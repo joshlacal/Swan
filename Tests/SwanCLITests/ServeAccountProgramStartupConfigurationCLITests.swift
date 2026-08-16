@@ -201,6 +201,63 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
         XCTAssertNil(mailpit)
     }
 
+    func testNonLabSMTPModeRequiresExplicitHostAndPort() throws {
+        // A complete-looking startTLS configuration with omitted host/port
+        // must refuse — never silently target mailpit:1025.
+        XCTAssertThrowsError(
+            try SwanCommand.Serve.resolveAuthenticatedSMTPConfiguration(
+                mode: .startTLS,
+                host: nil,
+                port: nil,
+                usernameFile: nil,
+                passwordFile: nil,
+                mechanism: .login,
+                expectedHostname: "smtp.example.com",
+                maximumAttempts: nil
+            )
+        ) { error in
+            let validation = error as? ValidationError
+            XCTAssertNotNil(validation, "\(error)")
+            XCTAssertTrue(
+                validation?.message.contains(
+                    "--email-smtp-mode startTLS requires --email-smtp-host and --email-smtp-port"
+                ) == true,
+                "\(String(describing: validation?.message))"
+            )
+        }
+
+        // An empty host is equally refused.
+        XCTAssertThrowsError(
+            try SwanCommand.Serve.resolveAuthenticatedSMTPConfiguration(
+                mode: .implicitTLS,
+                host: "   ",
+                port: 465,
+                usernameFile: nil,
+                passwordFile: nil,
+                mechanism: .plain,
+                expectedHostname: "smtp.example.com",
+                maximumAttempts: nil
+            )
+        ) { error in
+            XCTAssertTrue(error is ValidationError, "\(error)")
+        }
+
+        // plaintextLab keeps the Mailpit laboratory defaults.
+        let lab = try SwanCommand.Serve.resolveAuthenticatedSMTPConfiguration(
+            mode: .plaintextLab,
+            host: nil,
+            port: nil,
+            usernameFile: nil,
+            passwordFile: nil,
+            mechanism: nil,
+            expectedHostname: nil,
+            maximumAttempts: nil
+        )
+        let labConfiguration = try XCTUnwrap(lab)
+        XCTAssertEqual(labConfiguration.host, "mailpit")
+        XCTAssertEqual(labConfiguration.port, 1025)
+    }
+
     func testAuthenticatedSMTPResolvesCompleteConfigurationFromMountedFiles() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -407,6 +464,79 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
             result.error
         )
         XCTAssertFalse(result.error.contains(turnstile.path))
+        XCTAssertFalse(result.error.contains(root.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
+    }
+
+    func testSMTPCredentialOptionsWithoutModeRefuseWithoutCreatingData() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+        let username = root.appending(path: "smtp-username")
+        let password = root.appending(path: "smtp-password")
+        try protectedWrite(Data("smtp-user@example.com".utf8), to: username)
+        try protectedWrite(Data("smtp-password-value".utf8), to: password)
+
+        // Credential options without --email-smtp-mode must refuse — the
+        // process must not silently start on the Mailpit path discarding
+        // the operator's credentials.
+        let result = try runServe(data: data, arguments: [
+            "--enable-account-portal",
+            "--email-smtp-username-file", username.path,
+            "--email-smtp-password-file", password.path,
+            "--email-smtp-mechanism", "login",
+            "--email-smtp-expected-hostname", "smtp.example.com",
+        ])
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.isEmpty)
+        XCTAssertTrue(
+            result.error.contains(
+                "--email-smtp-username-file, --email-smtp-password-file, --email-smtp-mechanism, --email-smtp-expected-hostname, and --email-smtp-max-attempts require --email-smtp-mode"
+            ),
+            result.error
+        )
+        XCTAssertFalse(result.error.contains(username.path))
+        XCTAssertFalse(result.error.contains(password.path))
+        XCTAssertFalse(result.error.contains(root.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
+    }
+
+    func testNonLabSMTPModeWithoutHostOrPortRefusesWithoutCreatingData() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+        let turnstile = root.appending(path: "turnstile-secret")
+        try protectedWrite(Data(repeating: 0x41, count: 43), to: turnstile)
+        let username = root.appending(path: "smtp-username")
+        let password = root.appending(path: "smtp-password")
+        try protectedWrite(Data("smtp-user@example.com".utf8), to: username)
+        try protectedWrite(Data("smtp-password-value".utf8), to: password)
+
+        // A complete-looking startTLS configuration with omitted host/port
+        // must refuse — never silently target mailpit:1025.
+        let result = try runServe(data: data, arguments: [
+            "--enable-account-portal",
+            "--signup-policy", "openProtected",
+            "--turnstile-secret-file", turnstile.path,
+            "--email-smtp-mode", "startTLS",
+            "--email-smtp-username-file", username.path,
+            "--email-smtp-password-file", password.path,
+            "--email-smtp-mechanism", "login",
+            "--email-smtp-expected-hostname", "smtp.example.com",
+        ])
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.isEmpty)
+        XCTAssertTrue(
+            result.error.contains(
+                "--email-smtp-mode startTLS requires --email-smtp-host and --email-smtp-port"
+            ),
+            result.error
+        )
+        XCTAssertFalse(result.error.contains(turnstile.path))
+        XCTAssertFalse(result.error.contains(username.path))
+        XCTAssertFalse(result.error.contains(password.path))
         XCTAssertFalse(result.error.contains(root.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
     }

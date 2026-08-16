@@ -2553,6 +2553,18 @@ extension SwanCommand {
                 file: passwordFile,
                 option: "--email-smtp-password-file"
             )
+            // The Mailpit laboratory defaults are only for plaintextLab; a
+            // non-lab mode with omitted host/port would silently target
+            // mailpit:1025, so refuse instead.
+            if mode != .plaintextLab {
+                guard let host,
+                      !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let port else {
+                    throw ValidationError(
+                        "--email-smtp-mode \(Self.smtpModeName(mode)) requires --email-smtp-host and --email-smtp-port"
+                    )
+                }
+            }
             do {
                 return try AuthenticatedSMTPConfiguration(
                     host: host?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "mailpit",
@@ -2735,6 +2747,19 @@ extension SwanCommand {
                 guard (1 ... 86_400).contains(didWebRevalidationGraceSeconds) else {
                     throw ValidationError(
                         "--did-web-revalidation-grace-seconds must be from 1 through 86400"
+                    )
+                }
+                // SMTP credential options without an explicit mode would be
+                // silently discarded onto the Mailpit laboratory path; refuse
+                // instead (mirrors the turnstile-requires-openProtected check).
+                guard emailSMTPMode != nil
+                    || (emailSMTPUsernameFile == nil
+                        && emailSMTPPasswordFile == nil
+                        && emailSMTPMechanism == nil
+                        && emailSMTPExpectedHostname == nil
+                        && emailSMTPMaxAttempts == nil) else {
+                    throw ValidationError(
+                        "--email-smtp-username-file, --email-smtp-password-file, --email-smtp-mechanism, --email-smtp-expected-hostname, and --email-smtp-max-attempts require --email-smtp-mode"
                     )
                 }
                 if signupPolicy == .openProtected {
