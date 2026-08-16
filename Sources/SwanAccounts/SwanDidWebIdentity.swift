@@ -11,8 +11,8 @@ public struct SwanReservedSigningKey: Codable, Sendable, Equatable {
     public let publicKey: Data
 
     public init(keyID: String, keyType: String, publicKey: Data) throws {
-        guard !keyID.isEmpty, !keyType.isEmpty, !publicKey.isEmpty,
-              publicKey.count <= 4_096 else {
+        guard !keyID.isEmpty, !keyType.isEmpty,
+              publicKey.count == 32 || publicKey.count == 33 else {
             throw SwanError.invalidIdentifier("reserved signing key")
         }
         self.keyID = keyID
@@ -587,7 +587,7 @@ public actor InMemoryIdentityBindingStore: SwanAtomicDidWebClaimStore, SwanAtomi
     public func commitDidWebClaimAtomically(_ request: DidWebClaimCommitRequest,
                                             history entry: IdentityBindingHistoryEntry?, now: Date,
                                             gracePeriod: TimeInterval,
-                                            stepUpReceipt: SwanIdentityStepUpReceipt?) async throws {
+                                            stepUpReceipt: SwanIdentityStepUpReceipt?) async throws -> Bool {
         if let receipt = stepUpReceipt { try consumeStepUpReceipt(receipt, now: now, operation: .replace) }
         do {
             try await commitDidWebClaim(request, history: entry, now: now, gracePeriod: gracePeriod)
@@ -595,6 +595,7 @@ public actor InMemoryIdentityBindingStore: SwanAtomicDidWebClaimStore, SwanAtomi
             if let receipt = stepUpReceipt { consumedStepUpReceipts.remove(receipt.receiptDigest) }
             throw error
         }
+        return false
     }
     public func persistIdentityContinuity(_ binding: IdentityBinding) async throws -> IdentityBinding {
         guard bindings[binding.accountDID] != nil else { throw SwanError.invalidIdentifier("unknown identity binding") }
@@ -792,7 +793,17 @@ public actor SwanDidWebIdentityService {
             reservedKeyID: reservation.key.keyID,
             claimNonceDigest: transaction.claimNonceDigest,
             claimReceiptDigest: reservation.claimReceiptDigest,
-            idempotencyKey: reservation.requestID, now: now
+            idempotencyKey: reservation.requestID, now: now,
+            reservation: SwanPersistedDidWebReservation(
+                requestID: reservation.requestID, accountDID: reservation.accountDID,
+                targetDID: reservation.targetDID, handle: reservation.handle,
+                keyID: reservation.key.keyID, keyType: reservation.key.keyType,
+                publicKey: reservation.key.publicKey, nonce: reservation.nonce,
+                expiresAt: reservation.expiresAt, claimBytes: reservation.claimBytes,
+                claimReceiptDigest: reservation.claimReceiptDigest,
+                pdsURL: publicPDSURL, claimServiceEndpoint: reservation.claimServiceEndpoint,
+                state: .issued
+            )
         )
         let history = try existingBinding.map {
             try IdentityBindingHistoryEntry(
@@ -802,8 +813,9 @@ public actor SwanDidWebIdentityService {
                 reservedKeyID: $0.reservedKeyID, replacedAt: now
             )
         }
+        let reservationFinalizedInTransaction: Bool
         if let atomic = bindings as? any SwanAtomicDidWebClaimStore {
-            try await atomic.commitDidWebClaimAtomically(
+            reservationFinalizedInTransaction = try await atomic.commitDidWebClaimAtomically(
                 request, history: history, now: now, gracePeriod: gracePeriod,
                 stepUpReceipt: stepUpReceipt
             )
@@ -812,18 +824,22 @@ public actor SwanDidWebIdentityService {
                 throw SwanError.unavailable("identity replacement requires atomic durable store")
             }
             try await graceAware.commitDidWebClaim(request, history: history, now: now, gracePeriod: gracePeriod)
+            reservationFinalizedInTransaction = false
         } else {
             guard stepUpReceipt == nil else {
                 throw SwanError.unavailable("identity replacement requires atomic durable store")
             }
             try await bindings.commitDidWebClaim(request, history: history, now: now)
+            reservationFinalizedInTransaction = false
         }
-        do {
-            try await reservations.markReservationCommitted(requestID: reservation.requestID)
-        } catch {
-            // The durable binding is committed, so leave the provider tuple in
-            // repairable committed/outbox state rather than releasing it.
-            throw SwanError.unavailable("identity claim provider finalization pending")
+        if !reservationFinalizedInTransaction {
+            do {
+                try await reservations.markReservationCommitted(requestID: reservation.requestID)
+            } catch {
+                // The durable binding is committed, so leave the provider tuple in
+                // repairable committed/outbox state rather than releasing it.
+                throw SwanError.unavailable("identity claim provider finalization pending")
+            }
         }
         return try await bindings.identityBinding(accountDID: accountDID) ?? request.identityBinding
     }

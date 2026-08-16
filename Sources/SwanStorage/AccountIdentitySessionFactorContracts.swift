@@ -1,4 +1,5 @@
 import Foundation
+import Crypto
 import SwanCore
 
 public enum IdentityMethod: String, Codable, CaseIterable, Sendable {
@@ -217,8 +218,11 @@ public struct DidWebClaimCommitRequest: Sendable, Equatable {
     public let claimReceiptDigest: Data
     public let idempotencyKey: String
     public let identityBinding: IdentityBinding
+    /// The issued reservation tuple is carried into the durable claim commit.
+    /// SQLite consumes this row in the same transaction as the binding CAS.
+    public let reservation: SwanPersistedDidWebReservation?
 
-    public init(transaction: DidWebClaimTransaction, accountDID: String, targetDID: String, handle: String, documentDigest: Data, reservedKeyID: String, claimNonceDigest: Data, claimReceiptDigest: Data, idempotencyKey: String, now: Date) throws {
+    public init(transaction: DidWebClaimTransaction, accountDID: String, targetDID: String, handle: String, documentDigest: Data, reservedKeyID: String, claimNonceDigest: Data, claimReceiptDigest: Data, idempotencyKey: String, now: Date, reservation: SwanPersistedDidWebReservation? = nil) throws {
         guard transaction.state == .committing,
               transaction.accountDID == accountDID,
               transaction.targetDID == targetDID,
@@ -233,6 +237,20 @@ public struct DidWebClaimCommitRequest: Sendable, Equatable {
               now < transaction.expiresAt else {
             throw SwanError.invalidIdentifier("did:web claim commit")
         }
+        if let reservation {
+            guard reservation.requestID == idempotencyKey,
+                  reservation.accountDID == accountDID,
+                  reservation.targetDID == targetDID,
+                  reservation.handle == handle,
+                  reservation.keyID == reservedKeyID,
+                  reservation.nonce.count == 32,
+                  Data(SHA256.hash(data: reservation.nonce)) == claimNonceDigest,
+                  reservation.claimReceiptDigest == claimReceiptDigest,
+                  reservation.claimBytes.isEmpty == false,
+                  reservation.state == .issued else {
+                throw SwanError.invalidIdentifier("did:web reservation commit tuple")
+            }
+        }
         self.requestID = transaction.requestID
         self.accountDID = accountDID
         self.targetDID = targetDID
@@ -242,6 +260,7 @@ public struct DidWebClaimCommitRequest: Sendable, Equatable {
         self.claimNonceDigest = claimNonceDigest
         self.claimReceiptDigest = claimReceiptDigest
         self.idempotencyKey = idempotencyKey
+        self.reservation = reservation
         self.identityBinding = try IdentityBinding(
             accountDID: accountDID,
             identityDID: targetDID,

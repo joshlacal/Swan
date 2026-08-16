@@ -69,18 +69,18 @@ extension SQLiteControlDatabase: SwanAtomicDidWebClaimStore, SwanAtomicIdentityC
     }
 
     public func commitDidWebClaim(_ request: DidWebClaimCommitRequest, history: IdentityBindingHistoryEntry?, now: Date, gracePeriod: TimeInterval) async throws {
-        try await commitDidWebClaimInternal(request, history: history, now: now, gracePeriod: gracePeriod, stepUpReceipt: nil)
+        _ = try await commitDidWebClaimInternal(request, history: history, now: now, gracePeriod: gracePeriod, stepUpReceipt: nil)
     }
 
     public func commitDidWebClaimAtomically(_ request: DidWebClaimCommitRequest,
                                             history: IdentityBindingHistoryEntry?, now: Date,
                                             gracePeriod: TimeInterval,
-                                            stepUpReceipt: SwanIdentityStepUpReceipt?) async throws {
+                                            stepUpReceipt: SwanIdentityStepUpReceipt?) async throws -> Bool {
         try await commitDidWebClaimInternal(request, history: history, now: now, gracePeriod: gracePeriod, stepUpReceipt: stepUpReceipt)
     }
 
     private func commitDidWebClaimInternal(_ request: DidWebClaimCommitRequest, history: IdentityBindingHistoryEntry?, now: Date,
-                                           gracePeriod: TimeInterval, stepUpReceipt: SwanIdentityStepUpReceipt?) async throws {
+                                           gracePeriod: TimeInterval, stepUpReceipt: SwanIdentityStepUpReceipt?) async throws -> Bool {
         try await withConnectionGate {
             try await transaction {
                 let nonce = SQLiteData.blob(ByteBuffer(data: request.claimNonceDigest))
@@ -102,6 +102,32 @@ extension SQLiteControlDatabase: SwanAtomicDidWebClaimStore, SwanAtomicIdentityC
                     }
                     try await consumeStepUpReceipt(stepUpReceipt, now: now)
                 }
+                var reservationFinalized = false
+                if let reservation = request.reservation {
+                    let finalized = try await connection.query("""
+                        UPDATE did_web_signing_key_reservations
+                        SET state='committed', updated_at=?
+                        WHERE request_id=? AND state='issued'
+                          AND account_did IS ? AND target_did=? AND handle=?
+                          AND key_id=? AND key_type=? AND public_key=? AND nonce=?
+                          AND expires_at=? AND claim_bytes=? AND claim_receipt_digest=?
+                          AND pds_url=? AND claim_service_endpoint=?
+                        RETURNING request_id
+                        """, [.integer(timestamp(now)), .text(reservation.requestID),
+                              reservation.accountDID.map(SQLiteData.text) ?? .null,
+                              .text(reservation.targetDID), .text(reservation.handle),
+                              .text(reservation.keyID), .text(reservation.keyType),
+                              .blob(ByteBuffer(data: reservation.publicKey)),
+                              .blob(ByteBuffer(data: reservation.nonce)),
+                              .integer(timestamp(reservation.expiresAt)),
+                              .blob(ByteBuffer(data: reservation.claimBytes)),
+                              .blob(ByteBuffer(data: reservation.claimReceiptDigest)),
+                              .text(reservation.pdsURL), .text(reservation.claimServiceEndpoint)])
+                    guard finalized.count == 1 else {
+                        throw SwanError.conflict(expected: 1, actual: 0)
+                    }
+                    reservationFinalized = true
+                }
                 if let history {
                     _ = try await connection.query("INSERT INTO identity_binding_history(account_did, replaced_at, identity_did, document_digest, claim_receipt_digest, reserved_key_id) VALUES (?, ?, ?, ?, ?, ?)", [.text(history.accountDID), .integer(timestamp(history.replacedAt)), .text(history.identityDID), history.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null, history.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null, history.reservedKeyID.map(SQLiteData.text) ?? .null])
                 }
@@ -113,6 +139,7 @@ extension SQLiteControlDatabase: SwanAtomicDidWebClaimStore, SwanAtomicIdentityC
                     """, [.text(binding.accountDID), .text(binding.identityDID), .text(binding.handle), .blob(ByteBuffer(data: binding.documentDigest!)), .blob(ByteBuffer(data: binding.claimReceiptDigest!)), .text(binding.reservedKeyID!), .integer(timestamp(now)), .integer(timestamp(now.addingTimeInterval(gracePeriod))), .text(binding.state.rawValue)])
                 let committed = try await connection.query("UPDATE did_web_claim_transactions SET state = 'committed' WHERE request_id = ? AND state = 'committing' RETURNING request_id", [.text(request.requestID)])
                 guard committed.count == 1 else { throw SwanError.conflict(expected: 0, actual: 1) }
+                return reservationFinalized
             }
         }
     }

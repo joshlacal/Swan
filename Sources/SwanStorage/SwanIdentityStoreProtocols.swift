@@ -39,7 +39,7 @@ public struct SwanSigningKeyMaterial: Codable, Sendable, Equatable {
 
     public init(keyID: String, keyType: String, publicKey: Data) throws {
         guard keyID == "#atproto", keyType == "Multikey",
-              publicKey.count == 32 || publicKey.count == 33 || publicKey.count == 65 else {
+              publicKey.count == 32 || publicKey.count == 33 else {
             throw AccountControlStoreError.malformedRecord
         }
         self.keyID = keyID
@@ -111,7 +111,7 @@ public protocol SwanAtomicDidWebClaimStore: SwanGraceAwareIdentityBindingStore {
     func commitDidWebClaimAtomically(_ request: DidWebClaimCommitRequest,
                                      history: IdentityBindingHistoryEntry?, now: Date,
                                      gracePeriod: TimeInterval,
-                                     stepUpReceipt: SwanIdentityStepUpReceipt?) async throws
+                                     stepUpReceipt: SwanIdentityStepUpReceipt?) async throws -> Bool
 }
 
 public protocol SwanIdentityBindingEnumerating: Sendable {

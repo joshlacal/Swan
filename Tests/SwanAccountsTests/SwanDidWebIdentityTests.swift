@@ -50,6 +50,15 @@ final class SwanDidWebIdentityTests: XCTestCase {
         ))
     }
 
+    func testReservedKeyContractsRejectUnsupportedUncompressedMaterial() {
+        XCTAssertThrowsError(try SwanReservedSigningKey(
+            keyID: "#atproto", keyType: "Multikey", publicKey: Data(repeating: 1, count: 65)
+        ))
+        XCTAssertThrowsError(try SwanSigningKeyMaterial(
+            keyID: "#atproto", keyType: "Multikey", publicKey: Data(repeating: 1, count: 65)
+        ))
+    }
+
     func testReservationAndClaimAreOneTimeAndRetryIsIdempotent() async throws {
         let keys = InMemorySwanSigningKeyReservationService()
         let store = InMemoryIdentityBindingStore()
