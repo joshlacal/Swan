@@ -90,9 +90,10 @@ final class ScopedLegacyAuthTests: XCTestCase {
             DeclaredMethodScopePolicy.referenceLegacy.declaredMethods,
             Set(GeneratedLegacyMethodRegistry.declarations.keys)
         )
-        XCTAssertFalse(GeneratedLegacyMethodRegistry.declarations.keys.contains("com.atproto.server.createSession"))
+        XCTAssertTrue(GeneratedLegacyMethodRegistry.declarations.keys.contains("com.atproto.server.createSession"))
+        XCTAssertTrue(GeneratedLegacyMethodRegistry.routing["com.atproto.server.createSession"] == .local)
         XCTAssertFalse(GeneratedLegacyMethodRegistry.declarations.keys.contains("app.bsky.actor.defs"))
-        XCTAssertEqual(GeneratedLegacyMethodRegistry.declarations.count, 192)
+        XCTAssertEqual(GeneratedLegacyMethodRegistry.declarations.count, 193)
         XCTAssertEqual(GeneratedLegacyMethodRegistry.sourceDigest, "fc9ba90293fbe238224c0cf7456d3ea83750adf1ef1c63727be9fdea8c38f605")
         for (method, scopes) in GeneratedLegacyMethodRegistry.declarations {
             XCTAssertTrue(DeclaredMethodScopePolicy.isCanonicalMethod(method))

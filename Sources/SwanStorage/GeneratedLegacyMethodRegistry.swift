@@ -7,6 +7,7 @@ public enum GeneratedLegacyMethodRegistry {
     public static let sourceDigest = "fc9ba90293fbe238224c0cf7456d3ea83750adf1ef1c63727be9fdea8c38f605"
     public static let declarations: [String: Set<String>] = [
         "app.bsky.actor.getPreferences": ["rpc:app.bsky"],
+        "app.bsky.actor.getPreferencesExtended": ["rpc:app.bsky"],
         "app.bsky.actor.getProfile": ["rpc:app.bsky"],
         "app.bsky.actor.getProfiles": ["rpc:app.bsky"],
         "app.bsky.actor.getSuggestions": ["rpc:app.bsky"],
@@ -201,6 +202,7 @@ public enum GeneratedLegacyMethodRegistry {
     ]
     public static let routing: [String: RoutingDisposition] = [
         "app.bsky.actor.getPreferences": .local,
+        "app.bsky.actor.getPreferencesExtended": .proxyDefault,
         "app.bsky.actor.getProfile": .proxyDefault,
         "app.bsky.actor.getProfiles": .proxyDefault,
         "app.bsky.actor.getSuggestions": .proxyDefault,

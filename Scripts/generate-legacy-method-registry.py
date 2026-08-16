@@ -26,6 +26,7 @@ local = {
     'com.atproto.sync.getBlob': {'blob:read'}, 'com.atproto.sync.getLatestCommit': {'repo:read'}, 'com.atproto.sync.getRepo': {'repo:read'}, 'com.atproto.sync.getRepoStatus': {'repo:read'},
     'com.atproto.identity.resolveHandle': {'identity:read'}, 'app.bsky.actor.getPreferences': {'rpc:app.bsky'}, 'app.bsky.actor.putPreferences': {'rpc:app.bsky'},
 }
+supplemental = {'app.bsky.actor.getPreferencesExtended': 'rpc:app.bsky'}
 denied = set()
 rows = []
 dig = hashlib.sha256()
@@ -41,6 +42,7 @@ for path in sorted(ROOT.rglob('*.json')):
     rows.append((nsid, scope, 'proxyExplicit' if nsid in exact else 'proxyDefault'))
 by_method = {method: (method, scope, disposition) for method, scope, disposition in rows}
 for nsid, scopes in local.items(): by_method[nsid] = (nsid, ' '.join(sorted(scopes)), 'local')
+for nsid, scope in supplemental.items(): by_method[nsid] = (nsid, scope, 'proxyDefault')
 rows = sorted(by_method.values())
 target = OUT
 if '--check' in sys.argv:
