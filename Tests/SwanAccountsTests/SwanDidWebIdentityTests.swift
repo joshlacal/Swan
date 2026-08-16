@@ -14,12 +14,12 @@ final class SwanDidWebIdentityTests: XCTestCase {
         let nonce = Data(repeating: 7, count: 32)
         let first = try SwanDidWebClaimCanonicalizer.canonicalBytes(
             did: did, handle: handle, pdsURL: pds, keyID: "#atproto",
-            keyType: "Multikey", publicKey: Data([1, 2, 3]), nonce: nonce,
+            keyType: "Multikey", publicKey: Data(repeating: 1, count: 32), nonce: nonce,
             expiresAt: Date(timeIntervalSince1970: 1.234)
         )
         let second = try SwanDidWebClaimCanonicalizer.canonicalBytes(
             did: did, handle: handle, pdsURL: pds, keyID: "#atproto",
-            keyType: "Multikey", publicKey: Data([1, 2, 3]), nonce: nonce,
+            keyType: "Multikey", publicKey: Data(repeating: 1, count: 32), nonce: nonce,
             expiresAt: Date(timeIntervalSince1970: 1.234)
         )
         XCTAssertEqual(first, second)
@@ -31,7 +31,7 @@ final class SwanDidWebIdentityTests: XCTestCase {
 
     func testDocumentValidationRequiresExactSubjectAliasKeyEndpointAndClaimService() throws {
         let key = try SwanReservedSigningKey(
-            keyID: "#atproto", keyType: "Multikey", publicKey: Data([1, 2, 3])
+            keyID: "#atproto", keyType: "Multikey", publicKey: Data(repeating: 1, count: 32)
         )
         let nonce = Data(repeating: 9, count: 32)
         let claimEndpoint = "\(issuer)/.well-known/swan/did-web-claim/\(nonce.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: ""))"
@@ -180,7 +180,7 @@ private enum SwanDidWebDocumentFixture {
         let object: [String: Any] = [
             "id": did,
             "alsoKnownAs": ["at://\(handle)"],
-            "verificationMethod": [["id": "\(did)\(key.keyID)", "type": key.keyType, "controller": did, "publicKeyBase64": key.publicKey.base64EncodedString()]],
+            "verificationMethod": [["id": "\(did)\(key.keyID)", "type": key.keyType, "controller": did, "publicKeyMultibase": try SwanATMultikey.encode(publicKey: key.publicKey)]],
             "assertionMethod": ["\(did)\(key.keyID)"],
             "service": [["id": "\(did)#pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": pds], ["id": "\(did)#swan-claim", "type": "SwanDidWebClaim", "serviceEndpoint": claimEndpoint]],
         ]

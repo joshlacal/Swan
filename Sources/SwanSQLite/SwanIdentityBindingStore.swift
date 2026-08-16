@@ -41,7 +41,23 @@ extension SQLiteControlDatabase: SwanGraceAwareIdentityBindingStore, SwanConditi
         guard now < claim.expiresAt || claim.state == .expired else { throw SwanError.expired }
         try await withConnectionGate {
             try await self.transaction {
-                let current = try await connection.query("SELECT request_id FROM did_web_claim_transactions WHERE request_id = ? AND state = ?", [.text(claim.requestID), .text(expected.rawValue)])
+                let current = try await connection.query("""
+                    SELECT request_id FROM did_web_claim_transactions
+                    WHERE request_id = ? AND state = ?
+                      AND account_did IS ? AND target_did = ? AND handle = ?
+                      AND claim_nonce_digest = ?
+                      AND (requested_document_digest IS ? OR requested_document_digest = ?)
+                      AND (reserved_key_id IS ? OR reserved_key_id = ?)
+                      AND (claim_receipt_digest IS ? OR claim_receipt_digest = ?)
+                    """, [.text(claim.requestID), .text(expected.rawValue),
+                          claim.accountDID.map(SQLiteData.text) ?? .null, .text(claim.targetDID), .text(claim.handle),
+                          .blob(ByteBuffer(data: claim.claimNonceDigest)),
+                          claim.requestedDocumentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
+                          claim.requestedDocumentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
+                          claim.reservedKeyID.map(SQLiteData.text) ?? .null,
+                          claim.reservedKeyID.map(SQLiteData.text) ?? .null,
+                          claim.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
+                          claim.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null])
                 guard current.count == 1 else { throw SwanError.conflict(expected: 0, actual: 1) }
                 _ = try await connection.query("UPDATE did_web_claim_transactions SET state = ?, requested_document_digest = ?, reserved_key_id = ?, claim_receipt_digest = ? WHERE request_id = ? AND state = ?", [.text(claim.state.rawValue), claim.requestedDocumentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null, claim.reservedKeyID.map(SQLiteData.text) ?? .null, claim.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null, .text(claim.requestID), .text(expected.rawValue)])
             }
@@ -116,16 +132,24 @@ extension SQLiteControlDatabase: SwanGraceAwareIdentityBindingStore, SwanConditi
     public func compareAndPersistIdentityContinuity(expected: IdentityBinding, replacement: IdentityBinding) async throws -> IdentityBinding {
         try await withConnectionGate {
             let result = try await connection.query("""
-                UPDATE identity_bindings SET state = ?, last_validated_at = ?, grace_expires_at = ?
-                WHERE account_did = ? AND identity_did = ? AND document_digest = ?
-                """, [.text(replacement.state.rawValue), replacement.lastValidatedAt.map { .integer(timestamp($0)) } ?? .null,
-                      replacement.graceExpiresAt.map { .integer(timestamp($0)) } ?? .null, .text(expected.accountDID),
-                      .text(expected.identityDID), expected.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null])
-            guard result.count == 0 || result.count == 1 else { throw AccountControlStoreError.malformedRecord }
-            let rows = try await connection.query("SELECT * FROM identity_bindings WHERE account_did = ?", [.text(expected.accountDID)])
-            guard rows.count == 1, try decodeIdentityBinding(rows[0]) == replacement else {
-                throw SwanError.conflict(expected: 0, actual: 1)
-            }
+                UPDATE identity_bindings SET identity_did = ?, method = ?, handle = ?,
+                    document_digest = ?, claim_receipt_digest = ?, reserved_key_id = ?,
+                    state = ?, last_validated_at = ?, grace_expires_at = ?
+                WHERE account_did = ? AND identity_did = ? AND method = ? AND handle = ?
+                  AND document_digest IS ? AND claim_receipt_digest IS ?
+                  AND reserved_key_id IS ? AND state = ?
+                RETURNING account_did
+                """, [.text(replacement.identityDID), .text(replacement.method.rawValue), .text(replacement.handle),
+                      replacement.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
+                      replacement.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
+                      replacement.reservedKeyID.map(SQLiteData.text) ?? .null, .text(replacement.state.rawValue),
+                      replacement.lastValidatedAt.map { .integer(timestamp($0)) } ?? .null,
+                      replacement.graceExpiresAt.map { .integer(timestamp($0)) } ?? .null,
+                      .text(expected.accountDID), .text(expected.identityDID), .text(expected.method.rawValue),
+                      .text(expected.handle), expected.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
+                      expected.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
+                      expected.reservedKeyID.map(SQLiteData.text) ?? .null, .text(expected.state.rawValue)])
+            guard result.count == 1 else { throw SwanError.conflict(expected: 0, actual: 1) }
             return replacement
         }
     }

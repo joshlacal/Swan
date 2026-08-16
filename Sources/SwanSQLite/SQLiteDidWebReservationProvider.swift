@@ -17,23 +17,46 @@ public enum SQLiteDidWebReservationMigration {
       created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
       UNIQUE(nonce)
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS identity_did_web_active_identity_uq
+      ON identity_bindings(identity_did) WHERE method='did-web' AND state != 'released';
+    CREATE UNIQUE INDEX IF NOT EXISTS identity_did_web_active_handle_uq
+      ON identity_bindings(handle) WHERE method='did-web' AND state != 'released';
+    """
+    public static let createStepUpReceiptTableSQL = """
+    CREATE TABLE IF NOT EXISTS did_web_step_up_receipts (
+      receipt_digest BLOB PRIMARY KEY, session_id TEXT NOT NULL,
+      account_did TEXT NOT NULL, operation TEXT NOT NULL,
+      mfa_strength TEXT NOT NULL, verified_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL, consumed_at INTEGER
+    );
     """
 }
 
-extension SQLiteControlDatabase: SwanDidWebReservationStore {
+extension SQLiteControlDatabase: SwanDidWebReservationStore, SwanIdentityReservedMaterialStore, SwanIdentityStepUpReceiptStore {
     public func reserveDidWebSigningKey(requestID: String, accountDID: String?, targetDID: String,
                                         handle: String, expiresAt: Date, pdsURL: String,
-                                        publicURL: String) async throws -> SwanPersistedDidWebReservation {
+                                        publicURL: String, signingKey: SwanSigningKeyMaterial) async throws -> SwanPersistedDidWebReservation {
         try await withConnectionGate {
             try await transaction {
                 let existing = try await connection.query("SELECT * FROM did_web_signing_key_reservations WHERE request_id = ?", [.text(requestID)])
-                if let row = existing.first { return try decodeReservation(row) }
-                let key = P256.Signing.PrivateKey().publicKey.rawRepresentation
+                if let row = existing.first {
+                    let prior = try decodeReservation(row)
+                    guard prior.accountDID == accountDID, prior.targetDID == targetDID,
+                          prior.handle == handle, prior.expiresAt == expiresAt,
+                          prior.pdsURL == pdsURL, prior.keyID == signingKey.keyID,
+                          prior.keyType == signingKey.keyType,
+                          prior.publicKey == signingKey.publicKey,
+                          prior.claimServiceEndpoint == "\(publicURL)/.well-known/swan/did-web-claim/\(prior.nonce.base64URLEncodedString())" else {
+                        throw AccountControlStoreError.malformedRecord
+                    }
+                    return prior
+                }
+                let key = signingKey.publicKey
                 var generator = SystemRandomNumberGenerator()
                 let nonce = Data((0..<32).map { _ in UInt8.random(in: .min ... .max, using: &generator) })
                 let endpoint = "\(publicURL)/.well-known/swan/did-web-claim/\(nonce.base64URLEncodedString())"
                 let record = SwanPersistedDidWebReservation(requestID: requestID, accountDID: accountDID,
-                    targetDID: targetDID, handle: handle, keyID: "#atproto", keyType: "Multikey",
+                    targetDID: targetDID, handle: handle, keyID: signingKey.keyID, keyType: signingKey.keyType,
                     publicKey: key, nonce: nonce, expiresAt: expiresAt, claimBytes: Data(),
                     claimReceiptDigest: Data(), pdsURL: pdsURL, claimServiceEndpoint: endpoint)
                 _ = try await connection.query("""
@@ -48,9 +71,14 @@ extension SQLiteControlDatabase: SwanDidWebReservationStore {
 
     public func persistDidWebSigningReservation(_ reservation: SwanPersistedDidWebReservation) async throws {
         try await withConnectionGate {
-            _ = try await connection.query("""
-                UPDATE did_web_signing_key_reservations SET claim_bytes=?, claim_receipt_digest=?, state=?, updated_at=? WHERE request_id=? AND state != 'committed'
-                """, [.blob(ByteBuffer(data: reservation.claimBytes)), .blob(ByteBuffer(data: reservation.claimReceiptDigest)), .text(reservation.state.rawValue), .integer(timestamp(Date())), .text(reservation.requestID)])
+            let rows = try await connection.query("""
+                UPDATE did_web_signing_key_reservations SET claim_bytes=?, claim_receipt_digest=?, state=?, updated_at=?
+                WHERE request_id=? AND state='issued' AND account_did IS ? AND target_did=? AND handle=?
+                  AND key_id=? AND key_type=? AND public_key=? AND nonce=? AND expires_at=?
+                  AND pds_url=? AND claim_service_endpoint=?
+                RETURNING request_id
+                """, [.blob(ByteBuffer(data: reservation.claimBytes)), .blob(ByteBuffer(data: reservation.claimReceiptDigest)), .text(reservation.state.rawValue), .integer(timestamp(Date())), .text(reservation.requestID), reservation.accountDID.map(SQLiteData.text) ?? .null, .text(reservation.targetDID), .text(reservation.handle), .text(reservation.keyID), .text(reservation.keyType), .blob(ByteBuffer(data: reservation.publicKey)), .blob(ByteBuffer(data: reservation.nonce)), .integer(timestamp(reservation.expiresAt)), .text(reservation.pdsURL), .text(reservation.claimServiceEndpoint)])
+            guard rows.count == 1 else { throw AccountControlStoreError.malformedRecord }
         }
     }
 
@@ -71,6 +99,40 @@ extension SQLiteControlDatabase: SwanDidWebReservationStore {
                 let rows = try await connection.query("SELECT request_id FROM did_web_signing_key_reservations WHERE expires_at <= ? AND state = 'issued'", [.integer(timestamp(now))])
                 _ = try await connection.query("UPDATE did_web_signing_key_reservations SET state='released', updated_at=? WHERE expires_at <= ? AND state='issued'", [.integer(timestamp(now)), .integer(timestamp(now))])
                 return rows.compactMap { $0.column("request_id")?.string }
+            }
+        }
+    }
+
+    public func committedDidWebSigningReservation(accountDID: String) async throws -> SwanPersistedDidWebReservation? {
+        try await withConnectionGate {
+            let rows = try await connection.query("SELECT * FROM did_web_signing_key_reservations WHERE account_did = ? AND state = 'committed' ORDER BY updated_at DESC LIMIT 1", [.text(accountDID)])
+            return try rows.first.map(decodeReservation)
+        }
+    }
+
+    public func reservedMaterial(accountDID: String) async throws -> SwanPersistedDidWebReservation? {
+        try await committedDidWebSigningReservation(accountDID: accountDID)
+    }
+
+    public func consumeIdentityStepUpReceipt(sessionID: String, accountDID: String,
+                                              operation: String, mfaStrength: String,
+                                              verifiedAt: Date, expiresAt: Date,
+                                              receiptDigest: Data, now: Date) async throws {
+        guard receiptDigest.count == 32, verifiedAt <= now, now < expiresAt else {
+            throw AccountControlStoreError.malformedRecord
+        }
+        try await withConnectionGate {
+            try await transaction {
+                let rows = try await connection.query("""
+                    UPDATE did_web_step_up_receipts SET consumed_at=?
+                    WHERE receipt_digest=? AND session_id=? AND account_did=?
+                      AND operation=? AND mfa_strength=? AND verified_at<=?
+                      AND expires_at>? AND consumed_at IS NULL
+                    RETURNING receipt_digest
+                    """, [.integer(timestamp(now)), .blob(ByteBuffer(data: receiptDigest)),
+                          .text(sessionID), .text(accountDID), .text(operation), .text(mfaStrength),
+                          .integer(timestamp(verifiedAt)), .integer(timestamp(now))])
+                guard rows.count == 1 else { throw AccountControlStoreError.malformedRecord }
             }
         }
     }

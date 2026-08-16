@@ -61,11 +61,79 @@ public protocol SwanSigningKeyReservationService: Sendable {
     func consumeSigningKeyReservation(requestID: String) async throws
 }
 
+public protocol SwanSigningKeyProviding: Sendable {
+    func configuredSigningKey() async throws -> SwanReservedSigningKey
+}
+
+public protocol SwanContextualSigningKeyReservationService: SwanDurableSigningKeyReservationService {
+    func reserveSigningKey(requestID: String, accountDID: String?, targetDID: String, handle: String,
+                           expiresAt: Date, pdsURL: String, publicURL: String,
+                           signingKey: SwanSigningKeyMaterial) async throws -> (key: SwanReservedSigningKey, nonce: Data)
+}
+
+/// Production composition adapter. SQLite owns the durable tuple and this
+/// adapter injects the configured public material; it never generates a key.
+public struct SwanDurableSigningKeyReservationAdapter: SwanContextualSigningKeyReservationService, SwanSigningKeyProviding {
+    private let store: any SwanDidWebReservationStore
+    private let provider: any SwanSigningKeyProviding
+
+    public init(store: any SwanDidWebReservationStore, provider: any SwanSigningKeyProviding) {
+        self.store = store; self.provider = provider
+    }
+    public func configuredSigningKey() async throws -> SwanReservedSigningKey { try await provider.configuredSigningKey() }
+    public func reserveSigningKey(requestID: String, accountDID: String?, targetDID: String, handle: String,
+                                 expiresAt: Date, pdsURL: String, publicURL: String,
+                                 signingKey: SwanSigningKeyMaterial) async throws -> (key: SwanReservedSigningKey, nonce: Data) {
+        let row = try await store.reserveDidWebSigningKey(requestID: requestID, accountDID: accountDID,
+                                                          targetDID: targetDID, handle: handle, expiresAt: expiresAt,
+                                                          pdsURL: pdsURL, publicURL: publicURL, signingKey: signingKey)
+        return (try SwanReservedSigningKey(keyID: row.keyID, keyType: row.keyType, publicKey: row.publicKey), row.nonce)
+    }
+    public func reserveSigningKey(requestID: String) async throws -> (key: SwanReservedSigningKey, nonce: Data) {
+        let key = try await provider.configuredSigningKey()
+        let material = try SwanSigningKeyMaterial(keyID: key.keyID, keyType: key.keyType, publicKey: key.publicKey)
+        // This legacy entry point cannot bind the full DID tuple. Refuse it
+        // rather than persisting placeholder identity material.
+        _ = material
+        throw SwanError.unavailable("contextual did:web reservation required")
+    }
+    public func consumeSigningKeyReservation(requestID: String) async throws { try await markReservationCommitted(requestID: requestID) }
+    public func issuedReservation(requestID: String) async throws -> SwanDidWebClaimReservation? {
+        guard let row = try await store.loadDidWebSigningReservation(requestID: requestID), !row.claimBytes.isEmpty else { return nil }
+        return try claim(row)
+    }
+    public func committedReservation(accountDID: String) async throws -> SwanDidWebClaimReservation? {
+        guard let row = try await store.committedDidWebSigningReservation(accountDID: accountDID) else { return nil }
+        return try claim(row)
+    }
+    public func recordIssuedReservation(_ reservation: SwanDidWebClaimReservation) async throws {
+        guard let existing = try await store.loadDidWebSigningReservation(requestID: reservation.requestID) else {
+            throw SwanError.invalidIdentifier("unknown did:web reservation")
+        }
+        try await store.persistDidWebSigningReservation(SwanPersistedDidWebReservation(
+            requestID: reservation.requestID, accountDID: reservation.accountDID, targetDID: reservation.targetDID,
+            handle: reservation.handle, keyID: reservation.key.keyID, keyType: reservation.key.keyType,
+            publicKey: reservation.key.publicKey, nonce: reservation.nonce, expiresAt: reservation.expiresAt,
+            claimBytes: reservation.claimBytes, claimReceiptDigest: reservation.claimReceiptDigest,
+            pdsURL: existing.pdsURL, claimServiceEndpoint: reservation.claimServiceEndpoint, state: existing.state))
+    }
+    public func markReservationCommitted(requestID: String) async throws { try await store.markDidWebSigningReservationCommitted(requestID: requestID) }
+    public func releaseSigningKeyReservation(requestID: String) async throws { try await store.releaseDidWebSigningReservation(requestID: requestID) }
+    public func repairCommittedReservation(requestID: String) async throws { try await store.repairDidWebSigningReservation(requestID: requestID) }
+    private func claim(_ row: SwanPersistedDidWebReservation) throws -> SwanDidWebClaimReservation {
+        try SwanDidWebClaimReservation(requestID: row.requestID, accountDID: row.accountDID, targetDID: row.targetDID,
+                                       handle: row.handle, key: try SwanReservedSigningKey(keyID: row.keyID, keyType: row.keyType, publicKey: row.publicKey),
+                                       nonce: row.nonce, expiresAt: row.expiresAt, claimBytes: row.claimBytes,
+                                       claimReceiptDigest: row.claimReceiptDigest, claimServiceEndpoint: row.claimServiceEndpoint)
+    }
+}
+
 /// Durable providers implement this extension to make the reservation tuple
 /// authoritative across retries and process crashes. The base protocol stays
 /// source-compatible with existing callers and test doubles.
 public protocol SwanDurableSigningKeyReservationService: SwanSigningKeyReservationService {
     func issuedReservation(requestID: String) async throws -> SwanDidWebClaimReservation?
+    func committedReservation(accountDID: String) async throws -> SwanDidWebClaimReservation?
     func recordIssuedReservation(_ reservation: SwanDidWebClaimReservation) async throws
     func markReservationCommitted(requestID: String) async throws
     func releaseSigningKeyReservation(requestID: String) async throws
@@ -99,14 +167,30 @@ public struct SwanDidWebReplacementAuthorization: Sendable, Equatable {
 public enum SwanIdentityStepUpOperation: String, Sendable { case replace, remove }
 public protocol SwanStepUpReceiptConsumptionStore: Sendable {
     func consume(sessionID: String, accountDID: String, operation: SwanIdentityStepUpOperation,
-                 receiptDigest: Data, now: Date) async throws
+                 receiptDigest: Data, verifiedAt: Date, expiresAt: Date, now: Date) async throws
+}
+
+/// Dependency inversion adapter used by production composition: SQLite (or
+/// another durable store) owns the compare-and-set, while Accounts owns the
+/// typed operation vocabulary.
+public struct SwanDurableStepUpReceiptConsumer: SwanStepUpReceiptConsumptionStore {
+    private let store: any SwanIdentityStepUpReceiptStore
+    public init(store: any SwanIdentityStepUpReceiptStore) { self.store = store }
+    public func consume(sessionID: String, accountDID: String, operation: SwanIdentityStepUpOperation,
+                        receiptDigest: Data, verifiedAt: Date, expiresAt: Date, now: Date) async throws {
+        try await store.consumeIdentityStepUpReceipt(sessionID: sessionID, accountDID: accountDID,
+                                                     operation: operation.rawValue, mfaStrength: "phishingResistant",
+                                                     verifiedAt: verifiedAt, expiresAt: expiresAt,
+                                                     receiptDigest: receiptDigest, now: now)
+    }
 }
 
 public actor InMemorySwanStepUpReceiptConsumptionStore: SwanStepUpReceiptConsumptionStore {
     private var consumed: Set<Data> = []
     public init() {}
-    public func consume(sessionID: String, accountDID: String, operation: SwanIdentityStepUpOperation, receiptDigest: Data, now: Date) async throws {
-        guard !sessionID.isEmpty, !accountDID.isEmpty, receiptDigest.count == 32, now.timeIntervalSince1970 >= 0 else { throw SwanError.unauthorized("invalid step-up receipt") }
+    public func consume(sessionID: String, accountDID: String, operation: SwanIdentityStepUpOperation, receiptDigest: Data, verifiedAt: Date, expiresAt: Date, now: Date) async throws {
+        guard !sessionID.isEmpty, !accountDID.isEmpty, receiptDigest.count == 32,
+              verifiedAt <= now, now < expiresAt else { throw SwanError.unauthorized("invalid step-up receipt") }
         guard consumed.insert(receiptDigest).inserted else { throw SwanError.conflict(expected: 0, actual: 1) }
         _ = operation
     }
@@ -153,6 +237,14 @@ public actor InMemorySwanSigningKeyReservationService: SwanDurableSigningKeyRese
     public func issuedReservation(requestID: String) async throws -> SwanDidWebClaimReservation? {
         guard let value = reservations[requestID], value.2 != .released else { return nil }
         return value.3
+    }
+
+    public func committedReservation(accountDID: String) async throws -> SwanDidWebClaimReservation? {
+        reservations.values.compactMap { value in
+            guard value.2 == .committed, let reservation = value.3,
+                  reservation.accountDID == accountDID else { return nil }
+            return reservation
+        }.first
     }
 
     public func recordIssuedReservation(_ reservation: SwanDidWebClaimReservation) async throws {
@@ -229,12 +321,56 @@ public struct SwanValidatedDidWebDocument: Sendable, Equatable {
     public let canonicalJSON: Data
 }
 
+public enum SwanDidWebCanonicalizer {
+    public static func canonical(_ did: String) throws -> String {
+        guard did.hasPrefix("did:web:") else { throw SwanError.invalidIdentifier("did:web") }
+        let value = String(did.dropFirst("did:web:".count))
+        let parts = value.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard let authority = parts.first, !authority.isEmpty else { throw SwanError.invalidIdentifier("did:web authority") }
+        let authorityParts = authority.components(separatedBy: "%3A")
+        guard authorityParts.count <= 2,
+              authorityParts[0].lowercased() == authorityParts[0],
+              authorityParts[0].utf8.allSatisfy({ $0 == 45 || $0 == 46 || ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 122) }),
+              authorityParts[0].split(separator: ".", omittingEmptySubsequences: false).allSatisfy({ !$0.isEmpty && !$0.hasPrefix("-") && !$0.hasSuffix("-") }),
+              (authorityParts.count == 1 || ((1...65535).contains(Int(authorityParts[1]) ?? 0) && authorityParts[1] == String(Int(authorityParts[1])!))) else {
+            throw SwanError.invalidIdentifier("did:web authority")
+        }
+        let path = parts.dropFirst()
+        guard path.allSatisfy({ !$0.isEmpty && $0.utf8.allSatisfy { $0 == 45 || $0 == 46 || $0 == 95 || $0 == 126 || ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122) } }) else {
+            throw SwanError.invalidIdentifier("did:web path")
+        }
+        let result = "did:web:" + authority + (path.isEmpty ? "" : ":" + path.joined(separator: ":"))
+        guard result == did else { throw SwanError.invalidIdentifier("noncanonical did:web") }
+        return result
+    }
+}
+
+public enum SwanATMultikey {
+    public static func encode(publicKey: Data) throws -> String {
+        let prefix: Data
+        switch publicKey.count {
+        case 32: prefix = Data([0xed, 0x01])
+        case 33: prefix = Data([0x80, 0x24])
+        default: throw SwanError.invalidIdentifier("Multikey public key")
+        }
+        return "z" + Base58.encode(prefix + publicKey)
+    }
+
+    public static func decode(_ value: String, expected: Data) -> Bool {
+        guard value.first == "z", let decoded = Base58.decode(String(value.dropFirst())),
+              decoded.count == expected.count + 2, Data(decoded.dropFirst(2)) == expected else { return false }
+        let prefix = Array(decoded.prefix(2))
+        return (expected.count == 32 && prefix == [0xed, 0x01]) ||
+            (expected.count == 33 && prefix == [0x80, 0x24])
+    }
+}
+
 public enum SwanDidWebDocumentValidator {
     public static func validate(
         json: Data, did: String, handle: String, pdsURL: String,
         reservedKey: SwanReservedSigningKey, claimEndpoint: String
     ) throws -> SwanValidatedDidWebDocument {
-        guard try AccountIdentifiers.validateDID(did) == did, did.hasPrefix("did:web:"),
+        guard try SwanDidWebCanonicalizer.canonical(did) == did,
               try AccountIdentifiers.canonicalHandle(handle) == handle else {
             throw SwanError.invalidIdentifier("did:web claim identity")
         }
@@ -254,7 +390,8 @@ public enum SwanDidWebDocumentValidator {
             guard method["id"] as? String == keyID,
                   method["type"] as? String == reservedKey.keyType,
                   method["controller"] as? String == did else { return false }
-            return encodedPublicKey(method) == reservedKey.publicKey
+            guard let multibase = method["publicKeyMultibase"] as? String else { return false }
+            return SwanATMultikey.decode(multibase, expected: reservedKey.publicKey)
         }
         let assertions = dictionary["assertionMethod"] as? [Any] ?? []
         guard matchingKeys.count == 1,
@@ -294,13 +431,6 @@ public enum SwanDidWebDocumentValidator {
         return CanonicalObject(value: value, canonicalJSON: canonical)
     }
 
-    private static func encodedPublicKey(_ method: [String: Any]) -> Data? {
-        if let value = method["publicKeyBase64"] as? String { return Data(base64Encoded: value) }
-        if let value = method["publicKeyMultibase"] as? String, value.first == "z" {
-            return Base58.decode(String(value.dropFirst()))
-        }
-        return nil
-    }
 }
 
 /// RFC 8785 canonical JSON for the Foundation JSON value subset. It sorts
@@ -387,13 +517,17 @@ public enum SwanRFC8785JSON {
     }
 }
 
-public actor InMemoryIdentityBindingStore: SwanGraceAwareIdentityBindingStore, SwanConditionalIdentityContinuityStore, SwanExpiredIdentityClaimReleasingStore {
+public actor InMemoryIdentityBindingStore: SwanGraceAwareIdentityBindingStore, SwanConditionalIdentityContinuityStore, SwanExpiredIdentityClaimReleasingStore, SwanIdentityBindingEnumerating {
     private var claims: [String: DidWebClaimTransaction] = [:]
     private var bindings: [String: IdentityBinding] = [:]
     private var consumedNonces: Set<Data> = []
     private var history: [String: [IdentityBindingHistoryEntry]] = [:]
 
     public init() {}
+    public func identityBindings(afterAccountDID: String?, limit: Int) async throws -> [IdentityBinding] {
+        let ordered = bindings.values.sorted { $0.accountDID < $1.accountDID }
+        return Array(ordered.filter { binding in afterAccountDID.map { binding.accountDID > $0 } ?? true }.prefix(min(max(limit, 0), 256)))
+    }
     public func identityBinding(accountDID: String) async throws -> IdentityBinding? { bindings[accountDID] }
     public func reserveDidWebClaim(_ transaction: DidWebClaimTransaction, now: Date) async throws {
         if let existing = claims[transaction.requestID] {
@@ -430,6 +564,10 @@ public actor InMemoryIdentityBindingStore: SwanGraceAwareIdentityBindingStore, S
             return
         }
         let source = request.identityBinding
+        guard !bindings.values.contains(where: {
+            $0.accountDID != request.accountDID && $0.state != .released &&
+            ($0.identityDID == source.identityDID || $0.handle == source.handle)
+        }) else { throw SwanError.conflict(expected: 0, actual: 1) }
         let binding = try IdentityBinding(
             accountDID: source.accountDID, identityDID: source.identityDID,
             method: source.method, handle: source.handle,
@@ -473,6 +611,7 @@ public actor SwanDidWebIdentityService {
     private let gracePeriod: TimeInterval
     private let replacementAuthorizer: (any SwanDidWebReplacementAuthorizing)?
     private let stepUps: any SwanStepUpReceiptConsumptionStore
+    private let signingKeyProvider: (any SwanSigningKeyProviding)?
 
     public init(
         reservations: any SwanDurableSigningKeyReservationService,
@@ -480,13 +619,15 @@ public actor SwanDidWebIdentityService {
         publicPDSURL: String, publicURL: String,
         gracePeriod: TimeInterval = 86_400,
         replacementAuthorizer: (any SwanDidWebReplacementAuthorizing)? = nil,
-        stepUps: any SwanStepUpReceiptConsumptionStore
+        stepUps: any SwanStepUpReceiptConsumptionStore,
+        signingKeyProvider: (any SwanSigningKeyProviding)? = nil
     ) {
         self.reservations = reservations; self.bindings = bindings
         self.publicPDSURL = publicPDSURL; self.publicURL = publicURL
         self.gracePeriod = gracePeriod
         self.replacementAuthorizer = replacementAuthorizer
         self.stepUps = stepUps
+        self.signingKeyProvider = signingKeyProvider
     }
 
     public func reserveSigningKey(
@@ -495,13 +636,23 @@ public actor SwanDidWebIdentityService {
     ) async throws -> SwanDidWebClaimReservation {
         guard expiresAt > now else { throw SwanError.expired }
         guard !requestID.isEmpty else { throw SwanError.invalidIdentifier("claim request") }
-        guard try AccountIdentifiers.validateDID(targetDID) == targetDID,
-              targetDID.hasPrefix("did:web:") else { throw SwanError.invalidIdentifier("did:web target") }
+        guard try SwanDidWebCanonicalizer.canonical(targetDID) == targetDID else { throw SwanError.invalidIdentifier("did:web target") }
         if let accountDID {
             guard try AccountIdentifiers.validateDID(accountDID) == accountDID else { throw SwanError.invalidIdentifier("claim account") }
         }
         let canonicalHandle = try AccountIdentifiers.canonicalHandle(handle)
-        let reserved = try await reservations.reserveSigningKey(requestID: requestID)
+        let reserved: (key: SwanReservedSigningKey, nonce: Data)
+        if let contextual = reservations as? any SwanContextualSigningKeyReservationService,
+           let signingKeyProvider = signingKeyProvider ?? (reservations as? any SwanSigningKeyProviding) {
+            let key = try await signingKeyProvider.configuredSigningKey()
+            reserved = try await contextual.reserveSigningKey(
+                requestID: requestID, accountDID: accountDID, targetDID: targetDID,
+                handle: canonicalHandle, expiresAt: expiresAt, pdsURL: publicPDSURL,
+                publicURL: publicURL,
+                signingKey: try SwanSigningKeyMaterial(keyID: key.keyID, keyType: key.keyType, publicKey: key.publicKey))
+        } else {
+            reserved = try await reservations.reserveSigningKey(requestID: requestID)
+        }
         let claimBytes = try SwanDidWebClaimCanonicalizer.canonicalBytes(
             did: targetDID, handle: canonicalHandle, pdsURL: publicPDSURL,
             keyID: reserved.key.keyID, keyType: reserved.key.keyType,
@@ -573,7 +724,7 @@ public actor SwanDidWebIdentityService {
                   try await replacementAuthorizer.authorize(authorization, now: now) else {
                 throw SwanError.unauthorized("fresh step-up required for identity replacement")
             }
-            try await stepUps.consume(sessionID: authorization.sessionID, accountDID: accountDID, operation: .replace, receiptDigest: authorization.stepUpReceiptDigest, now: now)
+            try await stepUps.consume(sessionID: authorization.sessionID, accountDID: accountDID, operation: .replace, receiptDigest: authorization.stepUpReceiptDigest, verifiedAt: authorization.stepUpAt, expiresAt: authorization.stepUpAt.addingTimeInterval(300), now: now)
         }
         let transaction = try DidWebClaimTransaction(
             requestID: reservation.requestID, accountDID: accountDID,
@@ -658,7 +809,7 @@ public actor SwanDidWebIdentityService {
               try await replacementAuthorizer.authorize(authorization, now: now) else {
             throw SwanError.unauthorized("fresh step-up required for identity removal")
         }
-        try await stepUps.consume(sessionID: authorization.sessionID, accountDID: accountDID, operation: .remove, receiptDigest: authorization.stepUpReceiptDigest, now: now)
+        try await stepUps.consume(sessionID: authorization.sessionID, accountDID: accountDID, operation: .remove, receiptDigest: authorization.stepUpReceiptDigest, verifiedAt: authorization.stepUpAt, expiresAt: authorization.stepUpAt.addingTimeInterval(300), now: now)
         let released = try IdentityBinding(
             accountDID: binding.accountDID, identityDID: binding.identityDID,
             method: binding.method, handle: binding.handle,
@@ -678,11 +829,40 @@ public actor SwanDidWebIdentityService {
         binding: IdentityBinding, documents: any SwanDidWebDocumentFetching,
         now: Date = Date()
     ) async throws -> IdentityBinding {
-        guard binding.method == .didWeb else {
+        guard binding.method == .didWeb, binding.identityDID.hasPrefix("did:web:") else {
             throw SwanError.invalidIdentifier("did:web binding")
         }
-        _ = documents; _ = now
-        throw SwanError.unavailable("did:web revalidation requires stored reserved key material")
+        guard let reservation = try await reservations.committedReservation(accountDID: binding.accountDID) else {
+            throw SwanError.unavailable("did:web binding material unavailable")
+        }
+        return try await revalidate(binding: binding, reservation: reservation, documents: documents, now: now)
+    }
+
+    private func revalidate(binding: IdentityBinding, reservation: SwanDidWebClaimReservation,
+                            documents: any SwanDidWebDocumentFetching, now: Date) async throws -> IdentityBinding {
+        guard reservation.accountDID == binding.accountDID,
+              reservation.targetDID == binding.identityDID,
+              reservation.handle == binding.handle,
+              reservation.key.keyID == binding.reservedKeyID,
+              reservation.claimReceiptDigest == binding.claimReceiptDigest else {
+            throw SwanError.unavailable("did:web binding material mismatch")
+        }
+        let document: Data
+        do {
+            document = try await documents.documentJSON(forDID: binding.identityDID)
+        } catch {
+            return try await applyValidatedRevalidation(binding: binding, validated: nil, now: now, transientFailure: true)
+        }
+        do {
+            let validated = try SwanDidWebDocumentValidator.validate(
+                json: document, did: binding.identityDID, handle: binding.handle,
+                pdsURL: publicPDSURL, reservedKey: reservation.key,
+                claimEndpoint: reservation.claimServiceEndpoint
+            )
+            return try await applyValidatedRevalidation(binding: binding, validated: validated, now: now)
+        } catch {
+            return try await applyValidatedRevalidation(binding: binding, validated: nil, now: now)
+        }
     }
 
     /// Applies only a document already validated with the stored reserved key
@@ -755,6 +935,40 @@ public struct SwanIdentityAdmissionDecision: Sendable, Equatable {
     public let allowsTokenIssuance: Bool
 }
 
+/// Bounded startup/background revalidation. Enumeration is deliberately a
+/// storage capability so callers cannot accidentally scan unbounded account
+/// state in one event-loop turn.
+public actor SwanDidWebRevalidationScheduler {
+    private let service: SwanDidWebIdentityService
+    private let documents: any SwanDidWebDocumentFetching
+    private let bindings: any SwanIdentityBindingEnumerating
+    private let pageSize: Int
+
+    public init(service: SwanDidWebIdentityService, documents: any SwanDidWebDocumentFetching,
+                bindings: any SwanIdentityBindingEnumerating, pageSize: Int = 64) {
+        self.service = service
+        self.documents = documents
+        self.bindings = bindings
+        self.pageSize = min(max(pageSize, 1), 256)
+    }
+
+    public func runOnce(now: Date = Date()) async throws -> Int {
+        var cursor: String?
+        var processed = 0
+        while processed < pageSize {
+            let page = try await bindings.identityBindings(afterAccountDID: cursor, limit: min(16, pageSize - processed))
+            if page.isEmpty { break }
+            for binding in page where binding.method == .didWeb && binding.state != .released {
+                _ = try? await service.revalidate(binding: binding, documents: documents, now: now)
+                processed += 1
+            }
+            cursor = page.last?.accountDID
+            if page.count < min(16, pageSize - processed + page.count) { break }
+        }
+        return processed
+    }
+}
+
 public enum SwanIdentityContinuityState: String, Codable, Sendable { case active, grace, suspended }
 
 public enum SwanIdentityContinuity {
@@ -788,18 +1002,34 @@ private extension Data {
 
 private enum Base58 {
     static let alphabet = Array("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+    static func encode(_ value: Data) -> String {
+        guard !value.isEmpty else { return "" }
+        var digits = [UInt8]()
+        for byte in value {
+            var carry = Int(byte)
+            for index in digits.indices {
+                let number = Int(digits[index]) * 256 + carry
+                digits[index] = UInt8(number % 58)
+                carry = number / 58
+            }
+            while carry > 0 { digits.append(UInt8(carry % 58)); carry /= 58 }
+        }
+        var result = String(repeating: "1", count: value.prefix { $0 == 0 }.count)
+        result += digits.reversed().map { String(alphabet[Int($0)]) }.joined()
+        return result
+    }
     static func decode(_ value: String) -> Data? {
         var bytes = [UInt8]()
         for character in value {
             guard let index = alphabet.firstIndex(of: character) else { return nil }
             var carry = index
-            for i in bytes.indices.reversed() {
+            for i in bytes.indices {
                 let number = Int(bytes[i]) * 58 + carry
                 bytes[i] = UInt8(number & 0xff); carry = number >> 8
             }
-            while carry > 0 { bytes.insert(UInt8(carry & 0xff), at: 0); carry >>= 8 }
+            while carry > 0 { bytes.append(UInt8(carry & 0xff)); carry >>= 8 }
         }
-        for character in value where character == "1" { bytes.insert(0, at: 0) }
-        return Data(bytes)
+        let zeros = value.prefix { $0 == "1" }.count
+        return Data(repeating: 0, count: zeros) + Data(bytes.reversed())
     }
 }

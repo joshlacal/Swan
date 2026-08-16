@@ -1,4 +1,5 @@
 import Foundation
+import SwanCore
 
 public struct SwanPersistedDidWebReservation: Codable, Sendable, Equatable {
     public enum State: String, Codable, Sendable { case issued, committed, released }
@@ -29,16 +30,53 @@ public struct SwanPersistedDidWebReservation: Codable, Sendable, Equatable {
     }
 }
 
+/// Public key material is supplied by the account/repository key provider.
+/// Storage must never mint an identity key as a side effect of a reservation.
+public struct SwanSigningKeyMaterial: Codable, Sendable, Equatable {
+    public let keyID: String
+    public let keyType: String
+    public let publicKey: Data
+
+    public init(keyID: String, keyType: String, publicKey: Data) throws {
+        guard keyID == "#atproto", keyType == "Multikey",
+              publicKey.count == 32 || publicKey.count == 33 || publicKey.count == 65 else {
+            throw AccountControlStoreError.malformedRecord
+        }
+        self.keyID = keyID
+        self.keyType = keyType
+        self.publicKey = publicKey
+    }
+}
+
 public protocol SwanDidWebReservationStore: Sendable {
     func reserveDidWebSigningKey(requestID: String, accountDID: String?, targetDID: String,
                                  handle: String, expiresAt: Date, pdsURL: String,
-                                 publicURL: String) async throws -> SwanPersistedDidWebReservation
+                                 publicURL: String, signingKey: SwanSigningKeyMaterial) async throws -> SwanPersistedDidWebReservation
     func persistDidWebSigningReservation(_ reservation: SwanPersistedDidWebReservation) async throws
     func loadDidWebSigningReservation(requestID: String) async throws -> SwanPersistedDidWebReservation?
     func markDidWebSigningReservationCommitted(requestID: String) async throws
     func releaseDidWebSigningReservation(requestID: String) async throws
     func repairDidWebSigningReservation(requestID: String) async throws
     func purgeExpiredDidWebSigningReservations(now: Date) async throws -> [String]
+    func committedDidWebSigningReservation(accountDID: String) async throws -> SwanPersistedDidWebReservation?
+}
+
+public protocol SwanIdentityReservedMaterialStore: Sendable {
+    func reservedMaterial(accountDID: String) async throws -> SwanPersistedDidWebReservation?
+}
+
+/// Storage-side receipt consumption. The Accounts adapter turns the typed
+/// operation into this dependency-neutral form so SQLite remains below the
+/// account service target.
+public protocol SwanIdentityStepUpReceiptStore: Sendable {
+    func consumeIdentityStepUpReceipt(sessionID: String, accountDID: String,
+                                      operation: String, mfaStrength: String,
+                                      verifiedAt: Date, expiresAt: Date,
+                                      receiptDigest: Data, now: Date) async throws
+}
+
+public protocol SwanIdentityBindingEnumerating: Sendable {
+    func identityBindings(afterAccountDID: String?, limit: Int) async throws -> [IdentityBinding]
 }
 
 /// Optional identity-store capabilities layered over the reviewed base
