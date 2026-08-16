@@ -218,6 +218,7 @@ public actor TurnstileVerifier {
     private var used: [Data: Date] = [:]
     private var reservations: [Data: Date] = [:]
     private let maximumReservations = 1024
+    private let maximumUsed = 4096
 
     public init(secret: Data, hostname: String, action: String, maxAge: TimeInterval = 300, timeout: Duration = .seconds(5), transport: any TurnstileHTTPTransport) throws {
         guard secret.count >= 16, (1 ... 253).contains(hostname.utf8.count), (1 ... 128).contains(action.utf8.count), maxAge.isFinite, (1 ... 900).contains(maxAge), timeout > .zero, timeout <= .seconds(30) else { throw SwanError.invalidIdentifier("Turnstile configuration") }
@@ -229,6 +230,7 @@ public actor TurnstileVerifier {
         let digest = Data(SHA256.hash(data: Data(token.utf8)))
         used = used.filter { $0.value > now }
         guard used[digest] == nil else { throw TurnstileVerificationError.duplicate }
+        guard used.count < maximumUsed else { throw TurnstileVerificationError.transport }
         reservations = reservations.filter { $0.value > now }
         guard reservations.count < maximumReservations else { throw TurnstileVerificationError.transport }
         guard reservations.updateValue(now.addingTimeInterval(maxAge), forKey: digest) == nil else { throw TurnstileVerificationError.duplicate }
@@ -273,13 +275,18 @@ public struct URLSessionTurnstileTransport: TurnstileHTTPTransport {
     }
 
     public func verify(_ request: TurnstileSiteVerifyRequest, deadline: ContinuousClock.Instant) async throws -> TurnstileSiteVerifyResponse {
-        _ = deadline
-        var urlRequest = URLRequest(url: endpoint, timeoutInterval: timeout)
+        let now = ContinuousClock.now
+        guard deadline > now else { throw TurnstileVerificationError.transport }
+        let duration = now.duration(to: deadline)
+        let seconds = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+        guard seconds > 0 else { throw TurnstileVerificationError.transport }
+        var urlRequest = URLRequest(url: endpoint, timeoutInterval: min(timeout, seconds))
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         var components = URLComponents(); components.queryItems = [URLQueryItem(name: "secret", value: String(decoding: request.secret, as: UTF8.self)), URLQueryItem(name: "response", value: request.response)]
         if let remoteIP = request.remoteIP { components.queryItems?.append(URLQueryItem(name: "remoteip", value: remoteIP)) }
         urlRequest.httpBody = components.percentEncodedQuery?.data(using: .utf8)
+        try Task.checkCancellation()
         let (data, response) = try await URLSession.shared.data(for: urlRequest)
         guard (200 ..< 300).contains((response as? HTTPURLResponse)?.statusCode ?? 0) else { throw TurnstileVerificationError.transport }
         struct Wire: Decodable { let success: Bool; let challenge_ts: String?; let hostname: String?; let action: String?; let `error-codes`: [String]? }
@@ -330,8 +337,8 @@ public protocol SMTPTLSConnectionWithDeadline: SMTPTLSConnection {
 }
 
 public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPDeadlineTransport {
-    private let connect: @Sendable (AuthenticatedSMTPConfiguration) async throws -> any SMTPTLSConnectionWithDeadline
-    public init(connect: @escaping @Sendable (AuthenticatedSMTPConfiguration) async throws -> any SMTPTLSConnectionWithDeadline) {
+    private let connect: @Sendable (AuthenticatedSMTPConfiguration, ContinuousClock.Instant) async throws -> any SMTPTLSConnectionWithDeadline
+    public init(connect: @escaping @Sendable (AuthenticatedSMTPConfiguration, ContinuousClock.Instant) async throws -> any SMTPTLSConnectionWithDeadline) {
         self.connect = connect
     }
 
@@ -341,7 +348,7 @@ public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPDeadlineTransp
 
     public func deliver(configuration: AuthenticatedSMTPConfiguration, to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String, deadline: ContinuousClock.Instant) async throws {
         guard configuration.mode != .plaintextLab else { throw MailpitSMTPDeliveryError.invalidConfiguration }
-        let connection = try await connect(configuration)
+        let connection = try await connect(configuration, deadline)
         if configuration.mode != .plaintextLab {
             guard connection.authenticatedHostname.lowercased() == configuration.expectedHostname?.lowercased() else { throw MailpitSMTPDeliveryError.unavailable }
             guard let username = configuration.username, let password = configuration.password, let mechanism = configuration.mechanism else { throw MailpitSMTPDeliveryError.invalidConfiguration }
@@ -587,6 +594,7 @@ public actor SignupInviteRateAdmission: SignupRateAdmission {
     private let maximum: Int
     private let window: TimeInterval
     private var buckets: [Data: (started: Date, count: Int)] = [:]
+    private let maximumBuckets = 4096
 
     public init(maximum: Int = 5, window: TimeInterval = 60) throws {
         guard (1 ... 100).contains(maximum), window.isFinite, (1 ... 3600).contains(window) else { throw SwanError.invalidIdentifier("signup admission") }
@@ -596,6 +604,7 @@ public actor SignupInviteRateAdmission: SignupRateAdmission {
     public func permits(bucket: Data, now: Date) async throws -> Bool {
         guard bucket.count == 32 else { throw SwanError.invalidIdentifier("signup bucket") }
         buckets = buckets.filter { now.timeIntervalSince($0.value.started) < window }
+        guard buckets[bucket] != nil || buckets.count < maximumBuckets else { return false }
         if let current = buckets[bucket], current.count >= maximum { return false }
         let current = buckets[bucket] ?? (now, 0)
         buckets[bucket] = (current.started, current.count + 1)

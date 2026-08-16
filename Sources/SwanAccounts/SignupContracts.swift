@@ -9,9 +9,17 @@ public enum SignupPolicy: String, Codable, CaseIterable, Sendable {
     case inviteRequired
     case openProtected
 
-    public var advertisesInviteCodeRequired: Bool { self == .inviteRequired }
-    public var requiresTurnstile: Bool { self == .openProtected }
-    public var permitsPublicSignup: Bool { self != .closed }
+    public var advertisesInviteCodeRequired: Bool {
+        self == .inviteRequired
+    }
+
+    public var requiresTurnstile: Bool {
+        self == .openProtected
+    }
+
+    public var permitsPublicSignup: Bool {
+        self != .closed
+    }
 }
 
 public enum SignupAuthorizationState: String, Codable, CaseIterable, Sendable {
@@ -29,7 +37,8 @@ public struct SignupAuthorizationID: Codable, Hashable, Sendable, Equatable {
               rawValue.utf8.allSatisfy({
                   (48 ... 57).contains($0) || (65 ... 90).contains($0)
                       || (97 ... 122).contains($0) || $0 == 45 || $0 == 95
-              }) else {
+              })
+        else {
             throw SwanError.invalidIdentifier("signup authorization")
         }
         self.rawValue = rawValue
@@ -83,7 +92,8 @@ public struct SignupAuthorization: Codable, Sendable, Equatable {
               clientIPBucketDigest.count == 32,
               [emailProofDigest, inviteDigest].compactMap({ $0 }).allSatisfy({ $0.count == 32 }),
               expiresAt >= issuedAt,
-              leaseExpiresAt.map({ $0 >= issuedAt && $0 <= expiresAt }) ?? true else {
+              leaseExpiresAt.map({ $0 >= issuedAt && $0 <= expiresAt }) ?? true
+        else {
             throw SwanError.invalidIdentifier("signup authorization")
         }
         self.id = id
@@ -137,7 +147,8 @@ public struct SignupInvite: Codable, Sendable, Equatable {
 
     public init(digest: Data, issuedAt: Date, expiresAt: Date? = nil, redeemedAt: Date? = nil, redemptionAccountDID: String? = nil) throws {
         guard digest.count == 32, expiresAt.map({ $0 >= issuedAt }) ?? true,
-              redeemedAt.map({ $0 >= issuedAt }) ?? true else {
+              redeemedAt.map({ $0 >= issuedAt }) ?? true
+        else {
             throw SwanError.invalidIdentifier("signup invite digest")
         }
         self.digest = digest
@@ -178,7 +189,8 @@ public struct SignupFinalizationRequest: Codable, Sendable, Equatable {
     public init(authorizationID: SignupAuthorizationID, accountDID: String, handle: String, identityDID: String, reservedKeyID: String?, managementSession: ManagementSessionMetadata, sessionDigest: Data, csrfDigest: Data, emailProofDigest: Data?, inviteDigest: Data?, preAuthCSRFDigest: Data, idempotencyKey: String) throws {
         guard !accountDID.isEmpty, !handle.isEmpty, !identityDID.isEmpty, !idempotencyKey.isEmpty,
               sessionDigest.count == 32, csrfDigest.count == 32, preAuthCSRFDigest.count == 32,
-              [emailProofDigest, inviteDigest].compactMap({ $0 }).allSatisfy({ $0.count == 32 }) else {
+              [emailProofDigest, inviteDigest].compactMap({ $0 }).allSatisfy({ $0.count == 32 })
+        else {
             throw SwanError.invalidIdentifier("signup finalization")
         }
         self.authorizationID = authorizationID
@@ -249,7 +261,6 @@ public struct SignupFinalizationResult: Codable, Sendable, Equatable {
 public protocol SignupAuthorizationStore: Sendable {
     func reserve(_ authorization: SignupAuthorization, now: Date) async throws
     func authorization(id: SignupAuthorizationID, now: Date) async throws -> SignupAuthorization?
-    func fail(id: SignupAuthorizationID, now: Date) async throws
     func finalize(_ request: SignupFinalizationRequest, now: Date) async throws -> SignupFinalizationResult
     func purgeExpiredSignupState(now: Date) async throws
 }

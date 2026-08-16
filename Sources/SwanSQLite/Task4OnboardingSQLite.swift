@@ -264,7 +264,7 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
         SQLiteSignupFinalizationTransaction(store: self, request: request, now: now)
     }
 
-    public func fail(id: SignupAuthorizationID, now: Date) async throws {
+    fileprivate func fail(id: SignupAuthorizationID, now: Date) async throws {
         let current = try task4Timestamp(now)
         try await withConnectionGate { try await transaction {
             _ = try await connection.query("UPDATE signup_authorizations SET state='failed',lease_expires_at=NULL WHERE authorization_id=? AND state NOT IN('committed','failed')", [.text(id.rawValue)])
