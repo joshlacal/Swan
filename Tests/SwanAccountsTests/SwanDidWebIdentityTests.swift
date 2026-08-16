@@ -1,6 +1,7 @@
 import Crypto
 import XCTest
 @testable import SwanAccounts
+@testable import SwanCore
 @testable import SwanStorage
 
 final class SwanDidWebIdentityTests: XCTestCase {
@@ -83,6 +84,74 @@ final class SwanDidWebIdentityTests: XCTestCase {
         }
     }
 
+    func testForgedReservationAndReplacementRequireFreshAccountBoundStepUp() async throws {
+        let keys = InMemorySwanSigningKeyReservationService()
+        let store = InMemoryIdentityBindingStore()
+        let service = SwanDidWebIdentityService(reservations: keys, bindings: store, publicPDSURL: pds, publicURL: issuer, gracePeriod: 120)
+        let account = "did:plc:abcdefghijklmnopqrstuvwx"
+        let reservation = try await service.reserveSigningKey(requestID: "replace-1", accountDID: account, targetDID: did, handle: handle, expiresAt: Date().addingTimeInterval(300))
+        let json = try SwanDidWebDocumentFixture.json(did: did, handle: handle, pds: pds, key: reservation.key, claimEndpoint: reservation.claimServiceEndpoint)
+        _ = try await service.claim(reservation: reservation, documentJSON: json)
+
+        let forged = try SwanDidWebClaimReservation(
+            requestID: reservation.requestID, accountDID: account, targetDID: reservation.targetDID,
+            handle: reservation.handle, key: reservation.key, nonce: Data(repeating: 1, count: 32),
+            expiresAt: reservation.expiresAt, claimBytes: reservation.claimBytes,
+            claimReceiptDigest: reservation.claimReceiptDigest, claimServiceEndpoint: reservation.claimServiceEndpoint)
+        await XCTAssertThrowsAsyncError { _ = try await service.claim(reservation: forged, documentJSON: json) }
+
+        let replacement = try await service.reserveSigningKey(requestID: "replace-2", accountDID: account, targetDID: "did:web:new.example", handle: handle, expiresAt: Date().addingTimeInterval(300))
+        let replacementJSON = try SwanDidWebDocumentFixture.json(did: replacement.targetDID, handle: handle, pds: pds, key: replacement.key, claimEndpoint: replacement.claimServiceEndpoint)
+        await XCTAssertThrowsAsyncError { _ = try await service.claim(reservation: replacement, documentJSON: replacementJSON) }
+        let auth = try SwanDidWebReplacementAuthorization(accountDID: account, sessionAccountDID: account, sessionID: "session-1", stepUpAt: Date(), stepUpReceiptDigest: Data(repeating: 7, count: 32))
+        _ = try await service.claim(reservation: replacement, documentJSON: replacementJSON, authorization: auth)
+    }
+
+    func testProviderReleaseReclaimsReservationAndJCSCanonicalizesEdges() async throws {
+        let keys = InMemorySwanSigningKeyReservationService()
+        let first = try await keys.reserveSigningKey(requestID: "release-1")
+        try await keys.releaseSigningKeyReservation(requestID: "release-1")
+        let second = try await keys.reserveSigningKey(requestID: "release-1")
+        XCTAssertNotEqual(first.nonce, second.nonce)
+        let input = Data(#"{"b":1.0,"a":1e-6,"s":"slash/é"}"#.utf8)
+        XCTAssertEqual(String(data: try SwanRFC8785JSON.canonicalize(input), encoding: .utf8), #"{"a":0.000001,"b":1,"s":"slash/é"}"#)
+    }
+
+    func testConfiguredGracePersistsTransientFailureThenSuspendsAndFencesAdmission() async throws {
+        let keys = InMemorySwanSigningKeyReservationService()
+        let store = InMemoryIdentityBindingStore()
+        let service = SwanDidWebIdentityService(reservations: keys, bindings: store, publicPDSURL: pds, publicURL: issuer, gracePeriod: 120)
+        let account = "did:plc:abcdefghijklmnopqrstuvwx"
+        let reservation = try await service.reserveSigningKey(requestID: "grace-1", accountDID: account, targetDID: did, handle: handle, expiresAt: Date().addingTimeInterval(300))
+        let json = try SwanDidWebDocumentFixture.json(did: did, handle: handle, pds: pds, key: reservation.key, claimEndpoint: reservation.claimServiceEndpoint)
+        _ = try await service.claim(reservation: reservation, documentJSON: json)
+        guard let active = try await store.identityBinding(accountDID: account) else {
+            XCTFail("claim did not persist binding"); return
+        }
+        let transient = try await service.revalidate(binding: active, documents: FailingDocumentFetcher(), now: active.graceExpiresAt!.addingTimeInterval(-1))
+        XCTAssertEqual(transient.state, .active)
+        let persistedTransient = try await store.identityBinding(accountDID: account)
+        XCTAssertEqual(persistedTransient?.state, .active)
+        let decision = await service.admission(for: transient, now: Date(), revalidationFailed: true)
+        XCTAssertTrue(decision.allowsRead); XCTAssertFalse(decision.allowsWrite); XCTAssertFalse(decision.allowsTokenIssuance)
+        let expired = try await service.revalidate(binding: transient, documents: FailingDocumentFetcher(), now: active.graceExpiresAt!.addingTimeInterval(1))
+        XCTAssertEqual(expired.state, .suspended)
+        let persistedSuspended = try await store.identityBinding(accountDID: account)
+        XCTAssertEqual(persistedSuspended?.state, .suspended)
+    }
+
+    func testProviderCommitFailureIsRepairableByIdempotentRetry() async throws {
+        let keys = InMemorySwanSigningKeyReservationService()
+        let store = InMemoryIdentityBindingStore()
+        let service = SwanDidWebIdentityService(reservations: keys, bindings: store, publicPDSURL: pds, publicURL: issuer)
+        let reservation = try await service.reserveSigningKey(requestID: "repair-1", accountDID: "did:plc:abcdefghijklmnopqrstuvwx", targetDID: did, handle: handle, expiresAt: Date().addingTimeInterval(300))
+        let json = try SwanDidWebDocumentFixture.json(did: did, handle: handle, pds: pds, key: reservation.key, claimEndpoint: reservation.claimServiceEndpoint)
+        await keys.failNextCommitFinalization()
+        await XCTAssertThrowsAsyncError { _ = try await service.claim(reservation: reservation, documentJSON: json) }
+        let repaired = try await service.claim(reservation: reservation, documentJSON: json)
+        XCTAssertEqual(repaired.identityDID, did)
+    }
+
     func testContinuityGraceFencesWritesButPreservesReads() throws {
         let now = Date(timeIntervalSince1970: 100)
         XCTAssertEqual(
@@ -115,5 +184,11 @@ private enum SwanDidWebDocumentFixture {
             "service": [["id": "\(did)#pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": pds], ["id": "\(did)#swan-claim", "type": "SwanDidWebClaim", "serviceEndpoint": claimEndpoint]],
         ]
         return try JSONSerialization.data(withJSONObject: object)
+    }
+}
+
+private struct FailingDocumentFetcher: SwanDidWebDocumentFetching {
+    func documentJSON(forDID did: String) async throws -> Data {
+        throw SwanError.unavailable("transient fetch failure")
     }
 }

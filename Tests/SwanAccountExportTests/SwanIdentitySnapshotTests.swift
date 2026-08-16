@@ -13,6 +13,7 @@ final class SwanIdentitySnapshotTests: XCTestCase {
         )
         let snapshot = try SwanIdentitySnapshot(binding: binding, history: [])
         XCTAssertEqual(try SwanIdentitySnapshot.decode(snapshot.encoded()), snapshot)
+        XCTAssertEqual(try snapshot.validatedForRestore(accountDID: "did:plc:abcdefghijklmnopqrstuvwx"), snapshot)
         XCTAssertEqual(SwanIdentitySnapshot.plcArchiveCompatibility(Data("plc".utf8)), Data("plc".utf8))
     }
 }

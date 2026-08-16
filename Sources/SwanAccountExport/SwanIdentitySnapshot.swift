@@ -32,6 +32,27 @@ public struct SwanIdentitySnapshot: Codable, Sendable, Equatable {
         return value
     }
 
+    /// Restore admission validates ownership and method material before a
+    /// caller installs the snapshot into its durable account store.
+    public func validatedForRestore(accountDID: String) throws -> Self {
+        guard binding.accountDID == accountDID,
+              try AccountIdentifiers.validateDID(binding.accountDID) == binding.accountDID,
+              try AccountIdentifiers.validateDID(binding.identityDID) == binding.identityDID,
+              try AccountIdentifiers.canonicalHandle(binding.handle) == binding.handle,
+              history.allSatisfy({ $0.accountDID == accountDID }) else {
+            throw SwanPortableExportError.invalidManifest
+        }
+        if binding.method == .didWeb {
+            guard binding.documentDigest?.count == 32,
+                  binding.claimReceiptDigest?.count == 32,
+                  binding.reservedKeyID?.isEmpty == false,
+                  binding.identityDID.hasPrefix("did:web:") else {
+                throw SwanPortableExportError.invalidManifest
+            }
+        }
+        return self
+    }
+
     /// Compatibility assertion used by restore callers: this API returns the
     /// supplied legacy PLC archive bytes without transcoding or rewriting.
     public static func plcArchiveCompatibility(_ bytes: Data) -> Data { bytes }

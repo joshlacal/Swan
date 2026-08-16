@@ -7,7 +7,7 @@ import SwanStorage
 /// SQLite implementation of the reviewed method-neutral claim contract. The
 /// claim, replacement history, and nonce consumption are committed under one
 /// BEGIN IMMEDIATE transaction; no router or migration ownership is required.
-extension SQLiteControlDatabase: IdentityBindingStore {
+extension SQLiteControlDatabase: SwanGraceAwareIdentityBindingStore, SwanIdentityContinuityStore {
     public func identityBinding(accountDID: String) async throws -> IdentityBinding? {
         try await withConnectionGate {
             let rows = try await connection.query("SELECT * FROM identity_bindings WHERE account_did = ?", [.text(accountDID)])
@@ -49,6 +49,10 @@ extension SQLiteControlDatabase: IdentityBindingStore {
     }
 
     public func commitDidWebClaim(_ request: DidWebClaimCommitRequest, history: IdentityBindingHistoryEntry?, now: Date) async throws {
+        try await commitDidWebClaim(request, history: history, now: now, gracePeriod: 86_400)
+    }
+
+    public func commitDidWebClaim(_ request: DidWebClaimCommitRequest, history: IdentityBindingHistoryEntry?, now: Date, gracePeriod: TimeInterval) async throws {
         try await withConnectionGate {
             try await transaction {
                 let nonce = SQLiteData.blob(ByteBuffer(data: request.claimNonceDigest))
@@ -71,7 +75,7 @@ extension SQLiteControlDatabase: IdentityBindingStore {
                     INSERT INTO identity_bindings(account_did, identity_did, method, handle, document_digest, claim_receipt_digest, reserved_key_id, last_validated_at, grace_expires_at, state)
                     VALUES (?, ?, 'did-web', ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(account_did) DO UPDATE SET identity_did = excluded.identity_did, method = excluded.method, handle = excluded.handle, document_digest = excluded.document_digest, claim_receipt_digest = excluded.claim_receipt_digest, reserved_key_id = excluded.reserved_key_id, last_validated_at = excluded.last_validated_at, grace_expires_at = excluded.grace_expires_at, state = excluded.state
-                    """, [.text(binding.accountDID), .text(binding.identityDID), .text(binding.handle), .blob(ByteBuffer(data: binding.documentDigest!)), .blob(ByteBuffer(data: binding.claimReceiptDigest!)), .text(binding.reservedKeyID!), .integer(timestamp(now)), .integer(timestamp(binding.graceExpiresAt ?? now.addingTimeInterval(86_400))), .text(binding.state.rawValue)])
+                    """, [.text(binding.accountDID), .text(binding.identityDID), .text(binding.handle), .blob(ByteBuffer(data: binding.documentDigest!)), .blob(ByteBuffer(data: binding.claimReceiptDigest!)), .text(binding.reservedKeyID!), .integer(timestamp(now)), .integer(timestamp(now.addingTimeInterval(gracePeriod))), .text(binding.state.rawValue)])
                 _ = try await connection.query("UPDATE did_web_claim_transactions SET state = 'committed' WHERE request_id = ? AND state = 'committing'", [.text(request.requestID)])
             }
         }
@@ -80,6 +84,24 @@ extension SQLiteControlDatabase: IdentityBindingStore {
     public func purgeExpiredIdentityClaims(now: Date) async throws {
         try await withConnectionGate {
             _ = try await connection.query("DELETE FROM did_web_claim_transactions WHERE expires_at < ? AND state != 'committed'", [.integer(timestamp(now))])
+        }
+    }
+
+    public func persistIdentityContinuity(_ binding: IdentityBinding) async throws -> IdentityBinding {
+        try await withConnectionGate {
+            _ = try await connection.query("""
+                UPDATE identity_bindings SET identity_did = ?, method = ?, handle = ?,
+                    document_digest = ?, claim_receipt_digest = ?, reserved_key_id = ?,
+                    last_validated_at = ?, grace_expires_at = ?, state = ?
+                WHERE account_did = ?
+                """, [.text(binding.identityDID), .text(binding.method.rawValue), .text(binding.handle),
+                      binding.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
+                      binding.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
+                      binding.reservedKeyID.map(SQLiteData.text) ?? .null,
+                      binding.lastValidatedAt.map { .integer(timestamp($0)) } ?? .null,
+                      binding.graceExpiresAt.map { .integer(timestamp($0)) } ?? .null,
+                      .text(binding.state.rawValue), .text(binding.accountDID)])
+            return binding
         }
     }
 
