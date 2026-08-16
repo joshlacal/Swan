@@ -50,6 +50,31 @@ final class Task4OnboardingTests: XCTestCase {
         } catch TurnstileVerificationError.duplicate {}
     }
 
+    func testTurnstileRejectsFutureChallengeTimestamp() async throws {
+        let now = Date()
+        let transport = StubTurnstileTransport(response: .init(success: true, challengeTimestamp: now.addingTimeInterval(6), hostname: "accounts.example", action: "signup"))
+        let verifier = try TurnstileVerifier(secret: Data(repeating: 2, count: 32), hostname: "accounts.example", action: "signup", transport: transport)
+        do {
+            try await verifier.verify(token: "future-token", remoteIP: nil, now: now)
+            XCTFail("future challenge timestamps must fail closed")
+        } catch TurnstileVerificationError.expired {}
+    }
+
+    func testSignupRejectsUnsupportedIdentityMethodAndLifetime() async throws {
+        let store = InMemorySignupAuthorizationStore()
+        let input = try SignupAuthorizationInput(
+            requestID: "request-2", authorizationID: SignupAuthorizationID(rawValue: "authorization-2"),
+            handle: "alice.example.com", email: AccountEmailAddress("alice@example.com"),
+            identityDID: "did:key:z6Mk", emailProofDigest: Data(repeating: 4, count: 32), inviteDigest: nil,
+            clientIPBucketDigest: Data(repeating: 1, count: 32)
+        )
+        let service = try SignupService(policy: SignupPolicyService(policy: .openProtected), store: store)
+        do {
+            _ = try await service.authorize(input, lifetime: 901)
+            XCTFail("authorization lifetime must be bounded")
+        } catch SwanError.invalidIdentifier {}
+    }
+
     func testOpenAndInviteSignupRequireVerifiedEmailProof() async throws {
         let store = InMemorySignupAuthorizationStore()
         let input = try SignupAuthorizationInput(

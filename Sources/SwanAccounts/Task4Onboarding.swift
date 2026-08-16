@@ -211,7 +211,9 @@ public actor TurnstileVerifier {
         } catch let error as TurnstileVerificationError { reservations.removeValue(forKey: digest); throw error }
         catch { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.transport }
         guard response.success else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.failed }
-        guard let challenged = response.challengeTimestamp, abs(now.timeIntervalSince(challenged)) <= maxAge else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.expired }
+        guard let challenged = response.challengeTimestamp,
+              challenged <= now.addingTimeInterval(5),
+              now.timeIntervalSince(challenged) <= maxAge else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.expired }
         guard response.hostname?.lowercased() == hostname else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.wrongHostname }
         guard response.action == action else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.wrongAction }
         reservations.removeValue(forKey: digest)
@@ -301,7 +303,6 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
     private let configuration: AuthenticatedSMTPConfiguration
     private let transport: any AuthenticatedSMTPTransport
     private let attemptTimeout: Duration
-    private var delivered: Set<String> = []
     public init(configuration: AuthenticatedSMTPConfiguration, transport: any AuthenticatedSMTPTransport, attemptTimeout: Duration = .seconds(30)) throws {
         guard attemptTimeout > .zero else { throw SwanError.invalidIdentifier("SMTP attempt timeout") }
         self.configuration = configuration; self.transport = transport; self.attemptTimeout = attemptTimeout
@@ -310,7 +311,6 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
     public func deliver(to: AccountEmailAddress, subject: String, body: String) async throws {
         guard !subject.contains("\r"), !subject.contains("\n"), body.utf8.count <= 32768 else { throw MailpitSMTPDeliveryError.invalidMessage }
         let key = String(SHA256.hash(data: Data("\(to.value)\0\(subject)\0\(body)".utf8)).description)
-        if delivered.contains(key) { return }
         var last: Error?
         for attempt in 0 ..< configuration.maximumAttempts {
             do {
@@ -320,7 +320,7 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
                     defer { group.cancelAll() }
                     try await group.next()!
                 }
-                delivered.insert(key); return
+                return
             } catch { last = error; if attempt + 1 < configuration.maximumAttempts { try? await Task.sleep(for: .milliseconds(Int64(100 * (1 << attempt)))) } }
         }
         throw last ?? MailpitSMTPDeliveryError.unavailable
@@ -342,11 +342,27 @@ public struct AccountRecoveryRevocationCoordinator: Sendable {
         self.hooks = hooks
     }
 
+    public struct Failure: Error, Sendable {
+        public let credentialClass: String
+        public init(credentialClass: String) {
+            self.credentialClass = credentialClass
+        }
+    }
+
+    public struct AggregateError: Error, Sendable {
+        public let failures: [Failure]
+        public init(failures: [Failure]) {
+            self.failures = failures
+        }
+    }
+
     public func revokeAll(for did: String, now: Date = Date()) async throws {
-        try await hooks.revokeOAuthSessions(did: did, now: now)
-        try await hooks.revokeLegacySessions(did: did, now: now)
-        try await hooks.revokeManagementSessions(did: did, now: now)
-        try await hooks.revokeAppDerivedSessions(did: did, now: now)
+        var failures: [Failure] = []
+        do { try await hooks.revokeOAuthSessions(did: did, now: now) } catch { failures.append(.init(credentialClass: "oauth")) }
+        do { try await hooks.revokeLegacySessions(did: did, now: now) } catch { failures.append(.init(credentialClass: "legacy")) }
+        do { try await hooks.revokeManagementSessions(did: did, now: now) } catch { failures.append(.init(credentialClass: "management")) }
+        do { try await hooks.revokeAppDerivedSessions(did: did, now: now) } catch { failures.append(.init(credentialClass: "appDerived")) }
+        if !failures.isEmpty { throw AggregateError(failures: failures) }
     }
 }
 
@@ -404,36 +420,83 @@ public struct SignupAuthorizationInput: Sendable, Equatable {
 
 public protocol SignupFoundationBundle: Sendable {
     /// The foundation implementation performs account/identity/session work
-    /// and invokes `finalize` exactly once from its idempotent commit path.
-    /// Retrying the same canonical request must return the persisted result.
-    func commitSignup(
-        _ input: SignupFinalizationRequest,
-        finalize: @escaping @Sendable () async throws -> SignupFinalizationResult,
-        now: Date
-    ) async throws -> SignupFinalizationResult
+    /// and invokes the storage-owned transaction exactly once from its
+    /// idempotent commit path. Retrying returns the persisted result.
+    func commitSignup(_ input: SignupFinalizationRequest, transaction: any SignupFinalizationTransaction, now: Date) async throws -> SignupFinalizationResult
+}
+
+public protocol SignupFinalizationTransaction: Sendable {
+    func commit() async throws -> SignupFinalizationResult
+}
+
+/// Storage implementations may return a transaction bound to their durable
+/// connection. Foundation must retain and commit this object inside its own
+/// account/identity/session transaction boundary.
+public protocol SignupAtomicFinalizationStore: SignupAuthorizationStore {
+    func makeFinalizationTransaction(_ request: SignupFinalizationRequest, now: Date) async throws -> any SignupFinalizationTransaction
+}
+
+private struct StoreOwnedSignupFinalizationTransaction: SignupFinalizationTransaction {
+    let store: any SignupAuthorizationStore
+    let request: SignupFinalizationRequest
+    let now: Date
+    func commit() async throws -> SignupFinalizationResult {
+        try await store.finalize(request, now: now)
+    }
 }
 
 public enum SignupServiceError: Error, Sendable, Equatable { case closed, inviteRequired, emailProofRequired, turnstileRequired, invalidIdentity, duplicateRequest }
+
+public protocol SignupRateAdmission: Sendable {
+    func permits(bucket: Data, now: Date) async throws -> Bool
+}
+
+/// Small bounded admission gate for invite mode. Production can replace this
+/// with the shared IP/token-bucket service through the protocol seam.
+public actor SignupInviteRateAdmission: SignupRateAdmission {
+    private let maximum: Int
+    private let window: TimeInterval
+    private var buckets: [Data: (started: Date, count: Int)] = [:]
+
+    public init(maximum: Int = 5, window: TimeInterval = 60) throws {
+        guard (1 ... 100).contains(maximum), window.isFinite, (1 ... 3600).contains(window) else { throw SwanError.invalidIdentifier("signup admission") }
+        self.maximum = maximum; self.window = window
+    }
+
+    public func permits(bucket: Data, now: Date) async throws -> Bool {
+        guard bucket.count == 32 else { throw SwanError.invalidIdentifier("signup bucket") }
+        buckets = buckets.filter { now.timeIntervalSince($0.value.started) < window }
+        if let current = buckets[bucket], current.count >= maximum { return false }
+        let current = buckets[bucket] ?? (now, 0)
+        buckets[bucket] = (current.started, current.count + 1)
+        return true
+    }
+}
 
 public struct SignupService: Sendable {
     private let policy: SignupPolicyService
     private let store: any SignupAuthorizationStore
     private let turnstile: TurnstileVerifier?
-    public init(policy: SignupPolicyService, store: any SignupAuthorizationStore, turnstile: TurnstileVerifier? = nil) {
-        self.policy = policy; self.store = store; self.turnstile = turnstile
+    private let rateAdmission: (any SignupRateAdmission)?
+    public init(policy: SignupPolicyService, store: any SignupAuthorizationStore, turnstile: TurnstileVerifier? = nil, rateAdmission: (any SignupRateAdmission)? = nil) {
+        self.policy = policy; self.store = store; self.turnstile = turnstile; self.rateAdmission = rateAdmission
     }
 
     public func authorize(_ input: SignupAuthorizationInput, turnstileToken: String? = nil, remoteIP: String? = nil, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupAuthorization {
         guard policy.policy.permitsPublicSignup else { throw SignupServiceError.closed }
+        guard lifetime.isFinite, (1 ... 900).contains(lifetime) else { throw SwanError.invalidIdentifier("signup authorization lifetime") }
         guard input.email != nil, input.emailProofDigest != nil else { throw SignupServiceError.emailProofRequired }
         guard policy.permits(handle: input.handle, inviteCode: input.inviteDigest == nil ? nil : "present") else { throw SignupServiceError.inviteRequired }
+        if policy.policy == .inviteRequired {
+            guard let rateAdmission, try await rateAdmission.permits(bucket: input.clientIPBucketDigest, now: now) else { throw SignupServiceError.inviteRequired }
+        }
         if policy.policy == .openProtected {
             guard input.emailProofDigest != nil else { throw SignupServiceError.emailProofRequired }
             guard let turnstile else { throw SignupServiceError.turnstileRequired }
             guard let turnstileToken, !turnstileToken.isEmpty else { throw SignupServiceError.turnstileRequired }
             try await turnstile.verify(token: turnstileToken, remoteIP: remoteIP, now: now)
         }
-        guard input.identityDID.hasPrefix("did:") else { throw SignupServiceError.invalidIdentity }
+        guard AccountControlIdentifiers.isDID(input.identityDID) else { throw SignupServiceError.invalidIdentity }
         let authorization = try SignupAuthorization(id: input.authorizationID, requestID: input.requestID, policy: policy.policy, handle: input.handle, email: input.email?.value, identityDID: input.identityDID, emailProofDigest: input.emailProofDigest, inviteDigest: input.inviteDigest, clientIPBucketDigest: input.clientIPBucketDigest, issuedAt: now, expiresAt: now.addingTimeInterval(lifetime), leaseExpiresAt: now.addingTimeInterval(120))
         try await store.reserve(authorization, now: now)
         return authorization
@@ -443,12 +506,13 @@ public struct SignupService: Sendable {
         guard let authorization = try await store.authorization(id: request.authorizationID, now: now), authorization.requestID == request.idempotencyKey else { throw AccountControlStoreError.notFound }
         guard authorization.handle == request.handle, authorization.identityDID == request.identityDID else { throw SignupServiceError.duplicateRequest }
         do {
-            let store = store
-            return try await foundation.commitSignup(
-                request,
-                finalize: { try await store.finalize(request, now: now) },
-                now: now
-            )
+            let transaction: any SignupFinalizationTransaction
+            if let atomicStore = store as? any SignupAtomicFinalizationStore {
+                transaction = try await atomicStore.makeFinalizationTransaction(request, now: now)
+            } else {
+                transaction = StoreOwnedSignupFinalizationTransaction(store: store, request: request, now: now)
+            }
+            return try await foundation.commitSignup(request, transaction: transaction, now: now)
         } catch { try? await store.fail(id: request.authorizationID, now: now); throw error }
     }
 }
@@ -463,5 +527,33 @@ public struct AccountEmailUpdateService: Sendable {
     public func requestUpdate(did: String, email: AccountEmailAddress, now: Date = Date()) async throws {
         try await store.associateEmail(did: did, email: email, now: now)
         try await recovery.requestEmailConfirmation(did: did, email: email, now: now)
+    }
+}
+
+public struct SignupEmailRequestOutcome: Sendable, Equatable {
+    public let accepted: Bool
+    public init(accepted: Bool = true) {
+        self.accepted = accepted
+    }
+}
+
+/// Durable proof issuance is deliberately split from delivery. Implementors
+/// persist the proof and enqueue an outbox row in one transaction; callers get
+/// the same response for existing and new addresses.
+public protocol SignupEmailRequestStore: Sendable {
+    func persistSignupEmailRequest(email: AccountEmailAddress, handle: String, proofDigest: Data, issuedAt: Date, expiresAt: Date) async throws
+}
+
+public struct SignupEmailRequestService: Sendable {
+    private let store: any SignupEmailRequestStore
+    public init(store: any SignupEmailRequestStore) {
+        self.store = store
+    }
+
+    public func request(email: AccountEmailAddress, handle: String, proofDigest: Data, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupEmailRequestOutcome {
+        guard AccountControlIdentifiers.isCanonicalHandle(handle), proofDigest.count == 32,
+              lifetime.isFinite, (60 ... 900).contains(lifetime) else { throw SwanError.invalidIdentifier("signup email request") }
+        try await store.persistSignupEmailRequest(email: email, handle: handle, proofDigest: proofDigest, issuedAt: now, expiresAt: now.addingTimeInterval(lifetime))
+        return SignupEmailRequestOutcome()
     }
 }

@@ -83,3 +83,12 @@ Source parse, SwiftFormat, and `git diff --check` passed. Focused Swift tests
 were not rerun because another lane's Xcode-beta SwiftPM rebuild/test was still
 active and the shared volume had fallen to approximately 4.5 GiB free; racing
 it would invalidate the evidence.
+
+## Second review correction evidence (2026-08-16)
+
+- Proof reservations and finalization now compare the persisted email and handle, enforce the authorization lease, reject future authorization timestamps, and digest all authorization/session/CSRF/pre-auth and management-session metadata for idempotency.
+- Turnstile reservations are acquired before the injected transport await, bounded to 1024 with expiry cleanup, and future challenge timestamps fail closed. The URL transport accepts only the exact Cloudflare HTTPS authority/path.
+- Authorization lifetime is bounded to 1–900 seconds, identity validation uses canonical supported DID validation, invite mode has a bounded token-bucket admission seam, and signup email requests persist proof plus a durable lane outbox row in one transaction with an enumeration-resistant accepted response.
+- SMTP no longer uses process-memory deduplication; its deterministic idempotency key is passed to the durable outbox transport. Recovery revocation attempts all credential classes and aggregates failures. Lifecycle adapters require verifier-issued opaque capabilities, and create-account requires an authorization pipeline and verified email code.
+
+The frozen foundation still owns account, identity, session, and management side effects. The lane now exposes `SignupAtomicFinalizationStore.makeFinalizationTransaction` and a concrete `SQLiteSignupFinalizationTransaction`; integration must pass that object to the foundation and invoke `commit()` within the foundation's durable transaction (or shared transaction coordinator) so those side effects and proof/invite consumption are one commit. Full build, live Turnstile/SMTP, outbox worker, wire-flow, and production gates remain unexecuted.
