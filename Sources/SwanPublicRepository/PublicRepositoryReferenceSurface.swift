@@ -204,7 +204,12 @@ public actor PublicRepositoryReferenceSurface {
         if let decodedCursor { guard let cid = try? CID.parse(decodedCursor), (try? PublicRepositoryCID.validate(cid)) != nil, cid.string == decodedCursor else { throw PublicRepositoryReferenceSurfaceError.invalidCursor } }
         let values = blobCIDs.sorted { reverse ? $0.description > $1.description : $0.description < $1.description }.filter { cid in
             let afterCursor = decodedCursor.map { reverse ? cid.description < $0 : cid.description > $0 } ?? true
-            let afterRevision = since.map { blobRevisions[cid].map { $0 > $1 } ?? false } ?? true
+            let afterRevision: Bool
+            if let since {
+                afterRevision = blobRevisions[cid].map { $0 > since } ?? false
+            } else {
+                afterRevision = true
+            }
             return afterCursor && afterRevision
         }
         let page = Array(values.prefix(try validatedLimit(limit)))
@@ -221,8 +226,8 @@ public actor PublicRepositoryReferenceSurface {
         guard page.blobs.count <= limit, Set(page.blobs.map(\.cid)).count == page.blobs.count else { throw PublicRepositoryReferenceSurfaceError.invalidBinding }
         for blob in page.blobs {
             try PublicRepositoryCID.validate(blob.cid)
+            let authority = blob.recordURI.dropFirst(5)
             guard blob.recordURI.hasPrefix("at://"), blob.recordURI.utf8.count <= 2_048,
-                  let authority = blob.recordURI.dropFirst(5),
                   let authorityEnd = authority.firstIndex(of: "/"),
                   String(authority[..<authorityEnd]) == self.accountDID,
                   authority.distance(from: authorityEnd, to: authority.endIndex) > 1 else { throw PublicRepositoryReferenceSurfaceError.invalidBinding }

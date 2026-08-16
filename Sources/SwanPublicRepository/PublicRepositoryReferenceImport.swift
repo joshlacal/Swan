@@ -81,11 +81,23 @@ public enum PublicRepositoryReferenceImportError: Error, Sendable, Equatable {
 public struct PublicRepositoryReferenceImportVerifier: Sendable {
     public let maximumBlocks: Int
     public let maximumBytes: Int
+    public let maximumReferencedBlobs: Int
+    public let maximumReferenceBytes: Int
 
-    public init(maximumBlocks: Int = 100_000, maximumBytes: Int = 512 * 1_024 * 1_024) throws {
-        guard maximumBlocks > 0, maximumBytes > 0 else { throw PublicRepositoryReferenceImportError.blockLimitExceeded }
+    public init(
+        maximumBlocks: Int = 100_000,
+        maximumBytes: Int = 512 * 1_024 * 1_024,
+        maximumReferencedBlobs: Int = 100_000,
+        maximumReferenceBytes: Int = 8 * 1_024 * 1_024
+    ) throws {
+        guard maximumBlocks > 0, maximumBytes > 0,
+              maximumReferencedBlobs > 0, maximumReferenceBytes > 0 else {
+            throw PublicRepositoryReferenceImportError.blockLimitExceeded
+        }
         self.maximumBlocks = maximumBlocks
         self.maximumBytes = maximumBytes
+        self.maximumReferencedBlobs = maximumReferencedBlobs
+        self.maximumReferenceBytes = maximumReferenceBytes
     }
 
     public static func canonicalRequestDigest(for envelope: PublicRepositoryImportEnvelope) -> Data {
@@ -117,8 +129,22 @@ public struct PublicRepositoryReferenceImportVerifier: Sendable {
         guard envelope.requestDigest == Self.canonicalRequestDigest(for: envelope) else { throw PublicRepositoryReferenceImportError.requestDigestMismatch }
         guard (try? DID(didString: envelope.did)) != nil else { throw PublicRepositoryReferenceImportError.invalidDID }
         try PublicRepositoryCID.validate(envelope.rootCID)
-        for blob in envelope.referencedBlobs { try PublicRepositoryCID.validate(blob) }
+        guard envelope.referencedBlobs.count <= maximumReferencedBlobs else {
+            throw PublicRepositoryReferenceImportError.blockLimitExceeded
+        }
+        var referenceBytes = 0
+        for blob in envelope.referencedBlobs {
+            try PublicRepositoryCID.validate(blob)
+            let (next, overflow) = referenceBytes.addingReportingOverflow(blob.bytes.count)
+            guard !overflow, next <= maximumReferenceBytes else {
+                throw PublicRepositoryReferenceImportError.byteLimitExceeded
+            }
+            referenceBytes = next
+        }
         let referencedBlobSet = Set(envelope.referencedBlobs)
+        guard referencedBlobSet.count == envelope.referencedBlobs.count else {
+            throw PublicRepositoryReferenceImportError.duplicateBlockConflict
+        }
         guard envelope.blobPayloads.allSatisfy({ referencedBlobSet.contains($0.cid) }) else { throw PublicRepositoryReferenceImportError.invalidBinding }
         guard envelope.blocks.count + envelope.blobPayloads.count <= maximumBlocks else { throw PublicRepositoryReferenceImportError.blockLimitExceeded }
         var totalBytes = 0

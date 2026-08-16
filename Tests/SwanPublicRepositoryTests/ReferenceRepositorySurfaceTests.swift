@@ -18,7 +18,7 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
                 try .init(did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", head: blocks[0].cid, rev: "3jzfc6r5bqg2a"),
                 try .init(did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", head: blocks[1].cid, rev: "3jzfc6r5bqg2a")
             ],
-            maximumPageSize: 2
+            maximumPageSize: 3
         )
 
         let first = try await surface.listRepos(limit: 1)
@@ -46,7 +46,7 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
         let page = try await surface.listBlobs(limit: 2, since: "3jzfc6r5bqg2a")
         XCTAssertEqual(page.blobs.count, 2)
         let next = try await surface.listBlobs(limit: 2, since: "3jzfc6r5bqg2a", cursor: try XCTUnwrap(page.cursor))
-        XCTAssertEqual(next.blobs.count, 0)
+        XCTAssertEqual(next.blobs.count, 1)
     }
 
     func testMissingBlobListingIsPaginatedAndDoesNotMaterializeUnboundedInput() async throws {
@@ -127,6 +127,52 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
             XCTFail("unassembled committer unexpectedly accepted import")
         } catch let error as PublicRepositoryReferenceImportError {
             XCTAssertEqual(error, .unassembled)
+        }
+    }
+
+    func testImportRejectsDuplicateAndOversizedReferencedBlobInventory() async throws {
+        let bytes = Data([0xa0])
+        let root = CID.fromDAGCBOR(bytes)
+        let blob = CID.fromDAGCBOR(Data([0xa1, 0x61, 0x78, 0x01]))
+        let committer = RecordingImportCommitter()
+        let verifier = try PublicRepositoryReferenceImportVerifier(
+            maximumBlocks: 3,
+            maximumBytes: 64,
+            maximumReferencedBlobs: 2,
+            maximumReferenceBytes: 128
+        )
+        let duplicate = try PublicRepositoryImportEnvelope.make(
+            did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", rootCID: root,
+            blocks: [.init(cid: root, bytes: bytes)], referencedBlobs: [blob, blob],
+            signature: Data([1]), requestID: "duplicate-blobs"
+        )
+        do {
+            _ = try await verifier.verifyAndCommit(
+                duplicate, committer: committer, fullVerifier: FullVerifier()
+            ) { _, _, _ in true }
+            XCTFail("duplicate blob inventory unexpectedly accepted")
+        } catch let error as PublicRepositoryReferenceImportError {
+            XCTAssertEqual(error, .duplicateBlockConflict)
+        }
+
+        let strictBytes = try PublicRepositoryReferenceImportVerifier(
+            maximumBlocks: 3,
+            maximumBytes: 64,
+            maximumReferencedBlobs: 2,
+            maximumReferenceBytes: 1
+        )
+        let single = try PublicRepositoryImportEnvelope.make(
+            did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", rootCID: root,
+            blocks: [.init(cid: root, bytes: bytes)], referencedBlobs: [blob],
+            signature: Data([1]), requestID: "oversized-blob-inventory"
+        )
+        do {
+            _ = try await strictBytes.verifyAndCommit(
+                single, committer: committer, fullVerifier: FullVerifier()
+            ) { _, _, _ in true }
+            XCTFail("oversized blob inventory unexpectedly accepted")
+        } catch let error as PublicRepositoryReferenceImportError {
+            XCTAssertEqual(error, .byteLimitExceeded)
         }
     }
 

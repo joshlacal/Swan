@@ -41,12 +41,24 @@ public struct ModerationReportRequest: Sendable, Equatable {
     public let reasonType: String
     public let reason: String?
     public let details: String?
+    public let modTool: ModerationModTool?
 
-    public init(subject: ModerationSubject, reasonType: String, reason: String? = nil, details: String? = nil) {
+    public init(subject: ModerationSubject, reasonType: String, reason: String? = nil, details: String? = nil, modTool: ModerationModTool? = nil) {
         self.subject = subject
         self.reasonType = reasonType
         self.reason = reason
         self.details = details
+        self.modTool = modTool
+    }
+}
+
+public struct ModerationModTool: Codable, Sendable, Equatable {
+    public let name: String
+    public let meta: [String: String]?
+
+    public init(name: String, meta: [String: String]? = nil) {
+        self.name = name
+        self.meta = meta
     }
 }
 
@@ -86,6 +98,57 @@ public struct ModerationReportResult: Sendable, Equatable {
 /// over the injected trusted, peer-pinned transport. This adapter makes no
 /// claim that public identifiers are hidden or transformed for privacy.
 public struct ModerationServiceAdapter: Sendable {
+    /// Pinned from com.atproto.moderation.defs#reasonType. Unknown lexicon
+    /// values fail closed until this set is deliberately regenerated.
+    public static let knownReasonTypes: Set<String> = [
+        "com.atproto.moderation.defs#reasonSpam",
+        "com.atproto.moderation.defs#reasonViolation",
+        "com.atproto.moderation.defs#reasonMisleading",
+        "com.atproto.moderation.defs#reasonSexual",
+        "com.atproto.moderation.defs#reasonRude",
+        "com.atproto.moderation.defs#reasonOther",
+        "com.atproto.moderation.defs#reasonAppeal",
+        "tools.ozone.report.defs#reasonAppeal",
+        "tools.ozone.report.defs#reasonOther",
+        "tools.ozone.report.defs#reasonViolenceAnimal",
+        "tools.ozone.report.defs#reasonViolenceThreats",
+        "tools.ozone.report.defs#reasonViolenceGraphicContent",
+        "tools.ozone.report.defs#reasonViolenceGlorification",
+        "tools.ozone.report.defs#reasonViolenceExtremistContent",
+        "tools.ozone.report.defs#reasonViolenceTrafficking",
+        "tools.ozone.report.defs#reasonViolenceOther",
+        "tools.ozone.report.defs#reasonSexualAbuseContent",
+        "tools.ozone.report.defs#reasonSexualNCII",
+        "tools.ozone.report.defs#reasonSexualDeepfake",
+        "tools.ozone.report.defs#reasonSexualAnimal",
+        "tools.ozone.report.defs#reasonSexualUnlabeled",
+        "tools.ozone.report.defs#reasonSexualOther",
+        "tools.ozone.report.defs#reasonChildSafetyCSAM",
+        "tools.ozone.report.defs#reasonChildSafetyGroom",
+        "tools.ozone.report.defs#reasonChildSafetyPrivacy",
+        "tools.ozone.report.defs#reasonChildSafetyHarassment",
+        "tools.ozone.report.defs#reasonChildSafetyOther",
+        "tools.ozone.report.defs#reasonHarassmentTroll",
+        "tools.ozone.report.defs#reasonHarassmentTargeted",
+        "tools.ozone.report.defs#reasonHarassmentHateSpeech",
+        "tools.ozone.report.defs#reasonHarassmentDoxxing",
+        "tools.ozone.report.defs#reasonHarassmentOther",
+        "tools.ozone.report.defs#reasonMisleadingBot",
+        "tools.ozone.report.defs#reasonMisleadingImpersonation",
+        "tools.ozone.report.defs#reasonMisleadingSpam",
+        "tools.ozone.report.defs#reasonMisleadingScam",
+        "tools.ozone.report.defs#reasonMisleadingElections",
+        "tools.ozone.report.defs#reasonMisleadingOther",
+        "tools.ozone.report.defs#reasonRuleSiteSecurity",
+        "tools.ozone.report.defs#reasonRuleProhibitedSales",
+        "tools.ozone.report.defs#reasonRuleBanEvasion",
+        "tools.ozone.report.defs#reasonRuleOther",
+        "tools.ozone.report.defs#reasonSelfHarmContent",
+        "tools.ozone.report.defs#reasonSelfHarmED",
+        "tools.ozone.report.defs#reasonSelfHarmStunts",
+        "tools.ozone.report.defs#reasonSelfHarmSubstances",
+        "tools.ozone.report.defs#reasonSelfHarmOther",
+    ]
     private let transport: any ModerationTransport
     private let allowedHost: String
     private let pinnedPeer: String
@@ -103,14 +166,14 @@ public struct ModerationServiceAdapter: Sendable {
     }
 
     public func submit(_ request: ModerationReportRequest) async throws -> ModerationReportResult {
-        guard (1...256).contains(request.reasonType.utf8.count),
-              request.reasonType.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "." || $0 == "/" || $0 == "#" }),
-              request.reason.map({ $0.utf8.count <= 512 }) ?? true,
+        guard Self.knownReasonTypes.contains(request.reasonType),
+              request.reason.map({ $0.count <= 2_000 && $0.utf8.count <= 20_000 }) ?? true,
               request.details.map({ $0.utf8.count <= maximumBodyBytes }) ?? true,
+              request.modTool.map(valid(modTool:)) ?? true,
               valid(subject: request.subject) else {
             throw ModerationServiceAdapterError.invalidReport
         }
-        let envelope = try JSONEncoder().encode(TypedReport(reasonType: request.reasonType, subject: request.subject, reason: request.reason))
+        let envelope = try JSONEncoder().encode(TypedReport(reasonType: request.reasonType, subject: request.subject, reason: request.reason, modTool: request.modTool))
         guard envelope.count <= maximumBodyBytes else { throw ModerationServiceAdapterError.responseTooLarge }
         let response = try await transport.send(.init(host: allowedHost, pinnedPeer: pinnedPeer, path: "/reports", body: envelope, maximumResponseBytes: maximumResponseBytes, subject: request.subject, details: request.details))
         guard response.peer == pinnedPeer else { throw ModerationServiceAdapterError.peerMismatch }
@@ -132,6 +195,16 @@ public struct ModerationServiceAdapter: Sendable {
         }
     }
 
-    private struct TypedReport: Codable { let reasonType: String; let subject: ModerationSubject; let reason: String? }
+    private func valid(modTool: ModerationModTool) -> Bool {
+        guard (1...256).contains(modTool.name.utf8.count),
+              !modTool.name.utf8.contains(0),
+              (modTool.meta?.count ?? 0) <= 32 else { return false }
+        return modTool.meta?.allSatisfy {
+            (1...128).contains($0.key.utf8.count) && $0.value.utf8.count <= 2_048
+                && !$0.key.utf8.contains(0) && !$0.value.utf8.contains(0)
+        } ?? true
+    }
+
+    private struct TypedReport: Codable { let reasonType: String; let subject: ModerationSubject; let reason: String?; let modTool: ModerationModTool? }
     public struct ModerationReportOutput: Codable, Sendable, Equatable { public let id: Int; public let reasonType: String; public let subject: ModerationSubject; public let reason: String?; public let reportedBy: String; public let createdAt: String }
 }
