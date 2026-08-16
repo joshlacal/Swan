@@ -11,6 +11,14 @@ public protocol WebAuthnChallengeLookupStore: WebAuthnChallengeStore {
     func webAuthnChallenge(digest: Data, accountDID: String, now: Date) async throws -> WebAuthnChallenge?
 }
 
+public protocol WebAuthnAtomicVerificationStore: WebAuthnChallengeLookupStore {
+    func compareAndSwapWebAuthnSignCountAndConsumeChallenge(_ update: WebAuthnSignCountUpdate, challengeDigest: Data, now: Date) async throws -> WebAuthnSignCountUpdateOutcome
+}
+
+public protocol WebAuthnEnrollmentStore: WebAuthnChallengeLookupStore {
+    func consumeEnrollmentChallengeAndSaveCredential(challengeDigest: Data, accountDID: String, credential: WebAuthnCredentialMetadata, now: Date) async throws
+}
+
 public struct DurableFactorTokenRecord: Codable, Sendable, Equatable {
     public let digest: Data
     public let accountDID: String

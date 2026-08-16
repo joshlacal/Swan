@@ -127,7 +127,8 @@ final class Task7MFATests: XCTestCase {
         let credential = try WebAuthnCredentialMetadata(credentialIDDigest: Data(SHA256.hash(data: credentialID)), accountDID: "did:plc:alice", factorID: "factor", publicKeyReference: "key", signCount: 0, createdAt: Date(timeIntervalSince1970: 1))
         let keys = InMemoryWebAuthnKeyStore(reference: "key", key: key.publicKey)
         let store = InMemoryWebAuthnStore(credential: credential, challenge: challengeRecord)
-        let verifier = WebAuthnVerifier(keyStore: keys, credentialStore: store, challengeStore: store, relyingPartyID: "example.com", origin: "https://example.com")
+        let factors = InMemoryFactorStore(factors: [try AuthenticationFactorMetadata(id: "factor", accountDID: "did:plc:alice", kind: .passkey, label: "Passkey", lookupDigest: Data(repeating: 2, count: 32), createdAt: Date(timeIntervalSince1970: 1))])
+        let verifier = WebAuthnVerifier(keyStore: keys, credentialStore: store, challengeStore: store, factorStore: factors, relyingPartyID: "example.com", origin: "https://example.com")
         let badClientData = try JSONSerialization.data(withJSONObject: ["type": "webauthn.get", "challenge": testBase64URL(challenge), "origin": "https://evil.example"])
         let badAssertion = WebAuthnAssertion(credentialID: credentialID, clientDataJSON: badClientData, authenticatorData: authData, signature: try P256WireSignature.sign(authData + Data(SHA256.hash(data: badClientData)), using: key))
         do { _ = try await verifier.verify(assertion: badAssertion, accountDID: "did:plc:alice", challenge: challenge, now: Date(timeIntervalSince1970: 2)); XCTFail("wrong origin") } catch {}
@@ -202,7 +203,7 @@ private actor InMemoryFactorTokenStore: DurableFactorTokenStore {
     func revokeFactorTokens(accountDID: String, sessionID: String?, now: Date) async throws {}
 }
 
-private actor InMemoryWebAuthnStore: WebAuthnCredentialStore, WebAuthnChallengeLookupStore {
+private actor InMemoryWebAuthnStore: WebAuthnCredentialStore, WebAuthnAtomicVerificationStore, WebAuthnChallengeLookupStore {
     var credential: WebAuthnCredentialMetadata
     var challenge: WebAuthnChallenge
     init(credential: WebAuthnCredentialMetadata, challenge: WebAuthnChallenge) { self.credential = credential; self.challenge = challenge }
@@ -221,6 +222,13 @@ private actor InMemoryWebAuthnStore: WebAuthnCredentialStore, WebAuthnChallengeL
         let value = try WebAuthnChallenge(challengeDigest: challenge.challengeDigest, accountDID: challenge.accountDID, credentialIDDigest: challenge.credentialIDDigest, purpose: challenge.purpose, relyingPartyID: challenge.relyingPartyID, origin: challenge.origin, issuedAt: challenge.issuedAt, expiresAt: challenge.expiresAt, consumedAt: now)
         challenge = value
         return value
+    }
+    func compareAndSwapWebAuthnSignCountAndConsumeChallenge(_ update: WebAuthnSignCountUpdate, challengeDigest: Data, now: Date) async throws -> WebAuthnSignCountUpdateOutcome {
+        guard credential.signCount == update.expectedCurrent else { return .rollbackDetected(storedCount: credential.signCount) }
+        guard challenge.challengeDigest == challengeDigest, challenge.accountDID == update.accountDID, challenge.consumedAt == nil else { throw AccountControlStoreError.malformedRecord }
+        credential = try WebAuthnCredentialMetadata(credentialIDDigest: credential.credentialIDDigest, accountDID: credential.accountDID, factorID: credential.factorID, publicKeyReference: credential.publicKeyReference, signCount: update.proposed, transports: credential.transports, createdAt: credential.createdAt, lastUsedAt: now, disabledAt: credential.disabledAt)
+        challenge = try WebAuthnChallenge(challengeDigest: challenge.challengeDigest, accountDID: challenge.accountDID, credentialIDDigest: challenge.credentialIDDigest, purpose: challenge.purpose, relyingPartyID: challenge.relyingPartyID, origin: challenge.origin, issuedAt: challenge.issuedAt, expiresAt: challenge.expiresAt, consumedAt: now)
+        return .updated(newCount: update.proposed)
     }
 }
 

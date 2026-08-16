@@ -30,7 +30,7 @@ public struct TOTPConfiguration: Sendable, Equatable {
     public let drift: Int
 
     public init(period: TimeInterval = 30, digits: Int = 6, algorithm: TOTPAlgorithm = .sha1, drift: Int = 1) {
-        precondition(period > 0 && (digits == 6 || digits == 8) && drift >= 0)
+        precondition(period.isFinite && period > 0 && period <= 300 && (digits == 6 || digits == 8) && drift >= 0 && drift <= 2)
         self.period = period; self.digits = digits; self.algorithm = algorithm; self.drift = drift
     }
 }
@@ -165,7 +165,7 @@ public struct RecoveryCodeService: Sendable {
     }
 }
 
-public enum FactorTokenPurpose: String, Sendable, Codable { case stepUp, managementLogin, oauthToken }
+public enum FactorTokenPurpose: String, Sendable, Codable { case stepUp, managementLogin, oauthToken, loginRecovery }
 public struct IssuedFactorToken: Sendable, Equatable { public let token: String; public let expiresAt: Date; public let factor: AuthenticationFactorKind; public let sessionID: String }
 
 public actor FactorTokenService {
@@ -173,7 +173,16 @@ public actor FactorTokenService {
     public init(store: any DurableFactorTokenStore) { self.store = store }
     public func issue(accountDID: String, sessionID: String, purpose: FactorTokenPurpose, factor: AuthenticationFactorKind, strength: AuthenticationStrength, now: Date, lifetime: TimeInterval = 120) async throws -> IssuedFactorToken {
         guard lifetime > 0 && lifetime <= 600 else { throw MFAError.tokenInvalid }
-        guard factor != .recoveryCode || purpose != .stepUp else { throw MFAError.stepUpRequired }
+        let valid: Bool
+        switch purpose {
+        case .stepUp:
+            if factor == .totp { if case .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: _) = strength { valid = true } else { valid = false } }
+            else if factor == .passkey { if case .stepUpMFA(base: .passwordPlusPasskey, verifiedAt: _) = strength { valid = true } else { valid = false } }
+            else { valid = false }
+        case .loginRecovery: valid = factor == .recoveryCode && strength == .emailRecovery
+        case .managementLogin, .oauthToken: valid = factor != .recoveryCode && (factor == .totp || factor == .passkey)
+        }
+        guard valid else { throw MFAError.stepUpRequired }
         let token = randomBytes(count: 32).base64URLEncodedString(); let digest = Data(SHA256.hash(data: Data(token.utf8)))
         let expires = now.addingTimeInterval(lifetime)
         try await store.saveFactorToken(try DurableFactorTokenRecord(digest: digest, accountDID: accountDID, sessionID: sessionID, purpose: purpose.rawValue, factor: factor, strength: strength, issuedAt: now, expiresAt: expires), now: now)
@@ -189,7 +198,7 @@ public actor FactorTokenService {
 public enum SensitiveAccountOperation: String, CaseIterable, Sendable { case emailChange, passwordChange, handleChange, identityChange, factorChange, appPassword, export, migration, connectedAppRevocation, deleteAccount, sessionRevocation }
 public struct StepUpPolicy: Sendable {
     public let maximumAge: TimeInterval
-    public init(maximumAge: TimeInterval = 600) { self.maximumAge = maximumAge }
+    public init(maximumAge: TimeInterval = 600) { precondition(maximumAge.isFinite && maximumAge > 0 && maximumAge <= 600); self.maximumAge = maximumAge }
     public func authorize(_ operation: SensitiveAccountOperation, strength: AuthenticationStrength, mfaEnabled: Bool, now: Date) throws {
         let verifiedAt: Date?; let hasMFA: Bool
         switch strength {
@@ -198,8 +207,8 @@ public struct StepUpPolicy: Sendable {
         default: verifiedAt = nil; hasMFA = false
         }
         guard let verifiedAt, now.timeIntervalSince(verifiedAt) >= 0, now.timeIntervalSince(verifiedAt) <= maximumAge else { throw MFAError.stepUpRequired }
+        guard operation != .export || hasMFA else { throw MFAError.stepUpRequired }
         guard !mfaEnabled || hasMFA else { throw MFAError.stepUpRequired }
-        _ = operation
     }
 }
 
@@ -271,12 +280,14 @@ public struct WebAuthnVerifier: Sendable {
     private let keyStore: any WebAuthnPublicKeyStore
     private let credentialStore: any WebAuthnCredentialStore
     private let challengeStore: any WebAuthnChallengeLookupStore
+    private let factorStore: any AuthenticationFactorStore
     private let configuredRelyingPartyID: String?
     private let configuredOrigin: String?
-    public init(keyStore: any WebAuthnPublicKeyStore, credentialStore: any WebAuthnCredentialStore, challengeStore: any WebAuthnChallengeLookupStore, relyingPartyID: String? = nil, origin: String? = nil) {
+    public init(keyStore: any WebAuthnPublicKeyStore, credentialStore: any WebAuthnCredentialStore, challengeStore: any WebAuthnChallengeLookupStore, factorStore: any AuthenticationFactorStore, relyingPartyID: String? = nil, origin: String? = nil) {
         self.keyStore = keyStore
         self.credentialStore = credentialStore
         self.challengeStore = challengeStore
+        self.factorStore = factorStore
         self.configuredRelyingPartyID = relyingPartyID
         self.configuredOrigin = origin
     }
@@ -284,15 +295,16 @@ public struct WebAuthnVerifier: Sendable {
     public func verify(assertion: WebAuthnAssertion, accountDID: String, challenge: Data, purpose: FactorChallengePurpose = .assertion, now: Date) async throws -> WebAuthnVerificationResult {
         let credentialDigest = Data(SHA256.hash(data: assertion.credentialID))
         guard let credential = try await credentialStore.webAuthnCredential(credentialIDDigest: credentialDigest, accountDID: accountDID, now: now), credential.disabledAt == nil else { throw MFAError.credentialNotFound }
+        guard try await factorStore.listFactors(accountDID: accountDID, now: now).contains(where: { $0.id == credential.factorID && $0.kind == .passkey && $0.disabledAt == nil }) else { throw MFAError.credentialNotFound }
         let challengeDigest = Data(SHA256.hash(data: challenge))
         guard let challengeRecord = try await challengeStore.webAuthnChallenge(digest: challengeDigest, accountDID: accountDID, now: now) else { throw MFAError.invalidChallenge }
         guard now >= challengeRecord.issuedAt && now < challengeRecord.expiresAt,
               challengeRecord.purpose == purpose,
-              challengeRecord.credentialIDDigest == nil || challengeRecord.credentialIDDigest == credentialDigest else { throw MFAError.invalidChallenge }
+              challengeRecord.credentialIDDigest == credentialDigest else { throw MFAError.invalidChallenge }
         guard let expectedOrigin = configuredOrigin, let expectedRelyingPartyID = configuredRelyingPartyID else { throw MFAError.invalidOrigin }
         guard expectedOrigin == challengeRecord.origin, expectedRelyingPartyID == challengeRecord.relyingPartyID,
               let originURL = URL(string: expectedOrigin), originURL.scheme == "https", originURL.host == expectedRelyingPartyID, originURL.user == nil, originURL.password == nil, originURL.query == nil, originURL.fragment == nil, originURL.path.isEmpty || originURL.path == "/" else { throw MFAError.invalidOrigin }
-        guard let json = try? JSONDecoder().decode(ClientData.self, from: assertion.clientDataJSON), json.type == "webauthn.get", json.origin == expectedOrigin, let receivedChallenge = Data(base64URLEncoded: json.challenge), constantTimeEqual(receivedChallenge, challenge) else { throw MFAError.invalidClientData }
+        guard let json = try? JSONDecoder().decode(ClientData.self, from: assertion.clientDataJSON), json.type == "webauthn.get", json.origin == expectedOrigin, json.crossOrigin == false, let receivedChallenge = Data(base64URLEncoded: json.challenge), constantTimeEqual(receivedChallenge, challenge) else { throw MFAError.invalidClientData }
         guard assertion.authenticatorData.count >= 37 else { throw MFAError.invalidAuthenticatorData }
         guard constantTimeEqual(Data(assertion.authenticatorData.prefix(32)), Data(SHA256.hash(data: Data(expectedRelyingPartyID.utf8)))) else { throw MFAError.invalidRelyingParty }
         let flags = assertion.authenticatorData[32]; guard flags & 0x01 != 0, flags & 0x04 != 0 else { throw MFAError.invalidAuthenticatorData }
@@ -306,14 +318,17 @@ public struct WebAuthnVerifier: Sendable {
             return WebAuthnVerificationResult(accountDID: accountDID, newSignCount: 0)
         }
         guard count > credential.signCount else { throw MFAError.counterRollback }
-        switch try await credentialStore.compareAndSwapWebAuthnSignCount(try WebAuthnSignCountUpdate(credentialIDDigest: credentialDigest, accountDID: accountDID, expectedCurrent: credential.signCount, proposed: count, now: now)) {
+        guard let atomic = challengeStore as? any WebAuthnAtomicVerificationStore else { throw MFAError.storageUnavailable }
+        switch try await atomic.compareAndSwapWebAuthnSignCountAndConsumeChallenge(try WebAuthnSignCountUpdate(credentialIDDigest: credentialDigest, accountDID: accountDID, expectedCurrent: credential.signCount, proposed: count, now: now), challengeDigest: challengeDigest, now: now) {
         case let .updated(newCount):
-            do { _ = try await challengeStore.consumeWebAuthnChallenge(digest: challengeDigest, accountDID: accountDID, now: now) } catch { throw MFAError.invalidChallenge }
             return WebAuthnVerificationResult(accountDID: accountDID, newSignCount: newCount)
         case .rollbackDetected: throw MFAError.counterRollback
         }
     }
-    private struct ClientData: Decodable { let type: String; let challenge: String; let origin: String }
+    private struct ClientData: Decodable { let type: String; let challenge: String; let origin: String; let crossOrigin: Bool
+        enum CodingKeys: String, CodingKey { case type, challenge, origin, crossOrigin }
+        init(from decoder: Decoder) throws { let c = try decoder.container(keyedBy: CodingKeys.self); type = try c.decode(String.self, forKey: .type); challenge = try c.decode(String.self, forKey: .challenge); origin = try c.decode(String.self, forKey: .origin); crossOrigin = try c.decodeIfPresent(Bool.self, forKey: .crossOrigin) ?? false }
+    }
 }
 
 /// Registration accepts only the ES256/P-256 credential form used by this
@@ -360,6 +375,7 @@ public enum WebAuthnRegistrationVerifier {
     }
 
     private static func parseCOSEES256(_ data: Data) throws -> P256.Signing.PublicKey? {
+        guard data.count <= 4096 else { return nil }
         var reader = CBORReader(data: data)
         guard let mapLength = try? reader.readMapLength(), mapLength >= 5 else { return nil }
         var keyType: Int64?; var algorithm: Int64?; var curve: Int64?; var x: Data?; var y: Data?
@@ -374,6 +390,7 @@ public enum WebAuthnRegistrationVerifier {
             default: try reader.skipValue()
             }
         }
+        guard reader.index == data.count else { return nil }
         guard keyType == 2, algorithm == -7, curve == 1, let x, let y, x.count == 32, y.count == 32 else { return nil }
         return try P256.Signing.PublicKey(rawRepresentation: x + y)
     }
@@ -381,11 +398,27 @@ public enum WebAuthnRegistrationVerifier {
     private struct CBORReader {
         let data: Data; var index: Int = 0
         mutating func readByte() throws -> UInt8 { guard index < data.count else { throw MFAError.invalidSignature }; defer { index += 1 }; return data[index] }
-        mutating func readLength(_ initial: UInt8) throws -> Int { let additional = initial & 0x1f; if additional < 24 { return Int(additional) }; let count = 1 << Int(additional - 24); guard count <= 8 else { throw MFAError.invalidSignature }; var value = 0; for _ in 0 ..< count { value = (value << 8) | Int(try readByte()) }; return value }
-        mutating func readMapLength() throws -> Int { let initial = try readByte(); guard initial >> 5 == 5 else { throw MFAError.invalidSignature }; return try readLength(initial) }
-        mutating func readInt() throws -> Int64 { let initial = try readByte(); let major = initial >> 5; let value = Int64(try readLength(initial)); if major == 0 { return value }; if major == 1 { return -1 - value }; throw MFAError.invalidSignature }
-        mutating func readBytes() throws -> Data { let initial = try readByte(); guard initial >> 5 == 2 else { throw MFAError.invalidSignature }; let length = try readLength(initial); guard index + length <= data.count else { throw MFAError.invalidSignature }; defer { index += length }; return Data(data[index ..< index + length]) }
-        mutating func skipValue() throws { let initial = try readByte(); let major = initial >> 5; let length = try readLength(initial); if major == 2 || major == 3 { index += length } else if major == 4 { for _ in 0 ..< length { try skipValue() } } else if major == 5 { for _ in 0 ..< length { try skipValue(); try skipValue() } } else if major == 0 || major == 1 || major == 7 {} else { throw MFAError.invalidSignature }; guard index <= data.count else { throw MFAError.invalidSignature } }
+        mutating func readLength(_ initial: UInt8) throws -> Int { let additional = initial & 0x1f; guard additional != 31 else { throw MFAError.invalidSignature }; if additional < 24 { return Int(additional) }; let count = 1 << Int(additional - 24); guard count <= 8 else { throw MFAError.invalidSignature }; var value = 0; for _ in 0 ..< count { let byte = Int(try readByte()); guard value <= (Int.max - byte) / 256 else { throw MFAError.invalidSignature }; value = value * 256 + byte }; return value }
+        mutating func readMapLength() throws -> Int { let initial = try readByte(); guard initial >> 5 == 5 else { throw MFAError.invalidSignature }; let length = try readLength(initial); guard length <= 16 else { throw MFAError.invalidSignature }; return length }
+        mutating func readInt() throws -> Int64 { let initial = try readByte(); let major = initial >> 5; let raw = try readLength(initial); guard raw <= Int(Int64.max) else { throw MFAError.invalidSignature }; let value = Int64(raw); if major == 0 { return value }; if major == 1 { guard value < Int64.max else { throw MFAError.invalidSignature }; return -1 - value }; throw MFAError.invalidSignature }
+        mutating func readBytes() throws -> Data { let initial = try readByte(); guard initial >> 5 == 2 else { throw MFAError.invalidSignature }; let length = try readLength(initial); guard length <= 1024, length <= data.count - index else { throw MFAError.invalidSignature }; defer { index += length }; return Data(data[index ..< index + length]) }
+        mutating func skipValue(depth: Int = 0) throws { guard depth <= 8 else { throw MFAError.invalidSignature }; let initial = try readByte(); let major = initial >> 5; let length = try readLength(initial); if major == 2 || major == 3 { guard length <= data.count - index else { throw MFAError.invalidSignature }; index += length } else if major == 4 { guard length <= 64 else { throw MFAError.invalidSignature }; for _ in 0 ..< length { try skipValue(depth: depth + 1) } } else if major == 5 { guard length <= 16 else { throw MFAError.invalidSignature }; for _ in 0 ..< length { try skipValue(depth: depth + 1); try skipValue(depth: depth + 1) } } else if major == 0 || major == 1 || major == 7 {} else { throw MFAError.invalidSignature } }
+    }
+}
+
+/// Persists enrollment only through the challenge-consuming transaction. A
+/// consumed, expired, or malformed challenge therefore cannot create a
+/// credential, even if the caller retries after a process restart.
+public struct WebAuthnEnrollmentService: Sendable {
+    private let store: any WebAuthnEnrollmentStore
+    private let factorStore: any AuthenticationFactorStore
+    public init(store: any WebAuthnEnrollmentStore, factorStore: any AuthenticationFactorStore) { self.store = store; self.factorStore = factorStore }
+    public func enroll(clientDataJSON: Data, authenticatorData: Data, challenge: Data, accountDID: String, factorID: String, publicKeyReference: String, transports: Set<String>, challengeRecord: WebAuthnChallenge, expectedOrigin: String, relyingPartyID: String, now: Date) async throws -> WebAuthnRegistrationResult {
+        guard try await factorStore.listFactors(accountDID: accountDID, now: now).contains(where: { $0.id == factorID && $0.kind == .passkey && $0.disabledAt == nil }) else { throw MFAError.credentialNotFound }
+        let result = try WebAuthnRegistrationVerifier.verify(clientDataJSON: clientDataJSON, authenticatorData: authenticatorData, challenge: challenge, accountDID: accountDID, challengeRecord: challengeRecord, expectedOrigin: expectedOrigin, relyingPartyID: relyingPartyID, now: now)
+        let credential = try WebAuthnCredentialMetadata(credentialIDDigest: result.credentialIDDigest, accountDID: accountDID, factorID: factorID, publicKeyReference: publicKeyReference, signCount: result.signCount, transports: transports, createdAt: now)
+        do { try await store.consumeEnrollmentChallengeAndSaveCredential(challengeDigest: challengeRecord.challengeDigest, accountDID: accountDID, credential: credential, now: now) } catch { throw MFAError.storageUnavailable }
+        return result
     }
 }
 

@@ -13,6 +13,7 @@
   - Durable replay, factor-token, WebAuthn challenge lookup, and audit-store contracts.
 - `Sources/SwanSQLite/AccountFactorStore.swift`
   - SQLite implementations for factor metadata, generic/WebAuthn challenges, TOTP envelopes/replay state, recovery digests, WebAuthn credential metadata, durable tokens/audit events, and atomic CAS/consume operations.
+  - WebAuthn assertion CAS plus challenge consumption is one transaction; enrollment challenge consumption plus credential insertion is one transaction and fails closed when the seam is unavailable. Missing/invalid challenge-purpose context is corruption, never an assertion default.
 - `Tests/SwanAccountsTests/Task7MFATests.swift`
   - RFC vectors, drift/replay/concurrency, recovery single-use, token/policy, WebAuthn registration/assertion negative cases, and SQLite durable round-trip/CAS coverage.
 
@@ -30,6 +31,4 @@ Management-session/OAuth HTTP integration remains an exact integration patch aft
 
 ## Verification
 
-`swift build --target SwanSQLite` passed.
-
-`swift test --filter Task7MFATests` passed (10 tests, 0 failures; unrelated test targets were selected with zero tests by SwiftPM's filter).
+`swift test --filter Task7MFATests` passed (10 tests, 0 failures; SwiftPM also selected unrelated targets with zero tests). This focused command rebuilt affected products; no full repository test suite was run.
