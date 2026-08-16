@@ -82,6 +82,11 @@ final class ScopedLegacyAuthTests: XCTestCase {
         let password = try await service.createSession(identifier: "did:plc:mfa", password: "password", authFactorToken: "valid-factor")
         XCTAssertTrue(password.fullAccess)
         _ = try await service.getServiceAuth(accessToken: password.accessToken, lxm: "com.atproto.repo.getRecord", aud: "https://pds.example.test")
+        let refreshed = try await service.refreshSession(password.refreshToken)
+        XCTAssertTrue(refreshed.fullAccess)
+        let fetched = try await service.getSession(refreshed.accessToken)
+        XCTAssertTrue(fetched.fullAccess)
+        _ = try await service.getServiceAuth(accessToken: fetched.accessToken, lxm: "com.atproto.repo.getRecord", aud: "https://pds.example.test")
         do { _ = try await service.getServiceAuth(accessToken: password.accessToken, lxm: "com.atproto.repo.undeclared", aud: "https://pds.example.test"); XCTFail("undeclared full-access method must deny") } catch { }
     }
 

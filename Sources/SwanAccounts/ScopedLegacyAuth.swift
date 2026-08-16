@@ -168,7 +168,7 @@ public struct HMACLegacyTokenIssuer: LegacyTokenIssuer, Sendable {
               let iat = payload["iat"] as? Int, let exp = payload["exp"] as? Int, let jti = payload["jti"] as? String,
               iat <= Int(now.timeIntervalSince1970), exp > iat, exp > Int(now.timeIntervalSince1970), exp - iat <= Int(LegacyAuthService.accessLifetime), let sessionID = try? LegacySessionID(rawValue: sid), !jti.isEmpty else { throw SwanError.unauthorized("invalid access token") }
         let scopes = Set((payload["scope"] as? String ?? "").split(separator: " ").map(String.init))
-        guard LegacyAccessGrant.validate(scopes: grant == .fullAccessV1 ? [] : scopes, grant: grant),
+        guard LegacyAccessGrant.validateClaims(scopes: scopes, grant: grant),
               scopes.allSatisfy({ (try? SwanScope.parse($0)) != nil }) else { throw SwanError.unauthorized("invalid access grant") }
         return LegacyAccessClaims(subject: sub, sessionID: sessionID, scopes: scopes, issuedAt: Date(timeIntervalSince1970: TimeInterval(iat)), expiresAt: Date(timeIntervalSince1970: TimeInterval(exp)), tokenID: jti, grant: grant)
     }
@@ -335,7 +335,8 @@ public actor LegacyAuthService {
               let session = try await store.legacySession(digest: digest, now: now),
               session.accountDID == claims.subject,
               (session.scopeStrings.contains(LegacyAccessGrant.fullAccessMarker) ? .fullAccessV1 : .scoped) == claims.grant,
-              LegacyAccessGrant.validate(scopes: claims.scopes, grant: claims.grant),
+              LegacyAccessGrant.validateClaims(scopes: claims.scopes, grant: claims.grant),
+              LegacyAccessGrant.validateStoredSession(scopes: session.scopeStrings, grant: claims.grant),
               (claims.grant == .fullAccessV1 ? session.scopeStrings == [LegacyAccessGrant.fullAccessMarker] : claims.scopes == session.scopeStrings),
               session.revokedAt == nil, session.expiresAt > now else {
             throw SwanError.unauthorized("invalid access token")
@@ -349,7 +350,8 @@ public actor LegacyAuthService {
               let session = try await store.legacySession(digest: digest, now: now),
               session.accountDID == claims.subject,
               (session.scopeStrings.contains(LegacyAccessGrant.fullAccessMarker) ? .fullAccessV1 : .scoped) == claims.grant,
-              LegacyAccessGrant.validate(scopes: claims.scopes, grant: claims.grant),
+              LegacyAccessGrant.validateClaims(scopes: claims.scopes, grant: claims.grant),
+              LegacyAccessGrant.validateStoredSession(scopes: session.scopeStrings, grant: claims.grant),
               (claims.grant == .fullAccessV1 ? session.scopeStrings == [LegacyAccessGrant.fullAccessMarker] : claims.scopes == session.scopeStrings),
               session.revokedAt == nil, session.expiresAt > now else {
             throw SwanError.unauthorized("invalid access token")
