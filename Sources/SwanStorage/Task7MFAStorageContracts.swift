@@ -30,8 +30,8 @@ public struct DurableFactorTokenRecord: Codable, Sendable, Equatable {
     public let issuedAt: Date
     public let expiresAt: Date
 
-    public init(digest: Data, accountDID: String, sessionID: String, purpose: String, factor: AuthenticationFactorKind, factorID: String = "", strength: AuthenticationStrength, issuedAt: Date, expiresAt: Date) throws {
-        guard digest.count == 32, !accountDID.isEmpty, !sessionID.isEmpty, !purpose.isEmpty, factorID.utf8.count <= 128, expiresAt > issuedAt else { throw SwanError.invalidIdentifier("factor token") }
+    public init(digest: Data, accountDID: String, sessionID: String, purpose: String, factor: AuthenticationFactorKind, factorID: String, strength: AuthenticationStrength, issuedAt: Date, expiresAt: Date) throws {
+        guard digest.count == 32, !accountDID.isEmpty, !sessionID.isEmpty, !purpose.isEmpty, !factorID.isEmpty, factorID.utf8.count <= 128, expiresAt > issuedAt else { throw SwanError.invalidIdentifier("factor token") }
         self.digest = digest; self.accountDID = accountDID; self.sessionID = sessionID; self.purpose = purpose; self.factor = factor; self.factorID = factorID; self.strength = strength; self.issuedAt = issuedAt; self.expiresAt = expiresAt
     }
 }

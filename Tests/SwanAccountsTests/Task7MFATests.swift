@@ -24,7 +24,7 @@ final class Task7MFATests: XCTestCase {
         let firstReplayCAS = try await database.compareAndSwapTOTPReplay(factorID: "factor", accountDID: "did:plc:alice", expected: nil, proposed: 4, now: Date(timeIntervalSince1970: 4))
         let replayCAS = try await database.compareAndSwapTOTPReplay(factorID: "factor", accountDID: "did:plc:alice", expected: nil, proposed: 4, now: Date(timeIntervalSince1970: 4))
         XCTAssertTrue(firstReplayCAS); XCTAssertFalse(replayCAS)
-        let token = try DurableFactorTokenRecord(digest: Data(repeating: 3, count: 32), accountDID: "did:plc:alice", sessionID: "session", purpose: "stepUp", factor: .totp, strength: .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: Date(timeIntervalSince1970: 4)), issuedAt: Date(timeIntervalSince1970: 4), expiresAt: Date(timeIntervalSince1970: 30))
+        let token = try DurableFactorTokenRecord(digest: Data(repeating: 3, count: 32), accountDID: "did:plc:alice", sessionID: "session", purpose: "stepUp", factor: .totp, factorID: "factor", strength: .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: Date(timeIntervalSince1970: 4)), issuedAt: Date(timeIntervalSince1970: 4), expiresAt: Date(timeIntervalSince1970: 30))
         try await database.saveFactorToken(token, now: Date(timeIntervalSince1970: 4))
         let consumedToken = try await database.consumeFactorToken(digest: token.digest, accountDID: token.accountDID, sessionID: token.sessionID, purpose: token.purpose, factor: token.factor, factorID: token.factorID, strength: token.strength, now: Date(timeIntervalSince1970: 5))
         XCTAssertEqual(consumedToken, token)
@@ -93,13 +93,13 @@ final class Task7MFATests: XCTestCase {
 
     func testFactorTokensAreShortLivedSinglePurposeAndBoundToAccount() async throws {
         let service = FactorTokenService(store: InMemoryFactorTokenStore())
-        let issued = try await service.issue(accountDID: "did:plc:alice", sessionID: "session-a", purpose: .stepUp, factor: .totp, strength: .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: Date(timeIntervalSince1970: 10)), now: Date(timeIntervalSince1970: 10))
+        let issued = try await service.issue(accountDID: "did:plc:alice", sessionID: "session-a", purpose: .stepUp, factor: .totp, factorID: "factor", strength: .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: Date(timeIntervalSince1970: 10)), now: Date(timeIntervalSince1970: 10))
         let strength: AuthenticationStrength = .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: Date(timeIntervalSince1970: 10))
-        let consumed = try? await service.consume(issued.token, accountDID: "did:plc:alice", sessionID: "session-a", purpose: .stepUp, factor: .totp, strength: strength, now: Date(timeIntervalSince1970: 11))
-        let replayed = try? await service.consume(issued.token, accountDID: "did:plc:alice", sessionID: "session-a", purpose: .stepUp, factor: .totp, strength: strength, now: Date(timeIntervalSince1970: 11))
+        let consumed = try? await service.consume(issued.token, accountDID: "did:plc:alice", sessionID: "session-a", purpose: .stepUp, factor: .totp, factorID: "factor", strength: strength, now: Date(timeIntervalSince1970: 11))
+        let replayed = try? await service.consume(issued.token, accountDID: "did:plc:alice", sessionID: "session-a", purpose: .stepUp, factor: .totp, factorID: "factor", strength: strength, now: Date(timeIntervalSince1970: 11))
         XCTAssertNotNil(consumed); XCTAssertNil(replayed)
-        let other = try await service.issue(accountDID: "did:plc:alice", sessionID: "session-a", purpose: .stepUp, factor: .passkey, strength: .stepUpMFA(base: .passwordPlusPasskey, verifiedAt: Date(timeIntervalSince1970: 10)), now: Date(timeIntervalSince1970: 10))
-        let wrongAccount = try? await service.consume(other.token, accountDID: "did:plc:bob", sessionID: "session-a", purpose: .stepUp, factor: .passkey, strength: .stepUpMFA(base: .passwordPlusPasskey, verifiedAt: Date(timeIntervalSince1970: 10)), now: Date(timeIntervalSince1970: 11))
+        let other = try await service.issue(accountDID: "did:plc:alice", sessionID: "session-a", purpose: .stepUp, factor: .passkey, factorID: "passkey", strength: .stepUpMFA(base: .passwordPlusPasskey, verifiedAt: Date(timeIntervalSince1970: 10)), now: Date(timeIntervalSince1970: 10))
+        let wrongAccount = try? await service.consume(other.token, accountDID: "did:plc:bob", sessionID: "session-a", purpose: .stepUp, factor: .passkey, factorID: "passkey", strength: .stepUpMFA(base: .passwordPlusPasskey, verifiedAt: Date(timeIntervalSince1970: 10)), now: Date(timeIntervalSince1970: 11))
         XCTAssertNil(wrongAccount)
     }
 
