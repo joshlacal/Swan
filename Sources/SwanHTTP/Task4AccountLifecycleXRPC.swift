@@ -21,6 +21,24 @@ public protocol SwanCreateAccountProvisioning: Sendable {
     func createAccount(_ input: SwanCreateAccountXRPCInput, now: Date) async throws -> (account: AccountControlAccount, session: Data)
 }
 
+public enum AccountLifecycleAuthorizationRole: String, Sendable, Equatable {
+    case operatorRole
+    case managementSession
+}
+
+public struct AccountLifecycleAuthorizationContext: Sendable, Equatable {
+    public let role: AccountLifecycleAuthorizationRole
+    public let subjectDID: String?
+    public init(role: AccountLifecycleAuthorizationRole, subjectDID: String? = nil) {
+        self.role = role
+        self.subjectDID = subjectDID
+    }
+
+    public func permits(did: String) -> Bool {
+        role == .operatorRole || subjectDID == did
+    }
+}
+
 public struct SwanAccountLifecycleXRPCAdapter: Sendable {
     private let lifecycle: AccountLifecycleService
     private let provisioning: (any SwanCreateAccountProvisioning)?
@@ -34,23 +52,28 @@ public struct SwanAccountLifecycleXRPCAdapter: Sendable {
         return try await provisioning.createAccount(input, now: now)
     }
 
-    public func activate(did: String, now: Date = Date()) async throws -> AccountControlAccount {
-        try await lifecycle.activate(did: did, now: now)
+    public func activate(did: String, context: AccountLifecycleAuthorizationContext, now: Date = Date()) async throws -> AccountControlAccount {
+        guard context.role == .operatorRole else { throw SwanError.unavailable("operator authorization required") }
+        return try await lifecycle.activate(did: did, now: now)
     }
 
-    public func status(did: String) async throws -> AccountControlAccount? {
-        try await lifecycle.status(did: did)
+    public func status(did: String, context: AccountLifecycleAuthorizationContext) async throws -> AccountControlAccount? {
+        guard context.permits(did: did) else { throw SwanError.unavailable("account authorization required") }
+        return try await lifecycle.status(did: did)
     }
 
-    public func deactivate(did: String, now: Date = Date()) async throws -> AccountControlAccount {
-        try await lifecycle.deactivate(did: did, now: now)
+    public func deactivate(did: String, context: AccountLifecycleAuthorizationContext, now: Date = Date()) async throws -> AccountControlAccount {
+        guard context.permits(did: did) else { throw SwanError.unavailable("account authorization required") }
+        return try await lifecycle.deactivate(did: did, now: now)
     }
 
-    public func delete(did: String, now: Date = Date()) async throws -> AccountDeletionJob {
-        try await lifecycle.delete(did: did, now: now)
+    public func delete(did: String, context: AccountLifecycleAuthorizationContext, now: Date = Date()) async throws -> AccountDeletionJob {
+        guard context.permits(did: did) else { throw SwanError.unavailable("account authorization required") }
+        return try await lifecycle.delete(did: did, now: now)
     }
 
-    public func invite(code: String, expiresAt: Date? = nil) throws -> SignupInviteIssue {
-        try lifecycle.invite(code: code, expiresAt: expiresAt)
+    public func invite(code: String, context: AccountLifecycleAuthorizationContext, expiresAt: Date? = nil) throws -> SignupInviteIssue {
+        guard context.role == .operatorRole else { throw SwanError.unavailable("operator authorization required") }
+        return try lifecycle.invite(code: code, expiresAt: expiresAt)
     }
 }

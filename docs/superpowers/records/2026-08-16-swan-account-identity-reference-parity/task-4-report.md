@@ -59,3 +59,27 @@ while cloning `swift-crypto` (`No space left on device`).
 No live Turnstile, external email relay, production secret/configuration,
 router deployment, Docker build, Linux x86_64 build, official-client flow,
 network acceptance, push, or deploy was run.
+
+## Correction review evidence
+
+Correction commit aligns the SQLite extension with the foundation schema:
+`signup_authorizations.authorization_id` and `signup_invites.invite_digest`;
+the lane no longer defines either shared table. Reservations, pre-account
+email proofs, and persisted finalization results use separate extension tables.
+Finalization now uses an explicit `issued/failed -> committing` CAS, validates
+the canonical request digest, consumes proof/invite rows, persists the result,
+and only then marks `committed` in one transaction. Retries return the stored
+account DID and management session.
+
+Invite-required and open-protected authorization now require a canonical email
+and proof digest. Turnstile tokens reserve capacity before the transport await,
+expire from a bounded reservation set, and release on all failure paths. The
+default URLSession siteverify transport accepts only Cloudflare's exact HTTPS
+authority/path. Lifecycle adapters require an explicit operator or
+management-session authorization context. Authenticated SMTP now has a
+certificate-hostname-checked network transport seam plus per-attempt deadlines.
+
+Source parse, SwiftFormat, and `git diff --check` passed. Focused Swift tests
+were not rerun because another lane's Xcode-beta SwiftPM rebuild/test was still
+active and the shared volume had fallen to approximately 4.5 GiB free; racing
+it would invalidate the evidence.

@@ -49,6 +49,30 @@ final class Task4OnboardingTests: XCTestCase {
             XCTFail("tokens are one-use")
         } catch TurnstileVerificationError.duplicate {}
     }
+
+    func testOpenAndInviteSignupRequireVerifiedEmailProof() async throws {
+        let store = InMemorySignupAuthorizationStore()
+        let input = try SignupAuthorizationInput(
+            requestID: "request-1",
+            authorizationID: SignupAuthorizationID(rawValue: "authorization-1"),
+            handle: "alice.example.com",
+            email: AccountEmailAddress("alice@example.com"),
+            identityDID: "did:plc:alice",
+            emailProofDigest: nil,
+            inviteDigest: nil,
+            clientIPBucketDigest: Data(repeating: 1, count: 32)
+        )
+        let service = try SignupService(policy: SignupPolicyService(policy: .openProtected), store: store)
+        do {
+            _ = try await service.authorize(input)
+            XCTFail("missing verified email proof must fail")
+        } catch SignupServiceError.emailProofRequired {}
+    }
+
+    func testAuthenticatedSMTPRequiresTLSHostnameAndDeduplicates() throws {
+        XCTAssertThrowsError(try AuthenticatedSMTPConfiguration(host: "relay.example", port: 587, mode: .startTLS))
+        XCTAssertNoThrow(try AuthenticatedSMTPConfiguration(host: "relay.example", port: 587, mode: .startTLS, username: "u", password: "p", mechanism: .plain, expectedHostname: "relay.example"))
+    }
 }
 
 private struct StubTurnstileTransport: TurnstileHTTPTransport {
@@ -56,4 +80,23 @@ private struct StubTurnstileTransport: TurnstileHTTPTransport {
     func verify(_: TurnstileSiteVerifyRequest) async throws -> TurnstileSiteVerifyResponse {
         response
     }
+}
+
+private actor InMemorySignupAuthorizationStore: SignupAuthorizationStore {
+    private var values: [SignupAuthorizationID: SignupAuthorization] = [:]
+    func reserve(_ authorization: SignupAuthorization, now _: Date) async throws {
+        if let existing = values[authorization.id], existing != authorization { throw AccountControlStoreError.duplicateDID }
+        values[authorization.id] = authorization
+    }
+
+    func authorization(id: SignupAuthorizationID, now _: Date) async throws -> SignupAuthorization? {
+        values[id]
+    }
+
+    func fail(id _: SignupAuthorizationID, now _: Date) async throws {}
+    func finalize(_: SignupFinalizationRequest, now _: Date) async throws -> SignupFinalizationResult {
+        throw AccountControlStoreError.unavailable
+    }
+
+    func purgeExpiredSignupState(now _: Date) async throws {}
 }

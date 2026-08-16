@@ -183,6 +183,8 @@ public actor TurnstileVerifier {
     private let timeout: Duration
     private let transport: any TurnstileHTTPTransport
     private var used: Set<Data> = []
+    private var reservations: [Data: Date] = [:]
+    private let maximumReservations = 1024
 
     public init(secret: Data, hostname: String, action: String, maxAge: TimeInterval = 300, timeout: Duration = .seconds(5), transport: any TurnstileHTTPTransport) throws {
         guard secret.count >= 16, !hostname.isEmpty, !action.isEmpty, maxAge.isFinite, (1 ... 900).contains(maxAge) else { throw SwanError.invalidIdentifier("Turnstile configuration") }
@@ -193,6 +195,9 @@ public actor TurnstileVerifier {
         guard !token.isEmpty, token.utf8.count <= 2048 else { throw TurnstileVerificationError.missing }
         let digest = Data(SHA256.hash(data: Data(token.utf8)))
         guard !used.contains(digest) else { throw TurnstileVerificationError.duplicate }
+        reservations = reservations.filter { $0.value > now }
+        guard reservations.count < maximumReservations else { throw TurnstileVerificationError.transport }
+        guard reservations.updateValue(now.addingTimeInterval(maxAge), forKey: digest) == nil else { throw TurnstileVerificationError.duplicate }
         let transport = transport
         let request = TurnstileSiteVerifyRequest(secret: secret, response: token, remoteIP: remoteIP)
         let response: TurnstileSiteVerifyResponse
@@ -203,12 +208,13 @@ public actor TurnstileVerifier {
                 defer { group.cancelAll() }
                 return try await group.next()!
             }
-        } catch let error as TurnstileVerificationError { throw error }
-        catch { throw TurnstileVerificationError.transport }
-        guard response.success else { throw TurnstileVerificationError.failed }
-        guard let challenged = response.challengeTimestamp, abs(now.timeIntervalSince(challenged)) <= maxAge else { throw TurnstileVerificationError.expired }
-        guard response.hostname?.lowercased() == hostname else { throw TurnstileVerificationError.wrongHostname }
-        guard response.action == action else { throw TurnstileVerificationError.wrongAction }
+        } catch let error as TurnstileVerificationError { reservations.removeValue(forKey: digest); throw error }
+        catch { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.transport }
+        guard response.success else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.failed }
+        guard let challenged = response.challengeTimestamp, abs(now.timeIntervalSince(challenged)) <= maxAge else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.expired }
+        guard response.hostname?.lowercased() == hostname else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.wrongHostname }
+        guard response.action == action else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.wrongAction }
+        reservations.removeValue(forKey: digest)
         used.insert(digest)
     }
 }
@@ -221,7 +227,10 @@ public struct URLSessionTurnstileTransport: TurnstileHTTPTransport {
     public let endpoint: URL
     public let timeout: TimeInterval
     public init(endpoint: URL = URL(string: "https://challenges.cloudflare.com/turnstile/v0/siteverify")!, timeout: TimeInterval = 5) throws {
-        guard endpoint.scheme?.lowercased() == "https", timeout.isFinite, (0.1 ... 30).contains(timeout) else { throw SwanError.invalidIdentifier("Turnstile endpoint") }
+        guard endpoint.scheme?.lowercased() == "https",
+              endpoint.host?.lowercased() == "challenges.cloudflare.com",
+              endpoint.path == "/turnstile/v0/siteverify",
+              timeout.isFinite, (0.1 ... 30).contains(timeout) else { throw SwanError.invalidIdentifier("Turnstile endpoint") }
         self.endpoint = endpoint; self.timeout = timeout
     }
 
@@ -261,13 +270,41 @@ public protocol AuthenticatedSMTPTransport: Sendable {
     func deliver(configuration: AuthenticatedSMTPConfiguration, to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String) async throws
 }
 
+/// Concrete transport seam for the NIO SMTP implementation. A TLS session
+/// must report the hostname authenticated by certificate validation before
+/// this adapter permits SMTP AUTH; callers cannot downgrade that check.
+public protocol SMTPTLSConnection: Sendable {
+    var authenticatedHostname: String { get }
+    func authenticate(username: String, password: String, mechanism: SMTPAuthMechanism) async throws
+    func send(to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String) async throws
+}
+
+public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPTransport {
+    private let connect: @Sendable (AuthenticatedSMTPConfiguration) async throws -> any SMTPTLSConnection
+    public init(connect: @escaping @Sendable (AuthenticatedSMTPConfiguration) async throws -> any SMTPTLSConnection) {
+        self.connect = connect
+    }
+
+    public func deliver(configuration: AuthenticatedSMTPConfiguration, to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String) async throws {
+        let connection = try await connect(configuration)
+        if configuration.mode != .plaintextLab {
+            guard connection.authenticatedHostname.lowercased() == configuration.expectedHostname?.lowercased() else { throw MailpitSMTPDeliveryError.unavailable }
+            guard let username = configuration.username, let password = configuration.password, let mechanism = configuration.mechanism else { throw MailpitSMTPDeliveryError.invalidConfiguration }
+            try await connection.authenticate(username: username, password: password, mechanism: mechanism)
+        }
+        try await connection.send(to: to, subject: subject, body: body, idempotencyKey: idempotencyKey)
+    }
+}
+
 public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
     public nonisolated let cancellationContract: AccountEmailDeliveryCancellationContract = .bounded
     private let configuration: AuthenticatedSMTPConfiguration
     private let transport: any AuthenticatedSMTPTransport
+    private let attemptTimeout: Duration
     private var delivered: Set<String> = []
-    public init(configuration: AuthenticatedSMTPConfiguration, transport: any AuthenticatedSMTPTransport) {
-        self.configuration = configuration; self.transport = transport
+    public init(configuration: AuthenticatedSMTPConfiguration, transport: any AuthenticatedSMTPTransport, attemptTimeout: Duration = .seconds(30)) throws {
+        guard attemptTimeout > .zero else { throw SwanError.invalidIdentifier("SMTP attempt timeout") }
+        self.configuration = configuration; self.transport = transport; self.attemptTimeout = attemptTimeout
     }
 
     public func deliver(to: AccountEmailAddress, subject: String, body: String) async throws {
@@ -276,8 +313,15 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
         if delivered.contains(key) { return }
         var last: Error?
         for attempt in 0 ..< configuration.maximumAttempts {
-            do { try await transport.deliver(configuration: configuration, to: to, subject: subject, body: body, idempotencyKey: key); delivered.insert(key); return }
-            catch { last = error; if attempt + 1 < configuration.maximumAttempts { try? await Task.sleep(for: .milliseconds(Int64(100 * (1 << attempt)))) } }
+            do {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask { try await transport.deliver(configuration: configuration, to: to, subject: subject, body: body, idempotencyKey: key) }
+                    group.addTask { try await Task.sleep(for: attemptTimeout); throw MailpitSMTPDeliveryError.timedOut }
+                    defer { group.cancelAll() }
+                    try await group.next()!
+                }
+                delivered.insert(key); return
+            } catch { last = error; if attempt + 1 < configuration.maximumAttempts { try? await Task.sleep(for: .milliseconds(Int64(100 * (1 << attempt)))) } }
         }
         throw last ?? MailpitSMTPDeliveryError.unavailable
     }
@@ -374,6 +418,7 @@ public struct SignupService: Sendable {
 
     public func authorize(_ input: SignupAuthorizationInput, turnstileToken: String? = nil, remoteIP: String? = nil, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupAuthorization {
         guard policy.policy.permitsPublicSignup else { throw SignupServiceError.closed }
+        guard input.email != nil, input.emailProofDigest != nil else { throw SignupServiceError.emailProofRequired }
         guard policy.permits(handle: input.handle, inviteCode: input.inviteDigest == nil ? nil : "present") else { throw SignupServiceError.inviteRequired }
         if policy.policy == .openProtected {
             guard input.emailProofDigest != nil else { throw SignupServiceError.emailProofRequired }
@@ -390,8 +435,10 @@ public struct SignupService: Sendable {
     public func finalize(_ request: SignupFinalizationRequest, foundation: any SignupFoundationBundle, now: Date = Date()) async throws -> SignupFinalizationResult {
         guard let authorization = try await store.authorization(id: request.authorizationID, now: now), authorization.requestID == request.idempotencyKey else { throw AccountControlStoreError.notFound }
         guard authorization.handle == request.handle, authorization.identityDID == request.identityDID else { throw SignupServiceError.duplicateRequest }
-        do { return try await foundation.commitSignup(request, now: now) }
-        catch { try? await store.fail(id: request.authorizationID, now: now); throw error }
+        do {
+            _ = try await foundation.commitSignup(request, now: now)
+            return try await store.finalize(request, now: now)
+        } catch { try? await store.fail(id: request.authorizationID, now: now); throw error }
     }
 }
 
