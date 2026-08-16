@@ -50,13 +50,18 @@ public struct SignupEmailSMTPDeliveryWorker {
 /// signup service fails closed rather than pretending its side effects are
 /// atomic.
 public protocol SignupTransactionScopedFoundationWriter: Sendable {
-    func write(_ context: SQLiteSignupTransactionContext, request: SignupFinalizationRequest) async throws -> SignupFinalizationResult
+    func write(_ context: SQLiteSignupTransactionContext, request: SignupFinalizationRequest) async throws
 }
 
 public struct SQLiteSignupTransactionContext: Sendable {
     fileprivate let executeSQL: @Sendable (String, [SQLiteData]) async throws -> Void
+    fileprivate let finalizeTask4Closure: @Sendable (SignupFinalizationRequest, Date) async throws -> SignupFinalizationResult
     public func execute(_ sql: String, _ binds: [SQLiteData] = []) async throws {
         try await executeSQL(sql, binds)
+    }
+
+    public func finalizeTask4(_ request: SignupFinalizationRequest, now: Date) async throws -> SignupFinalizationResult {
+        try await finalizeTask4Closure(request, now)
     }
 }
 
@@ -66,10 +71,14 @@ public struct SQLiteSignupTransactionCoordinator: Sendable {
         self.database = database
     }
 
-    public func run(_ request: SignupFinalizationRequest, writer: any SignupTransactionScopedFoundationWriter) async throws -> SignupFinalizationResult {
+    public func run(_ request: SignupFinalizationRequest, now: Date, writer: any SignupTransactionScopedFoundationWriter) async throws -> SignupFinalizationResult {
         try await database.withConnectionGate { try await database.transaction {
-            let context = SQLiteSignupTransactionContext { sql, binds in _ = try await database.connection.query(sql, binds) }
-            return try await writer.write(context, request: request)
+            let context = SQLiteSignupTransactionContext(
+                executeSQL: { sql, binds in _ = try await database.connection.query(sql, binds) },
+                finalizeTask4Closure: { request, now in try await database.finalizeTask4OnCurrentConnection(request, now: now) }
+            )
+            try await writer.write(context, request: request)
+            return try await context.finalizeTask4(request, now: now)
         } }
     }
 }
@@ -83,7 +92,7 @@ public struct AssembledSQLiteSignupCoordinator: SignupFinalizationCoordinator {
 
     public func finalizeSignup(_ request: SignupFinalizationRequest, now: Date) async throws -> SignupFinalizationResult {
         _ = now
-        return try await coordinator.run(request, writer: writer)
+        return try await coordinator.run(request, now: now, writer: writer)
     }
 }
 
@@ -242,33 +251,35 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
     /// The committing CAS is the durable linearization point. Proof/invite
     /// consumption and the persisted idempotent result share this transaction.
     public func finalize(_ request: SignupFinalizationRequest, now: Date) async throws -> SignupFinalizationResult {
+        try await withConnectionGate { try await transaction { try await finalizeTask4OnCurrentConnection(request, now: now) } }
+    }
+
+    fileprivate func finalizeTask4OnCurrentConnection(_ request: SignupFinalizationRequest, now: Date) async throws -> SignupFinalizationResult {
         let current = try task4Timestamp(now)
-        return try await withConnectionGate { try await transaction {
-            let authRows = try await connection.query("SELECT * FROM signup_authorizations WHERE authorization_id=? AND request_id=?", [.text(request.authorizationID.rawValue), .text(request.idempotencyKey)])
-            guard let auth = authRows.first else { throw AccountControlStoreError.notFound }
-            let digest = task4FinalizationDigest(request)
-            if let result = try await connection.query("SELECT input_digest,account_did,session_id,committed_at FROM signup_authorization_results WHERE authorization_id=?", [.text(request.authorizationID.rawValue)]).first {
-                guard task4BlobValue(result, "input_digest") == digest, let did = task4Text(result, "account_did"), let session = task4Text(result, "session_id"), let committed = task4Integer(result, "committed_at") else { throw AccountControlStoreError.invalidInput }
-                return try SignupFinalizationResult(accountDID: did, managementSessionID: ManagementSessionID(rawValue: session), idempotencyKey: request.idempotencyKey, committedAt: Date(timeIntervalSince1970: Double(committed) / 1_000_000))
-            }
-            guard task4Integer(auth, "expires_at") ?? 0 > Int64(current),
-                  task4Integer(auth, "lease_expires_at") ?? 0 > Int64(current),
-                  task4Text(auth, "state") == "issued" || task4Text(auth, "state") == "failed" else { throw SwanError.expired }
-            guard task4BlobValue(auth, "invite_digest") == request.inviteDigest, task4BlobValue(auth, "email_proof_digest") == request.emailProofDigest else { throw AccountControlStoreError.invalidInput }
-            if let proof = request.emailProofDigest {
-                let proofRows = try await connection.query("SELECT email,handle,expires_at,consumed_at FROM signup_email_proofs WHERE proof_digest=?", [task4Blob(proof)])
-                guard let proofRow = proofRows.first, task4Text(proofRow, "email") == task4Text(auth, "email"), task4Text(proofRow, "handle") == task4Text(auth, "handle"), (task4Integer(proofRow, "expires_at") ?? 0) > Int64(current), task4Integer(proofRow, "consumed_at") == nil else { throw AccountControlStoreError.invalidInput }
-            }
-            let committing = try await connection.query("UPDATE signup_authorizations SET state='committing',account_did=? WHERE authorization_id=? AND request_id=? AND state IN('issued','failed') RETURNING authorization_id", [.text(request.accountDID), .text(request.authorizationID.rawValue), .text(request.idempotencyKey)])
-            guard committing.count == 1 else { throw AccountControlStoreError.unavailable }
-            if let invite = request.inviteDigest { let consumed = try await connection.query("UPDATE signup_invites SET redeemed_at=?,redemption_account_did=? WHERE invite_digest=? AND redeemed_at IS NULL RETURNING invite_digest", [.integer(current), .text(request.accountDID), task4Blob(invite)]); guard consumed.count == 1 else { throw AccountControlStoreError.invalidInput } }
-            if let proof = request.emailProofDigest { let consumed = try await connection.query("UPDATE signup_email_proofs SET consumed_at=? WHERE proof_digest=? AND consumed_at IS NULL RETURNING proof_digest", [.integer(current), task4Blob(proof)]); guard consumed.count == 1 else { throw AccountControlStoreError.invalidInput } }
-            _ = try await connection.query("DELETE FROM signup_invite_reservations WHERE authorization_id=?", [.text(request.authorizationID.rawValue)])
-            _ = try await connection.query("DELETE FROM signup_email_proof_reservations WHERE authorization_id=?", [.text(request.authorizationID.rawValue)])
-            _ = try await connection.query("INSERT INTO signup_authorization_results(authorization_id,input_digest,account_did,session_id,committed_at) VALUES(?,?,?,?,?)", [.text(request.authorizationID.rawValue), task4Blob(digest), .text(request.accountDID), .text(request.managementSession.sessionID.rawValue), .integer(current)])
-            _ = try await connection.query("UPDATE signup_authorizations SET state='committed',lease_expires_at=NULL WHERE authorization_id=? AND state='committing'", [.text(request.authorizationID.rawValue)])
-            return try SignupFinalizationResult(accountDID: request.accountDID, managementSessionID: request.managementSession.sessionID, idempotencyKey: request.idempotencyKey, committedAt: now)
-        } }
+        let authRows = try await connection.query("SELECT * FROM signup_authorizations WHERE authorization_id=? AND request_id=?", [.text(request.authorizationID.rawValue), .text(request.idempotencyKey)])
+        guard let auth = authRows.first else { throw AccountControlStoreError.notFound }
+        let digest = task4FinalizationDigest(request)
+        if let result = try await connection.query("SELECT input_digest,account_did,session_id,committed_at FROM signup_authorization_results WHERE authorization_id=?", [.text(request.authorizationID.rawValue)]).first {
+            guard task4BlobValue(result, "input_digest") == digest, let did = task4Text(result, "account_did"), let session = task4Text(result, "session_id"), let committed = task4Integer(result, "committed_at") else { throw AccountControlStoreError.invalidInput }
+            return try SignupFinalizationResult(accountDID: did, managementSessionID: ManagementSessionID(rawValue: session), idempotencyKey: request.idempotencyKey, committedAt: Date(timeIntervalSince1970: Double(committed) / 1_000_000))
+        }
+        guard task4Integer(auth, "expires_at") ?? 0 > Int64(current),
+              task4Integer(auth, "lease_expires_at") ?? 0 > Int64(current),
+              task4Text(auth, "state") == "issued" || task4Text(auth, "state") == "failed" else { throw SwanError.expired }
+        guard task4BlobValue(auth, "invite_digest") == request.inviteDigest, task4BlobValue(auth, "email_proof_digest") == request.emailProofDigest else { throw AccountControlStoreError.invalidInput }
+        if let proof = request.emailProofDigest {
+            let proofRows = try await connection.query("SELECT email,handle,expires_at,consumed_at FROM signup_email_proofs WHERE proof_digest=?", [task4Blob(proof)])
+            guard let proofRow = proofRows.first, task4Text(proofRow, "email") == task4Text(auth, "email"), task4Text(proofRow, "handle") == task4Text(auth, "handle"), (task4Integer(proofRow, "expires_at") ?? 0) > Int64(current), task4Integer(proofRow, "consumed_at") == nil else { throw AccountControlStoreError.invalidInput }
+        }
+        let committing = try await connection.query("UPDATE signup_authorizations SET state='committing',account_did=? WHERE authorization_id=? AND request_id=? AND state IN('issued','failed') RETURNING authorization_id", [.text(request.accountDID), .text(request.authorizationID.rawValue), .text(request.idempotencyKey)])
+        guard committing.count == 1 else { throw AccountControlStoreError.unavailable }
+        if let invite = request.inviteDigest { let consumed = try await connection.query("UPDATE signup_invites SET redeemed_at=?,redemption_account_did=? WHERE invite_digest=? AND redeemed_at IS NULL RETURNING invite_digest", [.integer(current), .text(request.accountDID), task4Blob(invite)]); guard consumed.count == 1 else { throw AccountControlStoreError.invalidInput } }
+        if let proof = request.emailProofDigest { let consumed = try await connection.query("UPDATE signup_email_proofs SET consumed_at=? WHERE proof_digest=? AND consumed_at IS NULL RETURNING proof_digest", [.integer(current), task4Blob(proof)]); guard consumed.count == 1 else { throw AccountControlStoreError.invalidInput } }
+        _ = try await connection.query("DELETE FROM signup_invite_reservations WHERE authorization_id=?", [.text(request.authorizationID.rawValue)])
+        _ = try await connection.query("DELETE FROM signup_email_proof_reservations WHERE authorization_id=?", [.text(request.authorizationID.rawValue)])
+        _ = try await connection.query("INSERT INTO signup_authorization_results(authorization_id,input_digest,account_did,session_id,committed_at) VALUES(?,?,?,?,?)", [.text(request.authorizationID.rawValue), task4Blob(digest), .text(request.accountDID), .text(request.managementSession.sessionID.rawValue), .integer(current)])
+        _ = try await connection.query("UPDATE signup_authorizations SET state='committed',lease_expires_at=NULL WHERE authorization_id=? AND state='committing'", [.text(request.authorizationID.rawValue)])
+        return try SignupFinalizationResult(accountDID: request.accountDID, managementSessionID: request.managementSession.sessionID, idempotencyKey: request.idempotencyKey, committedAt: now)
     }
 
     public func purgeExpiredSignupState(now: Date) async throws {

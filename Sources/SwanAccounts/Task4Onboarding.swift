@@ -82,7 +82,7 @@ public struct SignupInviteService: Sendable {
         guard Self.validCode(code), expiresAt.map({ $0 > Date() }) ?? true else {
             throw SwanError.invalidIdentifier("signup invite")
         }
-        return .init(code: code, digest: digest(code: code), expiresAt: expiresAt)
+        return try .init(code: code, digest: digest(code: code), expiresAt: expiresAt)
     }
 
     /// Generates the one-time bearer value for an operator. Only the caller
@@ -354,6 +354,9 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
     public func deliver(to: AccountEmailAddress, subject: String, body: String, idempotencyKey key: String) async throws {
         guard !key.isEmpty, !subject.contains("\r"), !subject.contains("\n"), body.utf8.count <= 32768 else { throw MailpitSMTPDeliveryError.invalidMessage }
         var last: Error?
+        let transport = self.transport
+        let configuration = self.configuration
+        let attemptTimeout = self.attemptTimeout
         for attempt in 0 ..< configuration.maximumAttempts {
             do {
                 try await withThrowingTaskGroup(of: Void.self) { group in
@@ -594,10 +597,8 @@ public struct SignupService: Sendable {
     public func finalize(_ request: SignupFinalizationRequest, now: Date = Date()) async throws -> SignupFinalizationResult {
         guard let authorization = try await store.authorization(id: request.authorizationID, now: now), authorization.requestID == request.idempotencyKey else { throw AccountControlStoreError.notFound }
         guard authorization.handle == request.handle, authorization.identityDID == request.identityDID else { throw SignupServiceError.duplicateRequest }
-        do {
-            guard let coordinator = finalizationCoordinator else { throw SwanError.unavailable("atomic signup coordinator unavailable") }
-            return try await coordinator.finalizeSignup(request, now: now)
-        } catch { try? await store.fail(id: request.authorizationID, now: now); throw error }
+        guard let coordinator = finalizationCoordinator else { throw SwanError.unavailable("atomic signup coordinator unavailable") }
+        return try await coordinator.finalizeSignup(request, now: now)
     }
 }
 
