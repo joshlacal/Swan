@@ -23,12 +23,12 @@ extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, Rec
     }
 
     public func reserveChallenge(_ challenge: FactorChallenge, now: Date) async throws {
-        try await withConnectionGate { _ = try await connection.query("INSERT INTO factor_challenges(challenge_digest, account_did, factor_id, purpose, issued_at, expires_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [challenge.challengeDigest.sqliteData!, .text(challenge.accountDID), challenge.factorID.map(SQLiteData.text) ?? .null, .text(challenge.purpose.rawValue), .integer(factorTimestamp(challenge.issuedAt)), .integer(factorTimestamp(challenge.expiresAt)), optionalTimestamp(challenge.consumedAt)]) }
+        try await withConnectionGate { if let factorID = challenge.factorID { let parent = try await connection.query("SELECT factor_id FROM authentication_factors WHERE factor_id = ? AND account_did = ? AND disabled_at IS NULL AND kind IN ('totp','passkey','recoveryCode')", [.text(factorID), .text(challenge.accountDID)]); guard !parent.isEmpty else { throw AccountControlStoreError.notFound } }; _ = try await connection.query("INSERT INTO factor_challenges(challenge_digest, account_did, factor_id, purpose, issued_at, expires_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [challenge.challengeDigest.sqliteData!, .text(challenge.accountDID), challenge.factorID.map(SQLiteData.text) ?? .null, .text(challenge.purpose.rawValue), .integer(factorTimestamp(challenge.issuedAt)), .integer(factorTimestamp(challenge.expiresAt)), optionalTimestamp(challenge.consumedAt)]) }
     }
 
     public func consumeChallenge(digest: Data, now: Date) async throws -> FactorChallenge {
         try await withConnectionGate { try await transaction {
-            let changed = try await connection.query("UPDATE factor_challenges SET consumed_at = ? WHERE challenge_digest = ? AND consumed_at IS NULL AND expires_at > ? RETURNING challenge_digest", [.integer(factorTimestamp(now)), digest.sqliteData!, .integer(factorTimestamp(now))])
+            let changed = try await connection.query("UPDATE factor_challenges SET consumed_at = ? WHERE challenge_digest = ? AND consumed_at IS NULL AND expires_at > ? AND (factor_id IS NULL OR EXISTS (SELECT 1 FROM authentication_factors f WHERE f.factor_id = factor_challenges.factor_id AND f.account_did = factor_challenges.account_did AND f.disabled_at IS NULL)) RETURNING challenge_digest", [.integer(factorTimestamp(now)), digest.sqliteData!, .integer(factorTimestamp(now))])
             guard !changed.isEmpty else { throw AccountControlStoreError.malformedRecord }
             let rows = try await connection.query("SELECT challenge_digest, account_did, factor_id, purpose, issued_at, expires_at, consumed_at FROM factor_challenges WHERE challenge_digest = ?", [digest.sqliteData!])
             guard let row = rows.first else { throw AccountControlStoreError.malformedRecord }

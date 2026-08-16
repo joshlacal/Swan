@@ -86,7 +86,7 @@ public enum TOTPAuthenticator {
     }
 
     public static func verify(code presented: String, secret: Data, at date: Date, configuration: TOTPConfiguration = TOTPConfiguration()) throws -> UInt64? {
-        guard presented.utf8.count == configuration.digits, presented.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }) else { return nil }
+        guard presented.utf8.count <= 8, secret.count <= 128, presented.utf8.count == configuration.digits, presented.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }) else { return nil }
         let counter = UInt64(max(0, floor(date.timeIntervalSince1970 / configuration.period)))
         for delta in -configuration.drift ... configuration.drift {
             let candidate = delta < 0 && UInt64(-delta) > counter ? nil : UInt64(Int64(counter) + Int64(delta))
@@ -152,6 +152,7 @@ public struct RecoveryCodeService: Sendable {
     }
 
     public func consume(_ code: String, accountDID: String, now: Date) async throws -> Bool {
+        guard code.utf8.count <= 128, accountDID.utf8.count <= 256 else { return false }
         do { guard try await factorStore.listFactors(accountDID: accountDID, now: now).contains(where: { $0.kind == .recoveryCode && $0.disabledAt == nil }) else { return false } } catch { throw MFAError.storageUnavailable }
         do { _ = try await store.consumeRecoveryCode(digest: Self.digest(code), accountDID: accountDID, now: now); return true }
         catch let error as AccountControlStoreError where error == .notFound { return false }
@@ -366,6 +367,7 @@ public struct WebAuthnRegistrationResult: Sendable, Equatable {
 
 public enum WebAuthnRegistrationVerifier {
     public static func verify(clientDataJSON: Data, authenticatorData: Data, challenge: Data, accountDID: String, challengeRecord: WebAuthnChallenge, expectedOrigin: String, relyingPartyID: String, now: Date) throws -> WebAuthnRegistrationResult {
+        guard clientDataJSON.count <= 4096, authenticatorData.count <= 4096, challenge.count <= 256, accountDID.utf8.count <= 256, expectedOrigin.utf8.count <= 512, relyingPartyID.utf8.count <= 256 else { throw MFAError.invalidChallenge }
         guard !accountDID.isEmpty, challengeRecord.accountDID == accountDID, challengeRecord.credentialIDDigest == nil,
               challengeRecord.purpose == .enrollment,
               challengeRecord.challengeDigest == Data(SHA256.hash(data: challenge)), now >= challengeRecord.issuedAt, now < challengeRecord.expiresAt,
