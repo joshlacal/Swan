@@ -25,7 +25,12 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
     /// Explicitly enumerated legacy methods. Full access is still bounded by
     /// this registry; it is never a wildcard over arbitrary route strings.
     public static let fullAccessV1 = DeclaredMethodScopePolicy(
-        declarations: [
+        declarations: GeneratedLegacyMethodRegistry.declarations
+    )
+    /* Legacy method declarations are generated from the pinned lexicons.
+        The old hand-written map is intentionally retained below as a review
+        reference in history, not as an authorization source.
+    public static let legacyReviewMap: [String: Set<String>] = [
             "com.atproto.server.createSession": [], "com.atproto.server.refreshSession": [],
             "com.atproto.server.getSession": [], "com.atproto.server.deleteSession": [],
             "com.atproto.server.getServiceAuth": [], "com.atproto.server.createAppPassword": [],
@@ -58,8 +63,8 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
             "tools.ozone.moderation.getRepo": ["rpc:tools.ozone"],
             "com.atproto.moderation.createReport": ["rpc:com.atproto.moderation"],
             "com.atproto.label.queryLabels": ["rpc:com.atproto.label"]
-        ], permitsFullAccess: true
-    )
+        ]
+    */
     /// The default reference policy uses exactly the same declarations and
     /// required capabilities as the scoped evaluator, while permitting only
     /// the internal full-access grant in addition.

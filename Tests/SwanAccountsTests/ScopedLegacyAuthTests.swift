@@ -85,6 +85,15 @@ final class ScopedLegacyAuthTests: XCTestCase {
         XCTAssertTrue(DeclaredMethodScopePolicy.referenceLegacy.declares("tools.ozone.moderation.getRepo"))
     }
 
+    func testGeneratedRegistryIsTheExactAuthorizationSet() {
+        XCTAssertEqual(
+            DeclaredMethodScopePolicy.referenceLegacy.declaredMethods,
+            Set(GeneratedLegacyMethodRegistry.declarations.keys)
+        )
+        XCTAssertFalse(GeneratedLegacyMethodRegistry.declarations.keys.contains("com.atproto.server.createSession"))
+        XCTAssertFalse(GeneratedLegacyMethodRegistry.declarations.keys.contains("app.bsky.actor.defs"))
+    }
+
     func testAppPasswordSecretPresentedOnceAndScopeEditRevokesDerivedSession() async throws {
         let store = InMemoryLegacyAuthStore()
         let service = try LegacyAuthService(store: store, accountResolver: .fixture, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, session, stepUp in session == "management" && (stepUp.isEmpty || stepUp == "step-up") }, loginAdmission: LegacyLoginAdmission { _ in }, methodPolicy: DeclaredMethodScopePolicy.fullAccessV1)
