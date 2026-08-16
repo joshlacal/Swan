@@ -637,6 +637,25 @@ public actor SwanDidWebIdentityService {
         try await durable.repairCommittedReservation(requestID: reservation.requestID)
     }
 
+    public func removeIdentity(binding: IdentityBinding, authorization: SwanDidWebReplacementAuthorization,
+                               now: Date = Date()) async throws -> IdentityBinding {
+        guard binding.method == .didWeb, binding.accountDID == authorization.accountDID,
+              let replacementAuthorizer,
+              try await replacementAuthorizer.authorize(authorization, now: now) else {
+            throw SwanError.unauthorized("fresh step-up required for identity removal")
+        }
+        let released = try IdentityBinding(
+            accountDID: binding.accountDID, identityDID: binding.identityDID,
+            method: binding.method, handle: binding.handle,
+            documentDigest: binding.documentDigest,
+            claimReceiptDigest: binding.claimReceiptDigest,
+            reservedKeyID: binding.reservedKeyID,
+            lastValidatedAt: binding.lastValidatedAt,
+            graceExpiresAt: binding.graceExpiresAt, state: .released
+        )
+        return try await persistContinuity(released)
+    }
+
     public func revalidate(
         binding: IdentityBinding, documents: any SwanDidWebDocumentFetching,
         now: Date = Date()
