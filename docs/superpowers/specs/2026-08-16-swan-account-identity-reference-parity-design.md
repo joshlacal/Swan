@@ -217,7 +217,29 @@ silently ignored.
 PLC remains Swan-controlled identity: existing PLC preparation/activation,
 reserved signing/rotation references, and export/restore continuity remain the
 authority. A user may instead claim an externally controlled `did:web` only
-through the following one-time binding:
+through the following one-time binding. Signup and authenticated existing-account
+claim/replacement use one shared durable `DidWebClaimTransaction` service; they
+do not have separate nonce-consumption or binding-write paths.
+
+The transaction takes a caller idempotency key, target DID/handle, requested
+document, and (for an existing account) a fresh step-up receipt. Its state is
+`reserved`, `pendingValidation`, `committing`, `committed`, `failed`, or
+`expired`. The shared sequence is: reserve the exact Swan key and one-time
+nonce; fetch and validate the exact DID, handle, reserved key, PDS endpoint,
+and temporary claim service; then atomically persist a new binding or replace
+the existing binding while appending its prior digest/key/claim to history and
+consuming the nonce. Existing-account claim/replacement must re-check the
+step-up receipt at commit and requires `stepUp(password)` when MFA is disabled
+or `stepUp(passwordPlusTOTP|passwordPlusPasskey)` when MFA is enabled.
+
+Reservation expiry releases the key/nonce reservation without consuming it.
+Storage or downstream failure before the commit transaction leaves the nonce
+unconsumed and the pending operation retryable; it never silently burns proof.
+A retry with the same idempotency key and identical input returns the same
+sanitized committed result, while a different input for that key is `409`.
+After commit, retries do not refetch or mint a second binding. These semantics
+apply identically to signup's account-creation transaction and an existing
+account's identity claim/replacement transaction.
 
 1. A reservation operation returns Swan's reserved repository public signing
    key (the exact key ID, key type, and encoded public key bytes) and a fresh
@@ -240,13 +262,14 @@ through the following one-time binding:
    PDS URL, and one temporary `SwanDidWebClaim` service with
    `id == did + "#swan-claim"` and endpoint exactly
    `publicURL + "/.well-known/swan/did-web-claim/" + base64url(nonce)`.
-   The nonce is consumed atomically with the pending signup commit. The
+   The nonce is consumed atomically with the shared claim transaction. The
    reserved key is a binding check, not an external assertion-signature
    requirement; no alternate document key can satisfy the claim.
 3. Swan stores a method-neutral `did:web` binding with the RFC 8785/JCS
    canonical JSON document-byte digest, claim-receipt digest, reserved-key
-   identity, and last valid revalidation. Swan does not create, rotate, delete, or otherwise claim
-   authority over the user's domain, DNS, DID document, PLC, or external keys.
+   identity, and last valid revalidation. Swan does not create, rotate, delete,
+   or otherwise claim authority over the user's domain, DNS, DID document, PLC,
+   or external keys.
 4. Revalidation is required before writes and new token issuance. A default
    24-hour grace permits bounded continuity after a transient resolver outage;
    a document mismatch or expired grace fences writes and new tokens while
