@@ -82,11 +82,9 @@ public struct ModerationReportResult: Sendable, Equatable {
     public let reportedBy: String?
 }
 
-/// Bounded moderation delivery. Subject and details are sent only as
-/// correlation values produced by a deployment-provided keyed HMAC. The
-/// trusted moderation transport also receives the typed subject/details over
-/// its pinned channel; HMAC values are for log correlation only and are not a
-/// privacy transformation for public identifiers.
+/// Bounded moderation delivery. The typed subject and optional details are sent
+/// over the injected trusted, peer-pinned transport. This adapter makes no
+/// claim that public identifiers are hidden or transformed for privacy.
 public struct ModerationServiceAdapter: Sendable {
     private let transport: any ModerationTransport
     private let allowedHost: String
