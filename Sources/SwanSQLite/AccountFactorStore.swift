@@ -101,6 +101,7 @@ extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, Rec
     }
 
     public func compareAndSwapTOTPReplay(factorID: String, accountDID: String, expected: UInt64?, proposed: UInt64, now: Date) async throws -> Bool {
+        guard proposed <= UInt64(Int.max), expected.map({ $0 <= UInt64(Int.max) }) ?? true else { throw AccountControlStoreError.invalidInput }
         try await withConnectionGate {
             try await ensureTask7DurableTables()
             let rows: [SQLiteRow]
