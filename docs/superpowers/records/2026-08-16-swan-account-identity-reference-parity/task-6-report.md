@@ -58,3 +58,12 @@ Signup pre-auth state is retained through email/request and authorize, and is
 consumed only after final signup returns an account-bound identity; successful
 signup issues the management cookie and rotated CSRF. Mutations now admit and
 forward bounded JSON payloads, including recursive identifier DELETE routes.
+
+Integration gates still required before release acceptance: provide production
+SQLite implementations of `SwanManagementPreAuthStore` and
+`SwanManagementCSRFStore` (the runtime intentionally has no production
+in-memory default), wire an atomic signup side-effect coordinator and injected
+signup policy, and run the adapter against a disposable Swift/Hummingbird
+harness. The checked-in Playwright fixture is deliberately disposable HTTPS
+coverage for static/CSP/browser behavior; it is not claimed as live Swift
+adapter evidence.
