@@ -12,7 +12,17 @@ public protocol SwanAccountPortalServing: Sendable {
     func bootstrap(now: Date) async throws -> SwanAccountPortalBootstrap
     func authenticate(handle: String, password: String, authFactorToken: String?, now: Date) async throws -> SwanAccountPortalAuthentication
     func portal(accountDID: String, now: Date) async throws -> SwanAccountPortalSnapshot
-    func mutate(path: String, accountDID: String, payload: Data?, now: Date) async throws -> SwanAccountPortalMutation
+    func mutate(path: String, context: SwanAccountPortalMutationContext, payload: Data?, now: Date) async throws -> SwanAccountPortalMutation
+}
+
+public struct SwanAccountPortalMutationContext: Sendable, Equatable {
+    public let sessionID: String
+    public let accountDID: String
+    public let strength: AuthenticationStrength
+    public let stepUpToken: String?
+    public init(sessionID: String, accountDID: String, strength: AuthenticationStrength, stepUpToken: String? = nil) {
+        self.sessionID = sessionID; self.accountDID = accountDID; self.strength = strength; self.stepUpToken = stepUpToken
+    }
 }
 
 public struct SwanAccountPortalAuthentication: Sendable, Equatable {
@@ -163,7 +173,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                     let admitted = try await collectAdmittedRequestBody(request, mediaType: .json, admission: .managementProcessShared, policy: .productionDefault, maximumBytes: 16 * 1024, termination: context.jsonWriteBodyTermination)
                     defer { admitted.release() }
                     let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
-                    let result = try await service.mutate(path: path, accountDID: "", payload: payload, now: Date())
+                    let result = try await service.mutate(path: path, context: .init(sessionID: "preauth", accountDID: "", strength: .password), payload: payload, now: Date())
                     if path == "signup" {
                         guard let accountDID = result.accountDID else { return accountError(.serviceUnavailable) }
                         let issued = try await sessions.issue(accountDID: accountDID)
@@ -189,7 +199,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                     let admitted = try await collectAdmittedRequestBody(request, mediaType: .json, admission: .managementProcessShared, policy: .productionDefault, maximumBytes: 16 * 1024, termination: context.jsonWriteBodyTermination)
                     defer { admitted.release() }
                     let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
-                    let mutation = try await service.mutate(path: path, accountDID: metadata.accountDID, payload: payload, now: Date())
+                    let mutation = try await service.mutate(path: path, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength), payload: payload, now: Date())
                     if path == "logout" { try await sessions.revoke(sessionValue: session) }
                     return accountJSON(.ok, mutation, cookies: path == "logout" ? [expiredManagementCookie(), expiredCSRFToken()] : [])
                 } catch { return accountError(.serviceUnavailable) }
@@ -205,7 +215,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                       (try? await sessions.acceptsCSRF(sessionValue: session, csrfValue: csrf)) == true else { return accountError(.forbidden) }
                 do {
                     let metadata = try await sessions.authenticate(sessionValue: session)
-                    return accountJSON(.ok, try await service.mutate(path: path, accountDID: metadata.accountDID, payload: nil, now: Date()))
+                    return accountJSON(.ok, try await service.mutate(path: path, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength), payload: nil, now: Date()))
                 } catch { return accountError(.serviceUnavailable) }
             }
         }
@@ -222,7 +232,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                     let admitted = try await collectAdmittedRequestBody(request, mediaType: .json, admission: .managementProcessShared, policy: .productionDefault, maximumBytes: 16 * 1024, termination: context.jsonWriteBodyTermination)
                     defer { admitted.release() }
                     let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
-                    return accountJSON(.ok, try await service.mutate(path: request.uri.path, accountDID: metadata.accountDID, payload: payload, now: Date()))
+                    return accountJSON(.ok, try await service.mutate(path: request.uri.path, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength), payload: payload, now: Date()))
                 } catch { return accountError(.serviceUnavailable) }
             }
         }
