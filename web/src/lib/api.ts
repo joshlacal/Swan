@@ -8,7 +8,10 @@ export type Session = {
 };
 
 export type PortalSnapshot = {
-  session: Session;
+  account: Session['account'];
+  identity?: Session['identity'];
+  strength: string;
+  factors: Session['factors'];
   sessions: { id: string; label: string; kind: string; lastSeen: string; current?: boolean }[];
   apps: { id: string; name: string; scopes: string[]; createdAt: string }[];
   passwords: { name: string; scopes: string[]; createdAt: string; lastUsedAt?: string }[];

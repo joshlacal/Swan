@@ -5,6 +5,24 @@ import SwanStorage
 
 /// Cookie/session boundary for the account portal. The browser sees only the
 /// random values; the durable store receives keyed digests and metadata.
+/// Durable pre-auth CSRF storage is injected by the integration lane. The
+/// default actor keeps local tests useful while production supplies a store
+/// backed by the same account database as management sessions.
+public protocol SwanManagementPreAuthStore: Sendable {
+    func put(digest: Data, expiresAt: Date) async
+    func take(digest: Data, now: Date) async -> Bool
+}
+
+public actor SwanInMemoryManagementPreAuthStore: SwanManagementPreAuthStore {
+    private var values: [Data: Date] = [:]
+    public init() {}
+    public func put(digest: Data, expiresAt: Date) async { values[digest] = expiresAt }
+    public func take(digest: Data, now: Date) async -> Bool {
+        guard let expiry = values.removeValue(forKey: digest), expiry >= now else { return false }
+        return true
+    }
+}
+
 public actor SwanManagementSessionRuntime {
     public static let sessionCookieName = "__Secure-swan_management"
     public static let csrfCookieName = "swan_csrf"
@@ -12,15 +30,18 @@ public actor SwanManagementSessionRuntime {
 
     private let store: any ManagementSessionStore
     private var csrfDigests: [Data: Data] = [:]
+    private let preAuthStore: any SwanManagementPreAuthStore
     private let idleLifetime: TimeInterval
     private let absoluteLifetime: TimeInterval
 
     public init(
         store: any ManagementSessionStore,
+        preAuthStore: any SwanManagementPreAuthStore = SwanInMemoryManagementPreAuthStore(),
         idleLifetime: TimeInterval = 12 * 60 * 60,
         absoluteLifetime: TimeInterval = 30 * 24 * 60 * 60
     ) {
         self.store = store
+        self.preAuthStore = preAuthStore
         self.idleLifetime = idleLifetime
         self.absoluteLifetime = absoluteLifetime
     }
@@ -42,6 +63,20 @@ public actor SwanManagementSessionRuntime {
         try await store.createManagementSession(metadata, sessionDigest: sessionDigest, csrfDigest: csrfDigest, now: now)
         csrfDigests[sessionDigest] = csrfDigest
         return IssuedManagementSession(sessionValue: sessionValue, csrfValue: csrfValue, metadata: metadata)
+    }
+
+    public func issuePreAuth(now: Date = Date(), lifetime: TimeInterval = 10 * 60) async -> String {
+        let value = Self.randomToken()
+        await preAuthStore.put(digest: Self.digest(value), expiresAt: now.addingTimeInterval(lifetime))
+        return value
+    }
+
+    /// Consumes a pre-auth token exactly once. A bootstrap refresh is allowed
+    /// to issue a new token, but a successful login/signup cannot replay one.
+    public func consumePreAuth(_ value: String, now: Date = Date()) async -> Bool {
+        let digest = Self.digest(value)
+        guard Self.validToken(value) else { return false }
+        return await preAuthStore.take(digest: digest, now: now)
     }
 
     public func authenticate(sessionValue: String, now: Date = Date()) async throws -> ManagementSessionMetadata {
