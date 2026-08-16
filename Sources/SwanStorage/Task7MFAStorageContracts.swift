@@ -25,19 +25,20 @@ public struct DurableFactorTokenRecord: Codable, Sendable, Equatable {
     public let sessionID: String
     public let purpose: String
     public let factor: AuthenticationFactorKind
+    public let factorID: String
     public let strength: AuthenticationStrength
     public let issuedAt: Date
     public let expiresAt: Date
 
-    public init(digest: Data, accountDID: String, sessionID: String, purpose: String, factor: AuthenticationFactorKind, strength: AuthenticationStrength, issuedAt: Date, expiresAt: Date) throws {
-        guard digest.count == 32, !accountDID.isEmpty, !sessionID.isEmpty, !purpose.isEmpty, expiresAt > issuedAt else { throw SwanError.invalidIdentifier("factor token") }
-        self.digest = digest; self.accountDID = accountDID; self.sessionID = sessionID; self.purpose = purpose; self.factor = factor; self.strength = strength; self.issuedAt = issuedAt; self.expiresAt = expiresAt
+    public init(digest: Data, accountDID: String, sessionID: String, purpose: String, factor: AuthenticationFactorKind, factorID: String = "", strength: AuthenticationStrength, issuedAt: Date, expiresAt: Date) throws {
+        guard digest.count == 32, !accountDID.isEmpty, !sessionID.isEmpty, !purpose.isEmpty, factorID.utf8.count <= 128, expiresAt > issuedAt else { throw SwanError.invalidIdentifier("factor token") }
+        self.digest = digest; self.accountDID = accountDID; self.sessionID = sessionID; self.purpose = purpose; self.factor = factor; self.factorID = factorID; self.strength = strength; self.issuedAt = issuedAt; self.expiresAt = expiresAt
     }
 }
 
 public protocol DurableFactorTokenStore: Sendable {
     func saveFactorToken(_ record: DurableFactorTokenRecord, now: Date) async throws
-    func consumeFactorToken(digest: Data, accountDID: String, sessionID: String, purpose: String, factor: AuthenticationFactorKind, strength: AuthenticationStrength, now: Date) async throws -> DurableFactorTokenRecord
+    func consumeFactorToken(digest: Data, accountDID: String, sessionID: String, purpose: String, factor: AuthenticationFactorKind, factorID: String, strength: AuthenticationStrength, now: Date) async throws -> DurableFactorTokenRecord
     func revokeFactorTokens(accountDID: String, sessionID: String?, now: Date) async throws
 }
 

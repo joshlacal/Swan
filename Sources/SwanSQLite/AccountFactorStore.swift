@@ -140,17 +140,17 @@ extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, Rec
             try await ensureTask7DurableTables()
             let strength = try JSONEncoder().encode(record.strength)
             _ = try await connection.query("DELETE FROM mfa_factor_tokens WHERE expires_at <= ? OR consumed_at IS NOT NULL OR revoked_at IS NOT NULL", [.integer(factorTimestamp(now))])
-            _ = try await connection.query("INSERT INTO mfa_factor_tokens(digest, account_did, session_id, purpose, factor, strength, issued_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [record.digest.sqliteData!, .text(record.accountDID), .text(record.sessionID), .text(record.purpose), .text(record.factor.rawValue), strength.sqliteData!, .integer(factorTimestamp(record.issuedAt)), .integer(factorTimestamp(record.expiresAt))])
+            _ = try await connection.query("INSERT INTO mfa_factor_tokens(digest, account_did, session_id, purpose, factor, factor_id, strength, issued_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [record.digest.sqliteData!, .text(record.accountDID), .text(record.sessionID), .text(record.purpose), .text(record.factor.rawValue), .text(record.factorID), strength.sqliteData!, .integer(factorTimestamp(record.issuedAt)), .integer(factorTimestamp(record.expiresAt))])
         }
     }
 
-    public func consumeFactorToken(digest: Data, accountDID: String, sessionID: String, purpose: String, factor: AuthenticationFactorKind, strength: AuthenticationStrength, now: Date) async throws -> DurableFactorTokenRecord {
+    public func consumeFactorToken(digest: Data, accountDID: String, sessionID: String, purpose: String, factor: AuthenticationFactorKind, factorID: String, strength: AuthenticationStrength, now: Date) async throws -> DurableFactorTokenRecord {
         try await withConnectionGate { try await transaction {
             try await ensureTask7DurableTables()
             let strengthData = try JSONEncoder().encode(strength)
-            let rows = try await connection.query("UPDATE mfa_factor_tokens SET consumed_at = ? WHERE digest = ? AND account_did = ? AND session_id = ? AND purpose = ? AND factor = ? AND strength = ? AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ? RETURNING digest, account_did, session_id, purpose, factor, strength, issued_at, expires_at", [.integer(factorTimestamp(now)), digest.sqliteData!, .text(accountDID), .text(sessionID), .text(purpose), .text(factor.rawValue), strengthData.sqliteData!, .integer(factorTimestamp(now))])
+            let rows = try await connection.query("UPDATE mfa_factor_tokens SET consumed_at = ? WHERE digest = ? AND account_did = ? AND session_id = ? AND purpose = ? AND factor = ? AND factor_id = ? AND strength = ? AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ? RETURNING digest, account_did, session_id, purpose, factor, factor_id, strength, issued_at, expires_at", [.integer(factorTimestamp(now)), digest.sqliteData!, .text(accountDID), .text(sessionID), .text(purpose), .text(factor.rawValue), .text(factorID), strengthData.sqliteData!, .integer(factorTimestamp(now))])
             guard let row = rows.first, let factor = AuthenticationFactorKind(rawValue: try requiredText(row, "factor")) else { throw AccountControlStoreError.notFound }
-            return try DurableFactorTokenRecord(digest: requiredBlob(row, "digest"), accountDID: requiredText(row, "account_did"), sessionID: requiredText(row, "session_id"), purpose: requiredText(row, "purpose"), factor: factor, strength: try JSONDecoder().decode(AuthenticationStrength.self, from: requiredBlob(row, "strength")), issuedAt: requiredDate(row, "issued_at"), expiresAt: requiredDate(row, "expires_at"))
+            return try DurableFactorTokenRecord(digest: requiredBlob(row, "digest"), accountDID: requiredText(row, "account_did"), sessionID: requiredText(row, "session_id"), purpose: requiredText(row, "purpose"), factor: factor, factorID: requiredText(row, "factor_id"), strength: try JSONDecoder().decode(AuthenticationStrength.self, from: requiredBlob(row, "strength")), issuedAt: requiredDate(row, "issued_at"), expiresAt: requiredDate(row, "expires_at"))
         } }
     }
 
@@ -172,7 +172,7 @@ private extension SQLiteControlDatabase {
         // This is intentionally adapter-local: Task 6 owns migration ordering.
         // IF NOT EXISTS makes the seam safe for already-provisioned databases.
         _ = try await connection.query("CREATE TABLE IF NOT EXISTS totp_replay_state (factor_id TEXT NOT NULL, account_did TEXT NOT NULL, accepted_counter INTEGER NOT NULL CHECK(accepted_counter >= 0), updated_at INTEGER NOT NULL, PRIMARY KEY(factor_id, account_did))")
-        _ = try await connection.query("CREATE TABLE IF NOT EXISTS mfa_factor_tokens (digest BLOB PRIMARY KEY CHECK(length(digest) = 32), account_did TEXT NOT NULL, session_id TEXT NOT NULL, purpose TEXT NOT NULL, factor TEXT NOT NULL, strength BLOB NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER, revoked_at INTEGER)")
+        _ = try await connection.query("CREATE TABLE IF NOT EXISTS mfa_factor_tokens (digest BLOB PRIMARY KEY CHECK(length(digest) = 32), account_did TEXT NOT NULL, session_id TEXT NOT NULL, purpose TEXT NOT NULL, factor TEXT NOT NULL, factor_id TEXT NOT NULL, strength BLOB NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER, revoked_at INTEGER)")
         _ = try await connection.query("CREATE TABLE IF NOT EXISTS mfa_audit_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, account_did TEXT NOT NULL, factor_id TEXT, success INTEGER NOT NULL, occurred_at INTEGER NOT NULL)")
         _ = try await connection.query("CREATE TABLE IF NOT EXISTS mfa_webauthn_challenge_context (challenge_digest BLOB PRIMARY KEY CHECK(length(challenge_digest) = 32), purpose TEXT NOT NULL)")
     }

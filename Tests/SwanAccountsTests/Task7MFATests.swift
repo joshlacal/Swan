@@ -26,9 +26,9 @@ final class Task7MFATests: XCTestCase {
         XCTAssertTrue(firstReplayCAS); XCTAssertFalse(replayCAS)
         let token = try DurableFactorTokenRecord(digest: Data(repeating: 3, count: 32), accountDID: "did:plc:alice", sessionID: "session", purpose: "stepUp", factor: .totp, strength: .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: Date(timeIntervalSince1970: 4)), issuedAt: Date(timeIntervalSince1970: 4), expiresAt: Date(timeIntervalSince1970: 30))
         try await database.saveFactorToken(token, now: Date(timeIntervalSince1970: 4))
-        let consumedToken = try await database.consumeFactorToken(digest: token.digest, accountDID: token.accountDID, sessionID: token.sessionID, purpose: token.purpose, factor: token.factor, strength: token.strength, now: Date(timeIntervalSince1970: 5))
+        let consumedToken = try await database.consumeFactorToken(digest: token.digest, accountDID: token.accountDID, sessionID: token.sessionID, purpose: token.purpose, factor: token.factor, factorID: token.factorID, strength: token.strength, now: Date(timeIntervalSince1970: 5))
         XCTAssertEqual(consumedToken, token)
-        do { _ = try await database.consumeFactorToken(digest: token.digest, accountDID: token.accountDID, sessionID: token.sessionID, purpose: token.purpose, factor: token.factor, strength: token.strength, now: Date(timeIntervalSince1970: 5)); XCTFail("factor token replay") } catch {}
+        do { _ = try await database.consumeFactorToken(digest: token.digest, accountDID: token.accountDID, sessionID: token.sessionID, purpose: token.purpose, factor: token.factor, factorID: token.factorID, strength: token.strength, now: Date(timeIntervalSince1970: 5)); XCTFail("factor token replay") } catch {}
         try await database.appendMFAAuditEvent(try MFAAuditEventRecord(event: "totpAccepted", accountDID: "did:plc:alice", factorID: "factor", success: true, occurredAt: Date(timeIntervalSince1970: 5)), now: Date(timeIntervalSince1970: 5))
     }
 
@@ -196,8 +196,8 @@ private actor InMemoryFactorTokenStore: DurableFactorTokenStore {
     private var records: [Data: DurableFactorTokenRecord] = [:]
     private var consumed: Set<Data> = []
     func saveFactorToken(_ record: DurableFactorTokenRecord, now: Date) async throws { records[record.digest] = record }
-    func consumeFactorToken(digest: Data, accountDID: String, sessionID: String, purpose: String, factor: AuthenticationFactorKind, strength: AuthenticationStrength, now: Date) async throws -> DurableFactorTokenRecord {
-        guard !consumed.contains(digest), let record = records[digest], record.accountDID == accountDID, record.sessionID == sessionID, record.purpose == purpose, record.factor == factor, record.strength == strength, now < record.expiresAt else { throw AccountControlStoreError.notFound }
+    func consumeFactorToken(digest: Data, accountDID: String, sessionID: String, purpose: String, factor: AuthenticationFactorKind, factorID: String, strength: AuthenticationStrength, now: Date) async throws -> DurableFactorTokenRecord {
+        guard !consumed.contains(digest), let record = records[digest], record.accountDID == accountDID, record.sessionID == sessionID, record.purpose == purpose, record.factor == factor, record.factorID == factorID, record.strength == strength, now < record.expiresAt else { throw AccountControlStoreError.notFound }
         consumed.insert(digest); return record
     }
     func revokeFactorTokens(accountDID: String, sessionID: String?, now: Date) async throws {}

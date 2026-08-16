@@ -172,7 +172,7 @@ public struct IssuedFactorToken: Sendable, Equatable { public let token: String;
 public actor FactorTokenService {
     private let store: any DurableFactorTokenStore
     public init(store: any DurableFactorTokenStore) { self.store = store }
-    public func issue(accountDID: String, sessionID: String, purpose: FactorTokenPurpose, factor: AuthenticationFactorKind, strength: AuthenticationStrength, now: Date, lifetime: TimeInterval = 120) async throws -> IssuedFactorToken {
+    public func issue(accountDID: String, sessionID: String, purpose: FactorTokenPurpose, factor: AuthenticationFactorKind, factorID: String = "", strength: AuthenticationStrength, now: Date, lifetime: TimeInterval = 120) async throws -> IssuedFactorToken {
         guard lifetime > 0 && lifetime <= 600 else { throw MFAError.tokenInvalid }
         let valid: Bool
         switch purpose {
@@ -188,16 +188,16 @@ public actor FactorTokenService {
         }
         guard valid else { throw MFAError.stepUpRequired }
         let verifiedAt: Date
-        if case let .stepUpMFA(_, date) = strength { verifiedAt = date } else { throw MFAError.stepUpRequired }
+        if purpose == .loginRecovery { if case let .stepUpPassword(date) = strength { verifiedAt = date } else if case let .stepUpMFA(_, date) = strength { verifiedAt = date } else if strength == .emailRecovery { verifiedAt = now } else { throw MFAError.stepUpRequired } } else if case let .stepUpMFA(_, date) = strength { verifiedAt = date } else { throw MFAError.stepUpRequired }
         guard verifiedAt <= now, now.timeIntervalSince(verifiedAt) <= 600 else { throw MFAError.stepUpRequired }
         let token = randomBytes(count: 32).base64URLEncodedString(); let digest = Data(SHA256.hash(data: Data(token.utf8)))
         let expires = now.addingTimeInterval(lifetime)
-        try await store.saveFactorToken(try DurableFactorTokenRecord(digest: digest, accountDID: accountDID, sessionID: sessionID, purpose: purpose.rawValue, factor: factor, strength: strength, issuedAt: now, expiresAt: expires), now: now)
+        try await store.saveFactorToken(try DurableFactorTokenRecord(digest: digest, accountDID: accountDID, sessionID: sessionID, purpose: purpose.rawValue, factor: factor, factorID: factorID, strength: strength, issuedAt: now, expiresAt: expires), now: now)
         return IssuedFactorToken(token: token, expiresAt: expires, factor: factor, sessionID: sessionID)
     }
-    public func consume(_ token: String, accountDID: String, sessionID: String, purpose: FactorTokenPurpose, factor: AuthenticationFactorKind, strength: AuthenticationStrength, now: Date) async throws -> Bool {
+    public func consume(_ token: String, accountDID: String, sessionID: String, purpose: FactorTokenPurpose, factor: AuthenticationFactorKind, factorID: String = "", strength: AuthenticationStrength, now: Date) async throws -> Bool {
         let digest = Data(SHA256.hash(data: Data(token.utf8)))
-        _ = try await store.consumeFactorToken(digest: digest, accountDID: accountDID, sessionID: sessionID, purpose: purpose.rawValue, factor: factor, strength: strength, now: now)
+        _ = try await store.consumeFactorToken(digest: digest, accountDID: accountDID, sessionID: sessionID, purpose: purpose.rawValue, factor: factor, factorID: factorID, strength: strength, now: now)
         return true
     }
 }
