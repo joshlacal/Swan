@@ -22,8 +22,9 @@ preflight before commit, and the explicit full-CAR/MST verifier seam. Import rem
 `assembled: false` until a durable full verifier is injected; the in-memory
 CAS committer is only a conformance model. PLC step-up, operator authorization
 verification, audit-on-success, moderation typed repoRef/strongRef subject and
-details delivery over a trusted pinned transport with versioned keyed HMAC log
-correlations, and identifier-free metrics/readiness are also covered. HMAC is
+details delivery over a trusted pinned transport with explicit `$type` subject
+unions and typed output validation (`id`, `reasonType`, `subject`,
+`reportedBy`, `createdAt`), plus versioned keyed HMAC log correlations. HMAC is
 not claimed to redact public values. Runtime health/metrics and route
 registration remain deferred.
 

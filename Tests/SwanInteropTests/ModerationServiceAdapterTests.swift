@@ -19,10 +19,9 @@ final class ModerationServiceAdapterTests: XCTestCase {
         let path = await transport.path
         let body = await transport.body
         XCTAssertEqual(path, "/reports")
-        XCTAssertFalse(body.contains("did:plc:"))
-        XCTAssertFalse(body.contains("secret details"))
-        XCTAssertTrue(body.contains("subjectCorrelation"))
-        XCTAssertTrue(body.contains("detailsCorrelation"))
+        XCTAssertTrue(body.contains("reasonType"))
+        XCTAssertTrue(body.contains("com.atproto.admin.defs#repoRef"))
+        XCTAssertTrue(body.contains("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"))
     }
 }
 
@@ -32,6 +31,6 @@ private actor TestModerationTransport: ModerationTransport {
     func send(_ request: ModerationTransportRequest) async throws -> ModerationTransportResponse {
         self.path = request.path
         self.body = String(decoding: request.body, as: UTF8.self)
-        return .init(status: 202, body: Data("{}".utf8), peer: request.pinnedPeer)
+        return .init(status: 202, body: Data("{\"id\":\"r1\",\"reasonType\":\"com.atproto.moderation.defs#reasonSpam\",\"subject\":{\"$type\":\"com.atproto.admin.defs#repoRef\",\"did\":\"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\"},\"reportedBy\":\"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb\",\"createdAt\":\"2026-08-16T00:00:00Z\"}".utf8), peer: request.pinnedPeer)
     }
 }

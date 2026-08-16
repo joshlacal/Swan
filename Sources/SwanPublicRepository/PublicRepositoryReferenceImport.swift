@@ -153,6 +153,7 @@ public struct PublicRepositoryReferenceImportVerifier: Sendable {
         }
         _ = byCID
         let state = try await fullVerifier.verifyAndStage(envelope)
+        guard state.did == envelope.did, state.rootCID == envelope.rootCID else { throw PublicRepositoryReferenceImportError.invalidBinding }
         return try await committer.commit(state, requestID: envelope.requestID, requestDigest: envelope.requestDigest, expectedRootCID: envelope.expectedExistingRootCID)
     }
 }
@@ -160,8 +161,8 @@ public struct PublicRepositoryReferenceImportVerifier: Sendable {
 /// A small actor model used by focused contract tests and local acceptance.
 /// Real SQLite adapters must provide the same atomic request-digest/CAS
 /// behavior inside their transaction; this model is not production storage.
-public actor InMemoryPublicRepositoryImportCommitter: PublicRepositoryImportCommitter {
-    public let isDurableTransactional = true
+actor InMemoryPublicRepositoryImportCommitter: PublicRepositoryImportCommitter {
+    let isDurableTransactional = false
     private var currentRootCID: CID?
     private var requests: [String: (digest: Data, state: PublicRepositoryImportedState)] = [:]
 

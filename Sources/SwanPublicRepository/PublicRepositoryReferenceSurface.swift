@@ -82,6 +82,7 @@ public protocol PublicRepositoryMissingBlobStore: Sendable {
 /// generated wire types without granting a caller an unbounded block or blob
 /// query.
 public actor PublicRepositoryReferenceSurface {
+    private let accountDID: String
     private let repositories: [PublicRepositorySyncRepository]
     private let blocks: [CID: Data]
     private let records: [PublicRepositoryPath: CID]
@@ -100,6 +101,8 @@ public actor PublicRepositoryReferenceSurface {
     ) throws {
         guard (1...1_000).contains(maximumPageSize) else { throw PublicRepositoryReferenceSurfaceError.invalidLimit }
         let map = try PublicRepositoryBlockMap(blocks: blocks)
+        guard (try? DID(didString: did)) != nil else { throw PublicRepositoryReferenceSurfaceError.invalidBinding }
+        self.accountDID = did
         let candidateRepositories = repositories ?? []
         guard Set(candidateRepositories.map(\.did)).count == candidateRepositories.count else { throw PublicRepositoryReferenceSurfaceError.duplicateRepository }
         self.repositories = candidateRepositories.sorted {
@@ -211,10 +214,17 @@ public actor PublicRepositoryReferenceSurface {
     }
 
     public func listMissingBlobs(accountDID: String, limit: Int = 100, cursor: String? = nil) async throws -> PublicRepositorySyncBlobPage {
-        guard (try? DID(didString: accountDID)) != nil else { throw PublicRepositoryReferenceSurfaceError.invalidBinding }
+        guard accountDID == self.accountDID, (try? DID(didString: accountDID)) != nil else { throw PublicRepositoryReferenceSurfaceError.invalidBinding }
         _ = try validatedLimit(limit)
         guard let missingBlobStore else { throw PublicRepositoryReferenceSurfaceError.invalidBinding }
-        return try await missingBlobStore.listMissingBlobs(accountDID: accountDID, limit: limit, cursor: cursor)
+        let page = try await missingBlobStore.listMissingBlobs(accountDID: accountDID, limit: limit, cursor: cursor)
+        guard page.blobs.count <= limit, Set(page.blobs.map(\.cid)).count == page.blobs.count else { throw PublicRepositoryReferenceSurfaceError.invalidBinding }
+        for blob in page.blobs {
+            try PublicRepositoryCID.validate(blob.cid)
+            guard blob.recordURI.hasPrefix("at://"), blob.recordURI.utf8.count <= 2_048 else { throw PublicRepositoryReferenceSurfaceError.invalidBinding }
+        }
+        if let next = page.cursor { _ = try decodeCursor(next) }
+        return page
     }
 
     private func pageRange(count: Int, limit: Int, cursor: String?) throws -> Range<Int> {
