@@ -143,6 +143,15 @@ public struct SignupEmailProofService: Sendable {
     private func digestUnchecked(code: String, email: AccountEmailAddress, handle: String) -> Data {
         Data(HMAC<SHA256>.authenticationCode(for: Data("swan.signup.email-proof.v1\0\(email.value)\0\(handle)\0\(code)".utf8), using: SymmetricKey(data: secret.bytes)))
     }
+
+    public func protectedEnvelope(code: String, email: AccountEmailAddress, handle: String, deliveryID: String, keyVersion: UInt8 = 1) throws -> Data {
+        guard (16 ... 256).contains(code.utf8.count), !deliveryID.isEmpty, AccountControlIdentifiers.isCanonicalHandle(handle) else { throw SwanError.invalidIdentifier("signup email envelope") }
+        let key = SymmetricKey(data: secret.bytes)
+        let aad = Data("swan.signup.email-envelope.v1\0\(keyVersion)\0\(deliveryID)\0\(email.value)\0\(handle)".utf8)
+        let plaintext = Data(code.utf8)
+        let sealed = try AES.GCM.seal(plaintext, using: key, authenticating: aad)
+        return Data([keyVersion]) + aad + sealed.combined!
+    }
 }
 
 // MARK: - Turnstile siteverify
@@ -289,8 +298,8 @@ public protocol SMTPTLSConnectionWithDeadline: SMTPTLSConnection {
 }
 
 public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPTransport {
-    private let connect: @Sendable (AuthenticatedSMTPConfiguration) async throws -> any SMTPTLSConnection
-    public init(connect: @escaping @Sendable (AuthenticatedSMTPConfiguration) async throws -> any SMTPTLSConnection) {
+    private let connect: @Sendable (AuthenticatedSMTPConfiguration) async throws -> any SMTPTLSConnectionWithDeadline
+    public init(connect: @escaping @Sendable (AuthenticatedSMTPConfiguration) async throws -> any SMTPTLSConnectionWithDeadline) {
         self.connect = connect
     }
 
@@ -301,11 +310,7 @@ public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPTransport {
             guard let username = configuration.username, let password = configuration.password, let mechanism = configuration.mechanism else { throw MailpitSMTPDeliveryError.invalidConfiguration }
             try await connection.authenticate(username: username, password: password, mechanism: mechanism)
         }
-        if let bounded = connection as? any SMTPTLSConnectionWithDeadline {
-            try await bounded.send(to: to, subject: subject, body: body, idempotencyKey: idempotencyKey, deadline: .now.advanced(by: .seconds(30)))
-        } else {
-            try await connection.send(to: to, subject: subject, body: body, idempotencyKey: idempotencyKey)
-        }
+        try await connection.send(to: to, subject: subject, body: body, idempotencyKey: idempotencyKey, deadline: .now.advanced(by: .seconds(30)))
     }
 }
 
@@ -423,12 +428,27 @@ public struct SignupAuthorizationInput: Sendable, Equatable {
     public let emailProofDigest: Data?
     public let inviteDigest: Data?
     public let clientIPBucketDigest: Data
+    private var trustedBucket: Bool
     public init(requestID: String, authorizationID: SignupAuthorizationID, handle: String, email: AccountEmailAddress?, identityDID: String, emailProofDigest: Data?, inviteDigest: Data?, clientIPBucketDigest: Data) throws {
         guard clientIPBucketDigest.count == 32, [emailProofDigest, inviteDigest].compactMap(\.self).allSatisfy({ $0.count == 32 }) else { throw SwanError.invalidIdentifier("signup authorization input") }
         self.requestID = requestID; self.authorizationID = authorizationID; self.handle = handle; self.email = email; self.identityDID = identityDID; self.emailProofDigest = emailProofDigest; self.inviteDigest = inviteDigest; self.clientIPBucketDigest = clientIPBucketDigest
+        trustedBucket = false
+    }
+
+    public init(requestID: String, authorizationID: SignupAuthorizationID, handle: String, email: AccountEmailAddress?, identityDID: String, emailProofDigest: Data?, inviteDigest: Data?, trustedPeerIP: String, serverSecret: Data) throws {
+        guard serverSecret.count >= 16, !trustedPeerIP.isEmpty else { throw SwanError.invalidIdentifier("trusted peer") }
+        let canonical = trustedPeerIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bucket = Data(HMAC<SHA256>.authenticationCode(for: Data("swan.signup.ip-bucket.v1\0\(canonical)".utf8), using: SymmetricKey(data: serverSecret)))
+        try self.init(requestID: requestID, authorizationID: authorizationID, handle: handle, email: email, identityDID: identityDID, emailProofDigest: emailProofDigest, inviteDigest: inviteDigest, clientIPBucketDigest: bucket)
+        trustedBucket = true
+    }
+
+    fileprivate var isTrustedBucket: Bool {
+        trustedBucket
     }
 }
 
+@available(*, deprecated, message: "Use SignupFinalizationCoordinator; generic callback finalization is not atomic")
 public protocol SignupFoundationBundle: Sendable {
     /// The foundation implementation performs account/identity/session work
     /// and invokes the storage-owned transaction exactly once from its
@@ -436,6 +456,7 @@ public protocol SignupFoundationBundle: Sendable {
     func commitSignup(_ input: SignupFinalizationRequest, transaction: any SignupFinalizationTransaction, now: Date) async throws -> SignupFinalizationResult
 }
 
+@available(*, deprecated, message: "Use SignupFinalizationCoordinator")
 public protocol SignupFinalizationTransaction: Sendable {
     func commit() async throws -> SignupFinalizationResult
 }
@@ -443,8 +464,15 @@ public protocol SignupFinalizationTransaction: Sendable {
 /// Storage implementations may return a transaction bound to their durable
 /// connection. Foundation must retain and commit this object inside its own
 /// account/identity/session transaction boundary.
+@available(*, deprecated, message: "Use SignupFinalizationCoordinator")
 public protocol SignupAtomicFinalizationStore: SignupAuthorizationStore {
     func makeFinalizationTransaction(_ request: SignupFinalizationRequest, now: Date) async throws -> any SignupFinalizationTransaction
+}
+
+/// Required single-connection finalization seam. Implementations must perform
+/// foundation writes and Task 4 consumption/result writes in this transaction.
+public protocol SignupFinalizationCoordinator: Sendable {
+    func finalizeSignup(_ request: SignupFinalizationRequest, now: Date) async throws -> SignupFinalizationResult
 }
 
 private struct StoreOwnedSignupFinalizationTransaction: SignupFinalizationTransaction {
@@ -494,7 +522,7 @@ public struct SignupService: Sendable {
     }
 
     public func authorize(_ input: SignupAuthorizationInput, turnstileToken: String? = nil, remoteIP: String? = nil, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupAuthorization {
-        guard policy.policy.permitsPublicSignup else { throw SignupServiceError.closed }
+        guard policy.policy.permitsPublicSignup, input.isTrustedBucket else { throw SignupServiceError.closed }
         guard lifetime.isFinite, (1 ... 900).contains(lifetime) else { throw SwanError.invalidIdentifier("signup authorization lifetime") }
         guard input.email != nil, input.emailProofDigest != nil else { throw SignupServiceError.emailProofRequired }
         guard policy.permits(handle: input.handle, inviteCode: input.inviteDigest == nil ? nil : "present") else { throw SignupServiceError.inviteRequired }
@@ -517,10 +545,9 @@ public struct SignupService: Sendable {
         guard let authorization = try await store.authorization(id: request.authorizationID, now: now), authorization.requestID == request.idempotencyKey else { throw AccountControlStoreError.notFound }
         guard authorization.handle == request.handle, authorization.identityDID == request.identityDID else { throw SignupServiceError.duplicateRequest }
         do {
-            let transaction: any SignupFinalizationTransaction
-            guard let atomicStore = store as? any SignupAtomicFinalizationStore else { throw SwanError.unavailable("atomic signup transaction unavailable") }
-            transaction = try await atomicStore.makeFinalizationTransaction(request, now: now)
-            return try await foundation.commitSignup(request, transaction: transaction, now: now)
+            guard let coordinator = store as? any SignupFinalizationCoordinator else { throw SwanError.unavailable("atomic signup coordinator unavailable") }
+            _ = foundation // Coordinator owns the single-connection foundation integration.
+            return try await coordinator.finalizeSignup(request, now: now)
         } catch { try? await store.fail(id: request.authorizationID, now: now); throw error }
     }
 }
@@ -560,6 +587,13 @@ public struct SignupEmailRequestService: Sendable {
     private let store: any SignupEmailRequestStore
     public init(store: any SignupEmailRequestStore) {
         self.store = store
+    }
+
+    public func request(email: AccountEmailAddress, handle: String, code: String, proof: SignupEmailProofService, now: Date = Date(), lifetime: TimeInterval = 600, keyVersion: UInt8 = 1) async throws -> SignupEmailRequestOutcome {
+        let digest = try proof.digest(code: code, email: email, handle: handle)
+        let deliveryID = "signup-" + digest.map { String(format: "%02x", $0) }.joined()
+        let envelope = try proof.protectedEnvelope(code: code, email: email, handle: handle, deliveryID: deliveryID, keyVersion: keyVersion)
+        return try await request(email: email, handle: handle, proofDigest: digest, protectedEnvelope: envelope, now: now, lifetime: lifetime)
     }
 
     public func request(email: AccountEmailAddress, handle: String, proofDigest: Data, protectedEnvelope: Data, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupEmailRequestOutcome {
