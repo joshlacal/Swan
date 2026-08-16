@@ -461,18 +461,10 @@ public struct SignupAuthorizationInput: Sendable, Equatable {
     public let inviteDigest: Data?
     public let clientIPBucketDigest: Data
     private var trustedBucket: Bool
-    public init(requestID: String, authorizationID: SignupAuthorizationID, handle: String, email: AccountEmailAddress?, identityDID: String, emailProofDigest: Data?, inviteDigest: Data?, clientIPBucketDigest: Data) throws {
+    init(requestID: String, authorizationID: SignupAuthorizationID, handle: String, email: AccountEmailAddress?, identityDID: String, emailProofDigest: Data?, inviteDigest: Data?, clientIPBucketDigest: Data) throws {
         guard clientIPBucketDigest.count == 32, [emailProofDigest, inviteDigest].compactMap(\.self).allSatisfy({ $0.count == 32 }) else { throw SwanError.invalidIdentifier("signup authorization input") }
         self.requestID = requestID; self.authorizationID = authorizationID; self.handle = handle; self.email = email; self.identityDID = identityDID; self.emailProofDigest = emailProofDigest; self.inviteDigest = inviteDigest; self.clientIPBucketDigest = clientIPBucketDigest
         trustedBucket = false
-    }
-
-    public init(requestID: String, authorizationID: SignupAuthorizationID, handle: String, email: AccountEmailAddress?, identityDID: String, emailProofDigest: Data?, inviteDigest: Data?, trustedPeerIP: String, serverSecret: Data) throws {
-        guard serverSecret.count >= 16, !trustedPeerIP.isEmpty else { throw SwanError.invalidIdentifier("trusted peer") }
-        let canonical = trustedPeerIP.trimmingCharacters(in: .whitespacesAndNewlines)
-        let bucket = Data(HMAC<SHA256>.authenticationCode(for: Data("swan.signup.ip-bucket.v1\0\(canonical)".utf8), using: SymmetricKey(data: serverSecret)))
-        try self.init(requestID: requestID, authorizationID: authorizationID, handle: handle, email: email, identityDID: identityDID, emailProofDigest: emailProofDigest, inviteDigest: inviteDigest, clientIPBucketDigest: bucket)
-        trustedBucket = true
     }
 
     fileprivate var isTrustedBucket: Bool {
@@ -481,7 +473,14 @@ public struct SignupAuthorizationInput: Sendable, Equatable {
 }
 
 public protocol SignupTrustedPeerIPExtractor: Sendable {
-    func bucketDigest(forCanonicalPeerIP peerIP: String) throws -> Data
+    func bucket(forCanonicalPeerIP peerIP: String) throws -> SignupTrustedPeerIPBucket
+}
+
+public struct SignupTrustedPeerIPBucket: Sendable, Equatable {
+    public let digest: Data
+    fileprivate init(digest: Data) {
+        self.digest = digest
+    }
 }
 
 @available(*, deprecated, message: "Use SignupFinalizationCoordinator; generic callback finalization is not atomic")
@@ -632,7 +631,7 @@ public struct SignupEmailRequestService: Sendable {
         return try await request(email: email, handle: handle, proofDigest: digest, protectedEnvelope: envelope, now: now, lifetime: lifetime)
     }
 
-    public func request(email: AccountEmailAddress, handle: String, proofDigest: Data, protectedEnvelope: Data, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupEmailRequestOutcome {
+    private func request(email: AccountEmailAddress, handle: String, proofDigest: Data, protectedEnvelope: Data, now: Date, lifetime: TimeInterval) async throws -> SignupEmailRequestOutcome {
         guard AccountControlIdentifiers.isCanonicalHandle(handle), proofDigest.count == 32,
               !protectedEnvelope.isEmpty, protectedEnvelope.count <= 16384,
               lifetime.isFinite, (60 ... 900).contains(lifetime) else { throw SwanError.invalidIdentifier("signup email request") }

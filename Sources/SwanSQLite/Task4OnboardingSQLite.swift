@@ -30,13 +30,27 @@ public struct SignupEmailOutboxMessage: Sendable, Equatable {
     }
 }
 
+public struct SignupEmailSMTPDeliveryWorker {
+    private let proof: SignupEmailProofService
+    private let smtp: AuthenticatedSMTPDelivery
+    public init(proof: SignupEmailProofService, smtp: AuthenticatedSMTPDelivery) {
+        self.proof = proof; self.smtp = smtp
+    }
+
+    public func deliver(_ message: SignupEmailOutboxMessage) async throws {
+        let address = try AccountEmailAddress(message.email)
+        let code = try proof.openProtectedEnvelope(message.protectedEnvelope, email: address, handle: message.handle, deliveryID: message.deliveryID)
+        try await smtp.deliver(to: address, subject: "Verify your Swan account", body: "Your verification code is \(code)", idempotencyKey: message.deliveryID)
+    }
+}
+
 /// Concrete integration seam: the writer is an object (not an escaping
 /// callback) and all of its account/identity/session writes run under this
 /// connection's transaction. Until the foundation supplies this writer, the
 /// signup service fails closed rather than pretending its side effects are
 /// atomic.
 public protocol SignupTransactionScopedFoundationWriter: Sendable {
-    func write(_ context: SQLiteSignupTransactionContext, request: SignupFinalizationRequest) async throws
+    func write(_ context: SQLiteSignupTransactionContext, request: SignupFinalizationRequest) async throws -> SignupFinalizationResult
 }
 
 public struct SQLiteSignupTransactionContext: Sendable {
@@ -52,15 +66,28 @@ public struct SQLiteSignupTransactionCoordinator: Sendable {
         self.database = database
     }
 
-    public func run(_ request: SignupFinalizationRequest, writer: any SignupTransactionScopedFoundationWriter) async throws {
+    public func run(_ request: SignupFinalizationRequest, writer: any SignupTransactionScopedFoundationWriter) async throws -> SignupFinalizationResult {
         try await database.withConnectionGate { try await database.transaction {
             let context = SQLiteSignupTransactionContext { sql, binds in _ = try await database.connection.query(sql, binds) }
-            try await writer.write(context, request: request)
+            return try await writer.write(context, request: request)
         } }
     }
 }
 
-extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupFinalizationCoordinator, SignupEmailRequestStore, SignupEmailOutboxStore {
+public struct AssembledSQLiteSignupCoordinator: SignupFinalizationCoordinator {
+    private let coordinator: SQLiteSignupTransactionCoordinator
+    private let writer: any SignupTransactionScopedFoundationWriter
+    public init(database: SQLiteControlDatabase, writer: any SignupTransactionScopedFoundationWriter) {
+        coordinator = SQLiteSignupTransactionCoordinator(database: database); self.writer = writer
+    }
+
+    public func finalizeSignup(_ request: SignupFinalizationRequest, now: Date) async throws -> SignupFinalizationResult {
+        _ = now
+        return try await coordinator.run(request, writer: writer)
+    }
+}
+
+extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailRequestStore, SignupEmailOutboxStore {
     public typealias Message = SignupEmailOutboxMessage
     public func claim(now: Date) async throws -> SignupEmailOutboxMessage? {
         try await claimSignupEmailOutbox(now: now)
