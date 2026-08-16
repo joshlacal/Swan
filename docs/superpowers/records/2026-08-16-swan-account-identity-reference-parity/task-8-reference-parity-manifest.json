@@ -11,7 +11,7 @@
     {"method":"com.atproto.sync.listRepos","capability":"sync-repository-page","intent":"bounded exact stored integer-time+DID keyset enumeration","registered":false},
     {"method":"com.atproto.repo.importRepo","capability":"transactional-import","intent":"canonical domain-separated digest plus injected full CAR/MST verifier, then durable idempotent CAS transaction; unassembled until both exist","registered":false},
     {"method":"com.atproto.admin.updateAccountStatus","capability":"operator-admin-lifecycle","intent":"operator authorization and safe audit","registered":false},
-    {"method":"com.atproto.moderation.createReport","capability":"moderation-service-adapter","intent":"typed reasonType/subject/output over allowlisted peer-pinned transport with versioned HMAC correlations","registered":false},
+    {"method":"com.atproto.moderation.createReport","capability":"moderation-service-adapter","intent":"typed reasonType/subject/reason/output over allowlisted peer-pinned transport","registered":false},
     {"method":"ops.readiness","capability":"operational-readiness","intent":"local evidence only; runtime health source unassembled","registered":false}
   ],
   "gates": {"network":"unexecuted", "official_client":"unexecuted", "linux_x86_64":"unexecuted", "browser":"unexecuted", "deployment":"unexecuted", "backup_restore":"deferred-unassembled", "key_rotation":"deferred-unassembled", "runtime_metrics_readiness":"deferred-unassembled"}

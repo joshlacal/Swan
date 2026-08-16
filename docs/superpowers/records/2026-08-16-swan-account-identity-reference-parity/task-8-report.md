@@ -23,9 +23,8 @@ preflight before commit, and the explicit full-CAR/MST verifier seam. Import rem
 CAS committer is only a conformance model. PLC step-up, operator authorization
 verification, audit-on-success, moderation typed repoRef/strongRef subject and
 details delivery over a trusted pinned transport with explicit `$type` subject
-unions and typed output validation (`id`, `reasonType`, `subject`,
-`reportedBy`, `createdAt`), plus versioned keyed HMAC log correlations. HMAC is
-not claimed to redact public values. Runtime health/metrics and route
+unions and typed output validation (`id`, `reasonType`, `subject`, optional
+`reason`, `reportedBy`, `createdAt`). Runtime health/metrics and route
 registration remain deferred.
 
 The focused Swift suite was not rerun in this correction: the shared disk was

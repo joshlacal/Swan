@@ -221,7 +221,11 @@ public actor PublicRepositoryReferenceSurface {
         guard page.blobs.count <= limit, Set(page.blobs.map(\.cid)).count == page.blobs.count else { throw PublicRepositoryReferenceSurfaceError.invalidBinding }
         for blob in page.blobs {
             try PublicRepositoryCID.validate(blob.cid)
-            guard blob.recordURI.hasPrefix("at://"), blob.recordURI.utf8.count <= 2_048 else { throw PublicRepositoryReferenceSurfaceError.invalidBinding }
+            guard blob.recordURI.hasPrefix("at://"), blob.recordURI.utf8.count <= 2_048,
+                  let authority = blob.recordURI.dropFirst(5),
+                  let authorityEnd = authority.firstIndex(of: "/"),
+                  String(authority[..<authorityEnd]) == self.accountDID,
+                  authority.distance(from: authorityEnd, to: authority.endIndex) > 1 else { throw PublicRepositoryReferenceSurfaceError.invalidBinding }
         }
         if let next = page.cursor { _ = try decodeCursor(next) }
         return page

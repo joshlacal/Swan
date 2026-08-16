@@ -9,10 +9,7 @@ final class ModerationServiceAdapterTests: XCTestCase {
             transport: transport,
             allowedHost: "moderation.example",
             pinnedPeer: "sha256/peer",
-            maximumBodyBytes: 256,
-            correlationKeyID: "test-key",
-            correlationKeyVersion: 1,
-            correlationKey: Data(repeating: 4, count: 32)
+            maximumBodyBytes: 256
         )
         let response = try await adapter.submit(.init(subject: .repoRef(did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"), reasonType: "com.atproto.moderation.defs#reasonSpam", reason: "spam", details: "secret details"))
         XCTAssertEqual(response.accepted, true)
@@ -31,6 +28,6 @@ private actor TestModerationTransport: ModerationTransport {
     func send(_ request: ModerationTransportRequest) async throws -> ModerationTransportResponse {
         self.path = request.path
         self.body = String(decoding: request.body, as: UTF8.self)
-        return .init(status: 202, body: Data("{\"id\":\"r1\",\"reasonType\":\"com.atproto.moderation.defs#reasonSpam\",\"subject\":{\"$type\":\"com.atproto.admin.defs#repoRef\",\"did\":\"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\"},\"reportedBy\":\"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb\",\"createdAt\":\"2026-08-16T00:00:00Z\"}".utf8), peer: request.pinnedPeer)
+        return .init(status: 202, body: Data("{\"id\":1,\"reasonType\":\"com.atproto.moderation.defs#reasonSpam\",\"subject\":{\"$type\":\"com.atproto.admin.defs#repoRef\",\"did\":\"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\"},\"reason\":\"spam\",\"reportedBy\":\"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb\",\"createdAt\":\"2026-08-16T00:00:00Z\"}".utf8), peer: request.pinnedPeer)
     }
 }

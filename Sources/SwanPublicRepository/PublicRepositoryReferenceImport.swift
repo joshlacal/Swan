@@ -154,6 +154,14 @@ public struct PublicRepositoryReferenceImportVerifier: Sendable {
         _ = byCID
         let state = try await fullVerifier.verifyAndStage(envelope)
         guard state.did == envelope.did, state.rootCID == envelope.rootCID else { throw PublicRepositoryReferenceImportError.invalidBinding }
+        guard !state.blocks.isEmpty, state.blocks.contains(where: { $0.cid == envelope.rootCID }), state.blocks.count <= maximumBlocks else { throw PublicRepositoryReferenceImportError.invalidRoot }
+        var stagedBytes = 0
+        for block in state.blocks {
+            try PublicRepositoryCID.validate(block.cid, blockBytes: block.bytes)
+            let (next, overflow) = stagedBytes.addingReportingOverflow(block.bytes.count)
+            guard !overflow, next <= maximumBytes else { throw PublicRepositoryReferenceImportError.byteLimitExceeded }
+            stagedBytes = next
+        }
         return try await committer.commit(state, requestID: envelope.requestID, requestDigest: envelope.requestDigest, expectedRootCID: envelope.expectedExistingRootCID)
     }
 }

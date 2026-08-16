@@ -1,5 +1,4 @@
 import Foundation
-import Crypto
 import SwanCore
 import SwanAccounts
 import Petrel
@@ -93,22 +92,16 @@ public struct ModerationServiceAdapter: Sendable {
     private let allowedHost: String
     private let pinnedPeer: String
     private let maximumBodyBytes: Int
-    private let correlationKey: SymmetricKey
-    private let correlationKeyID: String
-    private let correlationKeyVersion: Int
     private let maximumResponseBytes = 16 * 1_024
 
-    public init(transport: any ModerationTransport, allowedHost: String, pinnedPeer: String, maximumBodyBytes: Int = 64 * 1_024, correlationKeyID: String, correlationKeyVersion: Int, correlationKey: Data) throws {
-        guard !allowedHost.isEmpty, !pinnedPeer.isEmpty, (64...1_024 * 1_024).contains(maximumBodyBytes), (1...128).contains(correlationKeyID.utf8.count), correlationKeyVersion > 0, correlationKey.count >= 32, Set(correlationKey).count >= 4 else {
+    public init(transport: any ModerationTransport, allowedHost: String, pinnedPeer: String, maximumBodyBytes: Int = 64 * 1_024) throws {
+        guard !allowedHost.isEmpty, !pinnedPeer.isEmpty, (64...1_024 * 1_024).contains(maximumBodyBytes) else {
             throw ModerationServiceAdapterError.invalidConfiguration
         }
         self.transport = transport
         self.allowedHost = allowedHost
         self.pinnedPeer = pinnedPeer
         self.maximumBodyBytes = maximumBodyBytes
-        self.correlationKey = SymmetricKey(data: correlationKey)
-        self.correlationKeyID = correlationKeyID
-        self.correlationKeyVersion = correlationKeyVersion
     }
 
     public func submit(_ request: ModerationReportRequest) async throws -> ModerationReportResult {
@@ -125,12 +118,11 @@ public struct ModerationServiceAdapter: Sendable {
         guard response.peer == pinnedPeer else { throw ModerationServiceAdapterError.peerMismatch }
         guard response.body.count <= maximumResponseBytes else { throw ModerationServiceAdapterError.responseTooLarge }
         guard (200...299).contains(response.status) else { throw ModerationServiceAdapterError.rejected }
-        guard let output = try? JSONDecoder().decode(ModerationReportOutput.self, from: response.body), output.reasonType == request.reasonType, output.subject == request.subject else { throw ModerationServiceAdapterError.invalidOutput }
+        guard let output = try? JSONDecoder().decode(ModerationReportOutput.self, from: response.body), output.id > 0,
+              output.reasonType == request.reasonType, output.subject == request.subject, output.reason == request.reason,
+              (try? AccountIdentifiers.validateDID(output.reportedBy)) != nil,
+              ISO8601DateFormatter().date(from: output.createdAt) != nil else { throw ModerationServiceAdapterError.invalidOutput }
         return .init(accepted: true, status: response.status, output: response.body, reportedBy: output.reportedBy)
-    }
-
-    private func correlation(for value: String) -> String {
-        Hex.encode(HMAC<SHA256>.authenticationCode(for: Data(value.utf8), using: correlationKey))
     }
 
     private func valid(subject: ModerationSubject) -> Bool {
@@ -143,25 +135,5 @@ public struct ModerationServiceAdapter: Sendable {
     }
 
     private struct TypedReport: Codable { let reasonType: String; let subject: ModerationSubject; let reason: String? }
-    public struct ModerationReportOutput: Codable, Sendable, Equatable { public let id: String; public let reasonType: String; public let subject: ModerationSubject; public let reportedBy: String; public let createdAt: String }
-
-    private struct RedactedReport: Codable {
-        let subjectCorrelation: String
-        let reason: String?
-        let reasonType: String
-        let detailsCorrelation: String?
-        let schema: String
-        let keyID: String
-        let keyVersion: Int
-
-        init(subjectCorrelation: String, reason: String?, reasonType: String, detailsCorrelation: String?, keyID: String, keyVersion: Int) {
-            self.subjectCorrelation = subjectCorrelation
-            self.reason = reason
-            self.reasonType = reasonType
-            self.detailsCorrelation = detailsCorrelation
-            self.keyID = keyID
-            self.keyVersion = keyVersion
-            schema = "swan.moderation.report.v1"
-        }
-    }
+    public struct ModerationReportOutput: Codable, Sendable, Equatable { public let id: Int; public let reasonType: String; public let subject: ModerationSubject; public let reason: String?; public let reportedBy: String; public let createdAt: String }
 }
