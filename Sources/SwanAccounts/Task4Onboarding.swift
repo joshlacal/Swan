@@ -582,7 +582,7 @@ private struct StoreOwnedSignupFinalizationTransaction: SignupFinalizationTransa
     }
 }
 
-public enum SignupServiceError: Error, Sendable, Equatable { case closed, inviteRequired, emailProofRequired, turnstileRequired, invalidIdentity, duplicateRequest }
+public enum SignupServiceError: Error, Sendable, Equatable { case closed, inviteRequired, emailProofRequired, turnstileRequired, invalidIdentity, duplicateRequest, rateLimited }
 
 public protocol SignupRateAdmission: Sendable {
     func permits(bucket: Data, now: Date) async throws -> Bool
@@ -740,7 +740,7 @@ public actor BoundedSignupEmailProofVerifier: SignupEmailProofVerifier {
         attempts = attempts.filter { now.timeIntervalSince($0.value.started) < 900 }
         guard attempts[key] != nil || attempts.count < 4096 else { throw SwanError.unavailable("email proof capacity") }
         if let current = attempts[key] {
-            guard current.count < 5 else { throw SwanError.unavailable("email proof rate limited") }
+            guard current.count < 5 else { throw SignupServiceError.rateLimited }
             attempts[key] = (current.started, current.count + 1)
         } else {
             attempts[key] = (now, 1)

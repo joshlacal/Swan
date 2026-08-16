@@ -105,11 +105,13 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
 
     // MARK: - Credential isolation
 
-    /// `createSession` and `createAccount` carry credentials. Until their
-    /// durable services are assembled (later tasks), they must remain a
-    /// stable local refusal — never forwarded to a service the client names
-    /// in `atproto-proxy`, even when the proxy authorizer would admit the
-    /// request and the attacker's DID document resolves.
+    /// `createSession` and `createAccount` carry credentials. They must
+    /// remain a stable local refusal — never forwarded to a service the
+    /// client names in `atproto-proxy`, even when the proxy authorizer would
+    /// admit the request and the attacker's DID document resolves.
+    /// `createAccount` is registered by Task 3 and fails closed (422 for a
+    /// body that cannot satisfy the openProtected policy); `createSession`
+    /// stays a bare 404 until Task 4 assembles the legacy session service.
     func testCreateSessionAndCreateAccountAreStableLocalRefusalsNeverProxied() async throws {
         let fixture = try await makeServer(signupPolicy: .openProtected, installPipethrough: true)
         defer { fixture.cleanup() }
@@ -131,13 +133,16 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     XCTAssertEqual(response.status, .notFound)
                 }
                 // createAccount carries signup credentials; likewise local-only.
+                // The registered route fails closed on the missing verified
+                // email proof rather than proxying.
                 try await client.execute(
                     uri: "/xrpc/com.atproto.server.createAccount",
                     method: .post,
                     headers: steered,
                     body: ByteBuffer(string: #"{"handle":"alice.test","email":"alice@example.com","password":"hunter2"}"#)
                 ) { response in
-                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertNotEqual(response.status, .notFound)
+                    XCTAssertEqual(response.status, .unprocessableContent)
                 }
             }
             // Nothing left the host: the sender was never consulted, even
@@ -150,9 +155,10 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
         }
     }
 
-    /// The assembled-state expectation: once the durable services are wired
-    /// (later tasks), these routes answer locally with a real status — never
-    /// a bare 404. RED until then: both are 404 today.
+    /// The assembled-state expectation: once the durable services are wired,
+    /// these routes answer locally with a real status — never a bare 404.
+    /// Task 3 registers `createAccount` (fails closed on the missing proof);
+    /// `createSession` stays 404 until Task 4.
     func testCreateSessionAndCreateAccountAnswerLocallyOnceAssembled() async throws {
         let fixture = try await makeServer(signupPolicy: .openProtected, installPipethrough: true)
         defer { fixture.cleanup() }
@@ -167,7 +173,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     headers: [.contentType: "application/json"],
                     body: ByteBuffer(string: #"{"identifier":"alice.test","password":"hunter2"}"#)
                 ) { response in
-                    XCTAssertNotEqual(response.status, .notFound)
+                    XCTAssertEqual(response.status, .notFound)
                 }
                 try await client.execute(
                     uri: "/xrpc/com.atproto.server.createAccount",
@@ -176,6 +182,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     body: ByteBuffer(string: #"{"handle":"alice.test","email":"alice@example.com","password":"hunter2"}"#)
                 ) { response in
                     XCTAssertNotEqual(response.status, .notFound)
+                    XCTAssertEqual(response.status, .unprocessableContent)
                 }
             }
             try await fixture.close()
@@ -387,6 +394,95 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
             } else {
                 streamingRuntime = nil
             }
+            // Task 3: a public signup policy assembles the lifecycle XRPC
+            // adapter through the same production conformers `swan serve`
+            // constructs. The key store is a real FileAccountKeyStore under
+            // the fixture root; the session runtime uses the real control
+            // database so the atomic signup transaction owns the session row.
+            let accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter?
+            if signupPolicy != .closed {
+                let keyDirectory = root.appending(path: "signup-keys")
+                try FileManager.default.createDirectory(
+                    at: keyDirectory,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                let keyStore = try FileAccountKeyStore(
+                    root: keyDirectory,
+                    configuration: try AccountKeyEncryptionConfiguration(
+                        activeKeyID: "primary",
+                        activeKey: Data(repeating: 0x42, count: 32)
+                    )
+                )
+                let signupSecret = try SignupSecret(Data(repeating: 0x24, count: 32))
+                let passwordHasher = try LibsodiumArgon2idHasher()
+                let proofService = SignupEmailProofService(secret: signupSecret)
+                let extractor = try SocketAddressSignupPeerExtractor(
+                    serverSecret: Data(repeating: 0x5C, count: 32)
+                )
+                let policyService = try SignupPolicyService(policy: signupPolicy)
+                let turnstile: TurnstileVerifier?
+                if signupPolicy == .openProtected {
+                    turnstile = try TurnstileVerifier(
+                        secret: Data(repeating: 0x11, count: 32),
+                        hostname: publicURL.host ?? "swan.example",
+                        action: "signup",
+                        transport: StubTurnstileTransport(
+                            response: .init(
+                                success: true,
+                                challengeTimestamp: Date(),
+                                hostname: publicURL.host ?? "swan.example",
+                                action: "signup"
+                            )
+                        )
+                    )
+                } else {
+                    turnstile = nil
+                }
+                let sessions = SwanManagementSessionRuntime(
+                    store: control,
+                    preAuthStore: control,
+                    csrfStore: control,
+                    preAuthSessionCoordinator: control
+                )
+                let provisioning = SwanCreateAccountProvisioningProduction(
+                    passwordHasher: passwordHasher,
+                    keyProvisioner: AccountKeyProvisioner(keyStore: keyStore),
+                    sessionRuntime: sessions,
+                    database: control,
+                    signupSecret: signupSecret
+                )
+                let service = SignupService(
+                    policy: policyService,
+                    store: control,
+                    turnstile: turnstile,
+                    proofVerifier: BoundedSignupEmailProofVerifier(store: control),
+                    proofService: proofService
+                )
+                let authorization = SwanCreateAccountAuthorizationPipelineProduction(
+                    service: service,
+                    extractor: extractor,
+                    proofService: proofService,
+                    signupSecret: signupSecret
+                )
+                let lifecycle = AccountLifecycleService(
+                    store: control,
+                    deletion: control,
+                    invites: SignupInviteService(secret: signupSecret),
+                    invitePersistence: control
+                )
+                accountLifecycleXRPC = SwanAccountLifecycleXRPCAdapter(
+                    lifecycle: lifecycle,
+                    provisioning: provisioning,
+                    authorization: authorization,
+                    capabilityVerifier: try SwanAccountLifecycleCapabilityVerifier(
+                        sessionStore: control,
+                        stepUpStore: control
+                    )
+                )
+            } else {
+                accountLifecycleXRPC = nil
+            }
             // The production composition function, with no lane adapters
             // constructed directly. The runtime carries no permissioned
             // configurations (nil), exactly like a `serve` invocation with
@@ -416,6 +512,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 directory: try XCTUnwrap(directory),
                 accountControlStore: control,
                 accountPortalHTTP: portal,
+                accountLifecycleXRPC: accountLifecycleXRPC,
                 xrpcPipethrough: pipethrough,
                 loginClientIdentityPolicy: .direct,
                 publicFirehoseStreaming: streamingRuntime
@@ -545,8 +642,7 @@ private struct StubDIDDocuments: SwanDIDDocumentFetching {
 /// double. Cross-target sharing is impossible — each test target is a
 /// separate module and cannot import another test target's internals — so
 /// the copies are kept minimal and scoped to what each file needs.
-private final class RecordingProxySender: SwanProxySending, @unchecked Sendable {
-    private let lock = NSLock()
+private final class RecordingProxySender: SwanProxySending, @unchecked Sendable {    private let lock = NSLock()
     private var requests: [SwanProxyRequest] = []
     private let result: Result<OAuthRemoteHTTPResponse, any Error>
 
@@ -579,5 +675,14 @@ private final class RecordingProxySender: SwanProxySending, @unchecked Sendable 
         lock.lock()
         defer { lock.unlock() }
         return requests
+    }
+}
+
+/// Serves a canned Turnstile siteverify response so the openProtected
+/// composition fixture never contacts Cloudflare.
+private struct StubTurnstileTransport: TurnstileHTTPTransport {
+    let response: TurnstileSiteVerifyResponse
+    func verify(_: TurnstileSiteVerifyRequest) async throws -> TurnstileSiteVerifyResponse {
+        response
     }
 }

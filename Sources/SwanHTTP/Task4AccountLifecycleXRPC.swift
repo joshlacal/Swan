@@ -1,4 +1,5 @@
 import Foundation
+import NIOCore
 import SwanAccounts
 import SwanCore
 import SwanStorage
@@ -16,6 +17,23 @@ public struct SwanCreateAccountXRPCInput: Codable, Sendable, Equatable {
     public let recoveryKey: String?
     public let plcOp: String?
     public let verificationPhone: String?
+    /// Turnstile siteverify token required by the openProtected policy.
+    /// Reference-shaped bodies omit it; openProtected then fails closed with
+    /// turnstileRequired.
+    public let turnstileToken: String?
+
+    public init(handle: String, email: String?, password: String, inviteCode: String?, verificationCode: String?, did: String?, recoveryKey: String?, plcOp: String?, verificationPhone: String?, turnstileToken: String? = nil) {
+        self.handle = handle
+        self.email = email
+        self.password = password
+        self.inviteCode = inviteCode
+        self.verificationCode = verificationCode
+        self.did = did
+        self.recoveryKey = recoveryKey
+        self.plcOp = plcOp
+        self.verificationPhone = verificationPhone
+        self.turnstileToken = turnstileToken
+    }
 }
 
 public protocol SwanCreateAccountProvisioning: Sendable {
@@ -26,7 +44,7 @@ public protocol SwanCreateAccountProvisioning: Sendable {
 /// implementation must verify policy, email proof, invite/Turnstile and DID
 /// preparation before provisioning can run.
 public protocol SwanCreateAccountAuthorizationPipeline: Sendable {
-    func authorize(_ input: SwanCreateAccountXRPCInput, now: Date) async throws
+    func authorize(_ input: SwanCreateAccountXRPCInput, peerAddress: SocketAddress?, now: Date) async throws
 }
 
 public enum AccountLifecycleAuthorizationRole: String, Sendable, Equatable {
@@ -41,7 +59,9 @@ public struct AccountLifecycleCapability: Sendable, Equatable {
     public let expiresAt: Date
     public let action: String
     public let stepUpDigest: Data
-    fileprivate init(role: AccountLifecycleAuthorizationRole, subjectDID: String?, nonce: Data, expiresAt: Date, action: String, stepUpDigest: Data) {
+    /// Internal: only the same-module verifier may mint a capability. XRPC
+    /// callers cannot construct one from a role string.
+    init(role: AccountLifecycleAuthorizationRole, subjectDID: String?, nonce: Data, expiresAt: Date, action: String, stepUpDigest: Data) {
         self.role = role; self.subjectDID = subjectDID; self.nonce = nonce; self.expiresAt = expiresAt; self.action = action; self.stepUpDigest = stepUpDigest
     }
 
@@ -66,11 +86,11 @@ public struct SwanAccountLifecycleXRPCAdapter: Sendable {
         self.lifecycle = lifecycle; self.provisioning = provisioning; self.authorization = authorization; self.capabilityVerifier = capabilityVerifier
     }
 
-    public func createAccount(_ input: SwanCreateAccountXRPCInput, now: Date = Date()) async throws -> (account: AccountControlAccount, session: Data) {
+    public func createAccount(_ input: SwanCreateAccountXRPCInput, peerAddress: SocketAddress? = nil, now: Date = Date()) async throws -> (account: AccountControlAccount, session: Data) {
         guard input.verificationPhone == nil else { throw SwanError.invalidIdentifier("verificationPhone unsupported") }
         guard input.email != nil, input.verificationCode != nil else { throw SwanError.invalidIdentifier("verified email required") }
         guard let authorization else { throw SwanError.unavailable("signup authorization unavailable") }
-        try await authorization.authorize(input, now: now)
+        try await authorization.authorize(input, peerAddress: peerAddress, now: now)
         guard let provisioning else { throw SwanError.unavailable("account provisioning unavailable") }
         return try await provisioning.createAccount(input, now: now)
     }

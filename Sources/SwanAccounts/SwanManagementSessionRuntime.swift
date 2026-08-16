@@ -51,6 +51,18 @@ public actor SwanManagementSessionRuntime {
     }
 
     public func issue(accountDID: String, strength: AuthenticationStrength = .password, now: Date = Date()) async throws -> IssuedManagementSession {
+        let issued = try mint(accountDID: accountDID, strength: strength, now: now)
+        let sessionDigest = Self.digest(issued.sessionValue)
+        let csrfDigest = Self.digest(issued.csrfValue)
+        try await store.createManagementSession(issued.metadata, sessionDigest: sessionDigest, csrfDigest: csrfDigest, now: now)
+        try await csrfStore.put(sessionDigest: sessionDigest, csrfDigest: csrfDigest)
+        return issued
+    }
+
+    /// Mints session material without persisting it. The caller persists the
+    /// session inside its own atomic transaction (signup finalization); the
+    /// non-atomic `issue` path is for flows that own their own transaction.
+    public nonisolated func mint(accountDID: String, strength: AuthenticationStrength = .password, now: Date = Date()) throws -> IssuedManagementSession {
         let sessionValue = Self.randomToken()
         let csrfValue = Self.randomToken()
         let sessionID = try ManagementSessionID(rawValue: sessionValue)
@@ -62,10 +74,6 @@ public actor SwanManagementSessionRuntime {
             absoluteExpiresAt: now.addingTimeInterval(absoluteLifetime),
             strength: strength
         )
-        let sessionDigest = Self.digest(sessionValue)
-        let csrfDigest = Self.digest(csrfValue)
-        try await store.createManagementSession(metadata, sessionDigest: sessionDigest, csrfDigest: csrfDigest, now: now)
-        try await csrfStore.put(sessionDigest: sessionDigest, csrfDigest: csrfDigest)
         return IssuedManagementSession(sessionValue: sessionValue, csrfValue: csrfValue, metadata: metadata)
     }
 

@@ -597,6 +597,120 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
         }
     }
 
+    // MARK: - Signup runtime secrets (Task 3)
+
+    /// A public signup policy without the signup HMAC secret must refuse at
+    /// startup — never silently derive a weaker key.
+    func testPublicSignupPolicyRequiresSignupSecretWithoutCreatingData() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+        let turnstile = root.appending(path: "turnstile-secret")
+        try protectedWrite(Data(repeating: 0x41, count: 43), to: turnstile)
+        let username = root.appending(path: "smtp-username")
+        let password = root.appending(path: "smtp-password")
+        try protectedWrite(Data("smtp-user@example.com".utf8), to: username)
+        try protectedWrite(Data("smtp-password-value".utf8), to: password)
+
+        // inviteRequired without the signup secret.
+        let invite = try runServe(data: data, arguments: [
+            "--enable-account-portal",
+            "--signup-policy", "inviteRequired",
+        ])
+        XCTAssertNotEqual(invite.status, 0)
+        XCTAssertTrue(invite.output.isEmpty)
+        XCTAssertTrue(
+            invite.error.contains(
+                "--signup-policy inviteRequired requires an owner-only --signup-secret-file or SWAN_SIGNUP_SECRET"
+            ),
+            invite.error
+        )
+        XCTAssertFalse(invite.error.contains(root.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
+
+        // openProtected with a complete SMTP configuration but no signup
+        // secret still refuses.
+        let open = try runServe(data: data, arguments: [
+            "--enable-account-portal",
+            "--signup-policy", "openProtected",
+            "--turnstile-secret-file", turnstile.path,
+            "--email-smtp-mode", "startTLS",
+            "--email-smtp-host", "smtp.example.com",
+            "--email-smtp-port", "587",
+            "--email-smtp-username-file", username.path,
+            "--email-smtp-password-file", password.path,
+            "--email-smtp-mechanism", "login",
+            "--email-smtp-expected-hostname", "smtp.example.com",
+        ])
+        XCTAssertNotEqual(open.status, 0)
+        XCTAssertTrue(open.output.isEmpty)
+        XCTAssertTrue(
+            open.error.contains(
+                "--signup-policy openProtected requires an owner-only --signup-secret-file or SWAN_SIGNUP_SECRET"
+            ),
+            open.error
+        )
+        XCTAssertFalse(open.error.contains(turnstile.path))
+        XCTAssertFalse(open.error.contains(username.path))
+        XCTAssertFalse(open.error.contains(password.path))
+        XCTAssertFalse(open.error.contains(root.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
+    }
+
+    /// A public signup policy without the account KEK must refuse at startup
+    /// — the signup key store cannot be silently replaced by an in-memory
+    /// fallback.
+    func testPublicSignupPolicyRequiresAccountKEKWithoutCreatingData() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+        let signupSecret = root.appending(path: "signup-secret")
+        try protectedWrite(Data(repeating: 0x24, count: 43), to: signupSecret)
+
+        let result = try runServe(data: data, arguments: [
+            "--enable-account-portal",
+            "--signup-policy", "inviteRequired",
+            "--signup-secret-file", signupSecret.path,
+        ])
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.isEmpty)
+        XCTAssertTrue(
+            result.error.contains(
+                "--signup-policy inviteRequired requires an owner-only --signup-account-kek-file or SWAN_ACCOUNT_KEK"
+            ),
+            result.error
+        )
+        XCTAssertFalse(result.error.contains(signupSecret.path))
+        XCTAssertFalse(result.error.contains(root.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
+    }
+
+    /// A closed policy refuses supplied signup secret/KEK options — the
+    /// closed deployment never assembles a signup runtime.
+    func testClosedPolicyRefusesSignupSecretAndKEKOptions() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+        let signupSecret = root.appending(path: "signup-secret")
+        try protectedWrite(Data(repeating: 0x24, count: 43), to: signupSecret)
+
+        let result = try runServe(data: data, arguments: [
+            "--enable-account-portal",
+            "--signup-secret-file", signupSecret.path,
+        ])
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.isEmpty)
+        XCTAssertTrue(
+            result.error.contains(
+                "--signup-secret-file, --signup-account-kek-file, --signup-account-kek-id, and --signup-account-key-directory require --signup-policy inviteRequired or openProtected"
+            ),
+            result.error
+        )
+        XCTAssertFalse(result.error.contains(signupSecret.path))
+        XCTAssertFalse(result.error.contains(root.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
+    }
+
     // MARK: - Helpers
 
     private func runServe(

@@ -971,6 +971,7 @@ struct ServePermissionedRuntime {
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
         actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
         accountPortalHTTP: SwanAccountPortalHTTP? = nil,
+        accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter? = nil,
         xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil
@@ -1002,6 +1003,7 @@ struct ServePermissionedRuntime {
             blobStreamAdmission: directory.publicRepositorySpoolAdmission,
             accountEmailXRPC: accountEmailXRPC,
             accountPortalHTTP: accountPortalHTTP,
+            accountLifecycleXRPC: accountLifecycleXRPC,
             actorPreferencesXRPC: actorPreferencesXRPC,
             xrpcPipethrough: xrpcPipethrough,
             loginClientIdentityPolicy: loginClientIdentityPolicy,
@@ -2051,6 +2053,30 @@ extension SwanCommand {
         var turnstileSecretFile: String?
 
         @Option(
+            name: .customLong("signup-secret-file"),
+            help: "Owner-only mounted 32-byte base64url signup secret (email-proof/invite HMAC); SWAN_SIGNUP_SECRET is the alternative"
+        )
+        var signupSecretFile: String?
+
+        @Option(
+            name: .customLong("signup-account-kek-file"),
+            help: "Owner-only mounted account-KEK file for signup key provisioning; SWAN_ACCOUNT_KEK is the alternative"
+        )
+        var signupAccountKEKFile: String?
+
+        @Option(
+            name: .customLong("signup-account-kek-id"),
+            help: "Active account-KEK identifier for signup key provisioning (default: primary)"
+        )
+        var signupAccountKEKID: String?
+
+        @Option(
+            name: .customLong("signup-account-key-directory"),
+            help: "Protected account key-envelope directory for signup key provisioning; defaults to <data-directory>/keys"
+        )
+        var signupAccountKeyDirectory: String?
+
+        @Option(
             name: .customLong("email-smtp-mode"),
             help: "Authenticated SMTP mode: startTLS, implicitTLS, or plaintextLab; omit to use the Mailpit laboratory default"
         )
@@ -2726,6 +2752,10 @@ extension SwanCommand {
                 guard accountPortalDirectory == nil,
                       signupPolicy == nil,
                       turnstileSecretFile == nil,
+                      signupSecretFile == nil,
+                      signupAccountKEKFile == nil,
+                      signupAccountKEKID == nil,
+                      signupAccountKeyDirectory == nil,
                       emailSMTPMode == nil,
                       emailSMTPUsernameFile == nil,
                       emailSMTPPasswordFile == nil,
@@ -2797,6 +2827,35 @@ extension SwanCommand {
                 expectedHostname: emailSMTPExpectedHostname,
                 maximumAttempts: emailSMTPMaxAttempts
             )
+            // A public signup policy (inviteRequired or openProtected)
+            // assembles the signup runtime: the email-proof/invite HMAC
+            // secret and the account key store are both required, and
+            // neither may be silently replaced by a weaker default. This
+            // runs after the SMTP refusals so an incomplete SMTP
+            // configuration reports the SMTP problem first.
+            if enableAccountPortal && signupPolicy != .closed {
+                guard signupSecretFile != nil
+                    || ProcessInfo.processInfo.environment["SWAN_SIGNUP_SECRET"] != nil else {
+                    throw ValidationError(
+                        "--signup-policy \(signupPolicy.rawValue) requires an owner-only --signup-secret-file or SWAN_SIGNUP_SECRET"
+                    )
+                }
+                guard signupAccountKEKFile != nil
+                    || ProcessInfo.processInfo.environment["SWAN_ACCOUNT_KEK"] != nil else {
+                    throw ValidationError(
+                        "--signup-policy \(signupPolicy.rawValue) requires an owner-only --signup-account-kek-file or SWAN_ACCOUNT_KEK"
+                    )
+                }
+            } else if enableAccountPortal {
+                guard signupSecretFile == nil,
+                      signupAccountKEKFile == nil,
+                      signupAccountKEKID == nil,
+                      signupAccountKeyDirectory == nil else {
+                    throw ValidationError(
+                        "--signup-secret-file, --signup-account-kek-file, --signup-account-kek-id, and --signup-account-key-directory require --signup-policy inviteRequired or openProtected"
+                    )
+                }
+            }
             guard !enableManagementPLCProvisioning || managementPort != nil else {
                 throw ValidationError("--enable-management-plc-provisioning requires --management-port")
             }
@@ -3298,6 +3357,156 @@ extension SwanCommand {
                     accountEmailXRPC = nil
                     emailRecoveryService = nil
                 }
+                // Account program signup runtime (Task 3). Assembled only for
+                // a public signup policy; `closed` keeps the adapter nil so
+                // the createAccount route fails closed (503) rather than
+                // advertising a signup surface that cannot admit anyone.
+                let accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter?
+                var signupEmailOutboxService: SwanSignupEmailOutboxService?
+                if signupPolicy != .closed {
+                    do {
+                        let signupSecret: SignupSecret
+                        do {
+                            let secretData: Data
+                            if let signupSecretFile {
+                                secretData = try AccountProvisioningSecrets.requiredMounted32ByteSecret(
+                                    secretFile: URL(fileURLWithPath: signupSecretFile)
+                                )
+                            } else if let encoded = ProcessInfo.processInfo.environment["SWAN_SIGNUP_SECRET"],
+                                      let decoded = Data(base64URLEncoded: encoded),
+                                      decoded.count == 32 {
+                                secretData = decoded
+                            } else {
+                                throw SwanError.unavailable("signup secret is unavailable")
+                            }
+                            signupSecret = try SignupSecret(secretData)
+                        } catch let error as ValidationError {
+                            throw error
+                        } catch {
+                            throw ValidationError("signup secret is unavailable")
+                        }
+                        let keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                            activeKeyID: signupAccountKEKID ?? "primary",
+                            secretFile: signupAccountKEKFile.map { URL(fileURLWithPath: $0) }
+                        )
+                        let keyDirectory = signupAccountKeyDirectory.map {
+                            URL(fileURLWithPath: $0)
+                        } ?? dataURL.appending(path: "keys")
+                        try requireExistingOwnerOnlyKeyDirectory(keyDirectory)
+                        let keyStore = try FileAccountKeyStore(
+                            root: keyDirectory,
+                            configuration: keyConfiguration
+                        )
+                        let passwordHasher = try LibsodiumArgon2idHasher()
+                        let proofService = SignupEmailProofService(secret: signupSecret)
+                        let extractor = try SocketAddressSignupPeerExtractor(
+                            serverSecret: serverKey
+                        )
+                        let policyService = try SignupPolicyService(
+                            policy: signupPolicy
+                        )
+                        let turnstile: TurnstileVerifier?
+                        if signupPolicy == .openProtected {
+                            let secretData = try AccountProvisioningSecrets.requiredMounted32ByteSecret(
+                                secretFile: URL(fileURLWithPath: turnstileSecretFile!)
+                            )
+                            turnstile = try TurnstileVerifier(
+                                secret: secretData,
+                                hostname: baseURL.host ?? "",
+                                action: "signup",
+                                transport: try URLSessionTurnstileTransport()
+                            )
+                        } else {
+                            turnstile = nil
+                        }
+                        let smtpConfiguration = try Self.resolveAuthenticatedSMTPConfiguration(
+                            mode: smtpMode,
+                            host: emailSMTPHost,
+                            port: emailSMTPPort,
+                            usernameFile: emailSMTPUsernameFile,
+                            passwordFile: emailSMTPPasswordFile,
+                            mechanism: smtpMechanism,
+                            expectedHostname: emailSMTPExpectedHostname,
+                            maximumAttempts: emailSMTPMaxAttempts
+                        )
+                        let delivery: AuthenticatedSMTPDelivery?
+                        if let smtpConfiguration {
+                            let transport = try NIOAuthenticatedSMTPTransport()
+                            delivery = try AuthenticatedSMTPDelivery(
+                                configuration: smtpConfiguration,
+                                transport: transport.makeTransport()
+                            )
+                        } else {
+                            delivery = nil
+                        }
+                        let sessions = SwanManagementSessionRuntime(
+                            store: controlDatabase,
+                            preAuthStore: controlDatabase,
+                            csrfStore: controlDatabase,
+                            preAuthSessionCoordinator: controlDatabase
+                        )
+                        let provisioning = SwanCreateAccountProvisioningProduction(
+                            passwordHasher: passwordHasher,
+                            keyProvisioner: AccountKeyProvisioner(keyStore: keyStore),
+                            sessionRuntime: sessions,
+                            database: controlDatabase,
+                            signupSecret: signupSecret
+                        )
+                        let service = SignupService(
+                            policy: policyService,
+                            store: controlDatabase,
+                            turnstile: turnstile,
+                            proofVerifier: BoundedSignupEmailProofVerifier(
+                                store: controlDatabase
+                            ),
+                            proofService: proofService
+                        )
+                        let authorization = SwanCreateAccountAuthorizationPipelineProduction(
+                            service: service,
+                            extractor: extractor,
+                            proofService: proofService,
+                            signupSecret: signupSecret
+                        )
+                        let lifecycle = AccountLifecycleService(
+                            store: controlDatabase,
+                            deletion: controlDatabase,
+                            invites: SignupInviteService(secret: signupSecret),
+                            invitePersistence: controlDatabase
+                        )
+                        let capabilityVerifier = try SwanAccountLifecycleCapabilityVerifier(
+                            sessionStore: controlDatabase,
+                            stepUpStore: controlDatabase
+                        )
+                        accountLifecycleXRPC = SwanAccountLifecycleXRPCAdapter(
+                            lifecycle: lifecycle,
+                            provisioning: provisioning,
+                            authorization: authorization,
+                            capabilityVerifier: capabilityVerifier
+                        )
+                        if let delivery {
+                            let worker = SignupEmailOutboxWorker(
+                                store: controlDatabase,
+                                deliver: { message in
+                                    try await SignupEmailSMTPDeliveryWorker(
+                                        proof: proofService,
+                                        smtp: delivery
+                                    ).deliver(message)
+                                }
+                            )
+                            signupEmailOutboxService = SwanSignupEmailOutboxService(
+                                worker: worker,
+                                delivery: delivery
+                            )
+                        }
+                    } catch let error as ValidationError {
+                        throw error
+                    } catch {
+                        throw ValidationError("signup runtime is unavailable")
+                    }
+                } else {
+                    accountLifecycleXRPC = nil
+                    signupEmailOutboxService = nil
+                }
                 // Composed unconditionally, and deliberately not behind a
                 // flag. Preferences are PDS-owned state that the AppView does
                 // not store, so a nil capability here would leave the routes
@@ -3654,6 +3863,7 @@ extension SwanCommand {
                     authorizationServerConfiguration: authorizationServerConfiguration,
                     accountEmailXRPC: accountEmailXRPC,
                     actorPreferencesXRPC: actorPreferencesXRPC,
+                    accountLifecycleXRPC: accountLifecycleXRPC,
                     xrpcPipethrough: xrpcPipethrough,
                     loginClientIdentityPolicy: loginClientIdentityPolicy,
                     publicFirehoseStreaming: publicFirehoseStreamingRuntime
@@ -3747,6 +3957,10 @@ extension SwanCommand {
                 if let emailRecoveryService {
                     services.append(emailRecoveryService)
                     logger.info("account email recovery delivery enabled with Mailpit SMTP")
+                }
+                if let signupEmailOutboxService {
+                    services.append(signupEmailOutboxService)
+                    logger.info("durable signup email outbox worker enabled with authenticated SMTP")
                 }
                 if let publicFirehoseService {
                     services.append(publicFirehoseService)
