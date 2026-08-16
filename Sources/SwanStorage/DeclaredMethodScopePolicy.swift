@@ -22,7 +22,19 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
     private let permitsFullAccess: Bool
 
     public static let denyAll = DeclaredMethodScopePolicy()
-    public static let fullAccessV1 = DeclaredMethodScopePolicy(permitsFullAccess: true)
+    /// Explicitly enumerated legacy methods. Full access is still bounded by
+    /// this registry; it is never a wildcard over arbitrary route strings.
+    public static let fullAccessV1 = DeclaredMethodScopePolicy(
+        declarations: [
+            "com.atproto.server.createSession": [], "com.atproto.server.refreshSession": [],
+            "com.atproto.server.getSession": [], "com.atproto.server.deleteSession": [],
+            "com.atproto.server.getServiceAuth": [], "com.atproto.server.createAppPassword": [],
+            "com.atproto.server.listAppPasswords": [], "com.atproto.server.revokeAppPassword": [],
+            "com.atproto.repo.createRecord": [], "com.atproto.repo.getRecord": [],
+            "app.bsky.feed.getTimeline": [], "app.bsky.feed.post": [],
+            "chat.bsky.convo.listConvos": [], "chat.bsky.convo.sendMessage": []
+        ], permitsFullAccess: true
+    )
 
     public init(declarations: [String: Set<String>] = [:], permitsFullAccess: Bool = false) {
         self.declarations = declarations.filter { Self.isCanonicalMethod($0.key) }

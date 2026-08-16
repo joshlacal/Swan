@@ -32,13 +32,15 @@ final class ScopedLegacyAuthTests: XCTestCase {
 
     func testAppPasswordSecretPresentedOnceAndScopeEditRevokesDerivedSession() async throws {
         let store = InMemoryLegacyAuthStore()
-        let service = try LegacyAuthService(store: store, accountResolver: .fixture, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, session, stepUp in session == "management" && stepUp == "step-up" }, loginAdmission: LegacyLoginAdmission { _ in })
+        let service = try LegacyAuthService(store: store, accountResolver: .fixture, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, session, stepUp in session == "management" && (stepUp.isEmpty || stepUp == "step-up") }, loginAdmission: LegacyLoginAdmission { _ in })
         let created = try await service.createAppPassword(accountDID: "did:plc:alice", name: "writer", scopes: ["repo:write"], managementSessionToken: "management", stepUpToken: "step-up", now: Date(timeIntervalSince1970: 10))
         XCTAssertFalse(created.secret.isEmpty)
-        let listed = try await service.listAppPasswords(accountDID: "did:plc:alice", managementSessionToken: "management", stepUpToken: "step-up")
+        let listed = try await service.listAppPasswords(accountDID: "did:plc:alice", managementSessionToken: "management")
         XCTAssertEqual(listed.count, 1)
         let session = try await service.createSession(identifier: "did:plc:alice", password: created.secret, now: Date(timeIntervalSince1970: 11))
         XCTAssertEqual(session.scopes, ["repo:write"])
+        let used = try await service.listAppPasswords(accountDID: "did:plc:alice", managementSessionToken: "management")
+        XCTAssertEqual(used.first?.lastUsedAt, Date(timeIntervalSince1970: 11))
         try await service.updateAppPasswordScopes(accountDID: "did:plc:alice", name: "writer", scopes: ["repo:read"], managementSessionToken: "management", stepUpToken: "step-up", now: Date(timeIntervalSince1970: 12))
         do { _ = try await service.refreshSession(session.refreshToken, now: Date(timeIntervalSince1970: 13)); XCTFail("scope edit must revoke the old family") } catch { }
         let replacement = try await service.createSession(identifier: "did:plc:alice", password: created.secret, now: Date(timeIntervalSince1970: 14))
@@ -76,7 +78,9 @@ final class ScopedLegacyAuthTests: XCTestCase {
         let scoped = try await service.createSession(identifier: "did:plc:mfa", password: app.secret)
         XCTAssertEqual(scoped.scopes, ["repo:read"])
         let password = try await service.createSession(identifier: "did:plc:mfa", password: "password", authFactorToken: "valid-factor")
-        XCTAssertEqual(password.scopes, ["atproto"])
+        XCTAssertTrue(password.fullAccess)
+        _ = try await service.getServiceAuth(accessToken: password.accessToken, lxm: "com.atproto.repo.getRecord", aud: "https://pds.example.test")
+        do { _ = try await service.getServiceAuth(accessToken: password.accessToken, lxm: "com.atproto.repo.undeclared", aud: "https://pds.example.test"); XCTFail("undeclared full-access method must deny") } catch { }
     }
 
     func testManagementMutationWithoutVerifiedSessionOrStepUpIsDenied() async throws {

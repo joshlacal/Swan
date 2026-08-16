@@ -67,6 +67,10 @@ extension SQLiteControlDatabase: AppPasswordStore, LegacySessionStore {
         }
     }
 
+    public func markAppPasswordUsed(id: String, now: Date) async throws {
+        try await withConnectionGate { _ = try await connection.query("UPDATE app_passwords SET last_used_at = ? WHERE app_password_id = ? AND revoked_at IS NULL", [.integer(Self.seconds(now)), .text(id)]) }
+    }
+
     public func createLegacySessionFamily(_ family: LegacySessionFamilyMetadata, session: LegacySessionMetadata, sessionDigest: Data, now: Date) async throws {
         let familyExpiry = Self.seconds(family.expiresAt)
         try await withConnectionGate {

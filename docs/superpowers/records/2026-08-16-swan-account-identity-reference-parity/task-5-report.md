@@ -10,7 +10,10 @@ per-secret random-salt/versioned Argon2id digests, CSPRNG tokens, mandatory
 runtime keys, injected login admission, and injected management-session plus
 step-up authorization. Access and service credentials are signed/verifiable
 JWTs with issuer, audience/method, `iat`, `exp`, and `jti` claims; access JWTs
-carry the durable session ID for cross-replica lookup.
+carry the durable session ID for cross-replica lookup. Password sessions use
+an internal marker evaluated only against the explicit full-access method
+registry; app-password management adapters consume a typed opaque XRPC
+authorization context, never a browser cookie.
 
 ## Lane scope
 
