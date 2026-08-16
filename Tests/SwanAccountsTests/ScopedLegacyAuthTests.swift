@@ -80,6 +80,8 @@ final class ScopedLegacyAuthTests: XCTestCase {
         ]
         XCTAssertTrue(proxyManifest.isSubset(of: DeclaredMethodScopePolicy.referenceLegacy.declaredMethods))
         XCTAssertFalse(DeclaredMethodScopePolicy.referenceLegacy.declaredMethods.contains("app.bsky.unknown.getFeed"))
+        XCTAssertTrue(DeclaredMethodScopePolicy.referenceLegacy.allows(credential: .fullAccessV1, method: "com.atproto.repo.getRecord"))
+        XCTAssertTrue(DeclaredMethodScopePolicy.referenceLegacy.allows(credential: .fullAccessV1, method: "tools.ozone.moderation.emitEvent"))
     }
 
     func testAppPasswordSecretPresentedOnceAndScopeEditRevokesDerivedSession() async throws {
@@ -140,6 +142,8 @@ final class ScopedLegacyAuthTests: XCTestCase {
         let exactExpiry = Date(timeIntervalSince1970: 50)
         let serviceToken = try await service.getServiceAuth(accessToken: fetched.accessToken, lxm: "com.atproto.repo.getRecord", aud: "https://pds.example.test", requestedExpiry: exactExpiry, now: Date(timeIntervalSince1970: 15))
         XCTAssertEqual(serviceToken.expiresAt, exactExpiry)
+        let fractional = try await service.getServiceAuth(accessToken: fetched.accessToken, lxm: "com.atproto.repo.getRecord", aud: "https://pds.example.test", requestedExpiry: Date(timeIntervalSince1970: 75.9), now: Date(timeIntervalSince1970: 15.9))
+        XCTAssertEqual(fractional.expiresAt, Date(timeIntervalSince1970: 75))
         do { _ = try await service.getServiceAuth(accessToken: fetched.accessToken, lxm: "com.atproto.repo.getRecord", aud: "https://pds.example.test", requestedExpiry: Date(timeIntervalSince1970: 76), now: Date(timeIntervalSince1970: 15)); XCTFail("expiry over 60 seconds must deny") } catch { }
         do { _ = try await service.getServiceAuth(accessToken: password.accessToken, lxm: "com.atproto.repo.undeclared", aud: "https://pds.example.test"); XCTFail("undeclared full-access method must deny") } catch { }
     }

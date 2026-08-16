@@ -364,11 +364,14 @@ public actor LegacyAuthService {
         let session = try await getSession(accessToken, now: now)
         let isFull = session.fullAccess
         try SwanScopeEvaluator().evaluate(credential: isFull ? .fullAccessV1 : .scopes(session.scopes), canonicalMethod: lxm, declaredMethodPolicy: methodPolicy, audience: aud)
-        let expiry = requestedExpiry ?? now.addingTimeInterval(Self.serviceAuthLifetime)
-        guard expiry.timeIntervalSince(now) >= 1, expiry.timeIntervalSince(now) <= Self.serviceAuthLifetime else {
+        let issuedEpoch = floor(now.timeIntervalSince1970)
+        let expiryEpoch = requestedExpiry.map { floor($0.timeIntervalSince1970) } ?? (issuedEpoch + Self.serviceAuthLifetime)
+        guard expiryEpoch > issuedEpoch, expiryEpoch <= issuedEpoch + Self.serviceAuthLifetime else {
             throw SwanError.unauthorized("invalid service auth expiry")
         }
-        return LegacyServiceAuthToken(token: try tokenIssuer.issueServiceAuth(subject: session.did, audience: aud, method: lxm, issuedAt: now, expiresAt: expiry), subject: session.did, audience: aud, expiresAt: expiry)
+        let issuedAt = Date(timeIntervalSince1970: issuedEpoch)
+        let expiry = Date(timeIntervalSince1970: expiryEpoch)
+        return LegacyServiceAuthToken(token: try tokenIssuer.issueServiceAuth(subject: session.did, audience: aud, method: lxm, issuedAt: issuedAt, expiresAt: expiry), subject: session.did, audience: aud, expiresAt: expiry)
     }
 
     private func issueSession(account: LegacyAccountRecord, appPassword: AppPasswordMetadata?, scopes: Set<String>? = nil, now: Date) async throws -> LegacySessionTokens {

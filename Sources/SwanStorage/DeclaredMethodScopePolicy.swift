@@ -54,10 +54,14 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
             // Official-client chat methods.
             "chat.bsky.convo.getConvo": ["rpc:chat.bsky"], "chat.bsky.convo.getMessages": ["rpc:chat.bsky"],
             "chat.bsky.convo.listConvos": ["rpc:chat.bsky"], "chat.bsky.convo.sendMessage": ["rpc:chat.bsky"]
+            ,"tools.ozone.moderation.emitEvent": ["rpc:tools.ozone"],
+            "com.atproto.moderation.createReport": ["rpc:com.atproto.moderation"],
+            "com.atproto.label.queryLabels": ["rpc:com.atproto.label"]
         ], permitsFullAccess: true
     )
-    /// The scoped reference policy uses exactly the same declarations and
-    /// required capabilities, but does not enable the internal full grant.
+    /// The default reference policy uses exactly the same declarations and
+    /// required capabilities as the scoped evaluator, while permitting only
+    /// the internal full-access grant in addition.
     public static let referenceLegacy = DeclaredMethodScopePolicy(
         declarations: fullAccessV1.declarations, permitsFullAccess: true
     )
