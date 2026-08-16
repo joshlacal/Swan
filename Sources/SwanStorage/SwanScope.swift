@@ -55,8 +55,9 @@ public struct SwanScope: Codable, Hashable, Sendable, Equatable {
                 guard Self.isPathComponent(remainder) else { throw SwanScopeError.malformed }
                 return Self(kind: .transition(String(remainder)), canonicalValue: value)
             case "include":
-                guard Self.isPathComponent(remainder), String(remainder) != "full" else { throw SwanScopeError.malformed }
-                return Self(kind: .include(String(remainder)), canonicalValue: value)
+                // Includes have no expansion registry in this lane. Accepting
+                // one would create an unevaluated authority string.
+                throw SwanScopeError.wildcardNotAllowed
             case "rpc":
                 return try Self.parseRPC(String(remainder))
             default:
@@ -138,7 +139,8 @@ public enum SwanScopePreset: String, Codable, CaseIterable, Sendable {
 
     public var scopes: Set<String> {
         switch self {
-        case .bluesky: return ["atproto"]
+        case .bluesky:
+            return ["repo:read", "repo:write", "blob:read", "blob:write", "rpc:app.bsky?aud=https://api.bsky.app", "rpc:chat.bsky?aud=https://api.bsky.app"]
         case .full: return [] // fullAccessV1 is internal and cannot be requested
         case .readOnly: return ["repo:read", "blob:read", "account:read"]
         case .postOnly: return ["repo:write", "blob:write"]
@@ -158,7 +160,9 @@ public struct SwanScopeEvaluator: Sendable {
         guard DeclaredMethodScopePolicy.isCanonicalMethod(canonicalMethod) else {
             throw SwanScopeError.undeclaredMethod
         }
-        guard declaredMethodPolicy.declares(canonicalMethod) || credential == .fullAccessV1 else {
+        // Even the internal full-access sentinel is constrained by the
+        // canonical method registry. A missing declaration is never a grant.
+        guard declaredMethodPolicy.declares(canonicalMethod) else {
             throw SwanScopeError.undeclaredMethod
         }
         if credential == .fullAccessV1 {

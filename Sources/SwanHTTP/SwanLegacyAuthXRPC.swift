@@ -23,7 +23,7 @@ public struct SwanLegacyAuthXRPCAdapter: Sendable {
 
     public func getSession(accessToken: String, now: Date = Date()) async throws -> ComAtprotoServerGetSession.Output {
         let tokens = try await service.getSession(accessToken, now: now)
-        return try ComAtprotoServerGetSession.Output(handle: Handle(handleString: tokens.handle), did: DID(didString: tokens.did))
+        return try ComAtprotoServerGetSession.Output(handle: Handle(handleString: tokens.handle), did: DID(didString: tokens.did), email: tokens.email, emailConfirmed: tokens.emailConfirmed, emailAuthFactor: tokens.emailAuthFactor, active: tokens.active, status: tokens.status)
     }
 
     public func deleteSession(accessToken: String, now: Date = Date()) async throws {
@@ -35,18 +35,18 @@ public struct SwanLegacyAuthXRPCAdapter: Sendable {
         return ComAtprotoServerGetServiceAuth.Output(token: result.token)
     }
 
-    public func createAppPassword(accountDID: String, name: String, scopes: Set<String>, now: Date = Date()) async throws -> ComAtprotoServerCreateAppPassword.AppPassword {
-        let result = try await service.createAppPassword(accountDID: accountDID, name: name, scopes: scopes, now: now)
+    public func createAppPassword(accountDID: String, name: String, scopes: Set<String>, managementSessionToken: String, stepUpToken: String, now: Date = Date()) async throws -> ComAtprotoServerCreateAppPassword.AppPassword {
+        let result = try await service.createAppPassword(accountDID: accountDID, name: name, scopes: scopes, managementSessionToken: managementSessionToken, stepUpToken: stepUpToken, now: now)
         return ComAtprotoServerCreateAppPassword.AppPassword(name: result.name, password: result.secret, createdAt: ATProtocolDate(date: now), privileged: nil)
     }
 
-    public func listAppPasswords(accountDID: String, now: Date = Date()) async throws -> ComAtprotoServerListAppPasswords.Output {
-        let values = try await service.listAppPasswords(accountDID: accountDID, now: now)
+    public func listAppPasswords(accountDID: String, managementSessionToken: String, stepUpToken: String, now: Date = Date()) async throws -> ComAtprotoServerListAppPasswords.Output {
+        let values = try await service.listAppPasswords(accountDID: accountDID, managementSessionToken: managementSessionToken, stepUpToken: stepUpToken, now: now)
         return ComAtprotoServerListAppPasswords.Output(passwords: values.map { .init(name: $0.name, createdAt: ATProtocolDate(date: $0.createdAt), privileged: nil) })
     }
 
-    public func revokeAppPassword(accountDID: String, input: ComAtprotoServerRevokeAppPassword.Input, now: Date = Date()) async throws {
-        try await service.revokeAppPassword(accountDID: accountDID, name: input.name, now: now)
+    public func revokeAppPassword(accountDID: String, input: ComAtprotoServerRevokeAppPassword.Input, managementSessionToken: String, stepUpToken: String, now: Date = Date()) async throws {
+        try await service.revokeAppPassword(accountDID: accountDID, name: input.name, managementSessionToken: managementSessionToken, stepUpToken: stepUpToken, now: now)
     }
 
     private func createSessionOutput(_ tokens: LegacySessionTokens) throws -> ComAtprotoServerCreateSession.Output {
@@ -55,8 +55,8 @@ public struct SwanLegacyAuthXRPCAdapter: Sendable {
             refreshJwt: tokens.refreshToken,
             handle: Handle(handleString: tokens.handle),
             did: DID(didString: tokens.did),
-            didDoc: nil, email: nil, emailConfirmed: nil, emailAuthFactor: nil,
-            active: true, status: nil
+            didDoc: nil, email: tokens.email, emailConfirmed: tokens.emailConfirmed, emailAuthFactor: tokens.emailAuthFactor,
+            active: tokens.active, status: tokens.status
         )
     }
 
@@ -66,8 +66,8 @@ public struct SwanLegacyAuthXRPCAdapter: Sendable {
             refreshJwt: tokens.refreshToken,
             handle: Handle(handleString: tokens.handle),
             did: DID(didString: tokens.did),
-            didDoc: nil, email: nil, emailConfirmed: nil, emailAuthFactor: nil,
-            active: true, status: nil
+            didDoc: nil, email: tokens.email, emailConfirmed: tokens.emailConfirmed, emailAuthFactor: tokens.emailAuthFactor,
+            active: tokens.active, status: tokens.status
         )
     }
 }

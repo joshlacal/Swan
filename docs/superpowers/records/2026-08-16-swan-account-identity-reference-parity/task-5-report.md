@@ -1,5 +1,17 @@
 # Task 5 — scoped app passwords and legacy sessions
 
+## Review correction round
+
+The follow-up review required a second correction round. The lane now denies
+undeclared methods even for the internal full-access credential, rejects all
+`include:*` values until an expansion registry exists, revokes derived
+families on scope edits, preserves absolute family expiry on refresh, uses
+per-secret random-salt/versioned Argon2id digests, CSPRNG tokens, mandatory
+runtime keys, injected login admission, and injected management-session plus
+step-up authorization. Access and service credentials are signed/verifiable
+JWTs with issuer, audience/method, `iat`, `exp`, and `jti` claims; access JWTs
+carry the durable session ID for cross-replica lookup.
+
 ## Lane scope
 
 Implemented from foundation `884b92fd` in the `Swan-account-legacy-auth` lane.
@@ -17,8 +29,8 @@ Dockerfile, generated wire, or OAuth DPoP family source was changed.
   fails closed for undeclared methods, missing scopes, empty grants, and
   unauthorized full-access credentials.
 - `LegacyAuthService` creates/list/edits/revokes app passwords, presents a
-  generated secret only from create, stores only deterministic account-bound
-  Argon2id 32-byte digests, and
+  generated secret only from create, stores versioned random-salt Argon2id
+  digests, and
   issues the sibling legacy session family. Refresh rotates lineage, re-reads
   current app-password scopes, and rejects replay after atomic family
   revocation. App-password revocation revokes every derived family/session.
@@ -31,7 +43,8 @@ Dockerfile, generated wire, or OAuth DPoP family source was changed.
 - Focused tests cover grammar/audience boundaries, declaration enforcement,
   one-time secret behavior, refresh narrowing, replay reuse revocation, and
   derived-session revocation; an adapter test checks pinned session wire
-  fields.
+  fields. The correction round adds negative include/undeclared-full-access
+  checks and management/factor/admission injection coverage.
 
 ## Integration handoff
 

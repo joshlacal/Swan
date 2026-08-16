@@ -43,9 +43,14 @@ extension SQLiteControlDatabase: AppPasswordStore, LegacySessionStore {
         let encoded = try Self.encodeScopes(scopes)
         try await withConnectionGate {
             try await transaction {
-                let existing = try await connection.query("SELECT 1 FROM app_passwords WHERE account_did = ? AND canonical_name = ? AND revoked_at IS NULL LIMIT 1", [.text(accountDID), .text(canonicalName)])
+                let existing = try await connection.query("SELECT app_password_id FROM app_passwords WHERE account_did = ? AND canonical_name = ? AND revoked_at IS NULL LIMIT 1", [.text(accountDID), .text(canonicalName)])
                 guard !existing.isEmpty else { throw SwanError.unauthorized("app password not found") }
                 _ = try await connection.query("UPDATE app_passwords SET scope_strings = ?, last_used_at = ? WHERE account_did = ? AND canonical_name = ? AND revoked_at IS NULL", [.blob(encoded), .integer(Self.seconds(now)), .text(accountDID), .text(canonicalName)])
+                // A scope edit is a credential boundary: existing derived
+                // sessions retain no authority after the edit.
+                guard let passwordID = existing[0].column("app_password_id")?.string else { throw SwanError.malformed("app-password storage") }
+                _ = try await connection.query("UPDATE legacy_session_families SET revoked_at = COALESCE(revoked_at, ?) WHERE app_password_id = ? AND revoked_at IS NULL", [.integer(Self.seconds(now)), .text(passwordID)])
+                _ = try await connection.query("UPDATE legacy_sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE app_password_id = ? AND revoked_at IS NULL", [.integer(Self.seconds(now)), .text(passwordID)])
             }
         }
     }
