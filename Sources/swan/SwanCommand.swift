@@ -970,6 +970,7 @@ struct ServePermissionedRuntime {
         authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
         actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
+        accountPortalHTTP: SwanAccountPortalHTTP? = nil,
         xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil
@@ -1000,6 +1001,7 @@ struct ServePermissionedRuntime {
             },
             blobStreamAdmission: directory.publicRepositorySpoolAdmission,
             accountEmailXRPC: accountEmailXRPC,
+            accountPortalHTTP: accountPortalHTTP,
             actorPreferencesXRPC: actorPreferencesXRPC,
             xrpcPipethrough: xrpcPipethrough,
             loginClientIdentityPolicy: loginClientIdentityPolicy,

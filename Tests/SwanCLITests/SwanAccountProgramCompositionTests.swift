@@ -13,6 +13,7 @@ import SwanPublicFirehose
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
+@testable import swan
 import XCTest
 
 /// Task 1 of the Swan account-program runtime integration: freeze the
@@ -286,10 +287,14 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
         }
     }
 
-    /// Constructs `SwanHTTPServer` the way `swan serve` does: profile,
-    /// configuration, oauthRuntime, accountControlStore, directory, portal,
-    /// pipethrough, and firehose. The portal service and proxy transport are
-    /// test doubles; the server type and every argument kind are production.
+    /// Constructs the server through `ServePermissionedRuntime.makeServer` —
+    /// the exact production composition function `swan serve` calls — with
+    /// the same argument kinds the CLI passes (profile, configuration,
+    /// oauthRuntime, directory, accountControlStore, accountPortalHTTP,
+    /// xrpcPipethrough, loginClientIdentityPolicy, publicFirehoseStreaming).
+    /// The portal service and proxy transport are test doubles; the server
+    /// type, the composition function, and every argument kind are
+    /// production.
     private func makeServer(
         signupPolicy: SignupPolicy = .closed,
         installPipethrough: Bool = false,
@@ -383,7 +388,20 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
             } else {
                 streamingRuntime = nil
             }
-            let server = SwanHTTPServer(
+            // The production composition function, with no lane adapters
+            // constructed directly. The runtime carries no permissioned
+            // configurations (nil), exactly like a `serve` invocation with
+            // no local-space/notification/public-mutation features enabled.
+            let permissionedRuntime = ServePermissionedRuntime(
+                credentialConfiguration: nil,
+                credentialExchangeConfiguration: nil,
+                delegationConfiguration: nil,
+                repositorySyncConfiguration: nil,
+                repositoryCredentialConfiguration: nil,
+                notificationConfiguration: nil,
+                checkUserAccessConfiguration: nil
+            )
+            let server = permissionedRuntime.makeServer(
                 profile: profile,
                 configuration: .init(
                     host: "127.0.0.1",
@@ -393,15 +411,12 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     publicRouteSurface: .default
                 ),
                 oauthRuntime: oauthRuntime,
-                authenticatedGetSpaceDirectory: directory,
+                directory: try XCTUnwrap(directory),
                 accountControlStore: control,
-                publicRepositoryReadDirectory: directory,
                 accountPortalHTTP: portal,
                 xrpcPipethrough: pipethrough,
-                publicFirehoseStreaming: streamingRuntime,
-                publicFirehoseSubscriberAdmission: PublicFirehoseSubscriberAdmission(
-                    maximumConcurrentSubscribers: 4
-                )
+                loginClientIdentityPolicy: .direct,
+                publicFirehoseStreaming: streamingRuntime
             )
             return CompositionFixture(
                 root: root,
@@ -451,6 +466,12 @@ private struct PortalMemoryService: SwanAccountPortalServing {
 /// Admits every pipethrough request, so a fail-open route would really reach
 /// the sender. The credential-isolation tests assert the sender is never
 /// consulted despite this permissive authorizer.
+///
+/// Sibling copies: `Tests/SwanHTTPTests/AccountPortalSecurityHTTPTests.swift`
+/// and `Tests/SwanHTTPTests/SwanXRPCPipethroughTests.swift` declare the same
+/// double. Cross-target sharing is impossible — each test target is a
+/// separate module and cannot import another test target's internals — so
+/// the copies are kept minimal and scoped to what each file needs.
 private struct PipethroughAuthorizer: SwanXRPCPipethroughResourceAuthorizing {
     let result: Result<AuthorizationContext, SwanResourceAuthorizationFailure>
 
@@ -472,6 +493,12 @@ private struct PipethroughAuthorizer: SwanXRPCPipethroughResourceAuthorizing {
 
 /// Mints a real `ProxyServiceJWT` from a per-process test key, so the proxy
 /// path is exercised with actual signed claims rather than a placeholder.
+///
+/// Sibling copies: `Tests/SwanHTTPTests/AccountPortalSecurityHTTPTests.swift`
+/// and `Tests/SwanHTTPTests/SwanXRPCPipethroughTests.swift` declare the same
+/// double. Cross-target sharing is impossible — each test target is a
+/// separate module and cannot import another test target's internals — so
+/// the copies are kept minimal and scoped to what each file needs.
 private struct TestProxyServiceTokenIssuer: SwanProxyServiceTokenIssuing {
     static let key = P256.Signing.PrivateKey()
 
@@ -492,6 +519,11 @@ private struct TestProxyServiceTokenIssuer: SwanProxyServiceTokenIssuing {
     }
 }
 
+/// Sibling copies: `Tests/SwanHTTPTests/AccountPortalSecurityHTTPTests.swift`
+/// and `Tests/SwanHTTPTests/SwanXRPCPipethroughTests.swift` declare the same
+/// double. Cross-target sharing is impossible — each test target is a
+/// separate module and cannot import another test target's internals — so
+/// the copies are kept minimal and scoped to what each file needs.
 private struct StubDIDDocuments: SwanDIDDocumentFetching {
     let documents: [String: Data]
 
@@ -505,6 +537,12 @@ private struct StubDIDDocuments: SwanDIDDocumentFetching {
 
 /// Records every outbound proxy request. The credential-isolation tests
 /// assert `recorded().isEmpty` — nothing left the host.
+///
+/// Sibling copies: `Tests/SwanHTTPTests/AccountPortalSecurityHTTPTests.swift`
+/// and `Tests/SwanHTTPTests/SwanXRPCPipethroughTests.swift` declare the same
+/// double. Cross-target sharing is impossible — each test target is a
+/// separate module and cannot import another test target's internals — so
+/// the copies are kept minimal and scoped to what each file needs.
 private final class RecordingProxySender: SwanProxySending, @unchecked Sendable {
     private let lock = NSLock()
     private var requests: [SwanProxyRequest] = []

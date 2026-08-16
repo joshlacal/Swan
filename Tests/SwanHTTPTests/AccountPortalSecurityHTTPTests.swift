@@ -350,6 +350,12 @@ private struct PortalMemoryService: SwanAccountPortalServing {
 /// Admits every pipethrough request, so a fail-open route would really reach
 /// the sender. The credential-isolation tests assert the sender is never
 /// consulted despite this permissive authorizer.
+///
+/// Sibling copies: `Tests/SwanCLITests/SwanAccountProgramCompositionTests.swift`
+/// and `Tests/SwanHTTPTests/SwanXRPCPipethroughTests.swift` declare the same
+/// double. Cross-target sharing is impossible — each test target is a
+/// separate module and cannot import another test target's internals — so
+/// the copies are kept minimal and scoped to what each file needs.
 private struct PipethroughAuthorizer: SwanXRPCPipethroughResourceAuthorizing {
     let result: Result<AuthorizationContext, SwanResourceAuthorizationFailure>
 
@@ -371,6 +377,12 @@ private struct PipethroughAuthorizer: SwanXRPCPipethroughResourceAuthorizing {
 
 /// Mints a real `ProxyServiceJWT` from a per-process test key, so the proxy
 /// path is exercised with actual signed claims rather than a placeholder.
+///
+/// Sibling copies: `Tests/SwanCLITests/SwanAccountProgramCompositionTests.swift`
+/// and `Tests/SwanHTTPTests/SwanXRPCPipethroughTests.swift` declare the same
+/// double. Cross-target sharing is impossible — each test target is a
+/// separate module and cannot import another test target's internals — so
+/// the copies are kept minimal and scoped to what each file needs.
 private struct TestProxyServiceTokenIssuer: SwanProxyServiceTokenIssuing {
     static let key = P256.Signing.PrivateKey()
 
@@ -391,6 +403,11 @@ private struct TestProxyServiceTokenIssuer: SwanProxyServiceTokenIssuing {
     }
 }
 
+/// Sibling copies: `Tests/SwanCLITests/SwanAccountProgramCompositionTests.swift`
+/// and `Tests/SwanHTTPTests/SwanXRPCPipethroughTests.swift` declare the same
+/// double. Cross-target sharing is impossible — each test target is a
+/// separate module and cannot import another test target's internals — so
+/// the copies are kept minimal and scoped to what each file needs.
 private struct StubDIDDocuments: SwanDIDDocumentFetching {
     let documents: [String: Data]
 
@@ -404,6 +421,12 @@ private struct StubDIDDocuments: SwanDIDDocumentFetching {
 
 /// Records every outbound proxy request. The credential-isolation tests
 /// assert `recorded().isEmpty` — nothing left the host.
+///
+/// Sibling copies: `Tests/SwanCLITests/SwanAccountProgramCompositionTests.swift`
+/// and `Tests/SwanHTTPTests/SwanXRPCPipethroughTests.swift` declare the same
+/// double. Cross-target sharing is impossible — each test target is a
+/// separate module and cannot import another test target's internals — so
+/// the copies are kept minimal and scoped to what each file needs.
 private final class RecordingProxySender: SwanProxySending, @unchecked Sendable {
     private let lock = NSLock()
     private var requests: [SwanProxyRequest] = []
