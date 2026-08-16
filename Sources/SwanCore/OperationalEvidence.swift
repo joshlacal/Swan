@@ -20,6 +20,8 @@ public enum OperationalMetricError: Error, Sendable, Equatable {
 /// operational facts only; identifiers, credentials, paths, and payloads are
 /// deliberately rejected at the metric boundary.
 public final class OperationalMetrics: @unchecked Sendable {
+    /// Local accumulator only; runtime registration must inject a real sink.
+    public let assembled = false
     private let lock = NSLock()
     private var counts: [OperationalMetric: Int] = [:]
 
@@ -55,12 +57,21 @@ public enum OperationalReadinessCheck: String, CaseIterable, Sendable {
 }
 
 public struct OperationalReadinessReport: Sendable, Equatable {
+    public let assembled: Bool
     public let ready: Bool
     public let checks: [OperationalReadinessCheck: Bool]
     public let missing: [OperationalReadinessCheck]
+
+    public init(assembled: Bool, ready: Bool, checks: [OperationalReadinessCheck: Bool], missing: [OperationalReadinessCheck]) {
+        self.assembled = assembled
+        self.ready = ready
+        self.checks = checks
+        self.missing = missing
+    }
 }
 
 public final class OperationalReadiness: @unchecked Sendable {
+    public let assembled = false
     private let lock = NSLock()
     private var checks: [OperationalReadinessCheck: Bool] = [:]
 
@@ -74,6 +85,6 @@ public final class OperationalReadiness: @unchecked Sendable {
     public func report() -> OperationalReadinessReport {
         lock.lock(); defer { lock.unlock() }
         let missing = OperationalReadinessCheck.allCases.filter { checks[$0] != true }
-        return .init(ready: missing.isEmpty, checks: checks, missing: missing)
+        return .init(assembled: assembled, ready: missing.isEmpty, checks: checks, missing: missing)
     }
 }

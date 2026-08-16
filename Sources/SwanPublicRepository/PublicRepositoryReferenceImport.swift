@@ -2,17 +2,29 @@ import Foundation
 import Petrel
 
 public struct PublicRepositoryImportEnvelope: Sendable {
+    public let requestID: String
+    public let requestDigest: Data
     public let did: String
     public let rootCID: CID
+    public let expectedExistingRootCID: CID?
     public let blocks: [PublicRepositoryBlock]
     public let referencedBlobs: [CID]
+    public let blobPayloads: [PublicRepositoryBlock]
     public let signature: Data
 
-    public init(did: String, rootCID: CID, blocks: [PublicRepositoryBlock], referencedBlobs: [CID] = [], signature: Data) {
+    public init(did: String, rootCID: CID, expectedExistingRootCID: CID? = nil, blocks: [PublicRepositoryBlock], referencedBlobs: [CID] = [], blobPayloads: [PublicRepositoryBlock] = [], signature: Data, requestID: String, requestDigest: Data) throws {
+        guard !requestID.isEmpty, requestID.utf8.count <= 512, !requestID.contains("\0"), requestDigest.count == 32 else {
+            throw PublicRepositoryReferenceImportError.invalidBinding
+        }
+        self.requestID = requestID
+        self.requestDigest = requestDigest
         self.did = did
         self.rootCID = rootCID
+        if let expectedExistingRootCID { try PublicRepositoryCID.validate(expectedExistingRootCID) }
+        self.expectedExistingRootCID = expectedExistingRootCID
         self.blocks = blocks
         self.referencedBlobs = referencedBlobs
+        self.blobPayloads = blobPayloads
         self.signature = signature
     }
 }
@@ -30,17 +42,28 @@ public struct PublicRepositoryImportedState: Sendable, Equatable {
 }
 
 public protocol PublicRepositoryImportCommitter: Sendable {
-    func commit(_ state: PublicRepositoryImportedState) async throws
+    /// Implementations must atomically compare `expectedRootCID`, record the
+    /// request digest, and either commit once or replay the same result for an
+    /// identical `(requestID, requestDigest)`. A different digest for a reused
+    /// request ID is a conflict; no partial blocks may remain visible.
+    func commit(_ state: PublicRepositoryImportedState, requestID: String, requestDigest: Data, expectedRootCID: CID?) async throws -> PublicRepositoryImportedState
+}
+
+public protocol PublicRepositoryBlobResolver: Sendable {
+    func containsBlob(_ cid: CID) async throws -> Bool
 }
 
 public enum PublicRepositoryReferenceImportError: Error, Sendable, Equatable {
     case invalidDID
+    case invalidBinding
     case invalidRoot
     case blockLimitExceeded
     case byteLimitExceeded
     case duplicateBlockConflict
     case missingBlob(CID)
     case invalidSignature
+    case conflictingRequestReuse
+    case commitCASConflict
 }
 
 /// Verifies an import completely before invoking the injected durable commit
@@ -58,13 +81,20 @@ public struct PublicRepositoryReferenceImportVerifier: Sendable {
     public func verifyAndCommit(
         _ envelope: PublicRepositoryImportEnvelope,
         committer: any PublicRepositoryImportCommitter,
+        existingBlobResolver: (any PublicRepositoryBlobResolver)? = nil,
         verifySignature: @escaping @Sendable (String, CID, Data) throws -> Bool
     ) async throws -> PublicRepositoryImportedState {
         guard (try? DID(didString: envelope.did)) != nil else { throw PublicRepositoryReferenceImportError.invalidDID }
         try PublicRepositoryCID.validate(envelope.rootCID)
-        guard envelope.blocks.count <= maximumBlocks else { throw PublicRepositoryReferenceImportError.blockLimitExceeded }
+        for blob in envelope.referencedBlobs { try PublicRepositoryCID.validate(blob) }
+        guard envelope.blocks.count + envelope.blobPayloads.count <= maximumBlocks else { throw PublicRepositoryReferenceImportError.blockLimitExceeded }
         var totalBytes = 0
         for block in envelope.blocks {
+            let (next, overflow) = totalBytes.addingReportingOverflow(block.bytes.count)
+            guard !overflow, next <= maximumBytes else { throw PublicRepositoryReferenceImportError.byteLimitExceeded }
+            totalBytes = next
+        }
+        for block in envelope.blobPayloads {
             let (next, overflow) = totalBytes.addingReportingOverflow(block.bytes.count)
             guard !overflow, next <= maximumBytes else { throw PublicRepositoryReferenceImportError.byteLimitExceeded }
             totalBytes = next
@@ -77,12 +107,18 @@ public struct PublicRepositoryReferenceImportVerifier: Sendable {
             if let existing = byCID[block.cid], existing != block.bytes { throw PublicRepositoryReferenceImportError.duplicateBlockConflict }
             byCID[block.cid] = block.bytes
         }
+        for block in envelope.blobPayloads {
+            try PublicRepositoryCID.validate(block.cid, blockBytes: block.bytes)
+            if let existing = byCID[block.cid], existing != block.bytes { throw PublicRepositoryReferenceImportError.duplicateBlockConflict }
+            byCID[block.cid] = block.bytes
+        }
         guard byCID[envelope.rootCID] != nil else { throw PublicRepositoryReferenceImportError.invalidRoot }
         for blob in Set(envelope.referencedBlobs) where byCID[blob] == nil {
-            throw PublicRepositoryReferenceImportError.missingBlob(blob)
+            guard try await existingBlobResolver?.containsBlob(blob) == true else {
+                throw PublicRepositoryReferenceImportError.missingBlob(blob)
+            }
         }
         let state = PublicRepositoryImportedState(did: envelope.did, rootCID: envelope.rootCID, blocks: byCID.map { .init(cid: $0.key, bytes: $0.value) }.sorted { $0.cid.description < $1.cid.description })
-        try await committer.commit(state)
-        return state
+        return try await committer.commit(state, requestID: envelope.requestID, requestDigest: envelope.requestDigest, expectedRootCID: envelope.expectedExistingRootCID)
     }
 }

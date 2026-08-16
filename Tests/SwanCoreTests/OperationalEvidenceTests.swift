@@ -8,6 +8,7 @@ final class OperationalEvidenceTests: XCTestCase {
         XCTAssertThrowsError(try metrics.increment(.auth, labels: ["did": "did:plc:secret"]))
         XCTAssertThrowsError(try metrics.increment(.signup, labels: ["token": "bearer-secret"]))
         XCTAssertEqual(metrics.snapshot()[.httpError], 1)
+        XCTAssertFalse(metrics.assembled)
     }
 
     func testReadinessRequiresEveryDeclaredCriticalCheck() throws {
@@ -16,6 +17,8 @@ final class OperationalEvidenceTests: XCTestCase {
         checks.set(.backup, healthy: false)
         XCTAssertFalse(checks.report().ready)
         checks.set(.backup, healthy: true)
-        XCTAssertTrue(checks.report().ready)
+        let report = checks.report()
+        XCTAssertTrue(report.ready)
+        XCTAssertFalse(report.assembled)
     }
 }

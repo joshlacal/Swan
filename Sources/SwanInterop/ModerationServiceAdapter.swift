@@ -1,4 +1,14 @@
 import Foundation
+import Crypto
+import SwanCore
+
+public struct ModerationTransportRequest: Sendable, Equatable {
+    public let host: String
+    public let pinnedPeer: String
+    public let path: String
+    public let body: Data
+    public let maximumResponseBytes: Int
+}
 
 public struct ModerationReportRequest: Sendable, Equatable {
     public let subject: String
@@ -25,7 +35,7 @@ public struct ModerationTransportResponse: Sendable, Equatable {
 }
 
 public protocol ModerationTransport: Sendable {
-    func send(host: String, peer: String, path: String, body: Data, maximumResponseBytes: Int) async throws -> ModerationTransportResponse
+    func send(_ request: ModerationTransportRequest) async throws -> ModerationTransportResponse
 }
 
 public enum ModerationServiceAdapterError: Error, Sendable, Equatable {
@@ -69,15 +79,13 @@ public struct ModerationServiceAdapter: Sendable {
               request.details.map({ $0.utf8.count <= maximumBodyBytes }) ?? true else {
             throw ModerationServiceAdapterError.invalidReport
         }
-        let envelope = try JSONEncoder().encode(RedactedReport(reason: request.reason))
+        let envelope = try JSONEncoder().encode(RedactedReport(
+            subjectDigest: Hex.encode(SHA256.hash(data: Data(request.subject.utf8))),
+            reason: request.reason,
+            detailsDigest: request.details.map { Hex.encode(SHA256.hash(data: Data($0.utf8))) }
+        ))
         guard envelope.count <= maximumBodyBytes else { throw ModerationServiceAdapterError.responseTooLarge }
-        let response = try await transport.send(
-            host: allowedHost,
-            peer: pinnedPeer,
-            path: "/reports",
-            body: envelope,
-            maximumResponseBytes: maximumResponseBytes
-        )
+        let response = try await transport.send(.init(host: allowedHost, pinnedPeer: pinnedPeer, path: "/reports", body: envelope, maximumResponseBytes: maximumResponseBytes))
         guard response.peer == pinnedPeer else { throw ModerationServiceAdapterError.peerMismatch }
         guard response.body.count <= maximumResponseBytes else { throw ModerationServiceAdapterError.responseTooLarge }
         guard (200...299).contains(response.status) else { throw ModerationServiceAdapterError.rejected }
@@ -85,11 +93,15 @@ public struct ModerationServiceAdapter: Sendable {
     }
 
     private struct RedactedReport: Codable {
+        let subjectDigest: String
         let reason: String
+        let detailsDigest: String?
         let schema: String
 
-        init(reason: String) {
+        init(subjectDigest: String, reason: String, detailsDigest: String?) {
+            self.subjectDigest = subjectDigest
             self.reason = reason
+            self.detailsDigest = detailsDigest
             schema = "swan.moderation.report.v1"
         }
     }

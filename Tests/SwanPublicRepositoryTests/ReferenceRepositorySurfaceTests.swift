@@ -31,6 +31,23 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
         XCTAssertEqual(blockPage.blocks.count, 2)
         XCTAssertNotNil(blockPage.cursor)
         XCTAssertEqual(blockPage.missing, [])
+
+        let records = try await surface.listRecords(collection: "app.bsky.feed.post", limit: 1)
+        XCTAssertEqual(records.records.count, 1)
+        XCTAssertNotNil(records.cursor)
+    }
+
+    func testListBlobsHonorsSinceRevisionAndUsesCIDKeysetCursor() async throws {
+        let blocks = try makeBlocks(count: 3)
+        let surface = try PublicRepositoryReferenceSurface(
+            did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", revision: "3jzfc6r5bqg2a",
+            blocks: blocks, records: [], blobs: blocks.map(\.cid),
+            blobRevisions: [blocks[0].cid: "3jzfc6r5bqg2b", blocks[1].cid: "3jzfc6r5bqg2c", blocks[2].cid: "3jzfc6r5bqg2d"], maximumPageSize: 2
+        )
+        let page = try await surface.listBlobs(limit: 2, since: "3jzfc6r5bqg2a")
+        XCTAssertEqual(page.blobs.count, 2)
+        let next = try await surface.listBlobs(limit: 2, since: "3jzfc6r5bqg2a", cursor: try XCTUnwrap(page.cursor))
+        XCTAssertEqual(next.blobs.count, 0)
     }
 
     func testMissingBlobListingIsPaginatedAndDoesNotMaterializeUnboundedInput() async throws {
@@ -50,18 +67,32 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
         let root = CID.fromDAGCBOR(bytes)
         let committer = RecordingImportCommitter()
         let verifier = try PublicRepositoryReferenceImportVerifier(maximumBlocks: 2, maximumBytes: 32)
-        let envelope = PublicRepositoryImportEnvelope(
+        let envelope = try PublicRepositoryImportEnvelope(
             did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
             rootCID: root,
             blocks: [.init(cid: root, bytes: bytes)],
-            signature: Data([1])
+            signature: Data([1]), requestID: "import-1", requestDigest: Data(repeating: 7, count: 32)
         )
-        _ = try await verifier.verifyAndCommit(envelope, committer: committer) { did, cid, signature in
+        _ = try await verifier.verifyAndCommit(envelope, committer: committer, existingBlobResolver: nil) { did, cid, signature in
             did == "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa" && cid == root && signature == Data([1])
         }
         let committed = await committer.states
         XCTAssertEqual(committed.count, 1)
         XCTAssertEqual(committed[0].rootCID, root)
+    }
+
+    func testImportSupportsBoundedReferencedBlobPayloadAndIdempotentRetry() async throws {
+        let rootBytes = Data([0xa0])
+        let blobBytes = Data([0xa1, 0x61, 0x78, 0x01])
+        let root = CID.fromDAGCBOR(rootBytes)
+        let blob = CID.fromDAGCBOR(blobBytes)
+        let committer = RecordingImportCommitter()
+        let verifier = try PublicRepositoryReferenceImportVerifier(maximumBlocks: 3, maximumBytes: 64)
+        let envelope = try PublicRepositoryImportEnvelope(did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", rootCID: root, blocks: [.init(cid: root, bytes: rootBytes)], referencedBlobs: [blob], blobPayloads: [.init(cid: blob, bytes: blobBytes)], signature: Data([1]), requestID: "import-2", requestDigest: Data(repeating: 8, count: 32))
+        _ = try await verifier.verifyAndCommit(envelope, committer: committer) { _, _, _ in true }
+        _ = try await verifier.verifyAndCommit(envelope, committer: committer) { _, _, _ in true }
+        let states = await committer.states
+        XCTAssertEqual(states.count, 1)
     }
 
     func testImportRejectsInvalidSignatureWithoutCallingCommitter() async throws {
@@ -73,7 +104,7 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
             did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
             rootCID: root,
             blocks: [.init(cid: root, bytes: bytes)],
-            signature: Data([9])
+            signature: Data([9]), requestID: "import-invalid", requestDigest: Data(repeating: 9, count: 32)
         )
         do {
             _ = try await verifier.verifyAndCommit(envelope, committer: committer) { _, _, _ in false }
@@ -96,5 +127,14 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
 
 private actor RecordingImportCommitter: PublicRepositoryImportCommitter {
     var states: [PublicRepositoryImportedState] = []
-    func commit(_ state: PublicRepositoryImportedState) { states.append(state) }
+    private var requests: [String: Data] = [:]
+    func commit(_ state: PublicRepositoryImportedState, requestID: String, requestDigest: Data, expectedRootCID: CID?) async throws -> PublicRepositoryImportedState {
+        if let existing = requests[requestID] {
+            guard existing == requestDigest else { throw PublicRepositoryReferenceImportError.conflictingRequestReuse }
+            return states[0]
+        }
+        requests[requestID] = requestDigest
+        states.append(state)
+        return state
+    }
 }

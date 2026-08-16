@@ -18,15 +18,17 @@ final class ModerationServiceAdapterTests: XCTestCase {
         XCTAssertEqual(path, "/reports")
         XCTAssertFalse(body.contains("did:plc:"))
         XCTAssertFalse(body.contains("secret details"))
+        XCTAssertTrue(body.contains("subjectDigest"))
+        XCTAssertTrue(body.contains("detailsDigest"))
     }
 }
 
 private actor TestModerationTransport: ModerationTransport {
     var path = ""
     var body = ""
-    func send(host: String, peer: String, path: String, body: Data, maximumResponseBytes: Int) async throws -> ModerationTransportResponse {
-        self.path = path
-        self.body = String(decoding: body, as: UTF8.self)
-        return .init(status: 202, body: Data("{}".utf8), peer: peer)
+    func send(_ request: ModerationTransportRequest) async throws -> ModerationTransportResponse {
+        self.path = request.path
+        self.body = String(decoding: request.body, as: UTF8.self)
+        return .init(status: 202, body: Data("{}".utf8), peer: request.pinnedPeer)
     }
 }

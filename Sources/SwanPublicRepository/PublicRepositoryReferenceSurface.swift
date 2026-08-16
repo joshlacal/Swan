@@ -8,6 +8,7 @@ public enum PublicRepositoryReferenceSurfaceError: Error, Sendable, Equatable {
     case missingRecord
     case missingBlock
     case invalidBinding
+    case duplicatePath
 }
 
 public struct PublicRepositorySyncRepository: Sendable, Equatable {
@@ -53,6 +54,11 @@ public struct PublicRepositorySyncRecord: Sendable, Equatable {
     public let bytes: Data
 }
 
+public struct PublicRepositorySyncRecordPage: Sendable, Equatable {
+    public let records: [PublicRepositorySyncRecord]
+    public let cursor: String?
+}
+
 public struct PublicRepositorySyncBlobPage: Sendable, Equatable {
     public let blobs: [CID]
     public let cursor: String?
@@ -75,6 +81,7 @@ public actor PublicRepositoryReferenceSurface {
         records: [PublicRepositoryRecordIndexEntry],
         blobs: [CID] = [],
         repositories: [PublicRepositorySyncRepository]? = nil,
+        blobRevisions: [CID: String] = [:],
         maximumPageSize: Int = 100
     ) throws {
         guard (1...1_000).contains(maximumPageSize) else { throw PublicRepositoryReferenceSurfaceError.invalidLimit }
@@ -91,21 +98,36 @@ public actor PublicRepositoryReferenceSurface {
         let fallback = try PublicRepositorySyncRepository(did: did, head: fallbackHead, rev: revision)
         self.repositories = (repositories ?? [fallback]).sorted { $0.did < $1.did }
         self.blocks = Dictionary(uniqueKeysWithValues: map.cids.compactMap { cid in map.block(for: cid).map { (cid, $0) } })
-        self.records = Dictionary(uniqueKeysWithValues: records.map { ($0.path, $0.cid) })
+        var recordMap: [PublicRepositoryPath: CID] = [:]
+        for entry in records {
+            guard recordMap.updateValue(entry.cid, forKey: entry.path) == nil else { throw PublicRepositoryReferenceSurfaceError.duplicatePath }
+        }
+        self.records = recordMap
         self.maximumPageSize = maximumPageSize
-        self.blobCIDs = Set(blobs)
+        let blobSet = Set(blobs)
+        for cid in blobSet { try PublicRepositoryCID.validate(cid) }
+        for (cid, revision) in blobRevisions {
+            _ = try PublicRepositoryTID(revision)
+            guard blobSet.contains(cid) else { throw PublicRepositoryReferenceSurfaceError.invalidBinding }
+        }
+        self.blobCIDs = blobSet
+        self.blobRevisions = blobRevisions
     }
 
     private let blobCIDs: Set<CID>
+    private let blobRevisions: [CID: String]
 
     public func listRepos(limit: Int = 100, cursor: String? = nil) throws -> PublicRepositorySyncRepoPage {
-        let range = try pageRange(count: repositories.count, limit: limit, cursor: cursor)
-        let values = Array(repositories[range])
-        return .init(repos: values, cursor: nextCursor(end: range.upperBound, count: repositories.count))
+        guard (1...maximumPageSize).contains(limit) else { throw PublicRepositoryReferenceSurfaceError.invalidLimit }
+        let values = repositories.filter { repo in cursor.map { repo.did > $0 } ?? true }.prefix(limit)
+        let page = Array(values)
+        let next = page.count == limit && repositories.contains(where: { $0.did > (page.last?.did ?? "") }) ? page.last?.did : nil
+        return .init(repos: page, cursor: next)
     }
 
     public func getBlocks(_ cids: [CID], limit: Int = 100, cursor: String? = nil) throws -> PublicRepositorySyncBlockPage {
         guard cids.count <= 10_000 else { throw PublicRepositoryReferenceSurfaceError.tooManySelectors }
+        for cid in cids { try PublicRepositoryCID.validate(cid) }
         let range = try pageRange(count: cids.count, limit: limit, cursor: cursor)
         var found: [PublicRepositoryBlock] = []
         var missing: [CID] = []
@@ -120,14 +142,34 @@ public actor PublicRepositoryReferenceSurface {
         return .init(path: path, cid: cid, bytes: bytes)
     }
 
-    public func listBlobs(limit: Int = 100, cursor: String? = nil) throws -> PublicRepositorySyncBlobPage {
-        let values = blobCIDs.sorted { $0.description < $1.description }
-        let range = try pageRange(count: values.count, limit: limit, cursor: cursor)
-        return .init(blobs: Array(values[range]), cursor: nextCursor(end: range.upperBound, count: values.count))
+    public func listRecords(collection: String, limit: Int = 100, cursor: String? = nil) throws -> PublicRepositorySyncRecordPage {
+        let values = records.keys.sorted { $0.mstKey < $1.mstKey }
+            .filter { path in
+                guard path.collection == collection else { return false }
+                return cursor.map { path.mstKey > $0 } ?? true
+            }
+            .prefix(try validatedLimit(limit))
+            .compactMap { path in records[path].flatMap { cid in blocks[cid].map { PublicRepositorySyncRecord(path: path, cid: cid, bytes: $0) } } }
+        let page = Array(values)
+        let next = page.count == limit && records.keys.contains(where: { $0.collection == collection && $0.mstKey > (page.last?.path.mstKey ?? "") }) ? page.last?.path.mstKey : nil
+        return .init(records: page, cursor: next)
+    }
+
+    public func listBlobs(limit: Int = 100, since: String? = nil, cursor: String? = nil) throws -> PublicRepositorySyncBlobPage {
+        if let since { _ = try PublicRepositoryTID(since) }
+        let values = blobCIDs.sorted { $0.description < $1.description }.filter { cid in
+            let afterCursor = cursor.map { cid.description > $0 } ?? true
+            let afterRevision = since.map { blobRevisions[cid].map { $0 > $1 } ?? false } ?? true
+            return afterCursor && afterRevision
+        }
+        let page = Array(values.prefix(try validatedLimit(limit)))
+        let next = page.count == limit && values.contains(where: { $0.description > (page.last?.description ?? "") }) ? page.last?.description : nil
+        return .init(blobs: page, cursor: next)
     }
 
     public func listMissingBlobs(_ cids: [CID], limit: Int = 100, cursor: String? = nil) throws -> PublicRepositorySyncBlobPage {
         guard cids.count <= 10_000 else { throw PublicRepositoryReferenceSurfaceError.tooManySelectors }
+        for cid in cids { try PublicRepositoryCID.validate(cid) }
         var seen = Set<CID>()
         let missing = cids.filter { blocks[$0] == nil && seen.insert($0).inserted }
         let range = try pageRange(count: missing.count, limit: limit, cursor: cursor)
@@ -135,13 +177,18 @@ public actor PublicRepositoryReferenceSurface {
     }
 
     private func pageRange(count: Int, limit: Int, cursor: String?) throws -> Range<Int> {
-        guard (1...maximumPageSize).contains(limit) else { throw PublicRepositoryReferenceSurfaceError.invalidLimit }
+        _ = try validatedLimit(limit)
         let start: Int
         if let cursor {
             guard let parsed = Int(cursor), parsed >= 0, parsed <= count else { throw PublicRepositoryReferenceSurfaceError.invalidCursor }
             start = parsed
         } else { start = 0 }
         return start ..< min(start + limit, count)
+    }
+
+    private func validatedLimit(_ limit: Int) throws -> Int {
+        guard (1...maximumPageSize).contains(limit) else { throw PublicRepositoryReferenceSurfaceError.invalidLimit }
+        return limit
     }
 
     private func nextCursor(end: Int, count: Int) -> String? { end < count ? String(end) : nil }

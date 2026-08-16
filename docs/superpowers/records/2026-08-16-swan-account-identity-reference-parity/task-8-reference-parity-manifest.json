@@ -1,17 +1,18 @@
 {
   "schema": "swan.reference-parity.v1",
-  "reference": {"checkout": "/Users/joshlacalamito/Developer/Catbird+Petrel/atproto", "pin": "recorded-in-local-interop-fixture"},
+  "reference": {"checkout": "/Users/joshlacalamito/Developer/Catbird+Petrel/atproto", "pin": "0e1042e65d5df27030849167773728b84d469182"},
   "entries": [
     {"method":"com.atproto.server.updateEmail","capability":"plc-update-adapter","intent":"delegates to existing account PLC/step-up boundary","registered":false},
     {"method":"com.atproto.repo.getRecord","capability":"repo-record-projection","intent":"bounded indexed record read","registered":false},
-    {"method":"com.atproto.repo.listRecords","capability":"repo-record-projection","intent":"bounded cursor pagination","registered":false},
+    {"method":"com.atproto.repo.listRecords","capability":"repo-record-page","intent":"bounded collection keyset pagination","registered":false},
     {"method":"com.atproto.sync.getBlocks","capability":"sync-block-page","intent":"bounded CID selection and cursor","registered":false},
     {"method":"com.atproto.sync.listMissingBlobs","capability":"sync-missing-blob-page","intent":"deduplicated bounded missing set","registered":false},
-    {"method":"com.atproto.sync.listBlobs","capability":"sync-blob-page","intent":"bounded blob enumeration","registered":false},
-    {"method":"com.atproto.sync.listRepos","capability":"sync-repository-page","intent":"bounded repository enumeration","registered":false},
+    {"method":"com.atproto.sync.listBlobs","capability":"sync-blob-page","intent":"bounded CID keyset enumeration with since revision","registered":false},
+    {"method":"com.atproto.sync.listRepos","capability":"sync-repository-page","intent":"bounded DID keyset enumeration","registered":false},
+    {"method":"repo.import","capability":"transactional-import","intent":"signature/root/CID/blob validation with idempotent request digest and CAS","registered":false},
     {"method":"com.atproto.admin.updateAccountStatus","capability":"operator-admin-lifecycle","intent":"operator authorization and safe audit","registered":false},
-    {"method":"moderation.report","capability":"moderation-service-adapter","intent":"allowlisted peer-pinned redacted transport","registered":false},
-    {"method":"ops.readiness","capability":"operational-readiness","intent":"aggregate critical checks without identifiers","registered":false}
+    {"method":"moderation.report","capability":"moderation-service-adapter","intent":"allowlisted peer-pinned transport with subject/details digests","registered":false},
+    {"method":"ops.readiness","capability":"operational-readiness","intent":"local evidence only; runtime health source unassembled","registered":false}
   ],
-  "gates": {"network":"unexecuted", "official_client":"unexecuted", "linux_x86_64":"unexecuted", "browser":"unexecuted", "deployment":"unexecuted"}
+  "gates": {"network":"unexecuted", "official_client":"unexecuted", "linux_x86_64":"unexecuted", "browser":"unexecuted", "deployment":"unexecuted", "backup_restore":"deferred-unassembled", "key_rotation":"deferred-unassembled", "runtime_metrics_readiness":"deferred-unassembled"}
 }
