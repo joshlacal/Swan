@@ -6,7 +6,7 @@ import SwanStorage
 
 extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, RecoveryCodeStore, WebAuthnCredentialStore, WebAuthnChallengeStore, WebAuthnChallengeLookupStore, TOTPReplayStore, DurableFactorTokenStore, MFAAuditStore {
     public func listFactors(accountDID: String, now: Date) async throws -> [AuthenticationFactorMetadata] {
-        try await withConnectionGate {
+        return try await withConnectionGate {
             let rows = try await connection.query("SELECT factor_id, account_did, kind, label, lookup_digest, created_at, last_used_at, disabled_at FROM authentication_factors WHERE account_did = ? AND (disabled_at IS NULL OR disabled_at > ? ) ORDER BY created_at, factor_id", [.text(accountDID), .integer(factorTimestamp(now))])
             return try rows.map(decodeFactor)
         }
@@ -91,7 +91,7 @@ extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, Rec
     }
 
     public func webAuthnChallenge(digest: Data, accountDID: String, now: Date) async throws -> WebAuthnChallenge? {
-        try await withConnectionGate {
+        return try await withConnectionGate {
             try await ensureTask7DurableTables()
             let rows = try await connection.query("SELECT challenge_digest, account_did, credential_id_digest, relying_party_id, origin, issued_at, expires_at, consumed_at FROM webauthn_challenges WHERE challenge_digest = ? AND account_did = ? AND consumed_at IS NULL AND expires_at > ?", [digest.sqliteData!, .text(accountDID), .integer(factorTimestamp(now))])
             guard let row = rows.first else { return nil }
@@ -102,7 +102,7 @@ extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, Rec
 
     public func compareAndSwapTOTPReplay(factorID: String, accountDID: String, expected: UInt64?, proposed: UInt64, now: Date) async throws -> Bool {
         guard proposed <= UInt64(Int.max), expected.map({ $0 <= UInt64(Int.max) }) ?? true else { throw AccountControlStoreError.invalidInput }
-        try await withConnectionGate {
+        return try await withConnectionGate {
             try await ensureTask7DurableTables()
             let rows: [SQLiteRow]
             if let expected {
