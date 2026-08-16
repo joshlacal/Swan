@@ -82,6 +82,9 @@ public struct SwanScope: Codable, Hashable, Sendable, Equatable {
         let expected = stripFragment(expected)
         let actual = stripFragment(actual)
         guard !expected.isEmpty, !actual.isEmpty else { return false }
+        if expected.lowercased().hasPrefix("did:") || actual.lowercased().hasPrefix("did:") {
+            return expected == actual
+        }
         guard let expectedURL = URLComponents(string: expected), let actualURL = URLComponents(string: actual),
               let expectedScheme = expectedURL.scheme?.lowercased(), let actualScheme = actualURL.scheme?.lowercased(),
               let expectedHost = expectedURL.host?.lowercased(), let actualHost = actualURL.host?.lowercased(),
@@ -170,7 +173,7 @@ public enum SwanScopePreset: String, Codable, CaseIterable, Sendable {
     public var scopes: Set<String> {
         switch self {
         case .bluesky:
-            return ["repo:read", "repo:write", "blob:read", "blob:write", "identity:read", "rpc:app.bsky?aud=https://api.bsky.app", "rpc:chat.bsky?aud=https://api.bsky.app"]
+            return ["repo:read", "repo:write", "blob:read", "blob:write", "identity:read", "rpc:app.bsky?aud=did:web:api.bsky.app", "rpc:chat.bsky?aud=did:web:api.bsky.chat"]
         case .full: return [] // fullAccessV1 is internal and cannot be requested
         case .readOnly: return ["repo:read", "blob:read", "identity:read", "account:read"]
         case .postOnly: return ["repo:write", "blob:write"]

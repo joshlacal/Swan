@@ -40,9 +40,9 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
             "com.atproto.identity.resolveHandle": ["identity:read"],
             // Official-client AppView feed/identity methods.
             "app.bsky.actor.getPreferences": ["rpc:app.bsky"], "app.bsky.actor.getPreferencesExtended": ["rpc:app.bsky"],
-            "app.bsky.actor.getProfile": ["rpc:app.bsky"], "app.bsky.actor.putPreferences": ["rpc:app.bsky"],
+            "app.bsky.actor.getProfile": ["rpc:app.bsky"], "app.bsky.actor.getProfiles": ["rpc:app.bsky"], "app.bsky.actor.putPreferences": ["rpc:app.bsky"],
             "app.bsky.actor.searchActors": ["rpc:app.bsky"],
-            "app.bsky.feed.getAuthorFeed": ["rpc:app.bsky"], "app.bsky.feed.getFeedSkeleton": ["rpc:app.bsky"],
+            "app.bsky.feed.getAuthorFeed": ["rpc:app.bsky"], "app.bsky.feed.getFeed": ["rpc:app.bsky"], "app.bsky.feed.getFeedSkeleton": ["rpc:app.bsky"],
             "app.bsky.feed.getPostThread": ["rpc:app.bsky"], "app.bsky.feed.getPosts": ["rpc:app.bsky"],
             "app.bsky.feed.getTimeline": ["rpc:app.bsky"], "app.bsky.feed.post": ["rpc:app.bsky"],
             "app.bsky.graph.getBlocks": ["rpc:app.bsky"], "app.bsky.graph.getFollowers": ["rpc:app.bsky"],
@@ -59,7 +59,7 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
     /// The scoped reference policy uses exactly the same declarations and
     /// required capabilities, but does not enable the internal full grant.
     public static let referenceLegacy = DeclaredMethodScopePolicy(
-        declarations: fullAccessV1.declarations
+        declarations: fullAccessV1.declarations, permitsFullAccess: true
     )
 
     public init(declarations: [String: Set<String>] = [:], permitsFullAccess: Bool = false) {

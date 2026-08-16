@@ -27,10 +27,11 @@ final class ScopedLegacyAuthTests: XCTestCase {
                 XCTAssertEqual(try SwanScope.parse(parsed.canonicalValue).canonicalValue, parsed.canonicalValue)
             }
         }
-        let app = try SwanScope.parse("rpc:app.bsky?aud=https://api.bsky.app")
-        let chat = try SwanScope.parse("rpc:chat.bsky?aud=https://api.bsky.app")
-        XCTAssertTrue(app.allows(method: "app.bsky.feed.getTimeline", audience: "https://api.bsky.app"))
-        XCTAssertTrue(chat.allows(method: "chat.bsky.convo.listConvos", audience: "https://api.bsky.app"))
+        let app = try SwanScope.parse("rpc:app.bsky?aud=did:web:api.bsky.app")
+        let chat = try SwanScope.parse("rpc:chat.bsky?aud=did:web:api.bsky.chat")
+        XCTAssertTrue(app.allows(method: "app.bsky.feed.getTimeline", audience: "did:web:api.bsky.app"))
+        XCTAssertTrue(chat.allows(method: "chat.bsky.convo.listConvos", audience: "did:web:api.bsky.chat"))
+        XCTAssertFalse(app.allows(method: "app.bsky.feed.getFeed", audience: "https://api.bsky.app"))
         XCTAssertFalse(app.allows(method: "app.bsky.evil.feed.getTimeline", audience: "https://api.bsky.app.evil"))
         let feed = try SwanScope.parse("rpc:app.bsky.feed?aud=https://api.bsky.app")
         XCTAssertFalse(feed.allows(method: "app.bsky.feed-evil.getTimeline", audience: "https://api.bsky.app"))
