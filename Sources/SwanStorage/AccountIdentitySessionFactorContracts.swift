@@ -622,8 +622,8 @@ public struct TOTPSecretEnvelope: Codable, Sendable, Equatable {
     public let authenticationTag: Data
 
     public init(factorID: String, keyReference: String, nonce: Data, ciphertext: Data, authenticationTag: Data) throws {
-        guard !factorID.isEmpty, !keyReference.isEmpty,
-              nonce.count == 12, !ciphertext.isEmpty, authenticationTag.count == 16 else {
+        guard !factorID.isEmpty, factorID.utf8.count <= 128, !keyReference.isEmpty, keyReference.utf8.count <= 256,
+              nonce.count == 12, !ciphertext.isEmpty, ciphertext.count <= 4096, authenticationTag.count == 16 else {
             throw SwanError.invalidIdentifier("TOTP encrypted envelope")
         }
         self.factorID = factorID

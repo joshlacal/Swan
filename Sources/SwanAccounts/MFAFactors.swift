@@ -86,6 +86,7 @@ public enum TOTPAuthenticator {
     }
 
     public static func verify(code presented: String, secret: Data, at date: Date, configuration: TOTPConfiguration = TOTPConfiguration()) throws -> UInt64? {
+        guard date.timeIntervalSince1970.isFinite, date.timeIntervalSince1970 >= 0 else { return nil }
         guard presented.utf8.count <= 8, secret.count <= 128, presented.utf8.count == configuration.digits, presented.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }) else { return nil }
         let counter = UInt64(max(0, floor(date.timeIntervalSince1970 / configuration.period)))
         for delta in -configuration.drift ... configuration.drift {
