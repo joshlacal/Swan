@@ -53,8 +53,9 @@ final class SwanDidWebIdentityTests: XCTestCase {
     func testReservationAndClaimAreOneTimeAndRetryIsIdempotent() async throws {
         let keys = InMemorySwanSigningKeyReservationService()
         let store = InMemoryIdentityBindingStore()
+        let stepUps = InMemorySwanStepUpReceiptConsumptionStore()
         let service = SwanDidWebIdentityService(
-            reservations: keys, bindings: store, publicPDSURL: pds, publicURL: issuer
+            reservations: keys, bindings: store, publicPDSURL: pds, publicURL: issuer, stepUps: stepUps
         )
         let reservation = try await service.reserveSigningKey(
             requestID: "claim-1", accountDID: "did:plc:abcdefghijklmnopqrstuvwx",
@@ -87,7 +88,7 @@ final class SwanDidWebIdentityTests: XCTestCase {
     func testForgedReservationAndReplacementRequireFreshAccountBoundStepUp() async throws {
         let keys = InMemorySwanSigningKeyReservationService()
         let store = InMemoryIdentityBindingStore()
-        let service = SwanDidWebIdentityService(reservations: keys, bindings: store, publicPDSURL: pds, publicURL: issuer, gracePeriod: 120, replacementAuthorizer: TestReplacementAuthorizer())
+        let service = SwanDidWebIdentityService(reservations: keys, bindings: store, publicPDSURL: pds, publicURL: issuer, gracePeriod: 120, replacementAuthorizer: TestReplacementAuthorizer(), stepUps: InMemorySwanStepUpReceiptConsumptionStore())
         let account = "did:plc:abcdefghijklmnopqrstuvwx"
         let reservation = try await service.reserveSigningKey(requestID: "replace-1", accountDID: account, targetDID: did, handle: handle, expiresAt: Date().addingTimeInterval(300))
         let json = try SwanDidWebDocumentFixture.json(did: did, handle: handle, pds: pds, key: reservation.key, claimEndpoint: reservation.claimServiceEndpoint)
@@ -103,7 +104,7 @@ final class SwanDidWebIdentityTests: XCTestCase {
         let replacement = try await service.reserveSigningKey(requestID: "replace-2", accountDID: account, targetDID: "did:web:new.example", handle: handle, expiresAt: Date().addingTimeInterval(300))
         let replacementJSON = try SwanDidWebDocumentFixture.json(did: replacement.targetDID, handle: handle, pds: pds, key: replacement.key, claimEndpoint: replacement.claimServiceEndpoint)
         await XCTAssertThrowsAsyncError { _ = try await service.claim(reservation: replacement, documentJSON: replacementJSON) }
-        let auth = try SwanDidWebReplacementAuthorization(accountDID: account, sessionAccountDID: account, sessionID: "session-1", stepUpAt: Date(), stepUpReceiptDigest: Data(repeating: 7, count: 32), mfaStrength: .phishingResistant, receiptConsumed: true)
+        let auth = try SwanDidWebReplacementAuthorization(accountDID: account, sessionAccountDID: account, sessionID: "session-1", stepUpAt: Date(), stepUpReceiptDigest: Data(repeating: 7, count: 32), mfaStrength: .phishingResistant)
         _ = try await service.claim(reservation: replacement, documentJSON: replacementJSON, authorization: auth)
     }
 
@@ -120,7 +121,7 @@ final class SwanDidWebIdentityTests: XCTestCase {
     func testConfiguredGracePersistsTransientFailureThenSuspendsAndFencesAdmission() async throws {
         let keys = InMemorySwanSigningKeyReservationService()
         let store = InMemoryIdentityBindingStore()
-        let service = SwanDidWebIdentityService(reservations: keys, bindings: store, publicPDSURL: pds, publicURL: issuer, gracePeriod: 120)
+        let service = SwanDidWebIdentityService(reservations: keys, bindings: store, publicPDSURL: pds, publicURL: issuer, gracePeriod: 120, stepUps: InMemorySwanStepUpReceiptConsumptionStore())
         let account = "did:plc:abcdefghijklmnopqrstuvwx"
         let reservation = try await service.reserveSigningKey(requestID: "grace-1", accountDID: account, targetDID: did, handle: handle, expiresAt: Date().addingTimeInterval(300))
         let json = try SwanDidWebDocumentFixture.json(did: did, handle: handle, pds: pds, key: reservation.key, claimEndpoint: reservation.claimServiceEndpoint)
@@ -143,7 +144,7 @@ final class SwanDidWebIdentityTests: XCTestCase {
     func testProviderCommitFailureIsRepairableByIdempotentRetry() async throws {
         let keys = InMemorySwanSigningKeyReservationService()
         let store = InMemoryIdentityBindingStore()
-        let service = SwanDidWebIdentityService(reservations: keys, bindings: store, publicPDSURL: pds, publicURL: issuer)
+        let service = SwanDidWebIdentityService(reservations: keys, bindings: store, publicPDSURL: pds, publicURL: issuer, stepUps: InMemorySwanStepUpReceiptConsumptionStore())
         let reservation = try await service.reserveSigningKey(requestID: "repair-1", accountDID: "did:plc:abcdefghijklmnopqrstuvwx", targetDID: did, handle: handle, expiresAt: Date().addingTimeInterval(300))
         let json = try SwanDidWebDocumentFixture.json(did: did, handle: handle, pds: pds, key: reservation.key, claimEndpoint: reservation.claimServiceEndpoint)
         await keys.failNextCommitFinalization()

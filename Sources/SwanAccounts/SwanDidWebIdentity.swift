@@ -80,11 +80,10 @@ public struct SwanDidWebReplacementAuthorization: Sendable, Equatable {
     public let stepUpAt: Date
     public let stepUpReceiptDigest: Data
     public let mfaStrength: MFAStrength
-    public let receiptConsumed: Bool
 
     public init(accountDID: String, sessionAccountDID: String, sessionID: String,
                 stepUpAt: Date, stepUpReceiptDigest: Data,
-                mfaStrength: MFAStrength, receiptConsumed: Bool) throws {
+                mfaStrength: MFAStrength) throws {
         guard !sessionID.isEmpty, stepUpReceiptDigest.count == 32 else {
             throw SwanError.invalidIdentifier("did:web replacement authorization")
         }
@@ -94,7 +93,22 @@ public struct SwanDidWebReplacementAuthorization: Sendable, Equatable {
         self.stepUpAt = stepUpAt
         self.stepUpReceiptDigest = stepUpReceiptDigest
         self.mfaStrength = mfaStrength
-        self.receiptConsumed = receiptConsumed
+    }
+}
+
+public enum SwanIdentityStepUpOperation: String, Sendable { case replace, remove }
+public protocol SwanStepUpReceiptConsumptionStore: Sendable {
+    func consume(sessionID: String, accountDID: String, operation: SwanIdentityStepUpOperation,
+                 receiptDigest: Data, now: Date) async throws
+}
+
+public actor InMemorySwanStepUpReceiptConsumptionStore: SwanStepUpReceiptConsumptionStore {
+    private var consumed: Set<Data> = []
+    public init() {}
+    public func consume(sessionID: String, accountDID: String, operation: SwanIdentityStepUpOperation, receiptDigest: Data, now: Date) async throws {
+        guard !sessionID.isEmpty, !accountDID.isEmpty, receiptDigest.count == 32, now.timeIntervalSince1970 >= 0 else { throw SwanError.unauthorized("invalid step-up receipt") }
+        guard consumed.insert(receiptDigest).inserted else { throw SwanError.conflict(expected: 0, actual: 1) }
+        _ = operation
     }
 }
 
@@ -458,18 +472,21 @@ public actor SwanDidWebIdentityService {
     private let publicURL: String
     private let gracePeriod: TimeInterval
     private let replacementAuthorizer: (any SwanDidWebReplacementAuthorizing)?
+    private let stepUps: any SwanStepUpReceiptConsumptionStore
 
     public init(
         reservations: any SwanDurableSigningKeyReservationService,
         bindings: any IdentityBindingStore,
         publicPDSURL: String, publicURL: String,
         gracePeriod: TimeInterval = 86_400,
-        replacementAuthorizer: (any SwanDidWebReplacementAuthorizing)? = nil
+        replacementAuthorizer: (any SwanDidWebReplacementAuthorizing)? = nil,
+        stepUps: any SwanStepUpReceiptConsumptionStore
     ) {
         self.reservations = reservations; self.bindings = bindings
         self.publicPDSURL = publicPDSURL; self.publicURL = publicURL
         self.gracePeriod = gracePeriod
         self.replacementAuthorizer = replacementAuthorizer
+        self.stepUps = stepUps
     }
 
     public func reserveSigningKey(
@@ -552,11 +569,11 @@ public actor SwanDidWebIdentityService {
             guard let authorization, authorization.accountDID == accountDID,
                   let replacementAuthorizer,
                   authorization.mfaStrength == .phishingResistant,
-                  authorization.receiptConsumed,
                   now.timeIntervalSince(authorization.stepUpAt) <= 300,
                   try await replacementAuthorizer.authorize(authorization, now: now) else {
                 throw SwanError.unauthorized("fresh step-up required for identity replacement")
             }
+            try await stepUps.consume(sessionID: authorization.sessionID, accountDID: accountDID, operation: .replace, receiptDigest: authorization.stepUpReceiptDigest, now: now)
         }
         let transaction = try DidWebClaimTransaction(
             requestID: reservation.requestID, accountDID: accountDID,
@@ -637,11 +654,11 @@ public actor SwanDidWebIdentityService {
               binding.method == .didWeb, binding.accountDID == authorization.accountDID,
               let replacementAuthorizer,
               authorization.mfaStrength == .phishingResistant,
-              authorization.receiptConsumed,
               now.timeIntervalSince(authorization.stepUpAt) <= 300,
               try await replacementAuthorizer.authorize(authorization, now: now) else {
             throw SwanError.unauthorized("fresh step-up required for identity removal")
         }
+        try await stepUps.consume(sessionID: authorization.sessionID, accountDID: accountDID, operation: .remove, receiptDigest: authorization.stepUpReceiptDigest, now: now)
         let released = try IdentityBinding(
             accountDID: binding.accountDID, identityDID: binding.identityDID,
             method: binding.method, handle: binding.handle,
