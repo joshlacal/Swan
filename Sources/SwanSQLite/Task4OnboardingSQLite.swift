@@ -229,10 +229,6 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
         SQLiteSignupFinalizationTransaction(store: self, request: request, now: now)
     }
 
-    public func finalizeSignup(_ request: SignupFinalizationRequest, now: Date) async throws -> SignupFinalizationResult {
-        try await finalize(request, now: now)
-    }
-
     public func fail(id: SignupAuthorizationID, now: Date) async throws {
         let current = try task4Timestamp(now)
         try await withConnectionGate { try await transaction {

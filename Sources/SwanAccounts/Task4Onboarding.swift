@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import NIOCore
 import SwanCore
 import SwanStorage
 
@@ -350,8 +351,8 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
         try await deliver(to: to, subject: subject, body: body, idempotencyKey: key)
     }
 
-    public func deliver(to: AccountEmailAddress, subject: String, body: String, idempotencyKey _: String) async throws {
-        guard !subject.contains("\r"), !subject.contains("\n"), body.utf8.count <= 32768 else { throw MailpitSMTPDeliveryError.invalidMessage }
+    public func deliver(to: AccountEmailAddress, subject: String, body: String, idempotencyKey key: String) async throws {
+        guard !key.isEmpty, !subject.contains("\r"), !subject.contains("\n"), body.utf8.count <= 32768 else { throw MailpitSMTPDeliveryError.invalidMessage }
         var last: Error?
         for attempt in 0 ..< configuration.maximumAttempts {
             do {
@@ -483,6 +484,19 @@ public struct SignupTrustedPeerIPBucket: Sendable, Equatable {
     }
 }
 
+public struct SocketAddressSignupPeerExtractor: SignupTrustedPeerIPExtractor, Sendable {
+    private let secret: Data
+    public init(serverSecret: Data) throws {
+        guard serverSecret.count >= 16 else { throw SwanError.invalidIdentifier("peer bucket secret") }
+        secret = serverSecret
+    }
+
+    public func bucket(forCanonicalPeerIP peerIP: String) throws -> SignupTrustedPeerIPBucket {
+        guard let address = try? SocketAddress(ipAddress: peerIP, port: 0), let canonical = address.ipAddress, canonical == peerIP else { throw SwanError.invalidIdentifier("peer IP") }
+        return SignupTrustedPeerIPBucket(digest: Data(HMAC<SHA256>.authenticationCode(for: Data("swan.signup.ip-bucket.v1\0\(canonical)".utf8), using: SymmetricKey(data: secret))))
+    }
+}
+
 @available(*, deprecated, message: "Use SignupFinalizationCoordinator; generic callback finalization is not atomic")
 public protocol SignupFoundationBundle: Sendable {
     /// The foundation implementation performs account/identity/session work
@@ -550,10 +564,11 @@ public actor SignupInviteRateAdmission: SignupRateAdmission {
 public struct SignupService: Sendable {
     private let policy: SignupPolicyService
     private let store: any SignupAuthorizationStore
+    private let finalizationCoordinator: (any SignupFinalizationCoordinator)?
     private let turnstile: TurnstileVerifier?
     private let rateAdmission: (any SignupRateAdmission)?
-    public init(policy: SignupPolicyService, store: any SignupAuthorizationStore, turnstile: TurnstileVerifier? = nil, rateAdmission: (any SignupRateAdmission)? = nil) {
-        self.policy = policy; self.store = store; self.turnstile = turnstile; self.rateAdmission = rateAdmission
+    public init(policy: SignupPolicyService, store: any SignupAuthorizationStore, finalizationCoordinator: (any SignupFinalizationCoordinator)? = nil, turnstile: TurnstileVerifier? = nil, rateAdmission: (any SignupRateAdmission)? = nil) {
+        self.policy = policy; self.store = store; self.finalizationCoordinator = finalizationCoordinator; self.turnstile = turnstile; self.rateAdmission = rateAdmission
     }
 
     public func authorize(_ input: SignupAuthorizationInput, turnstileToken: String? = nil, remoteIP: String? = nil, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupAuthorization {
@@ -576,12 +591,11 @@ public struct SignupService: Sendable {
         return authorization
     }
 
-    public func finalize(_ request: SignupFinalizationRequest, foundation: any SignupFoundationBundle, now: Date = Date()) async throws -> SignupFinalizationResult {
+    public func finalize(_ request: SignupFinalizationRequest, now: Date = Date()) async throws -> SignupFinalizationResult {
         guard let authorization = try await store.authorization(id: request.authorizationID, now: now), authorization.requestID == request.idempotencyKey else { throw AccountControlStoreError.notFound }
         guard authorization.handle == request.handle, authorization.identityDID == request.identityDID else { throw SignupServiceError.duplicateRequest }
         do {
-            guard let coordinator = store as? any SignupFinalizationCoordinator else { throw SwanError.unavailable("atomic signup coordinator unavailable") }
-            _ = foundation // Coordinator owns the single-connection foundation integration.
+            guard let coordinator = finalizationCoordinator else { throw SwanError.unavailable("atomic signup coordinator unavailable") }
             return try await coordinator.finalizeSignup(request, now: now)
         } catch { try? await store.fail(id: request.authorizationID, now: now); throw error }
     }
