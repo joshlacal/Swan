@@ -88,7 +88,9 @@ public enum TOTPAuthenticator {
     public static func verify(code presented: String, secret: Data, at date: Date, configuration: TOTPConfiguration = TOTPConfiguration()) throws -> UInt64? {
         guard date.timeIntervalSince1970.isFinite, date.timeIntervalSince1970 >= 0 else { return nil }
         guard presented.utf8.count <= 8, secret.count <= 128, presented.utf8.count == configuration.digits, presented.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }) else { return nil }
-        let counter = UInt64(max(0, floor(date.timeIntervalSince1970 / configuration.period)))
+        let rawCounter = floor(date.timeIntervalSince1970 / configuration.period)
+        guard rawCounter.isFinite, rawCounter >= 0, rawCounter <= Double(UInt64.max), rawCounter <= Double(Int64.max) else { return nil }
+        let counter = UInt64(rawCounter)
         for delta in -configuration.drift ... configuration.drift {
             let candidate = delta < 0 && UInt64(-delta) > counter ? nil : UInt64(Int64(counter) + Int64(delta))
             if let candidate, constantTimeEqual(Data(try code(secret: secret, counter: candidate, configuration: configuration).utf8), Data(presented.utf8)) { return candidate }
