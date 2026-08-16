@@ -1,5 +1,6 @@
 import Foundation
 import SwanAccounts
+import SwanCore
 import SwanStorage
 
 /// Wire-shaped inputs for the reference `com.atproto.server.createAccount`

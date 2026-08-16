@@ -813,25 +813,18 @@ public actor SwanDidWebIdentityService {
                 reservedKeyID: $0.reservedKeyID, replacedAt: now
             )
         }
-        let reservationFinalizedInTransaction: Bool
-        if let atomic = bindings as? any SwanAtomicDidWebClaimStore {
-            reservationFinalizedInTransaction = try await atomic.commitDidWebClaimAtomically(
-                request, history: history, now: now, gracePeriod: gracePeriod,
-                stepUpReceipt: stepUpReceipt
-            )
-        } else if let graceAware = bindings as? any SwanGraceAwareIdentityBindingStore {
-            guard stepUpReceipt == nil else {
-                throw SwanError.unavailable("identity replacement requires atomic durable store")
-            }
-            try await graceAware.commitDidWebClaim(request, history: history, now: now, gracePeriod: gracePeriod)
-            reservationFinalizedInTransaction = false
-        } else {
-            guard stepUpReceipt == nil else {
-                throw SwanError.unavailable("identity replacement requires atomic durable store")
-            }
-            try await bindings.commitDidWebClaim(request, history: history, now: now)
-            reservationFinalizedInTransaction = false
+        // A claim consumes a one-time externally published nonce. Never allow
+        // type erasure or a wrapper around the durable store to downgrade the
+        // binding commit into a second transaction. In-memory test stores may
+        // implement the same atomic capability and report that their separate
+        // reservation fixture still needs finalization below.
+        guard let atomic = bindings as? any SwanAtomicDidWebClaimStore else {
+            throw SwanError.unavailable("identity claim requires atomic store")
         }
+        let reservationFinalizedInTransaction = try await atomic.commitDidWebClaimAtomically(
+            request, history: history, now: now, gracePeriod: gracePeriod,
+            stepUpReceipt: stepUpReceipt
+        )
         if !reservationFinalizedInTransaction {
             do {
                 try await reservations.markReservationCommitted(requestID: reservation.requestID)

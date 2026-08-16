@@ -2,6 +2,7 @@ import Crypto
 import Foundation
 import SQLiteNIO
 import SwanAccounts
+import SwanCore
 import SwanStorage
 
 /// Task 4 consumes foundation-owned signup tables. It adds only lane-owned
@@ -349,6 +350,10 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
             _ = try await connection.query("DELETE FROM signup_authorizations WHERE state IN('failed','committed') AND expires_at<=? LIMIT ?", [.integer(retention), .integer(batchSize)])
             _ = try await connection.query("DELETE FROM signup_email_request_outbox WHERE ((state IN('delivered','failed') AND COALESCE(delivered_at,expires_at)<=?) OR expires_at<=?) LIMIT ?", [.integer(retention), .integer(current), .integer(batchSize)])
         } }
+    }
+
+    public func purgeExpiredSignupState(now: Date) async throws {
+        try await purgeExpiredSignupState(now: now, batchSize: 500)
     }
 }
 

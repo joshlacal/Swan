@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "prepare": "svelte-kit sync",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "lint": "eslint . --ignore-pattern 'src/**' --ignore-pattern 'tests/**'",
     "test": "vitest run",

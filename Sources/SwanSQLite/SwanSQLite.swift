@@ -109,7 +109,7 @@ public enum SQLiteLayout {
         """
         CREATE TABLE IF NOT EXISTS identity_bindings (
             account_did TEXT PRIMARY KEY REFERENCES accounts(did) ON DELETE CASCADE,
-            identity_did TEXT NOT NULL UNIQUE,
+            identity_did TEXT NOT NULL,
             method TEXT NOT NULL CHECK(method IN ('plc', 'did-web')),
             handle TEXT NOT NULL,
             document_digest BLOB CHECK(document_digest IS NULL OR length(document_digest) = 32),

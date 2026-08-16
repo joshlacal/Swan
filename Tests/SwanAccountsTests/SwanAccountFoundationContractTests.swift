@@ -258,6 +258,7 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         XCTAssertEqual(ControlSchemaMigrationVersion.managementSessions.rawValue, 5)
         XCTAssertEqual(ControlSchemaMigrationVersion.factors.rawValue, 6)
         XCTAssertEqual(ControlSchemaMigrationVersion.hardening.rawValue, 7)
+        XCTAssertEqual(ControlSchemaMigrationVersion.accountProgramIntegration.rawValue, 8)
         let schema = SQLiteLayout.controlMigrations.joined(separator: "\n")
         for table in [
             "control_schema_migrations", "identity_bindings", "did_web_claim_transactions",
@@ -287,7 +288,7 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         let markerRows = try await database.connection.query(
             "SELECT version FROM control_schema_migrations ORDER BY version"
         )
-        XCTAssertEqual(markerRows.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7])
+        XCTAssertEqual(markerRows.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8])
         let tables = try await database.connection.query(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('identity_bindings', 'signup_authorizations', 'legacy_sessions', 'management_sessions', 'authentication_factors', 'factor_challenges', 'totp_secret_envelopes', 'recovery_code_digests', 'webauthn_credentials', 'webauthn_challenges')"
         )
@@ -368,8 +369,75 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         try await database.close()
         let reopened = try await SQLiteControlDatabase(dataDirectory: root)
         let reopenedMarkers = try await reopened.connection.query("SELECT version FROM control_schema_migrations ORDER BY version")
-        XCTAssertEqual(reopenedMarkers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7])
+        XCTAssertEqual(reopenedMarkers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8])
         try await reopened.close()
+    }
+
+    func testAccountProgramV8InstallsAuxiliaryTablesAndReleasedDidWebCanBeReclaimed() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swan-account-program-v8-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        let expected = [
+            "did_web_signing_key_reservations", "did_web_step_up_receipts",
+            "signup_invite_reservations", "signup_email_proofs",
+            "signup_email_proof_reservations", "signup_authorization_reservations",
+            "signup_authorization_results", "signup_email_request_outbox",
+            "management_pre_auth", "totp_replay_state", "mfa_factor_tokens",
+            "mfa_audit_events", "mfa_webauthn_challenge_context",
+        ]
+        let names = try await database.connection.query(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).compactMap { $0.column("name")?.string }
+        XCTAssertTrue(Set(expected).isSubset(of: Set(names)))
+
+        let first = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+        let second = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+        let third = "did:plc:cccccccccccccccccccccccc"
+        let fourth = "did:plc:dddddddddddddddddddddddd"
+        try await database.connection.query(
+            "INSERT INTO accounts(did,handle,status,created_at) VALUES ('\(first)','first.example','active',1),('\(second)','second.example','active',1),('\(third)','third.example','active',1),('\(fourth)','fourth.example','active',1)"
+        )
+        try await database.connection.query("PRAGMA foreign_keys = OFF")
+        try await database.connection.query("DROP TABLE identity_bindings")
+        try await database.connection.query(
+            """
+            CREATE TABLE identity_bindings (
+              account_did TEXT PRIMARY KEY REFERENCES accounts(did) ON DELETE CASCADE,
+              identity_did TEXT NOT NULL UNIQUE,
+              method TEXT NOT NULL CHECK(method IN ('plc', 'did-web')),
+              handle TEXT NOT NULL,
+              document_digest BLOB CHECK(document_digest IS NULL OR length(document_digest) = 32),
+              claim_receipt_digest BLOB CHECK(claim_receipt_digest IS NULL OR length(claim_receipt_digest) = 32),
+              reserved_key_id TEXT, last_validated_at INTEGER, grace_expires_at INTEGER,
+              state TEXT NOT NULL CHECK(state IN ('active', 'suspended', 'released'))
+            )
+            """
+        )
+        try await database.connection.query(
+            "INSERT INTO identity_bindings(account_did,identity_did,method,handle,document_digest,claim_receipt_digest,reserved_key_id,state) VALUES ('\(first)','did:web:reusable.example','did-web','reusable.example',zeroblob(32),randomblob(32),'key-1','released')"
+        )
+        try await database.connection.query("DELETE FROM control_schema_migrations WHERE version = 8")
+        try await database.connection.query("PRAGMA foreign_keys = ON")
+        try await database.close()
+
+        let migrated = try await SQLiteControlDatabase(dataDirectory: root)
+        try await migrated.connection.query(
+            "INSERT INTO identity_bindings(account_did,identity_did,method,handle,document_digest,claim_receipt_digest,reserved_key_id,state) VALUES ('\(second)','did:web:reusable.example','did-web','second.example',randomblob(32),randomblob(32),'key-2','active')"
+        )
+        do {
+            try await migrated.connection.query(
+                "INSERT INTO identity_bindings(account_did,identity_did,method,handle,document_digest,claim_receipt_digest,reserved_key_id,state) VALUES ('\(third)','did:web:reusable.example','did-web','third.example',randomblob(32),randomblob(32),'key-3','active')"
+            )
+            XCTFail("duplicate active did:web identity must be rejected")
+        } catch { }
+        do {
+            try await migrated.connection.query(
+                "INSERT INTO identity_bindings(account_did,identity_did,method,handle,document_digest,claim_receipt_digest,reserved_key_id,state) VALUES ('\(fourth)','did:web:fourth.example','did-web','second.example',randomblob(32),randomblob(32),'key-4','active')"
+            )
+            XCTFail("duplicate active did:web handle must be rejected")
+        } catch { }
+        try await migrated.close()
     }
 
     func testHardeningMigrationUpgradesOldFoundationFixtureAndPreservesRows() async throws {
@@ -443,7 +511,7 @@ final class SwanAccountFoundationContractTests: XCTestCase {
 
         let upgraded = try await SQLiteControlDatabase(dataDirectory: root)
         let markers = try await upgraded.connection.query("SELECT version FROM control_schema_migrations ORDER BY version")
-        XCTAssertEqual(markers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7])
+        XCTAssertEqual(markers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8])
         for (table, column) in [("did_web_claim_transactions", "reserved_key_id"), ("did_web_claim_transactions", "claim_receipt_digest"), ("legacy_session_families", "reuse_detected_at"), ("legacy_sessions", "rotated_at"), ("legacy_sessions", "replaced_by_digest"), ("legacy_sessions", "previous_session_digest"), ("legacy_sessions", "reuse_detected_at")] {
             let columns = try await upgraded.connection.query("PRAGMA table_info(\(table))")
             XCTAssertTrue(columns.contains { $0.column("name")?.string == column }, "\(table).\(column)")

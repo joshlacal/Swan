@@ -411,6 +411,9 @@ public struct SwanHTTPServer: Sendable {
     /// capability is nil unless the caller has assembled the proof codec,
     /// control-store adapter, rate limiter, and SMTP worker at startup.
     public let accountEmailXRPC: SwanAccountEmailXRPCServer?
+    /// Optional account portal bundle. Its registration owns `/account/api/**`
+    /// and `/account/**` and is installed before every XRPC or proxy fallback.
+    public let accountPortalHTTP: SwanAccountPortalHTTP?
     /// Local `app.bsky.actor.getPreferences` / `app.bsky.actor.putPreferences`
     /// routes. These can never be proxied to an AppView — the AppView does
     /// not store preferences, the PDS does — so this capability is nil unless
@@ -477,6 +480,7 @@ public struct SwanHTTPServer: Sendable {
         publicBlobSpoolAdmission: PublicRepositorySpoolAdmission? = nil,
         blobStreamAdmission: PublicRepositorySpoolAdmission? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
+        accountPortalHTTP: SwanAccountPortalHTTP? = nil,
         actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
         xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
@@ -497,6 +501,7 @@ public struct SwanHTTPServer: Sendable {
             SwanPublicHandleResolutionCapability(controlStore: $0)
         }
         self.accountEmailXRPC = accountEmailXRPC
+        self.accountPortalHTTP = accountPortalHTTP
         self.actorPreferencesXRPC = actorPreferencesXRPC
         self.xrpcPipethrough = xrpcPipethrough
         self.publicFirehoseStreaming = publicFirehoseStreaming
@@ -774,6 +779,12 @@ public struct SwanHTTPServer: Sendable {
             policy: jsonWriteBodyPolicy
         )
         router.get("/health") { _, _ in "OK" }
+
+        // The portal registers its explicit API routes and API catch-all
+        // before the SPA fallback. Installing the entire bundle here, before
+        // OAuth/XRPC/proxy routes, preserves that precedence at the sole
+        // supported router assembly boundary.
+        accountPortalHTTP?.register(on: router)
 
         let publicURL = configuration.publicURL
         let profile = profile

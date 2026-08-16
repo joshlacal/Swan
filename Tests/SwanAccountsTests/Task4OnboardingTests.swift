@@ -1,5 +1,6 @@
 import Crypto
 @testable import SwanAccounts
+@testable import SwanCore
 @testable import SwanStorage
 import XCTest
 
@@ -62,11 +63,13 @@ final class Task4OnboardingTests: XCTestCase {
 
     func testSignupRejectsUnsupportedIdentityMethodAndLifetime() async throws {
         let store = InMemorySignupAuthorizationStore()
-        let input = try SignupAuthorizationInput(
+        let peer = try SocketAddressSignupPeerExtractor(serverSecret: Data(repeating: 9, count: 32))
+            .bucket(forCanonicalPeerIP: "192.0.2.1")
+        let input = try SignupAuthorizationInput.make(
             requestID: "request-2", authorizationID: SignupAuthorizationID(rawValue: "authorization-2"),
             handle: "alice.example.com", email: AccountEmailAddress("alice@example.com"),
             identityDID: "did:key:z6Mk", emailProofDigest: Data(repeating: 4, count: 32), inviteDigest: nil,
-            clientIPBucketDigest: Data(repeating: 1, count: 32)
+            peer: peer
         )
         let service = try SignupService(policy: SignupPolicyService(policy: .openProtected), store: store)
         do {
@@ -77,7 +80,9 @@ final class Task4OnboardingTests: XCTestCase {
 
     func testOpenAndInviteSignupRequireVerifiedEmailProof() async throws {
         let store = InMemorySignupAuthorizationStore()
-        let input = try SignupAuthorizationInput(
+        let peer = try SocketAddressSignupPeerExtractor(serverSecret: Data(repeating: 9, count: 32))
+            .bucket(forCanonicalPeerIP: "192.0.2.1")
+        let input = try SignupAuthorizationInput.make(
             requestID: "request-1",
             authorizationID: SignupAuthorizationID(rawValue: "authorization-1"),
             handle: "alice.example.com",
@@ -85,7 +90,7 @@ final class Task4OnboardingTests: XCTestCase {
             identityDID: "did:plc:alice",
             emailProofDigest: nil,
             inviteDigest: nil,
-            clientIPBucketDigest: Data(repeating: 1, count: 32)
+            peer: peer
         )
         let service = try SignupService(policy: SignupPolicyService(policy: .openProtected), store: store)
         do {

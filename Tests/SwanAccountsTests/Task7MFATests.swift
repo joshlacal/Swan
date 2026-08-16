@@ -28,6 +28,10 @@ final class Task7MFATests: XCTestCase {
         XCTAssertTrue(firstReplayCAS); XCTAssertFalse(replayCAS)
         let token = try DurableFactorTokenRecord(digest: Data(repeating: 3, count: 32), accountDID: "did:plc:alice", sessionID: "session", purpose: "stepUp", factor: .totp, factorID: "factor", strength: .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: Date(timeIntervalSince1970: 4)), issuedAt: Date(timeIntervalSince1970: 4), expiresAt: Date(timeIntervalSince1970: 30))
         try await database.saveFactorToken(token, now: Date(timeIntervalSince1970: 4))
+        do {
+            _ = try await database.consumeFactorToken(digest: token.digest, accountDID: token.accountDID, sessionID: token.sessionID, purpose: token.purpose, factor: token.factor, factorID: token.factorID, strength: .stepUpMFA(base: .passwordPlusPasskey, verifiedAt: Date(timeIntervalSince1970: 4)), now: Date(timeIntervalSince1970: 5))
+            XCTFail("mismatched authentication strength must not consume the token")
+        } catch { }
         let consumedToken = try await database.consumeFactorToken(digest: token.digest, accountDID: token.accountDID, sessionID: token.sessionID, purpose: token.purpose, factor: token.factor, factorID: token.factorID, strength: token.strength, now: Date(timeIntervalSince1970: 5))
         XCTAssertEqual(consumedToken, token)
         do { _ = try await database.consumeFactorToken(digest: token.digest, accountDID: token.accountDID, sessionID: token.sessionID, purpose: token.purpose, factor: token.factor, factorID: token.factorID, strength: token.strength, now: Date(timeIntervalSince1970: 5)); XCTFail("factor token replay") } catch {}
