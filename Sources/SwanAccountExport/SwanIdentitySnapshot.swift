@@ -39,7 +39,8 @@ public struct SwanIdentitySnapshot: Codable, Sendable, Equatable {
               try AccountIdentifiers.validateDID(binding.accountDID) == binding.accountDID,
               try AccountIdentifiers.validateDID(binding.identityDID) == binding.identityDID,
               try AccountIdentifiers.canonicalHandle(binding.handle) == binding.handle,
-              history.allSatisfy({ $0.accountDID == accountDID }) else {
+              history.allSatisfy({ $0.accountDID == accountDID }),
+              zip(history, history.dropFirst()).allSatisfy({ $0.replacedAt < $1.replacedAt }) else {
             throw SwanPortableExportError.invalidManifest
         }
         if binding.method == .didWeb {
@@ -47,6 +48,16 @@ public struct SwanIdentitySnapshot: Codable, Sendable, Equatable {
                   binding.claimReceiptDigest?.count == 32,
                   binding.reservedKeyID?.isEmpty == false,
                   binding.identityDID.hasPrefix("did:web:") else {
+                throw SwanPortableExportError.invalidManifest
+            }
+        } else {
+            guard binding.documentDigest == nil, binding.claimReceiptDigest == nil, binding.reservedKeyID == nil,
+                  history.allSatisfy({ $0.documentDigest == nil && $0.claimReceiptDigest == nil && $0.reservedKeyID == nil }) else {
+                throw SwanPortableExportError.invalidManifest
+            }
+        }
+        for entry in history where entry.documentDigest != nil || entry.claimReceiptDigest != nil || entry.reservedKeyID != nil {
+            guard entry.documentDigest?.count == 32, entry.claimReceiptDigest?.count == 32, entry.reservedKeyID?.isEmpty == false else {
                 throw SwanPortableExportError.invalidManifest
             }
         }

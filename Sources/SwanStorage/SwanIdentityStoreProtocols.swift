@@ -12,3 +12,7 @@ public protocol SwanGraceAwareIdentityBindingStore: IdentityBindingStore {
 public protocol SwanIdentityContinuityStore: Sendable {
     func persistIdentityContinuity(_ binding: IdentityBinding) async throws -> IdentityBinding
 }
+
+public protocol SwanExpiredIdentityClaimReleasingStore: IdentityBindingStore {
+    func purgeExpiredIdentityClaimsReturningRequests(now: Date) async throws -> [String]
+}

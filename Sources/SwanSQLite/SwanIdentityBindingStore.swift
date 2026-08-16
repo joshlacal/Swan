@@ -7,7 +7,7 @@ import SwanStorage
 /// SQLite implementation of the reviewed method-neutral claim contract. The
 /// claim, replacement history, and nonce consumption are committed under one
 /// BEGIN IMMEDIATE transaction; no router or migration ownership is required.
-extension SQLiteControlDatabase: SwanGraceAwareIdentityBindingStore, SwanIdentityContinuityStore {
+extension SQLiteControlDatabase: SwanGraceAwareIdentityBindingStore, SwanIdentityContinuityStore, SwanExpiredIdentityClaimReleasingStore {
     public func identityBinding(accountDID: String) async throws -> IdentityBinding? {
         try await withConnectionGate {
             let rows = try await connection.query("SELECT * FROM identity_bindings WHERE account_did = ?", [.text(accountDID)])
@@ -82,8 +82,16 @@ extension SQLiteControlDatabase: SwanGraceAwareIdentityBindingStore, SwanIdentit
     }
 
     public func purgeExpiredIdentityClaims(now: Date) async throws {
+        _ = try await purgeExpiredIdentityClaimsReturningRequests(now: now)
+    }
+
+    public func purgeExpiredIdentityClaimsReturningRequests(now: Date) async throws -> [String] {
         try await withConnectionGate {
-            _ = try await connection.query("DELETE FROM did_web_claim_transactions WHERE expires_at < ? AND state != 'committed'", [.integer(timestamp(now))])
+            try await transaction {
+                let rows = try await connection.query("SELECT request_id FROM did_web_claim_transactions WHERE expires_at < ? AND state != 'committed'", [.integer(timestamp(now))])
+                _ = try await connection.query("DELETE FROM did_web_claim_transactions WHERE expires_at < ? AND state != 'committed'", [.integer(timestamp(now))])
+                return rows.compactMap { $0.column("request_id")?.string }
+            }
         }
     }
 

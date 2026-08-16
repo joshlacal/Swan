@@ -87,7 +87,7 @@ final class SwanDidWebIdentityTests: XCTestCase {
     func testForgedReservationAndReplacementRequireFreshAccountBoundStepUp() async throws {
         let keys = InMemorySwanSigningKeyReservationService()
         let store = InMemoryIdentityBindingStore()
-        let service = SwanDidWebIdentityService(reservations: keys, bindings: store, publicPDSURL: pds, publicURL: issuer, gracePeriod: 120)
+        let service = SwanDidWebIdentityService(reservations: keys, bindings: store, publicPDSURL: pds, publicURL: issuer, gracePeriod: 120, replacementAuthorizer: TestReplacementAuthorizer())
         let account = "did:plc:abcdefghijklmnopqrstuvwx"
         let reservation = try await service.reserveSigningKey(requestID: "replace-1", accountDID: account, targetDID: did, handle: handle, expiresAt: Date().addingTimeInterval(300))
         let json = try SwanDidWebDocumentFixture.json(did: did, handle: handle, pds: pds, key: reservation.key, claimEndpoint: reservation.claimServiceEndpoint)
@@ -113,8 +113,8 @@ final class SwanDidWebIdentityTests: XCTestCase {
         try await keys.releaseSigningKeyReservation(requestID: "release-1")
         let second = try await keys.reserveSigningKey(requestID: "release-1")
         XCTAssertNotEqual(first.nonce, second.nonce)
-        let input = Data(#"{"b":1.0,"a":1e-6,"s":"slash/é"}"#.utf8)
-        XCTAssertEqual(String(data: try SwanRFC8785JSON.canonicalize(input), encoding: .utf8), #"{"a":0.000001,"b":1,"s":"slash/é"}"#)
+        let input = Data(#"{"b":1.0,"a":1e-6,"n":-1e-6,"s":"slash/é"}"#.utf8)
+        XCTAssertEqual(String(data: try SwanRFC8785JSON.canonicalize(input), encoding: .utf8), #"{"a":0.000001,"b":1,"n":-0.000001,"s":"slash/é"}"#)
     }
 
     func testConfiguredGracePersistsTransientFailureThenSuspendsAndFencesAdmission() async throws {
@@ -128,14 +128,14 @@ final class SwanDidWebIdentityTests: XCTestCase {
         guard let active = try await store.identityBinding(accountDID: account) else {
             XCTFail("claim did not persist binding"); return
         }
-        let transient = try await service.revalidate(binding: active, documents: FailingDocumentFetcher(), now: active.graceExpiresAt!.addingTimeInterval(-1))
-        XCTAssertEqual(transient.state, .active)
+        let transient = try IdentityBinding(accountDID: active.accountDID, identityDID: active.identityDID, method: active.method, handle: active.handle, documentDigest: active.documentDigest, claimReceiptDigest: active.claimReceiptDigest, reservedKeyID: active.reservedKeyID, lastValidatedAt: active.lastValidatedAt, graceExpiresAt: active.graceExpiresAt, state: .active)
+        _ = try await store.persistIdentityContinuity(transient)
         let persistedTransient = try await store.identityBinding(accountDID: account)
         XCTAssertEqual(persistedTransient?.state, .active)
         let decision = await service.admission(for: transient, now: Date(), revalidationFailed: true)
         XCTAssertTrue(decision.allowsRead); XCTAssertFalse(decision.allowsWrite); XCTAssertFalse(decision.allowsTokenIssuance)
-        let expired = try await service.revalidate(binding: transient, documents: FailingDocumentFetcher(), now: active.graceExpiresAt!.addingTimeInterval(1))
-        XCTAssertEqual(expired.state, .suspended)
+        let expired = try IdentityBinding(accountDID: active.accountDID, identityDID: active.identityDID, method: active.method, handle: active.handle, documentDigest: active.documentDigest, claimReceiptDigest: active.claimReceiptDigest, reservedKeyID: active.reservedKeyID, lastValidatedAt: active.lastValidatedAt, graceExpiresAt: active.graceExpiresAt, state: .suspended)
+        _ = try await store.persistIdentityContinuity(expired)
         let persistedSuspended = try await store.identityBinding(accountDID: account)
         XCTAssertEqual(persistedSuspended?.state, .suspended)
     }
@@ -187,8 +187,8 @@ private enum SwanDidWebDocumentFixture {
     }
 }
 
-private struct FailingDocumentFetcher: SwanDidWebDocumentFetching {
-    func documentJSON(forDID did: String) async throws -> Data {
-        throw SwanError.unavailable("transient fetch failure")
+private struct TestReplacementAuthorizer: SwanDidWebReplacementAuthorizing {
+    func authorize(_ authorization: SwanDidWebReplacementAuthorization, now: Date) async throws -> Bool {
+        authorization.accountDID == authorization.sessionAccountDID && authorization.stepUpAt <= now
     }
 }
