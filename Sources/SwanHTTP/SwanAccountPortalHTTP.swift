@@ -10,15 +10,9 @@ import SwanCore
 /// and this adapter owns HTTP policy; account/domain services remain injectable.
 public protocol SwanAccountPortalServing: Sendable {
     func bootstrap(now: Date) async throws -> SwanAccountPortalBootstrap
-    func authenticate(handle: String, password: String, now: Date) async throws -> SwanAccountPortalAuthentication
+    func authenticate(handle: String, password: String, authFactorToken: String?, now: Date) async throws -> SwanAccountPortalAuthentication
     func portal(accountDID: String, now: Date) async throws -> SwanAccountPortalSnapshot
-    func mutate(path: String, accountDID: String, now: Date) async throws -> SwanAccountPortalMutation
-}
-
-public extension SwanAccountPortalServing {
-    func mutate(path: String, accountDID: String, payload: Data?, now: Date) async throws -> SwanAccountPortalMutation {
-        try await mutate(path: path, accountDID: accountDID, now: now)
-    }
+    func mutate(path: String, accountDID: String, payload: Data?, now: Date) async throws -> SwanAccountPortalMutation
 }
 
 public struct SwanAccountPortalAuthentication: Sendable, Equatable {
@@ -150,7 +144,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                 defer { admitted.release() }
                 guard let bytes = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes) else { throw PortalRequestError.malformed }
                 let credentials = try JSONDecoder().decode(PortalLoginCredentials.self, from: Data(bytes))
-                let authentication = try await service.authenticate(handle: credentials.handle, password: credentials.password, now: Date())
+                let authentication = try await service.authenticate(handle: credentials.handle, password: credentials.password, authFactorToken: credentials.authFactorToken, now: Date())
                 let issued = try await sessions.issue(accountDID: authentication.accountDID, strength: authentication.strength)
                 let snapshot = try await service.portal(accountDID: authentication.accountDID, now: Date())
                 guard await sessions.consumePreAuth(csrf) else { return accountError(.forbidden) }
@@ -211,7 +205,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                       (try? await sessions.acceptsCSRF(sessionValue: session, csrfValue: csrf)) == true else { return accountError(.forbidden) }
                 do {
                     let metadata = try await sessions.authenticate(sessionValue: session)
-                    return accountJSON(.ok, try await service.mutate(path: path, accountDID: metadata.accountDID, now: Date()))
+                    return accountJSON(.ok, try await service.mutate(path: path, accountDID: metadata.accountDID, payload: nil, now: Date()))
                 } catch { return accountError(.serviceUnavailable) }
             }
         }

@@ -47,7 +47,6 @@ public actor SwanManagementSessionRuntime {
     private let store: any ManagementSessionStore
     private let preAuthStore: any SwanManagementPreAuthStore
     private let csrfStore: any SwanManagementCSRFStore
-    private var reservedPreAuth: Set<Data> = []
     private let idleLifetime: TimeInterval
     private let absoluteLifetime: TimeInterval
 
@@ -94,19 +93,17 @@ public actor SwanManagementSessionRuntime {
     /// to issue a new token, but a successful login/signup cannot replay one.
     public func consumePreAuth(_ value: String, now: Date = Date()) async -> Bool {
         let digest = Self.digest(value)
-        guard Self.validToken(value), reservedPreAuth.remove(digest) != nil else { return false }
+        guard Self.validToken(value) else { return false }
         return await preAuthStore.take(digest: digest, now: now)
     }
 
     public func validatesPreAuth(_ value: String, now: Date = Date()) async -> Bool {
         guard Self.validToken(value) else { return false }
         let digest = Self.digest(value)
-        guard await preAuthStore.contains(digest: digest, now: now), !reservedPreAuth.contains(digest) else { return false }
-        reservedPreAuth.insert(digest)
-        return true
+        return await preAuthStore.contains(digest: digest, now: now)
     }
 
-    public func releasePreAuth(_ value: String) { reservedPreAuth.remove(Self.digest(value)) }
+    public func releasePreAuth(_ value: String) {}
 
     public func authenticate(sessionValue: String, now: Date = Date()) async throws -> ManagementSessionMetadata {
         guard Self.validToken(sessionValue) else { throw SwanManagementSessionError.unauthorized }
