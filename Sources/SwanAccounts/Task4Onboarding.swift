@@ -474,6 +474,12 @@ public struct SignupAuthorizationInput: Sendable, Equatable {
     fileprivate var isTrustedBucket: Bool {
         trustedBucket
     }
+
+    public static func make(requestID: String, authorizationID: SignupAuthorizationID, handle: String, email: AccountEmailAddress?, identityDID: String, emailProofDigest: Data?, inviteDigest: Data?, peer: SignupTrustedPeerIPBucket) throws -> Self {
+        var value = try Self(requestID: requestID, authorizationID: authorizationID, handle: handle, email: email, identityDID: identityDID, emailProofDigest: emailProofDigest, inviteDigest: inviteDigest, clientIPBucketDigest: peer.digest)
+        value.trustedBucket = true
+        return value
+    }
 }
 
 public protocol SignupTrustedPeerIPExtractor: Sendable {
@@ -592,6 +598,13 @@ public struct SignupService: Sendable {
         let authorization = try SignupAuthorization(id: input.authorizationID, requestID: input.requestID, policy: policy.policy, handle: input.handle, email: input.email?.value, identityDID: input.identityDID, emailProofDigest: input.emailProofDigest, inviteDigest: input.inviteDigest, clientIPBucketDigest: input.clientIPBucketDigest, issuedAt: now, expiresAt: now.addingTimeInterval(lifetime), leaseExpiresAt: now.addingTimeInterval(120))
         try await store.reserve(authorization, now: now)
         return authorization
+    }
+
+    public func authorize(requestID: String, authorizationID: SignupAuthorizationID, handle: String, email: AccountEmailAddress?, identityDID: String, emailProofDigest: Data?, inviteDigest: Data?, turnstileToken: String? = nil, peerAddress: SocketAddress, extractor: any SignupTrustedPeerIPExtractor, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupAuthorization {
+        guard let peerIP = peerAddress.ipAddress else { throw SwanError.invalidIdentifier("peer address") }
+        let bucket = try extractor.bucket(forCanonicalPeerIP: peerIP)
+        let input = try SignupAuthorizationInput.make(requestID: requestID, authorizationID: authorizationID, handle: handle, email: email, identityDID: identityDID, emailProofDigest: emailProofDigest, inviteDigest: inviteDigest, peer: bucket)
+        return try await authorize(input, turnstileToken: turnstileToken, remoteIP: peerIP, now: now, lifetime: lifetime)
     }
 
     public func finalize(_ request: SignupFinalizationRequest, now: Date = Date()) async throws -> SignupFinalizationResult {

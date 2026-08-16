@@ -258,6 +258,9 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
         let current = try task4Timestamp(now)
         let authRows = try await connection.query("SELECT * FROM signup_authorizations WHERE authorization_id=? AND request_id=?", [.text(request.authorizationID.rawValue), .text(request.idempotencyKey)])
         guard let auth = authRows.first else { throw AccountControlStoreError.notFound }
+        guard task4Text(auth, "handle") == request.handle,
+              task4Text(auth, "identity_did") == request.identityDID,
+              task4Text(auth, "account_did") == nil || task4Text(auth, "account_did") == request.accountDID else { throw AccountControlStoreError.invalidInput }
         let digest = task4FinalizationDigest(request)
         if let result = try await connection.query("SELECT input_digest,account_did,session_id,committed_at FROM signup_authorization_results WHERE authorization_id=?", [.text(request.authorizationID.rawValue)]).first {
             guard task4BlobValue(result, "input_digest") == digest, let did = task4Text(result, "account_did"), let session = task4Text(result, "session_id"), let committed = task4Integer(result, "committed_at") else { throw AccountControlStoreError.invalidInput }
@@ -266,6 +269,10 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
         guard task4Integer(auth, "expires_at") ?? 0 > Int64(current),
               task4Integer(auth, "lease_expires_at") ?? 0 > Int64(current),
               task4Text(auth, "state") == "issued" || task4Text(auth, "state") == "failed" else { throw SwanError.expired }
+        let inviteReservation = try await connection.query("SELECT invite_digest FROM signup_invite_reservations WHERE authorization_id=? AND reserved_until>?", [.text(request.authorizationID.rawValue), .integer(current)])
+        let proofReservation = try await connection.query("SELECT proof_digest FROM signup_email_proof_reservations WHERE authorization_id=? AND reserved_until>?", [.text(request.authorizationID.rawValue), .integer(current)])
+        if let invite = request.inviteDigest { guard inviteReservation.contains(where: { task4BlobValue($0, "invite_digest") == invite }) else { throw SwanError.expired } }
+        if let proof = request.emailProofDigest { guard proofReservation.contains(where: { task4BlobValue($0, "proof_digest") == proof }) else { throw SwanError.expired } }
         guard task4BlobValue(auth, "invite_digest") == request.inviteDigest, task4BlobValue(auth, "email_proof_digest") == request.emailProofDigest else { throw AccountControlStoreError.invalidInput }
         if let proof = request.emailProofDigest {
             let proofRows = try await connection.query("SELECT email,handle,expires_at,consumed_at FROM signup_email_proofs WHERE proof_digest=?", [task4Blob(proof)])
