@@ -36,12 +36,16 @@ Dockerfile, generated wire, or OAuth DPoP family source was changed.
 
 - `SwanScope` is the single parser for OAuth/app-password scope values. It
   rejects empty/malformed values and `rpc:*?aud=*`, canonicalizes fragments,
+  validates two-label-or-longer namespace prefixes separately from full NSIDs,
   applies dot-boundary method matching and bounded audience matching, and
   exposes explicit preset values without treating user input as
   `fullAccessV1`.
 - `SwanScopeEvaluator` authenticates the declared method policy boundary and
   fails closed for undeclared methods, missing scopes, empty grants, and
   unauthorized full-access credentials.
+- The explicit full-access registry includes the currently registered
+  repo/blob/sync, identity, feed, notification, and chat methods used by the
+  parity surface; unknown methods and broad prefixes remain denied.
 - `LegacyAuthService` creates/list/edits/revokes app passwords, presents a
   generated secret only from create, stores versioned random-salt Argon2id
   digests, and

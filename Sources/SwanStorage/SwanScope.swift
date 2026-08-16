@@ -103,7 +103,11 @@ public struct SwanScope: Codable, Hashable, Sendable, Equatable {
 
     private static func parseRPC(_ remainder: String) throws -> Self {
         let pieces = remainder.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
-        guard pieces.count == 2, isMethodPrefix(pieces[0]) else { throw SwanScopeError.malformed }
+        // A scope names a namespace (for example `app.bsky`), while the
+        // evaluator later receives the complete three-or-more-label NSID.
+        // Keep these validators distinct so a valid two-label prefix is not
+        // accidentally rejected, without weakening full method validation.
+        guard pieces.count == 2, isNamespacePrefix(pieces[0]) else { throw SwanScopeError.malformed }
         let query = String(pieces[1])
         guard query.hasPrefix("aud="), !query.dropFirst(4).isEmpty,
               !query.dropFirst(4).contains("&") else {
@@ -123,8 +127,22 @@ public struct SwanScope: Codable, Hashable, Sendable, Equatable {
         String(value.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first ?? "")
     }
 
-    private static func isMethodPrefix(_ value: Substring) -> Bool {
-        DeclaredMethodScopePolicy.isCanonicalMethod(String(value))
+    private static func isNamespacePrefix(_ value: Substring) -> Bool {
+        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 2 else { return false }
+        for (index, part) in parts.enumerated() {
+            guard !part.isEmpty, part != "*" else { return false }
+            let bytes = part.utf8
+            guard let first = bytes.first,
+                  (first >= 65 && first <= 90) || (first >= 97 && first <= 122),
+                  bytes.allSatisfy({
+                      ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
+                          || ($0 >= 48 && $0 <= 57) || $0 == 45
+                  }) else { return false }
+            if index < parts.count - 1,
+               bytes.contains(where: { $0 >= 65 && $0 <= 90 }) { return false }
+        }
+        return true
     }
 
     private static func isPathComponent(_ value: Substring) -> Bool {

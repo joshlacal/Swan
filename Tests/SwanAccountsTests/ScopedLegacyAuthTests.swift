@@ -20,6 +20,26 @@ final class ScopedLegacyAuthTests: XCTestCase {
         XCTAssertTrue(SwanScope.audienceMatches("https://api.bsky.app", "https://api.bsky.app:443/"))
     }
 
+    func testBlueskyPresetsRoundTripTwoLabelNamespacesAndRejectEvilBoundaries() throws {
+        for preset in [SwanScopePreset.bluesky, .readOnly, .postOnly] {
+            for value in preset.scopes {
+                let parsed = try SwanScope.parse(value)
+                XCTAssertEqual(try SwanScope.parse(parsed.canonicalValue).canonicalValue, parsed.canonicalValue)
+            }
+        }
+        let app = try SwanScope.parse("rpc:app.bsky?aud=https://api.bsky.app")
+        let chat = try SwanScope.parse("rpc:chat.bsky?aud=https://api.bsky.app")
+        XCTAssertTrue(app.allows(method: "app.bsky.feed.getTimeline", audience: "https://api.bsky.app"))
+        XCTAssertTrue(chat.allows(method: "chat.bsky.convo.listConvos", audience: "https://api.bsky.app"))
+        XCTAssertFalse(app.allows(method: "app.bsky.evil.feed.getTimeline", audience: "https://api.bsky.app.evil"))
+        let feed = try SwanScope.parse("rpc:app.bsky.feed?aud=https://api.bsky.app")
+        XCTAssertFalse(feed.allows(method: "app.bsky.feed-evil.getTimeline", audience: "https://api.bsky.app"))
+        XCTAssertFalse(feed.allows(method: "app.bsky.feed.getTimeline.evil", audience: "https://api.bsky.app"))
+        for value in ["rpc:app?aud=https://api.bsky.app", "rpc:app.*?aud=https://api.bsky.app", "rpc:app..bsky?aud=https://api.bsky.app"] {
+            XCTAssertThrowsError(try SwanScope.parse(value))
+        }
+    }
+
     func testDeclaredMethodPolicyDeniesUndeclaredMethodsAndRequiresScopes() throws {
         let policy = DeclaredMethodScopePolicy(declarations: [
             "com.atproto.repo.createRecord": ["repo:write"],

@@ -30,8 +30,29 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
             "com.atproto.server.getSession": [], "com.atproto.server.deleteSession": [],
             "com.atproto.server.getServiceAuth": [], "com.atproto.server.createAppPassword": [],
             "com.atproto.server.listAppPasswords": [], "com.atproto.server.revokeAppPassword": [],
-            "com.atproto.repo.createRecord": [], "com.atproto.repo.getRecord": [],
+            // Reference-compatible account/session methods.
+            "com.atproto.repo.applyWrites": [], "com.atproto.repo.createRecord": [],
+            "com.atproto.repo.deleteRecord": [], "com.atproto.repo.describeRepo": [],
+            "com.atproto.repo.getRecord": [], "com.atproto.repo.listRecords": [],
+            "com.atproto.repo.putRecord": [], "com.atproto.repo.uploadBlob": [],
+            "com.atproto.sync.getBlob": [], "com.atproto.sync.getLatestCommit": [],
+            "com.atproto.sync.getRepo": [], "com.atproto.sync.getRepoStatus": [],
+            "com.atproto.identity.resolveHandle": [],
+            // Official-client AppView feed/identity methods.
+            "app.bsky.actor.getPreferences": [], "app.bsky.actor.getPreferencesExtended": [],
+            "app.bsky.actor.getProfile": [], "app.bsky.actor.putPreferences": [],
+            "app.bsky.actor.searchActors": [],
+            "app.bsky.feed.getAuthorFeed": [], "app.bsky.feed.getFeedSkeleton": [],
+            "app.bsky.feed.getPostThread": [], "app.bsky.feed.getPosts": [],
             "app.bsky.feed.getTimeline": [], "app.bsky.feed.post": [],
+            "app.bsky.graph.getBlocks": [], "app.bsky.graph.getFollowers": [],
+            "app.bsky.graph.getFollows": [], "app.bsky.graph.getMutes": [],
+            "app.bsky.graph.getLists": [], "app.bsky.graph.muteActor": [],
+            "app.bsky.graph.unmuteActor": [],
+            "app.bsky.notification.listNotifications": [],
+            "app.bsky.notification.updateSeen": [],
+            // Official-client chat methods.
+            "chat.bsky.convo.getConvo": [], "chat.bsky.convo.getMessages": [],
             "chat.bsky.convo.listConvos": [], "chat.bsky.convo.sendMessage": []
         ], permitsFullAccess: true
     )
