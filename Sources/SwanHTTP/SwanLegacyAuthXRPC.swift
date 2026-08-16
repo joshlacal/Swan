@@ -1,7 +1,9 @@
 import Foundation
+import HTTPTypes
 import Petrel
 import SwanAccounts
 import SwanCore
+import SwanSpaces
 
 /// Pure XRPC boundary for the pinned `com.atproto.server` lexicons. Router
 /// registration is intentionally left to the integration owner; this adapter
@@ -9,6 +11,19 @@ import SwanCore
 public struct SwanLegacyAuthXRPCAdapter: Sendable {
     private let service: LegacyAuthService
 
+    /// The exact generated legacy-auth methods owned by this adapter. Keeping
+    /// this set explicit prevents a future registry entry from becoming live
+    /// merely because it shares the `com.atproto.server` namespace.
+    public static let methodNSIDs: Set<String> = [
+        ComAtprotoServerCreateSession.typeIdentifier,
+        ComAtprotoServerRefreshSession.typeIdentifier,
+        ComAtprotoServerGetSession.typeIdentifier,
+        ComAtprotoServerDeleteSession.typeIdentifier,
+        ComAtprotoServerGetServiceAuth.typeIdentifier,
+        ComAtprotoServerCreateAppPassword.typeIdentifier,
+        ComAtprotoServerListAppPasswords.typeIdentifier,
+        ComAtprotoServerRevokeAppPassword.typeIdentifier,
+    ]
     public init(service: LegacyAuthService) {
         self.service = service
     }
@@ -72,6 +87,57 @@ public struct SwanLegacyAuthXRPCAdapter: Sendable {
             didDoc: nil, email: tokens.email, emailConfirmed: tokens.emailConfirmed, emailAuthFactor: tokens.emailAuthFactor,
             active: tokens.active, status: tokens.status
         )
+    }
+}
+
+/// Authenticates legacy access tokens without entering the OAuth DPoP path.
+/// A successful lookup returns the distinct typed legacy grant, including its
+/// durable session identity and effective scopes; it never collapses into
+/// `accountOAuth` or a boolean authenticated flag.
+public struct SwanLegacyBearerAuthorizer: Sendable {
+    private let service: LegacyAuthService
+
+    public init(service: LegacyAuthService) {
+        self.service = service
+    }
+
+    public func authorize(accessToken: String, now: Date = Date()) async throws -> AuthorizationContext {
+        guard Self.validToken(accessToken) else {
+            throw SwanError.unauthorized("invalid legacy bearer")
+        }
+        let session = try await service.getSession(accessToken, now: now)
+        return .accountLegacySession(
+            subject: session.did,
+            sessionID: session.sessionID,
+            scopes: session.scopes
+        )
+    }
+
+    /// Extracts only the RFC 9110 `Bearer` credential form. DPoP proofs and
+    /// management cookies are intentionally not accepted by this boundary.
+    public static func accessToken(from headers: HTTPFields) throws -> String {
+        let values = headers[values: .authorization]
+        guard values.count == 1, values[0].hasPrefix("Bearer ") else {
+            throw SwanError.unauthorized("legacy bearer required")
+        }
+        let token = String(values[0].dropFirst("Bearer ".count))
+        guard validToken(token) else {
+            throw SwanError.unauthorized("invalid legacy bearer")
+        }
+        return token
+    }
+
+    private static func validToken(_ token: String) -> Bool {
+        guard !token.isEmpty, token.utf8.count <= 8 * 1024 else { return false }
+        return token.utf8.allSatisfy { byte in
+            switch byte {
+            case 0x21, 0x23 ... 0x27, 0x2A ... 0x2B, 0x2D ... 0x39,
+                 0x3C ... 0x5B, 0x5D ... 0x7E:
+                true
+            default:
+                false
+            }
+        }
     }
 }
 
