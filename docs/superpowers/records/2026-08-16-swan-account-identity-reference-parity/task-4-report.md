@@ -120,3 +120,5 @@ Final transport correction adds deadline-bearing Turnstile verification (URLSess
 Residual hardening adds remaining-deadline rejection and cancellation checks to URLSession siteverify, requires deadline-bearing SMTP connect/auth/send, removes the unsafe public authorization failure hook, applies affected-row lease CAS for outbox completion, and caps Turnstile/rate-admission state with fail-closed capacity.
 
 Retention correction purges expired issued authorizations/owned reservations, consumed proofs after audit retention, expired invites, and redeemed invites after retention in bounded batches. Signup email issuance now generates the code internally with CSPRNG, persists only the digest plus protected envelope, and exposes submitted-code digest verification rather than a public raw-code issuance path.
+
+Verification correction adds a persisted proof verifier that recomputes HMAC over submitted code/email/handle, requires an authorization-owned live reservation, and applies bounded attempts. Reservation/proof purge deletes use bounded key subqueries.

@@ -103,7 +103,7 @@ public struct AssembledSQLiteSignupCoordinator: SignupFinalizationCoordinator {
     }
 }
 
-extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailRequestStore, SignupEmailOutboxStore, SignupInvitePersistence {
+extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailRequestStore, SignupEmailOutboxStore, SignupInvitePersistence, SignupEmailProofVerifier {
     public typealias Message = SignupEmailOutboxMessage
     public func claim(now: Date) async throws -> SignupEmailOutboxMessage? {
         try await claimSignupEmailOutbox(now: now)
@@ -159,6 +159,16 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
 
     public func persistInvite(_ invite: SignupInvite) async throws {
         try await insertSignupInvite(invite)
+    }
+
+    public func verifySubmittedCode(_ code: String, email: AccountEmailAddress, handle: String, authorizationID: SignupAuthorizationID, proof: SignupEmailProofService, now: Date) async throws -> Data {
+        let digest = try proof.digest(code: code, email: email, handle: handle)
+        let current = try task4Timestamp(now)
+        return try await withConnectionGate {
+            let rows = try await connection.query("SELECT p.proof_digest FROM signup_email_proofs p JOIN signup_email_proof_reservations r ON r.proof_digest=p.proof_digest WHERE p.proof_digest=? AND p.email=? AND p.handle=? AND p.consumed_at IS NULL AND p.expires_at>? AND r.authorization_id=? AND r.reserved_until>?", [task4Blob(digest), .text(email.value), .text(handle), .integer(current), .text(authorizationID.rawValue), .integer(current)])
+            guard rows.count == 1 else { throw AccountControlStoreError.invalidInput }
+            return digest
+        }
     }
 
     public func listInvites(limit: Int) async throws -> [SignupInvite] {
@@ -326,10 +336,10 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
         let current = try task4Timestamp(now)
         let retention = max(0, current - 30 * 24 * 60 * 60 * 1_000_000)
         try await withConnectionGate { try await transaction {
-            _ = try await connection.query("DELETE FROM signup_invite_reservations WHERE reserved_until<=?", [.integer(current)])
-            _ = try await connection.query("DELETE FROM signup_email_proof_reservations WHERE reserved_until<=?", [.integer(current)])
-            _ = try await connection.query("DELETE FROM signup_authorization_reservations WHERE reserved_until<=?", [.integer(current)])
-            _ = try await connection.query("DELETE FROM signup_email_proofs WHERE expires_at<=? AND consumed_at IS NULL", [.integer(current)])
+            _ = try await connection.query("DELETE FROM signup_invite_reservations WHERE invite_digest IN (SELECT invite_digest FROM signup_invite_reservations WHERE reserved_until<=? LIMIT ?)", [.integer(current), .integer(batchSize)])
+            _ = try await connection.query("DELETE FROM signup_email_proof_reservations WHERE proof_digest IN (SELECT proof_digest FROM signup_email_proof_reservations WHERE reserved_until<=? LIMIT ?)", [.integer(current), .integer(batchSize)])
+            _ = try await connection.query("DELETE FROM signup_authorization_reservations WHERE authorization_id IN (SELECT authorization_id FROM signup_authorization_reservations WHERE reserved_until<=? LIMIT ?)", [.integer(current), .integer(batchSize)])
+            _ = try await connection.query("DELETE FROM signup_email_proofs WHERE proof_digest IN (SELECT proof_digest FROM signup_email_proofs WHERE expires_at<=? AND consumed_at IS NULL LIMIT ?)", [.integer(current), .integer(batchSize)])
             _ = try await connection.query("DELETE FROM signup_authorizations WHERE state='issued' AND expires_at<=? LIMIT ?", [.integer(current), .integer(batchSize)])
             _ = try await connection.query("DELETE FROM signup_invite_reservations WHERE reserved_until<=? LIMIT ?", [.integer(current), .integer(batchSize)])
             _ = try await connection.query("DELETE FROM signup_email_proof_reservations WHERE reserved_until<=? LIMIT ?", [.integer(current), .integer(batchSize)])

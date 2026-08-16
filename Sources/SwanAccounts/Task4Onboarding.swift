@@ -717,6 +717,27 @@ public struct SignupEmailRequestService: Sendable {
     }
 }
 
+public protocol SignupEmailProofVerifier: Sendable {
+    func verifySubmittedCode(_ code: String, email: AccountEmailAddress, handle: String, authorizationID: SignupAuthorizationID, proof: SignupEmailProofService, now: Date) async throws -> Data
+}
+
+public actor BoundedSignupEmailProofVerifier {
+    private let store: any SignupEmailProofVerifier
+    private var attempts: [String: (started: Date, count: Int)] = [:]
+    public init(store: any SignupEmailProofVerifier) {
+        self.store = store
+    }
+
+    public func verifySubmittedCode(_ code: String, email: AccountEmailAddress, handle: String, authorizationID: SignupAuthorizationID, proof: SignupEmailProofService, now: Date = Date()) async throws -> Data {
+        let key = "\(authorizationID.rawValue)\0\(email.value)"
+        attempts = attempts.filter { now.timeIntervalSince($0.value.started) < 900 }
+        guard let current = attempts[key], current.count >= 5 ? false : true else { attempts[key] = (now, 1); return try await store.verifySubmittedCode(code, email: email, handle: handle, authorizationID: authorizationID, proof: proof, now: now) }
+        attempts[key] = (current.started, current.count + 1)
+        guard current.count < 5 else { throw SwanError.unavailable("email proof rate limited") }
+        return try await store.verifySubmittedCode(code, email: email, handle: handle, authorizationID: authorizationID, proof: proof, now: now)
+    }
+}
+
 public protocol SignupEmailOutboxStore: Sendable {
     associatedtype Message: Sendable
     func claim(now: Date) async throws -> Message?
