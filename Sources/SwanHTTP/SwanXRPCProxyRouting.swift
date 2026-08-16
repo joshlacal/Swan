@@ -1,4 +1,5 @@
 import Foundation
+import SwanStorage
 
 /// Where a proxied XRPC request should be sent.
 public enum SwanXRPCProxyRoute: Sendable, Equatable {
@@ -130,8 +131,7 @@ public struct SwanXRPCProxyRouter: Sendable {
             // does not proxy is unrouted whether or not the client named a
             // destination, and it reports the same 404 an unknown namespace
             // gets so this cannot be used to enumerate what Swan reserves.
-            guard Self.proxyablePrefixes.contains(where: { nsid.hasPrefix($0) })
-                || Self.proxyableMethods.contains(nsid)
+            guard GeneratedLegacyMethodRegistry.declarations[nsid] != nil
             else {
                 throw SwanXRPCProxyRoutingFailure.unrouted
             }
@@ -151,7 +151,8 @@ public struct SwanXRPCProxyRouter: Sendable {
         // admissible set is narrower still than `proxyablePrefixes`: only the
         // AppView's own namespace. `chat.bsky.` and `tools.ozone.` live at
         // other services and a client must name them explicitly.
-        guard nsid.hasPrefix(Self.appViewPrefix) else {
+        guard GeneratedLegacyMethodRegistry.declarations[nsid] != nil,
+              nsid.hasPrefix(Self.appViewPrefix) else {
             throw SwanXRPCProxyRoutingFailure.unrouted
         }
         return .configuredAppView(did: appViewDID)
