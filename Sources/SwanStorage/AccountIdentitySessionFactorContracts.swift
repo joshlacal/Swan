@@ -727,6 +727,7 @@ public struct WebAuthnChallenge: Codable, Sendable, Equatable {
     public let challengeDigest: Data
     public let accountDID: String
     public let credentialIDDigest: Data?
+    public let purpose: FactorChallengePurpose
     public let relyingPartyID: String
     public let origin: String
     public let issuedAt: Date
@@ -737,6 +738,7 @@ public struct WebAuthnChallenge: Codable, Sendable, Equatable {
         challengeDigest: Data,
         accountDID: String,
         credentialIDDigest: Data? = nil,
+        purpose: FactorChallengePurpose = .assertion,
         relyingPartyID: String,
         origin: String,
         issuedAt: Date,
@@ -754,6 +756,7 @@ public struct WebAuthnChallenge: Codable, Sendable, Equatable {
         self.challengeDigest = challengeDigest
         self.accountDID = accountDID
         self.credentialIDDigest = credentialIDDigest
+        self.purpose = purpose
         self.relyingPartyID = relyingPartyID
         self.origin = origin
         self.issuedAt = issuedAt
@@ -761,7 +764,7 @@ public struct WebAuthnChallenge: Codable, Sendable, Equatable {
         self.consumedAt = consumedAt
     }
 
-    private enum CodingKeys: String, CodingKey { case challengeDigest, accountDID, credentialIDDigest, relyingPartyID, origin, issuedAt, expiresAt, consumedAt }
+    private enum CodingKeys: String, CodingKey { case challengeDigest, accountDID, credentialIDDigest, purpose, relyingPartyID, origin, issuedAt, expiresAt, consumedAt }
 
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -769,6 +772,7 @@ public struct WebAuthnChallenge: Codable, Sendable, Equatable {
             challengeDigest: c.decode(Data.self, forKey: .challengeDigest),
             accountDID: c.decode(String.self, forKey: .accountDID),
             credentialIDDigest: c.decodeIfPresent(Data.self, forKey: .credentialIDDigest),
+            purpose: c.decodeIfPresent(FactorChallengePurpose.self, forKey: .purpose) ?? .assertion,
             relyingPartyID: c.decode(String.self, forKey: .relyingPartyID),
             origin: c.decode(String.self, forKey: .origin),
             issuedAt: c.decode(Date.self, forKey: .issuedAt),

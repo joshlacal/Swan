@@ -18,6 +18,7 @@ public enum MFAError: Error, Equatable, Sendable {
     case counterRollback
     case tokenInvalid
     case stepUpRequired
+    case storageUnavailable
 }
 
 public enum TOTPAlgorithm: String, Sendable, Codable { case sha1, sha256, sha512 }
@@ -95,15 +96,15 @@ public enum TOTPAuthenticator {
 }
 
 public actor TOTPReplayGuard {
-    private var accepted: [String: UInt64] = [:]
+    private let store: any TOTPReplayStore
     private let configuration: TOTPConfiguration
-    public init(configuration: TOTPConfiguration = TOTPConfiguration()) { self.configuration = configuration }
+    public init(store: any TOTPReplayStore, configuration: TOTPConfiguration = TOTPConfiguration()) { self.store = store; self.configuration = configuration }
 
-    public func accept(factorID: String, code: String, secret: Data, at date: Date) throws -> Bool {
+    public func accept(factorID: String, accountDID: String, code: String, secret: Data, at date: Date) async throws -> Bool {
         guard let counter = try TOTPAuthenticator.verify(code: code, secret: secret, at: date, configuration: configuration) else { return false }
-        if let previous = accepted[factorID], counter <= previous { return false }
-        accepted[factorID] = counter
-        return true
+        // First acceptance is a CAS from no row; every subsequent acceptance
+        // must advance the durable counter atomically.
+        return try await store.compareAndSwapTOTPReplay(factorID: factorID, accountDID: accountDID, expected: nil, proposed: counter, now: date)
     }
 }
 
@@ -113,25 +114,33 @@ public actor TOTPReplayGuard {
 public struct TOTPFactorService: Sendable {
     private let keyStore: any TOTPEnvelopeKeyStore
     private let replayGuard: TOTPReplayGuard
+    private let factorStore: any AuthenticationFactorStore
     private let configuration: TOTPConfiguration
 
-    public init(keyStore: any TOTPEnvelopeKeyStore, replayGuard: TOTPReplayGuard = TOTPReplayGuard(), configuration: TOTPConfiguration = TOTPConfiguration()) {
+    public init(keyStore: any TOTPEnvelopeKeyStore, replayGuard: TOTPReplayGuard, factorStore: any AuthenticationFactorStore, configuration: TOTPConfiguration = TOTPConfiguration()) {
         self.keyStore = keyStore
         self.replayGuard = replayGuard
+        self.factorStore = factorStore
         self.configuration = configuration
     }
 
-    public func verify(envelope: TOTPSecretEnvelope, factorID: String, code: String, at date: Date) async throws -> Bool {
-        guard envelope.factorID == factorID, let key = try await keyStore.key(reference: envelope.keyReference) else { throw MFAError.invalidEnvelope }
+    public func verify(envelope: TOTPSecretEnvelope, accountDID: String, factorID: String, code: String, at date: Date) async throws -> Bool {
+        let factors: [AuthenticationFactorMetadata]
+        do { factors = try await factorStore.listFactors(accountDID: accountDID, now: date) } catch { throw MFAError.storageUnavailable }
+        guard envelope.factorID == factorID, factors.contains(where: { $0.id == factorID && $0.kind == .totp && $0.disabledAt == nil }) else { throw MFAError.credentialNotFound }
+        let key: Data?
+        do { key = try await keyStore.key(reference: envelope.keyReference) } catch { throw MFAError.storageUnavailable }
+        guard let key else { throw MFAError.invalidEnvelope }
         let secret = try TOTPEnvelopeCrypto.open(envelope, key: key)
-        return try await replayGuard.accept(factorID: factorID, code: code, secret: secret, at: date)
+        return try await replayGuard.accept(factorID: factorID, accountDID: accountDID, code: code, secret: secret, at: date)
     }
 }
 
 public struct RecoveryCodeService: Sendable {
     public static let defaultCount = 10
     private let store: any RecoveryCodeStore
-    public init(store: any RecoveryCodeStore) { self.store = store }
+    private let factorStore: any AuthenticationFactorStore
+    public init(store: any RecoveryCodeStore, factorStore: any AuthenticationFactorStore) { self.store = store; self.factorStore = factorStore }
 
     public func replace(accountDID: String, count: Int = defaultCount, now: Date) async throws -> [String] {
         guard (1 ... 32).contains(count) else { throw MFAError.invalidCode }
@@ -142,8 +151,11 @@ public struct RecoveryCodeService: Sendable {
     }
 
     public func consume(_ code: String, accountDID: String, now: Date) async throws -> Bool {
+        do { guard try await factorStore.listFactors(accountDID: accountDID, now: now).contains(where: { $0.kind == .recoveryCode && $0.disabledAt == nil }) else { return false } } catch { throw MFAError.storageUnavailable }
         do { _ = try await store.consumeRecoveryCode(digest: Self.digest(code), accountDID: accountDID, now: now); return true }
-        catch { return false }
+        catch let error as AccountControlStoreError where error == .notFound { return false }
+        catch let error as AccountControlStoreError where error == .invalidInput { return false }
+        catch { throw MFAError.storageUnavailable }
     }
 
     public static func digest(_ code: String) -> Data { Data(SHA256.hash(data: Data(("swan-recovery-v1:" + code.uppercased()).utf8))) }
@@ -154,23 +166,22 @@ public struct RecoveryCodeService: Sendable {
 }
 
 public enum FactorTokenPurpose: String, Sendable, Codable { case stepUp, managementLogin, oauthToken }
-public struct IssuedFactorToken: Sendable, Equatable { public let token: String; public let expiresAt: Date; public let factor: AuthenticationFactorKind }
-private struct FactorTokenRecord: Sendable { let digest: Data; let accountDID: String; let purpose: FactorTokenPurpose; let factor: AuthenticationFactorKind; let expiresAt: Date }
+public struct IssuedFactorToken: Sendable, Equatable { public let token: String; public let expiresAt: Date; public let factor: AuthenticationFactorKind; public let sessionID: String }
 
 public actor FactorTokenService {
-    private var records: [Data: FactorTokenRecord] = [:]
-    public init() {}
-    public func issue(accountDID: String, purpose: FactorTokenPurpose, factor: AuthenticationFactorKind, now: Date, lifetime: TimeInterval = 120) throws -> IssuedFactorToken {
+    private let store: any DurableFactorTokenStore
+    public init(store: any DurableFactorTokenStore) { self.store = store }
+    public func issue(accountDID: String, sessionID: String, purpose: FactorTokenPurpose, factor: AuthenticationFactorKind, strength: AuthenticationStrength, now: Date, lifetime: TimeInterval = 120) async throws -> IssuedFactorToken {
         guard lifetime > 0 && lifetime <= 600 else { throw MFAError.tokenInvalid }
+        guard factor != .recoveryCode || purpose != .stepUp else { throw MFAError.stepUpRequired }
         let token = randomBytes(count: 32).base64URLEncodedString(); let digest = Data(SHA256.hash(data: Data(token.utf8)))
         let expires = now.addingTimeInterval(lifetime)
-        records[digest] = FactorTokenRecord(digest: digest, accountDID: accountDID, purpose: purpose, factor: factor, expiresAt: expires)
-        return IssuedFactorToken(token: token, expiresAt: expires, factor: factor)
+        try await store.saveFactorToken(try DurableFactorTokenRecord(digest: digest, accountDID: accountDID, sessionID: sessionID, purpose: purpose.rawValue, factor: factor, strength: strength, issuedAt: now, expiresAt: expires), now: now)
+        return IssuedFactorToken(token: token, expiresAt: expires, factor: factor, sessionID: sessionID)
     }
-    public func consume(_ token: String, accountDID: String, purpose: FactorTokenPurpose, factor: AuthenticationFactorKind, now: Date) throws -> Bool {
+    public func consume(_ token: String, accountDID: String, sessionID: String, purpose: FactorTokenPurpose, factor: AuthenticationFactorKind, strength: AuthenticationStrength, now: Date) async throws -> Bool {
         let digest = Data(SHA256.hash(data: Data(token.utf8)))
-        guard let record = records[digest], record.accountDID == accountDID, record.purpose == purpose, record.factor == factor, now < record.expiresAt else { throw MFAError.tokenInvalid }
-        records.removeValue(forKey: digest)
+        _ = try await store.consumeFactorToken(digest: digest, accountDID: accountDID, sessionID: sessionID, purpose: purpose.rawValue, factor: factor, strength: strength, now: now)
         return true
     }
 }
@@ -227,15 +238,18 @@ public struct MFAAuditEvent: Codable, Equatable, Sendable {
 /// bound while retaining the newest security decisions.
 public actor MFAAuditLog {
     public let capacity: Int
+    private let store: (any MFAAuditStore)?
     private var events: [MFAAuditEvent] = []
 
-    public init(capacity: Int = 256) {
+    public init(capacity: Int = 256, store: (any MFAAuditStore)? = nil) {
         self.capacity = max(1, capacity)
+        self.store = store
     }
 
-    public func append(_ event: MFAAuditEvent) {
+    public func append(_ event: MFAAuditEvent) async throws {
         events.append(event)
         if events.count > capacity { events.removeFirst(events.count - capacity) }
+        if let store { try await store.appendMFAAuditEvent(try MFAAuditEventRecord(event: event.kind.rawValue, accountDID: event.accountDID, factorID: event.factor.map(\.rawValue), success: event.success, occurredAt: event.occurredAt), now: event.occurredAt) }
     }
 
     public func snapshot() -> [MFAAuditEvent] { events }
@@ -256,10 +270,10 @@ public struct WebAuthnVerificationResult: Sendable, Equatable { public let accou
 public struct WebAuthnVerifier: Sendable {
     private let keyStore: any WebAuthnPublicKeyStore
     private let credentialStore: any WebAuthnCredentialStore
-    private let challengeStore: any WebAuthnChallengeStore
+    private let challengeStore: any WebAuthnChallengeLookupStore
     private let configuredRelyingPartyID: String?
     private let configuredOrigin: String?
-    public init(keyStore: any WebAuthnPublicKeyStore, credentialStore: any WebAuthnCredentialStore, challengeStore: any WebAuthnChallengeStore, relyingPartyID: String? = nil, origin: String? = nil) {
+    public init(keyStore: any WebAuthnPublicKeyStore, credentialStore: any WebAuthnCredentialStore, challengeStore: any WebAuthnChallengeLookupStore, relyingPartyID: String? = nil, origin: String? = nil) {
         self.keyStore = keyStore
         self.credentialStore = credentialStore
         self.challengeStore = challengeStore
@@ -267,17 +281,17 @@ public struct WebAuthnVerifier: Sendable {
         self.configuredOrigin = origin
     }
 
-    public func verify(assertion: WebAuthnAssertion, accountDID: String, challenge: Data, now: Date) async throws -> WebAuthnVerificationResult {
+    public func verify(assertion: WebAuthnAssertion, accountDID: String, challenge: Data, purpose: FactorChallengePurpose = .assertion, now: Date) async throws -> WebAuthnVerificationResult {
         let credentialDigest = Data(SHA256.hash(data: assertion.credentialID))
         guard let credential = try await credentialStore.webAuthnCredential(credentialIDDigest: credentialDigest, accountDID: accountDID, now: now), credential.disabledAt == nil else { throw MFAError.credentialNotFound }
         let challengeDigest = Data(SHA256.hash(data: challenge))
-        let challengeRecord: WebAuthnChallenge
-        do { challengeRecord = try await challengeStore.consumeWebAuthnChallenge(digest: challengeDigest, accountDID: accountDID, now: now) } catch { throw MFAError.invalidChallenge }
+        guard let challengeRecord = try await challengeStore.webAuthnChallenge(digest: challengeDigest, accountDID: accountDID, now: now) else { throw MFAError.invalidChallenge }
         guard now >= challengeRecord.issuedAt && now < challengeRecord.expiresAt,
+              challengeRecord.purpose == purpose,
               challengeRecord.credentialIDDigest == nil || challengeRecord.credentialIDDigest == credentialDigest else { throw MFAError.invalidChallenge }
-        let expectedOrigin = configuredOrigin ?? challengeRecord.origin
-        let expectedRelyingPartyID = configuredRelyingPartyID ?? challengeRecord.relyingPartyID
-        guard expectedOrigin == challengeRecord.origin, expectedOrigin.hasPrefix("https://") else { throw MFAError.invalidOrigin }
+        guard let expectedOrigin = configuredOrigin, let expectedRelyingPartyID = configuredRelyingPartyID else { throw MFAError.invalidOrigin }
+        guard expectedOrigin == challengeRecord.origin, expectedRelyingPartyID == challengeRecord.relyingPartyID,
+              let originURL = URL(string: expectedOrigin), originURL.scheme == "https", originURL.host == expectedRelyingPartyID, originURL.user == nil, originURL.password == nil, originURL.query == nil, originURL.fragment == nil, originURL.path.isEmpty || originURL.path == "/" else { throw MFAError.invalidOrigin }
         guard let json = try? JSONDecoder().decode(ClientData.self, from: assertion.clientDataJSON), json.type == "webauthn.get", json.origin == expectedOrigin, let receivedChallenge = Data(base64URLEncoded: json.challenge), constantTimeEqual(receivedChallenge, challenge) else { throw MFAError.invalidClientData }
         guard assertion.authenticatorData.count >= 37 else { throw MFAError.invalidAuthenticatorData }
         guard constantTimeEqual(Data(assertion.authenticatorData.prefix(32)), Data(SHA256.hash(data: Data(expectedRelyingPartyID.utf8)))) else { throw MFAError.invalidRelyingParty }
@@ -288,11 +302,14 @@ public struct WebAuthnVerifier: Sendable {
         // monotonic signal to CAS in that mode, so the one-time challenge is
         // the replay boundary until an authenticator reports a positive count.
         if count == 0 && credential.signCount == 0 {
+            do { _ = try await challengeStore.consumeWebAuthnChallenge(digest: challengeDigest, accountDID: accountDID, now: now) } catch { throw MFAError.invalidChallenge }
             return WebAuthnVerificationResult(accountDID: accountDID, newSignCount: 0)
         }
         guard count > credential.signCount else { throw MFAError.counterRollback }
         switch try await credentialStore.compareAndSwapWebAuthnSignCount(try WebAuthnSignCountUpdate(credentialIDDigest: credentialDigest, accountDID: accountDID, expectedCurrent: credential.signCount, proposed: count, now: now)) {
-        case let .updated(newCount): return WebAuthnVerificationResult(accountDID: accountDID, newSignCount: newCount)
+        case let .updated(newCount):
+            do { _ = try await challengeStore.consumeWebAuthnChallenge(digest: challengeDigest, accountDID: accountDID, now: now) } catch { throw MFAError.invalidChallenge }
+            return WebAuthnVerificationResult(accountDID: accountDID, newSignCount: newCount)
         case .rollbackDetected: throw MFAError.counterRollback
         }
     }
@@ -313,14 +330,62 @@ public struct WebAuthnRegistrationResult: Sendable, Equatable {
 }
 
 public enum WebAuthnRegistrationVerifier {
-    public static func verify(credentialID: Data, authenticatorData: Data, publicKeyX963: Data, relyingPartyID: String) throws -> WebAuthnRegistrationResult {
-        guard !credentialID.isEmpty, !relyingPartyID.isEmpty, authenticatorData.count >= 37 else { throw MFAError.invalidAuthenticatorData }
+    public static func verify(clientDataJSON: Data, authenticatorData: Data, challenge: Data, accountDID: String, challengeRecord: WebAuthnChallenge, expectedOrigin: String, relyingPartyID: String, now: Date) throws -> WebAuthnRegistrationResult {
+        guard !accountDID.isEmpty, challengeRecord.accountDID == accountDID, challengeRecord.credentialIDDigest == nil,
+              challengeRecord.purpose == .enrollment,
+              challengeRecord.challengeDigest == Data(SHA256.hash(data: challenge)), now >= challengeRecord.issuedAt, now < challengeRecord.expiresAt,
+              challengeRecord.origin == expectedOrigin, challengeRecord.relyingPartyID == relyingPartyID,
+              expectedOrigin == challengeRecord.origin, expectedOrigin.hasPrefix("https://"),
+              let originURL = URL(string: expectedOrigin), originURL.scheme == "https", originURL.host == relyingPartyID, originURL.user == nil, originURL.password == nil, originURL.query == nil, originURL.fragment == nil, originURL.path.isEmpty || originURL.path == "/" else { throw MFAError.invalidChallenge }
+        guard let client = try? JSONDecoder().decode(RegistrationClientData.self, from: clientDataJSON), client.type == "webauthn.create", client.origin == expectedOrigin, client.crossOrigin == false,
+              let receivedChallenge = Data(base64URLEncoded: client.challenge), constantTimeEqual(receivedChallenge, challenge) else { throw MFAError.invalidClientData }
+        guard authenticatorData.count >= 55 else { throw MFAError.invalidAuthenticatorData }
         guard constantTimeEqual(Data(authenticatorData.prefix(32)), Data(SHA256.hash(data: Data(relyingPartyID.utf8)))) else { throw MFAError.invalidRelyingParty }
         let flags = authenticatorData[32]
-        guard flags & 0x01 != 0, flags & 0x04 != 0 else { throw MFAError.invalidAuthenticatorData }
-        guard let publicKey = try? P256.Signing.PublicKey(x963Representation: publicKeyX963) else { throw MFAError.invalidSignature }
+        guard flags & 0x01 != 0, flags & 0x04 != 0, flags & 0x40 != 0 else { throw MFAError.invalidAuthenticatorData }
         let signCount = authenticatorData[33 ..< 37].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        var offset = 53
+        guard offset + 2 <= authenticatorData.count else { throw MFAError.invalidAuthenticatorData }
+        let credentialLength = Int(authenticatorData[offset]) << 8 | Int(authenticatorData[offset + 1]); offset += 2
+        guard credentialLength > 0, offset + credentialLength < authenticatorData.count else { throw MFAError.invalidAuthenticatorData }
+        let credentialID = Data(authenticatorData[offset ..< offset + credentialLength]); offset += credentialLength
+        guard let publicKey = try parseCOSEES256(Data(authenticatorData[offset...])) else { throw MFAError.invalidSignature }
         return WebAuthnRegistrationResult(credentialIDDigest: Data(SHA256.hash(data: credentialID)), publicKey: publicKey, signCount: signCount)
+    }
+
+    private struct RegistrationClientData: Decodable {
+        let type: String; let challenge: String; let origin: String; let crossOrigin: Bool
+        enum CodingKeys: String, CodingKey { case type, challenge, origin, crossOrigin }
+        init(from decoder: Decoder) throws { let c = try decoder.container(keyedBy: CodingKeys.self); type = try c.decode(String.self, forKey: .type); challenge = try c.decode(String.self, forKey: .challenge); origin = try c.decode(String.self, forKey: .origin); crossOrigin = try c.decodeIfPresent(Bool.self, forKey: .crossOrigin) ?? false }
+    }
+
+    private static func parseCOSEES256(_ data: Data) throws -> P256.Signing.PublicKey? {
+        var reader = CBORReader(data: data)
+        guard let mapLength = try? reader.readMapLength(), mapLength >= 5 else { return nil }
+        var keyType: Int64?; var algorithm: Int64?; var curve: Int64?; var x: Data?; var y: Data?
+        for _ in 0 ..< mapLength {
+            let key = try reader.readInt()
+            switch key {
+            case 1: keyType = try reader.readInt()
+            case 3: algorithm = try reader.readInt()
+            case -1: curve = try reader.readInt()
+            case -2: x = try reader.readBytes()
+            case -3: y = try reader.readBytes()
+            default: try reader.skipValue()
+            }
+        }
+        guard keyType == 2, algorithm == -7, curve == 1, let x, let y, x.count == 32, y.count == 32 else { return nil }
+        return try P256.Signing.PublicKey(rawRepresentation: x + y)
+    }
+
+    private struct CBORReader {
+        let data: Data; var index: Int = 0
+        mutating func readByte() throws -> UInt8 { guard index < data.count else { throw MFAError.invalidSignature }; defer { index += 1 }; return data[index] }
+        mutating func readLength(_ initial: UInt8) throws -> Int { let additional = initial & 0x1f; if additional < 24 { return Int(additional) }; let count = 1 << Int(additional - 24); guard count <= 8 else { throw MFAError.invalidSignature }; var value = 0; for _ in 0 ..< count { value = (value << 8) | Int(try readByte()) }; return value }
+        mutating func readMapLength() throws -> Int { let initial = try readByte(); guard initial >> 5 == 5 else { throw MFAError.invalidSignature }; return try readLength(initial) }
+        mutating func readInt() throws -> Int64 { let initial = try readByte(); let major = initial >> 5; let value = Int64(try readLength(initial)); if major == 0 { return value }; if major == 1 { return -1 - value }; throw MFAError.invalidSignature }
+        mutating func readBytes() throws -> Data { let initial = try readByte(); guard initial >> 5 == 2 else { throw MFAError.invalidSignature }; let length = try readLength(initial); guard index + length <= data.count else { throw MFAError.invalidSignature }; defer { index += length }; return Data(data[index ..< index + length]) }
+        mutating func skipValue() throws { let initial = try readByte(); let major = initial >> 5; let length = try readLength(initial); if major == 2 || major == 3 { index += length } else if major == 4 { for _ in 0 ..< length { try skipValue() } } else if major == 5 { for _ in 0 ..< length { try skipValue(); try skipValue() } } else if major == 0 || major == 1 || major == 7 {} else { throw MFAError.invalidSignature }; guard index <= data.count else { throw MFAError.invalidSignature } }
     }
 }
 

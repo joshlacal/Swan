@@ -4,7 +4,7 @@ import SQLiteNIO
 import SwanCore
 import SwanStorage
 
-extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, RecoveryCodeStore, WebAuthnCredentialStore, WebAuthnChallengeStore {
+extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, RecoveryCodeStore, WebAuthnCredentialStore, WebAuthnChallengeStore, WebAuthnChallengeLookupStore, TOTPReplayStore, DurableFactorTokenStore, MFAAuditStore {
     public func listFactors(accountDID: String, now: Date) async throws -> [AuthenticationFactorMetadata] {
         try await withConnectionGate {
             let rows = try await connection.query("SELECT factor_id, account_did, kind, label, lookup_digest, created_at, last_used_at, disabled_at FROM authentication_factors WHERE account_did = ? AND (disabled_at IS NULL OR disabled_at > ? ) ORDER BY created_at, factor_id", [.text(accountDID), .integer(factorTimestamp(now))])
@@ -37,7 +37,7 @@ extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, Rec
     }
 
     public func purgeExpiredFactorState(now: Date) async throws {
-        try await withConnectionGate { _ = try await transaction { _ = try await connection.query("DELETE FROM factor_challenges WHERE expires_at <= ?", [.integer(factorTimestamp(now))]) } }
+        try await withConnectionGate { try await ensureTask7DurableTables(); _ = try await transaction { _ = try await connection.query("DELETE FROM factor_challenges WHERE expires_at <= ?", [.integer(factorTimestamp(now))]); _ = try await connection.query("DELETE FROM webauthn_challenges WHERE expires_at <= ?", [.integer(factorTimestamp(now))]); _ = try await connection.query("DELETE FROM mfa_webauthn_challenge_context WHERE challenge_digest NOT IN (SELECT challenge_digest FROM webauthn_challenges)", []) } }
     }
 
     public func saveTOTPEnvelope(_ envelope: TOTPSecretEnvelope, now: Date) async throws {
@@ -81,13 +81,78 @@ extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, Rec
 
     public func disableWebAuthnCredential(credentialIDDigest: Data, accountDID: String, now: Date) async throws { try await withConnectionGate { _ = try await connection.query("UPDATE webauthn_credentials SET disabled_at = ? WHERE credential_id_digest = ? AND account_did = ? AND disabled_at IS NULL", [.integer(factorTimestamp(now)), credentialIDDigest.sqliteData!, .text(accountDID)]) } }
 
-    public func reserveWebAuthnChallenge(_ challenge: WebAuthnChallenge, now: Date) async throws { try await withConnectionGate { _ = try await connection.query("INSERT INTO webauthn_challenges(challenge_digest, account_did, credential_id_digest, relying_party_id, origin, issued_at, expires_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [challenge.challengeDigest.sqliteData!, .text(challenge.accountDID), challenge.credentialIDDigest.map { $0.sqliteData! } ?? .null, .text(challenge.relyingPartyID), .text(challenge.origin), .integer(factorTimestamp(challenge.issuedAt)), .integer(factorTimestamp(challenge.expiresAt)), optionalTimestamp(challenge.consumedAt)]) } }
+    public func reserveWebAuthnChallenge(_ challenge: WebAuthnChallenge, now: Date) async throws { try await withConnectionGate { try await ensureTask7DurableTables(); try await transaction { _ = try await connection.query("INSERT INTO webauthn_challenges(challenge_digest, account_did, credential_id_digest, relying_party_id, origin, issued_at, expires_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [challenge.challengeDigest.sqliteData!, .text(challenge.accountDID), challenge.credentialIDDigest.map { $0.sqliteData! } ?? .null, .text(challenge.relyingPartyID), .text(challenge.origin), .integer(factorTimestamp(challenge.issuedAt)), .integer(factorTimestamp(challenge.expiresAt)), optionalTimestamp(challenge.consumedAt)]); _ = try await connection.query("INSERT INTO mfa_webauthn_challenge_context(challenge_digest, purpose) VALUES (?, ?)", [challenge.challengeDigest.sqliteData!, .text(challenge.purpose.rawValue)]) } } }
 
     public func consumeWebAuthnChallenge(digest: Data, accountDID: String, now: Date) async throws -> WebAuthnChallenge {
-        try await withConnectionGate { try await transaction {
+        try await withConnectionGate { try await ensureTask7DurableTables(); return try await transaction {
             let changed = try await connection.query("UPDATE webauthn_challenges SET consumed_at = ? WHERE challenge_digest = ? AND account_did = ? AND consumed_at IS NULL AND expires_at > ? RETURNING challenge_digest", [.integer(factorTimestamp(now)), digest.sqliteData!, .text(accountDID), .integer(factorTimestamp(now))]); guard !changed.isEmpty else { throw AccountControlStoreError.malformedRecord }
-            let rows = try await connection.query("SELECT challenge_digest, account_did, credential_id_digest, relying_party_id, origin, issued_at, expires_at, consumed_at FROM webauthn_challenges WHERE challenge_digest = ? AND account_did = ?", [digest.sqliteData!, .text(accountDID)]); guard let row = rows.first else { throw AccountControlStoreError.malformedRecord }; return try WebAuthnChallenge(challengeDigest: requiredBlob(row, "challenge_digest"), accountDID: requiredText(row, "account_did"), credentialIDDigest: optionalBlob(row, "credential_id_digest"), relyingPartyID: requiredText(row, "relying_party_id"), origin: requiredText(row, "origin"), issuedAt: requiredDate(row, "issued_at"), expiresAt: requiredDate(row, "expires_at"), consumedAt: optionalDate(row, "consumed_at"))
+            let rows = try await connection.query("SELECT challenge_digest, account_did, credential_id_digest, relying_party_id, origin, issued_at, expires_at, consumed_at FROM webauthn_challenges WHERE challenge_digest = ? AND account_did = ?", [digest.sqliteData!, .text(accountDID)]); guard let row = rows.first else { throw AccountControlStoreError.malformedRecord }; let purposeRows = try await connection.query("SELECT purpose FROM mfa_webauthn_challenge_context WHERE challenge_digest = ?", [digest.sqliteData!]); let purpose = purposeRows.first.flatMap { try? FactorChallengePurpose(rawValue: requiredText($0, "purpose")) } ?? .assertion; return try WebAuthnChallenge(challengeDigest: requiredBlob(row, "challenge_digest"), accountDID: requiredText(row, "account_did"), credentialIDDigest: optionalBlob(row, "credential_id_digest"), purpose: purpose, relyingPartyID: requiredText(row, "relying_party_id"), origin: requiredText(row, "origin"), issuedAt: requiredDate(row, "issued_at"), expiresAt: requiredDate(row, "expires_at"), consumedAt: optionalDate(row, "consumed_at"))
         } }
+    }
+
+    public func webAuthnChallenge(digest: Data, accountDID: String, now: Date) async throws -> WebAuthnChallenge? {
+        try await withConnectionGate {
+            try await ensureTask7DurableTables()
+            let rows = try await connection.query("SELECT challenge_digest, account_did, credential_id_digest, relying_party_id, origin, issued_at, expires_at, consumed_at FROM webauthn_challenges WHERE challenge_digest = ? AND account_did = ? AND consumed_at IS NULL AND expires_at > ?", [digest.sqliteData!, .text(accountDID), .integer(factorTimestamp(now))])
+            guard let row = rows.first else { return nil }
+            let purposeRows = try await connection.query("SELECT purpose FROM mfa_webauthn_challenge_context WHERE challenge_digest = ?", [digest.sqliteData!]); let purpose = purposeRows.first.flatMap { try? FactorChallengePurpose(rawValue: requiredText($0, "purpose")) } ?? .assertion
+            return try WebAuthnChallenge(challengeDigest: requiredBlob(row, "challenge_digest"), accountDID: requiredText(row, "account_did"), credentialIDDigest: optionalBlob(row, "credential_id_digest"), purpose: purpose, relyingPartyID: requiredText(row, "relying_party_id"), origin: requiredText(row, "origin"), issuedAt: requiredDate(row, "issued_at"), expiresAt: requiredDate(row, "expires_at"), consumedAt: optionalDate(row, "consumed_at"))
+        }
+    }
+
+    public func compareAndSwapTOTPReplay(factorID: String, accountDID: String, expected: UInt64?, proposed: UInt64, now: Date) async throws -> Bool {
+        try await withConnectionGate {
+            try await ensureTask7DurableTables()
+            let rows: [SQLiteRow]
+            if let expected {
+                rows = try await connection.query("UPDATE totp_replay_state SET accepted_counter = ?, updated_at = ? WHERE factor_id = ? AND account_did = ? AND accepted_counter = ? RETURNING factor_id", [.integer(Int(proposed)), .integer(factorTimestamp(now)), .text(factorID), .text(accountDID), .integer(Int(expected))])
+            } else {
+                rows = try await connection.query("INSERT INTO totp_replay_state(factor_id, account_did, accepted_counter, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(factor_id, account_did) DO UPDATE SET accepted_counter = excluded.accepted_counter, updated_at = excluded.updated_at WHERE totp_replay_state.accepted_counter < excluded.accepted_counter RETURNING factor_id", [.text(factorID), .text(accountDID), .integer(Int(proposed)), .integer(factorTimestamp(now))])
+            }
+            return !rows.isEmpty
+        }
+    }
+
+    public func saveFactorToken(_ record: DurableFactorTokenRecord, now: Date) async throws {
+        try await withConnectionGate {
+            try await ensureTask7DurableTables()
+            let strength = try JSONEncoder().encode(record.strength)
+            _ = try await connection.query("DELETE FROM mfa_factor_tokens WHERE expires_at <= ? OR consumed_at IS NOT NULL OR revoked_at IS NOT NULL", [.integer(factorTimestamp(now))])
+            _ = try await connection.query("INSERT INTO mfa_factor_tokens(digest, account_did, session_id, purpose, factor, strength, issued_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [record.digest.sqliteData!, .text(record.accountDID), .text(record.sessionID), .text(record.purpose), .text(record.factor.rawValue), strength.sqliteData!, .integer(factorTimestamp(record.issuedAt)), .integer(factorTimestamp(record.expiresAt))])
+        }
+    }
+
+    public func consumeFactorToken(digest: Data, accountDID: String, sessionID: String, purpose: String, factor: AuthenticationFactorKind, strength: AuthenticationStrength, now: Date) async throws -> DurableFactorTokenRecord {
+        try await withConnectionGate { try await transaction {
+            try await ensureTask7DurableTables()
+            let strengthData = try JSONEncoder().encode(strength)
+            let rows = try await connection.query("UPDATE mfa_factor_tokens SET consumed_at = ? WHERE digest = ? AND account_did = ? AND session_id = ? AND purpose = ? AND factor = ? AND strength = ? AND consumed_at IS NULL AND revoked_at IS NULL AND expires_at > ? RETURNING digest, account_did, session_id, purpose, factor, strength, issued_at, expires_at", [.integer(factorTimestamp(now)), digest.sqliteData!, .text(accountDID), .text(sessionID), .text(purpose), .text(factor.rawValue), strengthData.sqliteData!, .integer(factorTimestamp(now))])
+            guard let row = rows.first, let factor = AuthenticationFactorKind(rawValue: try requiredText(row, "factor")) else { throw AccountControlStoreError.notFound }
+            return try DurableFactorTokenRecord(digest: requiredBlob(row, "digest"), accountDID: requiredText(row, "account_did"), sessionID: requiredText(row, "session_id"), purpose: requiredText(row, "purpose"), factor: factor, strength: try JSONDecoder().decode(AuthenticationStrength.self, from: requiredBlob(row, "strength")), issuedAt: requiredDate(row, "issued_at"), expiresAt: requiredDate(row, "expires_at"))
+        } }
+    }
+
+    public func revokeFactorTokens(accountDID: String, sessionID: String?, now: Date) async throws {
+        try await withConnectionGate { try await ensureTask7DurableTables(); if let sessionID { _ = try await connection.query("UPDATE mfa_factor_tokens SET revoked_at = ? WHERE account_did = ? AND session_id = ? AND revoked_at IS NULL", [.integer(factorTimestamp(now)), .text(accountDID), .text(sessionID)]) } else { _ = try await connection.query("UPDATE mfa_factor_tokens SET revoked_at = ? WHERE account_did = ? AND revoked_at IS NULL", [.integer(factorTimestamp(now)), .text(accountDID)]) } }
+    }
+
+    public func appendMFAAuditEvent(_ event: MFAAuditEventRecord, now: Date) async throws {
+        try await withConnectionGate {
+            try await ensureTask7DurableTables()
+            _ = try await connection.query("INSERT INTO mfa_audit_events(event, account_did, factor_id, success, occurred_at) VALUES (?, ?, ?, ?, ?)", [.text(event.event), .text(event.accountDID), event.factorID.map(SQLiteData.text) ?? .null, .integer(event.success ? 1 : 0), .integer(factorTimestamp(event.occurredAt))])
+            _ = try await connection.query("DELETE FROM mfa_audit_events WHERE event_id NOT IN (SELECT event_id FROM mfa_audit_events ORDER BY event_id DESC LIMIT 10000)")
+        }
+    }
+}
+
+private extension SQLiteControlDatabase {
+    func ensureTask7DurableTables() async throws {
+        // This is intentionally adapter-local: Task 6 owns migration ordering.
+        // IF NOT EXISTS makes the seam safe for already-provisioned databases.
+        _ = try await connection.query("CREATE TABLE IF NOT EXISTS totp_replay_state (factor_id TEXT NOT NULL, account_did TEXT NOT NULL, accepted_counter INTEGER NOT NULL CHECK(accepted_counter >= 0), updated_at INTEGER NOT NULL, PRIMARY KEY(factor_id, account_did))")
+        _ = try await connection.query("CREATE TABLE IF NOT EXISTS mfa_factor_tokens (digest BLOB PRIMARY KEY CHECK(length(digest) = 32), account_did TEXT NOT NULL, session_id TEXT NOT NULL, purpose TEXT NOT NULL, factor TEXT NOT NULL, strength BLOB NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER, revoked_at INTEGER)")
+        _ = try await connection.query("CREATE TABLE IF NOT EXISTS mfa_audit_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, account_did TEXT NOT NULL, factor_id TEXT, success INTEGER NOT NULL, occurred_at INTEGER NOT NULL)")
+        _ = try await connection.query("CREATE TABLE IF NOT EXISTS mfa_webauthn_challenge_context (challenge_digest BLOB PRIMARY KEY CHECK(length(challenge_digest) = 32), purpose TEXT NOT NULL)")
     }
 }
 
