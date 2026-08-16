@@ -2677,9 +2677,10 @@ extension SwanCommand {
                       // `--email-smtp-host`/`--email-smtp-port` are shared
                       // with the account program's authenticated SMTP
                       // configuration, so they are exempt when that surface
-                      // is enabled.
+                      // is enabled with an explicit mode; without a mode they
+                      // remain Mailpit-path options.
                       (emailSMTPHost == nil && emailSMTPPort == nil)
-                        || enableAccountPortal else {
+                        || (enableAccountPortal && emailSMTPMode != nil) else {
                     throw ValidationError(
                         "email recovery options require --enable-email-recovery"
                     )
