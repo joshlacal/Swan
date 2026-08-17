@@ -8,6 +8,14 @@ PDS on day one.
 The active profile is `permissioned-data-0016-2026-07-30`. Its upstream pins
 and security boundary live in `Profiles/`.
 
+## Documentation
+
+- 🏛️ **[Modular Architecture & Components](docs/architecture.md):** Hummingbird 2 runtime, SQLite dual-plane storage, OAuth 2.1 / DPoP, public firehose, and MFA subsystem.
+- 🚀 **[Production Deployment & Configuration Guide](docs/deployment-guide.md):** Docker & systemd setups, secrets management (`0600` files), CLI flags (`swan serve`), and reverse proxy configurations (Caddy/Nginx).
+- 🛠️ **[Operational Runbook & Disaster Recovery](docs/operational-runbook.md):** Health monitoring, online encrypted account backup/restore, key rotation, and SQLite database maintenance.
+- 📖 **[API & Protocol Reference](docs/api-reference.md):** Complete AT Protocol XRPC endpoints, OAuth 2.1 endpoints, account portal REST APIs, and loopback management APIs.
+- 📚 **[Documentation Home](docs/README.md):** Complete index of all technical and protocol specifications.
+
 ## Development
 
 ```sh

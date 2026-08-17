@@ -168,7 +168,9 @@ final class DurableLegacySessionServiceTests: XCTestCase {
         }
         let (_, tokens) = try await issue(fixture)
         let parts = tokens.accessJWT.split(separator: ".")
-        let forged = "\(parts[0]).\(parts[1]).\(String(parts[2]).dropLast())A"
+        let sig = String(parts[2])
+        let tampered = sig.hasSuffix("A") ? "\(sig.dropLast())B" : "\(sig.dropLast())A"
+        let forged = "\(parts[0]).\(parts[1]).\(tampered)"
         await assertThrowsAsync(
             try await fixture.service.authorize(accessJWT: forged)
         )
