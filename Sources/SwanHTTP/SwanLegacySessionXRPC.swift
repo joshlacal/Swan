@@ -201,8 +201,8 @@ private struct Handlers: Sendable {
                 context: context,
                 required: ["identifier", "password"],
                 // Both are sent by the official client. `authFactorToken` is
-                // accepted and ignored: Swan has no second factor, and rejecting
-                // an unknown key would fail a client that always sends it.
+                // optional for password-only accounts and is validated by the
+                // canonical directory when the additive MFA runtime is active.
                 optional: ["authFactorToken", "allowTakendown"]
             )
             guard await rateLimiter.admitSessionCreation(
@@ -213,7 +213,8 @@ private struct Handlers: Sendable {
 
             let tokens = try await authenticate(
                 identifier: input.identifier,
-                password: input.password
+                password: input.password,
+                authFactorToken: input.authFactorToken
             )
             let handle = try await directory.canonicalHandle(did: tokens.did)
             return try json(
@@ -252,7 +253,8 @@ private struct Handlers: Sendable {
     /// happened twice" separates a missing account from a wrong password.
     private func authenticate(
         identifier: String,
-        password: String
+        password: String,
+        authFactorToken: String? = nil
     ) async throws -> SwanOAuth.LegacySessionTokens {
         let resolved: String?
         let handle: String?
@@ -274,7 +276,8 @@ private struct Handlers: Sendable {
         do {
             outcome = try await accounts.authenticateForLogin(
                 handle: handle ?? identifier,
-                password: password
+                password: password,
+                authFactorToken: authFactorToken
             )
         } catch {
             // `AccountLoginAuthenticationError.unavailable` is infrastructure,

@@ -479,6 +479,19 @@ public protocol ManagementSessionStore: Sendable {
     func purgeExpiredManagementSessions(now: Date) async throws
 }
 
+/// Atomic management-session strength upgrade. A step-up token is consumed
+/// before this update and the durable row is changed only for the same
+/// account/session while it remains live.
+public protocol ManagementSessionStepUpStore: ManagementSessionStore {
+    func upgradeManagementSession(
+        digest: Data,
+        accountDID: String,
+        strength: AuthenticationStrength,
+        lastStepUpAt: Date,
+        now: Date
+    ) async throws
+}
+
 /// Durable one-time state used before an account-management session exists.
 /// The browser only receives the bearer value; implementations persist its
 /// keyed digest and must consume it atomically.
@@ -597,10 +610,24 @@ public struct FactorChallenge: Codable, Sendable, Equatable {
 public protocol AuthenticationFactorStore: Sendable {
     func listFactors(accountDID: String, now: Date) async throws -> [AuthenticationFactorMetadata]
     func saveFactor(_ factor: AuthenticationFactorMetadata, now: Date) async throws
+    /// Inserts a factor only when its identifier is not already owned. The
+    /// boolean is the linearization result used by concurrent WebAuthn
+    /// enrollment callers; a loser must never compensate by disabling a row
+    /// created by the winner.
+    func saveFactorIfAbsent(_ factor: AuthenticationFactorMetadata, now: Date) async throws -> Bool
     func disableFactor(id: String, accountDID: String, now: Date) async throws
     func reserveChallenge(_ challenge: FactorChallenge, now: Date) async throws
     func consumeChallenge(digest: Data, now: Date) async throws -> FactorChallenge
     func purgeExpiredFactorState(now: Date) async throws
+}
+
+public extension AuthenticationFactorStore {
+    func saveFactorIfAbsent(_ factor: AuthenticationFactorMetadata, now: Date) async throws -> Bool {
+        let existing = try await listFactors(accountDID: factor.accountDID, now: now)
+        guard !existing.contains(where: { $0.id == factor.id }) else { return false }
+        try await saveFactor(factor, now: now)
+        return true
+    }
 }
 
 /// TOTP storage is an encrypted envelope contract only. The control database
@@ -719,6 +746,8 @@ public struct WebAuthnChallenge: Codable, Sendable, Equatable {
     public let challengeDigest: Data
     public let accountDID: String
     public let credentialIDDigest: Data?
+    public let sessionID: String?
+    public let factorID: String?
     public let purpose: FactorChallengePurpose
     public let relyingPartyID: String
     public let origin: String
@@ -730,6 +759,8 @@ public struct WebAuthnChallenge: Codable, Sendable, Equatable {
         challengeDigest: Data,
         accountDID: String,
         credentialIDDigest: Data? = nil,
+        sessionID: String? = nil,
+        factorID: String? = nil,
         purpose: FactorChallengePurpose = .assertion,
         relyingPartyID: String,
         origin: String,
@@ -739,6 +770,8 @@ public struct WebAuthnChallenge: Codable, Sendable, Equatable {
     ) throws {
         guard challengeDigest.count == 32,
               credentialIDDigest.map({ $0.count == 32 }) ?? true,
+              sessionID.map({ !$0.isEmpty && $0.utf8.count <= 512 }) ?? true,
+              factorID.map({ !$0.isEmpty && $0.utf8.count <= 128 }) ?? true,
               !relyingPartyID.isEmpty,
               !origin.isEmpty,
               expiresAt >= issuedAt,
@@ -748,6 +781,8 @@ public struct WebAuthnChallenge: Codable, Sendable, Equatable {
         self.challengeDigest = challengeDigest
         self.accountDID = accountDID
         self.credentialIDDigest = credentialIDDigest
+        self.sessionID = sessionID
+        self.factorID = factorID
         self.purpose = purpose
         self.relyingPartyID = relyingPartyID
         self.origin = origin
@@ -756,7 +791,7 @@ public struct WebAuthnChallenge: Codable, Sendable, Equatable {
         self.consumedAt = consumedAt
     }
 
-    private enum CodingKeys: String, CodingKey { case challengeDigest, accountDID, credentialIDDigest, purpose, relyingPartyID, origin, issuedAt, expiresAt, consumedAt }
+    private enum CodingKeys: String, CodingKey { case challengeDigest, accountDID, credentialIDDigest, sessionID, factorID, purpose, relyingPartyID, origin, issuedAt, expiresAt, consumedAt }
 
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -764,6 +799,8 @@ public struct WebAuthnChallenge: Codable, Sendable, Equatable {
             challengeDigest: c.decode(Data.self, forKey: .challengeDigest),
             accountDID: c.decode(String.self, forKey: .accountDID),
             credentialIDDigest: c.decodeIfPresent(Data.self, forKey: .credentialIDDigest),
+            sessionID: c.decodeIfPresent(String.self, forKey: .sessionID),
+            factorID: c.decodeIfPresent(String.self, forKey: .factorID),
             purpose: c.decodeIfPresent(FactorChallengePurpose.self, forKey: .purpose) ?? .assertion,
             relyingPartyID: c.decode(String.self, forKey: .relyingPartyID),
             origin: c.decode(String.self, forKey: .origin),
@@ -802,6 +839,15 @@ public protocol TOTPSecretStore: Sendable {
     func saveTOTPEnvelope(_ envelope: TOTPSecretEnvelope, now: Date) async throws
     func totpEnvelope(factorID: String, accountDID: String) async throws -> TOTPSecretEnvelope?
     func deleteTOTPEnvelope(factorID: String, accountDID: String, now: Date) async throws
+}
+
+/// Pending enrollment is durable and remains inactive until a current code
+/// proves possession of the proposed seed. Activation must be one linear
+/// transaction that enables the factor and installs the active envelope.
+public protocol TOTPEnrollmentStore: TOTPSecretStore {
+    func savePendingTOTPEnvelope(_ envelope: TOTPSecretEnvelope, accountDID: String, expiresAt: Date, now: Date) async throws
+    func pendingTOTPEnvelope(factorID: String, accountDID: String, now: Date) async throws -> TOTPSecretEnvelope?
+    func activatePendingTOTPEnvelope(factorID: String, accountDID: String, now: Date) async throws -> TOTPSecretEnvelope
 }
 
 public protocol RecoveryCodeStore: Sendable {

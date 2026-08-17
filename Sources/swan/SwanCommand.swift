@@ -2128,13 +2128,13 @@ extension SwanCommand {
 
         @Option(
             name: .customLong("signup-secret-file"),
-            help: "Owner-only mounted 32-byte base64url signup secret (email-proof/invite HMAC); SWAN_SIGNUP_SECRET is the alternative"
+            help: "Owner-only mounted 32-byte base64url signup secret (email-proof/invite HMAC)"
         )
         var signupSecretFile: String?
 
         @Option(
             name: .customLong("signup-account-kek-file"),
-            help: "Owner-only mounted account-KEK file for signup key provisioning; SWAN_ACCOUNT_KEK is the alternative"
+            help: "Owner-only mounted account-KEK file for signup key provisioning"
         )
         var signupAccountKEKFile: String?
 
@@ -2200,7 +2200,7 @@ extension SwanCommand {
 
         @Option(
             name: .customLong("did-web-signing-key-file"),
-            help: "Owner-only mounted 32-byte base64url did:web reserved signing key; SWAN_DID_WEB_SIGNING_KEY is the alternative"
+            help: "Owner-only mounted 32-byte base64url did:web reserved signing key"
         )
         var didWebSigningKeyFile: String?
 
@@ -2909,6 +2909,37 @@ extension SwanCommand {
             return value
         }
 
+        /// Public signup always needs an authenticated STARTTLS or implicit-TLS
+        /// email-proof/outbox path. The NIO production transport deliberately
+        /// rejects `plaintextLab`; accepting it here would defer a known
+        /// startup failure until the first delivery attempt.
+        static func requireAuthenticatedSMTPForPublicSignup(
+            policy: SignupPolicy,
+            emailSMTPMode: String?
+        ) throws {
+            guard policy == .closed else {
+                guard let emailSMTPMode else {
+                    throw ValidationError(
+                        "--signup-policy \(policy.rawValue) requires --email-smtp-mode"
+                    )
+                }
+                let mode = try parseSMTPMode(emailSMTPMode)
+                guard mode == .startTLS || mode == .implicitTLS else {
+                    throw ValidationError(
+                        "--signup-policy \(policy.rawValue) requires authenticated startTLS or implicitTLS SMTP"
+                    )
+                }
+                return
+            }
+            if let emailSMTPMode {
+                guard try parseSMTPMode(emailSMTPMode) == .plaintextLab else {
+                    throw ValidationError(
+                        "--email-smtp-mode plaintextLab is only available when public signup is disabled"
+                    )
+                }
+            }
+        }
+
         /// Resolves the authenticated SMTP configuration from the parsed
         /// options. `nil` mode selects the Mailpit laboratory default (the
         /// existing `--enable-email-recovery` path); an explicit non-lab mode
@@ -2939,7 +2970,7 @@ extension SwanCommand {
             if mode != .plaintextLab {
                 guard let host,
                       !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                      let port else {
+                      port != nil else {
                     throw ValidationError(
                         "--email-smtp-mode \(Self.smtpModeName(mode)) requires --email-smtp-host and --email-smtp-port"
                     )
@@ -2973,28 +3004,98 @@ extension SwanCommand {
             }
         }
 
-        /// Loads an owner-only mounted 32-byte base64url secret, with the
-        /// named environment variable as the alternative. The value is never
-        /// echoed into descriptions, logs, errors, or test snapshots; only
-        /// the option name appears in a refusal.
-        static func loadOwnerOnly32ByteSecret(
-            file: String?,
-            environmentName: String,
-            option: String
-        ) throws -> Data {
-            if let file {
-                return try AccountProvisioningSecrets.requiredMounted32ByteSecret(
-                    secretFile: URL(fileURLWithPath: file)
-                )
-            }
-            guard let encoded = ProcessInfo.processInfo.environment[environmentName],
-                  let decoded = Data(base64URLEncoded: encoded),
-                  decoded.count == 32 else {
+        struct ValidatedAccountProgramStartupMaterial: Sendable {
+            let signupSecret: SignupSecret?
+            let signupAccountKeyConfiguration: AccountKeyEncryptionConfiguration
+            let accountKEK: Data
+            let didWebSigningKey: Data
+        }
+
+        /// Validate every mounted secret consumed by the opt-in account
+        /// runtime before SQLite, repository bootstrap, or a listener exists.
+        /// A process environment is not an owner-only mounted authority and
+        /// therefore cannot configure signup or did:web in this production
+        /// path. Decoded values are retained so composition does not reopen a
+        /// pathname or consult a different source after storage exists.
+        static func preflightAccountProgramStartupMaterial(
+            enableAccountPortal: Bool,
+            signupPolicy: SignupPolicy,
+            signupSecretFile: String?,
+            signupAccountKEKFile: String?,
+            signupAccountKEKID: String?,
+            didWebSigningKeyFile: String?
+        ) throws -> ValidatedAccountProgramStartupMaterial? {
+            guard enableAccountPortal else { return nil }
+            guard let didWebSigningKeyFile,
+                  !didWebSigningKeyFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw ValidationError(
-                    "\(option) requires an owner-only mounted secret file or \(environmentName)"
+                    "--enable-account-portal requires an owner-only --did-web-signing-key-file"
                 )
             }
-            return decoded
+            let didWebSigningKey: Data
+            do {
+                didWebSigningKey = try AccountProvisioningSecrets.requiredMounted32ByteSecret(
+                    secretFile: URL(fileURLWithPath: didWebSigningKeyFile)
+                )
+            } catch {
+                throw ValidationError("--did-web-signing-key-file is unavailable")
+            }
+
+            guard let signupAccountKEKFile,
+                  !signupAccountKEKFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ValidationError(
+                    "--enable-account-portal requires an owner-only --signup-account-kek-file"
+                )
+            }
+            let accountKEK: Data
+            do {
+                accountKEK = try AccountProvisioningSecrets.requiredMounted32ByteSecret(
+                    secretFile: URL(fileURLWithPath: signupAccountKEKFile)
+                )
+            } catch {
+                throw ValidationError("--signup-account-kek-file is unavailable")
+            }
+            let signupSecret: SignupSecret?
+            if signupPolicy == .closed {
+                guard signupSecretFile == nil else {
+                    throw ValidationError(
+                        "--signup-secret-file requires --signup-policy inviteRequired or openProtected"
+                    )
+                }
+                signupSecret = nil
+            } else {
+                guard let signupSecretFile,
+                      !signupSecretFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw ValidationError(
+                        "--signup-policy \(signupPolicy.rawValue) requires an owner-only --signup-secret-file"
+                    )
+                }
+                do {
+                    signupSecret = try SignupSecret(
+                        AccountProvisioningSecrets.requiredMounted32ByteSecret(
+                            secretFile: URL(fileURLWithPath: signupSecretFile)
+                        )
+                    )
+                } catch {
+                    throw ValidationError("--signup-secret-file is unavailable")
+                }
+            }
+            let signupAccountKeyConfiguration: AccountKeyEncryptionConfiguration
+            do {
+                signupAccountKeyConfiguration = try AccountProvisioningSecrets
+                    .requiredMountedAccountKeyConfiguration(
+                        activeKeyID: signupAccountKEKID ?? "primary",
+                        secretFile: URL(fileURLWithPath: signupAccountKEKFile)
+                    )
+            } catch {
+                throw ValidationError("--signup-account-kek-file is unavailable")
+            }
+            return ValidatedAccountProgramStartupMaterial(
+                signupSecret: signupSecret,
+                signupAccountKeyConfiguration: signupAccountKeyConfiguration,
+                accountKEK: accountKEK,
+                didWebSigningKey: didWebSigningKey
+            )
         }
 
         func run() async throws {
@@ -3197,11 +3298,6 @@ extension SwanCommand {
                             "--signup-policy openProtected requires an owner-only --turnstile-secret-file"
                         )
                     }
-                    guard emailSMTPMode != nil else {
-                        throw ValidationError(
-                            "--signup-policy openProtected requires --email-smtp-mode"
-                        )
-                    }
                 } else {
                     guard turnstileSecretFile == nil else {
                         throw ValidationError(
@@ -3209,6 +3305,10 @@ extension SwanCommand {
                         )
                     }
                 }
+                try Self.requireAuthenticatedSMTPForPublicSignup(
+                    policy: resolvedSignupPolicy,
+                    emailSMTPMode: emailSMTPMode
+                )
             }
             let smtpMode = try Self.parseSMTPMode(emailSMTPMode)
             let smtpMechanism = try Self.parseSMTPMechanism(emailSMTPMechanism)
@@ -3231,26 +3331,14 @@ extension SwanCommand {
             // neither may be silently replaced by a weaker default. This
             // runs after the SMTP refusals so an incomplete SMTP
             // configuration reports the SMTP problem first.
-            if enableAccountPortal && resolvedSignupPolicy != .closed {
-                guard signupSecretFile != nil
-                    || ProcessInfo.processInfo.environment["SWAN_SIGNUP_SECRET"] != nil else {
+            if enableAccountPortal && resolvedSignupPolicy == .closed {
+                // The closed policy does not assemble public signup, but the
+                // opted-in account portal still needs its mounted account KEK
+                // for MFA envelope protection. Only the signup HMAC secret is
+                // forbidden on this path.
+                guard signupSecretFile == nil else {
                     throw ValidationError(
-                        "--signup-policy \(resolvedSignupPolicy.rawValue) requires an owner-only --signup-secret-file or SWAN_SIGNUP_SECRET"
-                    )
-                }
-                guard signupAccountKEKFile != nil
-                    || ProcessInfo.processInfo.environment["SWAN_ACCOUNT_KEK"] != nil else {
-                    throw ValidationError(
-                        "--signup-policy \(resolvedSignupPolicy.rawValue) requires an owner-only --signup-account-kek-file or SWAN_ACCOUNT_KEK"
-                    )
-                }
-            } else if enableAccountPortal {
-                guard signupSecretFile == nil,
-                      signupAccountKEKFile == nil,
-                      signupAccountKEKID == nil,
-                      signupAccountKeyDirectory == nil else {
-                    throw ValidationError(
-                        "--signup-secret-file, --signup-account-kek-file, --signup-account-kek-id, and --signup-account-key-directory require --signup-policy inviteRequired or openProtected"
+                        "--signup-secret-file requires --signup-policy inviteRequired or openProtected"
                     )
                 }
             }
@@ -3347,17 +3435,19 @@ extension SwanCommand {
                     option: "--public-url"
                 )
             }
-            // The portal composes the canonical app-password store and the
-            // did:web identity surface from durable state and owner-only
-            // signing material. Legacy bearer signing is separately gated by
-            // the canonical `--enable-legacy-sessions` interlock above.
-            if enableAccountPortal {
-                _ = try Self.loadOwnerOnly32ByteSecret(
-                    file: didWebSigningKeyFile,
-                    environmentName: "SWAN_DID_WEB_SIGNING_KEY",
-                    option: "--did-web-signing-key-file"
+            // The account-program mounted-secret preflight runs before any
+            // control database, account directory, repository bootstrap, or
+            // listener exists. Its decoded values are carried into the later
+            // composition instead of reopening paths or consulting env.
+            let accountProgramStartupMaterial = try Self
+                .preflightAccountProgramStartupMaterial(
+                    enableAccountPortal: enableAccountPortal,
+                    signupPolicy: resolvedSignupPolicy,
+                    signupSecretFile: signupSecretFile,
+                    signupAccountKEKFile: signupAccountKEKFile,
+                    signupAccountKEKID: signupAccountKEKID,
+                    didWebSigningKeyFile: didWebSigningKeyFile
                 )
-            }
             // Both laboratory interlocks run here: after the public origin is
             // known and before the control database, key stores, or any
             // listener exist, so a refused configuration leaves no state
@@ -3543,10 +3633,11 @@ extension SwanCommand {
                 } else {
                     localhostPARConfiguration = nil
                 }
-                let localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration?
+                var localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration?
                 if enableLocalhostOAuth {
                     do {
                         let passwordHasher = try LibsodiumArgon2idHasher()
+                        let factorTokens = FactorTokenService(store: controlDatabase)
                         let accounts = DurableAccountDirectory(
                             store: controlDatabase,
                             passwordHasher: passwordHasher,
@@ -3554,7 +3645,9 @@ extension SwanCommand {
                             loginAdmissionService: AccountLoginAdmissionService(
                                 store: controlDatabase,
                                 key: try AccountLoginAdmissionKey(serverKey)
-                            )
+                            ),
+                            loginFactorTokenVerifier: factorTokens,
+                            authenticationFactors: controlDatabase
                         )
                         localhostOAuthConfiguration = try SwanLocalhostOAuthConfiguration(
                             issuer: baseURL,
@@ -3617,7 +3710,7 @@ extension SwanCommand {
                         "--oauth-allow-localhost-development-client requires --enable-oauth-authorization-server"
                     )
                 }
-                let authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration?
+                var authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration?
                 if enableOAuthAuthorizationServer {
                     do {
                         guard let clientMetadataLoader else {
@@ -3626,6 +3719,7 @@ extension SwanCommand {
                             )
                         }
                         let passwordHasher = try LibsodiumArgon2idHasher()
+                        let factorTokens = FactorTokenService(store: controlDatabase)
                         let accounts = DurableAccountDirectory(
                             store: controlDatabase,
                             passwordHasher: passwordHasher,
@@ -3633,7 +3727,9 @@ extension SwanCommand {
                             loginAdmissionService: AccountLoginAdmissionService(
                                 store: controlDatabase,
                                 key: try AccountLoginAdmissionKey(serverKey)
-                            )
+                            ),
+                            loginFactorTokenVerifier: factorTokens,
+                            authenticationFactors: controlDatabase
                         )
                         authorizationServerConfiguration = try SwanOAuthAuthorizationServerConfiguration(
                             issuer: baseURL,
@@ -3892,6 +3988,13 @@ extension SwanCommand {
                 // the legacy route with its nil default while the proxy has a
                 // separate signing authority.
                 let accountProgramHasher = try LibsodiumArgon2idHasher()
+                // Canonical factor-token storage/verifier is composed for all
+                // account authentication consumers, even when the optional
+                // portal UI is disabled. A token can never be accepted by a
+                // second, UI-only authority.
+                let accountProgramFactorTokens = FactorTokenService(store: controlDatabase)
+                let accountProgramFactorTokenVerifier:
+                    (any AccountLoginFactorTokenVerifying) = accountProgramFactorTokens
                 let accountProgramAccounts = DurableAccountDirectory(
                     store: controlDatabase,
                     passwordHasher: accountProgramHasher,
@@ -3901,7 +4004,9 @@ extension SwanCommand {
                     loginAdmissionService: AccountLoginAdmissionService(
                         store: controlDatabase,
                         key: try AccountLoginAdmissionKey(serverKey)
-                    )
+                    ),
+                    loginFactorTokenVerifier: accountProgramFactorTokenVerifier,
+                    authenticationFactors: controlDatabase
                 )
                 let accountProxyServiceTokenIssuer: (any SwanProxyServiceTokenIssuing)?
                 if let appViewProxyAccountKEKFile {
@@ -4043,30 +4148,13 @@ extension SwanCommand {
                 var signupEmailOutboxService: SwanSignupEmailOutboxService?
                 if resolvedSignupPolicy != .closed {
                     do {
-                        let signupSecret: SignupSecret
-                        do {
-                            let secretData: Data
-                            if let signupSecretFile {
-                                secretData = try AccountProvisioningSecrets.requiredMounted32ByteSecret(
-                                    secretFile: URL(fileURLWithPath: signupSecretFile)
-                                )
-                            } else if let encoded = ProcessInfo.processInfo.environment["SWAN_SIGNUP_SECRET"],
-                                      let decoded = Data(base64URLEncoded: encoded),
-                                      decoded.count == 32 {
-                                secretData = decoded
-                            } else {
-                                throw SwanError.unavailable("signup secret is unavailable")
-                            }
-                            signupSecret = try SignupSecret(secretData)
-                        } catch let error as ValidationError {
-                            throw error
-                        } catch {
-                            throw ValidationError("signup secret is unavailable")
+                        guard let accountProgramStartupMaterial,
+                              let signupSecret = accountProgramStartupMaterial.signupSecret else {
+                            throw ValidationError(
+                                "signup runtime requires preflight owner-only mounted secrets"
+                            )
                         }
-                        let keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
-                            activeKeyID: signupAccountKEKID ?? "primary",
-                            secretFile: signupAccountKEKFile.map { URL(fileURLWithPath: $0) }
-                        )
+                        let keyConfiguration = accountProgramStartupMaterial.signupAccountKeyConfiguration
                         let keyDirectory = signupAccountKeyDirectory.map {
                             URL(fileURLWithPath: $0)
                         } ?? dataURL.appending(path: "keys")
@@ -4501,13 +4589,11 @@ extension SwanCommand {
                 var didWebRevalidationService: SwanDidWebRevalidationService?
                 if enableAccountPortal {
                     do {
-                        // did:web reserved signing key: owner-only mounted file
-                        // or SWAN_DID_WEB_SIGNING_KEY, validated at startup.
-                        let didWebSecret = try Self.loadOwnerOnly32ByteSecret(
-                            file: didWebSigningKeyFile,
-                            environmentName: "SWAN_DID_WEB_SIGNING_KEY",
-                            option: "--did-web-signing-key-file"
-                        )
+                        guard let didWebSecret = accountProgramStartupMaterial?.didWebSigningKey else {
+                            throw ValidationError(
+                                "did:web runtime requires a preflight owner-only mounted signing key"
+                            )
+                        }
                         // did:web identity surface. The reserved signing key is
                         // the mounted secret-derived P-256 key; the document
                         // fetcher is the peer-pinned OAuth transport.
@@ -4557,6 +4643,51 @@ extension SwanCommand {
                             interval: .seconds(didWebRevalidationIntervalSeconds)
                         )
 
+                        guard let startupMaterial = accountProgramStartupMaterial,
+                              let relyingPartyID = baseURL.host else {
+                            throw ValidationError(
+                                "account MFA runtime requires preflight owner-only mounted material"
+                            )
+                        }
+                        let accountMFA = try SwanAccountPortalMFARuntime(
+                            factors: controlDatabase,
+                            totpSecrets: controlDatabase,
+                            replayStore: controlDatabase,
+                            recoveryStore: controlDatabase,
+                            webAuthnCredentials: controlDatabase,
+                            webAuthnChallenges: controlDatabase,
+                            webAuthnEnrollmentStore: controlDatabase,
+                            factorTokens: accountProgramFactorTokens,
+                            accountKEK: startupMaterial.accountKEK,
+                            accountKEKID: startupMaterial.signupAccountKeyConfiguration.activeKeyID,
+                            relyingPartyID: relyingPartyID,
+                            origin: baseURL.absoluteString
+                        )
+
+                        // OAuth browser MFA is the same durable factor runtime
+                        // as the portal. Rebind the already-validated OAuth
+                        // configuration here, after the account-program
+                        // startup material and stores are fully composed.
+                        if let existing = localhostOAuthConfiguration {
+                            localhostOAuthConfiguration = try SwanLocalhostOAuthConfiguration(
+                                issuer: existing.issuer,
+                                accounts: existing.accounts,
+                                mfaService: SwanOAuthMFAServiceAdapter(factors: controlDatabase, oauthMFA: accountMFA)
+                            )
+                        }
+                        if let existing = authorizationServerConfiguration {
+                            authorizationServerConfiguration = try SwanOAuthAuthorizationServerConfiguration(
+                                issuer: existing.issuer,
+                                protectedResource: baseURL,
+                                accounts: existing.accounts,
+                                clientMetadataLoader: existing.clientMetadataLoader,
+                                scopesSupported: [
+                                    "atproto", "transition:generic", "transition:email", "transition:chat.bsky"
+                                ],
+                                mfaService: SwanOAuthMFAServiceAdapter(factors: controlDatabase, oauthMFA: accountMFA)
+                            )
+                        }
+
                         // Portal facade over the same durable stores and the
                         // shared management-session runtime.
                         let portalService = SwanAccountPortalService(
@@ -4570,6 +4701,8 @@ extension SwanCommand {
                                 didWeb: didWeb
                             ),
                             oauth: nil,
+                            mfa: accountMFA,
+                            factorTokens: accountProgramFactorTokens,
                             stepUpReceiptVerifier: SwanAccountPortalDurableStepUpReceiptVerifier(
                                 verifier: controlDatabase
                             ),

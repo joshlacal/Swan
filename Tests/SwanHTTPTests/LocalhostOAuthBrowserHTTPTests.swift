@@ -315,6 +315,230 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testLocalOAuthMFAIsAdmittedTwoPhaseAndRendersOperativeWebAuthn() async throws {
+        let fixture = try await makeFixture(withTOTP: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let requestSession = try makeSession(
+            proofID: "localhost-mfa-flow",
+            keyThumbprint: String(repeating: "m", count: 43)
+        )
+        let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
+            session: requestSession,
+            state: "localhost-mfa-state",
+            codeChallengeS256: String(repeating: "a", count: 43)
+        )
+        let authorize = "/oauth/authorize?client_id=\(formEncode(clientID.absoluteString))&request_uri=\(formEncode(requestURI))"
+
+        do {
+            let app = fixture.server.buildApplication(logger: Logger(label: "LocalhostOAuthBrowserHTTPTests.mfa"))
+            try await app.test(.live) { client in
+                var cookie: String?
+                var csrf: String?
+                try await client.execute(uri: authorize, method: .get) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let issuedCookie = try XCTUnwrap(response.headers[setCookieHeader])
+                    cookie = self.cookieValue(issuedCookie)
+                    csrf = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(cookie)).csrfToken
+                }
+
+                // A direct phase-two submission has no password-admitted
+                // OAuth phase and must fail before factor proof work.
+                let directMFA = [
+                    ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle),
+                    ("kind", "totp"), ("factorID", "oauth-totp-factor"), ("code", "000000")
+                ].map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
+                try await client.execute(
+                    uri: "/oauth/authorize/mfa", method: .post,
+                    headers: self.browserFormHeaders(cookie: try XCTUnwrap(cookie)),
+                    body: ByteBuffer(string: directMFA)
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+
+                var challengeCookie: String?
+                var challengeCSRF: String?
+                try await client.execute(
+                    uri: authorize, method: .get
+                ) { response in
+                    let issuedCookie = try XCTUnwrap(response.headers[setCookieHeader])
+                    challengeCookie = self.cookieValue(issuedCookie)
+                    challengeCSRF = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(challengeCookie)).csrfToken
+                }
+                let admittedLoginForm = [
+                    ("csrf", try XCTUnwrap(challengeCSRF)), ("handle", self.handle), ("password", self.password)
+                ].map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
+                try await client.execute(
+                    uri: "/oauth/authorize", method: .post,
+                    headers: self.browserFormHeaders(cookie: try XCTUnwrap(challengeCookie)),
+                    body: ByteBuffer(string: admittedLoginForm)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let html = String(decoding: Data(buffer: response.body), as: UTF8.self)
+                    XCTAssertTrue(html.contains("/oauth/authorize/mfa"))
+                    XCTAssertTrue(html.contains("name=\"kind\" value=\"totp\""))
+                    XCTAssertFalse(html.contains("name=\"password\""))
+                }
+
+                // The phase is bound to the browser CSRF/session tuple, not
+                // merely to the account and factor ID. A hostile-origin form
+                // cannot spend the admitted phase with a substituted CSRF.
+                let wrongCSRF = [
+                    ("csrf", String(repeating: "z", count: 43)), ("handle", self.handle),
+                    ("kind", "totp"), ("factorID", "oauth-totp-factor"), ("code", "000000")
+                ].map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
+                try await client.execute(
+                    uri: "/oauth/authorize/mfa", method: .post,
+                    headers: self.browserFormHeaders(cookie: try XCTUnwrap(challengeCookie)),
+                    body: ByteBuffer(string: wrongCSRF)
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                }
+
+                let secret = try XCTUnwrap(fixture.totpSecret)
+                let counter = UInt64(Date().timeIntervalSince1970 / 30)
+                let code = try TOTPAuthenticator.code(secret: secret, counter: counter)
+                let mfaForm = [
+                    ("csrf", try XCTUnwrap(challengeCSRF)), ("handle", self.handle),
+                    ("kind", "totp"), ("factorID", "oauth-totp-factor"), ("code", code)
+                ].map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
+                var consentCookie: String?
+                try await client.execute(
+                    uri: "/oauth/authorize/mfa", method: .post,
+                    headers: self.browserFormHeaders(cookie: try XCTUnwrap(challengeCookie)),
+                    body: ByteBuffer(string: mfaForm)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let html = String(decoding: Data(buffer: response.body), as: UTF8.self)
+                    XCTAssertTrue(html.contains("Approve"))
+                    consentCookie = self.cookieValue(try XCTUnwrap(response.headers[setCookieHeader]))
+                }
+
+                // The password-admitted phase and factor receipt are both
+                // one-time. A replay cannot recreate consent.
+                try await client.execute(
+                    uri: "/oauth/authorize/mfa", method: .post,
+                    headers: self.browserFormHeaders(cookie: try XCTUnwrap(challengeCookie)),
+                    body: ByteBuffer(string: mfaForm)
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+                XCTAssertNotNil(consentCookie)
+            }
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
+    func testLocalOAuthPasskeyPageUsesServerChallengeAndNavigatorCredentials() async throws {
+        let fixture = try await makeFixture(withPasskey: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let requestSession = try makeSession(
+            proofID: "localhost-passkey-page",
+            keyThumbprint: String(repeating: "k", count: 43)
+        )
+        let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
+            session: requestSession, state: "passkey-state", codeChallengeS256: String(repeating: "a", count: 43)
+        )
+        let authorize = "/oauth/authorize?client_id=\(formEncode(clientID.absoluteString))&request_uri=\(formEncode(requestURI))"
+        do {
+            let app = fixture.server.buildApplication(logger: Logger(label: "LocalhostOAuthBrowserHTTPTests.passkey"))
+            try await app.test(.live) { client in
+                var cookie: String?
+                var csrf: String?
+                try await client.execute(uri: authorize, method: .get) { response in
+                    let value = try XCTUnwrap(response.headers[setCookieHeader])
+                    cookie = self.cookieValue(value)
+                    csrf = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(cookie)).csrfToken
+                }
+                let form = [
+                    ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle), ("password", self.password)
+                ].map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
+                try await client.execute(
+                    uri: "/oauth/authorize", method: .post,
+                    headers: self.browserFormHeaders(cookie: try XCTUnwrap(cookie)),
+                    body: ByteBuffer(string: form)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let html = String(decoding: Data(buffer: response.body), as: UTF8.self)
+                    XCTAssertTrue(html.contains("navigator.credentials.get"))
+                    XCTAssertTrue(html.contains("name=\"challenge\""))
+                    XCTAssertTrue(html.contains("name=\"clientDataJSON\""))
+                    XCTAssertTrue(html.contains("name=\"authenticatorData\""))
+                    XCTAssertTrue(html.contains("name=\"credentialID\""))
+                    XCTAssertTrue(html.contains("name=\"signature\""))
+                }
+            }
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
+    func testLocalOAuthRecoveryOnlyFlowRendersCodeAndConsumesOnce() async throws {
+        let fixture = try await makeFixture(withRecovery: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let requestSession = try makeSession(
+            proofID: "localhost-recovery-flow",
+            keyThumbprint: String(repeating: "r", count: 43)
+        )
+        let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
+            session: requestSession, state: "recovery-state", codeChallengeS256: String(repeating: "a", count: 43)
+        )
+        let authorize = "/oauth/authorize?client_id=\(formEncode(clientID.absoluteString))&request_uri=\(formEncode(requestURI))"
+        do {
+            let app = fixture.server.buildApplication(logger: Logger(label: "LocalhostOAuthBrowserHTTPTests.recovery"))
+            try await app.test(.live) { client in
+                var cookie: String?
+                var csrf: String?
+                try await client.execute(uri: authorize, method: .get) { response in
+                    let value = try XCTUnwrap(response.headers[setCookieHeader])
+                    cookie = self.cookieValue(value)
+                    csrf = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(cookie)).csrfToken
+                }
+                let login = [
+                    ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle), ("password", self.password)
+                ].map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
+                try await client.execute(
+                    uri: "/oauth/authorize", method: .post,
+                    headers: self.browserFormHeaders(cookie: try XCTUnwrap(cookie)),
+                    body: ByteBuffer(string: login)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let html = String(decoding: Data(buffer: response.body), as: UTF8.self)
+                    XCTAssertTrue(html.contains("name=\"code\""))
+                    XCTAssertTrue(html.contains("recovery"))
+                }
+                let mfa = [
+                    ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle),
+                    ("kind", "recoveryCode"), ("factorID", "oauth-recovery-factor"),
+                    ("code", try XCTUnwrap(fixture.recoveryCode))
+                ].map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
+                try await client.execute(
+                    uri: "/oauth/authorize/mfa", method: .post,
+                    headers: self.browserFormHeaders(cookie: try XCTUnwrap(cookie)),
+                    body: ByteBuffer(string: mfa)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertTrue(String(decoding: Data(buffer: response.body), as: UTF8.self).contains("Approve"))
+                }
+                try await client.execute(
+                    uri: "/oauth/authorize/mfa", method: .post,
+                    headers: self.browserFormHeaders(cookie: try XCTUnwrap(cookie)),
+                    body: ByteBuffer(string: mfa)
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+            }
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
     func testLocalBrowserFlowRejectsBadPasswordAndCSRFWithoutCode() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -557,12 +781,17 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
 
     private func makeFixture(
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy? = nil,
-        loginAdmissionStore: (any AccountLoginAdmissionStore)? = nil
+        loginAdmissionStore: (any AccountLoginAdmissionStore)? = nil,
+        withTOTP: Bool = false,
+        withPasskey: Bool = false,
+        withRecovery: Bool = false
     ) async throws -> (
         server: SwanHTTPServer,
         runtime: SwanOAuthRuntime,
         control: SQLiteControlDatabase,
-        root: URL
+        root: URL,
+        totpSecret: Data?,
+        recoveryCode: String?
     ) {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "LocalhostOAuthBrowserHTTPTests-\(UUID().uuidString)")
@@ -575,6 +804,7 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
             } else {
                 admissionStore = control
             }
+            let factorTokenService = FactorTokenService(store: control)
             let directory = DurableAccountDirectory(
                 store: control,
                 passwordHasher: hasher,
@@ -584,7 +814,9 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
                     key: try AccountLoginAdmissionKey(
                         Data(repeating: 0xD5, count: 32)
                     )
-                )
+                ),
+                loginFactorTokenVerifier: factorTokenService,
+                authenticationFactors: control
             )
             _ = try await directory.registerProvisionedAccount(
                 did: did,
@@ -597,7 +829,94 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")
             )
-            let oauthConfiguration = try SwanLocalhostOAuthConfiguration(issuer: issuer, accounts: directory)
+            var totpSecret: Data?
+            var recoveryCode: String?
+            var mfaService: (any SwanOAuthMFAService)?
+            let factorID: String
+            if withTOTP {
+                let secret = Data("12345678901234567890".utf8)
+                factorID = "oauth-totp-factor"
+                let factor = try AuthenticationFactorMetadata(
+                    id: factorID,
+                    accountDID: did,
+                    kind: .totp,
+                    label: "Authenticator",
+                    lookupDigest: Data(repeating: 0x5A, count: 32),
+                    createdAt: Date()
+                )
+                try await control.saveFactor(factor, now: Date())
+                try await control.saveTOTPEnvelope(
+                    try TOTPEnvelopeCrypto.seal(
+                        secret: secret,
+                        factorID: factorID,
+                        keyReference: "account-kek:primary",
+                        key: Data(repeating: 0x4B, count: 32)
+                    ),
+                    now: Date()
+                )
+                totpSecret = secret
+            } else if withPasskey {
+                factorID = "oauth-passkey-factor"
+                try await control.saveFactor(
+                    try AuthenticationFactorMetadata(
+                        id: factorID,
+                        accountDID: did,
+                        kind: .passkey,
+                        label: "Passkey",
+                        lookupDigest: Data(repeating: 0x5B, count: 32),
+                        createdAt: Date()
+                    ),
+                    now: Date()
+                )
+            } else if withRecovery {
+                factorID = "oauth-recovery-factor"
+                try await control.saveFactor(
+                    try AuthenticationFactorMetadata(
+                        id: factorID,
+                        accountDID: did,
+                        kind: .recoveryCode,
+                        label: "Recovery",
+                        lookupDigest: Data(repeating: 0x5C, count: 32),
+                        createdAt: Date()
+                    ),
+                    now: Date()
+                )
+                let code = "RECOVERY-CODE-LOCAL-ONLY"
+                try await control.replaceRecoveryCodeDigests(
+                    accountDID: did,
+                    digests: [try RecoveryCodeDigest(
+                        accountDID: did,
+                        digest: RecoveryCodeService.digest(code),
+                        issuedAt: Date()
+                    )],
+                    now: Date()
+                )
+                recoveryCode = code
+            } else {
+                factorID = ""
+            }
+            if withTOTP || withPasskey || withRecovery {
+                let accountMFA = try SwanAccountPortalMFARuntime(
+                    factors: control,
+                    totpSecrets: control,
+                    replayStore: control,
+                    recoveryStore: control,
+                    webAuthnCredentials: control,
+                    webAuthnChallenges: control,
+                    webAuthnEnrollmentStore: control,
+                    factorTokens: factorTokenService,
+                    accountKEK: Data(repeating: 0x4B, count: 32),
+                    accountKEKID: "primary",
+                    relyingPartyID: "swan.example",
+                    origin: issuer.absoluteString
+                )
+                mfaService = SwanOAuthMFAServiceAdapter(factors: control, oauthMFA: accountMFA)
+            }
+            let oauthConfiguration = try SwanLocalhostOAuthConfiguration(
+                issuer: issuer,
+                accounts: directory,
+                mfaService: mfaService
+            )
             let server = SwanHTTPServer(
                 profile: profile,
                 configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: issuer),
@@ -610,7 +929,9 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
                 server,
                 runtime,
                 control,
-                root
+                root,
+                totpSecret,
+                recoveryCode
             )
         } catch {
             try? await control.close()

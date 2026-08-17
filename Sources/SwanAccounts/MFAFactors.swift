@@ -4,6 +4,7 @@ import SwanCore
 import SwanStorage
 
 public enum MFAError: Error, Equatable, Sendable {
+    case invalidRequest
     case invalidCode
     case replay
     case expired
@@ -160,6 +161,10 @@ public struct RecoveryCodeService: Sendable {
         do { _ = try await store.consumeRecoveryCode(digest: Self.digest(code), accountDID: accountDID, now: now); return true }
         catch let error as AccountControlStoreError where error == .notFound { return false }
         catch let error as AccountControlStoreError where error == .invalidInput { return false }
+        // A consumed digest is an ordinary one-time replay, not a storage
+        // outage. Keep the recovery endpoint idempotent and avoid forcing
+        // callers to distinguish replay from a transient backend failure.
+        catch let error as AccountControlStoreError where error == .malformedRecord { return false }
         catch { throw MFAError.storageUnavailable }
     }
 
@@ -173,10 +178,23 @@ public struct RecoveryCodeService: Sendable {
 public enum FactorTokenPurpose: String, Sendable, Codable { case stepUp, managementLogin, oauthToken, loginRecovery }
 public struct IssuedFactorToken: Sendable, Equatable { public let token: String; public let expiresAt: Date; public let factor: AuthenticationFactorKind; public let sessionID: String }
 
-public actor FactorTokenService {
+public actor FactorTokenService: AccountLoginFactorTokenVerifying, AccountLoginFactorTokenSessionVerifying, AccountLoginFactorTokenAtomicVerifying, AccountLoginAuthorizationGrantVerifying {
     private let store: any DurableFactorTokenStore
     public init(store: any DurableFactorTokenStore) { self.store = store }
-    public func issue(accountDID: String, sessionID: String, purpose: FactorTokenPurpose, factor: AuthenticationFactorKind, factorID: String, strength: AuthenticationStrength, now: Date, lifetime: TimeInterval = 120) async throws -> IssuedFactorToken {
+    public func issue(
+        accountDID: String,
+        sessionID: String,
+        purpose: FactorTokenPurpose,
+        factor: AuthenticationFactorKind,
+        factorID: String,
+        strength: AuthenticationStrength,
+        now: Date,
+        lifetime: TimeInterval = 120,
+        channel: AccountAuthorizationChannel = .account,
+        bindingDigest: Data? = nil,
+        clientID: String? = nil,
+        requestDigest: Data? = nil
+    ) async throws -> IssuedFactorToken {
         guard lifetime > 0 && lifetime <= 600 else { throw MFAError.tokenInvalid }
         let valid: Bool
         switch purpose {
@@ -188,21 +206,220 @@ public actor FactorTokenService {
         case .managementLogin, .oauthToken:
             if factor == .totp { if case .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: _) = strength { valid = true } else { valid = false } }
             else if factor == .passkey { if case .stepUpMFA(base: .passwordPlusPasskey, verifiedAt: _) = strength { valid = true } else { valid = false } }
+            else if factor == .recoveryCode {
+                // Recovery proofs are channel-bound just like TOTP/passkey
+                // proofs.  OAuth and portal/legacy management-login flows
+                // retain their own exact purpose; no generic recovery token
+                // is accepted by the grant consumer.
+                valid = strength == .emailRecovery
+            }
             else { valid = false }
         }
         guard valid else { throw MFAError.stepUpRequired }
         let verifiedAt: Date
-        if purpose == .loginRecovery { if case let .stepUpPassword(date) = strength { verifiedAt = date } else if case let .stepUpMFA(_, date) = strength { verifiedAt = date } else if strength == .emailRecovery { verifiedAt = now } else { throw MFAError.stepUpRequired } } else if case let .stepUpMFA(_, date) = strength { verifiedAt = date } else { throw MFAError.stepUpRequired }
+        if purpose == .loginRecovery || strength == .emailRecovery {
+            if case let .stepUpPassword(date) = strength { verifiedAt = date }
+            else if case let .stepUpMFA(_, date) = strength { verifiedAt = date }
+            else if strength == .emailRecovery { verifiedAt = now }
+            else { throw MFAError.stepUpRequired }
+        } else if case let .stepUpMFA(_, date) = strength { verifiedAt = date } else { throw MFAError.stepUpRequired }
         guard verifiedAt <= now, now.timeIntervalSince(verifiedAt) <= 600 else { throw MFAError.stepUpRequired }
         let token = randomBytes(count: 32).base64URLEncodedString(); let digest = Data(SHA256.hash(data: Data(token.utf8)))
         let expires = now.addingTimeInterval(lifetime)
-        try await store.saveFactorToken(try DurableFactorTokenRecord(digest: digest, accountDID: accountDID, sessionID: sessionID, purpose: purpose.rawValue, factor: factor, factorID: factorID, strength: strength, issuedAt: now, expiresAt: expires), now: now)
+        try await store.saveFactorToken(try DurableFactorTokenRecord(
+            digest: digest,
+            accountDID: accountDID,
+            sessionID: sessionID,
+            purpose: purpose.rawValue,
+            factor: factor,
+            factorID: factorID,
+            strength: strength,
+            issuedAt: now,
+            expiresAt: expires,
+            channel: channel,
+            bindingDigest: bindingDigest,
+            clientID: clientID,
+            requestDigest: requestDigest
+        ), now: now)
         return IssuedFactorToken(token: token, expiresAt: expires, factor: factor, sessionID: sessionID)
+    }
+
+    /// Consumes a channel-bound login receipt and creates the short-lived
+    /// authorization grant at the same SQLite linearization point.
+    public func authorizeLoginWithFactorToken(
+        token: String,
+        accountDID: String,
+        context: AccountAuthorizationContext,
+        now: Date
+    ) async throws -> AccountAuthorizationGrant {
+        guard !token.isEmpty, token.utf8.count <= 512, !accountDID.isEmpty,
+              let store = store as? any DurableFactorTokenAuthorizationStore else {
+            throw MFAError.tokenInvalid
+        }
+        let digest = Data(SHA256.hash(data: Data(token.utf8)))
+        var generator = SystemRandomNumberGenerator()
+        let grantDigest = Data((0 ..< 32).map { _ in UInt8.random(in: .min ... .max, using: &generator) })
+        do {
+            return try await store.consumeFactorTokenForLoginAndCreateGrant(
+                digest: digest,
+                accountDID: accountDID,
+                context: context,
+                grantDigest: grantDigest,
+                now: now
+            )
+        } catch {
+            throw MFAError.tokenInvalid
+        }
     }
     public func consume(_ token: String, accountDID: String, sessionID: String, purpose: FactorTokenPurpose, factor: AuthenticationFactorKind, factorID: String, strength: AuthenticationStrength, now: Date) async throws -> Bool {
         let digest = Data(SHA256.hash(data: Data(token.utf8)))
         _ = try await store.consumeFactorToken(digest: digest, accountDID: accountDID, sessionID: sessionID, purpose: purpose.rawValue, factor: factor, factorID: factorID, strength: strength, now: now)
         return true
+    }
+
+    /// Consumes the one-time step-up proof that upgrades a management
+    /// session. The caller supplies only the opaque token plus the current
+    /// account/session binding; factor, purpose, and strength are read from
+    /// the durable row and cannot be laundered through request metadata.
+    public func consumeStepUpToken(
+        token: String,
+        accountDID: String,
+        sessionID: String,
+        now: Date
+    ) async throws -> DurableFactorTokenRecord {
+        guard !token.isEmpty, token.utf8.count <= 512,
+              !accountDID.isEmpty, !sessionID.isEmpty else {
+            throw MFAError.tokenInvalid
+        }
+        let digest = Data(SHA256.hash(data: Data(token.utf8)))
+        do {
+            let record = try await store.consumeFactorTokenForStepUp(
+                digest: digest,
+                accountDID: accountDID,
+                sessionID: sessionID,
+                now: now
+            )
+            guard record.purpose == FactorTokenPurpose.stepUp.rawValue,
+                  record.strength.isStepUp else {
+                throw MFAError.tokenInvalid
+            }
+            return record
+        } catch let error as MFAError {
+            throw error
+        } catch {
+            throw MFAError.tokenInvalid
+        }
+    }
+
+    /// Verifies the opaque token supplied by a login caller without trusting
+    /// any factor/session/purpose metadata from that caller. The SQLite
+    /// implementation performs the consume and active-factor check in one
+    /// transaction, so a token cannot be replayed or used after its factor is
+    /// disabled. Login tokens are deliberately limited to the two purposes
+    /// emitted by the account-program MFA flow.
+    public func verifyLoginFactorToken(
+        token: String,
+        accountDID: String,
+        now: Date
+    ) async throws -> AuthenticationStrength {
+        try await verifyLoginFactorTokenAtomically(token: token, accountDID: accountDID, now: now)
+    }
+
+    public func verifyLoginFactorTokenAtomically(
+        token: String,
+        accountDID: String,
+        now: Date
+    ) async throws -> AuthenticationStrength {
+        try await verifyLoginFactorTokenAtomically(token: token, accountDID: accountDID, sessionID: nil, now: now)
+    }
+
+    public func verifyLoginFactorTokenAtomically(
+        token: String,
+        accountDID: String,
+        sessionID: String,
+        now: Date
+    ) async throws -> AuthenticationStrength {
+        try await verifyLoginFactorTokenAtomically(token: token, accountDID: accountDID, sessionID: Optional(sessionID), now: now)
+    }
+
+    private func verifyLoginFactorTokenAtomically(
+        token: String,
+        accountDID: String,
+        sessionID: String?,
+        now: Date
+    ) async throws -> AuthenticationStrength {
+        guard !token.isEmpty, token.utf8.count <= 512, !accountDID.isEmpty else { throw MFAError.tokenInvalid }
+        let digest = Data(SHA256.hash(data: Data(token.utf8)))
+        do {
+            let record: DurableFactorTokenRecord
+            if let sessionID,
+               let atomicStore = store as? any DurableFactorTokenAuthorizationStore {
+                record = try await atomicStore.consumeFactorTokenForLoginAndAuthorize(digest: digest, accountDID: accountDID, sessionID: sessionID, now: now)
+            } else if let atomicStore = store as? any DurableFactorTokenAuthorizationStore {
+                record = try await atomicStore.consumeFactorTokenForLoginAndAuthorize(digest: digest, accountDID: accountDID, now: now)
+            } else if let sessionID {
+                record = try await store.consumeFactorTokenForLogin(digest: digest, accountDID: accountDID, sessionID: sessionID, now: now)
+            } else {
+                record = try await store.consumeFactorTokenForLogin(digest: digest, accountDID: accountDID, now: now)
+            }
+            guard record.purpose == FactorTokenPurpose.managementLogin.rawValue
+                || record.purpose == FactorTokenPurpose.loginRecovery.rawValue else { throw MFAError.tokenInvalid }
+            return record.strength
+        } catch let error as MFAError { throw error }
+        catch { throw MFAError.tokenInvalid }
+    }
+
+    /// Portal login consumes the same token with the pre-auth session binding
+    /// that was recorded when the factor ceremony issued it. The optional
+    /// session is only used by the compatibility/account-only overload above;
+    /// production portal callers must provide a non-empty value.
+    public func verifyLoginFactorToken(
+        token: String,
+        accountDID: String,
+        sessionID: String,
+        now: Date
+    ) async throws -> AuthenticationStrength {
+        try await verifyLoginFactorTokenAtomically(token: token, accountDID: accountDID, sessionID: sessionID, now: now)
+    }
+
+    private func verifyLoginFactorToken(
+        token: String,
+        accountDID: String,
+        sessionID: String?,
+        now: Date
+    ) async throws -> AuthenticationStrength {
+        guard !token.isEmpty, token.utf8.count <= 512, !accountDID.isEmpty,
+              sessionID.map({ !$0.isEmpty && $0.utf8.count <= 512 }) ?? true else {
+            throw MFAError.tokenInvalid
+        }
+        let digest = Data(SHA256.hash(data: Data(token.utf8)))
+        do {
+            let record: DurableFactorTokenRecord
+            if let sessionID {
+                record = try await store.consumeFactorTokenForLogin(
+                    digest: digest,
+                    accountDID: accountDID,
+                    sessionID: sessionID,
+                    now: now
+                )
+            } else {
+                record = try await store.consumeFactorTokenForLogin(
+                    digest: digest,
+                    accountDID: accountDID,
+                    now: now
+                )
+            }
+            guard record.purpose == FactorTokenPurpose.managementLogin.rawValue
+                || record.purpose == FactorTokenPurpose.loginRecovery.rawValue
+            else {
+                throw MFAError.tokenInvalid
+            }
+            return record.strength
+        } catch let error as MFAError {
+            throw error
+        } catch {
+            throw MFAError.tokenInvalid
+        }
     }
 }
 
@@ -303,7 +520,7 @@ public struct WebAuthnVerifier: Sendable {
         self.configuredOrigin = origin
     }
 
-    public func verify(assertion: WebAuthnAssertion, accountDID: String, challenge: Data, purpose: FactorChallengePurpose = .assertion, now: Date) async throws -> WebAuthnVerificationResult {
+    public func verify(assertion: WebAuthnAssertion, accountDID: String, challenge: Data, purpose: FactorChallengePurpose = .assertion, sessionID: String? = nil, now: Date) async throws -> WebAuthnVerificationResult {
         guard assertion.credentialID.count <= 1024, assertion.clientDataJSON.count <= 4096, assertion.authenticatorData.count <= 4096, assertion.signature.count <= 512, assertion.userHandle.map({ $0.count <= 128 }) ?? true, challenge.count <= 256 else { throw MFAError.invalidChallenge }
         let credentialDigest = Data(SHA256.hash(data: assertion.credentialID))
         guard let credential = try await credentialStore.webAuthnCredential(credentialIDDigest: credentialDigest, accountDID: accountDID, now: now), credential.disabledAt == nil else { throw MFAError.credentialNotFound }
@@ -312,7 +529,9 @@ public struct WebAuthnVerifier: Sendable {
         guard let challengeRecord = try await challengeStore.webAuthnChallenge(digest: challengeDigest, accountDID: accountDID, now: now) else { throw MFAError.invalidChallenge }
         guard now >= challengeRecord.issuedAt && now < challengeRecord.expiresAt,
               challengeRecord.purpose == purpose,
-              challengeRecord.credentialIDDigest == credentialDigest else { throw MFAError.invalidChallenge }
+              (sessionID == nil || challengeRecord.sessionID == sessionID),
+              (challengeRecord.credentialIDDigest == nil || challengeRecord.credentialIDDigest == credentialDigest),
+              (challengeRecord.factorID == nil || challengeRecord.factorID == credential.factorID) else { throw MFAError.invalidChallenge }
         guard let expectedOrigin = configuredOrigin, let expectedRelyingPartyID = configuredRelyingPartyID else { throw MFAError.invalidOrigin }
         guard expectedOrigin == challengeRecord.origin, expectedRelyingPartyID == challengeRecord.relyingPartyID,
               let originURL = URL(string: expectedOrigin), originURL.scheme == "https", originURL.host == expectedRelyingPartyID, originURL.user == nil, originURL.password == nil, originURL.query == nil, originURL.fragment == nil, originURL.path.isEmpty || originURL.path == "/" else { throw MFAError.invalidOrigin }
@@ -369,10 +588,11 @@ public struct WebAuthnRegistrationResult: Sendable, Equatable {
 }
 
 public enum WebAuthnRegistrationVerifier {
-    public static func verify(clientDataJSON: Data, authenticatorData: Data, challenge: Data, accountDID: String, challengeRecord: WebAuthnChallenge, expectedOrigin: String, relyingPartyID: String, now: Date) throws -> WebAuthnRegistrationResult {
+    public static func verify(clientDataJSON: Data, authenticatorData: Data, challenge: Data, accountDID: String, challengeRecord: WebAuthnChallenge, expectedOrigin: String, relyingPartyID: String, sessionID: String? = nil, now: Date) throws -> WebAuthnRegistrationResult {
         guard clientDataJSON.count <= 4096, authenticatorData.count <= 4096, challenge.count <= 256, accountDID.utf8.count <= 256, expectedOrigin.utf8.count <= 512, relyingPartyID.utf8.count <= 256 else { throw MFAError.invalidChallenge }
         guard !accountDID.isEmpty, challengeRecord.accountDID == accountDID, challengeRecord.credentialIDDigest == nil,
               challengeRecord.purpose == .enrollment,
+              (sessionID == nil || challengeRecord.sessionID == sessionID),
               challengeRecord.challengeDigest == Data(SHA256.hash(data: challenge)), now >= challengeRecord.issuedAt, now < challengeRecord.expiresAt,
               challengeRecord.origin == expectedOrigin, challengeRecord.relyingPartyID == relyingPartyID,
               expectedOrigin == challengeRecord.origin, expectedOrigin.hasPrefix("https://"),

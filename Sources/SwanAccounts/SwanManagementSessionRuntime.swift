@@ -179,6 +179,75 @@ public actor SwanManagementSessionRuntime {
         try await store.revokeOtherManagementSessions(accountDID: accountDID, except: sessionID, now: now)
     }
 
+    /// Consumes a durable MFA step-up receipt and upgrades the same
+    /// management session in storage. The token is bound to the session and
+    /// account by ``FactorTokenService``; a replay or cross-session use is
+    /// rejected before the durable strength update.
+    public func upgradeFromStepUp(
+        sessionValue: String,
+        token: String,
+        factorTokens: FactorTokenService,
+        now: Date = Date()
+    ) async throws -> ManagementSessionMetadata {
+        let current = try await authenticate(sessionValue: sessionValue, now: now)
+        let record = try await factorTokens.consumeStepUpToken(
+            token: token,
+            accountDID: current.accountDID,
+            sessionID: current.sessionID.rawValue,
+            now: now
+        )
+        let verifiedAt: Date
+        switch record.strength {
+        case let .stepUpPassword(date), let .stepUpMFA(_, date):
+            verifiedAt = date
+        default:
+            throw SwanManagementSessionError.requestNotAllowed
+        }
+        guard let stepUpStore = store as? any ManagementSessionStepUpStore else {
+            throw SwanManagementSessionError.unavailable
+        }
+        do {
+            try await stepUpStore.upgradeManagementSession(
+                digest: Self.digest(sessionValue),
+                accountDID: current.accountDID,
+                strength: record.strength,
+                lastStepUpAt: verifiedAt,
+                now: now
+            )
+        } catch {
+            throw SwanManagementSessionError.unavailable
+        }
+        return try await authenticate(sessionValue: sessionValue, now: now)
+    }
+
+    /// Records a fresh password reauthentication on the existing management
+    /// session. This path is intentionally separate from MFA token upgrade:
+    /// the account directory has already verified the password, and the
+    /// durable session store supplies the single write linearization point.
+    public func upgradeFromPasswordReauth(
+        sessionValue: String,
+        accountDID: String,
+        now: Date = Date()
+    ) async throws -> ManagementSessionMetadata {
+        let current = try await authenticate(sessionValue: sessionValue, now: now)
+        guard current.accountDID == accountDID,
+              let stepUpStore = store as? any ManagementSessionStepUpStore else {
+            throw SwanManagementSessionError.requestNotAllowed
+        }
+        do {
+            try await stepUpStore.upgradeManagementSession(
+                digest: Self.digest(sessionValue),
+                accountDID: accountDID,
+                strength: .stepUpPassword(verifiedAt: now),
+                lastStepUpAt: now,
+                now: now
+            )
+        } catch {
+            throw SwanManagementSessionError.unavailable
+        }
+        return try await authenticate(sessionValue: sessionValue, now: now)
+    }
+
     public static func digest(_ value: String) -> Data {
         Data(SHA256.hash(data: Data(value.utf8)))
     }

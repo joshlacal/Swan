@@ -915,6 +915,21 @@ public protocol OAuthControlStore: Sendable {
     func purgeExpiredOAuthControlState(now: Date) async throws
 }
 
+/// Optional extension implemented by the account-program control database.
+/// Authorization-code insertion consumes the browser's one-time MFA/password
+/// grant inside the same SQLite transaction that inserts the code and token
+/// family; older OAuth-only stores remain source-compatible and fail closed
+/// when a caller supplies a grant.
+public protocol OAuthAuthorizationGrantStore: Sendable {
+    func storeAuthorizationCode(
+        _ code: OAuthAuthorizationCode,
+        requiringActiveSubjectRevisionMicroseconds revision: Int64,
+        authorizationGrantDigest: Data,
+        authorizationContext: AccountAuthorizationContext,
+        now: Date
+    ) async throws
+}
+
 /// One durable, expiry-bounded reservation for a verified permissioned-data
 /// delegation. The caller supplies an authority-scoped HMAC digest, never the
 /// raw JWT or its `jti`, so this remains a separate replay namespace from

@@ -185,7 +185,7 @@ public enum SQLiteControlDatabaseOpenMode: Sendable, Equatable {
 /// records deliberately never flow through this type. The actor serializes one
 /// process while `BEGIN IMMEDIATE` makes consume/rotate/revoke semantics hold
 /// across independently reopened Swan processes as well.
-public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
+public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantStore, AccountControlStore,
     AccountControlKeyRotationStore,
     SpaceDelegationReplayStore, SpaceClientAttestationReplayStore
 {
@@ -807,9 +807,36 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         )
     }
 
+    /// Account-program authorization-code issuance consumes the signed
+    /// browser grant inside the same SQLite transaction as the family/code
+    /// insert. A factor revision change therefore invalidates the grant before
+    /// any OAuth bearer material can be published.
+    public func storeAuthorizationCode(
+        _ code: OAuthAuthorizationCode,
+        requiringActiveSubjectRevisionMicroseconds revision: Int64,
+        authorizationGrantDigest: Data,
+        authorizationContext: AccountAuthorizationContext,
+        now: Date = Date()
+    ) async throws {
+        guard authorizationGrantDigest.count == 32 else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        guard revision >= 0, revision <= Int64(Int.max) else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        try await storeAuthorizationCode(
+            code,
+            activeSubjectRevisionMicroseconds: Int(revision),
+            authorizationGrantDigest: authorizationGrantDigest,
+            authorizationContext: authorizationContext,
+            now: now)
+    }
+
     private func storeAuthorizationCode(
         _ code: OAuthAuthorizationCode,
         activeSubjectRevisionMicroseconds: Int?,
+        authorizationGrantDigest: Data? = nil,
+        authorizationContext: AccountAuthorizationContext? = nil,
         now: Date
     ) async throws {
         try validate(code: code, now: now)
@@ -822,6 +849,15 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         try await withConnectionGate {
             try await transaction {
                 try await purgeExpiredLocked(now: now)
+                // Account-program authorization grants are provisioned by the
+                // additive MFA migration.  OAuth code issuance is also a
+                // valid first touch for a current-main database, so make the
+                // additive tables available inside the same connection gate
+                // before consuming the grant.  The grant consume and code /
+                // family inserts remain one transaction below.
+                if authorizationGrantDigest != nil {
+                    try await ensureTask7DurableTables()
+                }
                 if let activeSubjectRevisionMicroseconds {
                     let rows = try await connection.query(
                         """
@@ -837,6 +873,16 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                     guard rows.count == 1 else {
                         throw OAuthControlStoreError.bindingMismatch
                     }
+                }
+                if let authorizationGrantDigest {
+                    guard let authorizationContext else {
+                        throw OAuthControlStoreError.bindingMismatch
+                    }
+                    _ = try await consumeAuthorizationGrantLocked(
+                        grantDigest: authorizationGrantDigest,
+                        accountDID: code.subject,
+                        context: authorizationContext,
+                        now: now)
                 }
                 try await insertFamily(family)
                 try await requireInsertionCapacity(

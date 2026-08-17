@@ -601,6 +601,41 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
 
     // MARK: - Signup runtime secrets (Task 3)
 
+    func testInviteRequiredRequiresAuthenticatedSMTPModeAndRejectsLabMode() throws {
+        XCTAssertThrowsError(
+            try SwanCommand.Serve.requireAuthenticatedSMTPForPublicSignup(
+                policy: .inviteRequired,
+                emailSMTPMode: nil
+            )
+        ) { error in
+            XCTAssertTrue(
+                (error as? ValidationError)?.message.contains(
+                    "--signup-policy inviteRequired requires --email-smtp-mode"
+                ) == true,
+                "\(error)"
+            )
+        }
+        XCTAssertThrowsError(
+            try SwanCommand.Serve.requireAuthenticatedSMTPForPublicSignup(
+                policy: .inviteRequired,
+                emailSMTPMode: "plaintextLab"
+            )
+        ) { error in
+            XCTAssertTrue(
+                (error as? ValidationError)?.message.contains(
+                    "requires authenticated startTLS or implicitTLS SMTP"
+                ) == true,
+                "\(error)"
+            )
+        }
+        XCTAssertNoThrow(
+            try SwanCommand.Serve.requireAuthenticatedSMTPForPublicSignup(
+                policy: .inviteRequired,
+                emailSMTPMode: "startTLS"
+            )
+        )
+    }
+
     /// A public signup policy without the signup HMAC secret must refuse at
     /// startup — never silently derive a weaker key.
     func testPublicSignupPolicyRequiresSignupSecretWithoutCreatingData() throws {
@@ -611,19 +646,33 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
         try protectedWrite(Data(repeating: 0x41, count: 43), to: turnstile)
         let username = root.appending(path: "smtp-username")
         let password = root.appending(path: "smtp-password")
+        let accountKEK = root.appending(path: "account-kek")
+        let didWeb = root.appending(path: "did-web-key")
         try protectedWrite(Data("smtp-user@example.com".utf8), to: username)
         try protectedWrite(Data("smtp-password-value".utf8), to: password)
+        try protectedWrite(Data(base64URLEncoded(Data(repeating: 0x4B, count: 32)).utf8), to: accountKEK)
+        try protectedWrite(Data(base64URLEncoded(Data(repeating: 0x57, count: 32)).utf8), to: didWeb)
 
         // inviteRequired without the signup secret.
         let invite = try runServe(data: data, arguments: [
             "--enable-account-portal",
+            "--public-url", "https://swan.example",
             "--signup-policy", "inviteRequired",
+            "--signup-account-kek-file", accountKEK.path,
+            "--did-web-signing-key-file", didWeb.path,
+            "--email-smtp-mode", "startTLS",
+            "--email-smtp-host", "smtp.example.com",
+            "--email-smtp-port", "587",
+            "--email-smtp-username-file", username.path,
+            "--email-smtp-password-file", password.path,
+            "--email-smtp-mechanism", "login",
+            "--email-smtp-expected-hostname", "smtp.example.com",
         ])
         XCTAssertNotEqual(invite.status, 0)
         XCTAssertTrue(invite.output.isEmpty)
         XCTAssertTrue(
             invite.error.contains(
-                "--signup-policy inviteRequired requires an owner-only --signup-secret-file or SWAN_SIGNUP_SECRET"
+                "--signup-policy inviteRequired requires an owner-only --signup-secret-file"
             ),
             invite.error
         )
@@ -634,6 +683,7 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
         // secret still refuses.
         let open = try runServe(data: data, arguments: [
             "--enable-account-portal",
+            "--public-url", "https://swan.example",
             "--signup-policy", "openProtected",
             "--turnstile-secret-file", turnstile.path,
             "--email-smtp-mode", "startTLS",
@@ -643,12 +693,14 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
             "--email-smtp-password-file", password.path,
             "--email-smtp-mechanism", "login",
             "--email-smtp-expected-hostname", "smtp.example.com",
+            "--signup-account-kek-file", accountKEK.path,
+            "--did-web-signing-key-file", didWeb.path,
         ])
         XCTAssertNotEqual(open.status, 0)
         XCTAssertTrue(open.output.isEmpty)
         XCTAssertTrue(
             open.error.contains(
-                "--signup-policy openProtected requires an owner-only --signup-secret-file or SWAN_SIGNUP_SECRET"
+                "--signup-policy openProtected requires an owner-only --signup-secret-file"
             ),
             open.error
         )
@@ -667,18 +719,33 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let data = root.appending(path: "data")
         let signupSecret = root.appending(path: "signup-secret")
+        let didWeb = root.appending(path: "did-web-key")
+        let username = root.appending(path: "smtp-username")
+        let password = root.appending(path: "smtp-password")
         try protectedWrite(Data(repeating: 0x24, count: 43), to: signupSecret)
+        try protectedWrite(Data(base64URLEncoded(Data(repeating: 0x57, count: 32)).utf8), to: didWeb)
+        try protectedWrite(Data("smtp-user@example.com".utf8), to: username)
+        try protectedWrite(Data("smtp-password-value".utf8), to: password)
 
         let result = try runServe(data: data, arguments: [
             "--enable-account-portal",
+            "--public-url", "https://swan.example",
             "--signup-policy", "inviteRequired",
             "--signup-secret-file", signupSecret.path,
+            "--did-web-signing-key-file", didWeb.path,
+            "--email-smtp-mode", "startTLS",
+            "--email-smtp-host", "smtp.example.com",
+            "--email-smtp-port", "587",
+            "--email-smtp-username-file", username.path,
+            "--email-smtp-password-file", password.path,
+            "--email-smtp-mechanism", "login",
+            "--email-smtp-expected-hostname", "smtp.example.com",
         ])
         XCTAssertNotEqual(result.status, 0)
         XCTAssertTrue(result.output.isEmpty)
         XCTAssertTrue(
             result.error.contains(
-                "--signup-policy inviteRequired requires an owner-only --signup-account-kek-file or SWAN_ACCOUNT_KEK"
+                "--enable-account-portal requires an owner-only --signup-account-kek-file"
             ),
             result.error
         )
@@ -704,13 +771,72 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
         XCTAssertTrue(result.output.isEmpty)
         XCTAssertTrue(
             result.error.contains(
-                "--signup-secret-file, --signup-account-kek-file, --signup-account-kek-id, and --signup-account-key-directory require --signup-policy inviteRequired or openProtected"
+                "--signup-secret-file requires --signup-policy inviteRequired or openProtected"
             ),
             result.error
         )
         XCTAssertFalse(result.error.contains(signupSecret.path))
         XCTAssertFalse(result.error.contains(root.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
+    }
+
+    func testAccountProgramMountedSecretsRefuseEnvironmentSymlinkWrongModeAndMalformedInputsBeforeStorage() throws {
+        let encode: (Data) -> Data = { [self] data in
+            Data(self.base64URLEncoded(data).utf8)
+        }
+        let validKEK = encode(Data(repeating: 0x4B, count: 32))
+        let validDidWeb = encode(Data(repeating: 0x57, count: 32))
+
+        // Missing account KEK is the environment-only case: the account
+        // program does not consult SWAN_ACCOUNT_KEK or any other process
+        // environment value as a mounted-secret substitute.
+        do {
+            let root = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let didWeb = root.appending(path: "did-web-key")
+            try protectedWrite(validDidWeb, to: didWeb)
+            let result = try runServe(data: root.appending(path: "data"), arguments: [
+                "--enable-account-portal",
+                "--public-url", "https://swan.example",
+                "--did-web-signing-key-file", didWeb.path,
+            ])
+            XCTAssertNotEqual(result.status, 0)
+            XCTAssertTrue(result.error.contains("--enable-account-portal requires an owner-only --signup-account-kek-file"), result.error)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appending(path: "data").path))
+        }
+
+        let cases: [(String, (URL, URL) throws -> Void)] = [
+            ("symlink", { [self] root, didWeb in
+                let target = root.appending(path: "did-web-target")
+                try self.protectedWrite(validDidWeb, to: target)
+                try FileManager.default.createSymbolicLink(at: didWeb, withDestinationURL: target)
+            }),
+            ("wrong-mode", { [self] _, didWeb in
+                try self.protectedWrite(validDidWeb, to: didWeb)
+                try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: didWeb.path)
+            }),
+            ("malformed", { [self] _, didWeb in
+                try self.protectedWrite(Data("not-a-secret".utf8), to: didWeb)
+            }),
+        ]
+        for (name, configure) in cases {
+            let root = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let data = root.appending(path: "data")
+            let accountKEK = root.appending(path: "account-kek")
+            let didWeb = root.appending(path: "did-web-key")
+            try protectedWrite(validKEK, to: accountKEK)
+            try configure(root, didWeb)
+            let result = try runServe(data: data, arguments: [
+                "--enable-account-portal",
+                "--public-url", "https://swan.example",
+                "--signup-account-kek-file", accountKEK.path,
+                "--did-web-signing-key-file", didWeb.path,
+            ])
+            XCTAssertNotEqual(result.status, 0, name)
+            XCTAssertTrue(result.error.contains("--did-web-signing-key-file is unavailable"), "\(name): \(result.error)")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: data.path), name)
+        }
     }
 
     func testLegacySessionsRequireAccountKeyIssuerConfigurationAndAllowAppViewReuse() throws {

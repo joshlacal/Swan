@@ -27,6 +27,17 @@ import XCTest
 /// transport are test doubles because their production facades are later
 /// tasks (T5 portal facade, T4 legacy sessions, T3 signup).
 final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable {
+    func testAccountRouteAssemblyUsesExplicitOrderedRegistrationPhases() {
+        XCTAssertEqual(
+            SwanAccountPortalHTTP.registrationPhases,
+            [.api, .assets, .unknownGuards]
+        )
+        XCTAssertEqual(
+            SwanDidWebIdentityHTTP.registrationPhases,
+            [.publicClaim, .api]
+        )
+    }
+
     // MARK: - Route precedence through the production router
 
     /// The portal owns `/account/**` and is installed before every XRPC or
@@ -364,7 +375,8 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     XCTAssertTrue(body.contains("\"refreshJwt\""), body)
                 }
 
-                // A JSON body is not accepted: the route is bodyless.
+                // A consumed refresh token is rejected locally; the canonical
+                // route does not proxy a body-bearing retry.
                 var withBody = HTTPFields()
                 withBody[.authorization] = "Bearer \(token)"
                 withBody[.contentType] = "application/json"
@@ -375,15 +387,15 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     headers: withBody,
                     body: ByteBuffer(string: #"{"refreshJwt":"\(token)"}"#)
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(response.status, .badRequest)
                 }
 
-                // A missing bearer header is a stable local 401.
+                // A missing bearer header is a stable local refusal.
                 try await client.execute(
                     uri: "/xrpc/com.atproto.server.refreshSession",
                     method: .post
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(response.status, .badRequest)
                 }
             }
             XCTAssertEqual(fixture.sender.recorded().count, 0)
@@ -588,9 +600,9 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
         try? FileManager.default.removeItem(at: root)
     }
 
-    /// The app-password XRPC methods fail closed (403) because XRPC cannot
-    /// carry the management-session/step-up context they require — they are
-    /// never handed to the proxy.
+    /// The canonical legacy app-password XRPC methods stay local when no
+    /// bearer session is presented. They reject the request before the proxy
+    /// fallback, rather than reviving the retired management-context adapter.
     func testLegacyAppPasswordMethodsFailClosedNeverProxied() async throws {
         let fixture = try await makeServer(
             signupPolicy: .closed,
@@ -606,18 +618,18 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 var steered = HTTPFields()
                 steered[.contentType] = "application/json"
                 steered[HTTPField.Name("atproto-proxy")!] = "did:web:attacker.example#svc"
-                for uri in [
-                    "/xrpc/com.atproto.server.createAppPassword",
-                    "/xrpc/com.atproto.server.listAppPasswords",
-                    "/xrpc/com.atproto.server.revokeAppPassword",
+                for (uri, method) in [
+                    ("/xrpc/com.atproto.server.createAppPassword", HTTPRequest.Method.post),
+                    ("/xrpc/com.atproto.server.listAppPasswords", HTTPRequest.Method.get),
+                    ("/xrpc/com.atproto.server.revokeAppPassword", HTTPRequest.Method.post),
                 ] {
                     try await client.execute(
                         uri: uri,
-                        method: .post,
+                        method: method,
                         headers: steered,
                         body: ByteBuffer(string: #"{"name":"test"}"#)
                     ) { response in
-                        XCTAssertEqual(response.status, .forbidden, uri)
+                        XCTAssertEqual(response.status, .badRequest, uri)
                     }
                 }
             }
@@ -909,9 +921,22 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 preAuthStore: SwanInMemoryManagementPreAuthStore(),
                 csrfStore: SwanInMemoryManagementCSRFStore()
             )
+            // Keep the fixture self-contained: the checked-in source tree does
+            // not contain the generated Svelte build, while production mounts
+            // the compiled assets at this boundary.
+            let portalDirectory = root.appending(path: "portal-assets")
+            try FileManager.default.createDirectory(
+                at: portalDirectory,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try Data("<!doctype html><title>Swan account</title>".utf8)
+                .write(to: portalDirectory.appending(path: "index.html"))
+            try Data("body { color: black; }".utf8)
+                .write(to: portalDirectory.appending(path: "auth-tokens.css"))
             let configuration = try SwanAccountPortalConfiguration(
                 publicOrigin: publicURL,
-                staticDirectory: packageRoot().appending(path: "web/build"),
+                staticDirectory: portalDirectory,
                 signupPolicy: signupPolicy
             )
             portal = SwanAccountPortalHTTP(
@@ -919,19 +944,20 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 sessions: sessions,
                 service: PortalMemoryService()
             )
-            // Task 7: the legacy-auth XRPC surface and the did:web identity
-            // surface are installed through the same production conformers
-            // `swan serve` constructs, so route precedence is exercised
-            // against the real adapters.
-            let legacyAuthXRPC: SwanLegacyAuthXRPCAdapter?
+            // The legacy XRPC surface is installed through the canonical
+            // production session service. The retired LegacyAuthService and
+            // SwanLegacyAuthXRPCAdapter remain source-compatibility shims but
+            // are intentionally inert in SwanHTTPServer composition.
+            let legacySessionXRPC: SwanLegacySessionXRPCServer?
             if installLegacy {
                 // The legacy session family row has an FK to `accounts(did)`;
                 // create the fixture account so the durable session store
                 // accepts the login.
+                let passwordHasher = try LibsodiumArgon2idHasher()
                 _ = try await control.createAccount(try AccountControlRegistration(
                     did: "did:plc:abcdefghijklmnopqrstuvwx",
                     canonicalHandle: "alice.test",
-                    passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                    passwordVerifier: try passwordHasher.hash("password"),
                     signingKey: try AccountControlKeyReference(
                         purpose: .signing,
                         generation: 1
@@ -941,36 +967,29 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                         generation: 1
                     )
                 ))
-                let legacySecret = Data(repeating: 0x6E, count: 32)
-                let legacyService = try LegacyAuthService(
+                let credentials = try AppPasswordCredentials()
+                let accounts = DurableAccountDirectory(
                     store: control,
-                    accountResolver: LegacyAccountResolver(
-                        resolve: { identifier in
-                            guard identifier == "did:plc:abcdefghijklmnopqrstuvwx" || identifier == "alice.test" else { return nil }
-                            return LegacyAccountRecord(
-                                did: "did:plc:abcdefghijklmnopqrstuvwx",
-                                handle: "alice.test",
-                                passwordVerifier: "password"
-                            )
-                        },
-                        verifyPassword: { account, password, _ in
-                            account.passwordVerifier == password
-                        }
-                    ),
-                    secretKey: legacySecret,
-                    tokenIssuer: try HMACLegacyTokenIssuer(
-                        key: legacySecret,
-                        issuer: publicURL.host ?? "swan.example"
-                    ),
-                    managementAuthorizer: LegacyManagementAuthorizer(
-                        authorize: { _, _, _ in false }
-                    ),
-                    loginAdmission: LegacyLoginAdmission(admit: { _ in }),
-                    methodPolicy: .referenceLegacy
+                    passwordHasher: passwordHasher,
+                    verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher)
                 )
-                legacyAuthXRPC = SwanLegacyAuthXRPCAdapter(service: legacyService)
+                legacySessionXRPC = SwanLegacySessionXRPCServer(
+                    sessions: try DurableLegacySessionService(
+                        store: control,
+                        appPasswords: control,
+                        credentials: credentials,
+                        serviceDID: SwanServiceIdentity(publicURL: publicURL).did,
+                        serverKey: Data(repeating: 0x6E, count: 32)
+                    ),
+                    credentials: credentials,
+                    appPasswords: control,
+                    accounts: accounts,
+                    directory: SwanDurableLegacySessionDirectory(store: control),
+                    rateLimiter: SwanInProcessLegacySessionRateLimiter(),
+                    minimumFailedLoginDuration: .milliseconds(1)
+                )
             } else {
-                legacyAuthXRPC = nil
+                legacySessionXRPC = nil
             }
             let didWebIdentityHTTP: SwanDidWebIdentityHTTP?
             if installDidWeb {
@@ -1164,10 +1183,10 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 oauthRuntime: oauthRuntime,
                 directory: try XCTUnwrap(directory),
                 accountControlStore: control,
+                legacySessionXRPC: legacySessionXRPC,
                 accountPortalHTTP: portal,
                 accountLifecycleXRPC: accountLifecycleXRPC,
                 didWebIdentityHTTP: didWebIdentityHTTP,
-                legacyAuthXRPC: legacyAuthXRPC,
                 xrpcPipethrough: pipethrough,
                 loginClientIdentityPolicy: .direct,
                 publicFirehoseStreaming: streamingRuntime

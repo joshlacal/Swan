@@ -62,6 +62,16 @@ struct SwanCORSMiddleware<Context: RequestContext>: RouterMiddleware {
         context: Context,
         next: (Request, Context) async throws -> Response
     ) async throws -> Response {
+        // The account portal is a same-origin, cookie-authenticated surface.
+        // It must not inherit the public listener's wildcard CORS policy: a
+        // hostile page must not be able to preflight or read management
+        // responses, and the portal owns its own origin/CSRF checks.  Keep the
+        // boundary exact so a look-alike path such as `/accounting` remains a
+        // normal public-listener request.
+        if Self.isSameOriginAccountPath(request.uri.path) {
+            return try await next(request, context)
+        }
+
         // A request without `Origin` is not cross-origin. Adding CORS headers
         // to it would be noise, and — more importantly — leaving this path
         // untouched keeps every server-to-server caller (federation, relays,
@@ -91,6 +101,14 @@ struct SwanCORSMiddleware<Context: RequestContext>: RouterMiddleware {
             Self.decorate(&response.headers)
             return response
         }
+    }
+
+    private static func isSameOriginAccountPath(_ path: String) -> Bool {
+        path == "/account"
+            || path == "/account/"
+            || path.hasPrefix("/account/api/")
+            || path == "/account/api"
+            || path.hasPrefix("/account/")
     }
 
     /// Answers the preflight without consulting the router.

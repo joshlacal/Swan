@@ -217,6 +217,45 @@ final class SwanCORSTests: XCTestCase {
         }
     }
 
+    /// Account management is a same-origin cookie surface. It must not inherit
+    /// the public listener's wildcard preflight or response decoration, even
+    /// when a hostile page supplies an Origin header. A look-alike path stays
+    /// on the public CORS policy so the boundary cannot accidentally widen.
+    func testAccountSurfaceBypassesGlobalCORSAndPreservesPathBoundary() async throws {
+        try await withBoundaryRouter { client in
+            try await client.execute(
+                uri: "/account/api/test",
+                method: .options,
+                headers: [
+                    .origin: "https://evil.example",
+                    Self.requestMethod: "GET",
+                    Self.requestHeaders: "content-type",
+                ]
+            ) { response in
+                XCTAssertNotEqual(response.status, .noContent)
+                XCTAssertNil(response.headers[Self.allowOrigin])
+                XCTAssertNil(response.headers[Self.allowMethods])
+            }
+            try await client.execute(
+                uri: "/account/api/test",
+                method: .get,
+                headers: [.origin: "https://evil.example"]
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertNil(response.headers[Self.allowOrigin])
+                XCTAssertNil(response.headers[Self.exposeHeaders])
+            }
+            try await client.execute(
+                uri: "/accounting",
+                method: .get,
+                headers: [.origin: "https://evil.example"]
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertEqual(response.headers[Self.allowOrigin], "*")
+            }
+        }
+    }
+
     // MARK: - Harness
 
     private func withRouter(
@@ -251,6 +290,25 @@ final class SwanCORSTests: XCTestCase {
             try? await control.close()
             throw error
         }
+    }
+
+    private func withBoundaryRouter(
+        _ body: @escaping @Sendable (any TestClientProtocol) async throws -> Void
+    ) async throws {
+        let router = Router(context: SwanHTTPRequestContext.self)
+        router.add(middleware: SwanCORSMiddleware<SwanHTTPRequestContext>())
+        router.get("/account/api/test") { _, _ -> Response in
+            Response(status: .ok)
+        }
+        router.get("/accounting") { _, _ -> Response in
+            Response(status: .ok)
+        }
+        let app = Application(
+            router: router,
+            configuration: .init(address: .hostname("127.0.0.1", port: 0), serverName: "SwanCORSTests.boundary"),
+            logger: Logger(label: "SwanCORSTests.boundary")
+        )
+        try await app.test(.router, body)
     }
 
     private static func packageRoot() -> URL {

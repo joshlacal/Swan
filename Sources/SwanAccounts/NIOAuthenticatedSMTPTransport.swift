@@ -6,6 +6,72 @@ import NIOSSL
 import SwanCore
 import SwanStorage
 
+private actor NIOAuthenticatedSMTPShutdownState {
+    private var shutdownStarted = false
+    private var shutdownTask: Task<Void, Error>?
+    /// Identity of the exact in-flight shutdown task. Waiters can outlive a
+    /// failed task and resume after a retry has been installed, so clearing
+    /// by mere presence would let an old waiter erase the new generation.
+    private var nextShutdownGeneration: UInt64 = 0
+    private var shutdownTaskGeneration: UInt64?
+    private var activeConnects = 0
+    private var drainWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func beginConnect() throws {
+        guard !shutdownStarted else { throw MailpitSMTPDeliveryError.shutDown }
+        activeConnects += 1
+    }
+
+    func endConnect() {
+        activeConnects -= 1
+        guard activeConnects == 0 else { return }
+        let waiters = drainWaiters
+        drainWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func shutdown(group: MultiThreadedEventLoopGroup) async throws {
+        if let shutdownTask {
+            let awaitedGeneration = shutdownTaskGeneration
+            do {
+                try await shutdownTask.value
+            } catch {
+                if self.shutdownTaskGeneration == awaitedGeneration {
+                    self.shutdownTask = nil
+                    self.shutdownTaskGeneration = nil
+                }
+                throw error
+            }
+            return
+        }
+        shutdownStarted = true
+        nextShutdownGeneration &+= 1
+        let generation = nextShutdownGeneration
+        let task = Task { [self] in
+            await waitForConnectionsToDrain()
+            try await group.shutdownGracefully()
+        }
+        shutdownTask = task
+        shutdownTaskGeneration = generation
+        do {
+            try await task.value
+        } catch {
+            if self.shutdownTaskGeneration == generation {
+                self.shutdownTask = nil
+                self.shutdownTaskGeneration = nil
+            }
+            throw error
+        }
+    }
+
+    private func waitForConnectionsToDrain() async {
+        guard activeConnects > 0 else { return }
+        await withCheckedContinuation { continuation in
+            drainWaiters.append(continuation)
+        }
+    }
+}
+
 /// Production NIO transport for `AuthenticatedSMTPNetworkTransport`.
 ///
 /// `NIOAuthenticatedSMTPTransport` owns the shared NIO event-loop group and
@@ -17,6 +83,7 @@ import SwanStorage
 public struct NIOAuthenticatedSMTPTransport: Sendable {
     private let group: MultiThreadedEventLoopGroup
     private let tlsContext: NIOSSLContext
+    private let shutdownState: NIOAuthenticatedSMTPShutdownState
 
     public init(group: MultiThreadedEventLoopGroup? = nil, additionalTrustRootsPEM: Data? = nil) throws {
         var tls = TLSConfiguration.makeClientConfiguration()
@@ -24,7 +91,9 @@ public struct NIOAuthenticatedSMTPTransport: Sendable {
             tls.trustRoots = .certificates(try NIOSSLCertificate.fromPEMBytes([UInt8](pem)))
         }
         tlsContext = try NIOSSLContext(configuration: tls)
-        self.group = group ?? MultiThreadedEventLoopGroup(numberOfThreads: 2)
+        let group = group ?? MultiThreadedEventLoopGroup(numberOfThreads: 2)
+        self.group = group
+        shutdownState = NIOAuthenticatedSMTPShutdownState()
     }
 
     /// The connect factory consumed by `AuthenticatedSMTPNetworkTransport`.
@@ -34,18 +103,35 @@ public struct NIOAuthenticatedSMTPTransport: Sendable {
         configuration: AuthenticatedSMTPConfiguration,
         deadline: ContinuousClock.Instant
     ) async throws -> any SMTPTLSConnectionWithDeadline {
-        try await NIOAuthenticatedSMTPTLSConnection.connect(
-            configuration: configuration,
-            group: group,
-            tlsContext: tlsContext,
-            deadline: deadline
-        )
+        try await shutdownState.beginConnect()
+        do {
+            let connection = try await NIOAuthenticatedSMTPTLSConnection.connect(
+                configuration: configuration,
+                group: group,
+                tlsContext: tlsContext,
+                deadline: deadline
+            )
+            await shutdownState.endConnect()
+            return connection
+        } catch {
+            await shutdownState.endConnect()
+            throw error
+        }
     }
 
     public func makeTransport() -> AuthenticatedSMTPNetworkTransport {
         AuthenticatedSMTPNetworkTransport { configuration, deadline in
             try await self.connect(configuration: configuration, deadline: deadline)
+        } shutdown: {
+            try await self.shutdown()
         }
+    }
+
+    /// Shuts down this transport's event-loop group exactly once. The
+    /// idempotent actor gate is shared by every value copy and by the
+    /// `AuthenticatedSMTPNetworkTransport` closure passed to the outbox.
+    public func shutdown() async throws {
+        try await shutdownState.shutdown(group: group)
     }
 }
 

@@ -5,6 +5,17 @@ import NIOCore
 import SwanAccounts
 import SwanCore
 
+public enum SwanDidWebIdentityRegistrationPhase: String, Sendable, Equatable {
+    case publicClaim
+    case api
+}
+
+extension SwanDidWebIdentityHTTP {
+    public static let registrationPhases: [SwanDidWebIdentityRegistrationPhase] = [
+        .publicClaim, .api,
+    ]
+}
+
 /// Registration for the management-session-authenticated did:web identity
 /// surface and the public one-time claim endpoint.
 ///
@@ -15,11 +26,9 @@ import SwanCore
 /// `Sec-Fetch-Site: same-origin|none`, and a constant-time match of the
 /// management CSRF cookie/header. Management cookies never authenticate XRPC;
 /// these routes are the account API surface, not XRPC.
-func registerSwanDidWebIdentityRoutes(
+func registerSwanDidWebPublicClaimRoute(
     on router: Router<SwanHTTPRequestContext>,
-    didWeb: SwanDidWebIdentityHTTP,
-    publicOrigin: URL,
-    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+    didWeb: SwanDidWebIdentityHTTP
 ) {
     // Public one-time claim endpoint. The nonce is the final path segment; a
     // consumed, released, or unknown reservation 404s. This is deliberately
@@ -41,7 +50,14 @@ func registerSwanDidWebIdentityRoutes(
             return didWebAccountError(.serviceUnavailable)
         }
     }
+}
 
+func registerSwanDidWebIdentityAPIRoutes(
+    on router: Router<SwanHTTPRequestContext>,
+    didWeb: SwanDidWebIdentityHTTP,
+    publicOrigin: URL,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) {
     // Reserve a did:web signing key and one-time claim nonce.
     router.post("/account/api/identity/reserve") { request, context async -> Response in
         guard let session = await didWebAuthenticatedSession(request, didWeb: didWeb, publicOrigin: publicOrigin) else {
@@ -129,6 +145,23 @@ func registerSwanDidWebIdentityRoutes(
             return didWebErrorResponse(for: error)
         }
     }
+}
+
+/// Compatibility helper for focused identity-route tests. Production
+/// composition calls the public claim and account-API phases separately.
+func registerSwanDidWebIdentityRoutes(
+    on router: Router<SwanHTTPRequestContext>,
+    didWeb: SwanDidWebIdentityHTTP,
+    publicOrigin: URL,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) {
+    registerSwanDidWebPublicClaimRoute(on: router, didWeb: didWeb)
+    registerSwanDidWebIdentityAPIRoutes(
+        on: router,
+        didWeb: didWeb,
+        publicOrigin: publicOrigin,
+        requestBodyAdmission: requestBodyAdmission
+    )
 }
 
 // MARK: - Shared account-API policy (mirrors the portal adapter, spec §3.2)

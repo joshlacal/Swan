@@ -19,11 +19,16 @@ public struct SwanAccountPortalMutationContext: Sendable, Equatable {
     public let sessionID: String
     public let accountDID: String
     public let strength: AuthenticationStrength
+    /// The accepted socket peer for mutations that re-enter the canonical
+    /// login admission bucket (currently password reauthentication).  It is
+    /// deliberately optional for source-compatible domain callers; the HTTP
+    /// production adapter always supplies it for those routes.
+    public let directPeer: String?
     /// The one-time receipt echoed by the browser. The service verifies this
     /// value against durable state; it is not accepted as proof by itself.
     public let stepUpToken: String?
-    public init(sessionID: String, accountDID: String, strength: AuthenticationStrength, stepUpToken: String? = nil) {
-        self.sessionID = sessionID; self.accountDID = accountDID; self.strength = strength; self.stepUpToken = stepUpToken
+    public init(sessionID: String, accountDID: String, strength: AuthenticationStrength, stepUpToken: String? = nil, directPeer: String? = nil) {
+        self.sessionID = sessionID; self.accountDID = accountDID; self.strength = strength; self.stepUpToken = stepUpToken; self.directPeer = directPeer
     }
 }
 
@@ -43,12 +48,61 @@ private struct PortalLoginCredentials: Decodable {
     enum CodingKeys: String, CodingKey, CaseIterable { case handle, password, authFactorToken }
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        guard Set(container.allKeys) == Set(CodingKeys.allCases) else { throw PortalRequestError.malformed }
+        let keys = Set(container.allKeys)
+        guard keys == [.handle, .password] || keys == Set(CodingKeys.allCases) else {
+            throw PortalRequestError.malformed
+        }
         handle = try container.decode(String.self, forKey: .handle)
         password = try container.decode(String.self, forKey: .password)
         authFactorToken = try container.decodeIfPresent(String.self, forKey: .authFactorToken)
         guard (1...2_048).contains(handle.utf8.count), (1...4_096).contains(password.utf8.count),
               !handle.utf8.contains(0), !password.utf8.contains(0) else { throw PortalRequestError.malformed }
+    }
+}
+
+private struct PortalLoginFactorCredentials: Decodable {
+    let handle: String
+    let password: String
+    let kind: AuthenticationFactorKind
+    let factorID: String
+    let code: String?
+    let challenge: String?
+    let clientDataJSON: String?
+    let authenticatorData: String?
+    let credentialID: String?
+    let signature: String?
+    enum CodingKeys: String, CodingKey { case handle, password, kind, factorID, code, challenge, clientDataJSON, authenticatorData, credentialID, signature }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        handle = try c.decode(String.self, forKey: .handle)
+        password = try c.decode(String.self, forKey: .password)
+        kind = try c.decode(AuthenticationFactorKind.self, forKey: .kind)
+        factorID = try c.decode(String.self, forKey: .factorID)
+        code = try c.decodeIfPresent(String.self, forKey: .code)
+        challenge = try c.decodeIfPresent(String.self, forKey: .challenge)
+        clientDataJSON = try c.decodeIfPresent(String.self, forKey: .clientDataJSON)
+        authenticatorData = try c.decodeIfPresent(String.self, forKey: .authenticatorData)
+        credentialID = try c.decodeIfPresent(String.self, forKey: .credentialID)
+        signature = try c.decodeIfPresent(String.self, forKey: .signature)
+        guard (1 ... 2_048).contains(handle.utf8.count),
+              (1 ... 4_096).contains(password.utf8.count),
+              !factorID.isEmpty, factorID.utf8.count <= 128 else {
+            throw PortalRequestError.malformed
+        }
+    }
+
+    func factorPayload() throws -> Data {
+        var object: [String: Any] = [
+            "kind": kind.rawValue,
+            "factorID": factorID,
+        ]
+        if let code { object["code"] = code }
+        if let challenge { object["challenge"] = challenge }
+        if let clientDataJSON { object["clientDataJSON"] = clientDataJSON }
+        if let authenticatorData { object["authenticatorData"] = authenticatorData }
+        if let credentialID { object["credentialID"] = credentialID }
+        if let signature { object["signature"] = signature }
+        return try JSONSerialization.data(withJSONObject: object, options: [])
     }
 }
 
@@ -81,7 +135,38 @@ public struct SwanAccountPortalMutation: Codable, Sendable, Equatable {
     /// Creation-only plaintext. Listing/projection types intentionally do not
     /// carry this field, and all non-creation mutations leave it nil.
     public let password: String?
-    public init(accepted: Bool = true, message: String = "Accepted", accountDID: String? = nil, password: String? = nil) { self.accepted = accepted; self.message = message; self.accountDID = accountDID; self.password = password }
+    /// A one-time MFA receipt. It is present only on a successful step-up
+    /// response and is never included in portal projections.
+    public let factorToken: String?
+    /// Recovery codes are returned only by an explicit rotation request; the
+    /// durable store retains digests, never these plaintext values.
+    public let recoveryCodes: [String]?
+    /// Server-generated WebAuthn ceremony material. The challenge is safe to
+    /// echo to the browser; only its digest is retained durably.
+    public let challenge: String?
+    public let factorID: String?
+    public let factorKind: AuthenticationFactorKind?
+    public init(
+        accepted: Bool = true,
+        message: String = "Accepted",
+        accountDID: String? = nil,
+        password: String? = nil,
+        factorToken: String? = nil,
+        recoveryCodes: [String]? = nil,
+        challenge: String? = nil,
+        factorID: String? = nil,
+        factorKind: AuthenticationFactorKind? = nil
+    ) {
+        self.accepted = accepted
+        self.message = message
+        self.accountDID = accountDID
+        self.password = password
+        self.factorToken = factorToken
+        self.recoveryCodes = recoveryCodes
+        self.challenge = challenge
+        self.factorID = factorID
+        self.factorKind = factorKind
+    }
 }
 private struct AuthenticatedPortalResponse: Encodable {
     let snapshot: SwanAccountPortalSnapshot
@@ -108,10 +193,20 @@ public struct SwanAccountPortalConfiguration: Sendable, Equatable {
 
 public enum SwanAccountPortalHTTPError: Error, Sendable, Equatable { case invalidConfiguration }
 
+public enum SwanAccountPortalRegistrationPhase: String, Sendable, Equatable {
+    case api
+    case assets
+    case unknownGuards
+}
+
 /// Registration for the public account prefix. Call this before any broad
 /// public catch-all: API routes are registered first and therefore cannot be
 /// mistaken for static pages.
 public struct SwanAccountPortalHTTP: Sendable {
+    public static let registrationPhases: [SwanAccountPortalRegistrationPhase] = [
+        .api, .assets, .unknownGuards,
+    ]
+
     private let configuration: SwanAccountPortalConfiguration
     private let sessions: SwanManagementSessionRuntime
     private let service: any SwanAccountPortalServing
@@ -122,7 +217,16 @@ public struct SwanAccountPortalHTTP: Sendable {
         self.service = service
     }
 
+    /// Compatibility helper for isolated portal tests. Production composition
+    /// calls the three phases explicitly so the shared router's source order
+    /// is reviewable and cannot be hidden inside this helper.
     public func register(on router: Router<SwanHTTPRequestContext>) {
+        registerAPI(on: router)
+        registerAssets(on: router)
+        registerUnknownGuards(on: router)
+    }
+
+    public func registerAPI(on router: Router<SwanHTTPRequestContext>) {
         router.get("/account/api/signup/policy") { [configuration] _ , _ -> Response in
             accountJSON(.ok, SignupPolicyView(policy: configuration.signupPolicy))
         }
@@ -161,12 +265,83 @@ public struct SwanAccountPortalHTTP: Sendable {
                 defer { admitted.release() }
                 guard let bytes = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes) else { throw PortalRequestError.malformed }
                 let credentials = try JSONDecoder().decode(PortalLoginCredentials.self, from: Data(bytes))
-                let authentication = try await service.authenticate(handle: credentials.handle, password: credentials.password, authFactorToken: credentials.authFactorToken, now: Date())
+                if let admissionStatus = await accountLoginAdmissionStatus(
+                    service: service,
+                    handle: credentials.handle,
+                    context: context
+                ) {
+                    return accountError(admissionStatus)
+                }
+                let authentication: SwanAccountPortalAuthentication
+                if let sessionBound = service as? any SwanAccountPortalSessionBoundAuthenticationServing {
+                    authentication = try await sessionBound.authenticate(
+                        handle: credentials.handle,
+                        password: credentials.password,
+                        authFactorToken: credentials.authFactorToken,
+                        authFactorSessionID: csrf,
+                        now: Date()
+                    )
+                } else {
+                    authentication = try await service.authenticate(
+                        handle: credentials.handle,
+                        password: credentials.password,
+                        authFactorToken: credentials.authFactorToken,
+                        now: Date()
+                    )
+                }
                 let snapshot = try await service.portal(accountDID: authentication.accountDID, now: Date())
                 let issued = try await sessions.issueAfterPreAuth(csrf, accountDID: authentication.accountDID, strength: authentication.strength)
                 return accountJSON(.ok, AuthenticatedPortalResponse(snapshot: snapshot, csrf: issued.csrfValue), cookies: [managementCookie(issued.sessionValue), csrfCookie(issued.csrfValue), expiredPreAuthCookie()])
             } catch is PortalRequestError { await sessions.releasePreAuth(csrf); return accountError(.badRequest) }
             catch { await sessions.releasePreAuth(csrf); return accountError(.unauthorized) }
+        }
+
+        for (path, challengeOnly) in [("login/factor-challenge", true), ("login/factor", false)] {
+            router.post("/account/api/\(path)") { [configuration, sessions, service] request, context async -> Response in
+                guard mutationHeadersAllow(request, expectedOrigin: configuration.publicOrigin),
+                      let csrf = accountCookie(named: SwanManagementSessionRuntime.preAuthCookieName, request: request),
+                      let header = request.headers[HTTPField.Name("X-Swan-CSRF")!],
+                      constantTime(csrf, header), await sessions.validatesPreAuth(csrf) else {
+                    return accountError(.forbidden)
+                }
+                do {
+                    let admitted = try await collectAdmittedRequestBody(
+                        request,
+                        mediaType: .json,
+                        admission: .managementProcessShared,
+                        policy: .productionDefault,
+                        maximumBytes: 16 * 1024,
+                        termination: context.jsonWriteBodyTermination
+                    )
+                    defer { admitted.release() }
+                    guard let bytes = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes) else { throw PortalRequestError.malformed }
+                    let credentials = try JSONDecoder().decode(PortalLoginFactorCredentials.self, from: Data(bytes))
+                    if let admissionStatus = await accountLoginAdmissionStatus(
+                        service: service,
+                        handle: credentials.handle,
+                        context: context
+                    ) {
+                        return accountError(admissionStatus)
+                    }
+                    let payload = try credentials.factorPayload()
+                    guard let management = service as? any SwanAccountPortalManagementLoginServing else {
+                        throw SwanAccountPortalServiceError.unsupported
+                    }
+                    let result = try await management.managementLoginFactor(
+                        handle: credentials.handle,
+                        password: credentials.password,
+                        sessionID: csrf,
+                        payload: payload,
+                        challengeOnly: challengeOnly,
+                        now: Date()
+                    )
+                    return accountJSON(.ok, result)
+                } catch is PortalRequestError {
+                    return accountError(.badRequest)
+                } catch {
+                    return portalErrorResponse(error)
+                }
+            }
         }
 
         for path in ["signup/email/request", "signup/authorize", "signup"] {
@@ -190,7 +365,7 @@ public struct SwanAccountPortalHTTP: Sendable {
             }
         }
 
-        for path in ["logout", "profile", "identity", "app-passwords", "scopes/validate", "factors", "factors/recovery-codes/rotate", "factors/step-up", "connected-apps", "export", "export/request", "migration", "migration/request", "lifecycle/delete", "step-up", "sessions/revoke-others"] {
+        for path in ["logout", "profile", "identity", "app-passwords", "scopes/validate", "factors", "factors/totp", "factors/totp/verify", "factors/passkeys", "factors/passkeys/challenge", "factors/passkeys/options", "factors/passkeys/step-up-challenge", "factors/passkeys/assertion", "factors/step-up/passkey-challenge", "factors/recovery-codes/rotate", "factors/step-up", "connected-apps", "export", "export/request", "migration", "migration/request", "lifecycle/delete", "step-up", "step-up/password", "sessions/revoke-others"] {
             router.on("/account/api/\(path)", method: .post) { [configuration, sessions, service] request, context async -> Response in
                 guard mutationHeadersAllow(request, expectedOrigin: configuration.publicOrigin),
                       let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),
@@ -204,15 +379,50 @@ public struct SwanAccountPortalHTTP: Sendable {
                     let admitted = try await collectAdmittedRequestBody(request, mediaType: .json, admission: .managementProcessShared, policy: .productionDefault, maximumBytes: 16 * 1024, termination: context.jsonWriteBodyTermination)
                     defer { admitted.release() }
                     let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
-                    let mutation = try await service.mutate(path: path, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request)), payload: payload, now: Date())
+                    let mutation = try await service.mutate(path: path, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress), payload: payload, now: Date())
                     if path == "logout" { try await sessions.revoke(sessionValue: session) }
                     return accountJSON(.ok, mutation, cookies: path == "logout" ? [expiredManagementCookie(), expiredCSRFToken()] : [])
                 } catch { return portalErrorResponse(error) }
             }
         }
 
+        // The passkey contract also accepts an explicit factor identifier on
+        // enrollment. Exact challenge/enrollment routes above win trie
+        // precedence; this wildcard is only the id-bound completion form.
+        router.on("/account/api/factors/passkeys/*", method: .post) { [configuration, sessions, service] request, context async -> Response in
+            guard mutationHeadersAllow(request, expectedOrigin: configuration.publicOrigin),
+                  let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),
+                  let csrf = accountCookie(named: SwanManagementSessionRuntime.csrfCookieName, request: request),
+                  let header = request.headers[HTTPField.Name("X-Swan-CSRF")!],
+                  constantTime(csrf, header),
+                  (try? await sessions.acceptsCSRF(sessionValue: session, csrfValue: csrf)) == true else {
+                return accountError(.forbidden)
+            }
+            do {
+                let metadata = try await sessions.authenticate(sessionValue: session)
+                let admitted = try await collectAdmittedRequestBody(
+                    request,
+                    mediaType: .json,
+                    admission: .managementProcessShared,
+                    policy: .productionDefault,
+                    maximumBytes: 16 * 1024,
+                    termination: context.jsonWriteBodyTermination
+                )
+                defer { admitted.release() }
+                let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
+                let mutationPath = String(request.uri.path.dropFirst("/account/api/".count))
+                let mutation = try await service.mutate(
+                    path: mutationPath,
+                    context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress),
+                    payload: payload,
+                    now: Date()
+                )
+                return accountJSON(.ok, mutation)
+            } catch { return portalErrorResponse(error) }
+        }
+
         for path in ["sessions", "identity", "app-passwords", "factors/passkeys", "factors/totp", "connected-apps"] {
-            router.on("/account/api/\(path)", method: .delete) { [configuration, sessions, service] request, _ async -> Response in
+            router.on("/account/api/\(path)", method: .delete) { [configuration, sessions, service] request, context async -> Response in
                 guard mutationHeadersAllow(request, expectedOrigin: configuration.publicOrigin),
                       let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),
                       let csrf = accountCookie(named: SwanManagementSessionRuntime.csrfCookieName, request: request),
@@ -220,7 +430,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                       (try? await sessions.acceptsCSRF(sessionValue: session, csrfValue: csrf)) == true else { return accountError(.forbidden) }
                 do {
                     let metadata = try await sessions.authenticate(sessionValue: session)
-                    return accountJSON(.ok, try await service.mutate(path: path, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request)), payload: nil, now: Date()))
+                    return accountJSON(.ok, try await service.mutate(path: path, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress), payload: nil, now: Date()))
                 } catch { return portalErrorResponse(error) }
             }
         }
@@ -239,11 +449,20 @@ public struct SwanAccountPortalHTTP: Sendable {
                     defer { admitted.release() }
                     let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
                     let mutationPath = String(request.uri.path.dropFirst("/account/api/".count))
-                    return accountJSON(.ok, try await service.mutate(path: mutationPath, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request)), payload: payload, now: Date()))
+                    return accountJSON(.ok, try await service.mutate(path: mutationPath, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress), payload: payload, now: Date()))
                 } catch { return portalErrorResponse(error) }
             }
         }
 
+    }
+
+    public func registerAssets(on router: Router<SwanHTTPRequestContext>) {
+        router.get("/account") { [configuration] _, _ -> Response in staticAccountResponse(configuration: configuration, requestPath: "/account") }
+        router.get("/account/auth-tokens.css") { [configuration] _, _ -> Response in staticAuthCSSResponse(configuration: configuration) }
+        router.get("/account/*") { [configuration] request, _ -> Response in staticAccountResponse(configuration: configuration, requestPath: request.uri.path) }
+    }
+
+    public func registerUnknownGuards(on router: Router<SwanHTTPRequestContext>) {
         let methods: [HTTPRequest.Method] = [.get, .head, .post, .put, .patch, .delete, .options, .connect, .trace]
         for method in methods {
             router.on("/account/api/*", method: method) { _, _ -> Response in accountError(.notFound) }
@@ -251,10 +470,6 @@ public struct SwanAccountPortalHTTP: Sendable {
             router.on("/account/api/*/*/*", method: method) { _, _ -> Response in accountError(.notFound) }
             router.on("/account/api/*/*/*/*", method: method) { _, _ -> Response in accountError(.notFound) }
         }
-
-        router.get("/account") { [configuration] _, _ -> Response in staticAccountResponse(configuration: configuration, requestPath: "/account") }
-        router.get("/account/auth-tokens.css") { [configuration] _, _ -> Response in staticAuthCSSResponse(configuration: configuration) }
-        router.get("/account/*") { [configuration] request, _ -> Response in staticAccountResponse(configuration: configuration, requestPath: request.uri.path) }
     }
 }
 
@@ -376,6 +591,33 @@ private func stepUpReceipt(from request: Request) -> String? {
           !value.isEmpty, value.utf8.count <= 4096 else { return nil }
     return value
 }
+
+/// Returns a response status only for production services that expose the
+/// canonical durable admission seam. Test doubles intentionally omit the
+/// capability so they can exercise HTTP policy without constructing SQLite
+/// rate-limit state; production ``SwanAccountPortalService`` always exposes it
+/// and fails closed when the accepted socket peer is unavailable.
+private func accountLoginAdmissionStatus(
+    service: any SwanAccountPortalServing,
+    handle: String,
+    context: SwanHTTPRequestContext
+) async -> AccountStatus? {
+    guard let admission = service as? any SwanAccountPortalLoginAdmissionServing else {
+        return nil
+    }
+    guard let directPeer = context.remoteAddress?.ipAddress else {
+        return .serviceUnavailable
+    }
+    do {
+        switch try await admission.admitLogin(handle: handle, directPeer: directPeer, now: Date()) {
+        case .allowed: return nil
+        case .rateLimited: return .rateLimited
+        }
+    } catch {
+        return .serviceUnavailable
+    }
+}
+
 private func constantTime(_ lhs: String, _ rhs: String) -> Bool { guard lhs.utf8.count == rhs.utf8.count else { return false }; var result: UInt8 = 0; for (a, b) in zip(lhs.utf8, rhs.utf8) { result |= a ^ b }; return result == 0 }
 
 private func accountJSON(_ status: HTTPResponse.Status, _ body: some Encodable, cookies: [String] = []) -> Response { var headers: HTTPFields = [.contentType: "application/json", .cacheControl: "no-store"]; for cookie in cookies { headers.append(.init(name: HTTPField.Name("Set-Cookie")!, value: cookie)) }; let data = (try? JSONEncoder().encode(body)) ?? Data("{}".utf8); return Response(status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(data: data))) }
@@ -388,6 +630,7 @@ private func portalErrorResponse(_ error: Error) -> Response {
     switch error {
     case .unauthorized: return accountError(.unauthorized)
     case .forbidden: return accountError(.forbidden)
+    case .rateLimited: return accountError(.rateLimited)
     case .notFound: return accountError(.notFound)
     case .invalidRequest: return accountError(.badRequest)
     case .unsupported, .unavailable: return accountError(.serviceUnavailable)

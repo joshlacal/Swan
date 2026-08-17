@@ -169,10 +169,12 @@ public struct SwanLocalhostPARConfiguration: Sendable, Equatable {
 public struct SwanLocalhostOAuthConfiguration: Sendable {
     public let issuer: URL
     public let accounts: DurableAccountDirectory
+    public let mfaService: (any SwanOAuthMFAService)?
 
-    public init(issuer: URL, accounts: DurableAccountDirectory) throws {
+    public init(issuer: URL, accounts: DurableAccountDirectory, mfaService: (any SwanOAuthMFAService)? = nil) throws {
         self.issuer = try OAuthAuthorizationServerMetadata(issuer: issuer).issuer
         self.accounts = accounts
+        self.mfaService = mfaService
     }
 }
 
@@ -187,13 +189,15 @@ public struct SwanOAuthAuthorizationServerConfiguration: Sendable {
     public let accounts: DurableAccountDirectory
     public let clientMetadataLoader: OAuthClientMetadataLoader
     public let remoteFetchPolicy: OAuthRemoteFetchPolicy
+    public let mfaService: (any SwanOAuthMFAService)?
 
     public init(
         issuer: URL,
         protectedResource: URL,
         accounts: DurableAccountDirectory,
         clientMetadataLoader: OAuthClientMetadataLoader,
-        scopesSupported: [String] = ["atproto"]
+        scopesSupported: [String] = ["atproto"],
+        mfaService: (any SwanOAuthMFAService)? = nil
     ) throws {
         let metadata = try OAuthAuthorizationServerMetadata(
             issuer: issuer,
@@ -210,6 +214,7 @@ public struct SwanOAuthAuthorizationServerConfiguration: Sendable {
         // This immutable policy is retained as construction evidence only;
         // the loader remains the sole remote-fetch capability.
         remoteFetchPolicy = clientMetadataLoader.fetchPolicy
+        self.mfaService = mfaService
     }
 }
 
@@ -828,40 +833,14 @@ public struct SwanHTTPServer: Sendable {
         )
         router.get("/health") { _, _ in "OK" }
 
-        // The portal registers its explicit API routes and API catch-all
-        // before the SPA fallback. Installing the entire bundle here, before
-        // OAuth/XRPC/proxy routes, preserves that precedence at the sole
-        // supported router assembly boundary.
-        accountPortalHTTP?.register(on: router)
-
-        // The did:web identity surface registers its public one-time claim
-        // endpoint and management-session-authenticated account API routes
-        // before the unknown-public guards and the `/xrpc/**` proxy fallback.
-        // The claim endpoint is public by design (the external domain operator
-        // must fetch the claim bytes without a Swan credential); the account
-        // API routes enforce the same cookie/CSRF/origin policy as the portal.
-        if let didWebIdentityHTTP {
-            registerSwanDidWebIdentityRoutes(
-                on: router,
-                didWeb: didWebIdentityHTTP,
-                publicOrigin: configuration.publicURL,
-                requestBodyAdmission: requestBodyAdmission
-            )
-        }
-
+        // Reserve discovery paths before installing account or XRPC routes.
+        // The values below are captured once so the DID document and
+        // describeServer cannot drift apart during composition.
         let publicURL = configuration.publicURL
         let profile = profile
         let oauthPublicationGate = oauthPublicationGate
-        // One derivation, read by both the DID document and describeServer.
-        // A resolver reads `describeServer.did`, fetches the document that DID
-        // names, and compares the two; formatting the identity twice is how
-        // those two answers silently drift apart.
         let serviceIdentity = SwanServiceIdentity(publicURL: publicURL)
         let inviteCodeRequired = configuration.inviteCodeRequired
-        // `did:web:<authority>` resolves to
-        // `https://<authority>/.well-known/did.json`, so this route is the
-        // other half of the DID Swan publishes everywhere else. The body is
-        // public, static, non-secret identity data.
         router.get("/.well-known/did.json") { _, _ -> Response in
             oauthMetadataJSONResponse(SwanServiceDIDDocument(identity: serviceIdentity))
         }
@@ -893,55 +872,31 @@ public struct SwanHTTPServer: Sendable {
             return oauthMetadataCORSPreflightResponse()
         }
 
-        if let authorizationServerConfiguration {
-            registerOAuthAuthorizationServerEndpoints(
+        // Phase 1: reserve public discovery, including the one-time did:web
+        // claim endpoint. The claim is public by design; the external domain
+        // operator must fetch it without a Swan credential.
+        if let didWebIdentityHTTP {
+            registerSwanDidWebPublicClaimRoute(
                 on: router,
-                configuration: authorizationServerConfiguration,
-                runtime: oauthRuntime,
-                loginClientIdentityPolicy: loginClientIdentityPolicy,
-                requestBodyAdmission: requestBodyAdmission
+                didWeb: didWebIdentityHTTP
             )
-            registerOAuthAuthorizationServerPAREndpoint(
-                on: router,
-                configuration: authorizationServerConfiguration,
-                runtime: oauthRuntime,
-                loginClientIdentityPolicy: loginClientIdentityPolicy,
-                requestBodyAdmission: requestBodyAdmission
-            )
-        } else if let localhostOAuthConfiguration {
-            registerLocalhostOAuthEndpoints(
-                on: router,
-                configuration: localhostOAuthConfiguration,
-                runtime: oauthRuntime,
-                loginClientIdentityPolicy: loginClientIdentityPolicy,
-                requestBodyAdmission: requestBodyAdmission
-            )
-        } else {
-            router.get("/oauth/authorize") { _, _ -> Response in
-                oauthUnavailable()
-            }
         }
 
-        // This narrow development bridge stores a durable PAR only. It does
-        // not publish discovery and cannot lead to login, consent, codes, or
-        // tokens until a complete OAuth HTTP assembly is separately enabled.
-        if authorizationServerConfiguration != nil {
-            // Registered above as one inseparable authorization-server bundle.
-        } else if let localhostOAuthConfiguration {
-            registerLocalhostPAREndpoint(
+        // Phase 2: every exact account API route. Portal and did:web helpers
+        // deliberately do not install their broad API/static guards here.
+        accountPortalHTTP?.registerAPI(on: router)
+        if let didWebIdentityHTTP {
+            registerSwanDidWebIdentityAPIRoutes(
                 on: router,
-                issuer: localhostOAuthConfiguration.issuer,
-                runtime: oauthRuntime,
-                requestBodyAdmission: requestBodyAdmission
-            )
-        } else if let localhostPARConfiguration {
-            registerLocalhostPAREndpoint(
-                on: router,
-                configuration: localhostPARConfiguration,
-                runtime: oauthRuntime,
+                didWeb: didWebIdentityHTTP,
+                publicOrigin: configuration.publicURL,
                 requestBodyAdmission: requestBodyAdmission
             )
         }
+
+        // Phase 3: the account SPA/assets fallback, after all account API
+        // exact routes and before local XRPC/OAuth/repository routes.
+        accountPortalHTTP?.registerAssets(on: router)
 
         router.get("/xrpc/com.atproto.server.describeServer") { _, _ -> Response in
             jsonResponse(ServerDescription(
@@ -1022,6 +977,74 @@ public struct SwanHTTPServer: Sendable {
                     return lifecycleErrorResponse(for: error)
                 }
             }
+        }
+
+        // The exact local account, identity, and canonical legacy XRPC
+        // methods are all installed before OAuth and repository registration.
+        // They therefore remain Swan-owned even when a broad repository or
+        // proxy surface is enabled below.
+        accountEmailXRPC?.register(
+            on: router,
+            requestBodyAdmission: requestBodyAdmission,
+            servedMethods: configuration.publicRouteSurface.servedMethodNSIDs
+        )
+        legacySessionXRPC?.register(
+            on: router,
+            requestBodyAdmission: requestBodyAdmission
+        )
+        actorPreferencesXRPC?.register(
+            on: router,
+            requestBodyAdmission: requestBodyAdmission
+        )
+
+        if let authorizationServerConfiguration {
+            registerOAuthAuthorizationServerEndpoints(
+                on: router,
+                configuration: authorizationServerConfiguration,
+                runtime: oauthRuntime,
+                loginClientIdentityPolicy: loginClientIdentityPolicy,
+                requestBodyAdmission: requestBodyAdmission
+            )
+            registerOAuthAuthorizationServerPAREndpoint(
+                on: router,
+                configuration: authorizationServerConfiguration,
+                runtime: oauthRuntime,
+                loginClientIdentityPolicy: loginClientIdentityPolicy,
+                requestBodyAdmission: requestBodyAdmission
+            )
+        } else if let localhostOAuthConfiguration {
+            registerLocalhostOAuthEndpoints(
+                on: router,
+                configuration: localhostOAuthConfiguration,
+                runtime: oauthRuntime,
+                loginClientIdentityPolicy: loginClientIdentityPolicy,
+                requestBodyAdmission: requestBodyAdmission
+            )
+        } else {
+            router.get("/oauth/authorize") { _, _ -> Response in
+                oauthUnavailable()
+            }
+        }
+
+        // This narrow development bridge stores a durable PAR only. It does
+        // not publish discovery and cannot lead to login, consent, codes, or
+        // tokens until a complete OAuth HTTP assembly is separately enabled.
+        if authorizationServerConfiguration != nil {
+            // Registered above as one inseparable authorization-server bundle.
+        } else if let localhostOAuthConfiguration {
+            registerLocalhostPAREndpoint(
+                on: router,
+                issuer: localhostOAuthConfiguration.issuer,
+                runtime: oauthRuntime,
+                requestBodyAdmission: requestBodyAdmission
+            )
+        } else if let localhostPARConfiguration {
+            registerLocalhostPAREndpoint(
+                on: router,
+                configuration: localhostPARConfiguration,
+                runtime: oauthRuntime,
+                requestBodyAdmission: requestBodyAdmission
+            )
         }
 
         // Do not route permissioned traffic to the in-memory repository store
@@ -1158,13 +1181,6 @@ public struct SwanHTTPServer: Sendable {
             }
         }
 
-        // Reject future/unknown permissioned methods explicitly instead of
-        // allowing a later generic XRPC route to become an accidental public
-        // fallback. Exact profile routes above have higher router precedence,
-        // so a wrong method on a known endpoint remains unavailable (404),
-        // rather than being mistaken for its method-correct 503 gate.
-        registerUnknownPermissionedEndpointGuards(on: router)
-
         // Public repository/sync stays a finite, separately generated surface.
         // P1 deliberately installs only method-correct unavailable gates; no
         // public route receives permissioned repositories or credential
@@ -1243,24 +1259,20 @@ public struct SwanHTTPServer: Sendable {
             // writes off no longer replaces image serving with a 503.
             registerUnavailablePublicEndpoint(descriptor, on: router)
         }
-        accountEmailXRPC?.register(
-            on: router,
-            requestBodyAdmission: requestBodyAdmission,
-            servedMethods: servedPublicMethods
-        )
-        // Registered BEFORE `registerUnknownPublicEndpointGuards` for
-        // readability only — exact paths outrank a `<prefix>.*` guard in
-        // Hummingbird's trie regardless of order, which is what lets these seven
-        // methods coexist with the flat 404 over `com.atproto.server.*` without
-        // weakening it.
-        legacySessionXRPC?.register(
-            on: router,
-            requestBodyAdmission: requestBodyAdmission
-        )
-        actorPreferencesXRPC?.register(
-            on: router,
-            requestBodyAdmission: requestBodyAdmission
-        )
+        // Reject future/unknown permissioned methods explicitly instead of
+        // allowing a later generic XRPC route to become an accidental public
+        // fallback. Exact profile routes above have higher router precedence,
+        // so a wrong method on a known endpoint remains unavailable (404),
+        // rather than being mistaken for its method-correct 503 gate.
+        registerUnknownPermissionedEndpointGuards(on: router)
+
+        // All exact public XRPC routes (including account, identity, legacy,
+        // and repository methods) are now installed. Only the namespace guards
+        // follow, and the proxy is last.
+        // Account API unknowns are installed in this same guard phase rather
+        // than inside the portal API helper, making the complete source order
+        // explicit for review.
+        accountPortalHTTP?.registerUnknownGuards(on: router)
         registerUnknownPublicEndpointGuards(on: router)
         // Registered last, and lowest priority in the trie. Every exact route
         // and every `<prefix>.*` guard above resolves ahead of it, so this can

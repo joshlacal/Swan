@@ -4,6 +4,17 @@ import SwanAccounts
 import SwanSQLite
 import SwanStorage
 
+public enum SwanSignupEmailOutboxServiceError: Error, Sendable, Equatable, CustomStringConvertible {
+    case runLoopAndShutdown(runLoop: String, shutdown: String)
+
+    public var description: String {
+        switch self {
+        case let .runLoopAndShutdown(runLoop, shutdown):
+            return "signup email outbox failed during run loop (\(runLoop)); shutdown also failed (\(shutdown))"
+        }
+    }
+}
+
 /// Drains the durable signup-email outbox for the live `swan serve` process.
 ///
 /// The service owns SQLite admission/retry state through
@@ -27,6 +38,30 @@ public struct SwanSignupEmailOutboxService: Service {
     }
 
     public func run() async throws {
+        var runLoopFailure: Error?
+        do {
+            try await runLoop()
+        } catch {
+            runLoopFailure = error
+        }
+        do {
+            // Shutdown is owned by the service, including cancellation and
+            // worker/transport errors. The delivery single-flight gate makes
+            // this safe if a caller also performs an explicit teardown.
+            try await delivery.shutdown()
+        } catch {
+            if let runLoopFailure {
+                throw SwanSignupEmailOutboxServiceError.runLoopAndShutdown(
+                    runLoop: String(describing: runLoopFailure),
+                    shutdown: String(describing: error)
+                )
+            }
+            throw error
+        }
+        if let runLoopFailure { throw runLoopFailure }
+    }
+
+    private func runLoop() async throws {
         do {
             while !Task.isCancelled {
                 try Task.checkCancellation()

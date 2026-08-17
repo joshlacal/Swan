@@ -361,6 +361,8 @@ public actor DurableOAuthTokenService {
         binding: OAuthClientBinding,
         codeChallengeS256: String,
         activeSubjectRevisionMicroseconds: Int64,
+        authorizationGrantDigest: Data? = nil,
+        authorizationContext: AccountAuthorizationContext? = nil,
         codeLifetime: TimeInterval = 60,
         refreshLifetime: TimeInterval = 14 * 24 * 60 * 60,
         familyID: UUID = UUID(),
@@ -374,7 +376,9 @@ public actor DurableOAuthTokenService {
             codeLifetime: codeLifetime,
             refreshLifetime: refreshLifetime,
             familyID: familyID,
-            now: now
+            now: now,
+            authorizationGrantDigest: authorizationGrantDigest,
+            authorizationContext: authorizationContext
         )
     }
 
@@ -408,7 +412,9 @@ public actor DurableOAuthTokenService {
         codeLifetime: TimeInterval,
         refreshLifetime: TimeInterval,
         familyID: UUID,
-        now: Date
+        now: Date,
+        authorizationGrantDigest: Data? = nil,
+        authorizationContext: AccountAuthorizationContext? = nil
     ) async throws -> String {
         guard codeLifetime > 0, refreshLifetime > 0,
               codeLifetime.isFinite, refreshLifetime.isFinite else {
@@ -448,15 +454,30 @@ public actor DurableOAuthTokenService {
             familyExpiresAt: now.addingTimeInterval(refreshLifetime)
         )
         do {
-            if let activeSubjectRevisionMicroseconds {
-                try await controlStore.storeAuthorizationCode(
+            if let authorizationGrantDigest {
+                guard let authorizationContext,
+                      authorizationGrantDigest.count == 32,
+                      let grantStore = controlStore as? any OAuthAuthorizationGrantStore,
+                      let activeSubjectRevisionMicroseconds else {
+                    throw OAuthControlStoreError.bindingMismatch
+                }
+                try await grantStore.storeAuthorizationCode(
                     record,
-                    requiringActiveSubjectRevisionMicroseconds:
-                        activeSubjectRevisionMicroseconds,
-                    now: now
-                )
+                    requiringActiveSubjectRevisionMicroseconds: activeSubjectRevisionMicroseconds,
+                    authorizationGrantDigest: authorizationGrantDigest,
+                    authorizationContext: authorizationContext,
+                    now: now)
             } else {
-                try await controlStore.storeAuthorizationCode(record, now: now)
+                if let activeSubjectRevisionMicroseconds {
+                    try await controlStore.storeAuthorizationCode(
+                        record,
+                        requiringActiveSubjectRevisionMicroseconds:
+                            activeSubjectRevisionMicroseconds,
+                        now: now
+                    )
+                } else {
+                    try await controlStore.storeAuthorizationCode(record, now: now)
+                }
             }
         } catch {
             throw secureControlError(error)

@@ -35,6 +35,90 @@ final class Task7MFATests: XCTestCase {
         let consumedToken = try await database.consumeFactorToken(digest: token.digest, accountDID: token.accountDID, sessionID: token.sessionID, purpose: token.purpose, factor: token.factor, factorID: token.factorID, strength: token.strength, now: Date(timeIntervalSince1970: 5))
         XCTAssertEqual(consumedToken, token)
         do { _ = try await database.consumeFactorToken(digest: token.digest, accountDID: token.accountDID, sessionID: token.sessionID, purpose: token.purpose, factor: token.factor, factorID: token.factorID, strength: token.strength, now: Date(timeIntervalSince1970: 5)); XCTFail("factor token replay") } catch {}
+
+        // Login validation consumes only the opaque digest and account DID;
+        // caller-supplied factor/session/purpose metadata cannot launder a
+        // step-up token into a login token. A correctly issued management
+        // login token is accepted once, then rejected on replay.
+        let loginService = FactorTokenService(store: database)
+        let loginToken = try await loginService.issue(
+            accountDID: "did:plc:alice",
+            sessionID: "portal-session",
+            purpose: .managementLogin,
+            factor: .totp,
+            factorID: "factor",
+            strength: .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: Date(timeIntervalSince1970: 5)),
+            now: Date(timeIntervalSince1970: 5)
+        )
+        let loginStrength = try await loginService.verifyLoginFactorToken(
+            token: loginToken.token,
+            accountDID: "did:plc:alice",
+            now: Date(timeIntervalSince1970: 6)
+        )
+        XCTAssertEqual(loginStrength, .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: Date(timeIntervalSince1970: 5)))
+        do {
+            _ = try await loginService.verifyLoginFactorToken(
+                token: loginToken.token,
+                accountDID: "did:plc:alice",
+                now: Date(timeIntervalSince1970: 6)
+            )
+            XCTFail("login factor token replay")
+        } catch {}
+
+        let sessionBoundToken = try await loginService.issue(
+            accountDID: "did:plc:alice",
+            sessionID: "portal-session-a",
+            purpose: .managementLogin,
+            factor: .totp,
+            factorID: "factor",
+            strength: .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: Date(timeIntervalSince1970: 6)),
+            now: Date(timeIntervalSince1970: 6)
+        )
+        do {
+            _ = try await loginService.verifyLoginFactorToken(
+                token: sessionBoundToken.token,
+                accountDID: "did:plc:alice",
+                sessionID: "portal-session-b",
+                now: Date(timeIntervalSince1970: 7)
+            )
+            XCTFail("management login token must be bound to its pre-auth session")
+        } catch {}
+        let sessionBoundStrength = try await loginService.verifyLoginFactorToken(
+            token: sessionBoundToken.token,
+            accountDID: "did:plc:alice",
+            sessionID: "portal-session-a",
+            now: Date(timeIntervalSince1970: 7)
+        )
+        XCTAssertEqual(sessionBoundStrength, .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: Date(timeIntervalSince1970: 6)))
+
+        // Recovery is a login factor only for a recovery-only account. The
+        // authorization decision is committed with receipt consumption, so a
+        // mixed TOTP/recovery account cannot downgrade to email recovery.
+        let mixedRecovery = try await loginService.issue(
+            accountDID: "did:plc:alice", sessionID: "recovery-session", purpose: .loginRecovery,
+            factor: .recoveryCode, factorID: "recovery", strength: .emailRecovery,
+            now: Date(timeIntervalSince1970: 8))
+        do {
+            _ = try await loginService.verifyLoginFactorToken(
+                token: mixedRecovery.token, accountDID: "did:plc:alice", sessionID: "recovery-session",
+                now: Date(timeIntervalSince1970: 9))
+            XCTFail("mixed-factor account must not accept recovery login")
+        } catch {}
+        try await database.disableFactor(id: "factor", accountDID: "did:plc:alice", now: Date(timeIntervalSince1970: 10))
+        let recoveryOnly = try await loginService.issue(
+            accountDID: "did:plc:alice", sessionID: "recovery-session-2", purpose: .loginRecovery,
+            factor: .recoveryCode, factorID: "recovery", strength: .emailRecovery,
+            now: Date(timeIntervalSince1970: 11))
+        let recoveryStrength = try await loginService.verifyLoginFactorToken(
+            token: recoveryOnly.token, accountDID: "did:plc:alice", sessionID: "recovery-session-2",
+            now: Date(timeIntervalSince1970: 12))
+        XCTAssertEqual(recoveryStrength, .emailRecovery)
+        do {
+            _ = try await loginService.verifyLoginFactorToken(
+                token: recoveryOnly.token, accountDID: "did:plc:alice", sessionID: "recovery-session-2",
+                now: Date(timeIntervalSince1970: 12))
+            XCTFail("recovery login receipt must be single use")
+        } catch {}
         try await database.appendMFAAuditEvent(try MFAAuditEventRecord(event: "totpAccepted", accountDID: "did:plc:alice", factorID: "factor", success: true, occurredAt: Date(timeIntervalSince1970: 5)), now: Date(timeIntervalSince1970: 5))
     }
 
@@ -43,6 +127,232 @@ final class Task7MFATests: XCTestCase {
         XCTAssertEqual(try TOTPAuthenticator.code(secret: secret, counter: 1), "287082")
         XCTAssertEqual(try TOTPAuthenticator.code(secret: secret, counter: 20), "328281")
         XCTAssertEqual(try TOTPAuthenticator.code(secret: secret, counter: 59 / 30), "287082")
+    }
+
+    func testOAuthRecoveryGrantIsChannelAndRequestBound() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("swan-oauth-recovery-(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
+        try await database.connection.query("INSERT INTO accounts(did, handle, status, created_at) VALUES ('did:plc:recovery', 'recovery.example', 'active', 1)")
+        let factor = try AuthenticationFactorMetadata(
+            id: "recovery-factor", accountDID: "did:plc:recovery", kind: .recoveryCode,
+            label: "Recovery", lookupDigest: Data(repeating: 7, count: 32),
+            createdAt: Date(timeIntervalSince1970: 1)
+        )
+        try await database.saveFactor(factor, now: Date(timeIntervalSince1970: 1))
+        let service = FactorTokenService(store: database)
+        let csrf = Data(repeating: 8, count: 32)
+        let request = Data(repeating: 9, count: 32)
+        let context = try AccountAuthorizationContext(
+            channel: .oauth, sessionID: "oauth-browser", csrfDigest: csrf,
+            clientID: "client.example", requestDigest: request, purpose: "oauthToken"
+        )
+        let token = try await service.issue(
+            accountDID: "did:plc:recovery", sessionID: context.sessionID,
+            purpose: .oauthToken, factor: .recoveryCode, factorID: factor.id,
+            strength: .emailRecovery, now: Date(timeIntervalSince1970: 2),
+            channel: .oauth, bindingDigest: csrf, clientID: context.clientID,
+            requestDigest: request
+        )
+        let wrongContext = try AccountAuthorizationContext(
+            channel: .oauth, sessionID: context.sessionID, csrfDigest: Data(repeating: 1, count: 32),
+            clientID: context.clientID, requestDigest: request, purpose: "oauthToken"
+        )
+        do {
+            _ = try await service.authorizeLoginWithFactorToken(
+                token: token.token, accountDID: "did:plc:recovery", context: wrongContext,
+                now: Date(timeIntervalSince1970: 3)
+            )
+            XCTFail("OAuth recovery receipt must not cross CSRF binding")
+        } catch {}
+        let wrongClient = try AccountAuthorizationContext(
+            channel: .oauth, sessionID: context.sessionID, csrfDigest: context.csrfDigest!,
+            clientID: "other-client.example", requestDigest: request, purpose: "oauthToken"
+        )
+        do {
+            _ = try await service.authorizeLoginWithFactorToken(
+                token: token.token, accountDID: "did:plc:recovery", context: wrongClient,
+                now: Date(timeIntervalSince1970: 3)
+            )
+            XCTFail("OAuth recovery receipt must not cross client binding")
+        } catch {}
+        let wrongRequest = try AccountAuthorizationContext(
+            channel: .oauth, sessionID: context.sessionID, csrfDigest: context.csrfDigest!,
+            clientID: context.clientID, requestDigest: Data(repeating: 2, count: 32), purpose: "oauthToken"
+        )
+        do {
+            _ = try await service.authorizeLoginWithFactorToken(
+                token: token.token, accountDID: "did:plc:recovery", context: wrongRequest,
+                now: Date(timeIntervalSince1970: 3)
+            )
+            XCTFail("OAuth recovery receipt must not cross request binding")
+        } catch {}
+        let wrongChannel = try AccountAuthorizationContext(
+            channel: .portal, sessionID: context.sessionID, csrfDigest: context.csrfDigest,
+            clientID: nil, requestDigest: nil, purpose: "managementLogin"
+        )
+        do {
+            _ = try await service.authorizeLoginWithFactorToken(
+                token: token.token, accountDID: "did:plc:recovery", context: wrongChannel,
+                now: Date(timeIntervalSince1970: 3)
+            )
+            XCTFail("OAuth recovery receipt must not cross authorization channel")
+        } catch {}
+        let grant = try await service.authorizeLoginWithFactorToken(
+            token: token.token, accountDID: "did:plc:recovery", context: context,
+            now: Date(timeIntervalSince1970: 3)
+        )
+        XCTAssertEqual(grant.context, context)
+        XCTAssertEqual(grant.strength, .emailRecovery)
+        do {
+            _ = try await service.authorizeLoginWithFactorToken(
+                token: token.token, accountDID: "did:plc:recovery", context: context,
+                now: Date(timeIntervalSince1970: 3)
+            )
+            XCTFail("OAuth recovery receipt must be one-time")
+        } catch {}
+        // The same opaque receipt is never consumable through a no-session
+        // account/legacy path, even when its account and factor match.
+        do {
+            _ = try await database.consumeFactorTokenForLogin(
+                digest: Data(SHA256.hash(data: Data(token.token.utf8))),
+                accountDID: "did:plc:recovery", now: Date(timeIntervalSince1970: 3)
+            )
+            XCTFail("OAuth receipt must not enter the account-only SQL path")
+        } catch {}
+    }
+
+    func testAuthorizationGrantRevisionAndRecoveryPersistAcrossReopen() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("swan-grant-revision-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        try await database.connection.query("INSERT INTO accounts(did, handle, status, created_at) VALUES ('did:plc:grant', 'grant.example', 'active', 1)")
+        let factor = try AuthenticationFactorMetadata(
+            id: "totp-factor", accountDID: "did:plc:grant", kind: .totp,
+            label: "Authenticator", lookupDigest: Data(repeating: 3, count: 32),
+            createdAt: Date(timeIntervalSince1970: 1)
+        )
+        try await database.saveFactor(factor, now: Date(timeIntervalSince1970: 1))
+        let context = try AccountAuthorizationContext(
+            channel: .oauth, sessionID: "grant-session", csrfDigest: Data(repeating: 4, count: 32),
+            clientID: "client.example", requestDigest: Data(repeating: 5, count: 32), purpose: "oauthToken"
+        )
+        let service = FactorTokenService(store: database)
+        let token = try await service.issue(
+            accountDID: "did:plc:grant", sessionID: context.sessionID, purpose: .oauthToken,
+            factor: .totp, factorID: factor.id,
+            strength: .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: Date(timeIntervalSince1970: 2)),
+            now: Date(timeIntervalSince1970: 2), channel: .oauth,
+            bindingDigest: context.csrfDigest, clientID: context.clientID, requestDigest: context.requestDigest
+        )
+        let grant = try await service.authorizeLoginWithFactorToken(
+            token: token.token, accountDID: "did:plc:grant", context: context,
+            now: Date(timeIntervalSince1970: 3)
+        )
+        XCTAssertEqual(grant.factorRevision, 1)
+        try await database.disableFactor(id: factor.id, accountDID: "did:plc:grant", now: Date(timeIntervalSince1970: 4))
+        do {
+            _ = try await database.consumeAuthorizationGrant(
+                grantDigest: grant.grantDigest, accountDID: grant.accountDID,
+                context: context, now: Date(timeIntervalSince1970: 5)
+            )
+            XCTFail("factor revision change must invalidate an unconsumed grant")
+        } catch {}
+
+        // Recovery consumption is durable and remains one-time after a
+        // close/reopen boundary, rather than living in an in-memory receipt.
+        let recoveryFactor = try AuthenticationFactorMetadata(
+            id: "recovery-factor", accountDID: "did:plc:grant", kind: .recoveryCode,
+            label: "Recovery", lookupDigest: Data(repeating: 6, count: 32),
+            createdAt: Date(timeIntervalSince1970: 6)
+        )
+        try await database.saveFactor(recoveryFactor, now: Date(timeIntervalSince1970: 6))
+        let recovery = "RECOVERY-REOPEN-ONLY"
+        try await database.replaceRecoveryCodeDigests(
+            accountDID: "did:plc:grant",
+            digests: [try RecoveryCodeDigest(
+                accountDID: "did:plc:grant", digest: RecoveryCodeService.digest(recovery),
+                issuedAt: Date(timeIntervalSince1970: 6))],
+            now: Date(timeIntervalSince1970: 6)
+        )
+        try await database.close()
+        do {
+            let reopened = try await SQLiteControlDatabase(dataDirectory: root)
+            let recoveryService = RecoveryCodeService(store: reopened, factorStore: reopened)
+            let firstRecovery = try await recoveryService.consume(
+                recovery, accountDID: "did:plc:grant", now: Date(timeIntervalSince1970: 7))
+            XCTAssertTrue(firstRecovery)
+            try await reopened.close()
+        }
+        do {
+            let reopened = try await SQLiteControlDatabase(dataDirectory: root)
+            let recoveryService = RecoveryCodeService(store: reopened, factorStore: reopened)
+            let replayedRecovery = try await recoveryService.consume(
+                recovery, accountDID: "did:plc:grant", now: Date(timeIntervalSince1970: 8))
+            XCTAssertFalse(replayedRecovery)
+            try await reopened.close()
+        }
+    }
+
+    func testAuthorizationGrantRaceWithFactorRevisionHasOneSafeOutcome() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("swan-grant-race-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        try await database.connection.query("INSERT INTO accounts(did, handle, status, created_at) VALUES ('did:plc:grant-race', 'grant-race.example', 'active', 1)")
+        let factor = try AuthenticationFactorMetadata(
+            id: "grant-race-factor", accountDID: "did:plc:grant-race", kind: .totp,
+            label: "Authenticator", lookupDigest: Data(repeating: 0x31, count: 32),
+            createdAt: Date(timeIntervalSince1970: 1)
+        )
+        try await database.saveFactor(factor, now: Date(timeIntervalSince1970: 1))
+        let context = try AccountAuthorizationContext(
+            channel: .oauth, sessionID: "grant-race-session", csrfDigest: Data(repeating: 0x32, count: 32),
+            clientID: "grant-race-client", requestDigest: Data(repeating: 0x33, count: 32), purpose: "oauthToken"
+        )
+        let service = FactorTokenService(store: database)
+        let token = try await service.issue(
+            accountDID: factor.accountDID, sessionID: context.sessionID, purpose: .oauthToken,
+            factor: .totp, factorID: factor.id,
+            strength: .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: Date(timeIntervalSince1970: 2)),
+            now: Date(timeIntervalSince1970: 2), channel: .oauth,
+            bindingDigest: context.csrfDigest, clientID: context.clientID, requestDigest: context.requestDigest
+        )
+
+        // No timing sleeps are needed: both operations are durable actor/SQL
+        // operations. Whichever operation linearizes first, the factor
+        // revision change must prevent a grant from being consumed afterward.
+        let racedGrantDigest = await withTaskGroup(of: Data?.self, returning: Data?.self) { group in
+            group.addTask {
+                guard let grant = try? await service.authorizeLoginWithFactorToken(
+                    token: token.token, accountDID: factor.accountDID, context: context,
+                    now: Date(timeIntervalSince1970: 3)
+                ) else { return nil }
+                return grant.grantDigest
+            }
+            group.addTask {
+                try? await database.disableFactor(
+                    id: factor.id, accountDID: factor.accountDID,
+                    now: Date(timeIntervalSince1970: 4)
+                )
+                return nil
+            }
+            var digest: Data?
+            for await result in group where result != nil {
+                digest = result
+            }
+            return digest
+        }
+        if let racedGrantDigest {
+            do {
+                _ = try await database.consumeAuthorizationGrant(
+                    grantDigest: racedGrantDigest, accountDID: factor.accountDID,
+                    context: context, now: Date(timeIntervalSince1970: 5)
+                )
+                XCTFail("factor revision change must invalidate a raced grant")
+            } catch {}
+        }
+        try await database.close()
     }
 
     func testTOTPUsesOneStepDriftAndRejectsReplay() async throws {
@@ -107,6 +417,91 @@ final class Task7MFATests: XCTestCase {
         let other = try await service.issue(accountDID: "did:plc:alice", sessionID: "session-a", purpose: .stepUp, factor: .passkey, factorID: "passkey", strength: .stepUpMFA(base: .passwordPlusPasskey, verifiedAt: Date(timeIntervalSince1970: 10)), now: Date(timeIntervalSince1970: 10))
         let wrongAccount = try? await service.consume(other.token, accountDID: "did:plc:bob", sessionID: "session-a", purpose: .stepUp, factor: .passkey, factorID: "passkey", strength: .stepUpMFA(base: .passwordPlusPasskey, verifiedAt: Date(timeIntervalSince1970: 10)), now: Date(timeIntervalSince1970: 11))
         XCTAssertNil(wrongAccount)
+    }
+
+    func testStepUpTokenConsumptionIsSessionBoundAndSingleUse() async throws {
+        let service = FactorTokenService(store: InMemoryFactorTokenStore())
+        let verifiedAt = Date(timeIntervalSince1970: 10)
+        let issued = try await service.issue(
+            accountDID: "did:plc:alice",
+            sessionID: "session-a",
+            purpose: .stepUp,
+            factor: .totp,
+            factorID: "factor",
+            strength: .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: verifiedAt),
+            now: verifiedAt
+        )
+        let consumed = try await service.consumeStepUpToken(
+            token: issued.token,
+            accountDID: "did:plc:alice",
+            sessionID: "session-a",
+            now: verifiedAt.addingTimeInterval(1)
+        )
+        XCTAssertEqual(consumed.strength, .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: verifiedAt))
+        do {
+            _ = try await service.consumeStepUpToken(
+                token: issued.token,
+                accountDID: "did:plc:alice",
+                sessionID: "session-a",
+                now: verifiedAt.addingTimeInterval(1)
+            )
+            XCTFail("step-up token replay must fail")
+        } catch {}
+    }
+
+    func testManagementSessionStepUpDurablyUpgradesStrengthOnce() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("swan-task7-step-up-(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
+        let did = "did:plc:alice"
+        try await database.connection.query(
+            "INSERT INTO accounts(did, handle, status, created_at) VALUES (?, ?, 'active', 1)",
+            [.text(did), .text("alice.example")]
+        )
+        let factor = try AuthenticationFactorMetadata(
+            id: "factor",
+            accountDID: did,
+            kind: .totp,
+            label: "Authenticator",
+            lookupDigest: Data(repeating: 1, count: 32),
+            createdAt: Date(timeIntervalSince1970: 1)
+        )
+        try await database.saveFactor(factor, now: Date(timeIntervalSince1970: 1))
+        let sessions = SwanManagementSessionRuntime(
+            store: database,
+            preAuthStore: SwanInMemoryManagementPreAuthStore(),
+            csrfStore: SwanInMemoryManagementCSRFStore()
+        )
+        let issuedSession = try await sessions.issue(accountDID: did, now: Date(timeIntervalSince1970: 10))
+        let factors = FactorTokenService(store: database)
+        let verifiedAt = Date(timeIntervalSince1970: 11)
+        let token = try await factors.issue(
+            accountDID: did,
+            sessionID: issuedSession.metadata.sessionID.rawValue,
+            purpose: .stepUp,
+            factor: .totp,
+            factorID: factor.id,
+            strength: .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: verifiedAt),
+            now: verifiedAt
+        )
+        let upgraded = try await sessions.upgradeFromStepUp(
+            sessionValue: issuedSession.sessionValue,
+            token: token.token,
+            factorTokens: factors,
+            now: Date(timeIntervalSince1970: 12)
+        )
+        XCTAssertEqual(upgraded.strength, .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: verifiedAt))
+        XCTAssertEqual(upgraded.lastStepUpAt, verifiedAt)
+        do {
+            _ = try await sessions.upgradeFromStepUp(
+                sessionValue: issuedSession.sessionValue,
+                token: token.token,
+                factorTokens: factors,
+                now: Date(timeIntervalSince1970: 12)
+            )
+            XCTFail("step-up receipt replay must fail")
+        } catch {}
     }
 
     func testStepUpPolicyRequiresPasswordAndConfiguredMFAForSensitiveOperations() throws {
@@ -206,6 +601,10 @@ private actor InMemoryFactorTokenStore: DurableFactorTokenStore {
         guard !consumed.contains(digest), let record = records[digest], record.accountDID == accountDID, record.sessionID == sessionID, record.purpose == purpose, record.factor == factor, record.factorID == factorID, record.strength == strength, now < record.expiresAt else { throw AccountControlStoreError.notFound }
         consumed.insert(digest); return record
     }
+    func consumeFactorTokenForStepUp(digest: Data, accountDID: String, sessionID: String, now: Date) async throws -> DurableFactorTokenRecord {
+        guard !consumed.contains(digest), let record = records[digest], record.accountDID == accountDID, record.sessionID == sessionID, record.purpose == FactorTokenPurpose.stepUp.rawValue, record.strength.isStepUp, now < record.expiresAt else { throw AccountControlStoreError.notFound }
+        consumed.insert(digest); return record
+    }
     func revokeFactorTokens(accountDID: String, sessionID: String?, now: Date) async throws {}
 }
 
@@ -225,7 +624,7 @@ private actor InMemoryWebAuthnStore: WebAuthnCredentialStore, WebAuthnAtomicVeri
     func webAuthnChallenge(digest: Data, accountDID: String, now: Date) async throws -> WebAuthnChallenge? { challenge.challengeDigest == digest && challenge.accountDID == accountDID && challenge.consumedAt == nil && now < challenge.expiresAt ? challenge : nil }
     func consumeWebAuthnChallenge(digest: Data, accountDID: String, now: Date) async throws -> WebAuthnChallenge {
         guard challenge.challengeDigest == digest, challenge.accountDID == accountDID, challenge.consumedAt == nil else { throw SwanError.invalidIdentifier("challenge") }
-        let value = try WebAuthnChallenge(challengeDigest: challenge.challengeDigest, accountDID: challenge.accountDID, credentialIDDigest: challenge.credentialIDDigest, purpose: challenge.purpose, relyingPartyID: challenge.relyingPartyID, origin: challenge.origin, issuedAt: challenge.issuedAt, expiresAt: challenge.expiresAt, consumedAt: now)
+        let value = try WebAuthnChallenge(challengeDigest: challenge.challengeDigest, accountDID: challenge.accountDID, credentialIDDigest: challenge.credentialIDDigest, sessionID: challenge.sessionID, factorID: challenge.factorID, purpose: challenge.purpose, relyingPartyID: challenge.relyingPartyID, origin: challenge.origin, issuedAt: challenge.issuedAt, expiresAt: challenge.expiresAt, consumedAt: now)
         challenge = value
         return value
     }
@@ -233,7 +632,7 @@ private actor InMemoryWebAuthnStore: WebAuthnCredentialStore, WebAuthnAtomicVeri
         guard credential.signCount == update.expectedCurrent else { return .rollbackDetected(storedCount: credential.signCount) }
         guard challenge.challengeDigest == challengeDigest, challenge.accountDID == update.accountDID, challenge.consumedAt == nil else { throw AccountControlStoreError.malformedRecord }
         credential = try WebAuthnCredentialMetadata(credentialIDDigest: credential.credentialIDDigest, accountDID: credential.accountDID, factorID: credential.factorID, publicKeyReference: credential.publicKeyReference, signCount: update.proposed, transports: credential.transports, createdAt: credential.createdAt, lastUsedAt: now, disabledAt: credential.disabledAt)
-        challenge = try WebAuthnChallenge(challengeDigest: challenge.challengeDigest, accountDID: challenge.accountDID, credentialIDDigest: challenge.credentialIDDigest, purpose: challenge.purpose, relyingPartyID: challenge.relyingPartyID, origin: challenge.origin, issuedAt: challenge.issuedAt, expiresAt: challenge.expiresAt, consumedAt: now)
+        challenge = try WebAuthnChallenge(challengeDigest: challenge.challengeDigest, accountDID: challenge.accountDID, credentialIDDigest: challenge.credentialIDDigest, sessionID: challenge.sessionID, factorID: challenge.factorID, purpose: challenge.purpose, relyingPartyID: challenge.relyingPartyID, origin: challenge.origin, issuedAt: challenge.issuedAt, expiresAt: challenge.expiresAt, consumedAt: now)
         return .updated(newCount: update.proposed)
     }
 }

@@ -460,6 +460,199 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     }
   }
 
+  func testRemoteOAuthMFAIsAdmittedTwoPhaseAndTOTPReceiptIsOneTime() async throws {
+    let fixture = try await makeFixture(metadata: try publicMetadata(), withTOTP: true)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let resolved = try await fixture.completeConfiguration.clientMetadataLoader.load(clientID: clientID)
+      let session = try OAuthValidatedSession(
+        issuer: issuer.absoluteString, client: resolved, redirectURI: redirectURI,
+        scopes: ["atproto"], dpopProof: .init(
+          keyThumbprint: String(repeating: "m", count: 43), jwtID: "remote-mfa-flow", issuedAt: Date()))
+      let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
+        session: session, state: "remote-mfa-state", codeChallengeS256: String(repeating: "a", count: 43))
+      let authorize = "/oauth/authorize?client_id=\(encode(clientID.absoluteString))&request_uri=\(encode(requestURI))"
+      let app = fixture.server.buildApplication(logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.mfa"))
+      try await app.test(.live) { client in
+        var cookie: String?
+        var csrf: String?
+        try await client.execute(uri: authorize, method: .get) { response in
+          XCTAssertEqual(response.status, .ok)
+          cookie = self.cookie(response.headers[setCookieHeader])
+          csrf = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(cookie)).csrfToken
+        }
+        let direct = self.form([
+          ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle),
+          ("kind", "totp"), ("factorID", "oauth-totp-factor"), ("code", "000000")
+        ])
+        try await client.execute(
+          uri: "/oauth/authorize/mfa", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(cookie)), body: ByteBuffer(string: direct)
+        ) { response in
+          XCTAssertEqual(response.status, .unauthorized)
+        }
+
+        var phaseCookie: String?
+        var phaseCSRF: String?
+        try await client.execute(uri: authorize, method: .get) { response in
+          XCTAssertEqual(response.status, .ok)
+          phaseCookie = self.cookie(response.headers[setCookieHeader])
+          phaseCSRF = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(phaseCookie)).csrfToken
+        }
+        try await client.execute(
+          uri: "/oauth/authorize", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(phaseCookie)),
+          body: ByteBuffer(string: self.form([
+            ("csrf", try XCTUnwrap(phaseCSRF)), ("handle", self.handle), ("password", self.password)
+          ]))
+        ) { response in
+          XCTAssertEqual(response.status, .ok)
+          let html = String(decoding: Data(buffer: response.body), as: UTF8.self)
+          XCTAssertTrue(html.contains("/oauth/authorize/mfa"))
+          XCTAssertTrue(html.contains("name=\"kind\" value=\"totp\""))
+          XCTAssertFalse(html.contains("name=\"password\""))
+        }
+        // The admitted phase is browser-session/CSRF bound. A substituted
+        // CSRF must fail before TOTP work and leave the valid phase intact.
+        let wrongCSRF = self.form([
+          ("csrf", String(repeating: "z", count: 43)), ("handle", self.handle),
+          ("kind", "totp"), ("factorID", "oauth-totp-factor"), ("code", "000000")
+        ])
+        try await client.execute(
+          uri: "/oauth/authorize/mfa", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(phaseCookie)), body: ByteBuffer(string: wrongCSRF)
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+        }
+        let secret = try XCTUnwrap(fixture.totpSecret)
+        let code = try TOTPAuthenticator.code(secret: secret, counter: UInt64(Date().timeIntervalSince1970 / 30))
+        let mfa = self.form([
+          ("csrf", try XCTUnwrap(phaseCSRF)), ("handle", self.handle),
+          ("kind", "totp"), ("factorID", "oauth-totp-factor"), ("code", code)
+        ])
+        try await client.execute(
+          uri: "/oauth/authorize/mfa", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(phaseCookie)), body: ByteBuffer(string: mfa)
+        ) { response in
+          XCTAssertEqual(response.status, .ok)
+          XCTAssertTrue(String(decoding: Data(buffer: response.body), as: UTF8.self).contains("Approve"))
+        }
+        try await client.execute(
+          uri: "/oauth/authorize/mfa", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(phaseCookie)), body: ByteBuffer(string: mfa)
+        ) { response in
+          XCTAssertEqual(response.status, .unauthorized)
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
+  func testRemoteOAuthPasskeyPageUsesServerChallengeAndWebAuthnScript() async throws {
+    let fixture = try await makeFixture(metadata: try publicMetadata(), withPasskey: true)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let resolved = try await fixture.completeConfiguration.clientMetadataLoader.load(clientID: clientID)
+      let session = try OAuthValidatedSession(
+        issuer: issuer.absoluteString, client: resolved, redirectURI: redirectURI,
+        scopes: ["atproto"], dpopProof: .init(
+          keyThumbprint: String(repeating: "k", count: 43), jwtID: "remote-passkey-page", issuedAt: Date()))
+      let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
+        session: session, state: "remote-passkey-state", codeChallengeS256: String(repeating: "a", count: 43))
+      let authorize = "/oauth/authorize?client_id=\(encode(clientID.absoluteString))&request_uri=\(encode(requestURI))"
+      let app = fixture.server.buildApplication(logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.passkey"))
+      try await app.test(.live) { client in
+        var cookie: String?
+        var csrf: String?
+        try await client.execute(uri: authorize, method: .get) { response in
+          cookie = self.cookie(response.headers[setCookieHeader])
+          csrf = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(cookie)).csrfToken
+        }
+        try await client.execute(
+          uri: "/oauth/authorize", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(cookie)),
+          body: ByteBuffer(string: self.form([
+            ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle), ("password", self.password)
+          ]))
+        ) { response in
+          XCTAssertEqual(response.status, .ok)
+          let html = String(decoding: Data(buffer: response.body), as: UTF8.self)
+          XCTAssertTrue(html.contains("navigator.credentials.get"))
+          XCTAssertTrue(html.contains("name=\"challenge\""))
+          XCTAssertTrue(html.contains("name=\"clientDataJSON\""))
+          XCTAssertTrue(html.contains("name=\"authenticatorData\""))
+          XCTAssertTrue(html.contains("name=\"credentialID\""))
+          XCTAssertTrue(html.contains("name=\"signature\""))
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
+  func testRemoteOAuthRecoveryOnlyRendersAndConsumesChannelBoundCode() async throws {
+    let fixture = try await makeFixture(metadata: try publicMetadata(), withRecovery: true)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let resolved = try await fixture.completeConfiguration.clientMetadataLoader.load(clientID: clientID)
+      let session = try OAuthValidatedSession(
+        issuer: issuer.absoluteString, client: resolved, redirectURI: redirectURI,
+        scopes: ["atproto"], dpopProof: .init(
+          keyThumbprint: String(repeating: "r", count: 43), jwtID: "remote-recovery-flow", issuedAt: Date()))
+      let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
+        session: session, state: "remote-recovery-state", codeChallengeS256: String(repeating: "a", count: 43))
+      let authorize = "/oauth/authorize?client_id=\(encode(clientID.absoluteString))&request_uri=\(encode(requestURI))"
+      let app = fixture.server.buildApplication(logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.recovery"))
+      try await app.test(.live) { client in
+        var cookie: String?
+        var csrf: String?
+        try await client.execute(uri: authorize, method: .get) { response in
+          cookie = self.cookie(response.headers[setCookieHeader])
+          csrf = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(cookie)).csrfToken
+        }
+        try await client.execute(
+          uri: "/oauth/authorize", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(cookie)),
+          body: ByteBuffer(string: self.form([
+            ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle), ("password", self.password)
+          ]))
+        ) { response in
+          XCTAssertEqual(response.status, .ok)
+          let html = String(decoding: Data(buffer: response.body), as: UTF8.self)
+          XCTAssertTrue(html.contains("name=\"code\""))
+          XCTAssertTrue(html.contains("recovery"))
+        }
+        let mfa = self.form([
+          ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle),
+          ("kind", "recoveryCode"), ("factorID", "oauth-recovery-factor"),
+          ("code", try XCTUnwrap(fixture.recoveryCode))
+        ])
+        try await client.execute(
+          uri: "/oauth/authorize/mfa", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(cookie)), body: ByteBuffer(string: mfa)
+        ) { response in
+          XCTAssertEqual(response.status, .ok)
+          XCTAssertTrue(String(decoding: Data(buffer: response.body), as: UTF8.self).contains("Approve"))
+        }
+        try await client.execute(
+          uri: "/oauth/authorize/mfa", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(cookie)), body: ByteBuffer(string: mfa)
+        ) { response in
+          XCTAssertEqual(response.status, .unauthorized)
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
   func testOAuthBrowserCORSIsNarrowAndNeverCredentialed() async throws {
     let fixture = try await makeFixture(metadata: try publicMetadata())
     defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -1451,6 +1644,9 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     resolverAnswers: [[OAuthIPAddress]]? = nil,
     loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
     includeEmailRecovery: Bool = false,
+    withTOTP: Bool = false,
+    withPasskey: Bool = false,
+    withRecovery: Bool = false,
     jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
     maximumConnections: Int = 256,
     lexiconResolver: (any SwanLexiconResolving)? = nil
@@ -1460,13 +1656,17 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     let control = try await SQLiteControlDatabase(dataDirectory: root)
     do {
       let hasher = try LibsodiumArgon2idHasher(policy: .interactive)
+      let factorTokenService = FactorTokenService(store: control)
       let accounts = DurableAccountDirectory(
         store: control, passwordHasher: hasher,
         verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher),
         loginAdmissionService: AccountLoginAdmissionService(
           store: control,
           key: try AccountLoginAdmissionKey(Data(repeating: 0xE2, count: 32))
-        ))
+        ),
+        loginFactorTokenVerifier: factorTokenService,
+        authenticationFactors: control
+      )
       _ = try await accounts.registerProvisionedAccount(
         did: did, canonicalHandle: handle, password: password,
         signingReference: try AccountKeyReference(
@@ -1490,8 +1690,60 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
       let runtime = try SwanOAuthRuntime(
         controlStore: control, serverKey: Data(repeating: 0xE2, count: 32),
         lexiconResolver: lexiconResolver)
+      var totpSecret: Data?
+      var recoveryCode: String?
+      var mfaService: (any SwanOAuthMFAService)?
+      let factorID: String
+      if withTOTP {
+        let secret = Data("12345678901234567890".utf8)
+        factorID = "oauth-totp-factor"
+        try await control.saveFactor(
+          try AuthenticationFactorMetadata(
+            id: factorID, accountDID: did, kind: .totp, label: "Authenticator",
+            lookupDigest: Data(repeating: 0x5A, count: 32), createdAt: Date()),
+          now: Date())
+        try await control.saveTOTPEnvelope(
+          try TOTPEnvelopeCrypto.seal(
+            secret: secret, factorID: factorID, keyReference: "account-kek:primary",
+            key: Data(repeating: 0x4B, count: 32)),
+          now: Date())
+        totpSecret = secret
+      } else if withPasskey {
+        factorID = "oauth-passkey-factor"
+        try await control.saveFactor(
+          try AuthenticationFactorMetadata(
+            id: factorID, accountDID: did, kind: .passkey, label: "Passkey",
+            lookupDigest: Data(repeating: 0x5B, count: 32), createdAt: Date()),
+          now: Date())
+      } else if withRecovery {
+        factorID = "oauth-recovery-factor"
+        try await control.saveFactor(
+          try AuthenticationFactorMetadata(
+            id: factorID, accountDID: did, kind: .recoveryCode, label: "Recovery",
+            lookupDigest: Data(repeating: 0x5C, count: 32), createdAt: Date()),
+          now: Date())
+        let code = "RECOVERY-CODE-REMOTE-ONLY"
+        try await control.replaceRecoveryCodeDigests(
+          accountDID: did,
+          digests: [try RecoveryCodeDigest(
+            accountDID: did, digest: RecoveryCodeService.digest(code), issuedAt: Date())],
+          now: Date())
+        recoveryCode = code
+      } else {
+        factorID = ""
+      }
+      if withTOTP || withPasskey || withRecovery {
+        let accountMFA = try SwanAccountPortalMFARuntime(
+          factors: control, totpSecrets: control, replayStore: control,
+          recoveryStore: control, webAuthnCredentials: control,
+          webAuthnChallenges: control, webAuthnEnrollmentStore: control,
+          factorTokens: factorTokenService, accountKEK: Data(repeating: 0x4B, count: 32),
+          accountKEKID: "primary", relyingPartyID: "swan.example", origin: issuer.absoluteString)
+        mfaService = SwanOAuthMFAServiceAdapter(factors: control, oauthMFA: accountMFA)
+      }
       let complete = try SwanOAuthAuthorizationServerConfiguration(
-        issuer: issuer, protectedResource: issuer, accounts: accounts, clientMetadataLoader: loader)
+        issuer: issuer, protectedResource: issuer, accounts: accounts, clientMetadataLoader: loader,
+        mfaService: mfaService)
       let profile = try ProtocolProfile.load(
         from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json"))
       let emailDelivery: CapturedPasswordRecoveryDelivery?
@@ -1567,7 +1819,9 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
         root: root,
         transport: transport,
         emailRecovery: emailRecovery,
-        emailDelivery: emailDelivery
+        emailDelivery: emailDelivery,
+        totpSecret: totpSecret,
+        recoveryCode: recoveryCode
       )
     } catch {
       try? await control.close()
@@ -1795,6 +2049,8 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     let transport: RemoteOAuthTransport
     let emailRecovery: AccountEmailRecoveryService?
     let emailDelivery: CapturedPasswordRecoveryDelivery?
+    let totpSecret: Data?
+    let recoveryCode: String?
   }
 }
 

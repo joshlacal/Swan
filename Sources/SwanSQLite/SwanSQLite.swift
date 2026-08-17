@@ -271,6 +271,19 @@ public enum SQLiteLayout {
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS totp_pending_secret_envelopes (
+            factor_id TEXT PRIMARY KEY,
+            account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            key_reference TEXT NOT NULL,
+            nonce BLOB NOT NULL CHECK(length(nonce) = 12),
+            ciphertext BLOB NOT NULL CHECK(length(ciphertext) > 0),
+            authentication_tag BLOB NOT NULL CHECK(length(authentication_tag) = 16),
+            issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
+            expires_at INTEGER NOT NULL CHECK(expires_at > issued_at),
+            FOREIGN KEY(factor_id, account_did) REFERENCES authentication_factors(factor_id, account_did) ON DELETE CASCADE
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS recovery_code_digests (
             account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
             digest BLOB NOT NULL CHECK(length(digest) = 32),
@@ -299,6 +312,8 @@ public enum SQLiteLayout {
             challenge_digest BLOB PRIMARY KEY CHECK(length(challenge_digest) = 32),
             account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
             credential_id_digest BLOB CHECK(credential_id_digest IS NULL OR length(credential_id_digest) = 32),
+            session_id TEXT,
+            factor_id TEXT,
             relying_party_id TEXT NOT NULL,
             origin TEXT NOT NULL,
             issued_at INTEGER NOT NULL CHECK(issued_at >= 0),

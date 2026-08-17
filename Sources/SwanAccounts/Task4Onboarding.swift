@@ -316,6 +316,13 @@ public protocol AuthenticatedSMTPTransport: Sendable {
     func deliver(configuration: AuthenticatedSMTPConfiguration, to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String) async throws
 }
 
+/// A transport that owns process resources must expose an explicit shutdown
+/// boundary. Service lifecycle cancellation is not allowed to strand a NIO
+/// event-loop group until process exit.
+public protocol AuthenticatedSMTPTransportShutdown: AuthenticatedSMTPTransport {
+    func shutdown() async throws
+}
+
 public protocol AuthenticatedSMTPDeadlineTransport: AuthenticatedSMTPTransport {
     func deliver(configuration: AuthenticatedSMTPConfiguration, to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String, deadline: ContinuousClock.Instant) async throws
 }
@@ -336,10 +343,15 @@ public protocol SMTPTLSConnectionWithDeadline: SMTPTLSConnection {
     func send(to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String, deadline: ContinuousClock.Instant) async throws
 }
 
-public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPDeadlineTransport {
+public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPDeadlineTransport, AuthenticatedSMTPTransportShutdown {
     private let connect: @Sendable (AuthenticatedSMTPConfiguration, ContinuousClock.Instant) async throws -> any SMTPTLSConnectionWithDeadline
-    public init(connect: @escaping @Sendable (AuthenticatedSMTPConfiguration, ContinuousClock.Instant) async throws -> any SMTPTLSConnectionWithDeadline) {
+    private let shutdownHandler: @Sendable () async throws -> Void
+    public init(
+        connect: @escaping @Sendable (AuthenticatedSMTPConfiguration, ContinuousClock.Instant) async throws -> any SMTPTLSConnectionWithDeadline,
+        shutdown: @escaping @Sendable () async throws -> Void = {}
+    ) {
         self.connect = connect
+        shutdownHandler = shutdown
     }
 
     public func deliver(configuration: AuthenticatedSMTPConfiguration, to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String) async throws {
@@ -355,6 +367,10 @@ public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPDeadlineTransp
             try await connection.authenticate(username: username, password: password, mechanism: mechanism, deadline: deadline)
         }
         try await connection.send(to: to, subject: subject, body: body, idempotencyKey: idempotencyKey, deadline: deadline)
+    }
+
+    public func shutdown() async throws {
+        try await shutdownHandler()
     }
 }
 
@@ -372,6 +388,15 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
     private let configuration: AuthenticatedSMTPConfiguration
     private let transport: any AuthenticatedSMTPTransport
     private let attemptTimeout: Duration
+    private var shutdownStarted = false
+    private var shutdownTask: Task<Void, Error>?
+    /// Monotonic identity for the task currently stored in `shutdownTask`.
+    /// A waiter can resume after a later retry has replaced the task; it may
+    /// clear only the generation it actually awaited.
+    private var nextShutdownGeneration: UInt64 = 0
+    private var shutdownTaskGeneration: UInt64?
+    private var activeDeliveries = 0
+    private var drainWaiters: [CheckedContinuation<Void, Never>] = []
     public init(configuration: AuthenticatedSMTPConfiguration, transport: any AuthenticatedSMTPTransport, attemptTimeout: Duration = .seconds(30)) throws {
         guard attemptTimeout > .zero, attemptTimeout <= .seconds(300) else { throw SwanError.invalidIdentifier("SMTP attempt timeout") }
         self.configuration = configuration; self.transport = transport; self.attemptTimeout = attemptTimeout
@@ -384,6 +409,9 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
 
     public func deliver(to: AccountEmailAddress, subject: String, body: String, idempotencyKey key: String) async throws {
         guard !key.isEmpty, !subject.contains("\r"), !subject.contains("\n"), body.utf8.count <= 32768 else { throw MailpitSMTPDeliveryError.invalidMessage }
+        guard !shutdownStarted else { throw MailpitSMTPDeliveryError.shutDown }
+        activeDeliveries += 1
+        defer { finishDelivery() }
         var last: Error?
         guard let deadlineTransport = transport as? any AuthenticatedSMTPDeadlineTransport else { throw MailpitSMTPDeliveryError.invalidConfiguration }
         let configuration = self.configuration
@@ -402,6 +430,63 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
             }
         }
         throw last ?? MailpitSMTPDeliveryError.unavailable
+    }
+
+    /// Stops an owned transport exactly once. Non-owning test transports and
+    /// externally managed transports intentionally have a no-op shutdown. All
+    /// concurrent callers await the same operation. A failed operation clears
+    /// that shared task so a later owner can make one confirmed retry while
+    /// the delivery fence remains closed.
+    public func shutdown() async throws {
+        if let shutdownTask {
+            let awaitedGeneration = shutdownTaskGeneration
+            do {
+                try await shutdownTask.value
+            } catch {
+                if self.shutdownTaskGeneration == awaitedGeneration {
+                    self.shutdownTask = nil
+                    self.shutdownTaskGeneration = nil
+                }
+                throw error
+            }
+            return
+        }
+        shutdownStarted = true
+        nextShutdownGeneration &+= 1
+        let generation = nextShutdownGeneration
+        let task = Task { [self] in
+            await waitForDeliveriesToDrain()
+            guard let shutdown = transport as? any AuthenticatedSMTPTransportShutdown else {
+                return
+            }
+            try await shutdown.shutdown()
+        }
+        shutdownTask = task
+        shutdownTaskGeneration = generation
+        do {
+            try await task.value
+        } catch {
+            if self.shutdownTaskGeneration == generation {
+                self.shutdownTask = nil
+                self.shutdownTaskGeneration = nil
+            }
+            throw error
+        }
+    }
+
+    private func finishDelivery() {
+        activeDeliveries -= 1
+        guard activeDeliveries == 0 else { return }
+        let waiters = drainWaiters
+        drainWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.resume() }
+    }
+
+    private func waitForDeliveriesToDrain() async {
+        guard activeDeliveries > 0 else { return }
+        await withCheckedContinuation { continuation in
+            drainWaiters.append(continuation)
+        }
     }
 }
 

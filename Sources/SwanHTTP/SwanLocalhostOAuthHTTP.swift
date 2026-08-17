@@ -1,3 +1,4 @@
+import Crypto
 import Foundation
 import Hummingbird
 import HTTPTypes
@@ -32,6 +33,44 @@ private struct LocalhostLoginForm {
     let csrf: String
     let handle: String
     let password: String
+    let authFactorToken: String?
+}
+
+private struct LocalhostOAuthMFAForm {
+    let csrf: String
+    let handle: String
+    let kind: AuthenticationFactorKind
+    let factorID: String
+    let code: String?
+    let challenge: String?
+    let clientDataJSON: String?
+    let authenticatorData: String?
+    let credentialID: String?
+    let signature: String?
+
+    func payload() throws -> Data {
+        var value: [String: Any] = ["kind": kind.rawValue, "factorID": factorID]
+        if let code { value["code"] = code }
+        if let challenge { value["challenge"] = challenge }
+        if let clientDataJSON { value["clientDataJSON"] = clientDataJSON }
+        if let authenticatorData { value["authenticatorData"] = authenticatorData }
+        if let credentialID { value["credentialID"] = credentialID }
+        if let signature { value["signature"] = signature }
+        return try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+    }
+}
+
+private func localhostOAuthAuthorizationContext(
+    session: OAuthBrowserApprovalSession,
+    binding: OAuthClientBinding
+) throws -> AccountAuthorizationContext {
+    try AccountAuthorizationContext(
+        channel: .oauth,
+        sessionID: session.csrfToken,
+        csrfDigest: Data(SHA256.hash(data: Data(session.csrfToken.utf8))),
+        clientID: binding.clientID,
+        requestDigest: Data(SHA256.hash(data: Data(session.requestURI.utf8))),
+        purpose: "oauthToken")
 }
 
 private enum LocalhostConsentDecision: String {
@@ -115,6 +154,15 @@ func registerLocalhostOAuthEndpoints(
             configuration: configuration,
             runtime: runtime,
             loginClientIdentityPolicy: loginClientIdentityPolicy,
+            requestBodyAdmission: requestBodyAdmission
+        )
+    }
+    router.post("/oauth/authorize/mfa") { request, context async -> Response in
+        await completeLocalhostAuthorizationMFA(
+            request: request,
+            context: context,
+            configuration: configuration,
+            runtime: runtime,
             requestBodyAdmission: requestBodyAdmission
         )
     }
@@ -210,12 +258,49 @@ private func loginLocalhostAuthorization(
         case .allowed:
             break
         }
+        let authorizationContext = try localhostOAuthAuthorizationContext(
+            session: session, binding: pushed.binding)
         let authenticated: AccountAuthenticationSuccess
-        switch try await configuration.accounts.authenticateForLogin(
-            handle: form.handle,
-            password: form.password
-        ) {
+        let outcome: AccountLoginAuthenticationOutcome
+        if let grantDirectory = configuration.accounts as? any SwanAccountPortalAuthorizationGrantAccountDirectory {
+            outcome = try await grantDirectory.authenticateForLogin(
+                handle: form.handle,
+                password: form.password,
+                authFactorToken: form.authFactorToken,
+                authorizationContext: authorizationContext,
+                now: Date())
+        } else {
+            outcome = try await configuration.accounts.authenticateForLogin(
+                handle: form.handle,
+                password: form.password,
+                authFactorToken: form.authFactorToken,
+                authFactorSessionID: session.csrfToken)
+        }
+        switch outcome {
+        case let .authenticated(passwordProof) where passwordProof.requiresFactor:
+            guard let mfa = configuration.mfaService else {
+                return localhostAuthorizationError(.unauthorized)
+            }
+            let challenge = try await mfa.beginOAuthFactor(
+                accountDID: passwordProof.account.did,
+                sessionID: session.csrfToken,
+                context: authorizationContext,
+                factorID: nil,
+                now: Date()
+            )
+            return localhostHTML(
+                .ok,
+                oauthMFAChallengePage(
+                    csrf: session.csrfToken,
+                    handle: form.handle,
+                    factor: challenge
+                )
+            )
         case .rejected:
+            // Never retry Argon2 for an already-rejected browser request. The
+            // canonical directory owns the single admitted password phase;
+            // this branch must not become a password oracle or an alternate
+            // MFA admission path.
             return localhostAuthorizationError(.unauthorized)
         case let .authenticated(success):
             authenticated = success
@@ -224,6 +309,8 @@ private func loginLocalhostAuthorization(
             requestURI: session.requestURI,
             subject: authenticated.account.did,
             subjectUpdatedAt: authenticated.account.updatedAt,
+            authorizationGrantDigest: authenticated.authorizationGrantDigest,
+            csrfToken: session.csrfToken,
             lifetime: session.expiresAt.timeIntervalSinceNow
         )
         return localhostHTML(
@@ -248,6 +335,75 @@ private func loginLocalhostAuthorization(
         )
     } catch {
         return localhostAuthorizationError(.badRequest)
+    }
+}
+
+private func completeLocalhostAuthorizationMFA(
+    request: Request,
+    context: SwanHTTPRequestContext,
+    configuration: SwanLocalhostOAuthConfiguration,
+    runtime: SwanOAuthRuntime,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async -> Response {
+    do {
+        guard let mfa = configuration.mfaService else { return localhostAuthorizationError(.unauthorized) }
+        let form = try await parseOAuthMFAForm(request, context: context, requestBodyAdmission: requestBodyAdmission)
+        let session = try browserSession(from: request, runtime: runtime)
+        guard session.subject == nil,
+              form.csrf == session.csrfToken,
+              let pushed = try await runtime.tokenService.activePushedAuthorizationRequest(session.requestURI),
+              pushed.binding.issuer == configuration.issuer.absoluteString,
+              let account = try await configuration.accounts.resolve(handle: form.handle),
+              account.status.authorizesAccount else {
+            return localhostAuthorizationError(.badRequest)
+        }
+        let authorizationContext = try localhostOAuthAuthorizationContext(
+            session: session, binding: pushed.binding)
+        let proof = try await mfa.verifyOAuthFactor(
+            accountDID: account.did,
+            sessionID: session.csrfToken,
+            context: authorizationContext,
+            payload: try form.payload(),
+            now: Date()
+        )
+        guard let token = proof.factorToken else { return localhostAuthorizationError(.unauthorized) }
+        guard let grantDirectory = configuration.accounts as? any SwanAccountPortalAuthorizationGrantAccountDirectory else {
+            return localhostAuthorizationError(.serviceUnavailable)
+        }
+        let authenticated: AccountAuthenticationSuccess
+        switch try await grantDirectory.authenticateFactorForLogin(
+            accountDID: account.did,
+            authFactorToken: token,
+            authorizationContext: authorizationContext,
+            now: Date()) {
+        case .rejected: return localhostAuthorizationError(.unauthorized)
+        case let .authenticated(value): authenticated = value
+        }
+        guard authenticated.account.did == account.did else { return localhostAuthorizationError(.unauthorized) }
+        let issued = try runtime.browserSessionService.issue(
+            requestURI: session.requestURI,
+            subject: authenticated.account.did,
+            subjectUpdatedAt: authenticated.account.updatedAt,
+            authorizationGrantDigest: authenticated.authorizationGrantDigest,
+            csrfToken: session.csrfToken,
+            lifetime: session.expiresAt.timeIntervalSinceNow
+        )
+        return localhostHTML(
+            .ok,
+            consentPage(
+                csrf: issued.session.csrfToken,
+                subject: authenticated.account.did,
+                clientID: pushed.binding.clientID,
+                scopes: pushed.binding.scopes
+            ),
+            setCookie: browserCookie(issued.value)
+        )
+    } catch is SwanRequestBodyCollectionFailure {
+        return localhostAuthorizationError(.badRequest)
+    } catch is AccountLoginAuthenticationError {
+        return localhostAuthorizationError(.serviceUnavailable)
+    } catch {
+        return localhostAuthorizationError(.unauthorized)
     }
 }
 
@@ -284,14 +440,21 @@ private func consentLocalhostAuthorization(
             session.requestURI,
             binding: pushed.binding
         )
+        let authorizationContext = try localhostOAuthAuthorizationContext(
+            session: session, binding: consumed.binding)
         let destination: URL
         switch form.decision {
         case .approve:
+            guard let authorizationGrantDigest = session.authorizationGrantDigest else {
+                return fallback
+            }
             let code = try await runtime.tokenService.issueAuthorizationCode(
                 subject: account.did,
                 binding: consumed.binding,
                 codeChallengeS256: consumed.codeChallengeS256,
-                activeSubjectRevisionMicroseconds: subjectRevision
+                activeSubjectRevisionMicroseconds: subjectRevision,
+                authorizationGrantDigest: authorizationGrantDigest,
+                authorizationContext: authorizationContext
             )
             destination = try authorizationRedirect(
                 base: consumed.binding.redirectURI,
@@ -533,7 +696,8 @@ private func parseLoginForm(
 ) async throws -> LocalhostLoginForm {
     let fields = try await strictForm(
         request, context: context, requestBodyAdmission: requestBodyAdmission)
-    guard Set(fields.keys) == ["csrf", "handle", "password"],
+    guard Set(fields.keys) == ["csrf", "handle", "password"]
+            || Set(fields.keys) == ["csrf", "handle", "password", "authFactorToken"],
           let csrf = fields["csrf"], let handle = fields["handle"], let password = fields["password"],
           validBrowserOpaqueValue(csrf),
           !handle.isEmpty, handle.utf8.count <= 253,
@@ -541,7 +705,37 @@ private func parseLoginForm(
           !password.utf8.contains(0) else {
         throw LocalhostOAuthRequestError.malformed
     }
-    return LocalhostLoginForm(csrf: csrf, handle: handle, password: password)
+    let authFactorToken = fields["authFactorToken"]
+    if let authFactorToken, !validOpaqueToken(authFactorToken) {
+        throw LocalhostOAuthRequestError.malformed
+    }
+    return LocalhostLoginForm(csrf: csrf, handle: handle, password: password, authFactorToken: authFactorToken)
+}
+
+private func parseOAuthMFAForm(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> LocalhostOAuthMFAForm {
+    let fields = try await strictForm(request, context: context, requestBodyAdmission: requestBodyAdmission)
+    // Accept a legacy cached password field but never use it in phase two;
+    // the durable password-admitted phase is the only authority here.
+    let allowed = Set(["csrf", "handle", "password", "kind", "factorID", "code", "challenge", "clientDataJSON", "authenticatorData", "credentialID", "signature"])
+    guard Set(fields.keys).isSubset(of: allowed),
+          let csrf = fields["csrf"], validBrowserOpaqueValue(csrf),
+          let handle = fields["handle"], !handle.isEmpty, handle.utf8.count <= 253,
+          let kindText = fields["kind"], let kind = AuthenticationFactorKind(rawValue: kindText),
+          let factorID = fields["factorID"], !factorID.isEmpty, factorID.utf8.count <= 128 else {
+        throw LocalhostOAuthRequestError.malformed
+    }
+    guard fields.values.allSatisfy({ $0.utf8.count <= 16 * 1024 && !$0.utf8.contains(0) }) else {
+        throw LocalhostOAuthRequestError.malformed
+    }
+    return LocalhostOAuthMFAForm(
+        csrf: csrf, handle: handle, kind: kind, factorID: factorID,
+        code: fields["code"], challenge: fields["challenge"], clientDataJSON: fields["clientDataJSON"],
+        authenticatorData: fields["authenticatorData"], credentialID: fields["credentialID"], signature: fields["signature"]
+    )
 }
 
 private func parseConsentForm(
@@ -803,6 +997,23 @@ private func localUntrustedDPoPNonce(from proof: String) -> String? {
         return nil
     }
     return claims.nonce
+}
+
+private func oauthMFAChallengePage(csrf: String, handle: String, factor: SwanAccountPortalMutation) -> String {
+    let factorID = factor.factorID ?? ""
+    let challenge = factor.challenge ?? ""
+    let kind = factor.factorKind ?? (factor.challenge == nil ? .totp : .passkey)
+    let passkey = kind == .passkey
+    let recovery = kind == .recoveryCode
+    let proof: String
+    if passkey {
+        proof = "<input type=\"hidden\" name=\"challenge\" id=\"swan-challenge\" value=\"\(SwanBrowserPages.escape(challenge))\"><input type=\"hidden\" name=\"clientDataJSON\" id=\"swan-client-data\"><input type=\"hidden\" name=\"authenticatorData\" id=\"swan-auth-data\"><input type=\"hidden\" name=\"credentialID\" id=\"swan-credential\"><input type=\"hidden\" name=\"signature\" id=\"swan-signature\"><script>(async()=>{const f=document.forms[0],b=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/').padEnd(Math.ceil(s.length/4)*4,'=')),c=>c.charCodeAt(0)),e=a=>{let s='';new Uint8Array(a).forEach(c=>s+=String.fromCharCode(c));return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'')};try{const c=await navigator.credentials.get({publicKey:{challenge:b(document.getElementById('swan-challenge').value),userVerification:'required'}});document.getElementById('swan-client-data').value=e(c.response.clientDataJSON);document.getElementById('swan-auth-data').value=e(c.response.authenticatorData);document.getElementById('swan-credential').value=e(c.rawId);document.getElementById('swan-signature').value=e(c.response.signature);f.submit()}catch(_){document.body.insertAdjacentHTML('beforeend','<p>Passkey verification was cancelled.</p>')}}</script>"
+    } else if recovery {
+        proof = "<label>Recovery code <input name=\"code\" autocomplete=\"one-time-code\" required></label>"
+    } else {
+        proof = "<label>One-time code <input name=\"code\" autocomplete=\"one-time-code\" required></label>"
+    }
+    return "<!doctype html><html><head><meta charset=\"utf-8\"><title>Swan factor verification</title></head><body><main><h1>Verify your factor</h1><form method=\"post\" action=\"/oauth/authorize/mfa\"><input type=\"hidden\" name=\"csrf\" value=\"\(SwanBrowserPages.escape(csrf))\"><input type=\"hidden\" name=\"handle\" value=\"\(SwanBrowserPages.escape(handle))\"><input type=\"hidden\" name=\"kind\" value=\"\(kind.rawValue)\"><input type=\"hidden\" name=\"factorID\" value=\"\(SwanBrowserPages.escape(factorID))\">\(proof)<button type=\"submit\">Verify securely</button></form></main></body></html>"
 }
 
 private func localhostHTML(_ status: HTTPResponse.Status, _ html: String, setCookie: String? = nil) -> Response {

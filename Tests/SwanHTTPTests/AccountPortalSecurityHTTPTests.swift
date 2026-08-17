@@ -727,8 +727,20 @@ final class AccountPortalSecurityHTTPTests: XCTestCase, @unchecked Sendable {
         )
         let service = PortalMemoryService()
         let buildDirectory = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appending(path: "web/build")
+            .deletingLastPathComponent()
+            .appending(path: "portal-assets-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: buildDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try Data("<!doctype html><title>Swan account</title>".utf8)
+            .write(to: buildDirectory.appending(path: "index.html"))
+        try Data(":root { color-scheme: light dark; }".utf8)
+            .write(to: buildDirectory.appending(path: "auth-tokens.css"))
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: buildDirectory)
+        }
         let configuration = try SwanAccountPortalConfiguration(
             publicOrigin: URL(string: "https://accounts.example")!,
             staticDirectory: buildDirectory,

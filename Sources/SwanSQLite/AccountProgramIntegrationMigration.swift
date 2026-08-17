@@ -16,6 +16,7 @@ extension SQLiteControlDatabase {
         // transaction makes the drop/recreate atomic with startup.
         if !marker.isEmpty {
             try await recreateCanonicalAppPasswordCapacityTrigger()
+            try await ensureWebAuthnChallengeBindingColumns()
             return
         }
 
@@ -99,18 +100,39 @@ extension SQLiteControlDatabase {
             """,
             "CREATE INDEX IF NOT EXISTS management_pre_auth_expiry ON management_pre_auth(expires_at, token_digest)",
             "CREATE TABLE IF NOT EXISTS totp_replay_state (factor_id TEXT NOT NULL, account_did TEXT NOT NULL, accepted_counter INTEGER NOT NULL CHECK(accepted_counter >= 0), updated_at INTEGER NOT NULL, PRIMARY KEY(factor_id, account_did))",
+            "CREATE TABLE IF NOT EXISTS totp_pending_secret_envelopes (factor_id TEXT PRIMARY KEY, account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE, key_reference TEXT NOT NULL, nonce BLOB NOT NULL CHECK(length(nonce)=12), ciphertext BLOB NOT NULL CHECK(length(ciphertext)>0), authentication_tag BLOB NOT NULL CHECK(length(authentication_tag)=16), issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL CHECK(expires_at>issued_at), FOREIGN KEY(factor_id, account_did) REFERENCES authentication_factors(factor_id, account_did) ON DELETE CASCADE)",
             "CREATE TABLE IF NOT EXISTS mfa_factor_tokens (digest BLOB PRIMARY KEY CHECK(length(digest) = 32), account_did TEXT NOT NULL, session_id TEXT NOT NULL, purpose TEXT NOT NULL, factor TEXT NOT NULL, factor_id TEXT NOT NULL, strength BLOB NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER, revoked_at INTEGER)",
             "CREATE TABLE IF NOT EXISTS mfa_audit_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, account_did TEXT NOT NULL, factor_id TEXT, success INTEGER NOT NULL, occurred_at INTEGER NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS mfa_webauthn_challenge_context (challenge_digest BLOB PRIMARY KEY CHECK(length(challenge_digest) = 32), purpose TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS mfa_webauthn_challenge_context (challenge_digest BLOB PRIMARY KEY CHECK(length(challenge_digest) = 32), purpose TEXT NOT NULL, session_id TEXT, factor_id TEXT)",
             "CREATE INDEX IF NOT EXISTS mfa_factor_tokens_expiry ON mfa_factor_tokens(expires_at, digest)",
             "CREATE INDEX IF NOT EXISTS mfa_factor_tokens_account ON mfa_factor_tokens(account_did, session_id, consumed_at, revoked_at)",
             "CREATE INDEX IF NOT EXISTS mfa_audit_events_account ON mfa_audit_events(account_did, occurred_at, event_id)",
         ]
         for statement in statements { _ = try await connection.query(statement) }
+        try await ensureWebAuthnChallengeBindingColumns()
         try await recreateCanonicalAppPasswordCapacityTrigger()
         _ = try await connection.query(
             "INSERT INTO control_schema_migrations(version, applied_at) VALUES (8, unixepoch())"
         )
+    }
+
+    private func ensureWebAuthnChallengeBindingColumns() async throws {
+        let challengeColumns = try await connection.query("PRAGMA table_info(webauthn_challenges)")
+        let challengeNames = Set(challengeColumns.compactMap { $0.column("name")?.string })
+        if !challengeNames.contains("session_id") {
+            _ = try await connection.query("ALTER TABLE webauthn_challenges ADD COLUMN session_id TEXT")
+        }
+        if !challengeNames.contains("factor_id") {
+            _ = try await connection.query("ALTER TABLE webauthn_challenges ADD COLUMN factor_id TEXT")
+        }
+        let contextColumns = try await connection.query("PRAGMA table_info(mfa_webauthn_challenge_context)")
+        let contextNames = Set(contextColumns.compactMap { $0.column("name")?.string })
+        if !contextNames.contains("session_id") {
+            _ = try await connection.query("ALTER TABLE mfa_webauthn_challenge_context ADD COLUMN session_id TEXT")
+        }
+        if !contextNames.contains("factor_id") {
+            _ = try await connection.query("ALTER TABLE mfa_webauthn_challenge_context ADD COLUMN factor_id TEXT")
+        }
     }
 
     private func recreateCanonicalAppPasswordCapacityTrigger() async throws {

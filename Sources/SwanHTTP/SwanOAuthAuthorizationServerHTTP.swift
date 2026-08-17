@@ -1,3 +1,4 @@
+import Crypto
 import Foundation
 import HTTPTypes
 import Hummingbird
@@ -44,6 +45,31 @@ private struct OAuthServerLoginForm {
   let csrf: String
   let handle: String
   let password: String
+  let authFactorToken: String?
+}
+
+private struct OAuthServerMFAForm {
+  let csrf: String
+  let handle: String
+  let kind: AuthenticationFactorKind
+  let factorID: String
+  let code: String?
+  let challenge: String?
+  let clientDataJSON: String?
+  let authenticatorData: String?
+  let credentialID: String?
+  let signature: String?
+
+  func payload() throws -> Data {
+    var value: [String: Any] = ["kind": kind.rawValue, "factorID": factorID]
+    if let code { value["code"] = code }
+    if let challenge { value["challenge"] = challenge }
+    if let clientDataJSON { value["clientDataJSON"] = clientDataJSON }
+    if let authenticatorData { value["authenticatorData"] = authenticatorData }
+    if let credentialID { value["credentialID"] = credentialID }
+    if let signature { value["signature"] = signature }
+    return try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+  }
 }
 
 private enum OAuthServerConsentDecision: String {
@@ -54,6 +80,19 @@ private enum OAuthServerConsentDecision: String {
 private struct OAuthServerConsentForm {
   let csrf: String
   let decision: OAuthServerConsentDecision
+}
+
+private func oauthServerAuthorizationContext(
+  session: OAuthBrowserApprovalSession,
+  binding: OAuthClientBinding
+) throws -> AccountAuthorizationContext {
+  try AccountAuthorizationContext(
+    channel: .oauth,
+    sessionID: session.csrfToken,
+    csrfDigest: Data(SHA256.hash(data: Data(session.csrfToken.utf8))),
+    clientID: binding.clientID,
+    requestDigest: Data(SHA256.hash(data: Data(session.requestURI.utf8))),
+    purpose: "oauthToken")
 }
 
 private enum OAuthServerTokenGrant: String {
@@ -130,6 +169,11 @@ func registerOAuthAuthorizationServerEndpoints(
     await loginOAuthServerAuthorization(
       request: request, context: context, configuration: configuration, runtime: runtime,
       loginClientIdentityPolicy: loginClientIdentityPolicy,
+      requestBodyAdmission: requestBodyAdmission)
+  }
+  router.post("/oauth/authorize/mfa") { request, context async -> Response in
+    await completeOAuthServerAuthorizationMFA(
+      request: request, context: context, configuration: configuration, runtime: runtime,
       requestBodyAdmission: requestBodyAdmission)
   }
   router.post("/oauth/authorize/consent") { request, context async -> Response in
@@ -451,12 +495,47 @@ private func loginOAuthServerAuthorization(
     case .allowed:
       break
     }
+    let authorizationContext = try oauthServerAuthorizationContext(
+      session: session, binding: pushed.binding)
     let authenticated: AccountAuthenticationSuccess
-    switch try await configuration.accounts.authenticateForLogin(
-      handle: form.handle,
-      password: form.password
-    ) {
+    let outcome: AccountLoginAuthenticationOutcome
+    if let grantDirectory = configuration.accounts as? any SwanAccountPortalAuthorizationGrantAccountDirectory {
+      outcome = try await grantDirectory.authenticateForLogin(
+        handle: form.handle,
+        password: form.password,
+        authFactorToken: form.authFactorToken,
+        authorizationContext: authorizationContext,
+        now: Date())
+    } else {
+      outcome = try await configuration.accounts.authenticateForLogin(
+        handle: form.handle,
+        password: form.password,
+        authFactorToken: form.authFactorToken,
+        authFactorSessionID: session.csrfToken)
+    }
+    switch outcome {
+    case let .authenticated(passwordProof) where passwordProof.requiresFactor:
+      guard let mfa = configuration.mfaService else {
+        return oauthServerAuthorizationError(.unauthorized)
+      }
+      let challenge = try await mfa.beginOAuthFactor(
+        accountDID: passwordProof.account.did,
+        sessionID: session.csrfToken,
+        context: authorizationContext,
+        factorID: nil,
+        now: Date())
+      return oauthServerHTML(
+        .ok,
+        oauthServerMFAChallengePage(
+          csrf: session.csrfToken,
+          handle: form.handle,
+          factor: challenge),
+        formActionSource: oauthServerFormActionSource(pushed.binding.redirectURI))
     case .rejected:
+      // A rejected phase-one attempt is terminal. Do not run a second
+      // password verification here: doing so would turn a browser form into
+      // an unbounded Argon2 oracle and would bypass the single admitted
+      // password phase required by the OAuth MFA protocol.
       return oauthServerAuthorizationError(.unauthorized)
     case let .authenticated(success):
       authenticated = success
@@ -465,6 +544,8 @@ private func loginOAuthServerAuthorization(
       requestURI: session.requestURI,
       subject: authenticated.account.did,
       subjectUpdatedAt: authenticated.account.updatedAt,
+      authorizationGrantDigest: authenticated.authorizationGrantDigest,
+      csrfToken: session.csrfToken,
       lifetime: session.expiresAt.timeIntervalSinceNow
     )
     // §5.7.5 call site 1's second job. `include:` → concrete grants happens
@@ -541,6 +622,86 @@ private func loginOAuthServerAuthorization(
   }
 }
 
+private func completeOAuthServerAuthorizationMFA(
+  request: Request,
+  context: SwanHTTPRequestContext,
+  configuration: SwanOAuthAuthorizationServerConfiguration,
+  runtime: SwanOAuthRuntime,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async -> Response {
+  do {
+    guard let mfa = configuration.mfaService else {
+      return oauthServerAuthorizationError(.unauthorized)
+    }
+    let form = try await parseOAuthServerMFAForm(
+      request, context: context, requestBodyAdmission: requestBodyAdmission)
+    let session = try oauthServerBrowserSession(request, runtime: runtime)
+    guard session.subject == nil,
+      form.csrf == session.csrfToken,
+      let pushed = try await runtime.tokenService.activePushedAuthorizationRequest(session.requestURI),
+      pushed.binding.issuer == configuration.issuer.absoluteString,
+      let account = try await configuration.accounts.resolve(handle: form.handle),
+      account.status.authorizesAccount
+    else {
+      return oauthServerAuthorizationError(.badRequest)
+    }
+    let authorizationContext = try oauthServerAuthorizationContext(
+      session: session, binding: pushed.binding)
+    let proof = try await mfa.verifyOAuthFactor(
+      accountDID: account.did,
+      sessionID: session.csrfToken,
+      context: authorizationContext,
+      payload: try form.payload(),
+      now: Date())
+    guard let token = proof.factorToken else {
+      return oauthServerAuthorizationError(.unauthorized)
+    }
+    guard let grantDirectory = configuration.accounts as? any SwanAccountPortalAuthorizationGrantAccountDirectory else {
+      return oauthServerAuthorizationError(.serviceUnavailable)
+    }
+    let authenticated: AccountAuthenticationSuccess
+    switch try await grantDirectory.authenticateFactorForLogin(
+      accountDID: account.did,
+      authFactorToken: token,
+      authorizationContext: authorizationContext,
+      now: Date()) {
+    case .rejected:
+      return oauthServerAuthorizationError(.unauthorized)
+    case let .authenticated(value):
+      authenticated = value
+    }
+    guard authenticated.account.did == account.did else {
+      return oauthServerAuthorizationError(.unauthorized)
+    }
+    let issued = try runtime.browserSessionService.issue(
+      requestURI: session.requestURI,
+      subject: authenticated.account.did,
+      subjectUpdatedAt: authenticated.account.updatedAt,
+      authorizationGrantDigest: authenticated.authorizationGrantDigest,
+      csrfToken: session.csrfToken,
+      lifetime: session.expiresAt.timeIntervalSinceNow)
+    let expansion = try await OAuthLexiconScopeResolution.expandIncludes(
+      pushed.binding.scopes, resolver: runtime.lexiconResolver, stage: .pushedAuthorizationRequest)
+    oauthServerLogEmptyExpansions(expansion.emptyExpansions, context: context, stage: "consent")
+    return oauthServerHTML(
+      .ok,
+      oauthServerConsentPage(
+        csrf: issued.session.csrfToken,
+        subject: authenticated.account.did,
+        clientID: pushed.binding.clientID,
+        scopes: expansion.scopes,
+        emptyPermissionSets: expansion.emptyExpansions),
+      setCookie: oauthServerCookie(issued.value),
+      formActionSource: oauthServerFormActionSource(pushed.binding.redirectURI))
+  } catch is SwanRequestBodyCollectionFailure {
+    return oauthServerAuthorizationError(.badRequest)
+  } catch is AccountLoginAuthenticationError {
+    return oauthServerAuthorizationError(.serviceUnavailable)
+  } catch {
+    return oauthServerAuthorizationError(.unauthorized)
+  }
+}
+
 private func consentOAuthServerAuthorization(
   request: Request,
   context: SwanHTTPRequestContext,
@@ -571,14 +732,21 @@ private func consentOAuthServerAuthorization(
       session.requestURI,
       binding: pushed.binding
     )
+    let authorizationContext = try oauthServerAuthorizationContext(
+      session: session, binding: consumed.binding)
     let destination: URL
     switch form.decision {
     case .approve:
+      guard let authorizationGrantDigest = session.authorizationGrantDigest else {
+        return fallback
+      }
       let code = try await runtime.tokenService.issueAuthorizationCode(
         subject: account.did,
         binding: consumed.binding,
         codeChallengeS256: consumed.codeChallengeS256,
-        activeSubjectRevisionMicroseconds: subjectRevision
+        activeSubjectRevisionMicroseconds: subjectRevision,
+        authorizationGrantDigest: authorizationGrantDigest,
+        authorizationContext: authorizationContext
       )
       destination = try oauthServerAuthorizationRedirect(
         base: consumed.binding.redirectURI,
@@ -967,14 +1135,42 @@ private func parseOAuthServerLoginForm(
 ) async throws -> OAuthServerLoginForm {
   let fields = try await oauthServerForm(
     request, context: context, requestBodyAdmission: requestBodyAdmission)
-  guard Set(fields.keys) == ["csrf", "handle", "password"],
+  guard Set(fields.keys) == ["csrf", "handle", "password"]
+      || Set(fields.keys) == ["csrf", "handle", "password", "authFactorToken"],
     let csrf = fields["csrf"], let handle = fields["handle"], let password = fields["password"],
     oauthServerBrowserOpaque(csrf), !handle.isEmpty, handle.utf8.count <= 253,
     !password.isEmpty, password.utf8.count <= 1_024, !password.utf8.contains(0)
   else {
     throw OAuthServerRequestError.malformed
   }
-  return .init(csrf: csrf, handle: handle, password: password)
+  let authFactorToken = fields["authFactorToken"]
+  if let authFactorToken, !oauthServerOpaqueToken(authFactorToken) {
+    throw OAuthServerRequestError.malformed
+  }
+  return .init(csrf: csrf, handle: handle, password: password, authFactorToken: authFactorToken)
+}
+
+private func parseOAuthServerMFAForm(
+  _ request: Request,
+  context: SwanHTTPRequestContext,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> OAuthServerMFAForm {
+  let fields = try await oauthServerForm(
+    request, context: context, requestBodyAdmission: requestBodyAdmission)
+  // `password` remains an accepted legacy field for clients that cached the
+  // old form, but it is never read or verified in phase two.
+  let allowed: Set<String> = ["csrf", "handle", "password", "kind", "factorID", "code", "challenge", "clientDataJSON", "authenticatorData", "credentialID", "signature"]
+  guard Set(fields.keys).isSubset(of: allowed),
+    let csrf = fields["csrf"], oauthServerBrowserOpaque(csrf),
+    let handle = fields["handle"], !handle.isEmpty, handle.utf8.count <= 253,
+    let kindText = fields["kind"], let kind = AuthenticationFactorKind(rawValue: kindText),
+    let factorID = fields["factorID"], !factorID.isEmpty, factorID.utf8.count <= 128,
+    fields.values.allSatisfy({ $0.utf8.count <= 16 * 1024 && !$0.utf8.contains(0) })
+  else { throw OAuthServerRequestError.malformed }
+  return OAuthServerMFAForm(
+    csrf: csrf, handle: handle, kind: kind, factorID: factorID,
+    code: fields["code"], challenge: fields["challenge"], clientDataJSON: fields["clientDataJSON"],
+    authenticatorData: fields["authenticatorData"], credentialID: fields["credentialID"], signature: fields["signature"])
 }
 
 private func parseOAuthServerConsentForm(
@@ -1303,6 +1499,23 @@ private func oauthServerLogEmptyExpansions(
       "stage": .string(stage),
       "nsids": .string(nsids.joined(separator: ",")),
     ])
+}
+
+private func oauthServerMFAChallengePage(csrf: String, handle: String, factor: SwanAccountPortalMutation) -> String {
+  let factorID = factor.factorID ?? ""
+  let challenge = factor.challenge ?? ""
+  let kind = factor.factorKind ?? (factor.challenge == nil ? .totp : .passkey)
+  let passkey = kind == .passkey
+  let recovery = kind == .recoveryCode
+  let proof: String
+  if passkey {
+    proof = "<input type=\"hidden\" name=\"challenge\" id=\"swan-challenge\" value=\"\(SwanBrowserPages.escape(challenge))\"><input type=\"hidden\" name=\"clientDataJSON\" id=\"swan-client-data\"><input type=\"hidden\" name=\"authenticatorData\" id=\"swan-auth-data\"><input type=\"hidden\" name=\"credentialID\" id=\"swan-credential\"><input type=\"hidden\" name=\"signature\" id=\"swan-signature\"><script>(async()=>{const f=document.forms[0],b=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/').padEnd(Math.ceil(s.length/4)*4,'=')),c=>c.charCodeAt(0)),e=a=>{let s='';new Uint8Array(a).forEach(c=>s+=String.fromCharCode(c));return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'')};try{const c=await navigator.credentials.get({publicKey:{challenge:b(document.getElementById('swan-challenge').value),userVerification:'required'}});document.getElementById('swan-client-data').value=e(c.response.clientDataJSON);document.getElementById('swan-auth-data').value=e(c.response.authenticatorData);document.getElementById('swan-credential').value=e(c.rawId);document.getElementById('swan-signature').value=e(c.response.signature);f.submit()}catch(_){document.body.insertAdjacentHTML('beforeend','<p>Passkey verification was cancelled.</p>')}}</script>"
+  } else if recovery {
+    proof = "<label>Recovery code <input name=\"code\" autocomplete=\"one-time-code\" required></label>"
+  } else {
+    proof = "<label>One-time code <input name=\"code\" autocomplete=\"one-time-code\" required></label>"
+  }
+  return "<!doctype html><html><head><meta charset=\"utf-8\"><title>Swan factor verification</title></head><body><main><h1>Verify your factor</h1><form method=\"post\" action=\"/oauth/authorize/mfa\"><input type=\"hidden\" name=\"csrf\" value=\"\(SwanBrowserPages.escape(csrf))\"><input type=\"hidden\" name=\"handle\" value=\"\(SwanBrowserPages.escape(handle))\"><input type=\"hidden\" name=\"kind\" value=\"\(kind.rawValue)\"><input type=\"hidden\" name=\"factorID\" value=\"\(SwanBrowserPages.escape(factorID))\">\(proof)<button type=\"submit\">Verify securely</button></form></main></body></html>"
 }
 
 private func oauthServerHTML(
