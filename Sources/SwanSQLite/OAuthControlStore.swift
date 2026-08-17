@@ -884,7 +884,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
                         context: authorizationContext,
                         now: now)
                 }
-                try await insertFamily(family)
+                try await insertFamily(family, now: now)
                 try await requireInsertionCapacity(
                     table: "oauth_control_authorization_codes",
                     keyColumn: "code_digest",
@@ -1009,7 +1009,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
         try await withConnectionGate {
             try await transaction {
                 try await purgeExpiredLocked(now: now)
-                try await insertFamily(family)
+                try await insertFamily(family, now: now)
                 try await insertTokenPair(tokens)
             }
         }
@@ -1031,6 +1031,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
                            f.scope_provenance, f.scope_provenance_requested, f.dpop_jkt,
                            f.client_assertion_key_id, f.client_assertion_algorithm,
                            f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at, f.revoked_at,
+                           f.created_at,
                            a.expires_at AS token_expires_at
                     FROM oauth_control_access_tokens a
                     JOIN oauth_control_token_families f ON f.family_id = a.family_id
@@ -1102,6 +1103,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
                            f.scope_provenance, f.scope_provenance_requested, f.dpop_jkt,
                            f.client_assertion_key_id, f.client_assertion_algorithm,
                            f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at, f.revoked_at,
+                           f.created_at,
                            t.expires_at AS token_expires_at
                     FROM \(table) t
                     JOIN oauth_control_token_families f ON f.family_id = t.family_id
@@ -1196,6 +1198,50 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
                 try await purgeExpiredLocked(now: now)
                 try await revokeFamily(familyID, now: now)
             }
+        }
+    }
+
+    public func revokeTokenFamily(
+        familyID: UUID,
+        subject: String,
+        now: Date = Date()
+    ) async throws {
+        guard !subject.isEmpty else { throw OAuthControlStoreError.invalidInput }
+        try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                _ = try await connection.query(
+                    """
+                    UPDATE oauth_control_token_families
+                    SET revoked_at = COALESCE(revoked_at, ?)
+                    WHERE family_id = ? AND subject = ?
+                    """,
+                    [.integer(try timestamp(now)), .text(familyID.uuidString), .text(subject)]
+                )
+            }
+        }
+    }
+
+    public func tokenFamilies(subject: String, now: Date = Date()) async throws -> [OAuthTokenFamily] {
+        guard !subject.isEmpty else { throw OAuthControlStoreError.invalidInput }
+        let instant = try timestamp(now)
+        return try await withConnectionGate {
+            let rows = try await connection.query(
+                """
+                SELECT family_id, subject, issuer, client_id, redirect_uri, scopes,
+                       scopes_requested, scope_provenance, scope_provenance_requested,
+                       dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
+                       client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at,
+                       created_at
+                FROM oauth_control_token_families
+                WHERE subject = ?
+                  AND revoked_at IS NULL
+                  AND expires_at > ?
+                ORDER BY created_at, family_id
+                """,
+                [.text(subject), .integer(instant)]
+            )
+            return try rows.map(decodeFamily)
         }
     }
 
@@ -1554,6 +1600,17 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
                 table: "oauth_control_par_requests",
                 column: "refresh_token_allowed",
                 definition: "INTEGER NOT NULL DEFAULT 1 CHECK(refresh_token_allowed IN (0, 1))"
+            )
+            // Additive `created_at` for the portal connected-apps projection.
+            // Existing families (NULL) fall back to their expiry; new inserts
+            // always write the column.
+            try await addColumnIfMissing(
+                table: "oauth_control_token_families",
+                column: "created_at",
+                definition: "INTEGER"
+            )
+            _ = try await connection.query(
+                "UPDATE oauth_control_token_families SET created_at = expires_at WHERE created_at IS NULL"
             )
             // Additive schema, but review it as an AUTHORIZATION change: unlike
             // `dpop_jkt` / `client_assertion_*`, which are inert until a binding
@@ -2001,7 +2058,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
         }
     }
 
-    private func insertFamily(_ family: OAuthTokenFamily) async throws {
+    private func insertFamily(_ family: OAuthTokenFamily, now: Date) async throws {
         // Every caller of this is a MINT — `storeAuthorizationCode` and
         // `issueTokenPair` — so stage G's strict half belongs here. Rotation
         // now DOES rewrite a family row (`rewriteGrant`), and deliberately does
@@ -2020,8 +2077,9 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
                 family_id, subject, issuer, client_id, redirect_uri, scopes,
                 scopes_requested, scope_provenance, scope_provenance_requested,
                 dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
-                client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 .text(family.familyID.uuidString), .text(family.subject),
@@ -2042,6 +2100,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
                 .integer(family.binding.refreshTokenAllowed ? 1 : 0),
                 .integer(try timestamp(family.expiresAt)),
                 family.revokedAt.map { try? timestamp($0) }.flatMap { $0 }.map(SQLiteData.integer) ?? .null,
+                .integer(try timestamp(family.createdAt ?? now)),
             ]
         )
     }
@@ -2158,7 +2217,8 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
             SELECT family_id, subject, issuer, client_id, redirect_uri, scopes,
                    scopes_requested, scope_provenance, scope_provenance_requested,
                    dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
-                   client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at
+                   client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at,
+                   created_at
             FROM oauth_control_token_families
             WHERE family_id = ?
             """,
@@ -2176,7 +2236,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
                f.scopes_requested, f.scope_provenance, f.scope_provenance_requested,
                f.dpop_jkt, f.client_assertion_key_id, f.client_assertion_algorithm,
                f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at AS family_expires_at,
-               f.revoked_at
+               f.revoked_at, f.created_at
         FROM oauth_control_authorization_codes c
         JOIN oauth_control_token_families f ON f.family_id = c.family_id
         WHERE c.code_digest = ?
@@ -2190,7 +2250,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
                f.scope_provenance_requested,
                f.dpop_jkt, f.client_assertion_key_id,
                f.client_assertion_algorithm, f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at,
-               f.revoked_at, r.expires_at AS token_expires_at, r.used_at
+               f.revoked_at, f.created_at, r.expires_at AS token_expires_at, r.used_at
         FROM oauth_control_refresh_tokens r
         JOIN oauth_control_token_families f ON f.family_id = r.family_id
         WHERE r.token_digest = ?
@@ -2257,7 +2317,8 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
             subject: try requiredText(row, "subject"),
             binding: try decodeBinding(row),
             expiresAt: try requiredDate(row, "expires_at"),
-            revokedAt: try optionalDate(row, "revoked_at")
+            revokedAt: try optionalDate(row, "revoked_at"),
+            createdAt: try optionalDate(row, "created_at")
         )
         do {
             try validate(family: family, now: Date.distantPast, permitExpired: true)

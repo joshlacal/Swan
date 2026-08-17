@@ -705,19 +705,25 @@ public struct OAuthTokenFamily: Sendable, Equatable {
     public let binding: OAuthClientBinding
     public let expiresAt: Date
     public let revokedAt: Date?
+    /// Family creation time. `nil` only for families written before the
+    /// additive `created_at` column existed; the projection falls back to
+    /// `expiresAt` for those rows.
+    public let createdAt: Date?
 
     public init(
         familyID: UUID,
         subject: String,
         binding: OAuthClientBinding,
         expiresAt: Date,
-        revokedAt: Date? = nil
+        revokedAt: Date? = nil,
+        createdAt: Date? = nil
     ) {
         self.familyID = familyID
         self.subject = subject
         self.binding = binding
         self.expiresAt = expiresAt
         self.revokedAt = revokedAt
+        self.createdAt = createdAt
     }
 }
 
@@ -899,6 +905,18 @@ public protocol OAuthControlStore: Sendable {
     /// used when fresh confidential-client metadata shows the persisted key has
     /// been removed or rekeyed, and must be a single durable transaction.
     func revokeTokenFamily(familyID: UUID, now: Date) async throws
+
+    /// Lists the account's live token families for the portal connected-apps
+    /// projection. Storage returns only family metadata (client binding,
+    /// scopes, expiry) — never raw bearer material.
+    func tokenFamilies(subject: String, now: Date) async throws -> [OAuthTokenFamily]
+
+    /// Account-bound, idempotent family revocation. The durable row is updated
+    /// only when it belongs to `subject`, so a portal caller cannot revoke
+    /// another account's connected app by guessing a family identifier. The
+    /// revocation is immediately effective: access-token validation re-checks
+    /// `revoked_at` on every request.
+    func revokeTokenFamily(familyID: UUID, subject: String, now: Date) async throws
 
     /// Atomically reserves a DPoP `jti` digest through its proof validity.
     /// The store receives no DPoP proof body or raw `jti`.

@@ -178,6 +178,134 @@ extension SQLiteControlDatabase: LegacySessionStore {
         }
     }
 
+    public func revokeLegacySessionFamily(familyID: String, did: String, now: Date) async throws {
+        guard !did.isEmpty else { throw AccountControlStoreError.invalidInput }
+        let instant = try legacySessionTimestamp(now)
+        try await withConnectionGate {
+            try await transaction {
+                _ = try await connection.query(
+                    "UPDATE legacy_session_families SET revoked_at = COALESCE(revoked_at, ?) WHERE family_id = ? AND did = ?",
+                    [.integer(instant), .text(familyID), .text(did)]
+                )
+                _ = try await connection.query(
+                    "DELETE FROM legacy_session_tokens WHERE family_id = ? AND family_id IN (SELECT family_id FROM legacy_session_families WHERE did = ?)",
+                    [.text(familyID), .text(did)]
+                )
+            }
+        }
+    }
+
+    public func legacySessionFamilies(did: String, now: Date) async throws -> [LegacySessionFamilyMetadata] {
+        guard !did.isEmpty else { throw AccountControlStoreError.invalidInput }
+        let instant = try legacySessionTimestamp(now)
+        return try await withConnectionGate { () -> [LegacySessionFamilyMetadata] in
+            let rows = try await connection.query(
+                """
+                SELECT f.family_id, f.did, f.app_password_id, f.created_at,
+                       f.revoked_at, f.reuse_detected_at,
+                       MAX(t.expires_at) AS family_expires_at
+                FROM legacy_session_families AS f
+                LEFT JOIN legacy_session_tokens AS t ON t.family_id = f.family_id
+                WHERE f.did = ?
+                  AND f.revoked_at IS NULL
+                  AND (t.expires_at IS NULL OR t.expires_at > ?)
+                GROUP BY f.family_id
+                ORDER BY f.created_at
+                """,
+                [.text(did), .integer(instant)]
+            )
+            return try rows.map { row -> LegacySessionFamilyMetadata in
+                guard case let .text(familyID) = row.column("family_id"),
+                      case let .text(accountDID) = row.column("did"),
+                      case let .integer(createdAt) = row.column("created_at") else {
+                    throw AccountControlStoreError.malformedRecord
+                }
+                let appPasswordID = optionalLegacyText(row.column("app_password_id"))
+                let revokedAt = optionalLegacyDate(row.column("revoked_at"))
+                let reuseDetectedAt = optionalLegacyDate(row.column("reuse_detected_at"))
+                // The family projection's expiry is the latest live token
+                // expiry; a family with no live tokens is already excluded.
+                let expiry = row.column("family_expires_at").flatMap { value -> Date? in
+                    guard case let .integer(raw) = value, raw >= 0 else { return nil }
+                    return Date(timeIntervalSince1970: Double(raw) / 1_000_000)
+                } ?? Date(timeIntervalSince1970: Double(createdAt) / 1_000_000)
+                return try LegacySessionFamilyMetadata(
+                    familyID: familyID,
+                    accountDID: accountDID,
+                    appPasswordID: appPasswordID,
+                    createdAt: Date(timeIntervalSince1970: Double(createdAt) / 1_000_000),
+                    expiresAt: expiry,
+                    revokedAt: revokedAt,
+                    reuseDetectedAt: reuseDetectedAt
+                )
+            }
+        }
+    }
+
+    public func createLegacySessionFamilyConsumingGrant(
+        familyID: String,
+        did: String,
+        appPasswordID: String?,
+        accessDigest: Data,
+        accessExpiresAt: Date,
+        refreshDigest: Data,
+        refreshExpiresAt: Date,
+        authorizationGrantDigest: Data,
+        authorizationContext: AccountAuthorizationContext,
+        now: Date
+    ) async throws {
+        guard accessDigest.count == 32, refreshDigest.count == 32,
+              authorizationGrantDigest.count == 32,
+              authorizationContext.channel == .legacy,
+              authorizationContext.purpose == "managementLogin" else {
+            throw SwanError.malformed("legacy session grant")
+        }
+        let createdAt = try legacySessionTimestamp(now)
+        try await withConnectionGate {
+            try await ensureTask7DurableTables()
+            try await transaction {
+                do {
+                    _ = try await consumeAuthorizationGrantLocked(
+                        grantDigest: authorizationGrantDigest,
+                        accountDID: did,
+                        context: authorizationContext,
+                        now: now
+                    )
+                } catch {
+                    // A missing, replayed, expired, revision-mismatched, or
+                    // wrong-channel/wrong-purpose grant aborts this
+                    // transaction: no legacy session family is created.
+                    throw AccountControlStoreError.invalidTransition
+                }
+                _ = try await connection.query(
+                    """
+                    INSERT INTO legacy_session_families
+                        (family_id, did, app_password_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        .text(familyID),
+                        .text(did),
+                        appPasswordID.map(SQLiteData.text) ?? .null,
+                        .integer(createdAt),
+                    ]
+                )
+                try await insertLegacyToken(
+                    digest: accessDigest,
+                    familyID: familyID,
+                    kind: .access,
+                    expiresAt: accessExpiresAt
+                )
+                try await insertLegacyToken(
+                    digest: refreshDigest,
+                    familyID: familyID,
+                    kind: .refresh,
+                    expiresAt: refreshExpiresAt
+                )
+            }
+        }
+    }
+
     public func pruneLegacySessions(now: Date) async throws {
         let instant = try legacySessionTimestamp(now)
         _ = try await withConnectionGate {
@@ -250,4 +378,16 @@ extension SQLiteControlDatabase: LegacySessionStore {
     private static func date(_ value: Int) -> Date {
         Date(timeIntervalSince1970: Double(value) / 1_000_000)
     }
+}
+
+private func optionalLegacyDate(_ value: SQLiteData?) -> Date? {
+    guard let value, !value.isNull else { return nil }
+    guard case let .integer(raw) = value, raw >= 0 else { return nil }
+    return Date(timeIntervalSince1970: Double(raw) / 1_000_000)
+}
+
+private func optionalLegacyText(_ value: SQLiteData?) -> String? {
+    guard let value, !value.isNull else { return nil }
+    guard case let .text(text) = value else { return nil }
+    return text
 }

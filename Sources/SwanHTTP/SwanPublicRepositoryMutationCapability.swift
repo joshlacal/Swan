@@ -1,5 +1,6 @@
 import Foundation
 import Petrel
+import SwanAccounts
 import SwanOAuth
 import SwanPublicRepository
 import SwanStorage
@@ -75,6 +76,11 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
     let jsonWriteAdmission: PublicRepositoryJSONWriteAdmission
     /// Shared total elapsed-time policy for every admitted JSON write body.
     let jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy
+    /// Narrow durable identity admission for repository writes. A suspended
+    /// or failed-grace did:web identity denies every mutation; a store or
+    /// resolver failure fails closed (denies). PLC-only and active identities
+    /// are unaffected.
+    let identityAdmission: (any SwanIdentityAdmissionEvaluating)?
 
     public init(
         authorizer: SwanOAuthResourceAuthorizer,
@@ -83,7 +89,8 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
         blobStore: (any BlobStore)? = nil,
         publicBlobSpoolAdmission: PublicRepositorySpoolAdmission? = nil,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .processShared,
-        jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy = .productionDefault
+        jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy = .productionDefault,
+        identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil
     ) {
         self.authorizer = authorizer
         self.directory = directory
@@ -92,5 +99,25 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
         self.publicBlobSpoolAdmission = publicBlobSpoolAdmission
         self.jsonWriteAdmission = jsonWriteAdmission
         self.jsonWriteBodyPolicy = jsonWriteBodyPolicy
+        self.identityAdmission = identityAdmission
+    }
+
+    /// Fails closed for repository writes: a suspended or failed-grace
+    /// did:web identity denies the mutation, and a store/resolver failure is
+    /// treated as a denial. PLC-only and active identities pass through.
+    func requireWriteAdmission(accountDID: String, now: Date) async throws {
+        guard let identityAdmission else { return }
+        do {
+            let decision = try await identityAdmission.identityAdmission(
+                accountDID: accountDID, now: now
+            )
+            guard decision.allowsWrite else {
+                throw PublicRepositoryMutationCapabilityError.invalidTarget
+            }
+        } catch let error as PublicRepositoryMutationCapabilityError {
+            throw error
+        } catch {
+            throw PublicRepositoryMutationCapabilityError.unavailable
+        }
     }
 }

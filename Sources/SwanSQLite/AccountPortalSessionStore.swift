@@ -1,6 +1,7 @@
 import Crypto
 import Foundation
 import SQLiteNIO
+import SwanCore
 import SwanStorage
 
 /// SQLite adapter for the account portal's durable pre-auth and management
@@ -127,6 +128,33 @@ extension SQLiteControlDatabase: ManagementSessionStore,
         }
     }
 
+    public func revokeManagementSession(digest: Data, accountDID: String, now: Date) async throws {
+        guard digest.count == 32, !accountDID.isEmpty else {
+            throw AccountControlStoreError.invalidInput
+        }
+        let current = try portalTimestampOrThrow(now)
+        try await withConnectionGate {
+            try await transaction {
+                _ = try await connection.query(
+                    "UPDATE management_sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE session_digest = ? AND account_did = ?",
+                    [.integer(current), digest.sqliteData!, .text(accountDID)]
+                )
+            }
+        }
+    }
+
+    public func managementSessions(accountDID: String, now: Date) async throws -> [ManagementSessionMetadata] {
+        guard !accountDID.isEmpty else { throw AccountControlStoreError.invalidInput }
+        let current = try portalTimestampOrThrow(now)
+        return try await withConnectionGate {
+            let rows = try await connection.query(
+                "SELECT session_digest, account_did, csrf_digest, issued_at, idle_expires_at, absolute_expires_at, last_step_up_at, strength, revoked_at FROM management_sessions WHERE account_did = ? AND revoked_at IS NULL AND idle_expires_at >= ? AND absolute_expires_at >= ? ORDER BY issued_at",
+                [.text(accountDID), .integer(current), .integer(current)]
+            )
+            return try rows.map(decodeManagementSession)
+        }
+    }
+
     public func upgradeManagementSession(
         digest: Data,
         accountDID: String,
@@ -172,7 +200,12 @@ extension SQLiteControlDatabase: ManagementSessionStore,
     ) async throws {
         guard !accountDID.isEmpty else { throw AccountControlStoreError.invalidInput }
         let current = try portalTimestampOrThrow(now)
-        let exceptDigest = Data(SHA256.hash(data: Data(sessionID.rawValue.utf8)))
+        let exceptDigest: Data
+        if let decoded = Hex.decode(sessionID.rawValue), decoded.count == 32 {
+            exceptDigest = decoded
+        } else {
+            exceptDigest = Data(SHA256.hash(data: Data(sessionID.rawValue.utf8)))
+        }
         try await withConnectionGate {
             try await transaction {
                 _ = try await connection.query(
@@ -253,6 +286,54 @@ extension SQLiteControlDatabase: ManagementSessionStore,
                     [preAuthDigest.sqliteData!, .integer(current)]
                 )
                 guard consumed.count == 1 else { return false }
+                try await insertManagementSession(
+                    session,
+                    sessionDigest: sessionDigest,
+                    csrfDigest: csrfDigest,
+                    now: current
+                )
+                return true
+            }
+        }
+    }
+
+    public func consumePreAuthAndCreateManagementSessionConsumingGrant(
+        preAuthDigest: Data,
+        session: ManagementSessionMetadata,
+        sessionDigest: Data,
+        csrfDigest: Data,
+        authorizationGrantDigest: Data,
+        authorizationContext: AccountAuthorizationContext,
+        now: Date
+    ) async throws -> Bool {
+        guard preAuthDigest.count == 32, authorizationGrantDigest.count == 32,
+              authorizationContext.channel == .portal,
+              authorizationContext.purpose == "managementLogin" else {
+            throw AccountControlStoreError.invalidInput
+        }
+        try validatePortalDigests(sessionDigest, csrfDigest)
+        let current = try portalTimestampOrThrow(now)
+        return try await withConnectionGate {
+            try await ensureTask7DurableTables()
+            return try await transaction {
+                let consumed = try await connection.query(
+                    "DELETE FROM management_pre_auth WHERE token_digest = ? AND expires_at >= ? RETURNING token_digest",
+                    [preAuthDigest.sqliteData!, .integer(current)]
+                )
+                guard consumed.count == 1 else { return false }
+                do {
+                    _ = try await consumeAuthorizationGrantLocked(
+                        grantDigest: authorizationGrantDigest,
+                        accountDID: session.accountDID,
+                        context: authorizationContext,
+                        now: now
+                    )
+                } catch {
+                    // A missing, replayed, expired, revision-mismatched, or
+                    // wrong-channel/wrong-purpose grant aborts this
+                    // transaction: no portal session is issued.
+                    throw AccountControlStoreError.invalidTransition
+                }
                 try await insertManagementSession(
                     session,
                     sessionDigest: sessionDigest,

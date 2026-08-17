@@ -1025,6 +1025,80 @@ public struct SwanIdentityAdmissionDecision: Sendable, Equatable {
     public let allowsRead: Bool
     public let allowsWrite: Bool
     public let allowsTokenIssuance: Bool
+
+    public init(
+        continuity: SwanIdentityContinuityState,
+        allowsRead: Bool = true,
+        allowsWrite: Bool,
+        allowsTokenIssuance: Bool
+    ) {
+        self.continuity = continuity
+        self.allowsRead = allowsRead
+        self.allowsWrite = allowsWrite
+        self.allowsTokenIssuance = allowsTokenIssuance
+    }
+}
+
+/// Narrow durable identity-admission interface injected into repository
+/// mutation and OAuth/legacy token issuance. PLC-only accounts (no binding)
+/// and active did:web identities admit writes and new tokens; suspended or
+/// failed-grace did:web identities deny both while preserving public reads.
+/// Store/resolver failure must fail closed: implementations throw and every
+/// caller treats a thrown error as a denial.
+public protocol SwanIdentityAdmissionEvaluating: Sendable {
+    func identityAdmission(accountDID: String, now: Date) async throws -> SwanIdentityAdmissionDecision
+}
+
+/// Production evaluator backed by the durable identity-binding store. The
+/// did:web service owns the same continuity evaluation; this adapter only
+/// resolves the binding (nil = PLC-only = full admission) and applies the
+/// frozen continuity rules. It is constructible before the did:web service
+/// composition because it depends only on the control store and the grace
+/// policy value.
+public struct SwanDurableIdentityAdmission: SwanIdentityAdmissionEvaluating, Sendable {
+    private let bindings: any IdentityBindingStore
+    private let gracePeriod: TimeInterval
+
+    public init(bindings: any IdentityBindingStore, gracePeriod: TimeInterval = 86_400) {
+        precondition(gracePeriod.isFinite && gracePeriod > 0 && gracePeriod <= 86_400)
+        self.bindings = bindings
+        self.gracePeriod = gracePeriod
+    }
+
+    public func identityAdmission(accountDID: String, now: Date) async throws -> SwanIdentityAdmissionDecision {
+        guard !accountDID.isEmpty else {
+            throw SwanError.invalidIdentifier("identity admission account")
+        }
+        // Any thrown store error propagates to the caller, which must treat it
+        // as a denial (fail closed). It never becomes a permissive decision.
+        let binding = try await bindings.identityBinding(accountDID: accountDID)
+        guard let binding else {
+            // PLC-only account: no identity binding, full admission.
+            return SwanIdentityAdmissionDecision(
+                continuity: .active, allowsWrite: true, allowsTokenIssuance: true
+            )
+        }
+        guard binding.method == .didWeb else {
+            // A PLC binding is not subject to did:web continuity fencing.
+            return SwanIdentityAdmissionDecision(
+                continuity: .active, allowsWrite: true, allowsTokenIssuance: true
+            )
+        }
+        let state = SwanIdentityContinuity.evaluate(
+            state: binding.state,
+            lastValidatedAt: binding.lastValidatedAt,
+            now: now,
+            grace: binding.graceExpiresAt.map {
+                $0.timeIntervalSince(binding.lastValidatedAt ?? now)
+            } ?? gracePeriod,
+            revalidationFailed: false
+        )
+        return SwanIdentityAdmissionDecision(
+            continuity: state,
+            allowsWrite: SwanIdentityContinuity.allowsWrite(state),
+            allowsTokenIssuance: SwanIdentityContinuity.allowsTokenIssuance(state)
+        )
+    }
 }
 
 /// Bounded startup/background revalidation. Enumeration is deliberately a

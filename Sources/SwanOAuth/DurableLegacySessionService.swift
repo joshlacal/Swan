@@ -34,18 +34,27 @@ public actor DurableLegacySessionService {
     private let serviceDID: String
     private let signingKey: SymmetricKey
     private let macKey: SymmetricKey
+    /// Narrow durable identity admission for new-token issuance. `nil` keeps
+    /// focused fixtures source-compatible; production composition always
+    /// supplies it and every issuance path denies (fails closed) when the
+    /// identity is a suspended or failed-grace did:web account, or when the
+    /// store/resolver is unavailable.
+    private let identityAdmission: (any SwanIdentityAdmissionEvaluating)?
 
     /// - Parameters:
     ///   - serverKey: the owner-only mounted 32-byte secret behind
     ///     `--legacy-session-signing-key-file`. Used for BOTH the JWT signature
     ///     and the at-rest digests, under separate domain-separated derivations
     ///     so a token's signature can never be confused with its lookup key.
+    ///   - identityAdmission: optional durable admission evaluated at every
+    ///     family creation and refresh rotation.
     public init(
         store: any LegacySessionStore,
         appPasswords: any AppPasswordStore,
         credentials: AppPasswordCredentials,
         serviceDID: String,
-        serverKey: Data
+        serverKey: Data,
+        identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil
     ) throws {
         guard serverKey.count == 32 else {
             throw SwanError.malformed("legacy session signing key must be exactly 32 bytes")
@@ -54,6 +63,7 @@ public actor DurableLegacySessionService {
         self.appPasswords = appPasswords
         self.credentials = credentials
         self.serviceDID = serviceDID
+        self.identityAdmission = identityAdmission
         // Domain separation. The same 32 bytes are the root of two independent
         // uses; deriving both from it means neither is the other's key.
         self.signingKey = SymmetricKey(
@@ -70,17 +80,43 @@ public actor DurableLegacySessionService {
         )
     }
 
+    /// Fails closed for new-token issuance: a suspended or failed-grace
+    /// did:web identity denies new legacy sessions, and a store/resolver
+    /// failure is treated as a denial. PLC-only and active identities pass.
+    private func requireIdentityAdmission(did: String, now: Date) async throws {
+        guard let identityAdmission else { return }
+        do {
+            let decision = try await identityAdmission.identityAdmission(
+                accountDID: did, now: now
+            )
+            guard decision.allowsTokenIssuance else {
+                throw SwanError.unauthorized("identity does not admit legacy session issuance")
+            }
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("identity admission is unavailable")
+        }
+    }
+
     /// Opens a session for an already-authenticated credential.
     ///
     /// - Parameter appPassword: the credential the session was opened with, or
     ///   `nil` for the ACCOUNT password. Upstream's `createSession` accepts
     ///   either (`account-manager.ts:587-641`) and Swan matches it. The two
     ///   differ in authority and in the token's `scope` claim, not in mechanism.
+    /// - Parameter authorizationGrantDigest/authorizationContext: when a
+    ///   revision-bound login grant was created, the family insert consumes it
+    ///   in the same durable transaction; no legacy session is created without
+    ///   a successful consume result.
     public func issue(
         did: String,
         appPassword: AppPasswordRecord?,
-        now: Date = Date()
+        now: Date = Date(),
+        authorizationGrantDigest: Data? = nil,
+        authorizationContext: AccountAuthorizationContext? = nil
     ) async throws -> LegacySessionTokens {
+        try await requireIdentityAdmission(did: did, now: now)
         let familyID = UUID().uuidString.lowercased()
         let accessID = UUID().uuidString.lowercased()
         let refreshID = UUID().uuidString.lowercased()
@@ -100,16 +136,34 @@ public actor DurableLegacySessionService {
         )
         let refresh = try mint(.refresh, subject: did, tokenID: refreshID, scope: .refresh, now: now)
 
-        try await store.createLegacySessionFamily(
-            familyID: familyID,
-            did: did,
-            appPasswordID: appPassword?.id,
-            accessDigest: digest(access, purpose: .accessToken),
-            accessExpiresAt: accessExpiry,
-            refreshDigest: digest(refresh, purpose: .refreshToken),
-            refreshExpiresAt: refreshExpiry,
-            now: now
-        )
+        if let authorizationGrantDigest {
+            guard let authorizationContext else {
+                throw SwanError.malformed("legacy session grant context")
+            }
+            try await store.createLegacySessionFamilyConsumingGrant(
+                familyID: familyID,
+                did: did,
+                appPasswordID: appPassword?.id,
+                accessDigest: digest(access, purpose: .accessToken),
+                accessExpiresAt: accessExpiry,
+                refreshDigest: digest(refresh, purpose: .refreshToken),
+                refreshExpiresAt: refreshExpiry,
+                authorizationGrantDigest: authorizationGrantDigest,
+                authorizationContext: authorizationContext,
+                now: now
+            )
+        } else {
+            try await store.createLegacySessionFamily(
+                familyID: familyID,
+                did: did,
+                appPasswordID: appPassword?.id,
+                accessDigest: digest(access, purpose: .accessToken),
+                accessExpiresAt: accessExpiry,
+                refreshDigest: digest(refresh, purpose: .refreshToken),
+                refreshExpiresAt: refreshExpiry,
+                now: now
+            )
+        }
         return LegacySessionTokens(
             accessJWT: access,
             refreshJWT: refresh,
@@ -198,6 +252,7 @@ public actor DurableLegacySessionService {
             try await store.revokeLegacySessionFamily(familyID: family.familyID, now: now)
             throw SwanError.unauthorized("legacy session is not active")
         case let .active(family):
+            try await requireIdentityAdmission(did: family.did, now: now)
             // Re-derived HERE, from the app-password row, so an edited
             // credential narrows this session and a revoked one ends it. Never
             // re-minted from what the previous session carried.

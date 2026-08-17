@@ -477,6 +477,16 @@ public protocol ManagementSessionStore: Sendable {
     func revokeManagementSession(digest: Data, now: Date) async throws
     func revokeOtherManagementSessions(accountDID: String, except sessionID: ManagementSessionID, now: Date) async throws
     func purgeExpiredManagementSessions(now: Date) async throws
+
+    /// Lists the account's live management sessions for the portal
+    /// projection. Storage returns the digest-derived stable identifier
+    /// (never the bearer value) and the caller filters revoked/expired rows.
+    func managementSessions(accountDID: String, now: Date) async throws -> [ManagementSessionMetadata]
+
+    /// Account-bound, idempotent single-session revocation. The durable row
+    /// is updated only when it belongs to `accountDID`, so a caller cannot
+    /// revoke another account's session by guessing a digest.
+    func revokeManagementSession(digest: Data, accountDID: String, now: Date) async throws
 }
 
 /// Atomic management-session strength upgrade. A step-up token is consumed
@@ -519,6 +529,21 @@ public protocol SwanManagementPreAuthSessionCoordinator: Sendable {
         session: ManagementSessionMetadata,
         sessionDigest: Data,
         csrfDigest: Data,
+        now: Date
+    ) async throws -> Bool
+
+    /// Portal login variant: pre-auth consumption, revision-bound
+    /// authorization-grant consumption, and management-session creation share
+    /// ONE durable transaction. No protected portal session is created unless
+    /// the exact channel/session/purpose/context-bound grant is consumed at
+    /// this issuance linearization point.
+    func consumePreAuthAndCreateManagementSessionConsumingGrant(
+        preAuthDigest: Data,
+        session: ManagementSessionMetadata,
+        sessionDigest: Data,
+        csrfDigest: Data,
+        authorizationGrantDigest: Data,
+        authorizationContext: AccountAuthorizationContext,
         now: Date
     ) async throws -> Bool
 }
@@ -628,6 +653,20 @@ public extension AuthenticationFactorStore {
         try await saveFactor(factor, now: now)
         return true
     }
+}
+
+/// Atomic factor-mutation authority. Each operation performs the revision
+/// predicate (compare-and-swap), the factor mutation, and the revision
+/// increment in ONE SQLite transaction and returns the committed revision.
+/// The caller supplies the revision it authorized against; a concurrent
+/// factor mutation that advanced the revision between authorization and
+/// commit fails the predicate so a stale authorization can never commit.
+public protocol FactorMutationAuthorizingStore: Sendable {
+    func saveFactor(_ factor: AuthenticationFactorMetadata, expectedRevision: Int64, now: Date) async throws -> Int64
+    func saveFactorIfAbsent(_ factor: AuthenticationFactorMetadata, expectedRevision: Int64, now: Date) async throws -> (inserted: Bool, revision: Int64)
+    func disableFactor(id: String, accountDID: String, expectedRevision: Int64, now: Date) async throws -> Int64
+    func activatePendingTOTPEnvelope(factorID: String, accountDID: String, expectedRevision: Int64, now: Date) async throws -> (envelope: TOTPSecretEnvelope, revision: Int64)
+    func replaceRecoveryCodeDigests(accountDID: String, digests: [RecoveryCodeDigest], expectedRevision: Int64, now: Date) async throws -> Int64
 }
 
 /// TOTP storage is an encrypted envelope contract only. The control database

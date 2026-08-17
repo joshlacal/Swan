@@ -5,13 +5,17 @@ import Hummingbird
 import NIOCore
 import SwanAccounts
 import SwanCore
+import SwanStorage
 
 /// A deliberately narrow service protocol: route assembly owns authentication
 /// and this adapter owns HTTP policy; account/domain services remain injectable.
 public protocol SwanAccountPortalServing: Sendable {
     func bootstrap(now: Date) async throws -> SwanAccountPortalBootstrap
     func authenticate(handle: String, password: String, authFactorToken: String?, now: Date) async throws -> SwanAccountPortalAuthentication
-    func portal(accountDID: String, now: Date) async throws -> SwanAccountPortalSnapshot
+    /// `currentSessionID` is the digest-derived stable identifier of the
+    /// management session presenting the request; the projection marks exactly
+    /// that session as `current`. It is `nil` for login-time snapshots.
+    func portal(accountDID: String, currentSessionID: String?, now: Date) async throws -> SwanAccountPortalSnapshot
     func mutate(path: String, context: SwanAccountPortalMutationContext, payload: Data?, now: Date) async throws -> SwanAccountPortalMutation
 }
 
@@ -35,9 +39,25 @@ public struct SwanAccountPortalMutationContext: Sendable, Equatable {
 public struct SwanAccountPortalAuthentication: Sendable, Equatable {
     public let accountDID: String
     public let strength: AuthenticationStrength
-    public init(accountDID: String, strength: AuthenticationStrength = .password) {
+    /// The one-time revision-bound authorization grant created by the
+    /// canonical directory at login. The portal session issuance consumes it
+    /// in the same transaction that creates the management session; no
+    /// protected session is issued without a successful consume result.
+    public let authorizationGrantDigest: Data?
+    /// The exact channel/session/purpose binding the grant was created
+    /// against. It is required whenever a grant is present.
+    public let authorizationContext: AccountAuthorizationContext?
+
+    public init(
+        accountDID: String,
+        strength: AuthenticationStrength = .password,
+        authorizationGrantDigest: Data? = nil,
+        authorizationContext: AccountAuthorizationContext? = nil
+    ) {
         self.accountDID = accountDID
         self.strength = strength
+        self.authorizationGrantDigest = authorizationGrantDigest
+        self.authorizationContext = authorizationContext
     }
 }
 
@@ -239,7 +259,7 @@ public struct SwanAccountPortalHTTP: Sendable {
         router.get("/account/api/portal") { [sessions, service] request, _ async -> Response in
             guard let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),
                   let metadata = try? await sessions.authenticate(sessionValue: session) else { return accountError(.unauthorized) }
-            do { return accountJSON(.ok, try await service.portal(accountDID: metadata.accountDID, now: Date())) }
+            do { return accountJSON(.ok, try await service.portal(accountDID: metadata.accountDID, currentSessionID: metadata.sessionID.rawValue, now: Date())) }
             catch { return portalErrorResponse(error) }
         }
 
@@ -250,7 +270,7 @@ public struct SwanAccountPortalHTTP: Sendable {
             router.get("/account/api/\(path)") { [sessions, service] request, _ async -> Response in
                 guard let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),
                       let metadata = try? await sessions.authenticate(sessionValue: session) else { return accountError(.unauthorized) }
-                do { return accountJSON(.ok, try await service.portal(accountDID: metadata.accountDID, now: Date())) }
+                do { return accountJSON(.ok, try await service.portal(accountDID: metadata.accountDID, currentSessionID: metadata.sessionID.rawValue, now: Date())) }
                 catch { return portalErrorResponse(error) }
             }
         }
@@ -289,8 +309,14 @@ public struct SwanAccountPortalHTTP: Sendable {
                         now: Date()
                     )
                 }
-                let snapshot = try await service.portal(accountDID: authentication.accountDID, now: Date())
-                let issued = try await sessions.issueAfterPreAuth(csrf, accountDID: authentication.accountDID, strength: authentication.strength)
+                let snapshot = try await service.portal(accountDID: authentication.accountDID, currentSessionID: nil, now: Date())
+                let issued = try await sessions.issueAfterPreAuth(
+                    csrf,
+                    accountDID: authentication.accountDID,
+                    strength: authentication.strength,
+                    authorizationGrantDigest: authentication.authorizationGrantDigest,
+                    authorizationContext: authentication.authorizationContext
+                )
                 return accountJSON(.ok, AuthenticatedPortalResponse(snapshot: snapshot, csrf: issued.csrfValue), cookies: [managementCookie(issued.sessionValue), csrfCookie(issued.csrfValue), expiredPreAuthCookie()])
             } catch is PortalRequestError { await sessions.releasePreAuth(csrf); return accountError(.badRequest) }
             catch { await sessions.releasePreAuth(csrf); return accountError(.unauthorized) }
@@ -379,7 +405,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                     let admitted = try await collectAdmittedRequestBody(request, mediaType: .json, admission: .managementProcessShared, policy: .productionDefault, maximumBytes: 16 * 1024, termination: context.jsonWriteBodyTermination)
                     defer { admitted.release() }
                     let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
-                    let mutation = try await service.mutate(path: path, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress), payload: payload, now: Date())
+                    let mutation = try await service.mutate(path: path, context: .init(sessionID: session, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress), payload: payload, now: Date())
                     if path == "logout" { try await sessions.revoke(sessionValue: session) }
                     return accountJSON(.ok, mutation, cookies: path == "logout" ? [expiredManagementCookie(), expiredCSRFToken()] : [])
                 } catch { return portalErrorResponse(error) }
@@ -413,7 +439,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                 let mutationPath = String(request.uri.path.dropFirst("/account/api/".count))
                 let mutation = try await service.mutate(
                     path: mutationPath,
-                    context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress),
+                    context: .init(sessionID: session, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress),
                     payload: payload,
                     now: Date()
                 )
@@ -430,7 +456,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                       (try? await sessions.acceptsCSRF(sessionValue: session, csrfValue: csrf)) == true else { return accountError(.forbidden) }
                 do {
                     let metadata = try await sessions.authenticate(sessionValue: session)
-                    return accountJSON(.ok, try await service.mutate(path: path, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress), payload: nil, now: Date()))
+                    return accountJSON(.ok, try await service.mutate(path: path, context: .init(sessionID: session, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress), payload: nil, now: Date()))
                 } catch { return portalErrorResponse(error) }
             }
         }
@@ -449,7 +475,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                     defer { admitted.release() }
                     let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
                     let mutationPath = String(request.uri.path.dropFirst("/account/api/".count))
-                    return accountJSON(.ok, try await service.mutate(path: mutationPath, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress), payload: payload, now: Date()))
+                    return accountJSON(.ok, try await service.mutate(path: mutationPath, context: .init(sessionID: session, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress), payload: payload, now: Date()))
                 } catch { return portalErrorResponse(error) }
             }
         }

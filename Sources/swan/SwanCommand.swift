@@ -982,7 +982,8 @@ struct ServePermissionedRuntime {
         legacyAuthXRPC: SwanLegacyAuthXRPCAdapter? = nil,
         xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
-        publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil
+        publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil,
+        identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil
     ) -> SwanHTTPServer {
         SwanHTTPServer(
             profile: profile,
@@ -3602,10 +3603,20 @@ extension SwanCommand {
                 } else {
                     lexiconResolver = nil
                 }
+                // Task 4 identity admission. One durable evaluator over the
+                // control store backs OAuth issuance, legacy issuance, and
+                // public repository mutations; it is constructible before the
+                // did:web service composition because it depends only on the
+                // store and the grace-policy value.
+                let identityAdmission = SwanDurableIdentityAdmission(
+                    bindings: controlDatabase,
+                    gracePeriod: TimeInterval(didWebRevalidationGraceSeconds)
+                )
                 let oauthRuntime = try SwanOAuthRuntime(
                     controlStore: controlDatabase,
                     serverKey: serverKey,
-                    lexiconResolver: lexiconResolver
+                    lexiconResolver: lexiconResolver,
+                    identityAdmission: identityAdmission
                 )
                 // Make an unsafe public identity a startup error rather than
                 // silently leaving the authenticated endpoint closed. The
@@ -4100,7 +4111,8 @@ extension SwanCommand {
                                 // `describeServer` publish, so a token's `aud`
                                 // names the host that minted it.
                                 serviceDID: SwanServiceIdentity(publicURL: baseURL).did,
-                                serverKey: validatedLegacySessionStartup.signingKey
+                                serverKey: validatedLegacySessionStartup.signingKey,
+                                identityAdmission: identityAdmission
                             ),
                             credentials: credentials,
                             appPasswords: controlDatabase,
@@ -4700,7 +4712,9 @@ extension SwanCommand {
                             identity: SwanAccountPortalIdentityProjectionProduction(
                                 didWeb: didWeb
                             ),
-                            oauth: nil,
+                            oauth: SwanAccountPortalOAuthProjectionProduction(
+                                store: controlDatabase
+                            ),
                             mfa: accountMFA,
                             factorTokens: accountProgramFactorTokens,
                             stepUpReceiptVerifier: SwanAccountPortalDurableStepUpReceiptVerifier(
@@ -4709,7 +4723,8 @@ extension SwanCommand {
                             stepUpReceiptConsumer: SwanAccountPortalDurableStepUpReceiptConsumer(
                                 store: controlDatabase
                             ),
-                            sessions: managementSessions
+                            sessions: managementSessions,
+                            legacySessions: controlDatabase
                         )
                         accountPortalHTTP = SwanAccountPortalHTTP(
                             configuration: try SwanAccountPortalConfiguration(
@@ -4763,7 +4778,8 @@ extension SwanCommand {
                     didWebIdentityHTTP: didWebIdentityHTTP,
                     xrpcPipethrough: xrpcPipethrough,
                     loginClientIdentityPolicy: loginClientIdentityPolicy,
-                    publicFirehoseStreaming: publicFirehoseStreamingRuntime
+                    publicFirehoseStreaming: publicFirehoseStreamingRuntime,
+                    identityAdmission: identityAdmission
                 )
                 guard server.authenticatedGetSpace != nil else {
                     throw ValidationError(

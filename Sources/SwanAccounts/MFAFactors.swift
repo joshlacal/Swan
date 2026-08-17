@@ -147,11 +147,25 @@ public struct RecoveryCodeService: Sendable {
     private let factorStore: any AuthenticationFactorStore
     public init(store: any RecoveryCodeStore, factorStore: any AuthenticationFactorStore) { self.store = store; self.factorStore = factorStore }
 
-    public func replace(accountDID: String, count: Int = defaultCount, now: Date) async throws -> [String] {
+    public func replace(accountDID: String, count: Int = defaultCount, expectedRevision: Int64? = nil, now: Date) async throws -> [String] {
         guard (1 ... 32).contains(count) else { throw MFAError.invalidCode }
         let codes = (0 ..< count).map { _ in Self.recoveryCode() }
         let digests = try codes.map { try RecoveryCodeDigest(accountDID: accountDID, digest: Self.digest($0), issuedAt: now) }
-        try await store.replaceRecoveryCodeDigests(accountDID: accountDID, digests: digests, now: now)
+        if let expectedRevision {
+            // Revision-bound rotation: the predicate, digest replacement, and
+            // revision increment are one durable transaction.
+            guard let authorizingStore = store as? any FactorMutationAuthorizingStore else {
+                throw MFAError.storageUnavailable
+            }
+            _ = try await authorizingStore.replaceRecoveryCodeDigests(
+                accountDID: accountDID,
+                digests: digests,
+                expectedRevision: expectedRevision,
+                now: now
+            )
+        } else {
+            try await store.replaceRecoveryCodeDigests(accountDID: accountDID, digests: digests, now: now)
+        }
         return codes
     }
 

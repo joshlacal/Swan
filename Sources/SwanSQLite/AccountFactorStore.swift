@@ -665,6 +665,125 @@ extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPEnrollmentStore,
     }
 }
 
+extension SQLiteControlDatabase: FactorMutationAuthorizingStore {
+    /// Revision compare-and-swap guard shared by every atomic factor
+    /// mutation. The predicate, mutation, and revision increment are one
+    /// transaction, so a stale authorization (authorized against an older
+    /// revision) can never commit.
+    private func requireFactorRevision(_ expectedRevision: Int64, accountDID: String) async throws {
+        let current = try await currentFactorRevision(accountDID: accountDID)
+        guard current == expectedRevision else {
+            throw AccountControlStoreError.invalidTransition
+        }
+    }
+
+    public func saveFactor(_ factor: AuthenticationFactorMetadata, expectedRevision: Int64, now: Date) async throws -> Int64 {
+        guard factor.createdAt <= now, factor.lastUsedAt.map({ $0 <= now }) ?? true, factor.disabledAt.map({ $0 <= now }) ?? true else { throw AccountControlStoreError.invalidInput }
+        return try await withConnectionGate {
+            try await ensureTask7DurableTables()
+            return try await transaction {
+                try await requireFactorRevision(expectedRevision, accountDID: factor.accountDID)
+                _ = try await connection.query("INSERT INTO authentication_factors(factor_id, account_did, kind, label, lookup_digest, created_at, last_used_at, disabled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [.text(factor.id), .text(factor.accountDID), .text(factor.kind.rawValue), .text(factor.label), factor.lookupDigest.sqliteData!, .integer(try factorTimestamp(factor.createdAt)), try optionalTimestamp(factor.lastUsedAt), try optionalTimestamp(factor.disabledAt)])
+                try await bumpFactorRevision(accountDID: factor.accountDID)
+                return try await currentFactorRevision(accountDID: factor.accountDID)
+            }
+        }
+    }
+
+    public func saveFactorIfAbsent(_ factor: AuthenticationFactorMetadata, expectedRevision: Int64, now: Date) async throws -> (inserted: Bool, revision: Int64) {
+        guard factor.createdAt <= now, factor.lastUsedAt.map({ $0 <= now }) ?? true,
+              factor.disabledAt.map({ $0 <= now }) ?? true else {
+            throw AccountControlStoreError.invalidInput
+        }
+        return try await withConnectionGate {
+            try await ensureTask7DurableTables()
+            return try await transaction {
+                try await requireFactorRevision(expectedRevision, accountDID: factor.accountDID)
+                let inserted = try await connection.query(
+                    "INSERT INTO authentication_factors(factor_id, account_did, kind, label, lookup_digest, created_at, last_used_at, disabled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(factor_id) DO NOTHING RETURNING factor_id",
+                    [
+                        .text(factor.id), .text(factor.accountDID), .text(factor.kind.rawValue),
+                        .text(factor.label), factor.lookupDigest.sqliteData!,
+                        .integer(try factorTimestamp(factor.createdAt)),
+                        try optionalTimestamp(factor.lastUsedAt),
+                        try optionalTimestamp(factor.disabledAt),
+                    ]
+                )
+                if !inserted.isEmpty { try await bumpFactorRevision(accountDID: factor.accountDID) }
+                return (!inserted.isEmpty, try await currentFactorRevision(accountDID: factor.accountDID))
+            }
+        }
+    }
+
+    public func disableFactor(id: String, accountDID: String, expectedRevision: Int64, now: Date) async throws -> Int64 {
+        return try await withConnectionGate {
+            try await ensureTask7DurableTables()
+            return try await transaction {
+                try await requireFactorRevision(expectedRevision, accountDID: accountDID)
+                let changed = try await connection.query("UPDATE authentication_factors SET disabled_at = ? WHERE factor_id = ? AND account_did = ? AND disabled_at IS NULL RETURNING factor_id", [.integer(try factorTimestamp(now)), .text(id), .text(accountDID)])
+                if !changed.isEmpty { try await bumpFactorRevision(accountDID: accountDID) }
+                return try await currentFactorRevision(accountDID: accountDID)
+            }
+        }
+    }
+
+    public func activatePendingTOTPEnvelope(factorID: String, accountDID: String, expectedRevision: Int64, now: Date) async throws -> (envelope: TOTPSecretEnvelope, revision: Int64) {
+        return try await withConnectionGate {
+            return try await transaction {
+                try await ensureTask7DurableTables()
+                try await requireFactorRevision(expectedRevision, accountDID: accountDID)
+                let timestamp = try factorTimestamp(now)
+                let rows = try await connection.query(
+                    "SELECT factor_id, key_reference, nonce, ciphertext, authentication_tag FROM totp_pending_secret_envelopes WHERE factor_id = ? AND account_did = ? AND issued_at <= ? AND expires_at > ?",
+                    [.text(factorID), .text(accountDID), .integer(timestamp), .integer(timestamp)]
+                )
+                guard let row = rows.first else { throw AccountControlStoreError.notFound }
+                let envelope = try TOTPSecretEnvelope(
+                    factorID: try requiredText(row, "factor_id"),
+                    keyReference: try requiredText(row, "key_reference"),
+                    nonce: try requiredBlob(row, "nonce"),
+                    ciphertext: try requiredBlob(row, "ciphertext"),
+                    authenticationTag: try requiredBlob(row, "authentication_tag")
+                )
+                let enabled = try await connection.query(
+                    "UPDATE authentication_factors SET disabled_at = NULL WHERE factor_id = ? AND account_did = ? AND kind = 'totp' AND disabled_at IS NOT NULL RETURNING factor_id",
+                    [.text(factorID), .text(accountDID)]
+                )
+                guard !enabled.isEmpty else { throw AccountControlStoreError.notFound }
+                try await bumpFactorRevision(accountDID: accountDID)
+                _ = try await connection.query(
+                    "INSERT INTO totp_secret_envelopes(factor_id, account_did, key_reference, nonce, ciphertext, authentication_tag) VALUES (?, ?, ?, ?, ?, ?)",
+                    [.text(factorID), .text(accountDID), .text(envelope.keyReference), envelope.nonce.sqliteData!, envelope.ciphertext.sqliteData!, envelope.authenticationTag.sqliteData!]
+                )
+                _ = try await connection.query(
+                    "DELETE FROM totp_pending_secret_envelopes WHERE factor_id = ? AND account_did = ?",
+                    [.text(factorID), .text(accountDID)]
+                )
+                return (envelope, try await currentFactorRevision(accountDID: accountDID))
+            }
+        }
+    }
+
+    public func replaceRecoveryCodeDigests(accountDID: String, digests: [RecoveryCodeDigest], expectedRevision: Int64, now: Date) async throws -> Int64 {
+        guard digests.count <= 32 else { throw AccountControlStoreError.invalidInput }
+        guard digests.allSatisfy({ $0.issuedAt <= now }) else { throw AccountControlStoreError.invalidInput }
+        return try await withConnectionGate {
+            try await ensureTask7DurableTables()
+            return try await transaction {
+                try await requireFactorRevision(expectedRevision, accountDID: accountDID)
+                let parent = try await connection.query("SELECT factor_id FROM authentication_factors WHERE account_did = ? AND kind = 'recoveryCode' AND disabled_at IS NULL", [.text(accountDID)])
+                guard !parent.isEmpty else { throw AccountControlStoreError.notFound }
+                _ = try await connection.query("DELETE FROM recovery_code_digests WHERE account_did = ?", [.text(accountDID)])
+                for digest in digests {
+                    _ = try await connection.query("INSERT INTO recovery_code_digests(account_did, digest, issued_at, consumed_at) VALUES (?, ?, ?, ?)", [.text(accountDID), digest.digest.sqliteData!, .integer(try factorTimestamp(digest.issuedAt)), try optionalTimestamp(digest.consumedAt)])
+                }
+                try await bumpFactorRevision(accountDID: accountDID)
+                return try await currentFactorRevision(accountDID: accountDID)
+            }
+        }
+    }
+}
+
 extension SQLiteControlDatabase {
     func ensureTask7DurableTables() async throws {
         // This is intentionally adapter-local: Task 6 owns migration ordering.

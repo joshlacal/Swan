@@ -214,7 +214,8 @@ private struct Handlers: Sendable {
             let tokens = try await authenticate(
                 identifier: input.identifier,
                 password: input.password,
-                authFactorToken: input.authFactorToken
+                authFactorToken: input.authFactorToken,
+                sessionBinding: UUID().uuidString.lowercased()
             )
             let handle = try await directory.canonicalHandle(did: tokens.did)
             return try json(
@@ -254,7 +255,8 @@ private struct Handlers: Sendable {
     private func authenticate(
         identifier: String,
         password: String,
-        authFactorToken: String? = nil
+        authFactorToken: String? = nil,
+        sessionBinding: String
     ) async throws -> SwanOAuth.LegacySessionTokens {
         let resolved: String?
         let handle: String?
@@ -271,13 +273,22 @@ private struct Handlers: Sendable {
 
         // 1. The account password. `authenticateForLogin` is already
         //    enumeration-resistant, so it is handed the presented identifier
-        //    when nothing resolved rather than being skipped.
+        //    when nothing resolved rather than being skipped. The legacy
+        //    channel context binds the one-time authorization grant to this
+        //    issuance; the family insert consumes it in the same transaction
+        //    (Task 3 Finding 2 carry-forward).
+        let context = try AccountAuthorizationContext(
+            channel: .legacy,
+            sessionID: sessionBinding,
+            purpose: "managementLogin"
+        )
         let outcome: AccountLoginAuthenticationOutcome
         do {
             outcome = try await accounts.authenticateForLogin(
                 handle: handle ?? identifier,
                 password: password,
-                authFactorToken: authFactorToken
+                authFactorToken: authFactorToken,
+                authorizationContext: context
             )
         } catch {
             // `AccountLoginAuthenticationError.unavailable` is infrastructure,
@@ -295,9 +306,16 @@ private struct Handlers: Sendable {
             throw SwanLegacySessionXRPCFailure.unavailable
         }
 
-        if case .authenticated = outcome, let resolved {
-            // Full legacy authority, upstream's `AuthScope.Access`.
-            return try await open(did: resolved, appPassword: nil)
+        if case let .authenticated(success) = outcome, let resolved {
+            // Full legacy authority, upstream's `AuthScope.Access`. The
+            // revision-bound grant created by the directory is consumed at
+            // family insertion.
+            return try await open(
+                did: resolved,
+                appPassword: nil,
+                authorizationGrantDigest: success.authorizationGrantDigest,
+                authorizationContext: success.authorizationGrantDigest == nil ? nil : context
+            )
         }
         guard let resolved else {
             throw SwanLegacySessionXRPCFailure.authenticationRequired
@@ -311,15 +329,25 @@ private struct Handlers: Sendable {
         guard let record else {
             throw SwanLegacySessionXRPCFailure.authenticationRequired
         }
+        // An app-password session's authority is the live credential row: it
+        // is re-read on every use, so no revision-bound grant exists for this
+        // path. Issuance still fails when the credential is revoked or absent.
         return try await open(did: resolved, appPassword: record)
     }
 
     private func open(
         did: String,
-        appPassword: AppPasswordRecord?
+        appPassword: AppPasswordRecord?,
+        authorizationGrantDigest: Data? = nil,
+        authorizationContext: AccountAuthorizationContext? = nil
     ) async throws -> SwanOAuth.LegacySessionTokens {
         do {
-            return try await sessions.issue(did: did, appPassword: appPassword)
+            return try await sessions.issue(
+                did: did,
+                appPassword: appPassword,
+                authorizationGrantDigest: authorizationGrantDigest,
+                authorizationContext: authorizationContext
+            )
         } catch {
             throw SwanLegacySessionXRPCFailure.unavailable
         }

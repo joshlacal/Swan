@@ -325,6 +325,15 @@ private actor StaleStepUpSessionStore: ManagementSessionStore {
         values.removeValue(forKey: digest)
     }
 
+    func revokeManagementSession(digest: Data, accountDID: String, now _: Date) async throws {
+        guard let session = values[digest], session.accountDID == accountDID else { return }
+        values.removeValue(forKey: digest)
+    }
+
+    func managementSessions(accountDID: String, now _: Date) async throws -> [ManagementSessionMetadata] {
+        values.values.filter { $0.accountDID == accountDID }
+    }
+
     func revokeOtherManagementSessions(
         accountDID: String,
         except sessionID: ManagementSessionID,

@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import SwanAccounts
 import SwanCore
 import SwanStorage
 
@@ -54,12 +55,14 @@ public struct SwanOAuthRuntime: Sendable {
     public init(
         controlStore: any OAuthControlStore & SpaceDelegationReplayStore,
         serverKey: Data,
-        lexiconResolver: (any SwanLexiconResolving)? = nil
+        lexiconResolver: (any SwanLexiconResolving)? = nil,
+        identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil
     ) throws {
         tokenService = try DurableOAuthTokenService(
             controlStore: controlStore,
             serverKey: serverKey,
-            lexiconResolver: lexiconResolver
+            lexiconResolver: lexiconResolver,
+            identityAdmission: identityAdmission
         )
         self.lexiconResolver = lexiconResolver
         dpopReplayStore = try DurableDPoPReplayStore(
@@ -94,6 +97,12 @@ public actor DurableOAuthTokenService {
     /// §5.7.5 call site 2. `nil` leaves this service in Phase-1 behaviour — see
     /// ``SwanOAuthRuntime/lexiconResolver``.
     private let lexiconResolver: (any SwanLexiconResolving)?
+    /// Narrow durable identity admission for new-token issuance. `nil` keeps
+    /// the token-mechanics surface source-compatible; production composition
+    /// always supplies it and every issuance path denies (fails closed) when
+    /// the identity is a suspended or failed-grace did:web account, or when
+    /// the store/resolver is unavailable.
+    private let identityAdmission: (any SwanIdentityAdmissionEvaluating)?
 
     /// A resource-facing grant deliberately includes the DPoP binding instead
     /// of looking like a plain bearer-token result. Resource middleware must
@@ -153,14 +162,36 @@ public actor DurableOAuthTokenService {
     public init(
         controlStore: any OAuthControlStore,
         serverKey: Data,
-        lexiconResolver: (any SwanLexiconResolving)? = nil
+        lexiconResolver: (any SwanLexiconResolving)? = nil,
+        identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil
     ) throws {
         guard serverKey.count == 32 else {
             throw SwanError.malformed("OAuth server key must be exactly 32 bytes")
         }
         self.controlStore = controlStore
         self.lexiconResolver = lexiconResolver
+        self.identityAdmission = identityAdmission
         macKey = SymmetricKey(data: serverKey)
+    }
+
+    /// Fails closed for new-token issuance: a suspended or failed-grace
+    /// did:web identity denies new tokens, and a store/resolver failure is
+    /// treated as a denial rather than a permissive fallback. PLC-only and
+    /// active identities pass through unchanged.
+    private func requireIdentityAdmission(subject: String, now: Date) async throws {
+        guard let identityAdmission else { return }
+        do {
+            let decision = try await identityAdmission.identityAdmission(
+                accountDID: subject, now: now
+            )
+            guard decision.allowsTokenIssuance else {
+                throw SwanError.unauthorized("identity does not admit token issuance")
+            }
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("identity admission is unavailable")
+        }
     }
 
     /// Creates an opaque access/refresh pair in a new durable family.
@@ -172,6 +203,7 @@ public actor DurableOAuthTokenService {
         familyID: UUID = UUID(),
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
+        try await requireIdentityAdmission(subject: subject, now: now)
         // §5.7.5 call site 2, as at `_issueAuthorizationCode`: this is a mint, so
         // the family row must hold the RESOLVED grant or it would grant nothing.
         // (a) `include:` → concrete, (b) `expandSpaceCollections`, (c) stage F's
@@ -416,6 +448,7 @@ public actor DurableOAuthTokenService {
         authorizationGrantDigest: Data? = nil,
         authorizationContext: AccountAuthorizationContext? = nil
     ) async throws -> String {
+        try await requireIdentityAdmission(subject: subject, now: now)
         guard codeLifetime > 0, refreshLifetime > 0,
               codeLifetime.isFinite, refreshLifetime.isFinite else {
             throw SwanError.malformed("authorization code lifetimes must be positive")
@@ -534,6 +567,7 @@ public actor DurableOAuthTokenService {
               PKCE.verifyS256(verifier: verifier, challenge: record.codeChallengeS256) else {
             throw SwanError.unauthorized("authorization code rejected")
         }
+        try await requireIdentityAdmission(subject: record.subject, now: now)
         let refreshLifetime = record.familyExpiresAt.timeIntervalSince(now)
         let pair = try makeTokenPair(
             familyID: record.familyID,
@@ -619,6 +653,7 @@ public actor DurableOAuthTokenService {
         let refreshLifetime = record.familyExpiresAt.timeIntervalSince(now)
         let issueRefresh = record.binding.refreshTokenAllowed
             && client.metadata.grantTypes.contains("refresh_token")
+        try await requireIdentityAdmission(subject: record.subject, now: now)
         let grant: OAuthTokenGrantMaterial
         do {
             grant = try makeTokenGrant(
@@ -783,6 +818,7 @@ public actor DurableOAuthTokenService {
         } catch {
             throw secureControlError(error)
         }
+        try await requireIdentityAdmission(subject: family.subject, now: now)
         // BEFORE the rotation, deliberately: re-derivation performs network I/O
         // and can fail, and a failure must leave the presented refresh token
         // still usable rather than burning it on a rotation that then refuses.
@@ -996,6 +1032,7 @@ public actor DurableOAuthTokenService {
         } catch {
             throw secureControlError(error)
         }
+        try await requireIdentityAdmission(subject: family.subject, now: now)
         // The localhost bridge rotates through the same durable transaction and
         // therefore re-derives on the same terms. Exempting it would leave one
         // refresh path minting a frozen grant, which is the defect, not a

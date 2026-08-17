@@ -86,6 +86,16 @@ private struct PublicMutationHandlers {
                   let blobStore = target.store as? any StreamingBlobStore else {
                 throw PublicMutationFailure.notFound
             }
+            // The identity-admission fence runs before any body byte is
+            // streamed: a suspended or failed-grace did:web identity cannot
+            // consume the spool budget, and a store failure fails closed.
+            do {
+                try await capability.requireWriteAdmission(accountDID: subject, now: Date())
+            } catch let failure as PublicMutationFailure {
+                throw failure
+            } catch {
+                throw PublicMutationFailure.unavailable
+            }
             let contentTypes = request.headers[values: .contentType]
             guard contentTypes.count <= 1 else {
                 throw PublicMutationFailure.invalidRequest
@@ -191,6 +201,15 @@ private struct PublicMutationHandlers {
             adopted.did == subject,
             adopted.status == .active else {
             throw PublicMutationFailure.notFound
+        }
+        do {
+            // Re-fence identity admission at adoption: a suspension or grace
+            // expiry that landed mid-stream must not be answered with success.
+            try await capability.requireWriteAdmission(accountDID: subject, now: Date())
+        } catch let failure as PublicMutationFailure {
+            throw failure
+        } catch {
+            throw PublicMutationFailure.unavailable
         }
         guard case .staged = reference.namespace else {
             throw PublicMutationFailure.unavailable
@@ -385,6 +404,10 @@ private struct PublicMutationHandlers {
     /// selector. This half deliberately stays here: it is the only part of
     /// authorization that needs the decoded command, so it is also the only
     /// part that has to run after the body has been admitted and parsed.
+    ///
+    /// The durable identity-admission check also runs here: a suspended or
+    /// failed-grace did:web identity denies every write, and a store/resolver
+    /// failure fails closed (denies) rather than committing.
     private func mutationTarget(
         selector: String,
         subject: String
@@ -393,6 +416,13 @@ private struct PublicMutationHandlers {
             throw PublicMutationFailure.notFound
         }
         guard target.status == .active, target.did == subject else { throw PublicMutationFailure.notFound }
+        do {
+            try await capability.requireWriteAdmission(accountDID: subject, now: Date())
+        } catch let failure as PublicMutationFailure {
+            throw failure
+        } catch {
+            throw PublicMutationFailure.unavailable
+        }
         return target
     }
 

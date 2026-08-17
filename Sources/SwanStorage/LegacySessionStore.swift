@@ -85,6 +85,34 @@ public protocol LegacySessionStore: Sendable {
     /// Revokes a whole family and drops its tokens.
     func revokeLegacySessionFamily(familyID: String, now: Date) async throws
 
+    /// Account-bound, idempotent family revocation. The family row is updated
+    /// only when it belongs to `did`, so the portal cannot revoke another
+    /// account's legacy session by guessing a family identifier.
+    func revokeLegacySessionFamily(familyID: String, did: String, now: Date) async throws
+
+    /// Lists the account's legacy session families for the portal projection.
+    /// The family `expiresAt` is the latest live token expiry so the UI can
+    /// show whether a session is still usable.
+    func legacySessionFamilies(did: String, now: Date) async throws -> [LegacySessionFamilyMetadata]
+
+    /// Portal/legacy issuance variant: the revision-bound authorization grant
+    /// is consumed in the SAME transaction that inserts the family and its
+    /// first token pair. No protected legacy session is created unless the
+    /// exact account/channel/session/purpose-bound grant consumes at this
+    /// linearization point.
+    func createLegacySessionFamilyConsumingGrant(
+        familyID: String,
+        did: String,
+        appPasswordID: String?,
+        accessDigest: Data,
+        accessExpiresAt: Date,
+        refreshDigest: Data,
+        refreshExpiresAt: Date,
+        authorizationGrantDigest: Data,
+        authorizationContext: AccountAuthorizationContext,
+        now: Date
+    ) async throws
+
     /// Drops every token row that expired before `now`.
     func pruneLegacySessions(now: Date) async throws
 }

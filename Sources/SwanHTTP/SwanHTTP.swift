@@ -521,7 +521,8 @@ public struct SwanHTTPServer: Sendable {
         publicBlobRequestBodyAdmission: PublicRepositoryJSONWriteAdmission? = nil,
         jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
         publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil,
-        publicFirehoseSubscriberAdmission: PublicFirehoseSubscriberAdmission? = nil
+        publicFirehoseSubscriberAdmission: PublicFirehoseSubscriberAdmission? = nil,
+        identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -645,7 +646,8 @@ public struct SwanHTTPServer: Sendable {
                     signerProvider: signerProvider,
                     publicBlobSpoolAdmission: publicBlobSpoolAdmission,
                     jsonWriteAdmission: resolvedJSONWriteAdmission,
-                    jsonWriteBodyPolicy: resolvedJSONWriteBodyPolicy
+                    jsonWriteBodyPolicy: resolvedJSONWriteBodyPolicy,
+                    identityAdmission: identityAdmission
                 )
             } else {
                 publicRepositoryMutations = nil

@@ -810,6 +810,13 @@ private actor PortalMemorySessionStore: ManagementSessionStore {
     func createManagementSession(_ session: ManagementSessionMetadata, sessionDigest: Data, csrfDigest _: Data, now _: Date) async throws { values[sessionDigest] = session }
     func managementSession(digest: Data, now _: Date) async throws -> ManagementSessionMetadata? { values[digest] }
     func revokeManagementSession(digest: Data, now _: Date) async throws { values.removeValue(forKey: digest) }
+    func revokeManagementSession(digest: Data, accountDID: String, now _: Date) async throws {
+        guard let session = values[digest], session.accountDID == accountDID else { return }
+        values.removeValue(forKey: digest)
+    }
+    func managementSessions(accountDID: String, now _: Date) async throws -> [ManagementSessionMetadata] {
+        values.values.filter { $0.accountDID == accountDID }
+    }
     func revokeOtherManagementSessions(accountDID: String, except sessionID: ManagementSessionID, now _: Date) async throws { values = values.filter { $0.value.accountDID != accountDID || $0.value.sessionID == sessionID } }
     func purgeExpiredManagementSessions(now _: Date) async throws {}
 }
@@ -817,7 +824,7 @@ private actor PortalMemorySessionStore: ManagementSessionStore {
 private struct PortalMemoryService: SwanAccountPortalServing {
     func bootstrap(now _: Date) async throws -> SwanAccountPortalBootstrap { SwanAccountPortalBootstrap(csrf: "csrf") }
     func authenticate(handle _: String, password _: String, authFactorToken _: String?, now _: Date) async throws -> SwanAccountPortalAuthentication { throw SwanManagementSessionError.unauthorized }
-    func portal(accountDID: String, now _: Date) async throws -> SwanAccountPortalSnapshot {
+    func portal(accountDID: String, currentSessionID _: String?, now _: Date) async throws -> SwanAccountPortalSnapshot {
         .init(account: .init(did: accountDID, handle: "alice.example", email: nil, lifecycle: "active"), identity: nil, strength: "password", factors: [], sessions: [], apps: [], passwords: [])
     }
     func mutate(path _: String, context _: SwanAccountPortalMutationContext, payload _: Data?, now _: Date) async throws -> SwanAccountPortalMutation { .init() }

@@ -87,31 +87,37 @@ public struct SwanAccountPortalMFARuntime: SwanAccountPortalOAuthMFAService, Sen
         accountDID: String,
         sessionID: String,
         strength: AuthenticationStrength,
+        expectedRevision: Int64?,
         payload: Data?,
         now: Date
     ) async throws -> SwanAccountPortalMutation {
+        // A factor-state mutation is committed under a revision compare-and-
+        // swap: the portal service authorized against the revision it passes
+        // here, and the store refuses to commit when a concurrent mutation
+        // advanced the revision in between (Task 3 Finding 1 carry-forward).
+        let revision = try authorizedRevision(expectedRevision)
         switch path {
         case "factors/totp":
             if payload == nil,
                let factor = try await factors.listFactors(accountDID: accountDID, now: now).first(where: { $0.kind == .totp && $0.disabledAt == nil }) {
-                return try await disableFactor(id: factor.id, accountDID: accountDID, expected: .totp, now: now)
+                return try await disableFactor(id: factor.id, accountDID: accountDID, expected: .totp, expectedRevision: revision, now: now)
             }
-            return try await enrollTOTP(accountDID: accountDID, payload: payload, now: now)
+            return try await enrollTOTP(accountDID: accountDID, payload: payload, expectedRevision: revision, now: now)
         case "factors/totp/verify":
-            return try await verifyTOTPEnrollment(accountDID: accountDID, payload: payload, now: now)
+            return try await verifyTOTPEnrollment(accountDID: accountDID, payload: payload, expectedRevision: revision, now: now)
         case "factors/passkeys/challenge", "factors/passkeys/options":
             return try await beginPasskeyEnrollment(accountDID: accountDID, sessionID: sessionID, payload: payload, now: now)
         case "factors/passkeys":
             if payload == nil,
                let factor = try await factors.listFactors(accountDID: accountDID, now: now).first(where: { $0.kind == .passkey && $0.disabledAt == nil }) {
-                return try await disableFactor(id: factor.id, accountDID: accountDID, expected: .passkey, now: now)
+                return try await disableFactor(id: factor.id, accountDID: accountDID, expected: .passkey, expectedRevision: revision, now: now)
             }
-            return try await enrollPasskey(accountDID: accountDID, sessionID: sessionID, payload: payload, now: now)
+            return try await enrollPasskey(accountDID: accountDID, sessionID: sessionID, payload: payload, expectedRevision: revision, now: now)
         case "factors/passkeys/step-up-challenge", "factors/passkeys/assertion", "factors/step-up/passkey-challenge":
             return try await beginPasskeyAssertion(accountDID: accountDID, sessionID: sessionID, payload: payload, now: now)
         case "factors/recovery-codes/rotate":
             guard strength.isStepUp else { throw MFAError.stepUpRequired }
-            return try await rotateRecoveryCodes(accountDID: accountDID, now: now)
+            return try await rotateRecoveryCodes(accountDID: accountDID, expectedRevision: revision, now: now)
         case "factors/step-up":
             return try await stepUp(accountDID: accountDID, sessionID: sessionID, payload: payload, purpose: .stepUp, now: now)
         case "factors/login":
@@ -122,8 +128,8 @@ public struct SwanAccountPortalMFARuntime: SwanAccountPortalOAuthMFAService, Sen
             // same typed enrollment implementations.
             let kind = try decodeKind(payload)
             switch kind {
-            case .totp: return try await enrollTOTP(accountDID: accountDID, payload: payload, now: now)
-            case .passkey: return try await enrollPasskey(accountDID: accountDID, sessionID: sessionID, payload: payload, now: now)
+            case .totp: return try await enrollTOTP(accountDID: accountDID, payload: payload, expectedRevision: revision, now: now)
+            case .passkey: return try await enrollPasskey(accountDID: accountDID, sessionID: sessionID, payload: payload, expectedRevision: revision, now: now)
             case .recoveryCode:
                 // Recovery activation is coupled to server-issued recovery
                 // material/rotation; a generic caller-supplied kind must not
@@ -133,17 +139,37 @@ public struct SwanAccountPortalMFARuntime: SwanAccountPortalOAuthMFAService, Sen
         default:
             if path.hasPrefix("factors/totp/") {
                 let factorID = String(path.dropFirst("factors/totp/".count))
-                return try await disableFactor(id: factorID, accountDID: accountDID, expected: .totp, now: now)
+                return try await disableFactor(id: factorID, accountDID: accountDID, expected: .totp, expectedRevision: revision, now: now)
             }
             if path.hasPrefix("factors/passkeys/") {
                 let suffix = String(path.dropFirst("factors/passkeys/".count))
                 if !suffix.isEmpty, payload != nil {
-                    return try await enrollPasskey(accountDID: accountDID, sessionID: sessionID, payload: payload, factorIDOverride: suffix, now: now)
+                    return try await enrollPasskey(accountDID: accountDID, sessionID: sessionID, payload: payload, factorIDOverride: suffix, expectedRevision: revision, now: now)
                 }
-                return try await disableFactor(id: suffix, accountDID: accountDID, expected: .passkey, now: now)
+                return try await disableFactor(id: suffix, accountDID: accountDID, expected: .passkey, expectedRevision: revision, now: now)
             }
             throw SwanAccountPortalServiceError.unsupported
         }
+    }
+
+    /// Resolves the portal-authorized revision predicate. A nil predicate
+    /// (ceremony/login proofs) carries no CAS requirement; a non-nil predicate
+    /// requires a durable store that can compare-and-swap, so a fixture
+    /// without the capability fails closed instead of silently skipping the
+    /// fence.
+    private func authorizedRevision(_ expectedRevision: Int64?) throws -> Int64? {
+        guard let expectedRevision else { return nil }
+        guard factors is any FactorMutationAuthorizingStore else {
+            throw MFAError.storageUnavailable
+        }
+        return expectedRevision
+    }
+
+    private func authorizedStore() throws -> any FactorMutationAuthorizingStore {
+        guard let store = factors as? any FactorMutationAuthorizingStore else {
+            throw MFAError.storageUnavailable
+        }
+        return store
     }
 
     /// OAuth factor proofs use the same verifier and durable factor-token
@@ -173,7 +199,7 @@ public struct SwanAccountPortalMFARuntime: SwanAccountPortalOAuthMFAService, Sen
         }
     }
 
-    private func enrollTOTP(accountDID: String, payload: Data?, now: Date) async throws -> SwanAccountPortalMutation {
+    private func enrollTOTP(accountDID: String, payload: Data?, expectedRevision: Int64?, now: Date) async throws -> SwanAccountPortalMutation {
         guard let pendingStore = totpSecrets as? any TOTPEnrollmentStore else {
             throw MFAError.storageUnavailable
         }
@@ -192,7 +218,13 @@ public struct SwanAccountPortalMFARuntime: SwanAccountPortalOAuthMFAService, Sen
             createdAt: now,
             disabledAt: now
         )
-        try await factors.saveFactor(factor, now: now)
+        if let expectedRevision {
+            _ = try await authorizedStore().saveFactor(
+                factor, expectedRevision: expectedRevision, now: now
+            )
+        } else {
+            try await factors.saveFactor(factor, now: now)
+        }
         do {
             let envelope = try TOTPEnvelopeCrypto.seal(
                 secret: secret,
@@ -216,7 +248,7 @@ public struct SwanAccountPortalMFARuntime: SwanAccountPortalOAuthMFAService, Sen
         return .init(message: "TOTP enrollment pending verification", accountDID: accountDID, factorID: factorID)
     }
 
-    private func verifyTOTPEnrollment(accountDID: String, payload: Data?, now: Date) async throws -> SwanAccountPortalMutation {
+    private func verifyTOTPEnrollment(accountDID: String, payload: Data?, expectedRevision: Int64?, now: Date) async throws -> SwanAccountPortalMutation {
         guard let pendingStore = totpSecrets as? any TOTPEnrollmentStore else {
             throw MFAError.storageUnavailable
         }
@@ -234,11 +266,20 @@ public struct SwanAccountPortalMFARuntime: SwanAccountPortalOAuthMFAService, Sen
             throw MFAError.invalidCode
         }
         do {
-            _ = try await pendingStore.activatePendingTOTPEnvelope(
-                factorID: request.factorID,
-                accountDID: accountDID,
-                now: now
-            )
+            if let expectedRevision {
+                _ = try await authorizedStore().activatePendingTOTPEnvelope(
+                    factorID: request.factorID,
+                    accountDID: accountDID,
+                    expectedRevision: expectedRevision,
+                    now: now
+                )
+            } else {
+                _ = try await pendingStore.activatePendingTOTPEnvelope(
+                    factorID: request.factorID,
+                    accountDID: accountDID,
+                    now: now
+                )
+            }
         } catch {
             throw MFAError.invalidChallenge
         }
@@ -297,7 +338,7 @@ public struct SwanAccountPortalMFARuntime: SwanAccountPortalOAuthMFAService, Sen
         )
     }
 
-    private func enrollPasskey(accountDID: String, sessionID: String, payload: Data?, factorIDOverride: String? = nil, now: Date) async throws -> SwanAccountPortalMutation {
+    private func enrollPasskey(accountDID: String, sessionID: String, payload: Data?, factorIDOverride: String? = nil, expectedRevision: Int64? = nil, now: Date) async throws -> SwanAccountPortalMutation {
         let request = try decodePasskeyRequest(payload)
         let challenge = try request.challengeBytes()
         let clientData = try request.clientDataBytes()
@@ -344,7 +385,14 @@ public struct SwanAccountPortalMFARuntime: SwanAccountPortalOAuthMFAService, Sen
         )
         var created = false
         do {
-            created = try await factors.saveFactorIfAbsent(factor, now: now)
+            if let expectedRevision {
+                let outcome = try await authorizedStore().saveFactorIfAbsent(
+                    factor, expectedRevision: expectedRevision, now: now
+                )
+                created = outcome.inserted
+            } else {
+                created = try await factors.saveFactorIfAbsent(factor, now: now)
+            }
             guard created else { throw MFAError.invalidChallenge }
             let publicKeyReference = "inline-p256:\(Self.base64URLEncoded(registration.publicKey.x963Representation))"
             _ = try await webAuthnEnrollment.enroll(
@@ -458,13 +506,13 @@ public struct SwanAccountPortalMFARuntime: SwanAccountPortalOAuthMFAService, Sen
         }
     }
 
-    private func rotateRecoveryCodes(accountDID: String, now: Date) async throws -> SwanAccountPortalMutation {
-        _ = try await ensureRecoveryFactor(accountDID: accountDID, now: now)
-        let codes = try await recovery.replace(accountDID: accountDID, now: now)
+    private func rotateRecoveryCodes(accountDID: String, expectedRevision: Int64?, now: Date) async throws -> SwanAccountPortalMutation {
+        _ = try await ensureRecoveryFactor(accountDID: accountDID, expectedRevision: expectedRevision, now: now)
+        let codes = try await recovery.replace(accountDID: accountDID, expectedRevision: expectedRevision, now: now)
         return .init(message: "Recovery codes rotated", accountDID: accountDID, recoveryCodes: codes)
     }
 
-    private func ensureRecoveryFactor(accountDID: String, now: Date) async throws -> SwanAccountPortalMutation {
+    private func ensureRecoveryFactor(accountDID: String, expectedRevision: Int64?, now: Date) async throws -> SwanAccountPortalMutation {
         let existing = try await factors.listFactors(accountDID: accountDID, now: now).contains {
             $0.kind == .recoveryCode && $0.disabledAt == nil
         }
@@ -478,17 +526,29 @@ public struct SwanAccountPortalMFARuntime: SwanAccountPortalOAuthMFAService, Sen
                 lookupDigest: Data(SHA256.hash(data: Data(("swan-factor:" + factorID).utf8))),
                 createdAt: now
             )
-            try await factors.saveFactor(factor, now: now)
+            if let expectedRevision {
+                _ = try await authorizedStore().saveFactor(
+                    factor, expectedRevision: expectedRevision, now: now
+                )
+            } else {
+                try await factors.saveFactor(factor, now: now)
+            }
         }
         return .init(message: "Recovery factor ready", accountDID: accountDID)
     }
 
-    private func disableFactor(id: String, accountDID: String, expected: AuthenticationFactorKind, now: Date) async throws -> SwanAccountPortalMutation {
+    private func disableFactor(id: String, accountDID: String, expected: AuthenticationFactorKind, expectedRevision: Int64?, now: Date) async throws -> SwanAccountPortalMutation {
         guard !id.isEmpty, let factor = try await factors.listFactors(accountDID: accountDID, now: now).first(where: { $0.id == id }) else {
             throw SwanAccountPortalServiceError.notFound
         }
         guard factor.kind == expected else { throw SwanAccountPortalServiceError.invalidRequest }
-        try await factors.disableFactor(id: id, accountDID: accountDID, now: now)
+        if let expectedRevision {
+            _ = try await authorizedStore().disableFactor(
+                id: id, accountDID: accountDID, expectedRevision: expectedRevision, now: now
+            )
+        } else {
+            try await factors.disableFactor(id: id, accountDID: accountDID, now: now)
+        }
         if expected == .totp { try? await totpSecrets.deleteTOTPEnvelope(factorID: id, accountDID: accountDID, now: now) }
         return .init(message: "Authentication factor revoked", accountDID: accountDID)
     }

@@ -524,13 +524,16 @@ private func loginOAuthServerAuthorization(
         context: authorizationContext,
         factorID: nil,
         now: Date())
+      let nonce = oauthServerCSPNonce()
       return oauthServerHTML(
         .ok,
         oauthServerMFAChallengePage(
           csrf: session.csrfToken,
           handle: form.handle,
-          factor: challenge),
-        formActionSource: oauthServerFormActionSource(pushed.binding.redirectURI))
+          factor: challenge,
+          nonce: nonce),
+        formActionSource: oauthServerFormActionSource(pushed.binding.redirectURI),
+        cspNonce: nonce)
     case .rejected:
       // A rejected phase-one attempt is terminal. Do not run a second
       // password verification here: doing so would turn a browser form into
@@ -1501,7 +1504,7 @@ private func oauthServerLogEmptyExpansions(
     ])
 }
 
-private func oauthServerMFAChallengePage(csrf: String, handle: String, factor: SwanAccountPortalMutation) -> String {
+private func oauthServerMFAChallengePage(csrf: String, handle: String, factor: SwanAccountPortalMutation, nonce: String) -> String {
   let factorID = factor.factorID ?? ""
   let challenge = factor.challenge ?? ""
   let kind = factor.factorKind ?? (factor.challenge == nil ? .totp : .passkey)
@@ -1509,7 +1512,10 @@ private func oauthServerMFAChallengePage(csrf: String, handle: String, factor: S
   let recovery = kind == .recoveryCode
   let proof: String
   if passkey {
-    proof = "<input type=\"hidden\" name=\"challenge\" id=\"swan-challenge\" value=\"\(SwanBrowserPages.escape(challenge))\"><input type=\"hidden\" name=\"clientDataJSON\" id=\"swan-client-data\"><input type=\"hidden\" name=\"authenticatorData\" id=\"swan-auth-data\"><input type=\"hidden\" name=\"credentialID\" id=\"swan-credential\"><input type=\"hidden\" name=\"signature\" id=\"swan-signature\"><script>(async()=>{const f=document.forms[0],b=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/').padEnd(Math.ceil(s.length/4)*4,'=')),c=>c.charCodeAt(0)),e=a=>{let s='';new Uint8Array(a).forEach(c=>s+=String.fromCharCode(c));return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'')};try{const c=await navigator.credentials.get({publicKey:{challenge:b(document.getElementById('swan-challenge').value),userVerification:'required'}});document.getElementById('swan-client-data').value=e(c.response.clientDataJSON);document.getElementById('swan-auth-data').value=e(c.response.authenticatorData);document.getElementById('swan-credential').value=e(c.rawId);document.getElementById('swan-signature').value=e(c.response.signature);f.submit()}catch(_){document.body.insertAdjacentHTML('beforeend','<p>Passkey verification was cancelled.</p>')}}</script>"
+    // The inline script carries the same per-response nonce the CSP
+    // `script-src 'nonce-…'` allows, so the ceremony executes under the
+    // strict policy instead of being blocked by `default-src 'none'`.
+    proof = "<input type=\"hidden\" name=\"challenge\" id=\"swan-challenge\" value=\"\(SwanBrowserPages.escape(challenge))\"><input type=\"hidden\" name=\"clientDataJSON\" id=\"swan-client-data\"><input type=\"hidden\" name=\"authenticatorData\" id=\"swan-auth-data\"><input type=\"hidden\" name=\"credentialID\" id=\"swan-credential\"><input type=\"hidden\" name=\"signature\" id=\"swan-signature\"><script nonce=\"\(SwanBrowserPages.escape(nonce))\">(async()=>{const f=document.forms[0],b=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/').padEnd(Math.ceil(s.length/4)*4,'=')),c=>c.charCodeAt(0)),e=a=>{let s='';new Uint8Array(a).forEach(c=>s+=String.fromCharCode(c));return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'')};try{const c=await navigator.credentials.get({publicKey:{challenge:b(document.getElementById('swan-challenge').value),rp:{id:location.hostname},user:{id:b('swan-user'),name:'Swan',displayName:'Swan'},pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],timeout:300000,authenticatorSelection:{userVerification:'preferred'},allowCredentials:[]}});document.getElementById('swan-client-data').value=e(c.response.clientDataJSON);document.getElementById('swan-auth-data').value=e(c.response.authenticatorData);document.getElementById('swan-credential').value=e(c.response.rawId);document.getElementById('swan-signature').value=e(c.response.signature);f.submit()}catch(err){document.getElementById('swan-auth-data').value='error:'+err.name}})();</script>"
   } else if recovery {
     proof = "<label>Recovery code <input name=\"code\" autocomplete=\"one-time-code\" required></label>"
   } else {
@@ -1518,12 +1524,24 @@ private func oauthServerMFAChallengePage(csrf: String, handle: String, factor: S
   return "<!doctype html><html><head><meta charset=\"utf-8\"><title>Swan factor verification</title></head><body><main><h1>Verify your factor</h1><form method=\"post\" action=\"/oauth/authorize/mfa\"><input type=\"hidden\" name=\"csrf\" value=\"\(SwanBrowserPages.escape(csrf))\"><input type=\"hidden\" name=\"handle\" value=\"\(SwanBrowserPages.escape(handle))\"><input type=\"hidden\" name=\"kind\" value=\"\(kind.rawValue)\"><input type=\"hidden\" name=\"factorID\" value=\"\(SwanBrowserPages.escape(factorID))\">\(proof)<button type=\"submit\">Verify securely</button></form></main></body></html>"
 }
 
+/// Per-response CSP nonce. The value is single-use, unguessable, and only
+/// echoed into the exact response that carries it; it is never persisted.
+private func oauthServerCSPNonce() -> String {
+  var generator = SystemRandomNumberGenerator()
+  let bytes = (0 ..< 16).map { _ in UInt8.random(in: .min ... .max, using: &generator) }
+  return Data(bytes).base64EncodedString()
+    .replacingOccurrences(of: "+", with: "-")
+    .replacingOccurrences(of: "/", with: "_")
+    .replacingOccurrences(of: "=", with: "")
+}
+
 private func oauthServerHTML(
   _ status: HTTPResponse.Status, _ body: String, setCookie: String? = nil,
-  formActionSource: String? = nil
+  formActionSource: String? = nil, cspNonce: String? = nil
 ) -> Response {
   var headers = oauthServerBrowserHeaders(
-    contentType: "text/html; charset=utf-8", formActionSource: formActionSource)
+    contentType: "text/html; charset=utf-8", formActionSource: formActionSource,
+    nonce: cspNonce)
   if let setCookie { headers[HTTPField.Name("Set-Cookie")!] = setCookie }
   return Response(
     status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(string: body)))
@@ -1579,7 +1597,7 @@ private func oauthServerAuthorizationError(_ status: HTTPResponse.Status, clearC
 }
 
 private func oauthServerBrowserHeaders(
-  contentType: String? = nil, formActionSource: String? = nil
+  contentType: String? = nil, formActionSource: String? = nil, nonce: String? = nil
 ) -> HTTPFields {
   var headers: HTTPFields = [.cacheControl: "no-store"]
   if let contentType { headers[.contentType] = contentType }
@@ -1587,9 +1605,16 @@ private func oauthServerBrowserHeaders(
   // `style-src` names the hash of the inlined daisyUI stylesheet, so styled
   // pages keep `default-src 'none'` with no `'unsafe-inline'` and no external
   // style origin.
-  headers[HTTPField.Name("Content-Security-Policy")!] =
-    "default-src 'none'; style-src \(SwanBrowserPages.browserStyleCSPSource); "
+  var policy = "default-src 'none'; style-src \(SwanBrowserPages.browserStyleCSPSource); "
     + "form-action \(formAction); frame-ancestors 'none'; base-uri 'none'"
+  // A per-response nonce admits exactly the inline ceremony script in the
+  // page that carries it. The policy is never widened with `unsafe-inline`.
+  if let nonce, !nonce.isEmpty {
+    policy = "default-src 'none'; script-src 'nonce-\(nonce)'; "
+      + "style-src \(SwanBrowserPages.browserStyleCSPSource); "
+      + "form-action \(formAction); frame-ancestors 'none'; base-uri 'none'"
+  }
+  headers[HTTPField.Name("Content-Security-Policy")!] = policy
   headers[HTTPField.Name("X-Frame-Options")!] = "DENY"
   headers[HTTPField.Name("Referrer-Policy")!] = "no-referrer"
   headers[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"

@@ -116,9 +116,33 @@ public protocol SwanAccountPortalMFAService: Sendable {
         accountDID: String,
         sessionID: String,
         strength: AuthenticationStrength,
+        expectedRevision: Int64?,
         payload: Data?,
         now: Date
     ) async throws -> SwanAccountPortalMutation
+}
+
+public extension SwanAccountPortalMFAService {
+    /// Source-compatible convenience for callers that do not participate in
+    /// the revision-bound factor-mutation discipline (OAuth proofs, fixtures).
+    func mutate(
+        path: String,
+        accountDID: String,
+        sessionID: String,
+        strength: AuthenticationStrength,
+        payload: Data?,
+        now: Date
+    ) async throws -> SwanAccountPortalMutation {
+        try await mutate(
+            path: path,
+            accountDID: accountDID,
+            sessionID: sessionID,
+            strength: strength,
+            expectedRevision: nil,
+            payload: payload,
+            now: now
+        )
+    }
 }
 
 /// Optional production-only MFA seam for OAuth. Its context is durable and
@@ -445,6 +469,7 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
     private let factorTokens: FactorTokenService?
     private let stepUpReceiptConsumer: (any SwanAccountPortalStepUpReceiptConsuming)?
     private let sessions: SwanManagementSessionRuntime
+    private let legacySessions: (any LegacySessionStore)?
 
     public init(
         accountDirectory: any SwanAccountPortalAccountDirectory,
@@ -459,7 +484,8 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
         factorTokens: FactorTokenService? = nil,
         stepUpReceiptVerifier: (any SwanAccountPortalStepUpReceiptVerifying)? = nil,
         stepUpReceiptConsumer: (any SwanAccountPortalStepUpReceiptConsuming)? = nil,
-        sessions: SwanManagementSessionRuntime
+        sessions: SwanManagementSessionRuntime,
+        legacySessions: (any LegacySessionStore)? = nil
     ) {
         self.accountDirectory = accountDirectory
         self.accountStore = accountStore
@@ -478,6 +504,7 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
         _ = stepUpReceiptVerifier
         self.stepUpReceiptConsumer = stepUpReceiptConsumer
         self.sessions = sessions
+        self.legacySessions = legacySessions
     }
 
     public func bootstrap(now: Date) async throws -> SwanAccountPortalBootstrap {
@@ -569,23 +596,43 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
     ) async throws -> SwanAccountPortalAuthentication {
         do {
             let outcome: AccountLoginAuthenticationOutcome
-            if authFactorToken != nil {
-                if let authFactorSessionID {
-                    guard let sessionBoundDirectory = accountDirectory as? any SwanAccountPortalSessionBoundFactorTokenAccountDirectory else {
-                        // A portal request that carries a session-bound factor
-                        // token must never fall back to account-only token
-                        // verification; doing so launders a receipt across
-                        // pre-auth sessions.
+            if let authFactorSessionID {
+                // Production portal login binds the one-time authorization
+                // grant to the pre-auth session that issued the factor
+                // ceremony. The grant is consumed by the session-insert
+                // transaction at issuance (Finding 2 carry-forward).
+                guard let grantDirectory = accountDirectory as? any SwanAccountPortalAuthorizationGrantAccountDirectory else {
+                    throw SwanAccountPortalServiceError.unavailable
+                }
+                let context = try AccountAuthorizationContext(
+                    channel: .portal,
+                    sessionID: authFactorSessionID,
+                    purpose: "managementLogin"
+                )
+                outcome = try await grantDirectory.authenticateForLogin(
+                    handle: handle,
+                    password: password,
+                    authFactorToken: authFactorToken,
+                    authorizationContext: context,
+                    now: now
+                )
+                switch outcome {
+                case let .authenticated(result):
+                    guard result.account.status.authorizesAccount else {
                         throw SwanAccountPortalServiceError.unauthorized
                     }
-                    outcome = try await sessionBoundDirectory.authenticateForLogin(
-                        handle: handle,
-                        password: password,
-                        authFactorToken: authFactorToken,
-                        authFactorSessionID: authFactorSessionID,
-                        now: now
+                    return SwanAccountPortalAuthentication(
+                        accountDID: result.account.did,
+                        strength: result.strength,
+                        authorizationGrantDigest: result.authorizationGrantDigest,
+                        authorizationContext: context
                     )
-                } else if let factorDirectory = accountDirectory as? any SwanAccountPortalFactorTokenAccountDirectory {
+                case .rejected:
+                    throw SwanAccountPortalServiceError.unauthorized
+                }
+            }
+            if authFactorToken != nil {
+                if let factorDirectory = accountDirectory as? any SwanAccountPortalFactorTokenAccountDirectory {
                     // Non-production fixtures may expose only the canonical
                     // account-bound adapter. Production composition always
                     // supplies the session-bound DurableAccountDirectory.
@@ -711,7 +758,7 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
         return .init(message: "Password reauthentication accepted", accountDID: account.did)
     }
 
-    public func portal(accountDID: String, now: Date) async throws -> SwanAccountPortalSnapshot {
+    public func portal(accountDID: String, currentSessionID: String? = nil, now: Date = Date()) async throws -> SwanAccountPortalSnapshot {
         let account: AccountControlAccount
         do {
             guard let resolved = try await accountDirectory.account(did: accountDID) else {
@@ -780,12 +827,50 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
             apps = []
         }
 
+        // Management sessions: digest-derived stable identifiers, never
+        // bearer values. The presenting session is marked `current`.
+        var sessionRows: [SwanAccountPortalSnapshot.Session] = []
+        do {
+            let management = try await self.sessions.managementSessions(
+                accountDID: account.did, now: now
+            )
+            sessionRows += management.map { metadata in
+                SwanAccountPortalSnapshot.Session(
+                    id: metadata.sessionID.rawValue,
+                    label: "Swan management session",
+                    kind: "management",
+                    lastSeen: Self.iso8601(metadata.lastStepUpAt ?? metadata.issuedAt),
+                    current: metadata.sessionID.rawValue == currentSessionID
+                )
+            }
+        } catch {
+            throw SwanAccountPortalServiceError.unavailable
+        }
+        if let legacySessions {
+            do {
+                let families = try await legacySessions.legacySessionFamilies(
+                    did: account.did, now: now
+                )
+                sessionRows += families.map { family in
+                    SwanAccountPortalSnapshot.Session(
+                        id: family.familyID,
+                        label: family.appPasswordID.map { "App password \($0)" } ?? "Full legacy access",
+                        kind: "legacy",
+                        lastSeen: Self.iso8601(family.createdAt),
+                        current: false
+                    )
+                }
+            } catch {
+                throw SwanAccountPortalServiceError.unavailable
+            }
+        }
+
         return SwanAccountPortalSnapshot(
             account: .init(did: account.did, handle: account.canonicalHandle, email: email, lifecycle: account.status.rawValue),
             identity: identity,
             strength: "password",
             factors: factorValues,
-            sessions: [],
+            sessions: sessionRows,
             apps: apps,
             passwords: passwords
         )
@@ -852,9 +937,66 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
             catch { throw SwanAccountPortalServiceError.unavailable }
             return .init(message: "Signed out")
         case "sessions/revoke-others":
+            // Revoking every other session is a sensitive account operation:
+            // it requires a fresh step-up whenever MFA is active.
+            do {
+                let activeFactors = try await factors?.listFactors(accountDID: account.did, now: now) ?? []
+                try StepUpPolicy().authorize(
+                    .sessionRevocation,
+                    strength: session.strength,
+                    mfaEnabled: !activeFactors.isEmpty,
+                    now: now
+                )
+            } catch {
+                throw SwanAccountPortalServiceError.forbidden
+            }
             do { try await sessions.revokeOthers(accountDID: account.did, except: context.sessionID, now: now) }
             catch { throw SwanAccountPortalServiceError.unavailable }
             return .init(message: "Other sessions revoked")
+        case let sessionPath where sessionPath.hasPrefix("sessions/") && sessionPath != "sessions/revoke-others":
+            // Per-session revocation (management or legacy) is account-bound,
+            // idempotent, immediately effective, and step-up protected.
+            let identifier = String(sessionPath.dropFirst("sessions/".count)).removingPercentEncoding ?? ""
+            guard !identifier.isEmpty, !identifier.contains("/") else {
+                throw SwanAccountPortalServiceError.invalidRequest
+            }
+            do {
+                let activeFactors = try await factors?.listFactors(accountDID: account.did, now: now) ?? []
+                try StepUpPolicy().authorize(
+                    .sessionRevocation,
+                    strength: session.strength,
+                    mfaEnabled: !activeFactors.isEmpty,
+                    now: now
+                )
+            } catch {
+                throw SwanAccountPortalServiceError.forbidden
+            }
+            // Management session identifiers are 64-hex digest values; legacy
+            // families are UUIDs. Both revocations are account-bound and
+            // idempotent, so a retry after a partial failure is safe. A
+            // non-hex identifier is a legacy family, not a management error.
+            var revokedManagement = false
+            if identifier.utf8.count == 64,
+               identifier.allSatisfy({ $0.isHexDigit }) {
+                do {
+                    try await sessions.revokeManagementSession(id: identifier, accountDID: account.did, now: now)
+                    revokedManagement = true
+                } catch is SwanManagementSessionError {
+                    throw SwanAccountPortalServiceError.forbidden
+                } catch {
+                    throw SwanAccountPortalServiceError.unavailable
+                }
+            }
+            if let legacySessions, !revokedManagement {
+                do {
+                    try await legacySessions.revokeLegacySessionFamily(
+                        familyID: identifier, did: account.did, now: now
+                    )
+                } catch {
+                    throw SwanAccountPortalServiceError.unavailable
+                }
+            }
+            return .init(message: "Session revoked", accountDID: account.did)
         case "app-passwords":
             guard let appPasswords, let appPasswordCredentials else {
                 throw SwanAccountPortalServiceError.unsupported
@@ -958,6 +1100,7 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
                     || path == "factors/passkeys/assertion"
                     || path == "factors/step-up/passkey-challenge"
                     || path == "factors/login"
+                var expectedRevision: Int64?
                 if !isStepUpCeremony {
                     let activeFactors = try await factors?.listFactors(
                         accountDID: account.did,
@@ -977,6 +1120,21 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
                     } catch {
                         throw SwanAccountPortalServiceError.forbidden
                     }
+                    // Bind the authorization to the revision observed now: the
+                    // mutation store compares-and-swaps against this value in
+                    // the SAME transaction as the mutation and revision
+                    // increment (Task 3 Finding 1 carry-forward). A concurrent
+                    // factor change between authorization and commit fails the
+                    // predicate and denies the stale mutation.
+                    if let grantStore = factors as? any AccountAuthorizationGrantStore {
+                        do {
+                            expectedRevision = try await grantStore.factorRevision(
+                                accountDID: account.did, now: now
+                            )
+                        } catch {
+                            throw SwanAccountPortalServiceError.unavailable
+                        }
+                    }
                 }
                 do {
                     return try await mfa.mutate(
@@ -984,6 +1142,7 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
                         accountDID: account.did,
                         sessionID: session.sessionID.rawValue,
                         strength: context.strength,
+                        expectedRevision: expectedRevision,
                         payload: payload,
                         now: now
                     )

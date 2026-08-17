@@ -65,7 +65,7 @@ public actor SwanManagementSessionRuntime {
     public nonisolated func mint(accountDID: String, strength: AuthenticationStrength = .password, now: Date = Date()) throws -> IssuedManagementSession {
         let sessionValue = Self.randomToken()
         let csrfValue = Self.randomToken()
-        let sessionID = try ManagementSessionID(rawValue: sessionValue)
+        let sessionID = try ManagementSessionID(digest: Self.digest(sessionValue))
         let metadata = try ManagementSessionMetadata(
             sessionID: sessionID,
             accountDID: accountDID,
@@ -98,7 +98,7 @@ public actor SwanManagementSessionRuntime {
         }
         let sessionValue = Self.randomToken()
         let csrfValue = Self.randomToken()
-        let sessionID = try ManagementSessionID(rawValue: sessionValue)
+        let sessionID = try ManagementSessionID(digest: Self.digest(sessionValue))
         let metadata = try ManagementSessionMetadata(
             sessionID: sessionID,
             accountDID: accountDID,
@@ -116,6 +116,94 @@ public actor SwanManagementSessionRuntime {
         )
         guard consumed else { throw SwanManagementSessionError.unauthorized }
         return IssuedManagementSession(sessionValue: sessionValue, csrfValue: csrfValue, metadata: metadata)
+    }
+
+    /// Portal login issuance: pre-auth consumption, revision-bound
+    /// authorization-grant consumption, and management-session creation share
+    /// one durable transaction. The grant is the one-time receipt created by
+    /// the canonical directory at login; no protected portal session is
+    /// issued unless the exact context-bound grant consumes here.
+    public func issueAfterPreAuth(
+        _ value: String,
+        accountDID: String,
+        strength: AuthenticationStrength,
+        authorizationGrantDigest: Data?,
+        authorizationContext: AccountAuthorizationContext?,
+        now: Date = Date()
+    ) async throws -> IssuedManagementSession {
+        guard let authorizationGrantDigest else {
+            return try await issueAfterPreAuth(
+                value, accountDID: accountDID, strength: strength, now: now
+            )
+        }
+        guard let authorizationContext,
+              Self.validToken(value),
+              let coordinator = preAuthSessionCoordinator else {
+            throw SwanManagementSessionError.unavailable
+        }
+        let sessionValue = Self.randomToken()
+        let csrfValue = Self.randomToken()
+        let sessionID = try ManagementSessionID(digest: Self.digest(sessionValue))
+        let metadata = try ManagementSessionMetadata(
+            sessionID: sessionID,
+            accountDID: accountDID,
+            issuedAt: now,
+            idleExpiresAt: now.addingTimeInterval(idleLifetime),
+            absoluteExpiresAt: now.addingTimeInterval(absoluteLifetime),
+            strength: strength
+        )
+        let consumed = try await coordinator.consumePreAuthAndCreateManagementSessionConsumingGrant(
+            preAuthDigest: Self.digest(value),
+            session: metadata,
+            sessionDigest: Self.digest(sessionValue),
+            csrfDigest: Self.digest(csrfValue),
+            authorizationGrantDigest: authorizationGrantDigest,
+            authorizationContext: authorizationContext,
+            now: now
+        )
+        guard consumed else { throw SwanManagementSessionError.unauthorized }
+        return IssuedManagementSession(sessionValue: sessionValue, csrfValue: csrfValue, metadata: metadata)
+    }
+
+    /// Lists the account's live management sessions for the portal
+    /// projection. The returned identifiers are the storage digest-derived
+    /// stable values, never bearer session material.
+    public func managementSessions(accountDID: String, now: Date = Date()) async throws -> [ManagementSessionMetadata] {
+        try await store.managementSessions(accountDID: accountDID, now: now)
+    }
+
+    /// Account-bound, idempotent revocation of one management session
+    /// selected by its projection identifier (the digest-derived hex value).
+    /// The store updates the row only when it belongs to `accountDID`.
+    public func revokeManagementSession(id: String, accountDID: String, now: Date = Date()) async throws {
+        guard let digest = Self.hexDecode(id), digest.count == 32 else {
+            throw SwanManagementSessionError.requestNotAllowed
+        }
+        try await store.revokeManagementSession(digest: digest, accountDID: accountDID, now: now)
+    }
+
+    private static func hexDecode(_ value: String) -> Data? {
+        guard value.utf8.count % 2 == 0 else { return nil }
+        var output = Data()
+        output.reserveCapacity(value.utf8.count / 2)
+        var index = value.utf8.startIndex
+        while index < value.utf8.endIndex {
+            let high = value.utf8[index]
+            let low = value.utf8[value.utf8.index(after: index)]
+            guard let highValue = nibble(high), let lowValue = nibble(low) else { return nil }
+            output.append(highValue << 4 | lowValue)
+            index = value.utf8.index(index, offsetBy: 2)
+        }
+        return output
+    }
+
+    private static func nibble(_ byte: UInt8) -> UInt8? {
+        switch byte {
+        case 48 ... 57: return byte - 48
+        case 97 ... 102: return byte - 97 + 10
+        case 65 ... 70: return byte - 65 + 10
+        default: return nil
+        }
     }
 
     /// Consumes a pre-auth token exactly once. A bootstrap refresh is allowed
@@ -147,7 +235,7 @@ public actor SwanManagementSessionRuntime {
         // request so callers such as revokeOthers do not hash a synthetic
         // identifier and accidentally revoke the current session as well.
         return try ManagementSessionMetadata(
-            sessionID: try ManagementSessionID(rawValue: sessionValue),
+            sessionID: try ManagementSessionID(digest: Self.digest(sessionValue)),
             accountDID: metadata.accountDID,
             issuedAt: metadata.issuedAt,
             idleExpiresAt: metadata.idleExpiresAt,
