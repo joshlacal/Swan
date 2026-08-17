@@ -1,5 +1,8 @@
 import Crypto
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import NIOCore
 import SwanCore
 import SwanStorage
@@ -289,10 +292,30 @@ public struct URLSessionTurnstileTransport: TurnstileHTTPTransport {
         try Task.checkCancellation()
         let (data, response) = try await URLSession.shared.data(for: urlRequest)
         guard (200 ..< 300).contains((response as? HTTPURLResponse)?.statusCode ?? 0) else { throw TurnstileVerificationError.transport }
-        struct Wire: Decodable { let success: Bool; let challenge_ts: String?; let hostname: String?; let action: String?; let `error-codes`: [String]? }
+        struct Wire: Decodable {
+            let success: Bool
+            let challenge_ts: String?
+            let hostname: String?
+            let action: String?
+            let errorCodes: [String]?
+
+            enum CodingKeys: String, CodingKey {
+                case success
+                case challenge_ts
+                case hostname
+                case action
+                case errorCodes = "error-codes"
+            }
+        }
         let wire = try JSONDecoder().decode(Wire.self, from: data)
         let timestamp = wire.challenge_ts.flatMap { ISO8601DateFormatter().date(from: $0) }
-        return TurnstileSiteVerifyResponse(success: wire.success, challengeTimestamp: timestamp, hostname: wire.hostname, action: wire.action, errorCodes: wire.`error-codes` ?? [])
+        return TurnstileSiteVerifyResponse(
+            success: wire.success,
+            challengeTimestamp: timestamp,
+            hostname: wire.hostname,
+            action: wire.action,
+            errorCodes: wire.errorCodes ?? []
+        )
     }
 }
 

@@ -1,5 +1,8 @@
 import Crypto
 import Foundation
+#if canImport(CoreFoundation)
+import CoreFoundation
+#endif
 import SwanCore
 import SwanStorage
 
@@ -252,11 +255,13 @@ public actor InMemorySwanSigningKeyReservationService: SwanDurableSigningKeyRese
     }
 
     public func committedReservation(accountDID: String) async throws -> SwanDidWebClaimReservation? {
-        reservations.values.compactMap { value in
-            guard value.2 == .committed, let reservation = value.3,
-                  reservation.accountDID == accountDID else { return nil }
-            return reservation
-        }.first
+        for value in reservations.values {
+            if value.2 == .committed, let reservation = value.3,
+               reservation.accountDID == accountDID {
+                return reservation
+            }
+        }
+        return nil
     }
 
     public func recordIssuedReservation(_ reservation: SwanDidWebClaimReservation) async throws {
@@ -458,6 +463,7 @@ public enum SwanRFC8785JSON {
 
     private static func append(_ value: Any, to output: inout Data) throws {
         if value is NSNull { output.append(contentsOf: [110, 117, 108, 108]); return }
+        #if canImport(CoreFoundation)
         if let number = value as? NSNumber {
             if CFGetTypeID(number) == CFBooleanGetTypeID() {
                 output.append(contentsOf: Data((number.boolValue ? "true" : "false").utf8)); return
@@ -466,6 +472,16 @@ public enum SwanRFC8785JSON {
             guard let bytes = text.data(using: .utf8) else { throw SwanError.malformed("JCS number") }
             output.append(bytes); return
         }
+        #else
+        if let bool = value as? Bool {
+            output.append(contentsOf: Data((bool ? "true" : "false").utf8)); return
+        }
+        if let number = value as? NSNumber {
+            let text = canonicalNumber(number)
+            guard let bytes = text.data(using: .utf8) else { throw SwanError.malformed("JCS number") }
+            output.append(bytes); return
+        }
+        #endif
         if let string = value as? String {
             let encoded = try JSONSerialization.data(withJSONObject: [string], options: [.withoutEscapingSlashes])
             output.append(encoded.dropFirst().dropLast()); return
