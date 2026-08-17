@@ -40,7 +40,7 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
         XCTAssertTrue(reserve.claimServiceEndpoint.hasSuffix("/.well-known/swan/did-web-claim/\(reserve.nonce)"))
 
         let reservation = try await fixture.reservations.issuedReservation(requestID: "claim-1")
-    guard let reservation else { XCTFail("missing reservation"); return }
+        guard let reservation else { XCTFail("missing reservation"); return }
         let json = try DidWebDocumentFixture.json(
             did: did, handle: handle, pds: pds, key: reservation.key,
             claimEndpoint: reservation.claimServiceEndpoint
@@ -83,7 +83,7 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
             sessionValue: fixture.sessionValue, now: now
         )
         let reservation = try await fixture.reservations.issuedReservation(requestID: "claim-endpoint-1")
-    guard let reservation else { XCTFail("missing reservation"); return }
+        guard let reservation else { XCTFail("missing reservation"); return }
         let json = try DidWebDocumentFixture.json(
             did: did, handle: handle, pds: pds, key: reservation.key,
             claimEndpoint: reservation.claimServiceEndpoint
@@ -122,7 +122,7 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
             sessionValue: fixture.sessionValue, now: now
         )
         let reservation = try await fixture.reservations.issuedReservation(requestID: "replay-1")
-    guard let reservation else { XCTFail("missing reservation"); return }
+        guard let reservation else { XCTFail("missing reservation"); return }
         let json = try DidWebDocumentFixture.json(
             did: did, handle: handle, pds: pds, key: reservation.key,
             claimEndpoint: reservation.claimServiceEndpoint
@@ -140,7 +140,8 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
         XCTAssertEqual(first, retry)
 
         // A different request ID cannot mint a second binding from the same
-        // nonce: the reservation tuple lookup fails before any write.
+        // nonce: the adapter's reservation lookup finds no issued reservation
+        // for the forged request ID and refuses before any write.
         let forged = try SwanDidWebClaimReservation(
             requestID: "replay-2", accountDID: accountDID, targetDID: did,
             handle: handle, key: reservation.key, nonce: reservation.nonce,
@@ -148,9 +149,10 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
             claimReceiptDigest: reservation.claimReceiptDigest,
             claimServiceEndpoint: reservation.claimServiceEndpoint
         )
-        await XCTAssertThrowsAsyncError {
-            _ = try await fixture.service.claim(
-                reservation: forged, documents: fixture.fetcher, now: now
+        await XCTAssertThrowsIdentityError(.unprocessable("unknown claim reservation")) {
+            _ = try await fixture.adapter.claim(
+                SwanDidWebClaimRequest(requestID: "replay-2"),
+                sessionValue: fixture.sessionValue, now: now
             )
         }
         _ = reserve
@@ -172,7 +174,7 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
             sessionValue: fixture.sessionValue, now: now
         )
         let reservation = try await fixture.reservations.issuedReservation(requestID: "replace-1")
-    guard let reservation else { XCTFail("missing reservation"); return }
+        guard let reservation else { XCTFail("missing reservation"); return }
         let json = try DidWebDocumentFixture.json(
             did: did, handle: handle, pds: pds, key: reservation.key,
             claimEndpoint: reservation.claimServiceEndpoint
@@ -183,24 +185,11 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
             sessionValue: fixture.sessionValue, now: now
         )
 
-        // Replacement without a fresh step-up receipt is refused.
+        // Reserve the replacement tuple first (idempotent on requestID) and
+        // publish its temporary claim service document, so both the
+        // missing-receipt refusal and the successful rotate reach the
+        // step-up check rather than failing on document fetch.
         let newDID = "did:web:new.example"
-        let rotate = SwanDidWebRotateRequest(
-            requestID: "replace-2", targetDID: newDID, handle: handle,
-            expiresAt: now.addingTimeInterval(300), stepUpReceipt: "missing"
-        )
-        await XCTAssertThrowsAsyncError {
-            _ = try await fixture.adapter.rotate(rotate, sessionValue: fixture.sessionValue, now: now)
-        }
-
-        // With a valid receipt the replacement succeeds and consumes it.
-        let receiptValue = "step-up-receipt-replace-1"
-        try await fixture.insertReceipt(
-            sessionID: fixture.sessionID, accountDID: accountDID,
-            receiptValue: receiptValue, operation: "replace", now: now
-        )
-        // Reserve the replacement tuple first (idempotent on requestID), then
-        // publish its temporary claim service document.
         _ = try await fixture.adapter.reserve(
             SwanDidWebReserveRequest(
                 requestID: "replace-2", targetDID: newDID, handle: handle,
@@ -215,6 +204,22 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
             claimEndpoint: newReservation.claimServiceEndpoint
         )
         await fixture.fetcher.set(newJSON, forDID: newDID)
+
+        // Replacement without a fresh step-up receipt is refused.
+        let rotate = SwanDidWebRotateRequest(
+            requestID: "replace-2", targetDID: newDID, handle: handle,
+            expiresAt: now.addingTimeInterval(300), stepUpReceipt: "missing"
+        )
+        await XCTAssertThrowsIdentityError(.stepUpRequired) {
+            _ = try await fixture.adapter.rotate(rotate, sessionValue: fixture.sessionValue, now: now)
+        }
+
+        // With a valid receipt the replacement succeeds and consumes it.
+        let receiptValue = "step-up-receipt-replace-1"
+        try await fixture.insertReceipt(
+            sessionID: fixture.sessionID, accountDID: accountDID,
+            receiptValue: receiptValue, operation: "replace", now: now
+        )
         let rotated = try await fixture.adapter.rotate(
             SwanDidWebRotateRequest(
                 requestID: "replace-2", targetDID: newDID, handle: handle,
@@ -234,10 +239,27 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
             now: now
         )
         XCTAssertFalse(consumed)
-        await XCTAssertThrowsAsyncError {
+        // Publish a document for the replay target so the flow reaches the
+        // authorizer pre-check, which must refuse the consumed receipt.
+        let thirdDID = "did:web:third.example"
+        _ = try await fixture.adapter.reserve(
+            SwanDidWebReserveRequest(
+                requestID: "replace-3", targetDID: thirdDID, handle: handle,
+                expiresAt: now.addingTimeInterval(300)
+            ),
+            sessionValue: fixture.sessionValue, now: now
+        )
+        let thirdReservation = try await fixture.reservations.issuedReservation(requestID: "replace-3")
+        guard let thirdReservation else { XCTFail("missing replay reservation"); return }
+        let thirdJSON = try DidWebDocumentFixture.json(
+            did: thirdDID, handle: handle, pds: pds, key: thirdReservation.key,
+            claimEndpoint: thirdReservation.claimServiceEndpoint
+        )
+        await fixture.fetcher.set(thirdJSON, forDID: thirdDID)
+        await XCTAssertThrowsIdentityError(.stepUpRequired) {
             _ = try await fixture.adapter.rotate(
                 SwanDidWebRotateRequest(
-                    requestID: "replace-3", targetDID: "did:web:third.example",
+                    requestID: "replace-3", targetDID: thirdDID,
                     handle: self.handle, expiresAt: now.addingTimeInterval(300),
                     stepUpReceipt: receiptValue
                 ),
@@ -259,7 +281,7 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
             sessionValue: fixture.sessionValue, now: now
         )
         let reservation = try await fixture.reservations.issuedReservation(requestID: "remove-1")
-    guard let reservation else { XCTFail("missing reservation"); return }
+        guard let reservation else { XCTFail("missing reservation"); return }
         let json = try DidWebDocumentFixture.json(
             did: did, handle: handle, pds: pds, key: reservation.key,
             claimEndpoint: reservation.claimServiceEndpoint
@@ -270,7 +292,7 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
             sessionValue: fixture.sessionValue, now: now
         )
 
-        await XCTAssertThrowsAsyncError {
+        await XCTAssertThrowsIdentityError(.stepUpRequired) {
             _ = try await fixture.adapter.remove(
                 SwanDidWebRemoveRequest(stepUpReceipt: "missing"),
                 sessionValue: fixture.sessionValue, now: now
@@ -304,7 +326,7 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
             sessionValue: fixture.sessionValue, now: now
         )
         let reservation = try await fixture.reservations.issuedReservation(requestID: "suspend-1")
-    guard let reservation else { XCTFail("missing reservation"); return }
+        guard let reservation else { XCTFail("missing reservation"); return }
         let json = try DidWebDocumentFixture.json(
             did: did, handle: handle, pds: pds, key: reservation.key,
             claimEndpoint: reservation.claimServiceEndpoint
@@ -334,6 +356,63 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
         XCTAssertFalse(admission.allowsTokenIssuance)
     }
 
+    /// A did:web binding suspended by a document mismatch must return to
+    /// active once the operator corrects the published document and reverify
+    /// runs again — recovery is a revalidation outcome, not a new claim.
+    func testMismatchSuspensionRecoversToActiveAfterDocumentCorrection() async throws {
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let fixture = try await makeFixture(now: now)
+        defer { fixture.cleanup() }
+
+        let reserve = try await fixture.adapter.reserve(
+            SwanDidWebReserveRequest(
+                requestID: "recover-1", targetDID: did, handle: handle,
+                expiresAt: now.addingTimeInterval(300)
+            ),
+            sessionValue: fixture.sessionValue, now: now
+        )
+        let reservation = try await fixture.reservations.issuedReservation(requestID: "recover-1")
+        guard let reservation else { XCTFail("missing reservation"); return }
+        let json = try DidWebDocumentFixture.json(
+            did: did, handle: handle, pds: pds, key: reservation.key,
+            claimEndpoint: reservation.claimServiceEndpoint
+        )
+        await fixture.fetcher.set(json, forDID: did)
+        _ = try await fixture.adapter.claim(
+            SwanDidWebClaimRequest(requestID: "recover-1"),
+            sessionValue: fixture.sessionValue, now: now
+        )
+
+        // A document mismatch (subject change) suspends the binding.
+        let mismatched = try DidWebDocumentFixture.json(
+            did: "did:web:attacker.example", handle: handle, pds: pds,
+            key: reservation.key, claimEndpoint: reservation.claimServiceEndpoint
+        )
+        await fixture.fetcher.set(mismatched, forDID: did)
+        let suspended = try await fixture.adapter.reverify(
+            sessionValue: fixture.sessionValue, now: now
+        )
+        XCTAssertEqual(suspended.state, "suspended")
+        let fenced = try await fixture.adapter.admission(
+            sessionValue: fixture.sessionValue, now: now
+        )
+        XCTAssertTrue(fenced.allowsRead)
+        XCTAssertFalse(fenced.allowsWrite)
+
+        // The operator corrects the published document back to the exact
+        // claimed subject/key/endpoint; reverify restores active.
+        await fixture.fetcher.set(json, forDID: did)
+        let recovered = try await fixture.adapter.reverify(
+            sessionValue: fixture.sessionValue, now: now
+        )
+        XCTAssertEqual(recovered.state, "active")
+        let admitted = try await fixture.adapter.admission(
+            sessionValue: fixture.sessionValue, now: now
+        )
+        XCTAssertTrue(admitted.allowsWrite)
+        XCTAssertTrue(admitted.allowsTokenIssuance)
+    }
+
     func testDefaultGraceIs24Hours() async throws {
         let now = Date(timeIntervalSince1970: 1_750_000_000)
         // The session must outlive the 24-hour grace window so admission
@@ -351,7 +430,7 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
             sessionValue: fixture.sessionValue, now: now
         )
         let reservation = try await fixture.reservations.issuedReservation(requestID: "grace-1")
-    guard let reservation else { XCTFail("missing reservation"); return }
+        guard let reservation else { XCTFail("missing reservation"); return }
         let json = try DidWebDocumentFixture.json(
             did: did, handle: handle, pds: pds, key: reservation.key,
             claimEndpoint: reservation.claimServiceEndpoint
@@ -390,7 +469,7 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
             sessionValue: fixture.sessionValue, now: now
         )
         let reservation = try await fixture.reservations.issuedReservation(requestID: "restart-1")
-    guard let reservation else { XCTFail("missing reservation"); return }
+        guard let reservation else { XCTFail("missing reservation"); return }
         let json = try DidWebDocumentFixture.json(
             did: did, handle: handle, pds: pds, key: reservation.key,
             claimEndpoint: reservation.claimServiceEndpoint
@@ -449,6 +528,31 @@ final class SwanDidWebIdentityHTTPTests: XCTestCase {
     }
 
     // MARK: - Durable authorizer
+
+    /// Spec §3.3: storage/resolver/key-store outages are 503
+    /// `service_unavailable`, never a field-safe 422. The adapter must not
+    /// downgrade an infrastructure outage into a client-visible validation
+    /// failure.
+    func testUnavailableMapsToServiceUnavailable() {
+        let mapped = SwanDidWebIdentityHTTP.map(SwanError.unavailable("key-store outage"))
+        XCTAssertEqual(mapped, .serviceUnavailable)
+        XCTAssertEqual(mapped.statusCode, 503)
+        XCTAssertEqual(mapped.code, "service_unavailable")
+
+        // Document/reservation mismatches stay field-safe 422s.
+        let mismatch = SwanDidWebIdentityHTTP.map(
+            SwanError.unauthorized("did:web document subject mismatch")
+        )
+        XCTAssertEqual(mismatch, .unprocessable("did:web document subject mismatch"))
+        XCTAssertEqual(mismatch.statusCode, 422)
+
+        // Replayed receipts are conflicts, not validation failures.
+        let replayed = SwanDidWebIdentityHTTP.map(
+            SwanError.unauthorized("invalid or replayed identity step-up receipt")
+        )
+        XCTAssertEqual(replayed, .conflict)
+        XCTAssertEqual(replayed.statusCode, 409)
+    }
 
     func testDurableAuthorizerVerifiesWithoutConsuming() async throws {
         let now = Date(timeIntervalSince1970: 1_750_000_000)
@@ -642,5 +746,20 @@ private extension XCTestCase {
             try await expression()
             XCTFail("expected error")
         } catch {}
+    }
+
+    /// Asserts the expression throws exactly the given typed identity error.
+    func XCTAssertThrowsIdentityError(
+        _ expected: SwanDidWebIdentityHTTPError,
+        _ expression: @escaping () async throws -> Void
+    ) async {
+        do {
+            try await expression()
+            XCTFail("expected \(expected)")
+        } catch let error as SwanDidWebIdentityHTTPError {
+            XCTAssertEqual(error, expected)
+        } catch {
+            XCTFail("expected \(expected), got \(error)")
+        }
     }
 }

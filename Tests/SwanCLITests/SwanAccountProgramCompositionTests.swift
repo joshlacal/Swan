@@ -266,6 +266,143 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
         }
     }
 
+    // MARK: - Task 7: legacy and did:web route precedence
+
+    /// With the legacy-auth surface installed, `createSession` answers
+    /// locally with a real status — never a bare 404 and never proxied —
+    /// even when the pipethrough authorizer would admit the request.
+    func testLegacyCreateSessionAnswersLocallyAndIsNeverProxied() async throws {
+        let fixture = try await makeServer(
+            signupPolicy: .closed,
+            installPipethrough: true,
+            installLegacy: true
+        )
+        defer { fixture.cleanup() }
+        do {
+            let app = fixture.server.buildApplication(
+                logger: Logger(label: "SwanAccountProgramCompositionTests.legacy")
+            )
+            try await app.test(.router) { client in
+                var steered = HTTPFields()
+                steered[.contentType] = "application/json"
+                steered[HTTPField.Name("atproto-proxy")!] = "did:web:attacker.example#svc"
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.server.createSession",
+                    method: .post,
+                    headers: steered,
+                    body: ByteBuffer(string: #"{"identifier":"alice.test","password":"password"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let body = String(decoding: response.body.readableBytesView, as: UTF8.self)
+                    XCTAssertTrue(body.contains("\"accessJwt\""), body)
+                }
+                // A wrong password is a stable local 401, never proxied.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.server.createSession",
+                    method: .post,
+                    headers: steered,
+                    body: ByteBuffer(string: #"{"identifier":"alice.test","password":"wrong"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+            }
+            XCTAssertEqual(fixture.sender.recorded().count, 0)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    /// The app-password XRPC methods fail closed (403) because XRPC cannot
+    /// carry the management-session/step-up context they require — they are
+    /// never handed to the proxy.
+    func testLegacyAppPasswordMethodsFailClosedNeverProxied() async throws {
+        let fixture = try await makeServer(
+            signupPolicy: .closed,
+            installPipethrough: true,
+            installLegacy: true
+        )
+        defer { fixture.cleanup() }
+        do {
+            let app = fixture.server.buildApplication(
+                logger: Logger(label: "SwanAccountProgramCompositionTests.apppasswords")
+            )
+            try await app.test(.router) { client in
+                var steered = HTTPFields()
+                steered[.contentType] = "application/json"
+                steered[HTTPField.Name("atproto-proxy")!] = "did:web:attacker.example#svc"
+                for uri in [
+                    "/xrpc/com.atproto.server.createAppPassword",
+                    "/xrpc/com.atproto.server.listAppPasswords",
+                    "/xrpc/com.atproto.server.revokeAppPassword",
+                ] {
+                    try await client.execute(
+                        uri: uri,
+                        method: .post,
+                        headers: steered,
+                        body: ByteBuffer(string: #"{"name":"test"}"#)
+                    ) { response in
+                        XCTAssertEqual(response.status, .forbidden, uri)
+                    }
+                }
+            }
+            XCTAssertEqual(fixture.sender.recorded().count, 0)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    /// The did:web public claim endpoint is registered before the fallback:
+    /// an unknown nonce is a JSON 404 from the claim endpoint, and the
+    /// management-session identity routes enforce the account-API policy
+    /// (403 without a valid session cookie/CSRF pair).
+    func testDidWebClaimEndpointAndIdentityRoutesAreRegisteredBeforeFallback() async throws {
+        let fixture = try await makeServer(
+            signupPolicy: .closed,
+            installPipethrough: true,
+            installDidWeb: true
+        )
+        defer { fixture.cleanup() }
+        do {
+            let app = fixture.server.buildApplication(
+                logger: Logger(label: "SwanAccountProgramCompositionTests.didweb")
+            )
+            try await app.test(.router) { client in
+                // Unknown nonce: the claim endpoint answers 404 JSON.
+                try await client.execute(
+                    uri: "/.well-known/swan/did-web-claim/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(response.headers[.contentType], "application/json")
+                }
+                // Identity mutations without a management session are 403.
+                try await client.execute(
+                    uri: "/account/api/identity/reserve",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: ByteBuffer(string: #"{"requestID":"r","targetDID":"did:web:example.com","handle":"alice.test","expiresAt":4102444800}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .forbidden)
+                }
+                // The portal API still owns /account/api/*: an unknown API
+                // path is a JSON 404, never the SPA shell.
+                try await client.execute(uri: "/account/api/unknown/deep", method: .get) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(response.headers[.contentType], "application/json")
+                }
+            }
+            XCTAssertEqual(fixture.sender.recorded().count, 0)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     // MARK: - Fixture
 
     private struct DescribeServerBody: Decodable {
@@ -306,6 +443,8 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
         signupPolicy: SignupPolicy = .closed,
         installPipethrough: Bool = false,
         installFirehose: Bool = false,
+        installLegacy: Bool = false,
+        installDidWeb: Bool = false,
         publicURL: URL = URL(string: "https://swan.example")!,
         port: Int = 3000
     ) async throws -> CompositionFixture {
@@ -355,6 +494,89 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 sessions: sessions,
                 service: PortalMemoryService()
             )
+            // Task 7: the legacy-auth XRPC surface and the did:web identity
+            // surface are installed through the same production conformers
+            // `swan serve` constructs, so route precedence is exercised
+            // against the real adapters.
+            let legacyAuthXRPC: SwanLegacyAuthXRPCAdapter?
+            if installLegacy {
+                // The legacy session family row has an FK to `accounts(did)`;
+                // create the fixture account so the durable session store
+                // accepts the login.
+                _ = try await control.createAccount(try AccountControlRegistration(
+                    did: "did:plc:abcdefghijklmnopqrstuvwx",
+                    canonicalHandle: "alice.test",
+                    passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                    signingKey: try AccountControlKeyReference(
+                        purpose: .signing,
+                        generation: 1
+                    ),
+                    rotationKey: try AccountControlKeyReference(
+                        purpose: .rotation,
+                        generation: 1
+                    )
+                ))
+                let legacySecret = Data(repeating: 0x6E, count: 32)
+                let legacyService = try LegacyAuthService(
+                    store: control,
+                    accountResolver: LegacyAccountResolver(
+                        resolve: { identifier in
+                            guard identifier == "did:plc:abcdefghijklmnopqrstuvwx" || identifier == "alice.test" else { return nil }
+                            return LegacyAccountRecord(
+                                did: "did:plc:abcdefghijklmnopqrstuvwx",
+                                handle: "alice.test",
+                                passwordVerifier: "password"
+                            )
+                        },
+                        verifyPassword: { account, password, _ in
+                            account.passwordVerifier == password
+                        }
+                    ),
+                    secretKey: legacySecret,
+                    tokenIssuer: try HMACLegacyTokenIssuer(
+                        key: legacySecret,
+                        issuer: publicURL.host ?? "swan.example"
+                    ),
+                    managementAuthorizer: LegacyManagementAuthorizer(
+                        authorize: { _, _, _ in false }
+                    ),
+                    loginAdmission: LegacyLoginAdmission(admit: { _ in }),
+                    methodPolicy: .referenceLegacy
+                )
+                legacyAuthXRPC = SwanLegacyAuthXRPCAdapter(service: legacyService)
+            } else {
+                legacyAuthXRPC = nil
+            }
+            let didWebIdentityHTTP: SwanDidWebIdentityHTTP?
+            if installDidWeb {
+                let didWebSecret = Data(repeating: 0x7D, count: 32)
+                let provider = try ServeDidWebSigningKeyProvider(secret: didWebSecret)
+                let reservations = SwanDurableSigningKeyReservationAdapter(
+                    store: control,
+                    provider: provider
+                )
+                let identityService = SwanDidWebIdentityService(
+                    reservations: reservations,
+                    bindings: control,
+                    publicPDSURL: publicURL.absoluteString,
+                    publicURL: publicURL.absoluteString,
+                    gracePeriod: 86_400,
+                    replacementAuthorizer: SwanDurableDidWebReplacementAuthorizer(
+                        verifier: control
+                    ),
+                    stepUps: SwanDurableStepUpReceiptConsumer(store: control),
+                    signingKeyProvider: provider
+                )
+                didWebIdentityHTTP = SwanDidWebIdentityHTTP(
+                    service: identityService,
+                    sessions: sessions,
+                    documents: StubDidWebDocuments(),
+                    reservations: reservations,
+                    bindings: control
+                )
+            } else {
+                didWebIdentityHTTP = nil
+            }
             let pipethrough: SwanXRPCPipethroughServer?
             if installPipethrough {
                 pipethrough = SwanXRPCPipethroughServer(
@@ -513,6 +735,8 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 accountControlStore: control,
                 accountPortalHTTP: portal,
                 accountLifecycleXRPC: accountLifecycleXRPC,
+                didWebIdentityHTTP: didWebIdentityHTTP,
+                legacyAuthXRPC: legacyAuthXRPC,
                 xrpcPipethrough: pipethrough,
                 loginClientIdentityPolicy: .direct,
                 publicFirehoseStreaming: streamingRuntime
@@ -631,6 +855,16 @@ private struct StubDIDDocuments: SwanDIDDocumentFetching {
             throw SwanError.unavailable("no stub DID document")
         }
         return data
+    }
+}
+
+/// Conforms to the did:web identity surface's `SwanDidWebDocumentFetching`
+/// (the OAuth `SwanDIDDocumentFetching` is a different protocol). The
+/// composition fixture never fetches a real document, so an empty stub is
+/// sufficient for route-precedence assertions.
+private struct StubDidWebDocuments: SwanDidWebDocumentFetching {
+    func documentJSON(forDID did: String) async throws -> Data {
+        throw SwanError.unavailable("no stub did:web document")
     }
 }
 

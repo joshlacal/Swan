@@ -972,6 +972,8 @@ struct ServePermissionedRuntime {
         actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
         accountPortalHTTP: SwanAccountPortalHTTP? = nil,
         accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter? = nil,
+        didWebIdentityHTTP: SwanDidWebIdentityHTTP? = nil,
+        legacyAuthXRPC: SwanLegacyAuthXRPCAdapter? = nil,
         xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil
@@ -1004,6 +1006,8 @@ struct ServePermissionedRuntime {
             accountEmailXRPC: accountEmailXRPC,
             accountPortalHTTP: accountPortalHTTP,
             accountLifecycleXRPC: accountLifecycleXRPC,
+            didWebIdentityHTTP: didWebIdentityHTTP,
+            legacyAuthXRPC: legacyAuthXRPC,
             actorPreferencesXRPC: actorPreferencesXRPC,
             xrpcPipethrough: xrpcPipethrough,
             loginClientIdentityPolicy: loginClientIdentityPolicy,
@@ -2125,6 +2129,18 @@ extension SwanCommand {
         var didWebRevalidationGraceSeconds: Int = 86_400
 
         @Option(
+            name: .customLong("legacy-auth-secret-file"),
+            help: "Owner-only mounted 32-byte base64url legacy session HMAC secret; SWAN_LEGACY_AUTH_SECRET is the alternative"
+        )
+        var legacyAuthSecretFile: String?
+
+        @Option(
+            name: .customLong("did-web-signing-key-file"),
+            help: "Owner-only mounted 32-byte base64url did:web reserved signing key; SWAN_DID_WEB_SIGNING_KEY is the alternative"
+        )
+        var didWebSigningKeyFile: String?
+
+        @Option(
             name: .customLong("managing-service-audience"),
             help: "Explicit service-JWT audience for com.atproto.simplespace.checkUserAccess"
         )
@@ -2619,6 +2635,30 @@ extension SwanCommand {
             }
         }
 
+        /// Loads an owner-only mounted 32-byte base64url secret, with the
+        /// named environment variable as the alternative. The value is never
+        /// echoed into descriptions, logs, errors, or test snapshots; only
+        /// the option name appears in a refusal.
+        static func loadOwnerOnly32ByteSecret(
+            file: String?,
+            environmentName: String,
+            option: String
+        ) throws -> Data {
+            if let file {
+                return try AccountProvisioningSecrets.requiredMounted32ByteSecret(
+                    secretFile: URL(fileURLWithPath: file)
+                )
+            }
+            guard let encoded = ProcessInfo.processInfo.environment[environmentName],
+                  let decoded = Data(base64URLEncoded: encoded),
+                  decoded.count == 32 else {
+                throw ValidationError(
+                    "\(option) requires an owner-only mounted secret file or \(environmentName)"
+                )
+            }
+            return decoded
+        }
+
         func run() async throws {
             guard (1 ... 1_000_000).contains(spaceOplogRetention) else {
                 throw ValidationError(
@@ -2747,7 +2787,12 @@ extension SwanCommand {
             let accountPortalDirectoryURL = try Self.resolveAccountPortalDirectory(
                 accountPortalDirectory
             )
-            let signupPolicy = try Self.parseSignupPolicy(signupPolicy)
+            // The parsed policy is a non-optional enum; the raw option stays
+            // `String?` so the opt-in guard below can distinguish "option
+            // omitted" from "policy closed". Shadowing the option with the
+            // parsed value made `signupPolicy == nil` always false and refused
+            // every `serve` invocation without `--enable-account-portal`.
+            let resolvedSignupPolicy = try Self.parseSignupPolicy(signupPolicy)
             if !enableAccountPortal {
                 guard accountPortalDirectory == nil,
                       signupPolicy == nil,
@@ -2763,7 +2808,9 @@ extension SwanCommand {
                       emailSMTPExpectedHostname == nil,
                       emailSMTPMaxAttempts == nil,
                       didWebRevalidationIntervalSeconds == 3600,
-                      didWebRevalidationGraceSeconds == 86_400 else {
+                      didWebRevalidationGraceSeconds == 86_400,
+                      legacyAuthSecretFile == nil,
+                      didWebSigningKeyFile == nil else {
                     throw ValidationError(
                         "account program options require --enable-account-portal"
                     )
@@ -2792,7 +2839,7 @@ extension SwanCommand {
                         "--email-smtp-username-file, --email-smtp-password-file, --email-smtp-mechanism, --email-smtp-expected-hostname, and --email-smtp-max-attempts require --email-smtp-mode"
                     )
                 }
-                if signupPolicy == .openProtected {
+                if resolvedSignupPolicy == .openProtected {
                     guard let turnstileSecretFile,
                           !turnstileSecretFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                         throw ValidationError(
@@ -2833,17 +2880,17 @@ extension SwanCommand {
             // neither may be silently replaced by a weaker default. This
             // runs after the SMTP refusals so an incomplete SMTP
             // configuration reports the SMTP problem first.
-            if enableAccountPortal && signupPolicy != .closed {
+            if enableAccountPortal && resolvedSignupPolicy != .closed {
                 guard signupSecretFile != nil
                     || ProcessInfo.processInfo.environment["SWAN_SIGNUP_SECRET"] != nil else {
                     throw ValidationError(
-                        "--signup-policy \(signupPolicy.rawValue) requires an owner-only --signup-secret-file or SWAN_SIGNUP_SECRET"
+                        "--signup-policy \(resolvedSignupPolicy.rawValue) requires an owner-only --signup-secret-file or SWAN_SIGNUP_SECRET"
                     )
                 }
                 guard signupAccountKEKFile != nil
                     || ProcessInfo.processInfo.environment["SWAN_ACCOUNT_KEK"] != nil else {
                     throw ValidationError(
-                        "--signup-policy \(signupPolicy.rawValue) requires an owner-only --signup-account-kek-file or SWAN_ACCOUNT_KEK"
+                        "--signup-policy \(resolvedSignupPolicy.rawValue) requires an owner-only --signup-account-kek-file or SWAN_ACCOUNT_KEK"
                     )
                 }
             } else if enableAccountPortal {
@@ -2947,6 +2994,22 @@ extension SwanCommand {
                 try Self.validateHTTPSOrigin(
                     baseURL,
                     option: "--public-url"
+                )
+            }
+            // The portal composes the legacy session and did:web identity
+            // surfaces from owner-only mounted secrets. Refuse startup when
+            // the portal is enabled but either secret is missing — never
+            // silently derive a weaker key or run without the surface.
+            if enableAccountPortal {
+                _ = try Self.loadOwnerOnly32ByteSecret(
+                    file: legacyAuthSecretFile,
+                    environmentName: "SWAN_LEGACY_AUTH_SECRET",
+                    option: "--legacy-auth-secret-file"
+                )
+                _ = try Self.loadOwnerOnly32ByteSecret(
+                    file: didWebSigningKeyFile,
+                    environmentName: "SWAN_DID_WEB_SIGNING_KEY",
+                    option: "--did-web-signing-key-file"
                 )
             }
             // Both laboratory interlocks run here: after the public origin is
@@ -3357,13 +3420,40 @@ extension SwanCommand {
                     accountEmailXRPC = nil
                     emailRecoveryService = nil
                 }
+                // Account program shared runtime (Task 7 integration). One
+                // durable management-session runtime and one durable account
+                // directory back the portal, legacy session, and did:web
+                // surfaces so their admission and step-up checks read the
+                // same SQLite state.
+                let managementSessions = SwanManagementSessionRuntime(
+                    store: controlDatabase,
+                    preAuthStore: controlDatabase,
+                    csrfStore: controlDatabase,
+                    preAuthSessionCoordinator: controlDatabase
+                )
+                let accountProgramHasher = try LibsodiumArgon2idHasher()
+                let accountProgramAccounts = DurableAccountDirectory(
+                    store: controlDatabase,
+                    passwordHasher: accountProgramHasher,
+                    verificationExecutor: try Argon2idVerificationExecutor(
+                        hasher: accountProgramHasher
+                    ),
+                    loginAdmissionService: AccountLoginAdmissionService(
+                        store: controlDatabase,
+                        key: try AccountLoginAdmissionKey(serverKey)
+                    )
+                )
+                // Assigned by the signup runtime below; the portal's
+                // lifecycle/delete path fails closed (503) when no public
+                // signup policy assembled a lifecycle service.
+                var accountLifecycleService: AccountLifecycleService?
                 // Account program signup runtime (Task 3). Assembled only for
                 // a public signup policy; `closed` keeps the adapter nil so
                 // the createAccount route fails closed (503) rather than
                 // advertising a signup surface that cannot admit anyone.
                 let accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter?
                 var signupEmailOutboxService: SwanSignupEmailOutboxService?
-                if signupPolicy != .closed {
+                if resolvedSignupPolicy != .closed {
                     do {
                         let signupSecret: SignupSecret
                         do {
@@ -3403,10 +3493,10 @@ extension SwanCommand {
                             serverSecret: serverKey
                         )
                         let policyService = try SignupPolicyService(
-                            policy: signupPolicy
+                            policy: resolvedSignupPolicy
                         )
                         let turnstile: TurnstileVerifier?
-                        if signupPolicy == .openProtected {
+                        if resolvedSignupPolicy == .openProtected {
                             let secretData = try AccountProvisioningSecrets.requiredMounted32ByteSecret(
                                 secretFile: URL(fileURLWithPath: turnstileSecretFile!)
                             )
@@ -3439,16 +3529,10 @@ extension SwanCommand {
                         } else {
                             delivery = nil
                         }
-                        let sessions = SwanManagementSessionRuntime(
-                            store: controlDatabase,
-                            preAuthStore: controlDatabase,
-                            csrfStore: controlDatabase,
-                            preAuthSessionCoordinator: controlDatabase
-                        )
                         let provisioning = SwanCreateAccountProvisioningProduction(
                             passwordHasher: passwordHasher,
                             keyProvisioner: AccountKeyProvisioner(keyStore: keyStore),
-                            sessionRuntime: sessions,
+                            sessionRuntime: managementSessions,
                             database: controlDatabase,
                             signupSecret: signupSecret
                         )
@@ -3473,6 +3557,7 @@ extension SwanCommand {
                             invites: SignupInviteService(secret: signupSecret),
                             invitePersistence: controlDatabase
                         )
+                        accountLifecycleService = lifecycle
                         let capabilityVerifier = try SwanAccountLifecycleCapabilityVerifier(
                             sessionStore: controlDatabase,
                             stepUpStore: controlDatabase
@@ -3835,6 +3920,193 @@ extension SwanCommand {
                 } else {
                     permanentDeletionRuntime = nil
                 }
+                // Account program production composition (Task 7). The portal,
+                // legacy session, and did:web identity surfaces are assembled
+                // here from the durable SQLite stores and owner-only mounted
+                // secrets; no capability falls back to process memory, and an
+                // incomplete secret configuration refuses startup above.
+                let accountPortalHTTP: SwanAccountPortalHTTP?
+                let legacyAuthXRPC: SwanLegacyAuthXRPCAdapter?
+                let didWebIdentityHTTP: SwanDidWebIdentityHTTP?
+                var didWebRevalidationService: SwanDidWebRevalidationService?
+                if enableAccountPortal {
+                    do {
+                        // Legacy session HMAC secret: owner-only mounted file
+                        // or SWAN_LEGACY_AUTH_SECRET, validated at startup.
+                        let legacySecret = try Self.loadOwnerOnly32ByteSecret(
+                            file: legacyAuthSecretFile,
+                            environmentName: "SWAN_LEGACY_AUTH_SECRET",
+                            option: "--legacy-auth-secret-file"
+                        )
+                        // did:web reserved signing key: owner-only mounted file
+                        // or SWAN_DID_WEB_SIGNING_KEY, validated at startup.
+                        let didWebSecret = try Self.loadOwnerOnly32ByteSecret(
+                            file: didWebSigningKeyFile,
+                            environmentName: "SWAN_DID_WEB_SIGNING_KEY",
+                            option: "--did-web-signing-key-file"
+                        )
+                        let legacyService = try LegacyAuthService(
+                            store: controlDatabase,
+                            accountResolver: LegacyAccountResolver(
+                                resolve: { identifier in
+                                    let account: AccountControlAccount?
+                                    if let did = try? AccountIdentifiers.validateDID(identifier) {
+                                        account = try await accountProgramAccounts.account(did: did)
+                                    } else {
+                                        account = try await accountProgramAccounts.resolve(handle: identifier)
+                                    }
+                                    guard let account else { return nil }
+                                    return LegacyAccountRecord(
+                                        did: account.did,
+                                        handle: account.canonicalHandle,
+                                        passwordVerifier: account.credentialState == .configured ? "configured" : nil,
+                                        mfaEnabled: false,
+                                        email: nil,
+                                        emailConfirmed: nil,
+                                        emailAuthFactor: nil,
+                                        active: account.status.authorizesAccount,
+                                        status: account.status.rawValue
+                                    )
+                                },
+                                verifyPassword: { account, password, _ in
+                                    do {
+                                        let outcome = try await accountProgramAccounts.authenticateForLogin(
+                                            handle: account.handle,
+                                            password: password,
+                                            now: Date()
+                                        )
+                                        if case .authenticated = outcome { return true }
+                                        return false
+                                    } catch {
+                                        return false
+                                    }
+                                }
+                            ),
+                            secretKey: legacySecret,
+                            tokenIssuer: try HMACLegacyTokenIssuer(
+                                key: legacySecret,
+                                issuer: baseURL.host ?? "swan"
+                            ),
+                            managementAuthorizer: LegacyManagementAuthorizer(
+                                authorize: { accountDID, managementSessionToken, stepUpToken in
+                                    guard let metadata = try? await managementSessions.authenticate(
+                                        sessionValue: managementSessionToken
+                                    ) else { return false }
+                                    guard metadata.accountDID == accountDID else { return false }
+                                    // An empty step-up token is the
+                                    // session-only check (`authorizeSession`);
+                                    // a non-empty token requires a fresh
+                                    // phishing-resistant step-up receipt.
+                                    guard !stepUpToken.isEmpty else { return true }
+                                    guard metadata.strength.isStepUp,
+                                          let stepUpAt = metadata.lastStepUpAt,
+                                          Date().timeIntervalSince(stepUpAt) <= 300 else { return false }
+                                    let digest = Data(SHA256.hash(data: Data(stepUpToken.utf8)))
+                                    return (try? await controlDatabase.verifyIdentityStepUpReceipt(
+                                        sessionID: metadata.sessionID.rawValue,
+                                        accountDID: accountDID,
+                                        mfaStrength: "phishingResistant",
+                                        receiptDigest: digest,
+                                        now: Date()
+                                    )) == true
+                                }
+                            ),
+                            loginAdmission: LegacyLoginAdmission(
+                                admit: { identifier in
+                                    _ = try await accountProgramAccounts.admitLogin(
+                                        handle: identifier,
+                                        directPeer: "legacy-xrpc"
+                                    )
+                                }
+                            ),
+                            methodPolicy: .referenceLegacy
+                        )
+                        let legacyAdapter = SwanLegacyAuthXRPCAdapter(service: legacyService)
+                        legacyAuthXRPC = legacyAdapter
+
+                        // did:web identity surface. The reserved signing key is
+                        // the mounted secret-derived P-256 key; the document
+                        // fetcher is the peer-pinned OAuth transport.
+                        let fetchPolicy = try OAuthRemoteFetchPolicy()
+                        let documents = OAuthRemoteDocumentFetcher(
+                            policy: fetchPolicy,
+                            transport: try NIOPeerPinnedOAuthDocumentTransport(
+                                maximumTransportTimeout: fetchPolicy.timeout
+                            )
+                        )
+                        let signingKeyProvider = try ServeDidWebSigningKeyProvider(
+                            secret: didWebSecret
+                        )
+                        let reservations = SwanDurableSigningKeyReservationAdapter(
+                            store: controlDatabase,
+                            provider: signingKeyProvider
+                        )
+                        let identityService = SwanDidWebIdentityService(
+                            reservations: reservations,
+                            bindings: controlDatabase,
+                            publicPDSURL: baseURL.absoluteString,
+                            publicURL: baseURL.absoluteString,
+                            gracePeriod: TimeInterval(didWebRevalidationGraceSeconds),
+                            replacementAuthorizer: SwanDurableDidWebReplacementAuthorizer(
+                                verifier: controlDatabase
+                            ),
+                            stepUps: SwanDurableStepUpReceiptConsumer(
+                                store: controlDatabase
+                            ),
+                            signingKeyProvider: signingKeyProvider
+                        )
+                        let didWeb = SwanDidWebIdentityHTTP(
+                            service: identityService,
+                            sessions: managementSessions,
+                            documents: try SwanPeerPinnedDIDDocumentFetcher(
+                                documents: documents,
+                                plcOrigin: managementDeletionPLCConfiguration?
+                                    .origin
+                                    ?? PLCClientConfiguration.defaultProductionOrigin
+                            ),
+                            reservations: reservations,
+                            bindings: controlDatabase
+                        )
+                        didWebIdentityHTTP = didWeb
+                        didWebRevalidationService = SwanDidWebRevalidationService(
+                            scheduler: didWeb.revalidationScheduler,
+                            interval: .seconds(didWebRevalidationIntervalSeconds)
+                        )
+
+                        // Portal facade over the same durable stores and the
+                        // shared management-session runtime.
+                        let portalService = SwanAccountPortalService(
+                            accountDirectory: accountProgramAccounts,
+                            accountStore: controlDatabase,
+                            appPasswords: controlDatabase,
+                            factors: controlDatabase,
+                            legacy: legacyService,
+                            lifecycle: accountLifecycleService,
+                            identity: SwanAccountPortalIdentityProjectionProduction(
+                                didWeb: didWeb
+                            ),
+                            oauth: nil,
+                            sessions: managementSessions
+                        )
+                        accountPortalHTTP = SwanAccountPortalHTTP(
+                            configuration: try SwanAccountPortalConfiguration(
+                                publicOrigin: baseURL,
+                                staticDirectory: accountPortalDirectoryURL,
+                                signupPolicy: resolvedSignupPolicy
+                            ),
+                            sessions: managementSessions,
+                            service: portalService
+                        )
+                    } catch let error as ValidationError {
+                        throw error
+                    } catch {
+                        throw ValidationError("account program runtime is unavailable")
+                    }
+                } else {
+                    accountPortalHTTP = nil
+                    legacyAuthXRPC = nil
+                    didWebIdentityHTTP = nil
+                }
                 let server = permissionedRuntime.makeServer(
                     profile: loadedProfile,
                     configuration: .init(
@@ -3850,7 +4122,7 @@ extension SwanCommand {
                         // derived as `policy == .inviteRequired` and is never
                         // set independently. The same parsed policy drives the
                         // portal advertisement.
-                        inviteCodeRequired: signupPolicy == .inviteRequired,
+                        inviteCodeRequired: resolvedSignupPolicy == .inviteRequired,
                         publicRouteSurface: publicRouteSurface
                     ),
                     oauthRuntime: oauthRuntime,
@@ -3863,7 +4135,10 @@ extension SwanCommand {
                     authorizationServerConfiguration: authorizationServerConfiguration,
                     accountEmailXRPC: accountEmailXRPC,
                     actorPreferencesXRPC: actorPreferencesXRPC,
+                    accountPortalHTTP: accountPortalHTTP,
                     accountLifecycleXRPC: accountLifecycleXRPC,
+                    didWebIdentityHTTP: didWebIdentityHTTP,
+                    legacyAuthXRPC: legacyAuthXRPC,
                     xrpcPipethrough: xrpcPipethrough,
                     loginClientIdentityPolicy: loginClientIdentityPolicy,
                     publicFirehoseStreaming: publicFirehoseStreamingRuntime
@@ -3961,6 +4236,10 @@ extension SwanCommand {
                 if let signupEmailOutboxService {
                     services.append(signupEmailOutboxService)
                     logger.info("durable signup email outbox worker enabled with authenticated SMTP")
+                }
+                if let didWebRevalidationService {
+                    services.append(didWebRevalidationService)
+                    logger.info("durable did:web revalidation scheduler enabled")
                 }
                 if let publicFirehoseService {
                     services.append(publicFirehoseService)

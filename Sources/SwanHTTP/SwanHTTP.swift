@@ -420,6 +420,16 @@ public struct SwanHTTPServer: Sendable {
     /// deactivate/delete/invite/listInvites) are operator/management-session
     /// authorized and are not registered as live public routes in this task.
     public let accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter?
+    /// Optional did:web identity surface. When present, its public one-time
+    /// claim endpoint and management-session-authenticated reserve/claim/
+    /// rotate/remove/reverify/admission routes are registered before the
+    /// unknown-public guards and the `/xrpc/**` proxy fallback.
+    public let didWebIdentityHTTP: SwanDidWebIdentityHTTP?
+    /// Optional legacy-auth XRPC surface. When present, the exact
+    /// `SwanLegacyAuthXRPCAdapter.methodNSIDs` routes are registered before
+    /// the unknown-public guards and the `/xrpc/**` proxy fallback so a
+    /// legacy credential never leaves this host.
+    public let legacyAuthXRPC: SwanLegacyAuthXRPCAdapter?
     /// Local `app.bsky.actor.getPreferences` / `app.bsky.actor.putPreferences`
     /// routes. These can never be proxied to an AppView — the AppView does
     /// not store preferences, the PDS does — so this capability is nil unless
@@ -488,6 +498,8 @@ public struct SwanHTTPServer: Sendable {
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
         accountPortalHTTP: SwanAccountPortalHTTP? = nil,
         accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter? = nil,
+        didWebIdentityHTTP: SwanDidWebIdentityHTTP? = nil,
+        legacyAuthXRPC: SwanLegacyAuthXRPCAdapter? = nil,
         actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
         xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
@@ -510,6 +522,8 @@ public struct SwanHTTPServer: Sendable {
         self.accountEmailXRPC = accountEmailXRPC
         self.accountPortalHTTP = accountPortalHTTP
         self.accountLifecycleXRPC = accountLifecycleXRPC
+        self.didWebIdentityHTTP = didWebIdentityHTTP
+        self.legacyAuthXRPC = legacyAuthXRPC
         self.actorPreferencesXRPC = actorPreferencesXRPC
         self.xrpcPipethrough = xrpcPipethrough
         self.publicFirehoseStreaming = publicFirehoseStreaming
@@ -793,6 +807,35 @@ public struct SwanHTTPServer: Sendable {
         // OAuth/XRPC/proxy routes, preserves that precedence at the sole
         // supported router assembly boundary.
         accountPortalHTTP?.register(on: router)
+
+        // The did:web identity surface registers its public one-time claim
+        // endpoint and management-session-authenticated account API routes
+        // before the unknown-public guards and the `/xrpc/**` proxy fallback.
+        // The claim endpoint is public by design (the external domain operator
+        // must fetch the claim bytes without a Swan credential); the account
+        // API routes enforce the same cookie/CSRF/origin policy as the portal.
+        if let didWebIdentityHTTP {
+            registerSwanDidWebIdentityRoutes(
+                on: router,
+                didWeb: didWebIdentityHTTP,
+                publicOrigin: configuration.publicURL,
+                requestBodyAdmission: requestBodyAdmission
+            )
+        }
+
+        // The legacy-auth XRPC surface registers its exact
+        // `com.atproto.server.*` methods before the unknown-public guards and
+        // the `/xrpc/**` proxy fallback. A legacy credential therefore never
+        // leaves this host, and the app-password methods fail closed (403)
+        // because XRPC cannot carry the management-session/step-up context
+        // they require.
+        if let legacyAuthXRPC {
+            registerSwanLegacyAuthXRPC(
+                on: router,
+                adapter: legacyAuthXRPC,
+                requestBodyAdmission: requestBodyAdmission
+            )
+        }
 
         let publicURL = configuration.publicURL
         let profile = profile

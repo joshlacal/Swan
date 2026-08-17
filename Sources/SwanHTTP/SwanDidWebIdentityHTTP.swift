@@ -454,8 +454,10 @@ public struct SwanDidWebIdentityHTTP: Sendable {
         case let error as SwanError:
             switch error {
             case let .unauthorized(message):
-                if message.contains("step-up") { return .stepUpRequired }
+                // A replayed (already consumed) receipt is a consumed-claim
+                // conflict (409); a missing/stale step-up is 403.
                 if message.contains("replayed") { return .conflict }
+                if message.contains("step-up") { return .stepUpRequired }
                 // DID-document and reservation-tuple mismatches are
                 // field-safe validation failures, not authentication ones.
                 return .unprocessable(message)
