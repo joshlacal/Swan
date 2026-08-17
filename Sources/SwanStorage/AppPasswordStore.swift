@@ -1,6 +1,18 @@
 import Foundation
 import SwanCore
 
+/// Canonical app-password admission policy shared by the storage service and
+/// SQLite's durable trigger. Keeping the boundary here prevents a service-side
+/// limit from drifting above a schema-side limit and turning a typed refusal
+/// into an opaque database error.
+public enum AppPasswordStorePolicy {
+    /// Current-main's canonical per-account ceiling. Keep this value shared
+    /// with the SQLite admission trigger so populated databases can retain
+    /// more than the old account-program alpha limit without a split-brain
+    /// refusal between the service and storage layers.
+    public static let maximumPerAccount = 100
+}
+
 /// One app password, as it is safe to show a caller.
 ///
 /// Deliberately carries no credential material. The secret exists exactly once,

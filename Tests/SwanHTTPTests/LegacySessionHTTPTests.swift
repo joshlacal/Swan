@@ -1,3 +1,4 @@
+import Crypto
 import Foundation
 import Hummingbird
 import HummingbirdTesting
@@ -39,11 +40,13 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
         let root: URL
         let database: SQLiteControlDatabase
         let credentials: AppPasswordCredentials
+        let serviceAuthIssuer: TestServiceAuthIssuer
         let router: Router<SwanHTTPRequestContext>
     }
 
     private func makeFixture(
-        rateLimiter: any SwanLegacySessionRateLimiting = AlwaysAdmits()
+        rateLimiter: any SwanLegacySessionRateLimiting = AlwaysAdmits(),
+        serviceAuthIssuer: TestServiceAuthIssuer? = nil
     ) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "LegacySessionHTTPTests-" + UUID().uuidString)
@@ -65,6 +68,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             )
         )
         let credentials = try AppPasswordCredentials()
+        let serviceAuthIssuer = serviceAuthIssuer ?? TestServiceAuthIssuer()
         let router = Router(context: SwanHTTPRequestContext.self)
         SwanLegacySessionXRPCServer(
             sessions: try DurableLegacySessionService(
@@ -79,6 +83,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             accounts: accounts,
             directory: SwanDurableLegacySessionDirectory(store: database),
             rateLimiter: rateLimiter,
+            serviceAuthIssuer: serviceAuthIssuer,
             // These tests assert behaviour, not timing. The production floor is
             // 350ms and would add seconds across the suite.
             minimumFailedLoginDuration: .milliseconds(1)
@@ -92,7 +97,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
         // The fence these routes must coexist with, registered exactly as the
         // production assembly does.
         registerUnknownPublicEndpointGuards(on: router)
-        return Fixture(root: root, database: database, credentials: credentials, router: router)
+        return Fixture(root: root, database: database, credentials: credentials, serviceAuthIssuer: serviceAuthIssuer, router: router)
     }
 
     private func app(_ fixture: Fixture) -> some ApplicationProtocol {
@@ -404,6 +409,77 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    // MARK: - Service authentication
+
+    func testGetServiceAuthRequiresBothMethodAndAudienceAndBindsTheSignedClaims() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let audience = "did:web:remote.example#pds"
+        let method = "com.atproto.repo.getRecord"
+        let password = try await issuePassword(
+            fixture,
+            scopes: "atproto rpc:\(method)?aud=did:web:remote.example%23pds"
+        )
+        try await app(fixture).test(.router) { client in
+            var access = ""
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createSession",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string: "{\"identifier\":\"\(self.handle)\",\"password\":\"\(password)\"}")
+            ) { response in
+                access = try XCTUnwrap(try self.json(response)["accessJwt"] as? String)
+            }
+
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.getServiceAuth?aud=\(audience.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)!)&lxm=\(method)",
+                method: .get,
+                headers: [.authorization: "Bearer \(access)"]
+            ) { response in
+                XCTAssertEqual(response.status, .ok, self.body(response))
+                let token = try XCTUnwrap(try self.json(response)["token"] as? String)
+                let pieces = token.split(separator: ".")
+                XCTAssertEqual(pieces.count, 3)
+                let claims = try XCTUnwrap(
+                    JSONSerialization.jsonObject(
+                        with: try XCTUnwrap(Data(base64URLEncoded: String(pieces[1])))
+                    ) as? [String: Any]
+                )
+                XCTAssertEqual(claims["iss"] as? String, self.did)
+                XCTAssertEqual(claims["aud"] as? String, audience)
+                XCTAssertEqual(claims["lxm"] as? String, method)
+                let issuedAt = try XCTUnwrap(claims["iat"] as? NSNumber).int64Value
+                let expiresAt = try XCTUnwrap(claims["exp"] as? NSNumber).int64Value
+                XCTAssertEqual(expiresAt - issuedAt, 60)
+            }
+            let calls = await fixture.serviceAuthIssuer.calls()
+            XCTAssertEqual(calls.map(\.issuer), [self.did])
+            XCTAssertEqual(calls.map(\.audience), [audience])
+            XCTAssertEqual(calls.map(\.method), [method])
+
+            // Omitting either binding must never mint a broad token.
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.getServiceAuth?aud=\(audience.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)!)",
+                method: .get,
+                headers: [.authorization: "Bearer \(access)"]
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.getServiceAuth?aud=\(audience.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)!)&lxm=com.atproto.repo.deleteRecord",
+                method: .get,
+                headers: [.authorization: "Bearer \(access)"]
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+    }
+
     // MARK: - App-password management
 
     private func fullAccessToken(
@@ -563,7 +639,6 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             for nsid in [
                 "com.atproto.server.createAccount",
                 "com.atproto.server.resetPassword",
-                "com.atproto.server.getServiceAuth",
                 "com.atproto.server.requestPasswordReset",
             ] {
                 try await client.execute(
@@ -577,4 +652,29 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             }
         }
     }
+}
+
+private struct ServiceAuthCall: Sendable, Equatable {
+    let issuer: String
+    let audience: String
+    let method: String
+}
+
+private actor TestServiceAuthIssuer: SwanProxyServiceTokenIssuing {
+    private static let key = P256.Signing.PrivateKey()
+    private var recordedCalls: [ServiceAuthCall] = []
+
+    func issueProxyServiceToken(issuer: String, audience: String, method: String, now: Date) async throws -> String {
+        recordedCalls.append(.init(issuer: issuer, audience: audience, method: method))
+        return try ProxyServiceJWT.create(
+            issuer: issuer,
+            audience: audience,
+            method: method,
+            eventID: UUID().uuidString,
+            key: Self.key,
+            now: now
+        )
+    }
+
+    func calls() -> [ServiceAuthCall] { recordedCalls }
 }

@@ -180,6 +180,44 @@ final class AppPasswordStoreSQLiteTests: XCTestCase {
         }
     }
 
+    func testPerAccountCapacityAcceptsExactBoundaryAndPreservesTypedLimitError() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+
+        let now = Date(timeIntervalSince1970: 1_750_000_100)
+        for index in 0 ..< 100 {
+            _ = try await fixture.database.createAppPassword(
+                did: did,
+                name: "boundary-\(index)",
+                scopes: "atproto",
+                digest: Data(repeating: UInt8(index), count: 32),
+                now: now.addingTimeInterval(TimeInterval(index))
+            )
+        }
+        let listed = try await fixture.database.listAppPasswords(did: did)
+        XCTAssertEqual(listed.count, 100)
+
+        do {
+            _ = try await fixture.database.createAppPassword(
+                did: did,
+                name: "boundary-overflow",
+                scopes: "atproto",
+                digest: Data(repeating: 0xff, count: 32),
+                now: now
+            )
+            XCTFail("the 101st credential must be rejected")
+        } catch let error as AppPasswordStoreError {
+            XCTAssertEqual(error, .limitReached)
+        } catch {
+            XCTFail("capacity must preserve the typed limitReached error: \(error)")
+        }
+    }
+
     /// A credential must never be issued for an account that cannot use it. The
     /// foreign key would catch a missing account but not a deactivated one.
     func testAnUnknownAccountCannotBeIssuedACredential() async throws {

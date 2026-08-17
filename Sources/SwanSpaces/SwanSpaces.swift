@@ -246,6 +246,9 @@ public enum AuthorizationContext: Sendable, Equatable {
     /// DPoP-bound OAuth token is. Scope narrows what it reaches; it does not
     /// change that.
     case accountLegacySession(subject: String, permissions: SwanScopePermissions)
+    /// An opaque, revocable management session used only by `/account/api/*`.
+    /// It is never accepted as an XRPC bearer or permissioned-space grant.
+    case accountManagement(subject: String, sessionID: ManagementSessionID, strength: AuthenticationStrength)
     /// A short-lived, signature-verified user-to-space-host delegation. This
     /// context exists only while the authority evaluates whether that user may
     /// exchange it for a read credential. It is deliberately not a repository
@@ -302,7 +305,7 @@ public enum SpaceAuthorizationPolicy {
             else {
                 throw SwanError.unauthorized("OAuth scope does not cover this space operation")
             }
-        case .accountLegacySession:
+        case .accountManagement, .accountLegacySession:
             // The position this case exists to force a decision on, and the
             // answer is no.
             //

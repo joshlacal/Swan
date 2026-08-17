@@ -406,7 +406,7 @@ private func beginOAuthServerAuthorization(
     )
     return oauthServerHTML(
       .ok,
-      oauthServerLoginPage(csrf: issued.session.csrfToken),
+      SwanBrowserPages.login(csrf: issued.session.csrfToken),
       setCookie: oauthServerCookie(issued.value),
       formActionSource: oauthServerFormActionSource(pushed.binding.redirectURI)
     )
@@ -488,7 +488,7 @@ private func loginOAuthServerAuthorization(
     oauthServerLogEmptyExpansions(expansion.emptyExpansions, context: context, stage: "consent")
     return oauthServerHTML(
       .ok,
-      oauthServerConsentPage(
+      SwanBrowserPages.consent(
         csrf: issued.session.csrfToken,
         subject: authenticated.account.did,
         clientID: pushed.binding.clientID,
@@ -1305,33 +1305,6 @@ private func oauthServerLogEmptyExpansions(
     ])
 }
 
-private func oauthServerLoginPage(csrf: String) -> String {
-  "<!doctype html><html><head><meta charset=\"utf-8\"><title>Swan sign in</title></head><body><main><h1>Sign in to Swan</h1><form method=\"post\" action=\"/oauth/authorize\"><input type=\"hidden\" name=\"csrf\" value=\"\(csrf)\"><label>Handle <input name=\"handle\" autocomplete=\"username\" required></label><label>Password <input name=\"password\" type=\"password\" autocomplete=\"current-password\" required></label><button type=\"submit\">Continue</button></form></main></body></html>"
-}
-
-/// - Parameter emptyPermissionSets: NSIDs of `include:` scopes that resolved and
-///   expanded to nothing (§5.7.5). They MUST reach the page: the `.warn` this
-///   also emits reaches an operator, and the person authorizing never sees it,
-///   so an include that silently contributes zero capabilities would otherwise
-///   vanish from the consent screen entirely.
-private func oauthServerConsentPage(
-  csrf: String,
-  subject: String,
-  clientID: String,
-  scopes: Set<String>,
-  emptyPermissionSets: [String] = []
-) -> String {
-  let scopeSection = ScopeDescription.render(
-    scopes: scopes, emptyPermissionSets: emptyPermissionSets)
-  return "<!doctype html><html><head><meta charset=\"utf-8\"><title>Authorize Swan client</title></head><body><main><h1>Authorize client</h1><p>Signed in as \(oauthServerEscape(subject)).</p><p>Client: <code>\(oauthServerEscape(clientID))</code></p>\(scopeSection)<form method=\"post\" action=\"/oauth/authorize/consent\"><input type=\"hidden\" name=\"csrf\" value=\"\(oauthServerEscape(csrf))\"><button name=\"decision\" value=\"approve\" type=\"submit\">Approve</button><button name=\"decision\" value=\"deny\" type=\"submit\">Deny</button></form></main></body></html>"
-}
-
-private func oauthServerEscape(_ value: String) -> String {
-  value.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
-    .replacingOccurrences(of: ">", with: "&gt;").replacingOccurrences(of: "\"", with: "&quot;")
-    .replacingOccurrences(of: "'", with: "&#39;")
-}
-
 private func oauthServerHTML(
   _ status: HTTPResponse.Status, _ body: String, setCookie: String? = nil,
   formActionSource: String? = nil
@@ -1398,8 +1371,12 @@ private func oauthServerBrowserHeaders(
   var headers: HTTPFields = [.cacheControl: "no-store"]
   if let contentType { headers[.contentType] = contentType }
   let formAction = formActionSource.map { "'self' \($0)" } ?? "'self'"
+  // `style-src` names the hash of the inlined daisyUI stylesheet, so styled
+  // pages keep `default-src 'none'` with no `'unsafe-inline'` and no external
+  // style origin.
   headers[HTTPField.Name("Content-Security-Policy")!] =
-    "default-src 'none'; form-action \(formAction); frame-ancestors 'none'; base-uri 'none'"
+    "default-src 'none'; style-src \(SwanBrowserPages.browserStyleCSPSource); "
+    + "form-action \(formAction); frame-ancestors 'none'; base-uri 'none'"
   headers[HTTPField.Name("X-Frame-Options")!] = "DENY"
   headers[HTTPField.Name("Referrer-Policy")!] = "no-referrer"
   headers[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"

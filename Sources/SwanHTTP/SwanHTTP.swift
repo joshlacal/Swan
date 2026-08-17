@@ -420,6 +420,20 @@ public struct SwanHTTPServer: Sendable {
     /// control-store adapter, rate limiter, and SMTP worker at startup.
     public let accountEmailXRPC: SwanAccountEmailXRPCServer?
     public let legacySessionXRPC: SwanLegacySessionXRPCServer?
+    /// Optional account portal bundle. Its registration owns `/account/api/**`
+    /// and `/account/**` and is installed before every XRPC or proxy fallback.
+    public let accountPortalHTTP: SwanAccountPortalHTTP?
+    /// Optional account lifecycle XRPC adapter. When present, its
+    /// `com.atproto.server.createAccount` route is registered before the
+    /// unknown-public guards; the lifecycle methods (activate/status/
+    /// deactivate/delete/invite/listInvites) are operator/management-session
+    /// authorized and are not registered as live public routes in this task.
+    public let accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter?
+    /// Optional did:web identity surface. When present, its public one-time
+    /// claim endpoint and management-session-authenticated reserve/claim/
+    /// rotate/remove/reverify/admission routes are registered before the
+    /// unknown-public guards and the `/xrpc/**` proxy fallback.
+    public let didWebIdentityHTTP: SwanDidWebIdentityHTTP?
     /// Local `app.bsky.actor.getPreferences` / `app.bsky.actor.putPreferences`
     /// routes. These can never be proxied to an AppView — the AppView does
     /// not store preferences, the PDS does — so this capability is nil unless
@@ -487,6 +501,13 @@ public struct SwanHTTPServer: Sendable {
         blobStreamAdmission: PublicRepositorySpoolAdmission? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
         legacySessionXRPC: SwanLegacySessionXRPCServer? = nil,
+        accountPortalHTTP: SwanAccountPortalHTTP? = nil,
+        accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter? = nil,
+        didWebIdentityHTTP: SwanDidWebIdentityHTTP? = nil,
+        // Kept as a source-compatible, inert parameter for callers compiled
+        // against the account-program merge. Legacy XRPC is owned solely by
+        // `SwanLegacySessionXRPCServer`; this adapter is never registered.
+        legacyAuthXRPC: SwanLegacyAuthXRPCAdapter? = nil,
         actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
         xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
@@ -508,6 +529,10 @@ public struct SwanHTTPServer: Sendable {
         }
         self.accountEmailXRPC = accountEmailXRPC
         self.legacySessionXRPC = legacySessionXRPC
+        self.accountPortalHTTP = accountPortalHTTP
+        self.accountLifecycleXRPC = accountLifecycleXRPC
+        self.didWebIdentityHTTP = didWebIdentityHTTP
+        _ = legacyAuthXRPC
         self.actorPreferencesXRPC = actorPreferencesXRPC
         self.xrpcPipethrough = xrpcPipethrough
         self.publicFirehoseStreaming = publicFirehoseStreaming
@@ -803,6 +828,27 @@ public struct SwanHTTPServer: Sendable {
         )
         router.get("/health") { _, _ in "OK" }
 
+        // The portal registers its explicit API routes and API catch-all
+        // before the SPA fallback. Installing the entire bundle here, before
+        // OAuth/XRPC/proxy routes, preserves that precedence at the sole
+        // supported router assembly boundary.
+        accountPortalHTTP?.register(on: router)
+
+        // The did:web identity surface registers its public one-time claim
+        // endpoint and management-session-authenticated account API routes
+        // before the unknown-public guards and the `/xrpc/**` proxy fallback.
+        // The claim endpoint is public by design (the external domain operator
+        // must fetch the claim bytes without a Swan credential); the account
+        // API routes enforce the same cookie/CSRF/origin policy as the portal.
+        if let didWebIdentityHTTP {
+            registerSwanDidWebIdentityRoutes(
+                on: router,
+                didWeb: didWebIdentityHTTP,
+                publicOrigin: configuration.publicURL,
+                requestBodyAdmission: requestBodyAdmission
+            )
+        }
+
         let publicURL = configuration.publicURL
         let profile = profile
         let oauthPublicationGate = oauthPublicationGate
@@ -945,6 +991,37 @@ public struct SwanHTTPServer: Sendable {
                 roles: ["pds"],
                 methods: describedMethodNSIDs.map(CommunityServiceMethodReference.init(value:))
             ))
+        }
+
+        // `com.atproto.server.createAccount` is Swan's own PDS method and is
+        // registered before the unknown-public guards and the `/xrpc/**`
+        // proxy fallback. The adapter fails closed (503) when the signup
+        // runtime is not assembled; a registered route is never a bare 404.
+        if let accountLifecycleXRPC {
+            let adapter = accountLifecycleXRPC
+            router.post("/xrpc/com.atproto.server.createAccount") { request, context async -> Response in
+                let now = Date()
+                do {
+                    let input: SwanCreateAccountXRPCInput = try await decodeCreateAccountBody(
+                        request,
+                        context: context,
+                        requestBodyAdmission: requestBodyAdmission
+                    )
+                    let result = try await adapter.createAccount(
+                        input,
+                        peerAddress: context.remoteAddress,
+                        now: now
+                    )
+                    return jsonResponseWithStatus(.ok, body: CreateAccountResponse(
+                        did: result.account.did,
+                        handle: result.account.canonicalHandle,
+                        accessJwt: "",
+                        refreshJwt: ""
+                    ))
+                } catch {
+                    return lifecycleErrorResponse(for: error)
+                }
+            }
         }
 
         // Do not route permissioned traffic to the in-memory repository store
@@ -1521,4 +1598,133 @@ func jsonResponseWithStatus(_ status: HTTPResponse.Status, body: some Encodable)
     let encoder = JSONEncoder()
     let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
     return Response(status: status, headers: [.contentType: "application/json", .cacheControl: "no-store"], body: .init(byteBuffer: ByteBuffer(data: data)))
+}
+
+/// Wire response for `com.atproto.server.createAccount`. The durable signup
+/// path returns the account and a management session digest; the reference
+/// response shape carries empty JWTs because the OAuth session issuance is a
+/// later task.
+private struct CreateAccountResponse: Encodable {
+    let did: String
+    let handle: String
+    let accessJwt: String
+    let refreshJwt: String
+}
+
+/// Maps signup/lifecycle failures to the spec §3.3 status codes: 401
+/// authentication_required, 403 request_not_allowed, 422 field-safe codes,
+/// 409 duplicate, 429 rate limit, 503 service_unavailable. There is no
+/// fallback to weaker authentication.
+private func lifecycleErrorResponse(for error: any Error) -> Response {
+    let status: HTTPResponse.Status
+    let code: String
+    switch error {
+    case is TurnstileVerificationError:
+        status = .forbidden
+        code = "turnstile_verification_failed"
+    case SignupServiceError.closed:
+        status = .forbidden
+        code = "request_not_allowed"
+    case SignupServiceError.inviteRequired:
+        status = .forbidden
+        code = "invite_required"
+    case SignupServiceError.emailProofRequired:
+        status = .forbidden
+        code = "email_proof_required"
+    case SignupServiceError.turnstileRequired:
+        status = .forbidden
+        code = "turnstile_required"
+    case SignupServiceError.invalidIdentity:
+        status = HTTPResponse.Status(code: 422)
+        code = "invalid_identity"
+    case SignupServiceError.duplicateRequest:
+        status = .conflict
+        code = "duplicate_request"
+    case SignupServiceError.rateLimited:
+        status = .tooManyRequests
+        code = "rate_limited"
+    case AccountControlStoreError.duplicateDID:
+        status = .conflict
+        code = "duplicate_did"
+    case AccountControlStoreError.duplicateHandle:
+        status = .conflict
+        code = "duplicate_handle"
+    case AccountControlStoreError.invalidInput:
+        status = HTTPResponse.Status(code: 422)
+        code = "invalid_input"
+    case SwanError.invalidIdentifier:
+        status = HTTPResponse.Status(code: 422)
+        code = "invalid_request"
+    case SwanError.unauthorized:
+        status = .unauthorized
+        code = "authentication_required"
+    case SwanError.expired:
+        status = HTTPResponse.Status(code: 422)
+        code = "expired"
+    case is CancellationError:
+        status = .serviceUnavailable
+        code = "service_unavailable"
+    default:
+        status = .serviceUnavailable
+        code = "service_unavailable"
+    }
+    return jsonResponseWithStatus(status, body: ["error": code])
+}
+
+/// Decodes the `com.atproto.server.createAccount` body under the same strict
+/// JSON admission as the account-email XRPC surface: exact key set, no null
+/// values, bounded bytes. A malformed body surfaces as a 422 invalid_request
+/// through `lifecycleErrorResponse`.
+private func decodeCreateAccountBody(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> SwanCreateAccountXRPCInput {
+    let buffer: SwanAdmittedRequestBody
+    do {
+        buffer = try await collectAdmittedRequestBody(
+            request,
+            mediaType: .json,
+            admission: requestBodyAdmission.admission,
+            policy: requestBodyAdmission.policy,
+            maximumBytes: 8 * 1024,
+            termination: context.jsonWriteBodyTermination
+        )
+    } catch {
+        throw SwanError.invalidIdentifier("createAccount body")
+    }
+    defer { withExtendedLifetime(buffer) {} }
+    guard buffer.readableBytes > 0,
+          let bytes = buffer.getBytes(
+              at: buffer.readerIndex,
+              length: buffer.readableBytes
+          ) else {
+        throw SwanError.invalidIdentifier("createAccount body")
+    }
+    let data = Data(bytes)
+    do {
+        try StrictJSON.validate(data)
+        guard let object = try JSONSerialization.jsonObject(
+            with: data,
+            options: []
+        ) as? [String: Any] else {
+            throw SwanError.invalidIdentifier("createAccount body")
+        }
+        let keys = Set(object.keys)
+        let required: Set<String> = ["handle", "password"]
+        let optional: Set<String> = [
+            "email", "inviteCode", "verificationCode", "did",
+            "recoveryKey", "plcOp", "verificationPhone", "turnstileToken",
+        ]
+        guard required.isSubset(of: keys),
+              keys.isSubset(of: required.union(optional)),
+              !object.values.contains(where: { $0 is NSNull }) else {
+            throw SwanError.invalidIdentifier("createAccount body")
+        }
+        return try JSONDecoder().decode(SwanCreateAccountXRPCInput.self, from: data)
+    } catch let error as SwanError {
+        throw error
+    } catch {
+        throw SwanError.invalidIdentifier("createAccount body")
+    }
 }

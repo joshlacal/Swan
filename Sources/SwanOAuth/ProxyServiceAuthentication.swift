@@ -115,6 +115,40 @@ public protocol SwanProxyServiceTokenIssuing: Sendable {
         method: String,
         now: Date
     ) async throws -> String
+
+    /// Optional bounded expiry requested by `getServiceAuth`. Existing
+    /// issuers keep the original default implementation; the account-key
+    /// issuer overrides it so a valid `exp` is reflected in the signed
+    /// claims instead of being silently widened to the 60-second default.
+    func issueProxyServiceToken(
+        issuer: String,
+        audience: String,
+        method: String,
+        now: Date,
+        requestedExpiry: Date?
+    ) async throws -> String
+}
+
+public extension SwanProxyServiceTokenIssuing {
+    func issueProxyServiceToken(
+        issuer: String,
+        audience: String,
+        method: String,
+        now: Date,
+        requestedExpiry: Date?
+    ) async throws -> String {
+        guard requestedExpiry == nil else {
+            throw SwanError.unavailable(
+                "service-auth requested expiry is unsupported by this issuer"
+            )
+        }
+        return try await issueProxyServiceToken(
+            issuer: issuer,
+            audience: audience,
+            method: method,
+            now: now
+        )
+    }
 }
 
 /// Local issuer backed by the encrypted account key store. The control
@@ -139,6 +173,22 @@ public struct LocalAccountProxyServiceTokenIssuer: SwanProxyServiceTokenIssuing 
         method: String,
         now: Date = Date()
     ) async throws -> String {
+        try await issueProxyServiceToken(
+            issuer: issuer,
+            audience: audience,
+            method: method,
+            now: now,
+            requestedExpiry: nil
+        )
+    }
+
+    public func issueProxyServiceToken(
+        issuer: String,
+        audience: String,
+        method: String,
+        now: Date,
+        requestedExpiry: Date?
+    ) async throws -> String {
         let issuer = try AccountIdentifiers.validateDID(issuer)
         guard let authorizing = try await accounts.authorizingAccount(did: issuer) else {
             throw SwanError.unauthorized("proxy service token issuer is unavailable")
@@ -159,6 +209,34 @@ public struct LocalAccountProxyServiceTokenIssuer: SwanProxyServiceTokenIssuing 
         } catch {
             throw SwanError.unavailable("proxy service signing key is unavailable")
         }
+        let issuedSeconds = now.timeIntervalSince1970
+        guard issuedSeconds.isFinite,
+              issuedSeconds >= Double(Int64.min),
+              issuedSeconds <= Double(Int64.max) else {
+            throw SwanError.malformed("proxy service authentication time is invalid")
+        }
+        guard let issuedEpoch = Int64(exactly: issuedSeconds.rounded(.towardZero)) else {
+            throw SwanError.malformed("proxy service authentication time is invalid")
+        }
+        let lifetime: TimeInterval
+        if let requestedExpiry {
+            let expirySeconds = requestedExpiry.timeIntervalSince1970
+            guard expirySeconds.isFinite,
+                  expirySeconds >= Double(Int64.min),
+                  expirySeconds <= Double(Int64.max) else {
+                throw SwanError.malformed("proxy service authentication expiry is invalid")
+            }
+            guard let expiryEpoch = Int64(exactly: expirySeconds.rounded(.towardZero)) else {
+                throw SwanError.malformed("proxy service authentication expiry is invalid")
+            }
+            guard expiryEpoch > issuedEpoch,
+                  expiryEpoch <= issuedEpoch + Int64(ProxyServiceJWT.maximumLifetime) else {
+                throw SwanError.malformed("proxy service authentication expiry is invalid")
+            }
+            lifetime = TimeInterval(expiryEpoch - issuedEpoch)
+        } else {
+            lifetime = ProxyServiceJWT.maximumLifetime
+        }
         return try ProxyServiceJWT.create(
             issuer: issuer,
             audience: audience,
@@ -168,7 +246,7 @@ public struct LocalAccountProxyServiceTokenIssuer: SwanProxyServiceTokenIssuing 
             eventID: UUID().uuidString,
             key: privateKey,
             now: now,
-            lifetime: ProxyServiceJWT.maximumLifetime
+            lifetime: lifetime
         )
     }
 }

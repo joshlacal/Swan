@@ -37,6 +37,11 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.3"),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.37.2"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
+        // Direct dependency for the SwanCLITests composition tests (Task 1):
+        // the credential-isolation assertions steer `atproto-proxy` headers,
+        // which requires `HTTPField.Name` from HTTPTypes. Pinned to the
+        // version Hummingbird already resolves.
+        .package(url: "https://github.com/apple/swift-http-types.git", exact: "1.6.0"),
         // The pinned TypeScript PDS signs AT Protocol repository and space
         // JWTs with secp256k1 (`ES256K`). Keep verification in SwanOAuth
         // explicit rather than inheriting an unstable transitive product from
@@ -123,7 +128,7 @@ let package = Package(
         .target(
             name: "SwanSQLite",
             dependencies: [
-                "SwanStorage", "SwanPublicRepository", "SwanPublicFirehose",
+                "SwanAccounts", "SwanCore", "SwanStorage", "SwanPublicRepository", "SwanPublicFirehose",
                 .product(name: "Petrel", package: "Petrel"),
                 .product(name: "SQLiteNIO", package: "sqlite-nio"),
                 .product(name: "Crypto", package: "swift-crypto"),
@@ -274,6 +279,16 @@ let package = Package(
             dependencies: [
                 "SwanAccountExport", "SwanAccounts", "SwanPublicRepository",
                 "SwanSQLite", "SwanSpaces", "SwanStorage",
+                // Task 1 (runtime integration): the composition tests construct
+                // the production `SwanHTTPServer` the way `swan serve` does, so
+                // the test target needs the server type, the CLI module it
+                // mirrors, and the direct module dependencies Swift requires
+                // (no transitive imports).
+                "swan", "SwanHTTP", "SwanCore", "SwanOAuth", "SwanPublicFirehose",
+                .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HummingbirdTesting", package: "hummingbird"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),

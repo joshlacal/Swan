@@ -11,11 +11,6 @@ import SwanStorage
 /// loop over every row the account owns; see that type for why the digest can
 /// safely be deterministic.
 extension SQLiteControlDatabase: AppPasswordStore {
-    /// A ceiling, not a policy. Its job is to keep one account from making the
-    /// account-scoped list read or a future migration unbounded; it is far
-    /// above anything a person creates by hand.
-    static let appPasswordLimit = 100
-
     public func createAppPassword(
         did: String,
         name: String,
@@ -49,7 +44,7 @@ extension SQLiteControlDatabase: AppPasswordStore {
                 )
                 guard let row = existing.first,
                       case let .integer(total) = row.column("total"),
-                      total < Self.appPasswordLimit else {
+                      total < AppPasswordStorePolicy.maximumPerAccount else {
                     throw AppPasswordStoreError.limitReached
                 }
 
@@ -78,7 +73,7 @@ extension SQLiteControlDatabase: AppPasswordStore {
                         .text(identifier),
                         .text(did),
                         .text(name),
-                        digest.sqliteData!,
+                        .blob(ByteBuffer(data: digest)),
                         .text(scopes),
                         .integer(createdAt),
                     ]
@@ -113,12 +108,15 @@ extension SQLiteControlDatabase: AppPasswordStore {
 
     public func revokeAppPassword(did: String, name: String) async throws {
         _ = try await withConnectionGate {
-            // Idempotent by construction. Reporting "no such password" would
-            // turn revocation into a probe for which names an account holds.
-            try await connection.query(
-                "DELETE FROM account_app_passwords WHERE did = ? AND name = ?",
-                [.text(did), .text(name)]
-            )
+            // The canonical main schema cascades deletion through the legacy
+            // family and token rows. This keeps revocation account-bound and
+            // atomic without introducing a second session authority.
+            try await transaction {
+                _ = try await connection.query(
+                    "DELETE FROM account_app_passwords WHERE did = ? AND name = ?",
+                    [.text(did), .text(name)]
+                )
+            }
         }
     }
 

@@ -6,7 +6,13 @@ import SwanCore
 import SwanSQLite
 import SwanStorage
 import XCTest
-@testable import SwanAccounts
+@_spi(ServeStartup) @testable import SwanAccounts
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 final class SwanAccountsTests: XCTestCase {
     func testArgon2idHashVerifyUnicodeNULAndWrongPassword() throws {
@@ -404,6 +410,82 @@ final class SwanAccountsTests: XCTestCase {
             root: symlinkRoot,
             configuration: keyConfiguration(activeKeyID: "active", byte: 9)
         ))
+    }
+
+    func testDescriptorBackedExistingRootPinsValidatedInodeAcrossPathSwap() async throws {
+        let parent = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appending(path: "keys")
+        let movedRoot = parent.appending(path: "pinned-keys")
+        let replacementRoot = parent.appending(path: "replacement")
+        let reference = try keyReference()
+        let secondReference = try AccountKeyReference(
+            accountDID: Self.aliceDID,
+            purpose: .rotation,
+            generation: 1
+        )
+        let configuration = try keyConfiguration(activeKeyID: "active", byte: 41)
+
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let descriptor = root.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        defer {
+            if descriptor >= 0 { _ = close(descriptor) }
+        }
+
+        // This is the exact startup ordering: validate/open the root first,
+        // then let an attacker rename it and install a replacement at the
+        // original pathname before the store is initialized.
+        try FileManager.default.moveItem(at: root, to: movedRoot)
+        try FileManager.default.createDirectory(
+            at: replacementRoot,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        let store = try FileAccountKeyStore(
+            existingRootDirectoryDescriptor: descriptor,
+            configuration: configuration
+        )
+        try await store.create(Data(repeating: 1, count: 32), for: reference)
+
+        XCTAssertEqual(try keyFiles(in: movedRoot).count, 1)
+        XCTAssertTrue(try keyFiles(in: root).isEmpty)
+        XCTAssertTrue(try keyFiles(in: replacementRoot).isEmpty)
+
+        // Repeat the swap with a symlink. All marker, journal, and envelope
+        // operations must remain relative to the pinned inode and must never
+        // follow or create content below the replacement pathname.
+        try FileManager.default.removeItem(at: root)
+        try FileManager.default.createSymbolicLink(
+            at: root,
+            withDestinationURL: replacementRoot
+        )
+        try await store.create(Data(repeating: 2, count: 32), for: secondReference)
+
+        XCTAssertEqual(try keyFiles(in: movedRoot).count, 2)
+        XCTAssertTrue(try keyFiles(in: replacementRoot).isEmpty)
+        XCTAssertEqual(
+            try Data(contentsOf: movedRoot.appending(path: ".swan-active-kek-v1")),
+            Data("active".utf8)
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: replacementRoot.appending(path: ".swan-active-kek-v1").path
+            )
+        )
     }
 
     func testKeyStoreRejectsUnreadablePrivateKeySizesBeforeInstallation() async throws {

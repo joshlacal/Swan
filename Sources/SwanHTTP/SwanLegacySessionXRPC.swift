@@ -70,12 +70,13 @@ public protocol SwanLegacySessionRateLimiting: Sendable {
 public struct SwanLegacySessionXRPCServer: Sendable {
     static let maximumJSONBytes = 8 * 1024
 
-    /// The seven methods this service owns.
+    /// The eight methods this service owns.
     public static let methodNSIDs: Set<String> = [
         ComAtprotoServerCreateSession.typeIdentifier,
         ComAtprotoServerRefreshSession.typeIdentifier,
         ComAtprotoServerGetSession.typeIdentifier,
         ComAtprotoServerDeleteSession.typeIdentifier,
+        ComAtprotoServerGetServiceAuth.typeIdentifier,
         ComAtprotoServerCreateAppPassword.typeIdentifier,
         ComAtprotoServerListAppPasswords.typeIdentifier,
         ComAtprotoServerRevokeAppPassword.typeIdentifier,
@@ -89,6 +90,10 @@ public struct SwanLegacySessionXRPCServer: Sendable {
     private let accounts: DurableAccountDirectory
     private let directory: any SwanLegacySessionDirectory
     private let rateLimiter: any SwanLegacySessionRateLimiting
+    /// Account-key-backed service-JWT issuer. The route remains installed when
+    /// composition has no key store, but fails closed as unavailable rather
+    /// than falling back to the obsolete HMAC ``LegacyAuthService``.
+    private let serviceAuthIssuer: (any SwanProxyServiceTokenIssuing)?
     /// A floor on how long a failed `createSession` takes.
     ///
     /// Upstream pads every login to 350ms (`account-manager.ts:640`) for exactly
@@ -104,6 +109,7 @@ public struct SwanLegacySessionXRPCServer: Sendable {
         accounts: DurableAccountDirectory,
         directory: any SwanLegacySessionDirectory,
         rateLimiter: any SwanLegacySessionRateLimiting,
+        serviceAuthIssuer: (any SwanProxyServiceTokenIssuing)? = nil,
         minimumFailedLoginDuration: Duration = .milliseconds(350)
     ) {
         self.sessions = sessions
@@ -112,6 +118,7 @@ public struct SwanLegacySessionXRPCServer: Sendable {
         self.accounts = accounts
         self.directory = directory
         self.rateLimiter = rateLimiter
+        self.serviceAuthIssuer = serviceAuthIssuer
         self.minimumFailedLoginDuration = minimumFailedLoginDuration
     }
 
@@ -133,6 +140,7 @@ public struct SwanLegacySessionXRPCServer: Sendable {
             accounts: accounts,
             directory: directory,
             rateLimiter: rateLimiter,
+            serviceAuthIssuer: serviceAuthIssuer,
             requestBodyAdmission: requestBodyAdmission,
             minimumFailedLoginDuration: minimumFailedLoginDuration
         )
@@ -147,6 +155,10 @@ public struct SwanLegacySessionXRPCServer: Sendable {
         router.get("/xrpc/\(ComAtprotoServerGetSession.typeIdentifier)") {
             request, context async -> Response in
             await handlers.getSession(request, context: context)
+        }
+        router.get("/xrpc/\(ComAtprotoServerGetServiceAuth.typeIdentifier)") {
+            request, context async -> Response in
+            await handlers.getServiceAuth(request, context: context)
         }
         router.post("/xrpc/\(ComAtprotoServerDeleteSession.typeIdentifier)") {
             request, context async -> Response in
@@ -174,6 +186,7 @@ private struct Handlers: Sendable {
     let accounts: DurableAccountDirectory
     let directory: any SwanLegacySessionDirectory
     let rateLimiter: any SwanLegacySessionRateLimiting
+    let serviceAuthIssuer: (any SwanProxyServiceTokenIssuing)?
     let requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
     let minimumFailedLoginDuration: Duration
 
@@ -240,7 +253,7 @@ private struct Handlers: Sendable {
     private func authenticate(
         identifier: String,
         password: String
-    ) async throws -> LegacySessionTokens {
+    ) async throws -> SwanOAuth.LegacySessionTokens {
         let resolved: String?
         let handle: String?
         do {
@@ -301,7 +314,7 @@ private struct Handlers: Sendable {
     private func open(
         did: String,
         appPassword: AppPasswordRecord?
-    ) async throws -> LegacySessionTokens {
+    ) async throws -> SwanOAuth.LegacySessionTokens {
         do {
             return try await sessions.issue(did: did, appPassword: appPassword)
         } catch {
@@ -315,7 +328,7 @@ private struct Handlers: Sendable {
         do {
             try await requireNoQuery(request, context: context)
             let presented = try bearerToken(request)
-            let tokens: LegacySessionTokens
+            let tokens: SwanOAuth.LegacySessionTokens
             do {
                 tokens = try await sessions.refresh(refreshJWT: presented)
             } catch {
@@ -385,6 +398,63 @@ private struct Handlers: Sendable {
             // would make logout a probe.
             try? await sessions.revoke(refreshJWT: presented)
             return Response(status: .ok, headers: [:], body: .init())
+        } catch {
+            return response(for: error)
+        }
+    }
+
+    // MARK: getServiceAuth
+
+    /// Mints the canonical ES256 service token only after the durable legacy
+    /// access token has been authorized and the typed scope evaluator admits
+    /// the exact `(lxm, aud)` target. This endpoint never enters the obsolete
+    /// HMAC ``LegacyAuthService`` path.
+    func getServiceAuth(_ request: Request, context: SwanHTTPRequestContext) async -> Response {
+        do {
+            let now = Date()
+            guard let issuer = serviceAuthIssuer else {
+                throw SwanLegacySessionXRPCFailure.unavailable
+            }
+            let presented = try bearerToken(request)
+            let parameters = try serviceAuthParameters(from: request.uri.query)
+            if let requestedExpiry = parameters.exp {
+                let nowEpoch = Int64(now.timeIntervalSince1970.rounded(.towardZero))
+                guard requestedExpiry > nowEpoch,
+                      requestedExpiry <= nowEpoch + Int64(ProxyServiceJWT.maximumLifetime) else {
+                    throw SwanLegacySessionXRPCFailure.invalidRequest
+                }
+            }
+            let authorization: AuthorizationContext
+            do {
+                authorization = try await sessions.authorize(accessJWT: presented, now: now)
+            } catch {
+                throw SwanLegacySessionXRPCFailure.expiredToken
+            }
+            guard case let .accountLegacySession(did, permissions) = authorization else {
+                throw SwanLegacySessionXRPCFailure.expiredToken
+            }
+            do {
+                try permissions.requireRPC(
+                    .init(lxm: parameters.method, aud: parameters.audience)
+                )
+            } catch {
+                throw SwanLegacySessionXRPCFailure.authenticationRequired
+            }
+            let token: String
+            do {
+                token = try await issuer.issueProxyServiceToken(
+                    issuer: did,
+                    audience: parameters.audience,
+                    method: parameters.method,
+                    now: now,
+                    requestedExpiry: parameters.exp.map {
+                        Date(timeIntervalSince1970: TimeInterval($0))
+                    }
+                )
+            } catch {
+                throw SwanLegacySessionXRPCFailure.unavailable
+            }
+            return try json(.ok, ComAtprotoServerGetServiceAuth.Output(token: token))
         } catch {
             return response(for: error)
         }
@@ -511,6 +581,53 @@ private struct Handlers: Sendable {
             throw SwanLegacySessionXRPCFailure.invalidToken
         }
         return token
+    }
+
+    private struct ServiceAuthParameters: Sendable {
+        let audience: String
+        let method: String
+        let exp: Int64?
+    }
+
+    /// Strictly parses the generated `getServiceAuth` query shape. Both
+    /// audience and method are required even for transition grants; omitting
+    /// either would let a narrow legacy bearer mint a token with a broader
+    /// downstream meaning.
+    private func serviceAuthParameters(from query: String?) throws -> ServiceAuthParameters {
+        guard let query, !query.isEmpty,
+              let components = URLComponents(string: "https://swan.invalid/?\(query)"),
+              let items = components.queryItems else {
+            throw SwanLegacySessionXRPCFailure.authenticationRequired
+        }
+        var audience: String?
+        var method: String?
+        var exp: Int64?
+        for item in items {
+            switch item.name {
+            case "aud":
+                guard audience == nil, let value = item.value, !value.isEmpty else {
+                    throw SwanLegacySessionXRPCFailure.authenticationRequired
+                }
+                audience = value
+            case "lxm":
+                guard method == nil, let value = item.value,
+                      let nsid = try? NSID(nsidString: value) else {
+                    throw SwanLegacySessionXRPCFailure.authenticationRequired
+                }
+                method = nsid.description
+            case "exp":
+                guard exp == nil, let value = item.value, let parsed = Int64(value), parsed >= 0 else {
+                    throw SwanLegacySessionXRPCFailure.invalidRequest
+                }
+                exp = parsed
+            default:
+                throw SwanLegacySessionXRPCFailure.invalidRequest
+            }
+        }
+        guard let audience, let method else {
+            throw SwanLegacySessionXRPCFailure.authenticationRequired
+        }
+        return ServiceAuthParameters(audience: audience, method: method, exp: exp)
     }
 
     private func padTo(_ floor: Duration, since started: ContinuousClock.Instant) async {

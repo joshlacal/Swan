@@ -200,7 +200,7 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
                         )
                     )
                     XCTAssertTrue(
-                        consentHTML.contains("<code>atproto</code>")
+                        consentHTML.contains(">atproto</code>")
                     )
                     let cookie = try XCTUnwrap(response.headers[setCookieHeader])
                     consentCookie = self.cookieValue(cookie)
@@ -401,7 +401,7 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
                     )
                     XCTAssertTrue(
                         consentHTML.contains(
-                            "<code>\(scope.replacingOccurrences(of: "&", with: "&amp;"))</code>"
+                            ">\(scope.replacingOccurrences(of: "&", with: "&amp;"))</code>"
                         )
                     )
                     consentCookie = self.cookieValue(try XCTUnwrap(response.headers[setCookieHeader]))
@@ -654,7 +654,14 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(headers[.cacheControl], "no-store", file: file, line: line)
         XCTAssertEqual(
             headers[contentSecurityPolicyHeader],
-            "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+            "default-src 'none'; style-src \(SwanBrowserPages.browserStyleCSPSource); "
+                + "form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+            file: file,
+            line: line
+        )
+        // The stylesheet source must be a hash, never a relaxation.
+        XCTAssertTrue(
+            SwanBrowserPages.browserStyleCSPSource.hasPrefix("'sha256-"),
             file: file,
             line: line
         )

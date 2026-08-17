@@ -42,6 +42,11 @@ public enum AccountOperatorError: Error, Sendable, Equatable, LocalizedError {
 public struct AccountOperatorAuthorization: Sendable {
     fileprivate let isVerified: Bool
 
+    /// Explicit capability-boundary check for sibling operator adapters. The
+    /// value cannot be constructed outside this file; adapters must still
+    /// check it before mutating lifecycle state.
+    var isVerifiedForBoundary: Bool { isVerified }
+
     fileprivate init() {
         isVerified = true
     }

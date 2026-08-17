@@ -3,14 +3,12 @@ import SQLiteNIO
 import SwanCore
 import SwanStorage
 
-/// Legacy (app-password) session families, in the control database.
+/// Durable implementation of the canonical main legacy-session family.
 ///
-/// Modelled on the OAuth token families and reusing their design — family,
-/// rotation, reuse detection, family-wide revocation, digests at rest, never
-/// plaintext — but deliberately a SIBLING rather than an extension of them.
-/// `DurableOAuthTokenService.validateAccess` hard-requires a DPoP thumbprint on
-/// the token family; bolting a nullable one on to admit bearer sessions would
-/// weaken the invariant that makes every OAuth token sender-constrained.
+/// Access and refresh rows live in `legacy_session_tokens`, beside exactly one
+/// `legacy_session_families` authority. OAuth token families remain separate:
+/// they require DPoP binding, while these bearer sessions never add a nullable
+/// DPoP column to OAuth state.
 extension SQLiteControlDatabase: LegacySessionStore {
     public func createLegacySessionFamily(
         familyID: String,
@@ -22,6 +20,9 @@ extension SQLiteControlDatabase: LegacySessionStore {
         refreshExpiresAt: Date,
         now: Date
     ) async throws {
+        guard accessDigest.count == 32, refreshDigest.count == 32 else {
+            throw SwanError.malformed("legacy session digest")
+        }
         let createdAt = try legacySessionTimestamp(now)
         try await withConnectionGate {
             try await transaction {
@@ -55,6 +56,7 @@ extension SQLiteControlDatabase: LegacySessionStore {
     }
 
     public func legacyAccessSession(digest: Data, now: Date) async throws -> LegacySessionFamily? {
+        guard digest.count == 32 else { return nil }
         let instant = try legacySessionTimestamp(now)
         return try await withConnectionGate { () -> LegacySessionFamily? in
             let rows = try await connection.query(
@@ -67,6 +69,7 @@ extension SQLiteControlDatabase: LegacySessionStore {
                   AND t.expires_at > ?
                   AND t.consumed_at IS NULL
                   AND f.revoked_at IS NULL
+                LIMIT 1
                 """,
                 [digest.sqliteData!, .integer(instant)]
             )
@@ -76,12 +79,11 @@ extension SQLiteControlDatabase: LegacySessionStore {
     }
 
     public func legacyRefreshSession(digest: Data, now: Date) async throws -> LegacyRefreshResolution {
+        guard digest.count == 32 else { return .rejected }
         let instant = try legacySessionTimestamp(now)
         return try await withConnectionGate { () -> LegacyRefreshResolution in
-            // Deliberately does NOT filter on `consumed_at`: a consumed token is
-            // the reuse signal, and filtering it out here would make reuse
-            // indistinguishable from an unknown token, silently discarding the
-            // one piece of evidence that a refresh token was captured.
+            // Do not filter consumed rows: they are the replay evidence that
+            // distinguishes a captured refresh token from an unknown token.
             let rows = try await connection.query(
                 """
                 SELECT t.consumed_at,
@@ -91,6 +93,7 @@ extension SQLiteControlDatabase: LegacySessionStore {
                 WHERE t.digest = ?
                   AND t.kind = 'refresh'
                   AND t.expires_at > ?
+                LIMIT 1
                 """,
                 [digest.sqliteData!, .integer(instant)]
             )
@@ -113,32 +116,32 @@ extension SQLiteControlDatabase: LegacySessionStore {
         replacementRefreshExpiresAt: Date,
         now: Date
     ) async throws -> Bool {
+        guard refreshDigest.count == 32,
+              accessDigest.count == 32,
+              replacementRefreshDigest.count == 32 else { return false }
         let instant = try legacySessionTimestamp(now)
         return try await withConnectionGate { () -> Bool in
             try await transaction {
-                // The UPDATE is the concurrency gate. Two simultaneous refreshes
-                // of the same token both read `.active`, but only one can move
-                // `consumed_at` from NULL, so exactly one mints a replacement
-                // and the loser is told to retry rather than being handed a
-                // second live session.
-                _ = try await connection.query(
+                // The conditional UPDATE is the single-use concurrency gate.
+                // RETURNING makes the winner explicit even when two callers
+                // share an identical clock value.
+                let claimed = try await connection.query(
                     """
                     UPDATE legacy_session_tokens
                     SET consumed_at = ?
                     WHERE digest = ?
+                      AND family_id = ?
                       AND kind = 'refresh'
                       AND consumed_at IS NULL
+                    RETURNING digest
                     """,
-                    [.integer(instant), refreshDigest.sqliteData!]
+                    [
+                        .integer(instant),
+                        refreshDigest.sqliteData!,
+                        .text(familyID),
+                    ]
                 )
-                let claimed = try await connection.query(
-                    """
-                    SELECT consumed_at FROM legacy_session_tokens
-                    WHERE digest = ? AND consumed_at = ?
-                    """,
-                    [refreshDigest.sqliteData!, .integer(instant)]
-                )
-                guard !claimed.isEmpty else { return false }
+                guard claimed.count == 1 else { return false }
 
                 try await insertLegacyToken(
                     digest: accessDigest,
@@ -161,11 +164,10 @@ extension SQLiteControlDatabase: LegacySessionStore {
         let instant = try legacySessionTimestamp(now)
         try await withConnectionGate {
             try await transaction {
-                // The family row is kept and stamped rather than deleted, so a
-                // reuse detection remains visible to an operator afterwards.
-                // Its tokens go, so nothing about it is presentable again.
+                // Keep the family row as durable replay/revocation evidence;
+                // delete its token material so no credential remains usable.
                 _ = try await connection.query(
-                    "UPDATE legacy_session_families SET revoked_at = ? WHERE family_id = ?",
+                    "UPDATE legacy_session_families SET revoked_at = COALESCE(revoked_at, ?) WHERE family_id = ?",
                     [.integer(instant), .text(familyID)]
                 )
                 _ = try await connection.query(
@@ -212,7 +214,6 @@ extension SQLiteControlDatabase: LegacySessionStore {
               case let .integer(createdAt) = row.column("created_at") else {
             throw AccountControlStoreError.malformedRecord
         }
-        // NULL is the account-password case, not a malformed row.
         var appPasswordID: String?
         if let value = row.column("app_password_id"), !value.isNull {
             guard case let .text(identifier) = value else {
@@ -225,13 +226,13 @@ extension SQLiteControlDatabase: LegacySessionStore {
             guard case let .integer(stamp) = value else {
                 throw AccountControlStoreError.malformedRecord
             }
-            revokedAt = Date(timeIntervalSince1970: Double(stamp) / 1_000_000)
+            revokedAt = Self.date(stamp)
         }
         return LegacySessionFamily(
             familyID: familyID,
             did: did,
             appPasswordID: appPasswordID,
-            createdAt: Date(timeIntervalSince1970: Double(createdAt) / 1_000_000),
+            createdAt: Self.date(createdAt),
             revokedAt: revokedAt
         )
     }
@@ -244,5 +245,9 @@ extension SQLiteControlDatabase: LegacySessionStore {
             throw SwanError.malformed("legacy session timestamp is out of range")
         }
         return Int(microseconds.rounded(.down))
+    }
+
+    private static func date(_ value: Int) -> Date {
+        Date(timeIntervalSince1970: Double(value) / 1_000_000)
     }
 }
