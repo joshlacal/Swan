@@ -49,7 +49,7 @@ func registerSwanDidWebIdentityRoutes(
         }
         do {
             let payload = try await didWebBody(request, context: context, requestBodyAdmission: requestBodyAdmission)
-            let input = try JSONDecoder().decode(SwanDidWebReserveRequest.self, from: payload)
+            let input = try didWebDecode(SwanDidWebReserveRequest.self, from: payload)
             let result = try await didWeb.reserve(input, sessionValue: session)
             return didWebJSON(.ok, result)
         } catch {
@@ -64,7 +64,7 @@ func registerSwanDidWebIdentityRoutes(
         }
         do {
             let payload = try await didWebBody(request, context: context, requestBodyAdmission: requestBodyAdmission)
-            let input = try JSONDecoder().decode(SwanDidWebClaimRequest.self, from: payload)
+            let input = try didWebDecode(SwanDidWebClaimRequest.self, from: payload)
             let result = try await didWeb.claim(input, sessionValue: session)
             return didWebJSON(.ok, result)
         } catch {
@@ -79,7 +79,7 @@ func registerSwanDidWebIdentityRoutes(
         }
         do {
             let payload = try await didWebBody(request, context: context, requestBodyAdmission: requestBodyAdmission)
-            let input = try JSONDecoder().decode(SwanDidWebRotateRequest.self, from: payload)
+            let input = try didWebDecode(SwanDidWebRotateRequest.self, from: payload)
             let result = try await didWeb.rotate(input, sessionValue: session)
             return didWebJSON(.ok, result)
         } catch {
@@ -94,7 +94,7 @@ func registerSwanDidWebIdentityRoutes(
         }
         do {
             let payload = try await didWebBody(request, context: context, requestBodyAdmission: requestBodyAdmission)
-            let input = try JSONDecoder().decode(SwanDidWebRemoveRequest.self, from: payload)
+            let input = try didWebDecode(SwanDidWebRemoveRequest.self, from: payload)
             let result = try await didWeb.remove(input, sessionValue: session)
             return didWebJSON(.ok, result)
         } catch {
@@ -214,13 +214,17 @@ private func didWebFetchSiteAllows(_ request: Request, requireHeader: Bool = fal
 }
 
 private func didWebAccountCookie(named name: String, request: Request) -> String? {
-    request.headers[values: .cookie].first.flatMap { header in
-        header.split(separator: ";").map(String.init).first {
-            $0.trimmingCharacters(in: .whitespaces).hasPrefix("\(name)=")
-        }.map {
-            String($0.trimmingCharacters(in: .whitespaces).dropFirst(name.count + 1))
+    // Hummingbird may surface a single `Cookie: a=1; b=2` header as multiple
+    // values split on `;`, so every value must be searched — reading only the
+    // first would silently drop the CSRF cookie on real browser requests.
+    for header in request.headers[values: .cookie] {
+        for part in header.split(separator: ";").map(String.init) {
+            let trimmed = part.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("\(name)=") else { continue }
+            return String(trimmed.dropFirst(name.count + 1))
         }
     }
+    return nil
 }
 
 private func didWebConstantTime(_ lhs: String, _ rhs: String) -> Bool {
@@ -261,6 +265,21 @@ private func didWebBody(
         throw SwanDidWebIdentityHTTPError.unprocessable("invalid request body")
     }
     return Data(bytes)
+}
+
+/// Decodes an admitted did:web mutation payload. A malformed, missing, or
+/// wrongly typed body is a client validation failure (422), never an
+/// infrastructure outage (503): the body was already admitted and bounded, so
+/// a decode failure cannot be a storage/resolver/key-store fault.
+private func didWebDecode<Value: Decodable>(
+    _ type: Value.Type,
+    from data: Data
+) throws -> Value {
+    do {
+        return try JSONDecoder().decode(type, from: data)
+    } catch {
+        throw SwanDidWebIdentityHTTPError.unprocessable("invalid request body")
+    }
 }
 
 private enum DidWebAccountStatus {

@@ -38,19 +38,22 @@ func registerSwanLegacyAuthXRPC(
         }
     }
 
-    // com.atproto.server.refreshSession — refreshJwt in the body, no Input type.
+    // com.atproto.server.refreshSession — bodyless; the refresh JWT travels
+    // in `Authorization: Bearer ...` exactly as the generated client sends it
+    // (the lexicon declares no input schema). The same RFC 9110 bearer
+    // extraction the other bearer methods use validates the credential; a
+    // JSON body is not accepted here.
     router.post("/xrpc/com.atproto.server.refreshSession") { request, context async -> Response in
         do {
-            let body: LegacyRefreshSessionBody = try await decodeLegacyExactJSON(
+            let token = try SwanLegacyBearerAuthorizer.accessToken(from: request.headers)
+            try await requireLegacyEmptyBody(
                 request,
                 context: context,
-                requestBodyAdmission: requestBodyAdmission,
-                required: ["refreshJwt"],
-                optional: []
+                requestBodyAdmission: requestBodyAdmission
             )
             return jsonResponseWithStatus(
                 .ok,
-                body: try await adapter.refreshSession(refreshToken: body.refreshJwt)
+                body: try await adapter.refreshSession(refreshToken: token)
             )
         } catch {
             return legacyAuthErrorResponse(for: error)
@@ -115,10 +118,6 @@ func registerSwanLegacyAuthXRPC(
             jsonResponseWithStatus(.forbidden, body: ["error": "request_not_allowed"])
         }
     }
-}
-
-private struct LegacyRefreshSessionBody: Decodable {
-    let refreshJwt: String
 }
 
 /// Parses the `getServiceAuth` query parameters under the same strictness the

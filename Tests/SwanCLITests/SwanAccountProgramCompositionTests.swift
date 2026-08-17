@@ -314,6 +314,86 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
         }
     }
 
+    /// `com.atproto.server.refreshSession` is bodyless: the generated client
+    /// sends the refresh JWT in `Authorization: Bearer ...` (the lexicon
+    /// declares no input schema). The local route must accept that header and
+    /// must not require a JSON body — a bodyless request with the bearer
+    /// header refreshes, and a JSON body is refused.
+    func testLegacyRefreshSessionAcceptsBearerHeaderAndBodylessRequest() async throws {
+        let fixture = try await makeServer(
+            signupPolicy: .closed,
+            installPipethrough: true,
+            installLegacy: true
+        )
+        defer { fixture.cleanup() }
+        do {
+            let app = fixture.server.buildApplication(
+                logger: Logger(label: "SwanAccountProgramCompositionTests.refresh")
+            )
+            try await app.test(.router) { client in
+                // Establish a legacy session to obtain a real refresh JWT.
+                var refreshJwt: String?
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.server.createSession",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: ByteBuffer(string: #"{"identifier":"alice.test","password":"password"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let body = String(decoding: response.body.readableBytesView, as: UTF8.self)
+                    XCTAssertTrue(body.contains("\"refreshJwt\""), body)
+                    let object = try? JSONSerialization.jsonObject(
+                        with: Data(body.utf8)
+                    ) as? [String: Any]
+                    refreshJwt = object?["refreshJwt"] as? String
+                }
+                let token = try XCTUnwrap(refreshJwt)
+
+                // Bodyless request with the refresh JWT in the bearer header.
+                var steered = HTTPFields()
+                steered[.authorization] = "Bearer \(token)"
+                steered[HTTPField.Name("atproto-proxy")!] = "did:web:attacker.example#svc"
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.server.refreshSession",
+                    method: .post,
+                    headers: steered
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let body = String(decoding: response.body.readableBytesView, as: UTF8.self)
+                    XCTAssertTrue(body.contains("\"accessJwt\""), body)
+                    XCTAssertTrue(body.contains("\"refreshJwt\""), body)
+                }
+
+                // A JSON body is not accepted: the route is bodyless.
+                var withBody = HTTPFields()
+                withBody[.authorization] = "Bearer \(token)"
+                withBody[.contentType] = "application/json"
+                withBody[HTTPField.Name("atproto-proxy")!] = "did:web:attacker.example#svc"
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.server.refreshSession",
+                    method: .post,
+                    headers: withBody,
+                    body: ByteBuffer(string: #"{"refreshJwt":"\(token)"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+
+                // A missing bearer header is a stable local 401.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.server.refreshSession",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+            }
+            XCTAssertEqual(fixture.sender.recorded().count, 0)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     /// The app-password XRPC methods fail closed (403) because XRPC cannot
     /// carry the management-session/step-up context they require — they are
     /// never handed to the proxy.
@@ -403,6 +483,84 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
         }
     }
 
+    /// Malformed, missing, or wrongly typed did:web mutation payloads are
+    /// client validation failures: the admitted JSON body decodes to a typed
+    /// 422 `unprocessable_entity`, never a 503 infrastructure outage.
+    func testDidWebIdentityRoutesMapMalformedBodiesToUnprocessable() async throws {
+        let fixture = try await makeServer(
+            signupPolicy: .closed,
+            installPipethrough: true,
+            installDidWeb: true
+        )
+        defer { fixture.cleanup() }
+        do {
+            let issued = try await fixture.sessions.issue(
+                accountDID: "did:plc:abcdefghijklmnopqrstuvwx"
+            )
+            let app = fixture.server.buildApplication(
+                logger: Logger(label: "SwanAccountProgramCompositionTests.didweb422")
+            )
+            try await app.test(.router) { client in
+                var headers = HTTPFields()
+                headers[HTTPField.Name("Origin")!] = "https://swan.example"
+                headers[HTTPField.Name("Sec-Fetch-Site")!] = "same-origin"
+                headers[.contentType] = "application/json"
+                headers[.cookie] = "\(SwanManagementSessionRuntime.sessionCookieName)=\(issued.sessionValue); \(SwanManagementSessionRuntime.csrfCookieName)=\(issued.csrfValue)"
+                headers[HTTPField.Name("X-Swan-CSRF")!] = issued.csrfValue
+
+                // Wrongly typed field (expiresAt is a string, not a number).
+                try await client.execute(
+                    uri: "/account/api/identity/reserve",
+                    method: .post,
+                    headers: headers,
+                    body: ByteBuffer(string: #"{"requestID":"r","targetDID":"did:web:example.com","handle":"alice.test","expiresAt":"not-a-date"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status.code, 422)
+                    let body = String(decoding: response.body.readableBytesView, as: UTF8.self)
+                    XCTAssertTrue(body.contains("unprocessable_entity"), body)
+                }
+                // Missing required keys.
+                try await client.execute(
+                    uri: "/account/api/identity/claim",
+                    method: .post,
+                    headers: headers,
+                    body: ByteBuffer(string: #"{"requestID":42}"#)
+                ) { response in
+                    XCTAssertEqual(response.status.code, 422)
+                    let body = String(decoding: response.body.readableBytesView, as: UTF8.self)
+                    XCTAssertTrue(body.contains("unprocessable_entity"), body)
+                }
+                // Malformed JSON.
+                try await client.execute(
+                    uri: "/account/api/identity/rotate",
+                    method: .post,
+                    headers: headers,
+                    body: ByteBuffer(string: "not-json")
+                ) { response in
+                    XCTAssertEqual(response.status.code, 422)
+                    let body = String(decoding: response.body.readableBytesView, as: UTF8.self)
+                    XCTAssertTrue(body.contains("unprocessable_entity"), body)
+                }
+                // Wrongly typed field (stepUpReceipt is a number).
+                try await client.execute(
+                    uri: "/account/api/identity/remove",
+                    method: .post,
+                    headers: headers,
+                    body: ByteBuffer(string: #"{"stepUpReceipt":7}"#)
+                ) { response in
+                    XCTAssertEqual(response.status.code, 422)
+                    let body = String(decoding: response.body.readableBytesView, as: UTF8.self)
+                    XCTAssertTrue(body.contains("unprocessable_entity"), body)
+                }
+            }
+            XCTAssertEqual(fixture.sender.recorded().count, 0)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     // MARK: - Fixture
 
     private struct DescribeServerBody: Decodable {
@@ -418,6 +576,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
         let directory: SQLitePreMigratedAccountDirectory
         let firehose: SQLiteFirehoseDatabase?
         let sender: RecordingProxySender
+        let sessions: SwanManagementSessionRuntime
         let server: SwanHTTPServer
 
         func close() async throws {
@@ -747,6 +906,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 directory: try XCTUnwrap(directory),
                 firehose: firehose,
                 sender: sender,
+                sessions: sessions,
                 server: server
             )
         } catch {
