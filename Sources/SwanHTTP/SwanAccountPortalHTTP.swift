@@ -225,7 +225,8 @@ public struct SwanAccountPortalHTTP: Sendable {
                 guard mutationHeadersAllow(request, expectedOrigin: configuration.publicOrigin),
                       let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),
                       let csrf = accountCookie(named: SwanManagementSessionRuntime.csrfCookieName, request: request),
-                      request.headers[HTTPField.Name("X-Swan-CSRF")!] == csrf,
+                      let header = request.headers[HTTPField.Name("X-Swan-CSRF")!],
+                      constantTime(csrf, header),
                       (try? await sessions.acceptsCSRF(sessionValue: session, csrfValue: csrf)) == true else { return accountError(.forbidden) }
                 do {
                     let metadata = try await sessions.authenticate(sessionValue: session)
@@ -349,7 +350,19 @@ private func fetchSiteAllows(_ request: Request, requireHeader: Bool = false) ->
     return site == "same-origin" || site == "none"
 }
 
-private func accountCookie(named name: String, request: Request) -> String? { request.headers[values: .cookie].first.flatMap { header in header.split(separator: ";").map(String.init).first { $0.trimmingCharacters(in: .whitespaces).hasPrefix("\(name)=") }.map { String($0.trimmingCharacters(in: .whitespaces).dropFirst(name.count + 1)) } } }
+private func accountCookie(named name: String, request: Request) -> String? {
+    // Hummingbird may surface a single `Cookie: a=1; b=2` header as multiple
+    // values split on `;`, so every value must be searched — reading only the
+    // first would silently drop the CSRF cookie on real browser requests.
+    for header in request.headers[values: .cookie] {
+        for part in header.split(separator: ";").map(String.init) {
+            let trimmed = part.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("\(name)=") else { continue }
+            return String(trimmed.dropFirst(name.count + 1))
+        }
+    }
+    return nil
+}
 private func constantTime(_ lhs: String, _ rhs: String) -> Bool { guard lhs.utf8.count == rhs.utf8.count else { return false }; var result: UInt8 = 0; for (a, b) in zip(lhs.utf8, rhs.utf8) { result |= a ^ b }; return result == 0 }
 
 private func accountJSON(_ status: HTTPResponse.Status, _ body: some Encodable, cookies: [String] = []) -> Response { var headers: HTTPFields = [.contentType: "application/json", .cacheControl: "no-store"]; for cookie in cookies { headers.append(.init(name: HTTPField.Name("Set-Cookie")!, value: cookie)) }; let data = (try? JSONEncoder().encode(body)) ?? Data("{}".utf8); return Response(status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(data: data))) }

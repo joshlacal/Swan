@@ -33,3 +33,24 @@ Management-session/OAuth HTTP integration remains an exact integration patch aft
 ## Verification
 
 `swift test --filter Task7MFATests` passed (10 tests, 0 failures; SwiftPM also selected unrelated targets with zero tests). This focused command rebuilt affected products; no full repository test suite was run.
+
+## Final-review fix wave (portal cookie parsing + constant-time CSRF)
+
+Two final-review findings in the portal HTTP adapter were fixed on top of `9d44bf29`:
+
+1. **Portal multi-value cookie parsing.** `SwanAccountPortalHTTP.accountCookie(named:request:)` previously read only `request.headers[values: .cookie].first` and only the first semicolon-delimited part of that one value. Hummingbird may surface a single `Cookie: a=1; b=2` header as multiple values split on `;`, so a real browser request could silently drop the CSRF cookie (or the management session cookie) and falsely 403. The parser now searches every value and every semicolon-delimited part, matching the already-proven `didWebAccountCookie` behavior in `SwanDidWebIdentityRoutes.swift`.
+2. **Constant-time CSRF comparison in the DELETE wildcard group.** The `DELETE /account/api/{sessions,app-passwords,factors/passkeys}/*` route group compared `request.headers["X-Swan-CSRF"] == csrf` with a plain `==`. It now uses the existing `constantTime(csrf, header)` helper, satisfying spec §3.2 exactly like every other portal mutation route.
+
+Regression test: `SwanAccountProgramCompositionTests.testPortalDeleteWildcardAcceptsSeparateCookieHeaderValues` constructs genuinely separate `Cookie` header values (the management session and CSRF cookies in distinct header lines via `headers[values: .cookie] = [...]`) and exercises the production-shaped server (`ServePermissionedRuntime.makeServer`) through a real mutating DELETE (`/account/api/sessions/current`). It asserts the mutation is accepted (200, `"accepted":true`) rather than falsely 403ing, and that a mismatched CSRF header still fails closed (403). Red/green confirmed: with the old first-value-only parser the test fails with a false 403; with the fix it passes. Origin, fetch-site, JSON content-type, session authentication, and `acceptsCSRF` checks are all preserved.
+
+Evidence:
+
+```
+swift build                                                       # Build complete!
+swift test --filter SwanAccountProgramCompositionTests/testPortalDeleteWildcardAcceptsSeparateCookieHeaderValues
+    # passed (1 test, 0 failures); red-check failed with old parser (403)
+swift test --filter SwanAccountProgramCompositionTests           # 11 tests, 0 failures
+swift test --filter AccountPortalSecurityHTTPTests               # 7 tests, 0 failures
+```
+
+Checkpoint: `jj commit` on top of `9d44bf29` — see the commit ID in the commit message/`jj log` for this fix wave.

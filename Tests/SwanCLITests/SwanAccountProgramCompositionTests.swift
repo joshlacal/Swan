@@ -561,6 +561,78 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
         }
     }
 
+    /// The portal's DELETE wildcard routes (`/account/api/{sessions,
+    /// app-passwords, factors/passkeys}/*`) must find the management session
+    /// and CSRF cookies when Hummingbird surfaces them as genuinely separate
+    /// `Cookie` header values — a real browser may send the management
+    /// session and CSRF cookies in distinct header lines. The parser searches
+    /// every value and every semicolon-delimited part, and the CSRF header is
+    /// compared in constant time: a request carrying both cookies in separate
+    /// values reaches the mutation path instead of falsely 403ing.
+    func testPortalDeleteWildcardAcceptsSeparateCookieHeaderValues() async throws {
+        let fixture = try await makeServer(
+            signupPolicy: .closed,
+            installPipethrough: true
+        )
+        defer { fixture.cleanup() }
+        do {
+            let issued = try await fixture.sessions.issue(
+                accountDID: "did:plc:abcdefghijklmnopqrstuvwx"
+            )
+            let app = fixture.server.buildApplication(
+                logger: Logger(label: "SwanAccountProgramCompositionTests.portal-delete")
+            )
+            try await app.test(.router) { client in
+                // Genuinely separate Cookie header values: the management
+                // session and the CSRF cookie arrive in distinct header
+                // lines, exactly as Hummingbird may surface a browser's
+                // `Cookie: a=1; b=2` header.
+                var headers = HTTPFields()
+                headers[HTTPField.Name("Origin")!] = "https://swan.example"
+                headers[HTTPField.Name("Sec-Fetch-Site")!] = "same-origin"
+                headers[.contentType] = "application/json"
+                headers[values: .cookie] = [
+                    "\(SwanManagementSessionRuntime.sessionCookieName)=\(issued.sessionValue)",
+                    "\(SwanManagementSessionRuntime.csrfCookieName)=\(issued.csrfValue)",
+                ]
+                headers[HTTPField.Name("X-Swan-CSRF")!] = issued.csrfValue
+
+                // The mutating DELETE reaches the portal service: both
+                // cookies are found across the separate values, the CSRF
+                // header matches in constant time, and the session accepts
+                // the CSRF — the mutation is accepted, never a false 403.
+                try await client.execute(
+                    uri: "/account/api/sessions/current",
+                    method: .delete,
+                    headers: headers,
+                    body: ByteBuffer(string: "{}")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let body = String(decoding: response.body.readableBytesView, as: UTF8.self)
+                    XCTAssertTrue(body.contains("\"accepted\":true"), body)
+                }
+
+                // The origin/CSRF checks still fail closed: a mismatched CSRF
+                // header with the same separate cookie values is a 403.
+                var mismatched = headers
+                mismatched[HTTPField.Name("X-Swan-CSRF")!] = "not-the-csrf"
+                try await client.execute(
+                    uri: "/account/api/sessions/current",
+                    method: .delete,
+                    headers: mismatched,
+                    body: ByteBuffer(string: "{}")
+                ) { response in
+                    XCTAssertEqual(response.status, .forbidden)
+                }
+            }
+            XCTAssertEqual(fixture.sender.recorded().count, 0)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     // MARK: - Fixture
 
     private struct DescribeServerBody: Decodable {
