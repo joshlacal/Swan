@@ -227,7 +227,7 @@ public struct SwanAccountPortalHTTP: Sendable {
         .api, .assets, .unknownGuards,
     ]
 
-    private let configuration: SwanAccountPortalConfiguration
+    public let configuration: SwanAccountPortalConfiguration
     private let sessions: SwanManagementSessionRuntime
     private let service: any SwanAccountPortalServing
 
@@ -485,7 +485,7 @@ public struct SwanAccountPortalHTTP: Sendable {
     public func registerAssets(on router: Router<SwanHTTPRequestContext>) {
         router.get("/account") { [configuration] _, _ -> Response in staticAccountResponse(configuration: configuration, requestPath: "/account") }
         router.get("/account/auth-tokens.css") { [configuration] _, _ -> Response in staticAuthCSSResponse(configuration: configuration) }
-        router.get("/account/*") { [configuration] request, _ -> Response in staticAccountResponse(configuration: configuration, requestPath: request.uri.path) }
+        router.get("/account/**") { [configuration] request, _ -> Response in staticAccountResponse(configuration: configuration, requestPath: request.uri.path) }
     }
 
     public func registerUnknownGuards(on router: Router<SwanHTTPRequestContext>) {

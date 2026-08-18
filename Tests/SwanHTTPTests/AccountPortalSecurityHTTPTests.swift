@@ -713,6 +713,39 @@ final class AccountPortalSecurityHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testStaticAssetsServeMultiSegmentPathsAndSPAFallback() async throws {
+        let portal = try makePortal()
+        let router = Router(context: SwanHTTPRequestContext.self)
+        portal.register(on: router)
+        let app = Application(router: router)
+
+        // Write a multi-segment nested asset to the portal directory
+        let nestedDir = portal.configuration.staticDirectory.appending(path: "_app/immutable/entry")
+        try FileManager.default.createDirectory(at: nestedDir, withIntermediateDirectories: true)
+        try Data("console.log('start');".utf8).write(to: nestedDir.appending(path: "start.js"))
+
+        try await app.test(.router) { client in
+            // Multi-segment asset request
+            try await client.execute(uri: "/account/_app/immutable/entry/start.js", method: .get) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertEqual(response.headers[.contentType], "text/javascript; charset=utf-8")
+                XCTAssertEqual(response.headers[.cacheControl], "public, max-age=31536000, immutable")
+            }
+
+            // Extensionless SPA navigation request
+            try await client.execute(uri: "/account/login", method: .get) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertEqual(response.headers[.contentType], "text/html; charset=utf-8")
+                XCTAssertEqual(response.headers[.cacheControl], "no-cache")
+            }
+
+            // Missing asset with extension returns 404
+            try await client.execute(uri: "/account/_app/immutable/entry/missing.js", method: .get) { response in
+                XCTAssertEqual(response.status, .notFound)
+            }
+        }
+    }
+
     private func makePortalRouter(policy: SignupPolicy = .closed) throws -> Router<SwanHTTPRequestContext> {
         let router = Router(context: SwanHTTPRequestContext.self)
         try makePortal(policy: policy).register(on: router)

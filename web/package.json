@@ -7,6 +7,7 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "lint": "eslint . --ignore-pattern 'src/**' --ignore-pattern 'tests/**'",
     "test": "vitest run",
+    "test:unit": "vitest run",
     "build": "vite build",
     "test:browser": "playwright test"
   },
