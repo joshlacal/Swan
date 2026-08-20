@@ -19,6 +19,32 @@ final class RepositoryMSTVectorTests: XCTestCase {
         XCTAssertEqual(RepositoryMSTCodec.keyDepth(forASCIIKey: "app.bsky.feed.post/90"), 3)
     }
 
+    func testDecodeRejectsCanonicalButInvalidPrefixCompression() throws {
+        let recordCID = CID.fromDAGCBOR(Data([0xa0]))
+        let bytes = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "l", value: NSNull()),
+            (key: "e", value: [OrderedCBORMap(entries: [
+                (key: "p", value: UInt64(1)),
+                (key: "k", value: Data("x".utf8)),
+                (key: "v", value: ATProtoLink(cid: recordCID)),
+                (key: "t", value: NSNull()),
+            ])] as [Any]),
+        ]))
+        XCTAssertThrowsError(try RepositoryMSTCodec.decode(bytes)) { error in
+            XCTAssertEqual(error as? RepositoryMSTValidationError, .invalidPrefixCompression)
+        }
+    }
+
+    func testEncodeRejectsNegativePrefixLengthWithoutTrapping() throws {
+        let recordCID = CID.fromDAGCBOR(Data([0xa0]))
+        let node = RepositoryMSTNode(leftTreeCID: nil, entries: [
+            .init(prefixLength: -1, keySuffix: Data("x".utf8), valueCID: recordCID, rightTreeCID: nil),
+        ])
+        XCTAssertThrowsError(try RepositoryMSTCodec.encode(node)) { error in
+            XCTAssertEqual(error as? RepositoryMSTValidationError, .invalidPrefixCompression)
+        }
+    }
+
     func testCanonicalPrefixCompressedNodeVector() throws {
         let first = try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "0")
         let second = try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "2")
