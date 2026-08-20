@@ -231,6 +231,8 @@ private struct Handlers: Sendable {
 
     func createSession(_ request: Request, context: SwanHTTPRequestContext) async -> Response {
         let started = ContinuousClock.now
+        // Set after the body decodes, read by the rejection log below.
+        var factorTokenShape = "absent"
         do {
             try await requireNoQuery(request, context: context)
             let input: ComAtprotoServerCreateSession.Input = try await decodeExactJSON(
@@ -248,10 +250,22 @@ private struct Handlers: Sendable {
                 throw SwanLegacySessionXRPCFailure.rateLimited
             }
 
+            // An empty `authFactorToken` is a client sending the field it always
+            // sends, not a token: several clients populate the key with `""`
+            // when the user never entered a code. Treating it as present sends
+            // the request down the factor-verification branch, where an empty
+            // string can only fail, and turns a correct password into
+            // `AuthenticationRequired` with no way for the user to tell.
+            let presentedFactorToken = input.authFactorToken.flatMap {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+            }
+            factorTokenShape =
+                input.authFactorToken == nil
+                ? "absent" : (presentedFactorToken == nil ? "empty" : "present")
             let tokens = try await authenticate(
                 identifier: input.identifier,
                 password: input.password,
-                authFactorToken: input.authFactorToken,
+                authFactorToken: presentedFactorToken,
                 sessionBinding: UUID().uuidString.lowercased()
             )
             let handle = try await directory.canonicalHandle(did: tokens.did)
@@ -280,10 +294,16 @@ private struct Handlers: Sendable {
             // server-side — the state that made a live bsky.app 401 impossible
             // to attribute. `LegacyLoginStage` is a fixed vocabulary and never
             // carries an identifier, a password, or a token.
+            // `factorToken` records the SHAPE of the field, never its value:
+            // `absent`, `empty` (the key was sent with no code in it), or
+            // `present`. That distinction is the difference between "wrong
+            // password" and "client sent a field this server mishandled", and
+            // guessing between the two is what made the last 401 opaque.
             context.logger.info(
                 "legacy createSession rejected",
                 metadata: [
                     "stage": .string(legacyLoginStage(for: error).rawValue),
+                    "factorToken": .string(factorTokenShape),
                 ]
             )
             return response(for: error)
