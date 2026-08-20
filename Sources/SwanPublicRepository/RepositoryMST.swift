@@ -45,13 +45,11 @@ public struct RepositoryMST: Sendable {
         case leaf(RepositoryMSTLeaf)
         case tree(RepositoryMST)
     }
-
     private let blocks: any PublicRepositoryBlockSource
     private let pointer: CID?
-    private let knownEntries: [Entry]?
-    private let knownLayer: Int?
+    private var knownEntries: [Entry]?
+    private var knownLayer: Int?
     private let limits: PublicRepositoryLimits
-
     private init(
         blocks: any PublicRepositoryBlockSource,
         pointer: CID?,
@@ -102,28 +100,36 @@ public struct RepositoryMST: Sendable {
     }
 
     public func get(_ path: PublicRepositoryPath) async throws -> CID? {
-        let entries = try await entries()
+        var copy = self
+        return try await copy.getMutating(path)
+    }
+
+    private mutating func getMutating(_ path: PublicRepositoryPath) async throws -> CID? {
+        let (entries, _) = try await loadNode()
         let index = firstLeafIndex(notLessThan: path, in: entries)
         if case let .leaf(leaf)? = entry(at: index, in: entries), leaf.path == path {
             return leaf.recordCID
         }
         if case let .tree(subtree)? = entry(at: index - 1, in: entries) {
-            return try await subtree.get(path)
+            var child = subtree
+            return try await child.getMutating(path)
         }
         return nil
     }
 
     public func adding(path: PublicRepositoryPath, recordCID: CID) async throws -> Self {
         try validateRecordCID(recordCID)
-        return try await add(path: path, recordCID: recordCID, knownDepth: nil)
+        var copy = self
+        return try await copy.add(path: path, recordCID: recordCID, knownDepth: nil)
     }
 
     public func updating(path: PublicRepositoryPath, recordCID: CID) async throws -> Self {
         try validateRecordCID(recordCID)
-        let entries = try await entries()
+        var copy = self
+        let (entries, _) = try await copy.loadNode()
         let index = firstLeafIndex(notLessThan: path, in: entries)
         if case let .leaf(found)? = entry(at: index, in: entries), found.path == path {
-            return try replacing(
+            return try copy.replacing(
                 entryAt: index,
                 with: .leaf(.init(path: path, recordCID: recordCID)),
                 in: entries
@@ -131,18 +137,21 @@ public struct RepositoryMST: Sendable {
         }
         if case let .tree(subtree)? = entry(at: index - 1, in: entries) {
             let updated = try await subtree.updating(path: path, recordCID: recordCID)
-            return try replacing(entryAt: index - 1, with: .tree(updated), in: entries)
+            return try copy.replacing(entryAt: index - 1, with: .tree(updated), in: entries)
         }
         throw RepositoryMSTMutationError.missingKey
     }
 
     public func deleting(path: PublicRepositoryPath) async throws -> Self {
-        try await deleteRecursively(path: path).trimmingTop()
+        var copy = self
+        var deleted = try await copy.deleteRecursively(path: path)
+        return try await deleted.trimmingTop()
     }
 
     public func listed() async throws -> [RepositoryMSTLeaf] {
         var result: [RepositoryMSTLeaf] = []
-        try await appendLeaves(to: &result)
+        var copy = self
+        try await copy.appendLeaves(to: &result)
         return result
     }
 
@@ -202,7 +211,8 @@ public struct RepositoryMST: Sendable {
             maximumVisitedNodes: maximumVisitedNodes
         )
         var leaves: [RepositoryMSTLeaf] = []
-        try await appendPageLeaves(
+        var copy = self
+        try await copy.appendPageLeaves(
             lowerBound: lowerBound,
             upperBound: upperBound,
             reverse: reverse,
@@ -220,7 +230,8 @@ public struct RepositoryMST: Sendable {
 
     public func materialized() async throws -> MaterializedRepositoryMST {
         var collector = NewBlockCollector(limits: limits)
-        let root = try await collectNewBlocks(into: &collector)
+        var copy = self
+        let root = try await copy.collectNewBlocks(into: &collector)
         let map: PublicRepositoryBlockMap
         do {
             map = try PublicRepositoryBlockMap(
@@ -237,14 +248,13 @@ public struct RepositoryMST: Sendable {
 
     // MARK: Mutation
 
-    private func add(
+    private mutating func add(
         path: PublicRepositoryPath,
         recordCID: CID,
         knownDepth: Int?
     ) async throws -> Self {
         let keyDepth = knownDepth ?? path.keyDepth
-        let layer = try await layer()
-        let entries = try await entries()
+        let (entries, layer) = try await loadNode()
         let leaf = Entry.leaf(.init(path: path, recordCID: recordCID))
 
         if keyDepth == layer {
@@ -253,7 +263,8 @@ public struct RepositoryMST: Sendable {
                 throw RepositoryMSTMutationError.duplicateKey
             }
             if case let .tree(subtree)? = entry(at: index - 1, in: entries) {
-                let split = try await subtree.split(around: path)
+                var child = subtree
+                let split = try await child.split(around: path)
                 var replacement: [Entry] = []
                 if let left = split.left { replacement.append(.tree(left)) }
                 replacement.append(leaf)
@@ -261,24 +272,25 @@ public struct RepositoryMST: Sendable {
                 var updated = Array(entries[..<(index - 1)])
                 updated.append(contentsOf: replacement)
                 updated.append(contentsOf: entries[index...])
-                return try newTree(updated)
+                return try newTree(updated, layer: layer)
             }
             var updated = entries
             updated.insert(leaf, at: index)
-            return try newTree(updated)
+            return try newTree(updated, layer: layer)
         }
 
         if keyDepth < layer {
             let index = firstLeafIndex(notLessThan: path, in: entries)
             if case let .tree(subtree)? = entry(at: index - 1, in: entries) {
-                let updated = try await subtree.add(
+                var child = subtree
+                let updated = try await child.add(
                     path: path,
                     recordCID: recordCID,
                     knownDepth: keyDepth
                 )
                 return try replacing(entryAt: index - 1, with: .tree(updated), in: entries)
             }
-            let child = Self(
+            var child = Self(
                 blocks: blocks,
                 pointer: nil,
                 entries: [],
@@ -292,7 +304,7 @@ public struct RepositoryMST: Sendable {
             )
             var updated = entries
             updated.insert(.tree(updatedChild), at: index)
-            return try newTree(updated)
+            return try newTree(updated, layer: layer)
         }
 
         let split = try await split(around: path)
@@ -318,13 +330,14 @@ public struct RepositoryMST: Sendable {
         ).checked()
     }
 
-    private func deleteRecursively(path: PublicRepositoryPath) async throws -> Self {
-        let entries = try await entries()
+    private mutating func deleteRecursively(path: PublicRepositoryPath) async throws -> Self {
+        let (entries, _) = try await loadNode()
         let index = firstLeafIndex(notLessThan: path, in: entries)
         if case let .leaf(found)? = entry(at: index, in: entries), found.path == path {
             if case let .tree(left)? = entry(at: index - 1, in: entries),
                case let .tree(right)? = entry(at: index + 1, in: entries) {
-                let merged = try await left.appendingMerge(right)
+                var leftCopy = left
+                let merged = try await leftCopy.appendingMerge(right)
                 var updated = Array(entries[..<(index - 1)])
                 updated.append(.tree(merged))
                 if index + 2 < entries.count {
@@ -338,8 +351,10 @@ public struct RepositoryMST: Sendable {
         }
 
         if case let .tree(subtree)? = entry(at: index - 1, in: entries) {
-            let updatedSubtree = try await subtree.deleteRecursively(path: path)
-            let childEntries = try await updatedSubtree.entries()
+            var child = subtree
+            let updatedSubtree = try await child.deleteRecursively(path: path)
+            var updatedChild = updatedSubtree
+            let (childEntries, _) = try await updatedChild.loadNode()
             if childEntries.isEmpty {
                 var updated = entries
                 updated.remove(at: index - 1)
@@ -350,16 +365,16 @@ public struct RepositoryMST: Sendable {
         throw RepositoryMSTMutationError.missingKey
     }
 
-    private func split(around path: PublicRepositoryPath) async throws -> (left: Self?, right: Self?) {
-        let entries = try await entries()
-        let currentLayer = try await layer()
+    private mutating func split(around path: PublicRepositoryPath) async throws -> (left: Self?, right: Self?) {
+        let (entries, currentLayer) = try await loadNode()
         let index = firstLeafIndex(notLessThan: path, in: entries)
         var leftEntries = Array(entries[..<index])
         var rightEntries = Array(entries[index...])
 
         if case let .tree(boundary)? = leftEntries.last {
             leftEntries.removeLast()
-            let splitBoundary = try await boundary.split(around: path)
+            var boundaryCopy = boundary
+            let splitBoundary = try await boundaryCopy.split(around: path)
             if let left = splitBoundary.left { leftEntries.append(.tree(left)) }
             if let right = splitBoundary.right { rightEntries.insert(.tree(right), at: 0) }
         }
@@ -369,26 +384,33 @@ public struct RepositoryMST: Sendable {
         return (left, right)
     }
 
-    private func appendingMerge(_ other: Self) async throws -> Self {
-        guard try await layer() == other.layer() else {
+    private mutating func appendingMerge(_ other: Self) async throws -> Self {
+        var otherCopy = other
+        let (_, selfLayer) = try await loadNode()
+        let (_, otherLayer) = try await otherCopy.loadNode()
+        guard selfLayer == otherLayer else {
             throw RepositoryMSTMutationError.invalidLayer
         }
-        var leftEntries = try await entries()
-        var rightEntries = try await other.entries()
+        let (selfEntries, _) = try await loadNode()
+        let (otherEntries, _) = try await otherCopy.loadNode()
+        var leftEntries = selfEntries
+        var rightEntries = otherEntries
         if case let .tree(leftBoundary)? = leftEntries.last,
            case let .tree(rightBoundary)? = rightEntries.first {
             leftEntries.removeLast()
             rightEntries.removeFirst()
-            let merged = try await leftBoundary.appendingMerge(rightBoundary)
+            var leftCopy = leftBoundary
+            let merged = try await leftCopy.appendingMerge(rightBoundary)
             return try newTree(leftEntries + [.tree(merged)] + rightEntries)
         }
         return try newTree(leftEntries + rightEntries)
     }
 
-    private func trimmingTop() async throws -> Self {
-        let entries = try await entries()
+    private mutating func trimmingTop() async throws -> Self {
+        let (entries, _) = try await loadNode()
         if entries.count == 1, case let .tree(child) = entries[0] {
-            return try await child.trimmingTop()
+            var childCopy = child
+            return try await childCopy.trimmingTop()
         }
         return self
     }
@@ -407,9 +429,15 @@ public struct RepositoryMST: Sendable {
     }
 
     // MARK: Loading and encoding
-
-    private func entries() async throws -> [Entry] {
-        if let knownEntries { return knownEntries }
+    private mutating func loadNode() async throws -> (entries: [Entry], layer: Int) {
+        if let knownEntries, let knownLayer {
+            return (knownEntries, knownLayer)
+        }
+        if let knownEntries {
+            let l = try await computeLayer(from: knownEntries)
+            knownLayer = l
+            return (knownEntries, l)
+        }
         guard let pointer, let bytes = try await blocks.block(for: pointer) else {
             throw RepositoryMSTMutationError.missingBlock
         }
@@ -457,25 +485,34 @@ public struct RepositoryMST: Sendable {
         guard result.count <= limits.maximumMSTEntriesPerNode * 2 + 1 else {
             throw RepositoryMSTMutationError.entryLimitExceeded
         }
-        return result
-    }
-
-    private func layer() async throws -> Int {
+        let resolvedLayer: Int
         if let knownLayer {
             guard (0 ... 128).contains(knownLayer) else {
                 throw RepositoryMSTMutationError.invalidLayer
             }
-            return knownLayer
+            resolvedLayer = knownLayer
+        } else if let inferredLayer {
+            guard (0 ... 128).contains(inferredLayer) else {
+                throw RepositoryMSTMutationError.invalidLayer
+            }
+            resolvedLayer = inferredLayer
+        } else {
+            resolvedLayer = try await computeLayer(from: result)
         }
-        let entries = try await entries()
+        knownEntries = result
+        knownLayer = resolvedLayer
+        return (result, resolvedLayer)
+    }
+
+    private func computeLayer(from entries: [Entry]) async throws -> Int {
         for entry in entries {
             if case let .leaf(leaf) = entry {
                 return leaf.path.keyDepth
             }
         }
         for entry in entries {
-            if case let .tree(child) = entry {
-                let childLayer = try await child.layer()
+            if case var .tree(child) = entry {
+                let (_, childLayer) = try await child.loadNode()
                 guard childLayer < 128 else { throw RepositoryMSTMutationError.invalidLayer }
                 return childLayer + 1
             }
@@ -483,22 +520,30 @@ public struct RepositoryMST: Sendable {
         return 0
     }
 
-    private func encoded() async throws -> (cid: CID, bytes: Data) {
-        let entries = try await entries()
+    private mutating func collectNewBlocks(into collector: inout NewBlockCollector) async throws -> CID {
+        // A CID-only node is an untouched subtree loaded from the immutable
+        // base source. Its pointer is already the complete persisted
+        // projection, so do not fetch/decode it merely to rediscover that it
+        // contributes no new blocks. This is the same stored-pointer
+        // short-circuit used by the pinned TypeScript implementation.
+        if let pointer, knownEntries == nil {
+            return pointer
+        }
+        let (resolvedEntries, _) = try await loadNode()
         var leaves: [RepositoryMSTLeaf] = []
         var leftTreeCID: CID?
         var index = 0
-        if case let .tree(left)? = entries.first {
-            leftTreeCID = try await left.rootCID()
+        if case var .tree(left)? = resolvedEntries.first {
+            leftTreeCID = try await left.collectNewBlocks(into: &collector)
             index = 1
         }
-        while index < entries.count {
-            guard case let .leaf(leaf) = entries[index] else {
+        while index < resolvedEntries.count {
+            guard case let .leaf(leaf) = resolvedEntries[index] else {
                 throw RepositoryMSTMutationError.invalidNode
             }
             var rightTreeCID: CID?
-            if index + 1 < entries.count, case let .tree(right) = entries[index + 1] {
-                rightTreeCID = try await right.rootCID()
+            if index + 1 < resolvedEntries.count, case var .tree(right) = resolvedEntries[index + 1] {
+                rightTreeCID = try await right.collectNewBlocks(into: &collector)
                 index += 1
             }
             leaves.append(.init(path: leaf.path, recordCID: leaf.recordCID, rightTreeCID: rightTreeCID))
@@ -508,57 +553,37 @@ public struct RepositoryMST: Sendable {
             throw RepositoryMSTMutationError.entryLimitExceeded
         }
         let node: RepositoryMSTNode
+        let bytes: Data
         do {
             node = try RepositoryMSTCodec.node(leaves: leaves, leftTreeCID: leftTreeCID)
-            let bytes = try RepositoryMSTCodec.encode(node)
-            return (CID.fromDAGCBOR(bytes), bytes)
+            bytes = try RepositoryMSTCodec.encode(node)
         } catch {
             throw RepositoryMSTMutationError.invalidNode
         }
-    }
-
-    private func rootCID() async throws -> CID {
-        if let pointer, knownEntries == nil { return pointer }
-        return try await encoded().cid
-    }
-
-    private func collectNewBlocks(into collector: inout NewBlockCollector) async throws -> CID {
-        // A CID-only node is an untouched subtree loaded from the immutable
-        // base source. Its pointer is already the complete persisted
-        // projection, so do not fetch/decode it merely to rediscover that it
-        // contributes no new blocks. This is the same stored-pointer
-        // short-circuit used by the pinned TypeScript implementation.
-        if let pointer, knownEntries == nil {
-            return pointer
-        }
-        let encoded = try await encoded()
-        if let existing = try await blocks.block(for: encoded.cid) {
-            guard existing == encoded.bytes else {
+        let cid = CID.fromDAGCBOR(bytes)
+        if let existing = try await blocks.block(for: cid) {
+            guard existing == bytes else {
                 throw RepositoryMSTMutationError.blockCIDMismatch
             }
-            return encoded.cid
+            return cid
         }
-        try collector.add(cid: encoded.cid, bytes: encoded.bytes)
-        for entry in try await entries() {
-            if case let .tree(child) = entry {
-                _ = try await child.collectNewBlocks(into: &collector)
-            }
-        }
-        return encoded.cid
+        try collector.add(cid: cid, bytes: bytes)
+        return cid
     }
-
-    private func appendLeaves(to result: inout [RepositoryMSTLeaf]) async throws {
-        for entry in try await entries() {
+    private mutating func appendLeaves(to result: inout [RepositoryMSTLeaf]) async throws {
+        let (entries, _) = try await loadNode()
+        for entry in entries {
             switch entry {
             case let .leaf(leaf):
                 result.append(leaf)
             case let .tree(child):
-                try await child.appendLeaves(to: &result)
+                var childCopy = child
+                try await childCopy.appendLeaves(to: &result)
             }
         }
     }
 
-    private func appendPageLeaves(
+    private mutating func appendPageLeaves(
         lowerBound: Data,
         upperBound: Data,
         reverse: Bool,
@@ -573,7 +598,7 @@ public struct RepositoryMST: Sendable {
         if let pointer {
             try budget.visit(pointer)
         }
-        let entries = try await entries()
+        let (entries, _) = try await loadNode()
 
         var lowerByIndex = Array<Data?>(repeating: nil, count: entries.count)
         var previous = inheritedLowerBound
@@ -614,7 +639,8 @@ public struct RepositoryMST: Sendable {
                     RepositoryMSTCodec.lexicographicallyPrecedes(lowerBound, $0)
                 } ?? true
                 guard isBeforeUpper, isAfterLower else { continue }
-                try await child.appendPageLeaves(
+                var childCopy = child
+                try await childCopy.appendPageLeaves(
                     lowerBound: lowerBound,
                     upperBound: upperBound,
                     reverse: reverse,
