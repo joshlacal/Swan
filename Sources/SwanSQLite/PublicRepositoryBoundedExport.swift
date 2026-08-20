@@ -58,11 +58,11 @@ extension SQLiteAccountDatabase {
             let leaves = try RepositoryMSTCodec.reconstructedLeaves(from: node)
             let layer: Int
             if let first = leaves.first {
-                layer = RepositoryMSTCodec.keyDepth(for: first.path)
+                layer = first.path.keyDepth
                 guard (0...128).contains(layer),
                       expectedLayer == nil || layer == expectedLayer,
                       leaves.allSatisfy({
-                          RepositoryMSTCodec.keyDepth(for: $0.path) == layer
+                          $0.path.keyDepth == layer
                       }) else {
                     throw RepositoryMSTValidationError.invalidLayer
                 }

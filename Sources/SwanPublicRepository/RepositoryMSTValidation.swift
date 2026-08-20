@@ -202,14 +202,14 @@ public enum RepositoryMSTValidation {
             let layer: Int
 
             if let first = nodeLeaves.first {
-                layer = RepositoryMSTCodec.keyDepth(for: first.path)
+                layer = first.path.keyDepth
                 guard (0 ... 128).contains(layer) else {
                     throw RepositoryMSTValidationError.invalidLayer
                 }
                 if let expected = item.expectedLayer, layer != expected {
                     throw RepositoryMSTValidationError.invalidLayer
                 }
-                for leaf in nodeLeaves where RepositoryMSTCodec.keyDepth(for: leaf.path) != layer {
+                for leaf in nodeLeaves where leaf.path.keyDepth != layer {
                     throw RepositoryMSTValidationError.leafLayerMismatch
                 }
             } else if item.isRoot {
@@ -249,7 +249,7 @@ public enum RepositoryMSTValidation {
             }
 
             for leaf in nodeLeaves {
-                let key = Data(leaf.path.mstKey.utf8)
+                let key = leaf.path.mstKeyBytes
                 guard isInside(key, lower: item.lowerBound, upper: item.upperBound) else {
                     throw RepositoryMSTValidationError.subtreeOutOfRange
                 }
@@ -277,7 +277,7 @@ public enum RepositoryMSTValidation {
                 work.append(.init(
                     cid: left,
                     lowerBound: item.lowerBound,
-                    upperBound: Data(nodeLeaves[0].path.mstKey.utf8),
+                    upperBound: nodeLeaves[0].path.mstKeyBytes,
                     expectedLayer: layer - 1,
                     isRoot: false
                 ))
@@ -287,9 +287,9 @@ public enum RepositoryMSTValidation {
                 guard referencedNodes.insert(right).inserted else {
                     throw RepositoryMSTValidationError.repeatedNode
                 }
-                let lower = Data(nodeLeaves[index].path.mstKey.utf8)
+                let lower = nodeLeaves[index].path.mstKeyBytes
                 let upper = index + 1 < nodeLeaves.count
-                    ? Data(nodeLeaves[index + 1].path.mstKey.utf8)
+                    ? nodeLeaves[index + 1].path.mstKeyBytes
                     : item.upperBound
                 work.append(.init(
                     cid: right,
@@ -338,7 +338,7 @@ public enum RepositoryMSTValidation {
 
         leaves = Self.sortedByMSTKey(leaves, keys: leafKeys)
         for pair in zip(leaves, leaves.dropFirst()) {
-            guard pair.0.path.mstKey < pair.1.path.mstKey else {
+            guard RepositoryMSTCodec.lexicographicallyPrecedes(pair.0.path.mstKeyBytes, pair.1.path.mstKeyBytes) else {
                 throw RepositoryMSTValidationError.keysNotStrictlyIncreasing
             }
         }
@@ -423,7 +423,7 @@ public enum RepositoryMSTValidation {
             let nodeLeaves = try RepositoryMSTCodec.reconstructedLeaves(from: node)
             let layer: Int
             if let first = nodeLeaves.first {
-                layer = RepositoryMSTCodec.keyDepth(for: first.path)
+                layer = first.path.keyDepth
                 guard (0 ... 128).contains(layer) else {
                     throw RepositoryMSTValidationError.invalidLayer
                 }
@@ -431,7 +431,7 @@ public enum RepositoryMSTValidation {
                     throw RepositoryMSTValidationError.invalidLayer
                 }
                 guard nodeLeaves.allSatisfy({
-                    RepositoryMSTCodec.keyDepth(for: $0.path) == layer
+                    $0.path.keyDepth == layer
                 }) else {
                     throw RepositoryMSTValidationError.leafLayerMismatch
                 }
@@ -465,7 +465,7 @@ public enum RepositoryMSTValidation {
                 continue
             }
             for leaf in nodeLeaves {
-                let key = Data(leaf.path.mstKey.utf8)
+                let key = leaf.path.mstKeyBytes
                 guard isInside(key, lower: item.lowerBound, upper: item.upperBound) else {
                     throw RepositoryMSTValidationError.subtreeOutOfRange
                 }
@@ -490,7 +490,7 @@ public enum RepositoryMSTValidation {
                 }
                 work.append(.init(
                     cid: left, lowerBound: item.lowerBound,
-                    upperBound: Data(nodeLeaves[0].path.mstKey.utf8),
+                    upperBound: nodeLeaves[0].path.mstKeyBytes,
                     expectedLayer: layer - 1, isRoot: false
                 ))
             }
@@ -501,9 +501,9 @@ public enum RepositoryMSTValidation {
                 }
                 work.append(.init(
                     cid: right,
-                    lowerBound: Data(nodeLeaves[index].path.mstKey.utf8),
+                    lowerBound: nodeLeaves[index].path.mstKeyBytes,
                     upperBound: index + 1 < nodeLeaves.count
-                        ? Data(nodeLeaves[index + 1].path.mstKey.utf8)
+                        ? nodeLeaves[index + 1].path.mstKeyBytes
                         : item.upperBound,
                     expectedLayer: layer - 1,
                     isRoot: false
@@ -548,7 +548,7 @@ public enum RepositoryMSTValidation {
         }
         leaves = Self.sortedByMSTKey(leaves, keys: leafKeys)
         for pair in zip(leaves, leaves.dropFirst()) {
-            guard pair.0.path.mstKey < pair.1.path.mstKey else {
+            guard RepositoryMSTCodec.lexicographicallyPrecedes(pair.0.path.mstKeyBytes, pair.1.path.mstKeyBytes) else {
                 throw RepositoryMSTValidationError.keysNotStrictlyIncreasing
             }
         }
@@ -593,13 +593,13 @@ public enum RepositoryMSTValidation {
     ) -> [RepositoryMSTLeaf] {
         precondition(leaves.count == keys.count)
         return zip(keys, leaves)
-            .sorted { $0.0.lexicographicallyPrecedes($1.0) }
+            .sorted { RepositoryMSTCodec.lexicographicallyPrecedes($0.0, $1.0) }
             .map(\.1)
     }
 
     private static func isInside(_ key: Data, lower: Data?, upper: Data?) -> Bool {
-        if let lower, !lower.lexicographicallyPrecedes(key) { return false }
-        if let upper, !key.lexicographicallyPrecedes(upper) { return false }
+        if let lower, !RepositoryMSTCodec.lexicographicallyPrecedes(lower, key) { return false }
+        if let upper, !RepositoryMSTCodec.lexicographicallyPrecedes(key, upper) { return false }
         return true
     }
 

@@ -242,7 +242,7 @@ public struct RepositoryMST: Sendable {
         recordCID: CID,
         knownDepth: Int?
     ) async throws -> Self {
-        let keyDepth = knownDepth ?? RepositoryMSTCodec.keyDepth(for: path)
+        let keyDepth = knownDepth ?? path.keyDepth
         let layer = try await layer()
         let entries = try await entries()
         let leaf = Entry.leaf(.init(path: path, recordCID: recordCID))
@@ -430,7 +430,7 @@ public struct RepositoryMST: Sendable {
         } catch {
             throw RepositoryMSTMutationError.invalidNode
         }
-        let inferredLayer = leaves.first.map { RepositoryMSTCodec.keyDepth(for: $0.path) }
+        let inferredLayer = leaves.first.map(\.path.keyDepth)
         let childLayer = knownLayer.map { $0 - 1 } ?? inferredLayer.map { $0 - 1 }
         var result: [Entry] = []
         if let left = node.leftTreeCID {
@@ -470,7 +470,7 @@ public struct RepositoryMST: Sendable {
         let entries = try await entries()
         for entry in entries {
             if case let .leaf(leaf) = entry {
-                return RepositoryMSTCodec.keyDepth(for: leaf.path)
+                return leaf.path.keyDepth
             }
         }
         for entry in entries {
@@ -580,7 +580,7 @@ public struct RepositoryMST: Sendable {
         for index in entries.indices {
             lowerByIndex[index] = previous
             if case let .leaf(leaf) = entries[index] {
-                previous = Data(leaf.path.mstKey.utf8)
+                previous = leaf.path.mstKeyBytes
             }
         }
         var upperByIndex = Array<Data?>(repeating: nil, count: entries.count)
@@ -588,7 +588,7 @@ public struct RepositoryMST: Sendable {
         for index in entries.indices.reversed() {
             upperByIndex[index] = next
             if case let .leaf(leaf) = entries[index] {
-                next = Data(leaf.path.mstKey.utf8)
+                next = leaf.path.mstKeyBytes
             }
         }
 
@@ -599,19 +599,19 @@ public struct RepositoryMST: Sendable {
             guard result.count < limit else { return }
             switch entries[index] {
             case let .leaf(leaf):
-                let key = Data(leaf.path.mstKey.utf8)
-                if key.lexicographicallyPrecedes(upperBound),
-                   lowerBound.lexicographicallyPrecedes(key) {
+                let key = leaf.path.mstKeyBytes
+                if RepositoryMSTCodec.lexicographicallyPrecedes(key, upperBound),
+                   RepositoryMSTCodec.lexicographicallyPrecedes(lowerBound, key) {
                     result.append(leaf)
                 }
             case let .tree(child):
                 let subtreeLower = lowerByIndex[index]
                 let subtreeUpper = upperByIndex[index]
                 let isBeforeUpper = subtreeLower.map {
-                    $0.lexicographicallyPrecedes(upperBound)
+                    RepositoryMSTCodec.lexicographicallyPrecedes($0, upperBound)
                 } ?? true
                 let isAfterLower = subtreeUpper.map {
-                    lowerBound.lexicographicallyPrecedes($0)
+                    RepositoryMSTCodec.lexicographicallyPrecedes(lowerBound, $0)
                 } ?? true
                 guard isBeforeUpper, isAfterLower else { continue }
                 try await child.appendPageLeaves(
@@ -667,7 +667,7 @@ public struct RepositoryMST: Sendable {
     private func firstLeafIndex(notLessThan path: PublicRepositoryPath, in entries: [Entry]) -> Int {
         entries.firstIndex {
             if case let .leaf(leaf) = $0 {
-                return leaf.path.mstKey >= path.mstKey
+                return !RepositoryMSTCodec.lexicographicallyPrecedes(leaf.path.mstKeyBytes, path.mstKeyBytes)
             }
             return false
         } ?? entries.count
