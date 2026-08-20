@@ -3,7 +3,6 @@
   import { modals } from '$lib/stores/modals';
   import { toasts } from '$lib/stores/toasts';
   import { api } from '$lib/api';
-  import Spinner from '$lib/components/ui/Spinner.svelte';
 
   let revokingId = $state<string | null>(null);
 
@@ -41,369 +40,148 @@
   }
 </script>
 
-<div class="security-view">
-  <section class="panel">
-    <div class="panel-head">
-      <div>
-        <span class="eyebrow">FACTORS & SIGN-IN</span>
-        <h2>Multi-factor authentication</h2>
-      </div>
-      <span class="pill" class:success={$activeFactors.length > 0}>
-        {$activeFactors.length > 0 ? `${$activeFactors.length} active factor${$activeFactors.length === 1 ? '' : 's'}` : 'Password only'}
-      </span>
-    </div>
-    <p class="panel-copy">
-      Protect your account against unauthorized access with FIDO2/WebAuthn passkeys, time-based one-time passwords (TOTP), and single-use recovery codes.
-    </p>
-
-    <!-- Passkeys Section -->
-    <div class="factor-group">
-      <div class="factor-group-head">
+<div class="flex flex-col gap-6">
+  <!-- Page Header / Summary Card -->
+  <section class="card bg-base-100 shadow-sm border border-base-200">
+    <div class="card-body gap-4">
+      <div class="flex items-start justify-between gap-4">
         <div>
-          <h3>WebAuthn Passkeys</h3>
-          <small>Hardware security keys, Touch ID, Face ID, and platform authenticators</small>
+          <span class="text-xs font-mono font-semibold uppercase tracking-wider text-base-content/60">Factors & sign-in</span>
+          <h2 class="card-title text-lg mt-1">Multi-factor authentication</h2>
+        </div>
+        <span class="badge {$activeFactors.length > 0 ? 'badge-success' : 'badge-neutral'}">
+          {$activeFactors.length > 0 ? `${$activeFactors.length} active factor${$activeFactors.length === 1 ? '' : 's'}` : 'Password only'}
+        </span>
+      </div>
+      <p class="text-sm text-base-content/70">
+        Protect your account with passkeys, authenticator apps, and single-use recovery codes.
+      </p>
+    </div>
+  </section>
+
+  <!-- Passkeys Card -->
+  <section class="card bg-base-100 shadow-sm border border-base-200">
+    <div class="card-body gap-4">
+      <div class="flex items-start justify-between gap-4">
+        <div>
+          <h3 class="font-semibold text-base">WebAuthn passkeys</h3>
+          <p class="text-xs text-base-content/60 mt-0.5">Hardware security keys and platform authenticators</p>
         </div>
         <button
           type="button"
-          class="button primary"
+          class="btn btn-primary btn-sm"
           onclick={() => modals.open('passkey-enroll')}
         >
-          Add Passkey ＋
+          Add passkey
         </button>
       </div>
 
-      <div class="table">
+      <div class="flex flex-col gap-2 pt-1">
         {#if passkeys.length === 0}
-          <div class="empty-row">No passkeys registered. Add one to enable biometric sign-in.</div>
+          <div class="text-sm text-base-content/60 py-2">No passkeys registered.</div>
         {:else}
           {#each passkeys as passkey (passkey.id)}
-            <div class="table-row">
-              <div class="factor-icon">🛡️</div>
-              <div class="factor-meta">
-                <strong>{passkey.label || 'Passkey'}</strong>
-                <small>Kind: WebAuthn · ID: {passkey.id}</small>
+            <div class="card card-border bg-base-200/60 p-4 flex flex-row items-center justify-between gap-4">
+              <div class="min-w-0">
+                <div class="font-semibold text-sm">{passkey.label || 'Passkey'}</div>
+                <div class="font-mono text-xs text-base-content/60 mt-0.5 break-all">ID: {passkey.id}</div>
               </div>
-              <span class="pill success">Active</span>
-              <button
-                type="button"
-                class="row-action"
-                disabled={revokingId === passkey.id}
-                onclick={() => handleRevokePasskey(passkey.id)}
-                aria-label={`Revoke passkey ${passkey.label}`}
-              >
-                {#if revokingId === passkey.id}
-                  <Spinner size={12} color="var(--coral)" />
-                {:else}
-                  Revoke
-                {/if}
-              </button>
+              <div class="flex items-center gap-3 shrink-0">
+                <span class="badge badge-success badge-sm">Active</span>
+                <button
+                  type="button"
+                  class="btn btn-error btn-outline btn-sm"
+                  disabled={revokingId === passkey.id}
+                  onclick={() => handleRevokePasskey(passkey.id)}
+                  aria-label={`Revoke passkey ${passkey.label}`}
+                >
+                  {#if revokingId === passkey.id}
+                    <span class="loading loading-spinner loading-xs"></span>
+                  {:else}
+                    Revoke
+                  {/if}
+                </button>
+              </div>
             </div>
           {/each}
         {/if}
       </div>
     </div>
+  </section>
 
-    <!-- Authenticator Apps (TOTP) Section -->
-    <div class="factor-group">
-      <div class="factor-group-head">
+  <!-- Authenticator Apps (TOTP) Card -->
+  <section class="card bg-base-100 shadow-sm border border-base-200">
+    <div class="card-body gap-4">
+      <div class="flex items-start justify-between gap-4">
         <div>
-          <h3>Authenticator Apps (TOTP)</h3>
-          <small>6-digit verification codes generated by apps like 1Password, Aegis, or Google Authenticator</small>
+          <h3 class="font-semibold text-base">Authenticator apps (TOTP)</h3>
+          <p class="text-xs text-base-content/60 mt-0.5">Time-based verification codes generated by an authenticator app</p>
         </div>
         {#if !hasTotp}
           <button
             type="button"
-            class="button dark"
+            class="btn btn-outline btn-sm"
             onclick={() => modals.open('totp-enroll')}
           >
-            Set Up TOTP ↗
+            Set up TOTP
           </button>
         {/if}
       </div>
 
-      <div class="table">
+      <div class="flex flex-col gap-2 pt-1">
         {#if !hasTotp}
-          <div class="empty-row">No authenticator app enrolled.</div>
+          <div class="text-sm text-base-content/60 py-2">No authenticator app enrolled.</div>
         {:else}
           {#each totpFactors as totp (totp.id)}
-            <div class="table-row">
-              <div class="factor-icon">📱</div>
-              <div class="factor-meta">
-                <strong>{totp.label || 'Authenticator App'}</strong>
-                <small>Kind: Time-Based OTP (RFC 6238)</small>
+            <div class="card card-border bg-base-200/60 p-4 flex flex-row items-center justify-between gap-4">
+              <div class="min-w-0">
+                <div class="font-semibold text-sm">{totp.label || 'Authenticator App'}</div>
+                <div class="text-xs text-base-content/60 mt-0.5">Time-based one-time password (RFC 6238)</div>
               </div>
-              <span class="pill success">Active</span>
-              <button
-                type="button"
-                class="row-action"
-                disabled={revokingId === (totp.id || 'totp')}
-                onclick={() => handleRevokeTotp(totp.id)}
-                aria-label="Revoke TOTP authenticator"
-              >
-                {#if revokingId === (totp.id || 'totp')}
-                  <Spinner size={12} color="var(--coral)" />
-                {:else}
-                  Revoke
-                {/if}
-              </button>
+              <div class="flex items-center gap-3 shrink-0">
+                <span class="badge badge-success badge-sm">Active</span>
+                <button
+                  type="button"
+                  class="btn btn-error btn-outline btn-sm"
+                  disabled={revokingId === (totp.id || 'totp')}
+                  onclick={() => handleRevokeTotp(totp.id)}
+                  aria-label="Revoke TOTP authenticator"
+                >
+                  {#if revokingId === (totp.id || 'totp')}
+                    <span class="loading loading-spinner loading-xs"></span>
+                  {:else}
+                    Revoke
+                  {/if}
+                </button>
+              </div>
             </div>
           {/each}
         {/if}
       </div>
     </div>
+  </section>
 
-    <!-- Emergency Recovery Codes Trigger -->
-    <div class="factor-group">
-      <div class="factor-group-head">
+  <!-- Emergency Recovery Codes Card -->
+  <section class="card bg-base-100 shadow-sm border border-base-200">
+    <div class="card-body gap-4">
+      <div class="flex items-start justify-between gap-4">
         <div>
-          <h3>Emergency Recovery Codes</h3>
-          <small>Single-use backup keys for account recovery if you lose your primary factors</small>
+          <h3 class="font-semibold text-base">Emergency recovery codes</h3>
+          <p class="text-xs text-base-content/60 mt-0.5">Single-use backup keys for account recovery if primary factors are unavailable</p>
         </div>
         <button
           type="button"
-          class="button outline"
+          class="btn btn-outline btn-sm"
           onclick={() => modals.open('recovery-rotate')}
         >
-          Rotate Recovery Codes ↗
+          Rotate recovery codes
         </button>
       </div>
     </div>
-
-    <div class="capability-note">
-      <span>✦</span>
-      <div>
-        <strong>Step-Up Security</strong>
-        <small>Enrolling or revoking authentication factors requires step-up re-authentication.</small>
-      </div>
-    </div>
   </section>
+
+  <!-- Step-Up Notice -->
+  <div class="text-xs text-base-content/60 px-1">
+    Enrolling or revoking authentication factors requires step-up re-authentication.
+  </div>
 </div>
-
-<style>
-  .security-view {
-    display: flex;
-    flex-direction: column;
-    gap: 28px;
-  }
-
-  .eyebrow {
-    display: block;
-    font: 600 10px/1.3 var(--mono);
-    color: var(--muted);
-    letter-spacing: 0.14em;
-  }
-
-  .panel {
-    background: #faf8f1;
-    border: 1px solid var(--line);
-    padding: 28px;
-    border-radius: 2px;
-  }
-
-  .panel-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 16px;
-  }
-
-  .panel h2 {
-    font: 400 26px/1.05 var(--serif);
-    margin: 9px 0 0;
-    letter-spacing: -0.02em;
-    color: var(--ink);
-  }
-
-  .panel-copy {
-    color: var(--muted);
-    font-size: 13px;
-    line-height: 1.6;
-    max-width: 650px;
-    margin: 14px 0 0;
-  }
-
-  .factor-group {
-    margin-top: 32px;
-    padding-top: 24px;
-    border-top: 1px solid var(--line);
-  }
-
-  .factor-group-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 16px;
-  }
-
-  .factor-group-head h3 {
-    font: 600 16px var(--sans);
-    margin: 0;
-    color: var(--ink);
-  }
-
-  .factor-group-head small {
-    display: block;
-    color: var(--muted);
-    font-size: 12px;
-    margin-top: 3px;
-  }
-
-  .table {
-    margin-top: 16px;
-    border-top: 1px solid var(--line);
-  }
-
-  .table-row {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    min-height: 68px;
-    border-bottom: 1px solid var(--line);
-  }
-
-  .factor-icon {
-    width: 37px;
-    height: 37px;
-    background: #e6e3d9;
-    display: grid;
-    place-items: center;
-    font-size: 18px;
-    border-radius: 2px;
-    flex-shrink: 0;
-  }
-
-  .factor-meta {
-    min-width: 0;
-  }
-
-  .factor-meta strong {
-    font-size: 13px;
-    display: block;
-    color: var(--ink);
-  }
-
-  .factor-meta small {
-    color: var(--muted);
-    display: block;
-    font: 10px var(--mono);
-    margin-top: 4px;
-  }
-
-  .pill {
-    margin-left: auto;
-    border-radius: 20px;
-    padding: 4px 8px;
-    font: 10px var(--mono);
-    background: #e6e3d9;
-    color: var(--muted);
-    flex-shrink: 0;
-  }
-
-  .pill.success {
-    color: #39755b;
-    background: #dceee1;
-  }
-
-  .row-action {
-    border: 0;
-    background: none;
-    color: var(--coral);
-    font: 11px var(--mono);
-    cursor: pointer;
-    padding: 6px 10px;
-    border-radius: 2px;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-  }
-
-  .row-action:hover:not(:disabled) {
-    background: #faeae6;
-  }
-
-  .row-action:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .empty-row {
-    color: var(--muted);
-    font-size: 13px;
-    padding: 20px 0;
-  }
-
-  .button {
-    border: 1px solid transparent;
-    padding: 9px 14px;
-    font-size: 12px;
-    font-weight: 600;
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    text-decoration: none;
-    cursor: pointer;
-    border-radius: 2px;
-    transition: opacity 0.15s ease;
-    flex-shrink: 0;
-  }
-
-  .button:hover {
-    opacity: 0.9;
-  }
-
-  .button.primary {
-    background: var(--teal);
-    color: white;
-  }
-
-  .button.dark {
-    background: var(--ink);
-    color: #f7f2e7;
-  }
-
-  .button.outline {
-    background: transparent;
-    border-color: var(--line);
-    color: var(--ink);
-  }
-
-  .button.outline:hover {
-    background: #e6e3d9;
-  }
-
-  .capability-note {
-    display: flex;
-    gap: 12px;
-    margin-top: 28px;
-    padding: 15px;
-    background: #eee9dc;
-    border-radius: 2px;
-  }
-
-  .capability-note > span {
-    color: var(--ochre);
-    font-size: 22px;
-    line-height: 1;
-  }
-
-  .capability-note strong {
-    display: block;
-    font-size: 12px;
-    color: var(--ink);
-  }
-
-  .capability-note small {
-    display: block;
-    color: var(--muted);
-    font-size: 11px;
-    margin-top: 4px;
-    line-height: 1.4;
-  }
-
-  @media (max-width: 640px) {
-    .factor-group-head {
-      flex-direction: column;
-      align-items: flex-start;
-    }
-  }
-</style>

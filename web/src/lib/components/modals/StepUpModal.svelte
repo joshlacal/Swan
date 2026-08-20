@@ -4,7 +4,6 @@
   import { stepup, type StepUpFactorKind } from '$lib/stores/stepup';
   import { activeFactors } from '$lib/stores/portal';
   import { performPasskeyAssertion, formatWebAuthnError } from '$lib/webauthn';
-  import Spinner from '$lib/components/ui/Spinner.svelte';
   import Modal from '$lib/components/ui/Modal.svelte';
 
   let password = $state('');
@@ -49,7 +48,7 @@
       const res = await api.stepUpPassword(password);
       stepup.resolveStepUp(res.factorToken || true);
     } catch (err: any) {
-      stepup.setError(err.message || 'Password incorrect. Please try again.');
+      stepup.setError(err.message || 'Password incorrect.');
     }
   }
 
@@ -66,7 +65,7 @@
       const res = await api.stepUpTotp(factor.id, cleanCode);
       stepup.resolveStepUp(res.factorToken || true);
     } catch (err: any) {
-      stepup.setError(err.message || 'Invalid TOTP verification code.');
+      stepup.setError(err.message || 'Invalid verification code.');
     }
   }
 
@@ -119,40 +118,27 @@
 
 <Modal
   {isOpen}
+  title="Confirm identity"
+  description={context?.operation ? `Authorizing ${context.operation} requires verification.` : 'This action requires verification.'}
   size="md"
   preventClose={loading}
   onClose={() => stepup.cancelStepUp()}
 >
-  {#snippet header()}
-    <header class="dialog-header">
-      <span class="eyebrow">SECURITY RE-AUTHENTICATION</span>
-      <h2 id="step-up-title">Confirm it's you</h2>
-      <p id="step-up-desc">
-        {#if context?.operation}
-          Authorizing <code>{context.operation}</code> requires step-up verification.
-        {:else}
-          This protected action requires elevated security clearance.
-        {/if}
-      </p>
-    </header>
-  {/snippet}
-
   {#if allowedFactors.length > 1}
-    <div class="factor-tabs" role="tablist" aria-label="Verification method">
+    <div class="join w-full mb-4" role="tablist" aria-label="Verification method">
       {#each allowedFactors as factor}
         <button
           type="button"
           role="tab"
-          class="tab-button"
-          class:active={selectedFactor === factor}
+          class="btn join-item flex-1 btn-sm {selectedFactor === factor ? 'btn-active btn-neutral' : 'btn-ghost'}"
           aria-selected={selectedFactor === factor}
           disabled={loading}
           onclick={() => stepup.selectFactor(factor)}
         >
-          {#if factor === 'password'}🔑 Password
-          {:else if factor === 'passkey'}🛡️ Passkey
-          {:else if factor === 'totp'}📱 Authenticator
-          {:else if factor === 'recoveryCode'}🗝️ Recovery
+          {#if factor === 'password'}Password
+          {:else if factor === 'passkey'}Passkey
+          {:else if factor === 'totp'}Authenticator
+          {:else if factor === 'recoveryCode'}Recovery code
           {/if}
         </button>
       {/each}
@@ -160,52 +146,60 @@
   {/if}
 
   {#if errorMessage}
-    <div class="error-banner" role="alert">
-      <span class="error-glyph">⚠</span>
+    <div class="alert alert-error text-sm py-2 mb-4" role="alert">
       <span>{errorMessage}</span>
     </div>
   {/if}
 
-  <div class="factor-body">
+  <div>
     {#if selectedFactor === 'password'}
-      <form onsubmit={submitPassword} class="form-stack">
-        <label>
-          <span class="label-text">Account Password</span>
+      <form onsubmit={submitPassword} class="flex flex-col gap-4">
+        <fieldset class="fieldset gap-1">
+          <legend class="fieldset-legend">Account password</legend>
           <input
             bind:this={passwordInput}
             type="password"
+            class="input w-full"
             bind:value={password}
             autocomplete="current-password"
-            placeholder="Enter your account password"
+            placeholder="Enter your password"
             disabled={loading}
             required
           />
-        </label>
-        <div class="form-actions">
-          <button type="button" class="button dark" disabled={loading} onclick={() => stepup.cancelStepUp()}>
+        </fieldset>
+        <div class="modal-action mt-2">
+          <button type="button" class="btn btn-ghost" disabled={loading} onclick={() => stepup.cancelStepUp()}>
             Cancel
           </button>
-          <button type="submit" class="button primary" disabled={loading || !password}>
-            {#if loading}<Spinner size={14} color="#ffffff" /> Verifying…{:else}Verify Password ↗{/if}
+          <button type="submit" class="btn btn-primary" disabled={loading || !password}>
+            {#if loading}
+              <span class="loading loading-spinner loading-xs"></span> Verifying…
+            {:else}
+              Verify password
+            {/if}
           </button>
         </div>
       </form>
     {:else if selectedFactor === 'passkey'}
-      <div class="passkey-pane">
-        <p class="pane-copy">Use your device biometrics (Touch ID, Face ID, Windows Hello) or a hardware security key.</p>
-        <div class="form-actions">
-          <button type="button" class="button dark" disabled={loading} onclick={() => stepup.cancelStepUp()}>
+      <div class="flex flex-col gap-4">
+        <p class="text-sm text-base-content/70">Use device biometrics or a security key to verify.</p>
+        <div class="modal-action mt-2">
+          <button type="button" class="btn btn-ghost" disabled={loading} onclick={() => stepup.cancelStepUp()}>
             Cancel
           </button>
-          <button type="button" class="button primary" disabled={loading} onclick={submitPasskey}>
-            {#if loading}<Spinner size={14} color="#ffffff" /> Awaiting Passkey…{:else}Verify with Passkey ↗{/if}
+          <button type="button" class="btn btn-primary" disabled={loading} onclick={submitPasskey}>
+            {#if loading}
+              <span class="loading loading-spinner loading-xs"></span> Waiting for passkey…
+            {:else}
+              Verify with passkey
+            {/if}
           </button>
         </div>
       </div>
     {:else if selectedFactor === 'totp'}
-      <form onsubmit={submitTotp} class="form-stack">
-        <label>
-          <span class="label-text">6-Digit Authenticator Code</span>
+      <form onsubmit={submitTotp} class="flex flex-col gap-4">
+        <fieldset class="fieldset gap-1">
+          <legend class="fieldset-legend">6-digit authenticator code</legend>
           <input
             bind:this={totpInput}
             type="text"
@@ -213,184 +207,58 @@
             pattern="[0-9]{6}"
             maxlength="6"
             placeholder="123456"
+            class="input w-full font-mono text-center text-lg tracking-widest"
             value={totpCode}
             oninput={handleTotpInput}
             autocomplete="one-time-code"
             disabled={loading}
             required
           />
-        </label>
-        <div class="form-actions">
-          <button type="button" class="button dark" disabled={loading} onclick={() => stepup.cancelStepUp()}>
+        </fieldset>
+        <div class="modal-action mt-2">
+          <button type="button" class="btn btn-ghost" disabled={loading} onclick={() => stepup.cancelStepUp()}>
             Cancel
           </button>
-          <button type="submit" class="button primary" disabled={loading || totpCode.length !== 6}>
-            {#if loading}<Spinner size={14} color="#ffffff" /> Verifying…{:else}Verify Code ↗{/if}
+          <button type="submit" class="btn btn-primary" disabled={loading || totpCode.length !== 6}>
+            {#if loading}
+              <span class="loading loading-spinner loading-xs"></span> Verifying…
+            {:else}
+              Verify code
+            {/if}
           </button>
         </div>
       </form>
     {:else if selectedFactor === 'recoveryCode'}
-      <form onsubmit={submitRecovery} class="form-stack">
-        <label>
-          <span class="label-text">Single-Use Recovery Code</span>
+      <form onsubmit={submitRecovery} class="flex flex-col gap-4">
+        <fieldset class="fieldset gap-1">
+          <legend class="fieldset-legend">Single-use recovery code</legend>
           <input
             bind:this={recoveryInput}
             type="text"
+            class="input w-full font-mono uppercase"
             bind:value={recoveryCode}
             placeholder="RCV-XXXX-XXXX"
-            autocomplete="off"
+            autocomplete="one-time-code"
+            inputmode="numeric"
             spellcheck="false"
             disabled={loading}
             required
           />
-        </label>
-        <p class="hint-text">Using a recovery code consumes it permanently.</p>
-        <div class="form-actions">
-          <button type="button" class="button dark" disabled={loading} onclick={() => stepup.cancelStepUp()}>
+          <p class="text-xs text-base-content/60">Using a recovery code consumes it permanently.</p>
+        </fieldset>
+        <div class="modal-action mt-2">
+          <button type="button" class="btn btn-ghost" disabled={loading} onclick={() => stepup.cancelStepUp()}>
             Cancel
           </button>
-          <button type="submit" class="button primary" disabled={loading || !recoveryCode.trim()}>
-            {#if loading}<Spinner size={14} color="#ffffff" /> Consuming Code…{:else}Use Recovery Code ↗{/if}
+          <button type="submit" class="btn btn-primary" disabled={loading || !recoveryCode.trim()}>
+            {#if loading}
+              <span class="loading loading-spinner loading-xs"></span> Consuming code…
+            {:else}
+              Use recovery code
+            {/if}
           </button>
         </div>
       </form>
     {/if}
   </div>
 </Modal>
-
-<style>
-  .dialog-header h2 {
-    font: 400 28px/1.1 var(--serif, 'Iowan Old Style', serif);
-    margin: 8px 0 10px;
-    letter-spacing: -0.02em;
-  }
-  .dialog-header p {
-    color: var(--muted, #687270);
-    font-size: 13px;
-    line-height: 1.5;
-    margin: 0 0 16px;
-  }
-  .dialog-header code {
-    font: 11px var(--mono, monospace);
-    background: #e6e3d9;
-    padding: 2px 6px;
-    border-radius: 2px;
-  }
-  .eyebrow {
-    display: block;
-    font: 600 10px/1.3 var(--mono, monospace);
-    color: var(--teal, #2b7169);
-    letter-spacing: 0.14em;
-  }
-  .factor-tabs {
-    display: flex;
-    gap: 6px;
-    border-bottom: 1px solid var(--line, #d7d5ca);
-    margin-bottom: 20px;
-    padding-bottom: 8px;
-    overflow-x: auto;
-  }
-  .tab-button {
-    border: 0;
-    background: transparent;
-    color: var(--muted, #687270);
-    font: 600 11px var(--sans, sans-serif);
-    padding: 8px 12px;
-    border-radius: 2px;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: all 0.2s;
-  }
-  .tab-button.active {
-    background: var(--teal-deep, #173f3e);
-    color: #f7f2e7;
-  }
-  .error-banner {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    background: #fcf1ef;
-    border: 1px solid #eecbc4;
-    color: var(--coral, #ba5e47);
-    padding: 10px 14px;
-    font-size: 12px;
-    margin-bottom: 16px;
-    border-radius: 2px;
-  }
-  .error-glyph {
-    font-weight: bold;
-  }
-  .form-stack {
-    display: grid;
-    gap: 16px;
-  }
-  .label-text {
-    display: block;
-    font: 600 11px var(--mono, monospace);
-    color: var(--muted, #687270);
-    margin-bottom: 6px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-  }
-  input {
-    width: 100%;
-    padding: 10px 12px;
-    border: 1px solid var(--line, #d7d5ca);
-    background: #ffffff;
-    font-size: 14px;
-    color: var(--ink, #1f2827);
-    box-sizing: border-box;
-    border-radius: 2px;
-  }
-  input:focus {
-    outline: 2px solid var(--teal, #2b7169);
-    border-color: transparent;
-  }
-  .hint-text {
-    font-size: 11px;
-    color: var(--muted, #687270);
-    margin: -8px 0 0;
-  }
-  .pane-copy {
-    font-size: 13px;
-    color: var(--muted, #687270);
-    line-height: 1.5;
-    margin: 0 0 24px;
-  }
-  .form-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 10px;
-    margin-top: 8px;
-  }
-  .button {
-    border: 1px solid transparent;
-    padding: 10px 16px;
-    font-size: 12px;
-    font-weight: 600;
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    cursor: pointer;
-    border-radius: 2px;
-    font-family: var(--sans, sans-serif);
-  }
-  .button.primary {
-    background: var(--teal, #2b7169);
-    color: white;
-  }
-  .button.primary:hover {
-    background: var(--teal-deep, #173f3e);
-  }
-  .button.dark {
-    background: #e6e3d9;
-    color: var(--ink, #1f2827);
-  }
-  .button.dark:hover {
-    background: #d7d5ca;
-  }
-  .button:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
-</style>

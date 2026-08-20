@@ -2,7 +2,6 @@
   import { portal, activeApps } from '$lib/stores/portal';
   import { toasts } from '$lib/stores/toasts';
   import { api } from '$lib/api';
-  import Spinner from '$lib/components/ui/Spinner.svelte';
 
   let revokingId = $state<string | null>(null);
 
@@ -21,243 +20,75 @@
   }
 </script>
 
-<div class="apps-view">
-  <section class="panel">
-    <div class="panel-head">
-      <div>
-        <span class="eyebrow">OAUTH GRANTS</span>
-        <h2>Connected apps</h2>
+<div class="flex flex-col gap-6">
+  <section class="card bg-base-100 shadow-sm">
+    <div class="card-body gap-4">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <span class="text-xs font-semibold uppercase tracking-wider text-base-content/60">OAuth Grants</span>
+          <h2 class="card-title text-lg">Connected apps</h2>
+        </div>
+        <span class="badge badge-neutral badge-sm">
+          {$activeApps.length} {$activeApps.length === 1 ? 'grant' : 'grants'}
+        </span>
       </div>
-      <span class="pill" class:success={$activeApps.length > 0}>
-        {$activeApps.length} grant{$activeApps.length === 1 ? '' : 's'}
-      </span>
-    </div>
-    <p class="panel-copy">
-      These third-party applications can act on your behalf through narrowly scoped, DPoP-bound OAuth grants. Revocation takes effect immediately.
-    </p>
 
-    <div class="table">
+      <p class="text-sm text-base-content/70">
+        Third-party applications authorized to act on your behalf. Revocation takes effect immediately.
+      </p>
+
       {#if $activeApps.length === 0}
-        <div class="empty-row">No connected apps. Your account is quiet.</div>
+        <div class="py-8 text-center text-sm text-base-content/60">No connected apps found.</div>
       {:else}
-        {#each $activeApps as app (app.id)}
-          <div class="table-row">
-            <div class="app-badge">
-              {app.name ? app.name.slice(0, 1).toUpperCase() : 'A'}
-            </div>
-            <div class="app-meta">
-              <strong>{app.name}</strong>
-              <div class="scope-tags">
-                {#each app.scopes as scope}
-                  <span class="scope-pill">{scope}</span>
-                {/each}
+        <div class="flex flex-col gap-3">
+          {#each $activeApps as app (app.id)}
+            <div class="card card-border bg-base-200/60 p-4">
+              <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div class="flex flex-col gap-2 min-w-0">
+                  <div class="flex items-baseline gap-2 flex-wrap">
+                    {#if app.name}
+                      <span class="font-medium text-base-content text-sm">{app.name}</span>
+                    {/if}
+                    <span class="font-mono break-all text-sm text-base-content/70">{app.id}</span>
+                  </div>
+
+                  {#if app.scopes && app.scopes.length > 0}
+                    <div class="flex flex-wrap gap-1.5">
+                      {#each app.scopes as scope}
+                        <span class="badge badge-neutral badge-sm">{scope}</span>
+                      {/each}
+                    </div>
+                  {/if}
+
+                  <span class="text-xs text-base-content/60">
+                    Granted on {app.createdAt || 'recently'}
+                  </span>
+                </div>
+
+                <div class="shrink-0">
+                  <button
+                    type="button"
+                    class="btn btn-error btn-sm"
+                    disabled={revokingId === app.id}
+                    onclick={() => handleRevokeApp(app.id, app.name)}
+                    aria-label={`Revoke access for ${app.name}`}
+                  >
+                    {#if revokingId === app.id}
+                      <span class="loading loading-spinner loading-xs" aria-hidden="true"></span>
+                    {:else}
+                      Revoke
+                    {/if}
+                  </button>
+                </div>
               </div>
-              <small>Granted on {app.createdAt || 'recent'}</small>
             </div>
-
-            <div class="app-action">
-              <button
-                type="button"
-                class="row-action"
-                disabled={revokingId === app.id}
-                onclick={() => handleRevokeApp(app.id, app.name)}
-                aria-label={`Revoke access for ${app.name}`}
-              >
-                {#if revokingId === app.id}
-                  <Spinner size={12} color="var(--coral)" />
-                {:else}
-                  Revoke
-                {/if}
-              </button>
-            </div>
-          </div>
-        {/each}
+          {/each}
+        </div>
       {/if}
-    </div>
 
-    <div class="capability-note">
-      <span>✦</span>
-      <div>
-        <strong>Cryptographic DPoP Binding</strong>
-        <small>Connected OAuth apps use Demonstrating Proof-of-Possession (DPoP) tokens. Revoking a client immediately rejects further API requests.</small>
+      <div class="alert alert-warning/10 text-xs text-base-content/80 mt-2">
+        <span>Revoking an app invalidates its DPoP-bound tokens and rejects further requests immediately.</span>
       </div>
     </div>
   </section>
 </div>
-
-<style>
-  .apps-view {
-    display: flex;
-    flex-direction: column;
-    gap: 28px;
-  }
-
-  .eyebrow {
-    display: block;
-    font: 600 10px/1.3 var(--mono);
-    color: var(--muted);
-    letter-spacing: 0.14em;
-  }
-
-  .panel {
-    background: #faf8f1;
-    border: 1px solid var(--line);
-    padding: 28px;
-    border-radius: 2px;
-  }
-
-  .panel-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 16px;
-  }
-
-  .panel h2 {
-    font: 400 26px/1.05 var(--serif);
-    margin: 9px 0 0;
-    letter-spacing: -0.02em;
-    color: var(--ink);
-  }
-
-  .panel-copy {
-    color: var(--muted);
-    font-size: 13px;
-    line-height: 1.6;
-    max-width: 650px;
-    margin: 14px 0 0;
-  }
-
-  .pill {
-    border-radius: 20px;
-    padding: 4px 8px;
-    font: 10px var(--mono);
-    background: #e6e3d9;
-    color: var(--muted);
-  }
-
-  .pill.success {
-    color: #39755b;
-    background: #dceee1;
-  }
-
-  .table {
-    margin-top: 25px;
-    border-top: 1px solid var(--line);
-  }
-
-  .table-row {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    min-height: 74px;
-    border-bottom: 1px solid var(--line);
-  }
-
-  .app-badge {
-    width: 37px;
-    height: 37px;
-    display: grid;
-    place-items: center;
-    color: white;
-    background: var(--ochre);
-    font: 700 17px var(--serif);
-    border-radius: 2px;
-    flex-shrink: 0;
-  }
-
-  .app-meta {
-    min-width: 0;
-    flex-grow: 1;
-  }
-
-  .app-meta strong {
-    font-size: 13px;
-    display: block;
-    color: var(--ink);
-  }
-
-  .scope-tags {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    margin-top: 4px;
-  }
-
-  .scope-pill {
-    background: #e6e3d9;
-    color: var(--muted);
-    font: 9px var(--mono);
-    padding: 2px 6px;
-    border-radius: 2px;
-  }
-
-  .app-meta small {
-    color: var(--muted);
-    display: block;
-    font: 10px var(--mono);
-    margin-top: 4px;
-  }
-
-  .app-action {
-    margin-left: auto;
-    flex-shrink: 0;
-  }
-
-  .row-action {
-    border: 0;
-    background: none;
-    color: var(--coral);
-    font: 11px var(--mono);
-    cursor: pointer;
-    padding: 6px 10px;
-    border-radius: 2px;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-  }
-
-  .row-action:hover:not(:disabled) {
-    background: #faeae6;
-  }
-
-  .row-action:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .empty-row {
-    color: var(--muted);
-    font-size: 13px;
-    padding: 24px 0;
-  }
-
-  .capability-note {
-    display: flex;
-    gap: 12px;
-    margin-top: 28px;
-    padding: 15px;
-    background: #eee9dc;
-    border-radius: 2px;
-  }
-
-  .capability-note > span {
-    color: var(--ochre);
-    font-size: 22px;
-    line-height: 1;
-  }
-
-  .capability-note strong {
-    display: block;
-    font-size: 12px;
-    color: var(--ink);
-  }
-
-  .capability-note small {
-    display: block;
-    color: var(--muted);
-    font-size: 11px;
-    margin-top: 4px;
-    line-height: 1.4;
-  }
-</style>

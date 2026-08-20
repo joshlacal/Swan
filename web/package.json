@@ -12,15 +12,18 @@
     "test:browser": "playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.54.2",
     "@sveltejs/adapter-static": "^3.0.8",
     "@sveltejs/kit": "^2.37.0",
     "@sveltejs/vite-plugin-svelte": "^6.1.0",
-    "@playwright/test": "^1.54.2",
+    "@tailwindcss/vite": "^4.3.3",
     "@types/node": "^22.15.0",
+    "daisyui": "^5.7.19",
     "eslint": "^9.32.0",
     "eslint-plugin-svelte": "^3.10.1",
     "svelte": "^5.38.7",
     "svelte-check": "^4.3.1",
+    "tailwindcss": "^4.3.3",
     "typescript": "^5.8.3",
     "vite": "^7.1.2",
     "vitest": "^3.2.4"

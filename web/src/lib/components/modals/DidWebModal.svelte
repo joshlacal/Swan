@@ -1,7 +1,6 @@
 <script lang="ts">
   import Modal from '$lib/components/ui/Modal.svelte';
   import CopyButton from '$lib/components/ui/CopyButton.svelte';
-  import Spinner from '$lib/components/ui/Spinner.svelte';
   import { api } from '$lib/api';
   import { toasts } from '$lib/stores/toasts';
   import { portal } from '$lib/stores/portal';
@@ -82,7 +81,7 @@
       });
 
       stage = 'success';
-      toasts.success(`Custom domain @${reservation.handle || domain} bound successfully!`);
+      toasts.success(`Custom domain @${reservation.handle || domain} bound successfully.`);
 
       try {
         const snapshot = await api.fetchSnapshot();
@@ -91,7 +90,7 @@
         // Non-blocking snapshot refresh
       }
     } catch (err: any) {
-      error = err.message || 'Verification failed. Please ensure DNS TXT or did.json is reachable.';
+      error = err.message || 'Verification failed. Ensure DNS TXT or did.json is reachable.';
     } finally {
       busy = false;
     }
@@ -208,19 +207,19 @@
   }
 
   const modalTitle = $derived.by(() => {
-    if (stage === 'success') return 'Domain Identity Updated';
-    if (mode === 'remove') return 'Remove Custom did:web Domain';
-    if (mode === 'rotate') return 'Rotate did:web Identity';
-    if (stage === 'verify') return 'Verify Domain Ownership';
-    return 'Bring Your Own Domain (did:web)';
+    if (stage === 'success') return 'Custom domain updated';
+    if (mode === 'remove') return 'Remove did:web domain';
+    if (mode === 'rotate') return 'Rotate did:web identity';
+    if (stage === 'verify') return 'Verify domain ownership';
+    return 'Custom domain (did:web)';
   });
 
   const modalDesc = $derived.by(() => {
-    if (stage === 'success') return 'Your decentralized identity changes have been committed to the ledger.';
+    if (stage === 'success') return 'Your custom domain identity configuration is complete.';
     if (mode === 'remove') return 'Revert your account identity back to standard did:plc.';
-    if (mode === 'rotate') return 'Update or re-key your custom domain decentralized identity binding.';
-    if (stage === 'verify') return 'Publish either a DNS TXT record or HTTPS did.json file to prove domain control.';
-    return 'Bind your own domain name (e.g. alice.example.com) to your Swan account using did:web.';
+    if (mode === 'rotate') return 'Update your custom domain decentralized identity binding.';
+    if (stage === 'verify') return 'Publish a DNS TXT record or HTTPS did.json file to prove domain control.';
+    return 'Bind your own domain name (e.g. alice.example.com) to your account using did:web.';
   });
 </script>
 
@@ -233,100 +232,115 @@
   onClose={handleFinish}
 >
   {#if stage === 'success'}
-    <div class="success-view">
-      <div class="success-circle">✓</div>
-      <h3>Configuration Complete</h3>
-      <p>Your account identity settings have been updated successfully.</p>
-      <div class="action-footer">
-        <button type="button" class="btn primary" onclick={handleFinish}>Done</button>
+    <div class="flex flex-col items-center text-center gap-4 py-4">
+      <div class="w-12 h-12 rounded-full bg-success text-success-content flex items-center justify-center text-xl font-bold">
+        ✓
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold text-base-content">Domain configured</h3>
+        <p class="text-sm text-base-content/70 mt-1">Your account identity settings have been updated.</p>
+      </div>
+      <div class="modal-action mt-2 w-full flex justify-end">
+        <button type="button" class="btn btn-primary" onclick={handleFinish}>Done</button>
       </div>
     </div>
   {:else if mode === 'remove'}
-    <div class="confirm-view">
+    <div class="flex flex-col gap-5">
       {#if error}
-        <div class="error-banner" role="alert">{error}</div>
+        <div class="alert alert-error text-sm" role="alert">
+          <span>{error}</span>
+        </div>
       {/if}
 
-      <div class="warning-card">
-        <span class="warning-glyph">⚠️</span>
+      <div class="alert alert-warning text-sm" role="alert">
+        <svg class="h-5 w-5 shrink-0 stroke-current" fill="none" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+        </svg>
         <div>
-          <strong>Revert to PLC Decentralized Identifier</strong>
-          <p>Removing your custom domain identity will revert your account to its original <code>did:plc:...</code> identifier. Existing references to your did:web DID may break.</p>
+          <div class="font-semibold">Revert to PLC identifier</div>
+          <p class="mt-0.5 text-xs">
+            Removing your custom domain reverts your account to its original <code class="font-mono">did:plc:...</code> identifier. Existing references to your did:web identifier may break.
+          </p>
         </div>
       </div>
 
-      <div class="action-footer">
-        <button type="button" class="btn ghost" onclick={handleFinish} disabled={busy}>
+      <div class="modal-action mt-2 flex justify-end gap-2">
+        <button type="button" class="btn btn-ghost" onclick={handleFinish} disabled={busy}>
           Cancel
         </button>
-        <button type="button" class="btn danger" onclick={handleRemove} disabled={busy}>
+        <button type="button" class="btn btn-error" onclick={handleRemove} disabled={busy}>
           {#if busy}
-            <Spinner size={14} color="#ffffff" /> Removing domain…
+            <span class="loading loading-spinner loading-xs"></span>
+            <span>Removing domain…</span>
           {:else}
-            Remove did:web Identity <span>↗</span>
+            Remove did:web identity
           {/if}
         </button>
       </div>
     </div>
   {:else if mode === 'rotate'}
-    <form class="wizard-form" onsubmit={handleRotate}>
+    <form class="flex flex-col gap-5" onsubmit={handleRotate}>
       {#if error}
-        <div class="error-banner" role="alert">{error}</div>
+        <div class="alert alert-error text-sm" role="alert">
+          <span>{error}</span>
+        </div>
       {/if}
 
-      <div class="form-field">
-        <label for="did-rotate-domain">New Domain Name</label>
+      <fieldset class="fieldset gap-1">
+        <legend class="fieldset-legend text-xs font-semibold uppercase tracking-wider text-base-content/70">New domain name</legend>
         <input
           id="did-rotate-domain"
           type="text"
+          class="input w-full font-mono"
           bind:value={domain}
           placeholder="new-domain.example.com"
           required
           disabled={busy}
         />
-        <small class="field-hint">Rotation requires an elevated step-up session to authorize key update.</small>
-      </div>
+        <p class="fieldset-label text-xs text-base-content/60">Rotation requires authorization with your account credentials.</p>
+      </fieldset>
 
-      <div class="action-footer">
-        <button type="button" class="btn ghost" onclick={handleFinish} disabled={busy}>
+      <div class="modal-action mt-2 flex justify-end gap-2">
+        <button type="button" class="btn btn-ghost" onclick={handleFinish} disabled={busy}>
           Cancel
         </button>
-        <button type="submit" class="btn primary" disabled={busy || !domain.trim()}>
+        <button type="submit" class="btn btn-primary" disabled={busy || !domain.trim()}>
           {#if busy}
-            <Spinner size={14} color="#ffffff" /> Rotating…
+            <span class="loading loading-spinner loading-xs"></span>
+            <span>Rotating…</span>
           {:else}
-            Rotate Domain <span>↗</span>
+            Rotate domain
           {/if}
         </button>
       </div>
     </form>
   {:else if stage === 'verify'}
-    <div class="verify-view">
+    <div class="flex flex-col gap-5">
       {#if error}
-        <div class="error-banner" role="alert">{error}</div>
+        <div class="alert alert-error text-sm" role="alert">
+          <span>{error}</span>
+        </div>
       {/if}
 
-      <div class="reservation-badge">
-        <span class="eyebrow">RESERVED TARGET DID</span>
-        <strong>{reservation?.targetDID || `did:web:${cleanDomain(domain)}`}</strong>
+      <div class="card card-border bg-base-200/60 p-3.5 flex flex-col gap-1">
+        <span class="text-xs font-mono font-semibold uppercase tracking-wider text-base-content/60">Reserved target DID</span>
+        <strong class="font-mono text-sm break-all text-base-content">{reservation?.targetDID || `did:web:${cleanDomain(domain)}`}</strong>
       </div>
 
-      <div class="tabs" role="tablist">
+      <div class="tabs tabs-box" role="tablist">
         <button
           type="button"
           role="tab"
-          class="tab-btn"
-          class:active={verificationTab === 'dns'}
+          class="tab {verificationTab === 'dns' ? 'tab-active' : ''}"
           aria-selected={verificationTab === 'dns'}
           onclick={() => (verificationTab = 'dns')}
         >
-          Option 1: DNS TXT Record (Recommended)
+          Option 1: DNS TXT record (Recommended)
         </button>
         <button
           type="button"
           role="tab"
-          class="tab-btn"
-          class:active={verificationTab === 'https'}
+          class="tab {verificationTab === 'https' ? 'tab-active' : ''}"
           aria-selected={verificationTab === 'https'}
           onclick={() => (verificationTab = 'https')}
         >
@@ -335,137 +349,97 @@
       </div>
 
       {#if verificationTab === 'dns'}
-        <div class="instruction-box">
-          <p>Add the following DNS <strong>TXT</strong> record to your domain's DNS provider:</p>
-          <div class="dns-grid">
-            <div class="dns-cell">
-              <span class="cell-label">HOST / NAME</span>
-              <code>{getDnsTxtHost()}</code>
-              <CopyButton text={getDnsTxtHost()} size="sm" label="Copy Host" />
+        <div class="card card-border bg-base-100 p-4 flex flex-col gap-3">
+          <p class="text-sm text-base-content">Add the following DNS <strong class="font-semibold">TXT</strong> record to your domain:</p>
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+            <div class="sm:col-span-2 bg-base-200/80 rounded-box p-3 flex flex-col gap-2 border border-base-300">
+              <span class="text-xs font-mono font-semibold uppercase text-base-content/60">Host / Name</span>
+              <div class="flex items-center justify-between gap-2">
+                <code class="font-mono text-sm break-all">{getDnsTxtHost()}</code>
+                <CopyButton text={getDnsTxtHost()} size="sm" label="Copy" />
+              </div>
             </div>
-            <div class="dns-cell">
-              <span class="cell-label">TYPE</span>
-              <code>TXT</code>
+            <div class="bg-base-200/80 rounded-box p-3 flex flex-col gap-2 border border-base-300">
+              <span class="text-xs font-mono font-semibold uppercase text-base-content/60">Type</span>
+              <code class="font-mono text-sm font-semibold">TXT</code>
             </div>
-            <div class="dns-cell full-width">
-              <span class="cell-label">VALUE / CONTENT</span>
-              <code>{getDnsTxtValue()}</code>
-              <CopyButton text={getDnsTxtValue()} size="sm" label="Copy Value" />
+            <div class="sm:col-span-3 bg-base-200/80 rounded-box p-3 flex flex-col gap-2 border border-base-300">
+              <span class="text-xs font-mono font-semibold uppercase text-base-content/60">Value / Content</span>
+              <div class="flex items-center justify-between gap-2">
+                <code class="font-mono text-sm break-all">{getDnsTxtValue()}</code>
+                <CopyButton text={getDnsTxtValue()} size="sm" label="Copy" />
+              </div>
             </div>
           </div>
         </div>
       {:else}
-        <div class="instruction-box">
-          <p>Host the following JSON document at <code>https://{cleanDomain(domain)}/.well-known/did.json</code>:</p>
-          <div class="code-preview">
-            <pre><code>{getGeneratedDidJson()}</code></pre>
-            <div class="preview-actions">
-              <CopyButton text={getGeneratedDidJson()} variant="primary" label="Copy did.json" />
+        <div class="card card-border bg-base-100 p-4 flex flex-col gap-3">
+          <p class="text-sm text-base-content">Host this JSON document at <code class="font-mono text-xs bg-base-200 px-1.5 py-0.5 rounded border border-base-300">https://{cleanDomain(domain)}/.well-known/did.json</code>:</p>
+          <div class="rounded-box border border-base-300 overflow-hidden bg-base-200">
+            <pre class="p-3 text-xs font-mono overflow-x-auto max-h-56"><code>{getGeneratedDidJson()}</code></pre>
+            <div class="p-2 border-t border-base-300 flex justify-end bg-base-100">
+              <CopyButton text={getGeneratedDidJson()} variant="primary" size="sm" label="Copy did.json" />
             </div>
           </div>
         </div>
       {/if}
 
-      <div class="action-footer">
-        <button type="button" class="btn ghost" onclick={handleFinish} disabled={busy}>
+      <div class="modal-action mt-2 flex justify-end gap-2">
+        <button type="button" class="btn btn-ghost" onclick={handleFinish} disabled={busy}>
           Cancel
         </button>
-        <button type="button" class="btn primary" onclick={handleClaim} disabled={busy}>
+        <button type="button" class="btn btn-primary" onclick={handleClaim} disabled={busy}>
           {#if busy}
-            <Spinner size={14} color="#ffffff" /> Verifying…
+            <span class="loading loading-spinner loading-xs"></span>
+            <span>Verifying…</span>
           {:else}
-            Verify & Claim Binding <span>✓</span>
+            Verify and claim domain
           {/if}
         </button>
       </div>
     </div>
   {:else}
-    <form class="wizard-form" onsubmit={handleReserve}>
+    <form class="flex flex-col gap-5" onsubmit={handleReserve}>
       {#if error}
-        <div class="error-banner" role="alert">{error}</div>
+        <div class="alert alert-error text-sm" role="alert">
+          <span>{error}</span>
+        </div>
       {/if}
 
-      <div class="form-field">
-        <label for="did-domain-input">Your Custom Domain</label>
+      <fieldset class="fieldset gap-1">
+        <legend class="fieldset-legend text-xs font-semibold uppercase tracking-wider text-base-content/70">Custom domain</legend>
         <input
           id="did-domain-input"
           type="text"
+          class="input w-full font-mono"
           bind:value={domain}
           placeholder="e.g. alice.example.com"
           required
           disabled={busy}
         />
-        <small class="field-hint">Enter your domain or subdomain. You must have DNS or web hosting control over it.</small>
+        <p class="fieldset-label text-xs text-base-content/60">Enter a domain or subdomain you control.</p>
+      </fieldset>
+
+      <div class="card card-border bg-base-200/50 p-4">
+        <div class="text-sm font-semibold text-base-content">Domain identity</div>
+        <p class="text-xs text-base-content/70 mt-1">
+          With did:web, your domain hosts your public keys. Swan serves your repository data while you retain ownership of the domain.
+        </p>
       </div>
 
-      <div class="info-card">
-        <span class="card-glyph">◎</span>
-        <div>
-          <strong>Self-Sovereign Identity</strong>
-          <p>With did:web, your domain hosts your public keys. Swan acts as your personal data server while you retain full identity ownership.</p>
-        </div>
-      </div>
-
-      <div class="action-footer">
-        <button type="button" class="btn ghost" onclick={handleFinish} disabled={busy}>
+      <div class="modal-action mt-2 flex justify-end gap-2">
+        <button type="button" class="btn btn-ghost" onclick={handleFinish} disabled={busy}>
           Cancel
         </button>
-        <button type="submit" class="btn primary" disabled={busy || !domain.trim()}>
+        <button type="submit" class="btn btn-primary" disabled={busy || !domain.trim()}>
           {#if busy}
-            <Spinner size={14} color="#ffffff" /> Reserving…
+            <span class="loading loading-spinner loading-xs"></span>
+            <span>Reserving…</span>
           {:else}
-            Reserve Domain <span>↗</span>
+            Reserve domain
           {/if}
         </button>
       </div>
     </form>
   {/if}
 </Modal>
-
-<style>
-  .wizard-form, .verify-view, .confirm-view, .success-view { display: flex; flex-direction: column; gap: 20px; }
-  .form-field { display: flex; flex-direction: column; gap: 6px; }
-  .form-field label { font: 600 11px var(--mono, monospace); color: var(--muted, #687270); letter-spacing: 0.08em; text-transform: uppercase; }
-  .form-field input[type="text"] { padding: 10px 12px; font: 13px var(--sans, sans-serif); border: 1px solid var(--line, #d7d5ca); background: #ffffff; color: var(--ink, #1f2827); border-radius: 2px; }
-  .form-field input:focus { outline: 2px solid var(--teal, #2b7169); border-color: var(--teal, #2b7169); }
-  .field-hint { font-size: 11px; color: var(--muted, #687270); }
-  .info-card { display: flex; gap: 12px; background: #faf8f1; border: 1px solid var(--line, #d7d5ca); padding: 14px; border-radius: 2px; }
-  .card-glyph { font-size: 22px; color: var(--teal, #2b7169); }
-  .info-card strong { display: block; font-size: 13px; color: var(--ink, #1f2827); font-family: var(--sans, sans-serif); }
-  .info-card p { margin: 4px 0 0; font-size: 12px; color: var(--muted, #687270); line-height: 1.4; }
-  .warning-card { display: flex; gap: 12px; background: #faf4e6; border: 1px solid #f1dfb8; padding: 14px; border-radius: 2px; color: #5c4714; }
-  .warning-glyph { font-size: 20px; flex-shrink: 0; }
-  .warning-card strong { display: block; font-size: 13px; font-family: var(--sans, sans-serif); }
-  .warning-card p { margin: 4px 0 0; font-size: 12px; line-height: 1.4; }
-  .warning-card code { font: 11px var(--mono, monospace); background: #e6ded0; padding: 2px 4px; border-radius: 2px; }
-  .error-banner { background: #fbebe8; color: var(--coral, #ba5e47); border-left: 3px solid var(--coral, #ba5e47); padding: 10px 14px; font-size: 12px; border-radius: 2px; }
-  .reservation-badge { background: #faf8f1; border: 1px solid var(--line, #d7d5ca); padding: 12px 16px; border-radius: 2px; display: flex; flex-direction: column; gap: 4px; }
-  .eyebrow { font: 600 10px var(--mono, monospace); color: var(--teal, #2b7169); letter-spacing: 0.1em; }
-  .reservation-badge strong { font: 600 14px var(--mono, monospace); color: var(--teal-deep, #173f3e); }
-  .tabs { display: flex; gap: 8px; border-bottom: 1px solid var(--line, #d7d5ca); padding-bottom: 8px; }
-  .tab-btn { border: 0; background: transparent; color: var(--muted, #687270); font: 600 12px var(--sans, sans-serif); padding: 8px 12px; border-radius: 2px; cursor: pointer; transition: all 0.15s; }
-  .tab-btn.active { background: var(--teal-deep, #173f3e); color: #ffffff; }
-  .instruction-box { background: #ffffff; border: 1px solid var(--line, #d7d5ca); padding: 16px; border-radius: 2px; display: flex; flex-direction: column; gap: 12px; }
-  .instruction-box p { margin: 0; font-size: 13px; color: var(--ink, #1f2827); font-family: var(--sans, sans-serif); }
-  .dns-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; margin-top: 4px; }
-  .dns-cell { background: #faf8f1; border: 1px solid var(--line, #d7d5ca); padding: 10px 12px; border-radius: 2px; display: flex; flex-direction: column; gap: 6px; }
-  .dns-cell.full-width { grid-column: 1 / -1; }
-  .cell-label { font: 600 10px var(--mono, monospace); color: var(--muted, #687270); }
-  .dns-cell code { font: 600 12px var(--mono, monospace); color: var(--teal-deep, #173f3e); word-break: break-all; }
-  .code-preview { position: relative; background: #faf8f1; border: 1px solid var(--line, #d7d5ca); border-radius: 2px; }
-  .code-preview pre { margin: 0; padding: 14px; font: 12px var(--mono, monospace); color: var(--ink, #1f2827); overflow-x: auto; max-height: 220px; }
-  .preview-actions { padding: 8px 12px; border-top: 1px solid var(--line, #d7d5ca); display: flex; justify-content: flex-end; background: #ffffff; }
-  .success-view { text-align: center; align-items: center; padding: 20px 0; display: flex; flex-direction: column; gap: 12px; }
-  .success-circle { width: 48px; height: 48px; border-radius: 50%; background: var(--teal, #2b7169); color: #ffffff; display: grid; place-items: center; font-size: 22px; font-weight: bold; }
-  .success-view h3 { margin: 0; font: 400 24px var(--serif, serif); }
-  .success-view p { color: var(--muted, #687270); font-size: 13px; margin: 0; }
-  .action-footer { display: flex; justify-content: flex-end; gap: 10px; width: 100%; }
-  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 16px; font-size: 12px; font-weight: 600; cursor: pointer; border-radius: 2px; border: 1px solid transparent; font-family: var(--sans, sans-serif); }
-  .btn.primary { background: var(--teal, #2b7169); color: #ffffff; }
-  .btn.primary:hover { background: var(--teal-deep, #173f3e); }
-  .btn.danger { background: var(--coral, #ba5e47); color: #ffffff; }
-  .btn.danger:hover { background: #963d28; }
-  .btn.ghost { background: transparent; color: var(--muted, #687270); border-color: var(--line, #d7d5ca); }
-  .btn.ghost:hover { background: #e6e3d9; color: var(--ink, #1f2827); }
-  .btn:disabled { opacity: 0.6; cursor: not-allowed; }
-</style>

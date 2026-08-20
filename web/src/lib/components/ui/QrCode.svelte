@@ -14,7 +14,7 @@
   let {
     value,
     size = 200,
-    fgColor = 'var(--ink, #1f2827)',
+    fgColor = '#000000',
     bgColor = '#ffffff',
     margin = 2,
     title = 'QR Code',
@@ -34,8 +34,7 @@
 </script>
 
 <div
-  class="qr-code-wrapper {className}"
-  style="--qr-size: {computedSize}; --qr-bg: {bgColor};"
+  class="bg-base-100 border-base-300 rounded-box border p-3 inline-block {className}"
   role="img"
   aria-label={title}
 >
@@ -43,45 +42,21 @@
     <svg
       xmlns="http://www.w3.org/2000/svg"
       viewBox={qrData.viewBox}
-      width="100%"
-      height="100%"
+      style="width: {computedSize}; height: {computedSize};"
       shape-rendering="crispEdges"
       aria-hidden="true"
+      class="block bg-white rounded"
     >
-      <rect width="100%" height="100%" fill="var(--qr-bg)" />
+      <rect width="100%" height="100%" fill={bgColor} />
       <path d={qrData.path} fill={fgColor} />
     </svg>
   {:else}
-    <div class="qr-placeholder" aria-hidden="true">
-      <span>No QR code data</span>
+    <div
+      class="grid place-items-center bg-base-200 text-base-content/60 font-mono text-xs rounded"
+      style="width: {computedSize}; height: {computedSize};"
+      aria-hidden="true"
+    >
+      <span>No QR code</span>
     </div>
   {/if}
 </div>
-
-<style>
-  .qr-code-wrapper {
-    display: inline-block;
-    width: var(--qr-size, 200px);
-    height: var(--qr-size, 200px);
-    background: var(--qr-bg, #ffffff);
-    padding: 8px;
-    box-sizing: border-box;
-    border: 1px solid var(--line, #d7d5ca);
-    border-radius: 2px;
-  }
-
-  .qr-placeholder {
-    width: 100%;
-    height: 100%;
-    display: grid;
-    place-items: center;
-    background: #faf8f1;
-    color: var(--muted, #687270);
-    font-family: var(--mono, monospace);
-    font-size: 11px;
-  }
-
-  svg {
-    display: block;
-  }
-</style>

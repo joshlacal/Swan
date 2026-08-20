@@ -9,9 +9,11 @@ test.describe('account portal over local HTTPS', () => {
     expect(await page.evaluate(() => document.querySelector('script'))).toBeTruthy();
   });
 
-  test('keeps the OAuth page script-free and uses the shared auth stylesheet', async ({ page }) => {
+  test('keeps the OAuth page script-free and self-contained', async ({ page }) => {
     await page.goto('/oauth/authorize');
-    await expect(page.locator('link[href="/account/auth-tokens.css"]')).toHaveCount(1);
+    // The OAuth pages inline their daisyUI stylesheet under a CSP hash, so they
+    // fetch no stylesheet and run no script.
+    await expect(page.locator('link[rel="stylesheet"]')).toHaveCount(0);
     await expect(page.locator('script')).toHaveCount(0);
   });
 });

@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import Modal from '$lib/components/ui/Modal.svelte';
-  import Spinner from '$lib/components/ui/Spinner.svelte';
   import { accountFetch, api } from '$lib/api';
   import { toasts } from '$lib/stores/toasts';
 
@@ -112,150 +111,118 @@
 
 <Modal
   {isOpen}
-  title="Account Data Export"
-  description="Generate a portable cryptographic archive containing your AT Protocol repository, commit records, and identity proofs."
+  title="Account data export"
+  description="Generate a portable archive containing your AT Protocol repository, commit records, and identity proofs."
   size="md"
   preventClose={stage === 'requesting'}
   onClose={handleClose}
 >
   {#if stage === 'ready' && exportData}
-    <div class="ready-view">
-      <div class="success-banner">
-        <span class="banner-icon">✓</span>
+    <div class="flex flex-col gap-4">
+      <div class="alert alert-success text-sm">
+        <svg class="h-5 w-5 shrink-0 stroke-current" fill="none" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+        </svg>
         <div>
-          <strong>Export Archive Ready</strong>
-          <p>Format: swan-account-export-v2 (CAR + identity manifest)</p>
+          <div class="font-semibold">Export archive ready</div>
+          <div class="text-xs opacity-80">Format: swan-account-export-v2 (CAR + identity manifest)</div>
         </div>
       </div>
 
-      <div class="export-meta-card">
-        <div class="meta-row">
-          <span class="meta-label">EXPORT ID</span>
-          <code>{exportData.id || 'exp_current'}</code>
+      <div class="card card-border bg-base-100 p-4 flex flex-col gap-2.5">
+        <div class="flex justify-between items-center text-sm">
+          <span class="text-xs font-mono font-semibold uppercase text-base-content/60">Export ID</span>
+          <code class="font-mono text-xs bg-base-200 px-2 py-0.5 rounded border border-base-300">{exportData.id || 'exp_current'}</code>
         </div>
         {#if exportData.requestedAt}
-          <div class="meta-row">
-            <span class="meta-label">GENERATED AT</span>
-            <span>{new Date(exportData.requestedAt).toLocaleString()}</span>
+          <div class="flex justify-between items-center text-sm">
+            <span class="text-xs font-mono font-semibold uppercase text-base-content/60">Generated at</span>
+            <span class="text-xs text-base-content/80">{new Date(exportData.requestedAt).toLocaleString()}</span>
           </div>
         {/if}
-        <div class="meta-row">
-          <span class="meta-label">FORMAT</span>
-          <span>Content Addressable Archive (.car)</span>
+        <div class="flex justify-between items-center text-sm">
+          <span class="text-xs font-mono font-semibold uppercase text-base-content/60">Format</span>
+          <span class="text-xs text-base-content/80">Content Addressable Archive (.car)</span>
         </div>
       </div>
 
-      <div class="security-box">
-        <span class="sec-icon">🔒</span>
-        <p>
-          <strong>Security Notice:</strong> Store this archive in an encrypted, offline location. This file contains your complete public and private repository records.
-        </p>
+      <div class="alert alert-warning text-sm" role="alert">
+        <svg class="h-5 w-5 shrink-0 stroke-current" fill="none" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+        </svg>
+        <span>Store this archive in a secure location. It contains your complete repository records and credentials.</span>
       </div>
 
-      <div class="action-footer">
-        <button type="button" class="btn ghost" onclick={handleRequestExport}>
-          Request Fresh Export ↺
+      <div class="modal-action mt-2 flex justify-between items-center gap-2">
+        <button type="button" class="btn btn-ghost" onclick={handleRequestExport}>
+          Request fresh export
         </button>
         <a
-          class="btn primary"
+          class="btn btn-primary"
           href={exportData.downloadUrl || '/account/api/export/download'}
           download={`swan-export-${exportData.id || 'account'}.car`}
         >
-          Download Data Archive <span>↓</span>
+          Download archive
         </a>
       </div>
     </div>
   {:else if stage === 'polling' || stage === 'requesting'}
-    <div class="polling-view">
-      <div class="spinner-box">
-        <Spinner size={32} />
-        <h3>Packaging Your Repository…</h3>
-        <p>Compiling your data tree, cryptographic signing keys, and identity bindings. This usually takes 5 to 30 seconds.</p>
+    <div class="flex flex-col items-center text-center gap-4 py-6">
+      <span class="loading loading-spinner loading-lg text-primary"></span>
+      <div>
+        <h3 class="text-lg font-semibold text-base-content">Packaging repository…</h3>
+        <p class="text-sm text-base-content/70 mt-1 max-w-sm">Compiling your data tree, cryptographic signing keys, and identity bindings. This usually takes 5 to 30 seconds.</p>
       </div>
 
-      <div class="pulse-indicator">
-        <span class="pulse-dot"></span>
-        <span class="pulse-text">Polling status every 2.5s</span>
+      <div class="badge badge-neutral gap-2 py-3 px-4 text-xs font-mono">
+        <span class="inline-block w-2 h-2 rounded-full bg-primary animate-pulse"></span>
+        Polling status every 2.5s
       </div>
 
-      <div class="action-footer">
-        <button type="button" class="btn ghost" onclick={handleClose}>
-          Close & Notify Me
+      <div class="modal-action mt-2 w-full flex justify-end">
+        <button type="button" class="btn btn-ghost" onclick={handleClose}>
+          Close
         </button>
       </div>
     </div>
   {:else}
-    <div class="intro-view">
+    <div class="flex flex-col gap-5">
       {#if stage === 'error'}
-        <div class="error-banner" role="alert">{errorMessage}</div>
+        <div class="alert alert-error text-sm" role="alert">
+          <span>{errorMessage}</span>
+        </div>
       {/if}
 
-      <div class="info-card">
-        <span class="card-glyph">📦</span>
-        <div>
-          <strong>Self-Contained Portable Archive</strong>
-          <p>
-            Your export includes all AT Protocol repository commits, signed blocks, account metadata, and factor envelopes. It can be inspected or imported into any compatible PDS.
-          </p>
-        </div>
+      <div class="card card-border bg-base-200/50 p-4">
+        <div class="text-sm font-semibold text-base-content">Portable account archive</div>
+        <p class="text-xs text-base-content/70 mt-1">
+          Your export includes all AT Protocol repository commits, signed blocks, account metadata, and factor records. It can be inspected or imported into any compatible PDS.
+        </p>
       </div>
 
-      <div class="checklist">
-        <div class="check-item">
-          <span class="check-glyph">✓</span>
+      <div class="card card-border bg-base-100 p-4 flex flex-col gap-2">
+        <div class="flex items-center gap-2 text-sm text-base-content">
+          <span class="text-success font-bold">✓</span>
           <span>Complete CAR repository history</span>
         </div>
-        <div class="check-item">
-          <span class="check-glyph">✓</span>
-          <span>Decentralized identity claims & keys</span>
+        <div class="flex items-center gap-2 text-sm text-base-content">
+          <span class="text-success font-bold">✓</span>
+          <span>Decentralized identity claims and keys</span>
         </div>
-        <div class="check-item">
-          <span class="check-glyph">✓</span>
+        <div class="flex items-center gap-2 text-sm text-base-content">
+          <span class="text-success font-bold">✓</span>
           <span>Account configuration and factor records</span>
         </div>
       </div>
 
-      <div class="action-footer">
-        <button type="button" class="btn ghost" onclick={handleClose}>
+      <div class="modal-action mt-2 flex justify-end gap-2">
+        <button type="button" class="btn btn-ghost" onclick={handleClose}>
           Cancel
         </button>
-        <button type="button" class="btn primary" onclick={handleRequestExport}>
-          Generate Data Export <span>↗</span>
+        <button type="button" class="btn btn-primary" onclick={handleRequestExport}>
+          Generate data export
         </button>
       </div>
     </div>
   {/if}
 </Modal>
-
-<style>
-  .intro-view, .polling-view, .ready-view { display: flex; flex-direction: column; gap: 20px; }
-  .info-card { display: flex; gap: 12px; background: #faf8f1; border: 1px solid var(--line, #d7d5ca); padding: 16px; border-radius: 2px; }
-  .card-glyph { font-size: 24px; }
-  .info-card strong { display: block; font-size: 13px; color: var(--ink, #1f2827); font-family: var(--sans, sans-serif); }
-  .info-card p { margin: 6px 0 0; font-size: 12px; color: var(--muted, #687270); line-height: 1.5; }
-  .checklist { display: flex; flex-direction: column; gap: 8px; background: #ffffff; border: 1px solid var(--line, #d7d5ca); padding: 14px 16px; border-radius: 2px; }
-  .check-item { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--ink, #1f2827); }
-  .check-glyph { color: var(--teal, #2b7169); font-weight: bold; }
-  .error-banner { background: #fbebe8; color: var(--coral, #ba5e47); border-left: 3px solid var(--coral, #ba5e47); padding: 10px 14px; font-size: 12px; border-radius: 2px; }
-  .polling-view { text-align: center; align-items: center; padding: 20px 0; }
-  .spinner-box { display: flex; flex-direction: column; align-items: center; gap: 12px; }
-  .spinner-box h3 { margin: 0; font: 400 24px var(--serif, serif); }
-  .spinner-box p { color: var(--muted, #687270); font-size: 13px; max-width: 380px; margin: 0; line-height: 1.5; }
-  .pulse-indicator { display: flex; align-items: center; gap: 8px; font: 600 11px var(--mono, monospace); color: var(--teal, #2b7169); background: #faf8f1; padding: 6px 12px; border-radius: 12px; }
-  .pulse-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--teal, #2b7169); animation: pulse 1.5s infinite; }
-  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-  .success-banner { display: flex; align-items: center; gap: 12px; background: #dceee1; padding: 14px 16px; border-radius: 2px; color: var(--teal-deep, #173f3e); font-size: 13px; }
-  .banner-icon { width: 24px; height: 24px; border-radius: 50%; background: var(--teal, #2b7169); color: #ffffff; display: grid; place-items: center; font-weight: bold; flex-shrink: 0; }
-  .export-meta-card { background: #ffffff; border: 1px solid var(--line, #d7d5ca); padding: 16px; border-radius: 2px; display: flex; flex-direction: column; gap: 10px; }
-  .meta-row { display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
-  .meta-label { font: 600 10px var(--mono, monospace); color: var(--muted, #687270); letter-spacing: 0.08em; }
-  .meta-row code { font: 600 12px var(--mono, monospace); color: var(--teal-deep, #173f3e); background: #faf8f1; padding: 2px 6px; border-radius: 2px; }
-  .security-box { display: flex; gap: 10px; background: #faf4e6; border: 1px solid #f1dfb8; padding: 12px 14px; border-radius: 2px; color: #5c4714; font-size: 12px; line-height: 1.5; }
-  .sec-icon { font-size: 16px; flex-shrink: 0; }
-  .action-footer { display: flex; justify-content: flex-end; gap: 10px; width: 100%; }
-  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 16px; font-size: 12px; font-weight: 600; cursor: pointer; border-radius: 2px; border: 1px solid transparent; text-decoration: none; font-family: var(--sans, sans-serif); }
-  .btn.primary { background: var(--teal, #2b7169); color: #ffffff; }
-  .btn.primary:hover { background: var(--teal-deep, #173f3e); }
-  .btn.ghost { background: transparent; color: var(--muted, #687270); border-color: var(--line, #d7d5ca); }
-  .btn.ghost:hover { background: #e6e3d9; color: var(--ink, #1f2827); }
-</style>

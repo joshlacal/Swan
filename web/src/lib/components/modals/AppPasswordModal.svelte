@@ -1,7 +1,6 @@
 <script lang="ts">
   import Modal from '$lib/components/ui/Modal.svelte';
   import CopyButton from '$lib/components/ui/CopyButton.svelte';
-  import Spinner from '$lib/components/ui/Spinner.svelte';
   import { api } from '$lib/api';
   import { toasts } from '$lib/stores/toasts';
   import { portal } from '$lib/stores/portal';
@@ -23,19 +22,19 @@
   const scopeLabels: Record<AppPasswordScope, { label: string; desc: string }> = {
     'atproto': {
       label: 'Base AT Protocol access',
-      desc: 'Allows reading and creating repository records (required).'
+      desc: 'Read and create repository records (required).'
     },
     'transition:chat.bsky': {
-      label: 'Direct Messages (chat.bsky)',
-      desc: 'Allows accessing Bluesky direct messages.'
+      label: 'Direct messages (chat.bsky)',
+      desc: 'Access Bluesky direct messages.'
     },
     'transition:email': {
-      label: 'Email Notifications',
-      desc: 'Allows managing email communication preferences.'
+      label: 'Email notifications',
+      desc: 'Manage email preferences.'
     },
     'transition:generic': {
-      label: 'Generic Account Transition',
-      desc: 'Allows general transition operations across services.'
+      label: 'Generic account transition',
+      desc: 'Transition operations across services.'
     }
   };
 
@@ -68,7 +67,7 @@
 
       if (result.password) {
         createdPassword = result.password;
-        toasts.success('App password created successfully');
+        toasts.success('App password created');
         try {
           const snapshot = await api.fetchSnapshot();
           portal.setSnapshot(snapshot);
@@ -96,130 +95,105 @@
 
 <Modal
   {isOpen}
-  title={createdPassword ? 'App Password Created' : 'Create App Password'}
-  description={createdPassword ? undefined : 'Generate a scoped password for legacy clients that do not support OAuth.'}
+  title={createdPassword ? 'App password created' : 'Create app password'}
+  description={createdPassword ? undefined : 'Generate a scoped password for clients that do not support OAuth.'}
   size="md"
   preventClose={submitting}
   onClose={handleFinish}
 >
   {#if createdPassword}
-    <div class="created-state">
-      <div class="success-banner">
-        <span class="banner-icon">✓</span>
+    <div class="flex flex-col gap-4">
+      <div class="alert alert-success text-sm">
+        <svg class="h-5 w-5 shrink-0 stroke-current" fill="none" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+        </svg>
         <div>
-          <strong>Generated for {name}</strong>
-          <p>Scopes: {Array.from(selectedScopes).join(' · ')}</p>
+          <div class="font-semibold">Generated for {name}</div>
+          <div class="text-xs opacity-80">Scopes: {Array.from(selectedScopes).join(' · ')}</div>
         </div>
       </div>
 
-      <div class="password-box">
-        <span class="eyebrow">YOUR ONE-TIME PASSWORD</span>
-        <div class="password-row">
-          <code class="password-code">{createdPassword}</code>
-          <CopyButton text={createdPassword} variant="primary" label="Copy Password" copiedLabel="Copied!" />
+      <div class="card card-border bg-base-200/60 p-4 flex flex-col gap-2">
+        <span class="text-xs font-mono font-semibold uppercase tracking-wider text-base-content/60">One-time password</span>
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+          <code class="font-mono font-semibold text-base break-all bg-base-100 px-3 py-1.5 rounded-box border border-base-300">{createdPassword}</code>
+          <CopyButton text={createdPassword} variant="primary" label="Copy password" copiedLabel="Copied" />
         </div>
       </div>
 
-      <div class="warning-box" role="alert">
-        <span class="warning-icon">⚠️</span>
-        <p>
-          <strong>Save this password now.</strong> For security, Swan will never display this secret again. Anyone with this password can act on your behalf with the selected scopes.
-        </p>
+      <div class="alert alert-warning text-sm" role="alert">
+        <svg class="h-5 w-5 shrink-0 stroke-current" fill="none" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+        </svg>
+        <span>Save this password now. It will not be shown again. Anyone with this password can access your account with the selected scopes.</span>
       </div>
 
-      <div class="action-footer">
-        <button type="button" class="btn primary" onclick={handleFinish}>
+      <div class="modal-action mt-2 flex justify-end">
+        <button type="button" class="btn btn-primary" onclick={handleFinish}>
           Done
         </button>
       </div>
     </div>
   {:else}
-    <form class="create-form" onsubmit={handleSubmit}>
+    <form class="flex flex-col gap-5" onsubmit={handleSubmit}>
       {#if error}
-        <div class="error-banner" role="alert">{error}</div>
+        <div class="alert alert-error text-sm" role="alert">
+          <span>{error}</span>
+        </div>
       {/if}
 
-      <div class="form-field">
-        <label for="app-name">App Name or Device</label>
+      <fieldset class="fieldset gap-1">
+        <legend class="fieldset-legend text-xs font-semibold uppercase tracking-wider text-base-content/70">App name or device</legend>
         <input
           id="app-name"
           type="text"
+          class="input w-full"
           bind:value={name}
-          placeholder="e.g. Grayscale iOS, Feed Bot"
+          placeholder="e.g. Grayscale iOS, Feed bot"
           maxlength="255"
           required
           disabled={submitting}
         />
-      </div>
+      </fieldset>
 
-      <div class="scopes-field">
-        <span class="field-label">Access Permissions</span>
-        <div class="scopes-list">
+      <fieldset class="fieldset gap-2">
+        <legend class="fieldset-legend text-xs font-semibold uppercase tracking-wider text-base-content/70">Access permissions</legend>
+        <div class="flex flex-col gap-2">
           {#each APP_PASSWORD_SCOPES as scope}
-            <label class="scope-item" class:disabled={scope === 'atproto'}>
+            <label
+              class="flex items-start gap-3 p-3 rounded-box border border-base-300 bg-base-100 cursor-pointer hover:bg-base-200/50 transition-colors {scope === 'atproto' ? 'opacity-70 cursor-not-allowed bg-base-200/40' : ''}"
+            >
               <input
                 type="checkbox"
+                class="checkbox checkbox-primary checkbox-sm mt-0.5"
                 checked={selectedScopes.has(scope)}
                 disabled={scope === 'atproto' || submitting}
                 onchange={() => toggleScope(scope)}
               />
-              <div class="scope-text">
-                <span class="scope-name">{scopeLabels[scope]?.label ?? scope}</span>
-                <span class="scope-desc">{scopeLabels[scope]?.desc ?? ''}</span>
+              <div class="flex flex-col gap-0.5">
+                <span class="text-sm font-semibold text-base-content">{scopeLabels[scope]?.label ?? scope}</span>
+                {#if scopeLabels[scope]?.desc}
+                  <span class="text-xs text-base-content/60">{scopeLabels[scope]?.desc}</span>
+                {/if}
               </div>
             </label>
           {/each}
         </div>
-      </div>
+      </fieldset>
 
-      <div class="form-actions">
-        <button type="button" class="btn ghost" onclick={handleFinish} disabled={submitting}>
+      <div class="modal-action mt-2 flex justify-end gap-2">
+        <button type="button" class="btn btn-ghost" onclick={handleFinish} disabled={submitting}>
           Cancel
         </button>
-        <button type="submit" class="btn primary" disabled={submitting || !name.trim()}>
+        <button type="submit" class="btn btn-primary" disabled={submitting || !name.trim()}>
           {#if submitting}
-            <Spinner size={14} color="#ffffff" /> Creating…
+            <span class="loading loading-spinner loading-xs"></span>
+            <span>Creating…</span>
           {:else}
-            Create Password <span>＋</span>
+            Create password
           {/if}
         </button>
       </div>
     </form>
   {/if}
 </Modal>
-
-<style>
-  .create-form { display: flex; flex-direction: column; gap: 20px; }
-  .form-field { display: flex; flex-direction: column; gap: 6px; }
-  .form-field label, .field-label { font: 600 11px var(--mono, monospace); color: var(--muted, #687270); letter-spacing: 0.08em; text-transform: uppercase; }
-  .form-field input[type="text"] { padding: 10px 12px; font: 13px var(--sans, sans-serif); border: 1px solid var(--line, #d7d5ca); background: #ffffff; color: var(--ink, #1f2827); border-radius: 2px; }
-  .form-field input:focus { outline: 2px solid var(--teal, #2b7169); border-color: var(--teal, #2b7169); }
-  .scopes-field { display: flex; flex-direction: column; gap: 6px; }
-  .scopes-list { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
-  .scope-item { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; background: #ffffff; border: 1px solid var(--line, #d7d5ca); border-radius: 2px; cursor: pointer; }
-  .scope-item.disabled { background: #faf8f1; cursor: default; }
-  .scope-item input[type="checkbox"] { margin-top: 3px; accent-color: var(--teal, #2b7169); }
-  .scope-text { display: flex; flex-direction: column; gap: 2px; }
-  .scope-name { font-weight: 600; font-size: 13px; color: var(--ink, #1f2827); }
-  .scope-desc { font-size: 11px; color: var(--muted, #687270); }
-  .error-banner { background: #fbebe8; color: var(--coral, #ba5e47); border-left: 3px solid var(--coral, #ba5e47); padding: 10px 14px; font-size: 12px; border-radius: 2px; }
-  .form-actions, .action-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 10px; }
-  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 16px; font-size: 12px; font-weight: 600; cursor: pointer; border-radius: 2px; border: 1px solid transparent; font-family: var(--sans, sans-serif); }
-  .btn.primary { background: var(--teal, #2b7169); color: #ffffff; }
-  .btn.primary:hover { background: var(--teal-deep, #173f3e); }
-  .btn.ghost { background: transparent; color: var(--muted, #687270); border-color: var(--line, #d7d5ca); }
-  .btn.ghost:hover { background: #e6e3d9; color: var(--ink, #1f2827); }
-  .btn:disabled { opacity: 0.6; cursor: not-allowed; }
-  .created-state { display: flex; flex-direction: column; gap: 18px; }
-  .success-banner { display: flex; align-items: center; gap: 12px; background: #dceee1; padding: 12px 16px; border-radius: 2px; color: var(--teal-deep, #173f3e); font-size: 13px; }
-  .success-banner strong { display: block; }
-  .success-banner p { margin: 2px 0 0; font-size: 11px; opacity: 0.85; }
-  .banner-icon { width: 24px; height: 24px; border-radius: 50%; background: var(--teal, #2b7169); color: #ffffff; display: grid; place-items: center; font-weight: bold; flex-shrink: 0; }
-  .password-box { background: #ffffff; border: 1px solid var(--line, #d7d5ca); padding: 16px; border-radius: 2px; display: flex; flex-direction: column; gap: 8px; }
-  .eyebrow { font: 600 10px var(--mono, monospace); color: var(--muted, #687270); letter-spacing: 0.1em; }
-  .password-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-  .password-code { font: 600 16px var(--mono, monospace); color: var(--teal-deep, #173f3e); background: #faf8f1; padding: 6px 10px; border-radius: 2px; word-break: break-all; }
-  .warning-box { display: flex; gap: 10px; background: #faf4e6; border: 1px solid #f1dfb8; padding: 12px 14px; border-radius: 2px; color: #5c4714; font-size: 12px; line-height: 1.5; }
-  .warning-icon { font-size: 16px; flex-shrink: 0; }
-  .warning-box p { margin: 0; }
-</style>

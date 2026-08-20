@@ -2,7 +2,6 @@
   import Modal from '$lib/components/ui/Modal.svelte';
   import QrCode from '$lib/components/ui/QrCode.svelte';
   import CopyButton from '$lib/components/ui/CopyButton.svelte';
-  import Spinner from '$lib/components/ui/Spinner.svelte';
   import { api } from '$lib/api';
   import { toasts } from '$lib/stores/toasts';
   import { portal, currentAccount } from '$lib/stores/portal';
@@ -69,7 +68,7 @@
     e.preventDefault();
     const cleanCode = verificationCode.replace(/\D/g, '');
     if (cleanCode.length !== 6) {
-      error = 'Please enter a valid 6-digit confirmation code.';
+      error = 'Enter a valid 6-digit confirmation code.';
       return;
     }
 
@@ -90,7 +89,7 @@
       }
     } catch (err: any) {
       stage = 'ready';
-      error = err.message || 'Invalid confirmation code. Please check your authenticator clock and try again.';
+      error = err.message || 'Invalid confirmation code. Check your authenticator time and try again.';
       verificationCode = '';
     }
   }
@@ -111,135 +110,109 @@
 
 <Modal
   {isOpen}
-  title="Set Up Authenticator (TOTP)"
-  description="Connect an authenticator app (Google Authenticator, Apple Passwords, 1Password) for 6-digit security codes."
+  title="Set up authenticator"
+  description="Connect an authenticator app for 6-digit verification codes."
   size="md"
   preventClose={stage === 'verifying'}
   onClose={handleDone}
 >
   {#if stage === 'init'}
-    <div class="loading-box">
-      <Spinner size={24} />
-      <p>Generating cryptographic seed…</p>
+    <div class="flex flex-col items-center justify-center py-8 gap-3 text-base-content/60">
+      <span class="loading loading-spinner loading-md"></span>
+      <span class="text-xs font-mono">Generating key…</span>
     </div>
   {:else if stage === 'success'}
-    <div class="success-view">
-      <div class="success-circle">✓</div>
-      <h3>Authenticator Enrolled</h3>
-      <p>Your authenticator app is now registered. You can use it whenever a 6-digit verification code is required.</p>
-      <div class="action-footer">
-        <button type="button" class="btn primary" onclick={handleDone}>Done</button>
+    <div class="flex flex-col items-center text-center gap-4 py-4">
+      <div class="badge badge-success badge-xl p-4">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 stroke-current shrink-0" fill="none" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+        </svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold">Authenticator added</h3>
+        <p class="text-sm text-base-content/70 mt-1">Your authenticator app is now registered for verification codes.</p>
+      </div>
+      <div class="modal-action w-full justify-end">
+        <button type="button" class="btn btn-primary" onclick={handleDone}>Done</button>
       </div>
     </div>
   {:else}
-    <div class="totp-container">
+    <div class="flex flex-col gap-4">
       {#if error}
-        <div class="error-banner" role="alert">{error}</div>
+        <div class="alert alert-error text-sm" role="alert">{error}</div>
       {/if}
 
-      <div class="step-card">
-        <span class="step-badge">1</span>
-        <div class="step-content">
-          <strong>Scan this QR code with your authenticator</strong>
-          <div class="qr-presentation">
+      <div class="card card-border bg-base-200/50">
+        <div class="card-body p-4 gap-3">
+          <h3 class="font-medium text-sm">1. Scan QR code</h3>
+          <div class="flex justify-center p-2 bg-white rounded">
             <QrCode value={otpauthUri} size={180} title="TOTP Setup QR Code" />
           </div>
 
-          <div class="manual-toggle">
+          <div class="text-center">
             <button
               type="button"
-              class="text-btn"
+              class="btn btn-link btn-xs text-base-content/70 no-underline hover:underline"
               onclick={() => (showManualKey = !showManualKey)}
             >
-              {showManualKey ? 'Hide manual key' : 'Can’t scan? View setup key ↗'}
+              {showManualKey ? 'Hide manual key' : 'Enter key manually'}
             </button>
           </div>
 
           {#if showManualKey}
-            <div class="manual-box">
-              <span class="eyebrow">MANUAL SETUP SECRET</span>
-              <div class="manual-row">
-                <code class="secret-code">{formatSecret(secret)}</code>
-                <CopyButton text={secret} size="sm" label="Copy Secret" />
+            <div class="bg-base-100 border border-base-300 p-3 rounded flex flex-col gap-1">
+              <span class="text-xs text-base-content/60 font-mono">SECRET KEY</span>
+              <div class="flex items-center justify-between gap-2">
+                <code class="font-mono break-all text-sm font-semibold">{formatSecret(secret)}</code>
+                <CopyButton text={secret} size="sm" label="Copy" />
               </div>
             </div>
           {/if}
         </div>
       </div>
 
-      <div class="step-card">
-        <span class="step-badge">2</span>
-        <form class="verify-form" onsubmit={handleVerify}>
-          <div class="form-field">
-            <label for="totp-code">Enter the 6-digit code shown in your app</label>
-            <div class="code-input-row">
-              <input
-                id="totp-code"
-                type="text"
-                inputmode="numeric"
-                pattern="[0-9]*"
-                maxlength="6"
-                placeholder="000000"
-                bind:value={verificationCode}
-                disabled={stage === 'verifying'}
-                autocomplete="one-time-code"
-                required
-              />
-              <button
-                type="submit"
-                class="btn primary"
-                disabled={stage === 'verifying' || verificationCode.replace(/\D/g, '').length !== 6}
-              >
-                {#if stage === 'verifying'}
-                  <Spinner size={14} color="#ffffff" /> Verifying…
-                {:else}
-                  Verify & Activate <span>✓</span>
-                {/if}
-              </button>
-            </div>
-          </div>
-        </form>
+      <div class="card card-border bg-base-200/50">
+        <div class="card-body p-4">
+          <h3 class="font-medium text-sm mb-2">2. Enter verification code</h3>
+          <form onsubmit={handleVerify} class="flex flex-col gap-3">
+            <fieldset class="fieldset gap-1">
+              <legend class="fieldset-legend">6-digit code</legend>
+              <div class="flex gap-2">
+                <input
+                  id="totp-code"
+                  type="text"
+                  inputmode="numeric"
+                  pattern="[0-9]*"
+                  maxlength="6"
+                  placeholder="000000"
+                  class="input w-full font-mono text-center text-lg tracking-widest"
+                  bind:value={verificationCode}
+                  disabled={stage === 'verifying'}
+                  autocomplete="one-time-code"
+                  required
+                />
+                <button
+                  type="submit"
+                  class="btn btn-primary shrink-0"
+                  disabled={stage === 'verifying' || verificationCode.replace(/\D/g, '').length !== 6}
+                >
+                  {#if stage === 'verifying'}
+                    <span class="loading loading-spinner loading-xs"></span> Verifying…
+                  {:else}
+                    Verify
+                  {/if}
+                </button>
+              </div>
+            </fieldset>
+          </form>
+        </div>
       </div>
 
-      <div class="action-footer">
-        <button type="button" class="btn ghost" onclick={handleDone} disabled={stage === 'verifying'}>
+      <div class="modal-action">
+        <button type="button" class="btn btn-ghost" onclick={handleDone} disabled={stage === 'verifying'}>
           Cancel
         </button>
       </div>
     </div>
   {/if}
 </Modal>
-
-<style>
-  .totp-container { display: flex; flex-direction: column; gap: 20px; }
-  .loading-box { display: grid; place-items: center; padding: 40px 0; color: var(--muted, #687270); gap: 12px; font-size: 13px; font-family: var(--mono, monospace); }
-  .step-card { display: flex; gap: 14px; background: #ffffff; border: 1px solid var(--line, #d7d5ca); padding: 18px; border-radius: 2px; }
-  .step-badge { width: 24px; height: 24px; border-radius: 50%; background: var(--teal-deep, #173f3e); color: #ffffff; display: grid; place-items: center; font: 700 12px var(--mono, monospace); flex-shrink: 0; }
-  .step-content { flex: 1; display: flex; flex-direction: column; gap: 12px; }
-  .step-content strong { font-size: 13px; color: var(--ink, #1f2827); }
-  .qr-presentation { display: grid; place-items: center; padding: 10px 0; }
-  .manual-toggle { text-align: center; }
-  .text-btn { border: 0; background: transparent; color: var(--teal, #2b7169); font-size: 12px; font-weight: 600; cursor: pointer; padding: 4px; font-family: var(--sans, sans-serif); }
-  .manual-box { background: #faf8f1; border: 1px solid var(--line, #d7d5ca); padding: 12px; border-radius: 2px; display: flex; flex-direction: column; gap: 6px; }
-  .eyebrow { font: 600 10px var(--mono, monospace); color: var(--muted, #687270); letter-spacing: 0.1em; }
-  .manual-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-  .secret-code { font: 600 13px var(--mono, monospace); color: var(--teal-deep, #173f3e); }
-  .verify-form { flex: 1; }
-  .form-field { display: flex; flex-direction: column; gap: 8px; }
-  .form-field label { font-size: 13px; font-weight: 600; color: var(--ink, #1f2827); font-family: var(--sans, sans-serif); }
-  .code-input-row { display: flex; gap: 10px; }
-  .code-input-row input { flex: 1; padding: 10px 14px; font: 700 18px var(--mono, monospace); letter-spacing: 0.25em; text-align: center; border: 1px solid var(--line, #d7d5ca); border-radius: 2px; }
-  .code-input-row input:focus { outline: 2px solid var(--teal, #2b7169); }
-  .error-banner { background: #fbebe8; color: var(--coral, #ba5e47); border-left: 3px solid var(--coral, #ba5e47); padding: 10px 14px; font-size: 12px; border-radius: 2px; }
-  .success-view { text-align: center; align-items: center; padding: 20px 0; display: flex; flex-direction: column; gap: 12px; }
-  .success-circle { width: 48px; height: 48px; border-radius: 50%; background: var(--teal, #2b7169); color: #ffffff; display: grid; place-items: center; font-size: 22px; font-weight: bold; }
-  .success-view h3 { margin: 0; font: 400 24px var(--serif, serif); }
-  .success-view p { color: var(--muted, #687270); font-size: 13px; max-width: 360px; margin: 0; }
-  .action-footer { display: flex; justify-content: flex-end; gap: 10px; width: 100%; }
-  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 16px; font-size: 12px; font-weight: 600; cursor: pointer; border-radius: 2px; border: 1px solid transparent; font-family: var(--sans, sans-serif); }
-  .btn.primary { background: var(--teal, #2b7169); color: #ffffff; }
-  .btn.primary:hover { background: var(--teal-deep, #173f3e); }
-  .btn.ghost { background: transparent; color: var(--muted, #687270); border-color: var(--line, #d7d5ca); }
-  .btn.ghost:hover { background: #e6e3d9; color: var(--ink, #1f2827); }
-  .btn:disabled { opacity: 0.6; cursor: not-allowed; }
-</style>

@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onDestroy, type Snippet } from 'svelte';
-  import { fade, fly } from 'svelte/transition';
 
   interface Props {
     isOpen?: boolean;
@@ -43,6 +42,16 @@
   const id = `modal-${Math.random().toString(36).substring(2, 9)}`;
   const titleId = `modal-title-${id}`;
   const descId = `modal-desc-${id}`;
+
+  const sizeClass = $derived(
+    size === 'sm'
+      ? 'max-w-sm'
+      : size === 'lg'
+        ? 'max-w-3xl'
+        : size === 'xl'
+          ? 'max-w-5xl'
+          : 'max-w-lg'
+  );
 
   let dialogElement = $state<HTMLElement | null>(null);
   let previousActiveElement: HTMLElement | null = null;
@@ -132,174 +141,65 @@
 
 {#if isOpen}
   <div
-    class="modal-backdrop"
-    in:fade={{ duration: 150 }}
-    out:fade={{ duration: 120 }}
-    onclick={handleBackdropClick}
+    class="modal modal-open"
     role="presentation"
+    onclick={handleBackdropClick}
   >
     <div
       bind:this={dialogElement}
-      class="modal-card {size} {className}"
+      class="modal-box relative {sizeClass} {className}"
       role="dialog"
       aria-modal="true"
       aria-labelledby={title ? titleId : ariaLabel ? undefined : undefined}
       aria-label={ariaLabel}
       aria-describedby={description ? descId : ariaDescribedBy}
       tabindex="-1"
-      in:fly={{ y: 12, duration: 200 }}
-      out:fade={{ duration: 120 }}
     >
-      <div class="modal-header">
-        {#if header}
+      {#if showCloseButton && !preventClose}
+        <button
+          type="button"
+          class="btn btn-sm btn-circle btn-ghost absolute right-3 top-3 modal-close"
+          aria-label="Close dialog"
+          onclick={handleClose}
+        >
+          ✕
+        </button>
+      {/if}
+
+      {#if header}
+        <div class="mb-4">
           {@render header()}
-        {:else}
-          <div class="title-group">
-            {#if titleSnippet}
-              {@render titleSnippet()}
-            {:else if title}
-              <h2 id={titleId} class="modal-title">{title}</h2>
-            {/if}
-            {#if description}
-              <p id={descId} class="modal-desc">{description}</p>
-            {/if}
-          </div>
-        {/if}
+        </div>
+      {:else if titleSnippet || title || description}
+        <div class="mb-4 pr-8">
+          {#if titleSnippet}
+            {@render titleSnippet()}
+          {:else if title}
+            <h3 id={titleId} class="text-lg font-semibold">{title}</h3>
+          {/if}
+          {#if description}
+            <p id={descId} class="text-sm text-base-content/70 mt-1">{description}</p>
+          {/if}
+        </div>
+      {/if}
 
-        {#if showCloseButton && !preventClose}
-          <button
-            type="button"
-            class="modal-close"
-            aria-label="Close dialog"
-            onclick={handleClose}
-          >
-            &times;
-          </button>
-        {/if}
-      </div>
-
-      <div class="modal-body">
+      <div>
         {@render children?.()}
       </div>
 
       {#if footer}
-        <div class="modal-footer">
+        <div class="modal-action mt-6">
           {@render footer()}
         </div>
       {/if}
     </div>
+
+    {#if closeOnBackdrop && !preventClose}
+      <div class="modal-backdrop">
+        <button type="button" class="cursor-default" aria-label="Close" onclick={handleClose}>
+          close
+        </button>
+      </div>
+    {/if}
   </div>
 {/if}
-
-<style>
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 9999;
-    background: rgba(23, 63, 62, 0.45);
-    backdrop-filter: blur(4px);
-    display: grid;
-    place-items: center;
-    padding: 16px;
-    overflow-y: auto;
-  }
-
-  .modal-card {
-    background: var(--paper, #f3f0e9);
-    color: var(--ink, #1f2827);
-    border: 1px solid var(--line, #d7d5ca);
-    border-radius: 2px;
-    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.16);
-    width: 100%;
-    max-height: calc(100vh - 32px);
-    display: flex;
-    flex-direction: column;
-    outline: none;
-    margin: auto;
-  }
-
-  .modal-card.sm { max-width: 400px; }
-  .modal-card.md { max-width: 540px; }
-  .modal-card.lg { max-width: 720px; }
-  .modal-card.xl { max-width: 900px; }
-
-  .modal-header {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    padding: 24px 28px 16px;
-    border-bottom: 1px solid var(--line, #d7d5ca);
-    gap: 16px;
-  }
-
-  .title-group {
-    flex: 1;
-    min-width: 0;
-  }
-
-  .modal-title {
-    margin: 0;
-    font-family: var(--serif, 'Iowan Old Style', serif);
-    font-weight: 400;
-    font-size: 24px;
-    line-height: 1.15;
-    letter-spacing: -0.02em;
-    color: var(--ink, #1f2827);
-  }
-
-  .modal-desc {
-    margin: 6px 0 0;
-    font-family: var(--sans, sans-serif);
-    font-size: 13px;
-    color: var(--muted, #687270);
-    line-height: 1.45;
-  }
-
-  .modal-close {
-    border: 0;
-    background: transparent;
-    color: var(--muted, #687270);
-    font-size: 24px;
-    line-height: 1;
-    cursor: pointer;
-    padding: 2px 6px;
-    margin: -4px -6px 0 0;
-    transition: color 0.15s;
-  }
-
-  .modal-close:hover {
-    color: var(--ink, #1f2827);
-  }
-
-  .modal-body {
-    padding: 24px 28px;
-    overflow-y: auto;
-    flex: 1;
-  }
-
-  .modal-footer {
-    padding: 16px 28px 24px;
-    border-top: 1px solid var(--line, #d7d5ca);
-    display: flex;
-    justify-content: flex-end;
-    gap: 12px;
-    background: rgba(0, 0, 0, 0.02);
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .modal-backdrop, .modal-card {
-      transition: none !important;
-      animation: none !important;
-    }
-  }
-
-  @media (max-width: 560px) {
-    .modal-header, .modal-body, .modal-footer {
-      padding-left: 20px;
-      padding-right: 20px;
-    }
-    .modal-card {
-      max-height: calc(100vh - 16px);
-    }
-  }
-</style>

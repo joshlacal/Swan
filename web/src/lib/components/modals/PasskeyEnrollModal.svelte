@@ -1,6 +1,5 @@
 <script lang="ts">
   import Modal from '$lib/components/ui/Modal.svelte';
-  import Spinner from '$lib/components/ui/Spinner.svelte';
   import { api } from '$lib/api';
   import { toasts } from '$lib/stores/toasts';
   import { portal, currentAccount } from '$lib/stores/portal';
@@ -83,97 +82,76 @@
 
 <Modal
   {isOpen}
-  title="Add Passkey Factor"
-  description="Register biometric authentication (Touch ID, Face ID, Windows Hello) or a hardware security key."
+  title="Add passkey"
+  description="Register biometric authentication or a hardware security key."
   size="md"
   preventClose={stage === 'enrolling'}
   onClose={handleDone}
 >
   {#if stage === 'unsupported'}
-    <div class="unsupported-view">
-      <div class="error-banner">
-        <strong>WebAuthn Not Supported</strong>
-        <p>Your current browser does not support WebAuthn passkey registration. Please use a modern browser such as Safari, Chrome, Edge, or Firefox.</p>
+    <div class="flex flex-col gap-4">
+      <div class="alert alert-error text-sm" role="alert">
+        <div>
+          <div class="font-bold">WebAuthn not supported</div>
+          <div class="text-xs mt-1">This browser does not support WebAuthn passkey registration.</div>
+        </div>
       </div>
-      <div class="action-footer">
-        <button type="button" class="btn ghost" onclick={handleDone}>Close</button>
+      <div class="modal-action">
+        <button type="button" class="btn btn-ghost" onclick={handleDone}>Close</button>
       </div>
     </div>
   {:else if stage === 'success'}
-    <div class="success-view">
-      <div class="success-circle">✓</div>
-      <h3>Passkey Activated</h3>
-      <p>Your passkey <strong>"{label}"</strong> is now registered as a strong authentication factor on your account.</p>
-      <div class="action-footer">
-        <button type="button" class="btn primary" onclick={handleDone}>Done</button>
+    <div class="flex flex-col items-center text-center gap-4 py-4">
+      <div class="badge badge-success badge-xl p-4">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 stroke-current shrink-0" fill="none" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+        </svg>
+      </div>
+      <div>
+        <h3 class="text-lg font-semibold">Passkey registered</h3>
+        <p class="text-sm text-base-content/70 mt-1">Passkey "{label}" is now registered to your account.</p>
+      </div>
+      <div class="modal-action w-full justify-end">
+        <button type="button" class="btn btn-primary" onclick={handleDone}>Done</button>
       </div>
     </div>
   {:else}
-    <form class="enroll-form" onsubmit={handleEnroll}>
+    <form class="flex flex-col gap-4" onsubmit={handleEnroll}>
       {#if error}
-        <div class="error-banner" role="alert">{error}</div>
+        <div class="alert alert-error text-sm" role="alert">{error}</div>
       {/if}
 
-      <div class="form-field">
-        <label for="passkey-label">Passkey Label</label>
+      <fieldset class="fieldset gap-1">
+        <legend class="fieldset-legend">Passkey label</legend>
         <input
           id="passkey-label"
           type="text"
+          class="input w-full"
           bind:value={label}
-          placeholder="e.g. MacBook Touch ID, YubiKey 5C"
+          placeholder="e.g. MacBook Touch ID, YubiKey"
           maxlength="100"
           required
           disabled={stage === 'enrolling'}
         />
-        <small class="field-hint">Give this device a recognizable name so you can identify it in your security settings.</small>
+        <p class="text-xs text-base-content/60">A label to identify this device.</p>
+      </fieldset>
+
+      <div class="alert alert-info bg-base-200 text-base-content border-base-300 text-sm">
+        <span>Your device will prompt for biometric verification or a security key.</span>
       </div>
 
-      <div class="info-card">
-        <span class="card-glyph">🔑</span>
-        <div>
-          <strong>How this works</strong>
-          <p>When you click continue, your device will prompt you to use your fingerprint, facial recognition, or insert your security key.</p>
-        </div>
-      </div>
-
-      <div class="form-actions">
-        <button type="button" class="btn ghost" onclick={handleDone} disabled={stage === 'enrolling'}>
+      <div class="modal-action">
+        <button type="button" class="btn btn-ghost" onclick={handleDone} disabled={stage === 'enrolling'}>
           Cancel
         </button>
-        <button type="submit" class="btn primary" disabled={stage === 'enrolling' || !label.trim()}>
+        <button type="submit" class="btn btn-primary" disabled={stage === 'enrolling' || !label.trim()}>
           {#if stage === 'enrolling'}
-            <Spinner size={14} color="#ffffff" /> Waiting for device…
+            <span class="loading loading-spinner loading-xs"></span> Waiting for device…
           {:else}
-            Continue with Passkey <span>↗</span>
+            Continue
           {/if}
         </button>
       </div>
     </form>
   {/if}
 </Modal>
-
-<style>
-  .enroll-form, .unsupported-view, .success-view { display: flex; flex-direction: column; gap: 20px; }
-  .form-field { display: flex; flex-direction: column; gap: 6px; }
-  .form-field label { font: 600 11px var(--mono, monospace); color: var(--muted, #687270); letter-spacing: 0.08em; text-transform: uppercase; }
-  .form-field input[type="text"] { padding: 10px 12px; font: 13px var(--sans, sans-serif); border: 1px solid var(--line, #d7d5ca); background: #ffffff; color: var(--ink, #1f2827); border-radius: 2px; }
-  .form-field input:focus { outline: 2px solid var(--teal, #2b7169); border-color: var(--teal, #2b7169); }
-  .field-hint { font-size: 11px; color: var(--muted, #687270); }
-  .info-card { display: flex; gap: 12px; background: #faf8f1; border: 1px solid var(--line, #d7d5ca); padding: 14px; border-radius: 2px; }
-  .card-glyph { font-size: 20px; }
-  .info-card strong { display: block; font-size: 13px; color: var(--ink, #1f2827); }
-  .info-card p { margin: 4px 0 0; font-size: 12px; color: var(--muted, #687270); line-height: 1.4; }
-  .error-banner { background: #fbebe8; color: var(--coral, #ba5e47); border-left: 3px solid var(--coral, #ba5e47); padding: 10px 14px; font-size: 12px; line-height: 1.4; border-radius: 2px; }
-  .error-banner p { margin: 4px 0 0; }
-  .success-view { text-align: center; align-items: center; padding: 10px 0; }
-  .success-circle { width: 48px; height: 48px; border-radius: 50%; background: var(--teal, #2b7169); color: #ffffff; display: grid; place-items: center; font-size: 22px; font-weight: bold; margin-bottom: 8px; }
-  .success-view h3 { margin: 0; font: 400 24px var(--serif, serif); }
-  .success-view p { color: var(--muted, #687270); font-size: 13px; max-width: 360px; margin: 8px auto 0; }
-  .form-actions, .action-footer { display: flex; justify-content: flex-end; gap: 10px; width: 100%; }
-  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 16px; font-size: 12px; font-weight: 600; cursor: pointer; border-radius: 2px; border: 1px solid transparent; font-family: var(--sans, sans-serif); }
-  .btn.primary { background: var(--teal, #2b7169); color: #ffffff; }
-  .btn.primary:hover { background: var(--teal-deep, #173f3e); }
-  .btn.ghost { background: transparent; color: var(--muted, #687270); border-color: var(--line, #d7d5ca); }
-  .btn.ghost:hover { background: #e6e3d9; color: var(--ink, #1f2827); }
-  .btn:disabled { opacity: 0.6; cursor: not-allowed; }
-</style>

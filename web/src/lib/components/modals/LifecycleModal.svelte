@@ -1,6 +1,5 @@
 <script lang="ts">
   import Modal from '$lib/components/ui/Modal.svelte';
-  import Spinner from '$lib/components/ui/Spinner.svelte';
   import { api } from '$lib/api';
   import { toasts } from '$lib/stores/toasts';
   import { portal, currentAccount } from '$lib/stores/portal';
@@ -95,12 +94,12 @@
   }
 
   const modalTitle = $derived(
-    mode === 'delete' ? 'Delete Account Permanently' : 'Deactivate Account'
+    mode === 'delete' ? 'Delete account permanently' : 'Deactivate account'
   );
 
   const modalDesc = $derived(
     mode === 'delete'
-      ? 'Permanent, irreversible action: all repository commits, signing keys, and factor envelopes will be destroyed.'
+      ? 'Permanent action: all repository commits, signing keys, and factor envelopes will be deleted.'
       : 'Temporary deactivation: your profile will be hidden and write operations suspended until your next login.'
   );
 </script>
@@ -114,117 +113,102 @@
   onClose={handleClose}
 >
   {#if mode === 'delete'}
-    <form class="lifecycle-form" onsubmit={handleDelete}>
+    <form class="flex flex-col gap-5" onsubmit={handleDelete}>
       {#if error}
-        <div class="error-banner" role="alert">{error}</div>
+        <div class="alert alert-error text-sm" role="alert">
+          <span>{error}</span>
+        </div>
       {/if}
 
-      <div class="danger-box">
-        <span class="danger-glyph">⚠️</span>
+      <div class="alert alert-error text-sm" role="alert">
+        <svg class="h-5 w-5 shrink-0 stroke-current" fill="none" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+        </svg>
         <div>
-          <strong>IRREVERSIBLE ACCOUNT DESTRUCTION</strong>
-          <p>
-            Deleting your account writes a permanent tombstone to the PLC directory. Your handle, repository records, and cryptographic credentials cannot be recovered by anyone.
+          <div class="font-semibold uppercase tracking-wider text-xs">Irreversible action</div>
+          <p class="mt-0.5 text-xs">
+            Deleting your account writes a permanent tombstone to the PLC directory. Your handle, repository records, and cryptographic credentials cannot be recovered.
           </p>
         </div>
       </div>
 
-      <div class="form-field">
-        <label for="delete-confirm-input">
-          To confirm deletion, type <strong class="confirm-target">DELETE</strong> or <strong class="confirm-target">@{accountHandle}</strong>:
-        </label>
+      <fieldset class="fieldset gap-1.5">
+        <legend class="fieldset-legend text-xs">
+          To confirm, type <strong class="font-mono text-error font-bold">DELETE</strong> or <strong class="font-mono text-error font-bold">@{accountHandle}</strong>:
+        </legend>
         <input
           id="delete-confirm-input"
           type="text"
+          class="input w-full font-mono"
           bind:value={confirmInput}
           placeholder="DELETE"
           disabled={submitting}
           required
         />
-      </div>
+      </fieldset>
 
-      <div class="action-footer">
-        <button type="button" class="btn ghost" onclick={handleClose} disabled={submitting}>
+      <div class="modal-action mt-2 flex justify-end gap-2">
+        <button type="button" class="btn btn-ghost" onclick={handleClose} disabled={submitting}>
           Cancel
         </button>
-        <button type="submit" class="btn danger" disabled={!isConfirmed || submitting}>
+        <button type="submit" class="btn btn-error" disabled={!isConfirmed || submitting}>
           {#if submitting}
-            <Spinner size={14} color="#ffffff" /> Deleting Account…
+            <span class="loading loading-spinner loading-xs"></span>
+            <span>Deleting account…</span>
           {:else}
-            Permanently Delete Account <span>✕</span>
+            Permanently delete account
           {/if}
         </button>
       </div>
     </form>
   {:else}
-    <form class="lifecycle-form" onsubmit={handleDeactivate}>
+    <form class="flex flex-col gap-5" onsubmit={handleDeactivate}>
       {#if error}
-        <div class="error-banner" role="alert">{error}</div>
+        <div class="alert alert-error text-sm" role="alert">
+          <span>{error}</span>
+        </div>
       {/if}
 
-      <div class="warning-box">
-        <span class="warning-glyph">✦</span>
+      <div class="alert alert-warning text-sm" role="alert">
+        <svg class="h-5 w-5 shrink-0 stroke-current" fill="none" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+        </svg>
         <div>
-          <strong>Account Deactivation</strong>
-          <p>
-            Your profile and public repositories will be hidden from view. Your sessions will be signed out. You can reactivate your account at any time simply by signing in again.
+          <div class="font-semibold">Account deactivation</div>
+          <p class="mt-0.5 text-xs">
+            Your profile and public repositories will be hidden from view. Your sessions will be signed out. You can reactivate your account at any time by signing in again.
           </p>
         </div>
       </div>
 
-      <div class="form-field">
-        <label for="deactivate-confirm-input">
-          To confirm deactivation, type your handle <strong class="confirm-target">@{accountHandle}</strong>:
-        </label>
+      <fieldset class="fieldset gap-1.5">
+        <legend class="fieldset-legend text-xs">
+          To confirm deactivation, type your handle <strong class="font-mono font-bold text-warning-content">@{accountHandle}</strong>:
+        </legend>
         <input
           id="deactivate-confirm-input"
           type="text"
+          class="input w-full font-mono"
           bind:value={confirmInput}
           placeholder={accountHandle}
           disabled={submitting}
           required
         />
-      </div>
+      </fieldset>
 
-      <div class="action-footer">
-        <button type="button" class="btn ghost" onclick={handleClose} disabled={submitting}>
+      <div class="modal-action mt-2 flex justify-end gap-2">
+        <button type="button" class="btn btn-ghost" onclick={handleClose} disabled={submitting}>
           Cancel
         </button>
-        <button type="submit" class="btn warning-btn" disabled={!isConfirmed || submitting}>
+        <button type="submit" class="btn btn-warning" disabled={!isConfirmed || submitting}>
           {#if submitting}
-            <Spinner size={14} color="#ffffff" /> Deactivating…
+            <span class="loading loading-spinner loading-xs"></span>
+            <span>Deactivating…</span>
           {:else}
-            Deactivate Account <span>↗</span>
+            Deactivate account
           {/if}
         </button>
       </div>
     </form>
   {/if}
 </Modal>
-
-<style>
-  .lifecycle-form { display: flex; flex-direction: column; gap: 20px; }
-  .danger-box { display: flex; gap: 12px; background: #fbebe8; border: 1px solid #f3cdc6; padding: 16px; border-radius: 2px; color: #662214; }
-  .danger-glyph { font-size: 22px; flex-shrink: 0; }
-  .danger-box strong { display: block; font-size: 13px; font-family: var(--mono, monospace); letter-spacing: 0.05em; }
-  .danger-box p { margin: 6px 0 0; font-size: 12px; line-height: 1.5; color: #7a2d1d; }
-  .warning-box { display: flex; gap: 12px; background: #faf4e6; border: 1px solid #f1dfb8; padding: 16px; border-radius: 2px; color: #5c4714; }
-  .warning-glyph { font-size: 22px; flex-shrink: 0; color: var(--ochre, #d1a85b); }
-  .warning-box strong { display: block; font-size: 13px; font-family: var(--sans, sans-serif); }
-  .warning-box p { margin: 6px 0 0; font-size: 12px; line-height: 1.5; }
-  .form-field { display: flex; flex-direction: column; gap: 8px; }
-  .form-field label { font-size: 13px; color: var(--ink, #1f2827); font-family: var(--sans, sans-serif); }
-  .confirm-target { font-family: var(--mono, monospace); color: var(--coral, #ba5e47); background: #faf8f1; padding: 2px 6px; border-radius: 2px; }
-  .form-field input[type="text"] { padding: 10px 12px; font: 14px var(--mono, monospace); border: 1px solid var(--line, #d7d5ca); background: #ffffff; color: var(--ink, #1f2827); border-radius: 2px; }
-  .form-field input:focus { outline: 2px solid var(--coral, #ba5e47); border-color: var(--coral, #ba5e47); }
-  .error-banner { background: #fbebe8; color: var(--coral, #ba5e47); border-left: 3px solid var(--coral, #ba5e47); padding: 10px 14px; font-size: 12px; border-radius: 2px; }
-  .action-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }
-  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 16px; font-size: 12px; font-weight: 600; cursor: pointer; border-radius: 2px; border: 1px solid transparent; font-family: var(--sans, sans-serif); }
-  .btn.danger { background: var(--coral, #ba5e47); color: #ffffff; }
-  .btn.danger:hover { background: #963d28; }
-  .btn.warning-btn { background: var(--ochre, #d1a85b); color: #1f2827; }
-  .btn.warning-btn:hover { background: #b89146; }
-  .btn.ghost { background: transparent; color: var(--muted, #687270); border-color: var(--line, #d7d5ca); }
-  .btn.ghost:hover { background: #e6e3d9; color: var(--ink, #1f2827); }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-</style>
