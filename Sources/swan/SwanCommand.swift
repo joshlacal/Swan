@@ -983,7 +983,8 @@ struct ServePermissionedRuntime {
         xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil,
-        identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil
+        identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil,
+        foreignHandleResolution: (any SwanForeignHandleResolving)? = nil
     ) -> SwanHTTPServer {
         SwanHTTPServer(
             profile: profile,
@@ -1019,7 +1020,9 @@ struct ServePermissionedRuntime {
             actorPreferencesXRPC: actorPreferencesXRPC,
             xrpcPipethrough: xrpcPipethrough,
             loginClientIdentityPolicy: loginClientIdentityPolicy,
-            publicFirehoseStreaming: publicFirehoseStreaming
+            publicFirehoseStreaming: publicFirehoseStreaming,
+            identityAdmission: identityAdmission,
+            foreignHandleResolution: foreignHandleResolution
         )
     }
 }
@@ -1937,6 +1940,17 @@ extension SwanCommand {
         /// string mints — neither is a change to make on an operator's behalf.
         @Flag(name: .customLong("enable-lexicon-resolution"), help: "Resolve include:<nsid> permission sets and bare space:<type> collection declarations from their authority's cryptographically proved repo record (spec §5.7.4); requires the complete OAuth authorization server")
         var enableLexiconResolution = false
+
+        /// Opt-in because it is the only thing that makes an unauthenticated
+        /// route reach the network. A reference PDS resolves foreign handles
+        /// from its identity resolver, and without this every handle-to-DID
+        /// lookup a client sends here for someone else's handle answers
+        /// `InvalidRequest` — measured against bsky.app, which asks on every
+        /// profile it opens. Resolution reuses the pinned TXT and
+        /// `/.well-known/atproto-did` path that verifies did:web claims, so
+        /// reserved TLDs and non-public addresses are refused before a lookup.
+        @Flag(name: .customLong("enable-foreign-handle-resolution"), help: "Answer com.atproto.identity.resolveHandle for handles this host does not hold, using the pinned DNS TXT and /.well-known/atproto-did resolver")
+        var enableForeignHandleResolution = false
 
         @Option(
             name: .customLong("oauth-server-key-file"),
@@ -4751,6 +4765,27 @@ extension SwanCommand {
                     accountPortalHTTP = nil
                     didWebIdentityHTTP = nil
                 }
+                // The anonymous `resolveHandle` route's only network reach.
+                // Built from the same pinned TXT/`.well-known` resolver that
+                // verifies did:web claims, so an attacker-chosen handle cannot
+                // steer it at a reserved TLD or a non-public address.
+                let foreignHandleResolution: (any SwanForeignHandleResolving)?
+                if enableForeignHandleResolution {
+                    do {
+                        foreignHandleResolution = try SwanForeignHandleResolver(
+                            verifier: ATProtocolHandleVerifier(
+                                policy: try ATHandleResolutionPolicy.production(),
+                                http: try NIOPeerPinnedATHandleHTTPTransport()
+                            )
+                        )
+                    } catch {
+                        throw ValidationError(
+                            "--enable-foreign-handle-resolution could not build its pinned resolver"
+                        )
+                    }
+                } else {
+                    foreignHandleResolution = nil
+                }
                 let server = permissionedRuntime.makeServer(
                     profile: loadedProfile,
                     configuration: .init(
@@ -4786,7 +4821,8 @@ extension SwanCommand {
                     xrpcPipethrough: xrpcPipethrough,
                     loginClientIdentityPolicy: loginClientIdentityPolicy,
                     publicFirehoseStreaming: publicFirehoseStreamingRuntime,
-                    identityAdmission: identityAdmission
+                    identityAdmission: identityAdmission,
+                    foreignHandleResolution: foreignHandleResolution
                 )
                 guard server.authenticatedGetSpace != nil else {
                     throw ValidationError(

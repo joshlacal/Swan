@@ -522,6 +522,64 @@ final class PublicHandleResolutionHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// A reference PDS answers a handle it does not host from its identity
+    /// resolver: bsky.social returns 200 and the DID for a third-party handle.
+    /// Refusing them made every handle-to-DID lookup a client sent this host
+    /// for someone else's handle fail with `InvalidRequest`.
+    func testAForeignHandleFallsThroughToTheConfiguredResolver() async throws {
+        try await withControl { control in
+            _ = try await control.createAccount(Self.registration())
+            let foreign = StubForeignHandleResolver(
+                answers: ["nobody.example.com": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"]
+            )
+            let capability = SwanPublicHandleResolutionCapability(
+                controlStore: control, foreign: foreign
+            )
+
+            // A hosted account is still answered from storage, so no local
+            // identity depends on a network lookup.
+            let hosted = try await capability.activeDID(forCanonicalHandle: Self.handle)
+            XCTAssertEqual(hosted, Self.did)
+            let afterHosted = await foreign.calls
+            XCTAssertEqual(afterHosted, [])
+
+            let resolved = try await capability.activeDID(
+                forCanonicalHandle: "nobody.example.com")
+            XCTAssertEqual(resolved, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+            let afterForeign = await foreign.calls
+            XCTAssertEqual(afterForeign, ["nobody.example.com"])
+
+            // A non-canonical spelling is refused before the resolver, so a
+            // malformed handle cannot trigger an outbound lookup.
+            for nonCanonical in ["Swan.Place", "swan_place", ""] {
+                let answer = try await capability.activeDID(forCanonicalHandle: nonCanonical)
+                XCTAssertNil(answer, "for \(nonCanonical)")
+            }
+            let afterMalformed = await foreign.calls
+            XCTAssertEqual(afterMalformed, ["nobody.example.com"])
+        }
+    }
+
+    /// Absent a configured resolver the anonymous route stays entirely off the
+    /// network, and a resolver that throws still reports one opaque answer.
+    func testForeignResolutionIsOptOutAndNeverPropagatesItsFailure() async throws {
+        try await withControl { control in
+            let localOnly = SwanPublicHandleResolutionCapability(controlStore: control)
+            let offNetwork = try await localOnly.activeDID(forCanonicalHandle: "nobody.example.com")
+            XCTAssertNil(offNetwork)
+
+            let failing = StubForeignHandleResolver(answers: [:], failing: true)
+            let capability = SwanPublicHandleResolutionCapability(
+                controlStore: control, foreign: failing
+            )
+            let afterFailure = try await capability.activeDID(
+                forCanonicalHandle: "nobody.example.com")
+            XCTAssertNil(afterFailure)
+            let attempted = await failing.calls
+            XCTAssertEqual(attempted, ["nobody.example.com"])
+        }
+    }
+
     // MARK: Fixture
 
     /// Runs `body` against a live router and closes the control database on
@@ -724,3 +782,24 @@ private struct PermanentlyUnadmittablePublicReadDirectory:
         -> PublicRepositoryReadOutcome<PublicRepositoryReadBlobTarget>
     { throw refusal }
 }
+
+/// Stands in for the pinned TXT/`.well-known` resolver so the capability's
+/// fallback is exercised without a network.
+private actor StubForeignHandleResolver: SwanForeignHandleResolving {
+    private(set) var calls: [String] = []
+    private let answers: [String: String]
+    private let failing: Bool
+
+    init(answers: [String: String], failing: Bool = false) {
+        self.answers = answers
+        self.failing = failing
+    }
+
+    func resolve(handle: String) async throws -> String? {
+        calls.append(handle)
+        if failing { throw StubForeignHandleResolverFailure.refused }
+        return answers[handle]
+    }
+}
+
+private enum StubForeignHandleResolverFailure: Error { case refused }

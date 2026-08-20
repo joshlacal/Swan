@@ -434,6 +434,46 @@ public struct ATProtocolHandleVerifier: PLCHandleVerifying, Sendable {
         }
     }
 
+    /// Resolves a handle this host does not own to whatever DID it claims,
+    /// TXT first and `/.well-known/atproto-did` second — the same order, the
+    /// same bounds, and the same pinned transport `verify` uses.
+    ///
+    /// `verify` asks "does this handle point at the DID I already expect"; this
+    /// asks "what does this handle point at", which is what a PDS answering
+    /// `com.atproto.identity.resolveHandle` for a handle it does not host has
+    /// to do. A reference PDS answers those from its identity resolver, and
+    /// refusing them made every handle-to-DID lookup a client sent this host
+    /// fail with `InvalidRequest`.
+    ///
+    /// `nil` means the handle resolved to nothing usable. Reserved TLDs,
+    /// malformed handles, and non-public addresses are refused before any
+    /// lookup, so an anonymous caller cannot steer this at an internal host.
+    public func resolve(handle rawHandle: String) async throws -> String? {
+        do {
+            let handle = try AccountIdentifiers.canonicalHandle(rawHandle)
+            try validateHandlePolicy(handle)
+            do {
+                if let viaDNS = try await resolveTXT(handle: handle) {
+                    return viaDNS
+                }
+            } catch let error as ATHandleVerificationError
+                where error == .verificationFailed {
+                // A malformed or ambiguous TXT answer is a fault in the record,
+                // not a reason to fall through to a second source that could
+                // disagree with it.
+                throw error
+            } catch {
+                // Anything else — timeout, SERVFAIL, no record — is the
+                // ordinary "no TXT" case the HTTPS leg exists for.
+            }
+            return try await resolveHTTP(handle: handle)
+        } catch let error as ATHandleVerificationError {
+            throw error
+        } catch {
+            throw ATHandleVerificationError.verificationFailed
+        }
+    }
+
     private func validateHandlePolicy(_ handle: String) throws {
         guard let tld = handle.split(separator: ".").last.map(String.init) else {
             throw ATHandleVerificationError.verificationFailed

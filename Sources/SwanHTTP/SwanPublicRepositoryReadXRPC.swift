@@ -360,9 +360,21 @@ func isInstalledPublicReadMethod(
 /// promises to only call one method on it.
 public struct SwanPublicHandleResolutionCapability: Sendable {
     private let controlStore: any AccountControlStore
+    private let foreign: (any SwanForeignHandleResolving)?
 
-    public init(controlStore: any AccountControlStore) {
+    /// - Parameter foreign: resolves handles this host does not host, or `nil`
+    ///   to keep the route local-only. A reference PDS answers those from its
+    ///   identity resolver, so with this absent every handle-to-DID lookup a
+    ///   client sends for someone else's handle fails with `InvalidRequest`.
+    ///   It is injected rather than constructed here because it is the one part
+    ///   of this route that reaches the network, and an operator must be able
+    ///   to keep an anonymous endpoint off the network entirely.
+    public init(
+        controlStore: any AccountControlStore,
+        foreign: (any SwanForeignHandleResolving)? = nil
+    ) {
         self.controlStore = controlStore
+        self.foreign = foreign
     }
 
     /// Resolves a *canonical* handle to a hosted, active account's DID.
@@ -374,17 +386,31 @@ public struct SwanPublicHandleResolutionCapability: Sendable {
     /// whose `resolveHandle` likewise excludes deactivated and taken-down
     /// accounts.
     ///
-    /// This performs no DNS, PLC, DID, or HTTP resolution: a handle this
-    /// service does not host is simply unresolvable here.
+    /// A handle this host does not hold falls through to `foreign` when one is
+    /// configured. Hosted accounts are always answered from storage first, so
+    /// no local identity depends on a network lookup.
     func activeDID(forCanonicalHandle handle: String) async throws -> String? {
         guard AccountControlIdentifiers.isCanonicalHandle(handle) else {
             return nil
         }
-        guard let account = try await controlStore.account(
+        if let account = try await controlStore.account(
             canonicalHandle: handle
-        ), account.status.authorizesAccount else { return nil }
-        return account.did
+        ), account.status.authorizesAccount {
+            return account.did
+        }
+        guard let foreign else { return nil }
+        return try? await foreign.resolve(handle: handle)
     }
+}
+
+/// Resolves a handle this host does not host.
+///
+/// Deliberately narrow: one method, no transport or policy in the signature, so
+/// the public route cannot reach anything else and a test can substitute it
+/// without a network.
+public protocol SwanForeignHandleResolving: Sendable {
+    /// The DID the handle claims, or `nil` when it resolves to nothing usable.
+    func resolve(handle: String) async throws -> String?
 }
 
 /// `com.atproto.identity.resolveHandle`'s entire output.

@@ -522,7 +522,11 @@ public struct SwanHTTPServer: Sendable {
         jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
         publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil,
         publicFirehoseSubscriberAdmission: PublicFirehoseSubscriberAdmission? = nil,
-        identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil
+        identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil,
+        /// Resolves handles this host does not hold, for
+        /// `com.atproto.identity.resolveHandle`. Absent keeps that anonymous
+        /// route off the network entirely.
+        foreignHandleResolution: (any SwanForeignHandleResolving)? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -531,7 +535,8 @@ public struct SwanHTTPServer: Sendable {
         self.loginClientIdentityPolicy = loginClientIdentityPolicy
         self.publicRepositoryReadDirectory = publicRepositoryReadDirectory
         publicHandleResolution = accountControlStore.map {
-            SwanPublicHandleResolutionCapability(controlStore: $0)
+            SwanPublicHandleResolutionCapability(
+                controlStore: $0, foreign: foreignHandleResolution)
         }
         self.accountEmailXRPC = accountEmailXRPC
         self.legacySessionXRPC = legacySessionXRPC
