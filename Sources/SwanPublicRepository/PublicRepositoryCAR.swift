@@ -300,49 +300,7 @@ public enum PublicRepositoryCAR {
             throw PublicRepositoryCARError.repository(.invalidNodeSchema)
         }
 
-        var orderedCIDs: [CID] = []
-        var queue = [dataCID]
-        var recordCIDs: [CID] = []
-        var seenRecords = Set<CID>()
-        var seenNodes = Set<CID>()
-        while !queue.isEmpty {
-            try Task.checkCancellation()
-            let layer = queue
-            queue.removeAll(keepingCapacity: true)
-            for cid in layer {
-                guard seenNodes.insert(cid).inserted,
-                      let nodeBytes = validated.reachableMSTBlocks[cid] else {
-                    throw PublicRepositoryCARError.repository(.missingBlock)
-                }
-                orderedCIDs.append(cid)
-                let node: RepositoryMSTNode
-                let leaves: [RepositoryMSTLeaf]
-                do {
-                    node = try RepositoryMSTCodec.decode(nodeBytes)
-                    leaves = try RepositoryMSTCodec.reconstructedLeaves(from: node)
-                } catch let error as RepositoryMSTValidationError {
-                    throw PublicRepositoryCARError.repository(error)
-                } catch {
-                    throw PublicRepositoryCARError.repository(.invalidNodeSchema)
-                }
-                if let left = node.leftTreeCID {
-                    queue.append(left)
-                }
-                for leaf in leaves {
-                    if seenRecords.insert(leaf.recordCID).inserted {
-                        recordCIDs.append(leaf.recordCID)
-                    }
-                    if let right = leaf.rightTreeCID {
-                        queue.append(right)
-                    }
-                }
-            }
-        }
-        guard seenNodes == Set(validated.reachableMSTBlocks.keys),
-              seenRecords == validated.reachableRecordCIDs else {
-            throw PublicRepositoryCARError.repository(.missingBlock)
-        }
-        orderedCIDs.append(contentsOf: recordCIDs)
+        let orderedCIDs = validated.orderedBlockCIDs
 
         return try await write(
             rootCID: commitCID,
