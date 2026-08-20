@@ -33,7 +33,7 @@ public enum RelayFullRepositoryVerifier {
         to: sink
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     let blocks = await sink.blocks
     guard let commitBytes = blocks[parsed.rootCID] else {
@@ -46,7 +46,7 @@ public enum RelayFullRepositoryVerifier {
         expectedCommitCID: parsed.rootCID
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     let repository: ValidatedPublicRepositoryMST
     do {
@@ -55,7 +55,7 @@ public enum RelayFullRepositoryVerifier {
         blocks: RelayDictionaryBlockSource(storage: blocks)
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     let required = Set(repository.reachableMSTBlocks.keys)
       .union(repository.reachableRecordCIDs)
@@ -248,7 +248,7 @@ public struct RelayRepositoryVerificationState: Sendable {
         to: sink
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     if let expectedRoot, parsed.rootCID != expectedRoot {
       throw RelayVerifierError.commitCIDMismatch
@@ -273,7 +273,7 @@ public struct RelayRepositoryVerificationState: Sendable {
         verifier: verifier
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     let blockSource = RelayDictionaryBlockSource(storage: merged)
     let repository: ValidatedPublicRepositoryMST
@@ -283,7 +283,7 @@ public struct RelayRepositoryVerificationState: Sendable {
         blocks: blockSource
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     if requireSelfContainedRepository {
       let required = Set(repository.reachableMSTBlocks.keys)
@@ -330,7 +330,7 @@ public struct RelayRepositoryVerificationState: Sendable {
         to: sink
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     let blocks = await sink.blocks
     guard parsed.frameCount == 1,
@@ -346,7 +346,7 @@ public struct RelayRepositoryVerificationState: Sendable {
       )
       return (commit, bytes)
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
   }
 
@@ -388,7 +388,10 @@ public enum RelayRepositoryDigest {
   }
 }
 
-private func mapRepositoryError(_ error: Error) -> RelayVerifierError {
+private func mapRepositoryError(_ error: Error) throws -> RelayVerifierError {
+  if error is CancellationError {
+    throw CancellationError()
+  }
   if let error = error as? PublicRepositoryCommitError, error == .invalidSignature {
     return .invalidCommitSignature
   }

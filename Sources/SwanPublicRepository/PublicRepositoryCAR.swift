@@ -294,6 +294,8 @@ public enum PublicRepositoryCAR {
                 blocks: blocks,
                 limits: limits
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as RepositoryMSTValidationError {
             throw PublicRepositoryCARError.repository(error)
         } catch {
@@ -354,6 +356,8 @@ public enum PublicRepositoryCAR {
                 blocks: importedSource,
                 limits: limits
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as RepositoryMSTValidationError {
             throw PublicRepositoryCARError.repository(error)
         } catch {

@@ -55,13 +55,27 @@ public enum PublicRepositoryReachableBlockKind: String, Sendable, Equatable {
 
 /// Durable import validators use this sink to externalize the verified
 /// projection. Calls carry identifiers only; block bodies remain in the
-/// supplied block source and are released after each validation step.
 public protocol PublicRepositoryReachableProjectionSink: Sendable {
     func recordReachableBlock(
         cid: CID,
         kind: PublicRepositoryReachableBlockKind
     ) async throws
+    func recordReachableBlock(
+        cid: CID,
+        kind: PublicRepositoryReachableBlockKind,
+        bytes: Data?
+    ) async throws
     func recordRepositoryIndex(path: PublicRepositoryPath, recordCID: CID) async throws
+}
+
+extension PublicRepositoryReachableProjectionSink {
+    public func recordReachableBlock(
+        cid: CID,
+        kind: PublicRepositoryReachableBlockKind,
+        bytes: Data?
+    ) async throws {
+        try await recordReachableBlock(cid: cid, kind: kind)
+    }
 }
 
 public struct ValidatedPublicRepositoryProjection: Sendable, Equatable {
@@ -114,7 +128,7 @@ public enum RepositoryMSTValidation {
         limits: PublicRepositoryLimits = .standard,
         maximumReachableRepositoryBytes: Int? = nil
     ) async throws -> ValidatedPublicRepositoryMST {
-        let collector = ValidationCollector(source: blocks)
+        let collector = ValidationCollector()
         let projection = try await validateProjection(rootCID: rootCID, blocks: blocks, projection: collector,
             limits: limits, maximumReachableRepositoryBytes: maximumReachableRepositoryBytes)
         let snapshot = await collector.snapshot()
@@ -131,7 +145,7 @@ public enum RepositoryMSTValidation {
         maximumMSTNodesOverride: Int? = nil,
         maximumMSTEntriesPerNodeOverride: Int? = nil
     ) async throws -> ValidatedPublicRepositoryMST {
-        let collector = ValidationCollector(source: blocks)
+        let collector = ValidationCollector()
         let projection = try await run(rootCID: rootCID, blocks: blocks, projection: collector, limits: limits,
             maximumReachableRepositoryBytes: maximumReachableRepositoryBytes,
             maximumMSTNodes: maximumMSTNodesOverride ?? limits.maximumMSTNodes,
@@ -210,7 +224,7 @@ public enum RepositoryMSTValidation {
                 layer = expected
             }
             if item.isRoot { rootLayer = layer }
-            try await projection.recordReachableBlock(cid: item.cid, kind: .mst)
+            try await projection.recordReachableBlock(cid: item.cid, kind: .mst, bytes: bytes)
             if nodeLeaves.isEmpty {
                 if let left = node.leftTreeCID {
                     guard referenced.insert(left).inserted else { throw RepositoryMSTValidationError.repeatedNode }
@@ -255,7 +269,7 @@ public enum RepositoryMSTValidation {
                 do { try RepositoryRecordBlockValidator.validate(data, expectedType: collection, maximumDepth: limits.maximumCBORNestingDepth) }
                 catch { throw RepositoryMSTValidationError.invalidRecordBlock }
             }
-            try await projection.recordReachableBlock(cid: cid, kind: .record)
+            try await projection.recordReachableBlock(cid: cid, kind: .record, bytes: data)
         }
         leaves = Self.sortedByMSTKey(leaves, keys: keys)
         for pair in zip(leaves, leaves.dropFirst()) {
@@ -321,14 +335,18 @@ private actor ValidationCollector: PublicRepositoryReachableProjectionSink {
         var rootLayer: Int?
         var bytes = 0
     }
-    private let source: (any PublicRepositoryBlockSource)?
     private var state = Snapshot()
 
-    init(source: (any PublicRepositoryBlockSource)? = nil) { self.source = source }
     func recordReachableBlock(cid: CID, kind: PublicRepositoryReachableBlockKind) async throws {
         state.orderedCIDs.append(cid)
-        if kind == .mst, let source, let data = try await source.block(for: cid) {
-            state.mstBlocks[cid] = data
+        if kind == .record {
+            state.recordCIDs.insert(cid)
+        }
+    }
+    func recordReachableBlock(cid: CID, kind: PublicRepositoryReachableBlockKind, bytes: Data?) async throws {
+        state.orderedCIDs.append(cid)
+        if kind == .mst, let bytes {
+            state.mstBlocks[cid] = bytes
         } else if kind == .record {
             state.recordCIDs.insert(cid)
         }

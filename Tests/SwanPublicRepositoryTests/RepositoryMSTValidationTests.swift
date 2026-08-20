@@ -867,6 +867,37 @@ final class RepositoryMSTValidationTests: XCTestCase {
         precondition(bytes.count < 24)
         return Data([0x60 | UInt8(bytes.count)]) + bytes
     }
+
+    func testValidatedMSTRetainsFirstReadBytesFromNonRepeatableSource() async throws {
+        let path = try PublicRepositoryPath(
+            collection: "app.bsky.feed.post", recordKey: "0"
+        )
+        let record = try recordBytes(for: path)
+        let recordCID = CID.fromDAGCBOR(record)
+        let node = try RepositoryMSTCodec.node(leaves: [
+            .init(path: path, recordCID: recordCID),
+        ])
+        let nodeBytes = try RepositoryMSTCodec.encode(node)
+        let rootCID = CID.fromDAGCBOR(nodeBytes)
+
+        let unstableSource = NonRepeatableBlockSource(
+            initial: [
+                rootCID: nodeBytes,
+                recordCID: record,
+            ],
+            subsequent: [
+                rootCID: nil,
+                recordCID: record,
+            ]
+        )
+
+        let validated = try await RepositoryMSTValidation.validate(
+            rootCID: rootCID,
+            blocks: unstableSource
+        )
+        XCTAssertEqual(validated.reachableMSTBlocks[rootCID], nodeBytes)
+        XCTAssertEqual(validated.leaves.map(\.path), [path])
+    }
 }
 
 private struct TestBlockSource: PublicRepositoryBlockSource {
@@ -874,6 +905,29 @@ private struct TestBlockSource: PublicRepositoryBlockSource {
 
     func block(for cid: CID) async throws -> Data? {
         storage[cid]
+    }
+}
+
+private actor NonRepeatableBlockSource: PublicRepositoryBlockSource {
+    private var storage: [CID: Data]
+    private let subsequent: [CID: Data?]
+    private var readCount: [CID: Int] = [:]
+
+    init(initial: [CID: Data], subsequent: [CID: Data?]) {
+        self.storage = initial
+        self.subsequent = subsequent
+    }
+
+    func block(for cid: CID) async throws -> Data? {
+        let count = readCount[cid, default: 0]
+        readCount[cid] = count + 1
+        if count == 0 {
+            return storage[cid]
+        }
+        if let override = subsequent[cid] {
+            return override
+        }
+        return storage[cid]
     }
 }
 
