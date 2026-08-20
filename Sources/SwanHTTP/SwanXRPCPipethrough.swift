@@ -471,6 +471,19 @@ private func handleSwanXRPCPipethrough(
                 maximumBodyBytes: capability.limits.maximumResponseBodyBytes
             )
         } catch {
+            // A 502 with no server-side trace makes every outbound failure —
+            // DNS, TLS, peer pinning, timeout — look identical to the client
+            // and to the operator. The endpoint host and the transport error
+            // are deployment facts, not credentials: the minted service token
+            // never appears here.
+            context.logger.info(
+                "xrpc pipethrough upstream failed",
+                metadata: [
+                    "nsid": .string(nsid),
+                    "host": .string(endpoint.host() ?? "unknown"),
+                    "reason": .string(String(describing: error)),
+                ]
+            )
             throw SwanXRPCPipethroughFailure.badGateway
         }
         return try pipethroughResponse(response)
