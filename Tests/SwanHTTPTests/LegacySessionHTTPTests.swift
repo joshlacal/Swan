@@ -52,10 +52,13 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             .appending(path: "LegacySessionHTTPTests-" + UUID().uuidString)
         let database = try await SQLiteControlDatabase(dataDirectory: root)
         let hasher = try LibsodiumArgon2idHasher()
+        let factorTokens = FactorTokenService(store: database)
         let accounts = DurableAccountDirectory(
             store: database,
             passwordHasher: hasher,
-            verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher)
+            verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher),
+            loginFactorTokenVerifier: factorTokens,
+            authenticationFactors: database
         )
         _ = try await database.createAccount(
             try AccountControlRegistration(
@@ -288,6 +291,271 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
                 XCTAssertEqual(response.status, .ok, self.body(response))
             }
         }
+    }
+    /// When an account has an active second factor enrolled, a login attempt
+    /// presenting the correct account password but omitting `authFactorToken`
+    /// must be refused with HTTP 401 and error name `AuthFactorTokenRequired`,
+    /// matching the lexicon definition in com.atproto.server.createSession.
+    func testFactorEnrolledCorrectPasswordNoTokenReturnsAuthFactorTokenRequired() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let factor = try AuthenticationFactorMetadata(
+            id: "totp-factor",
+            accountDID: did,
+            kind: .totp,
+            label: "Authenticator",
+            lookupDigest: Data(repeating: 1, count: 32),
+            createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        try await fixture.database.saveFactor(factor, now: Date(timeIntervalSince1970: 1_750_000_000))
+        try await app(fixture).test(.router) { client in
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createSession",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string:
+                    "{\"identifier\":\"\(self.handle)\",\"password\":\"\(Self.accountPassword)\"}"
+                )
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized, self.body(response))
+                let payload = try self.json(response)
+                XCTAssertEqual(payload["error"] as? String, "AuthFactorTokenRequired")
+            }
+        }
+    }
+
+    /// A wrong password on a factor-enrolled account must return `AuthenticationRequired`,
+    /// NEVER `AuthFactorTokenRequired`. Otherwise the error response becomes an
+    /// existence-and-MFA oracle for handles probed by an attacker.
+    func testFactorEnrolledWrongPasswordReturnsAuthenticationRequired() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let factor = try AuthenticationFactorMetadata(
+            id: "totp-factor",
+            accountDID: did,
+            kind: .totp,
+            label: "Authenticator",
+            lookupDigest: Data(repeating: 1, count: 32),
+            createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        try await fixture.database.saveFactor(factor, now: Date(timeIntervalSince1970: 1_750_000_000))
+        try await app(fixture).test(.router) { client in
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createSession",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string:
+                    "{\"identifier\":\"\(self.handle)\",\"password\":\"wrong-password-value\"}"
+                )
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized, self.body(response))
+                let payload = try self.json(response)
+                XCTAssertEqual(payload["error"] as? String, "AuthenticationRequired")
+            }
+        }
+    }
+
+    /// Presenting an invalid or expired factor token alongside the correct password
+    /// must fail closed with `AuthenticationRequired`, not `AuthFactorTokenRequired`
+    /// (a bad code is not a missing code).
+    func testFactorEnrolledCorrectPasswordBadTokenReturnsAuthenticationRequired() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let factor = try AuthenticationFactorMetadata(
+            id: "totp-factor",
+            accountDID: did,
+            kind: .totp,
+            label: "Authenticator",
+            lookupDigest: Data(repeating: 1, count: 32),
+            createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        try await fixture.database.saveFactor(factor, now: Date(timeIntervalSince1970: 1_750_000_000))
+        try await app(fixture).test(.router) { client in
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createSession",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string:
+                    "{\"identifier\":\"\(self.handle)\",\"password\":\"\(Self.accountPassword)\",\"authFactorToken\":\"bad-code-123456\"}"
+                )
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized, self.body(response))
+                let payload = try self.json(response)
+                XCTAssertEqual(payload["error"] as? String, "AuthenticationRequired")
+            }
+        }
+    }
+
+    /// App password login on a factor-enrolled account must succeed without
+    /// requiring an authFactorToken (app passwords bypass second-factor ceremony).
+    func testFactorEnrolledAppPasswordBypassesMFA() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let factor = try AuthenticationFactorMetadata(
+            id: "totp-factor",
+            accountDID: did,
+            kind: .totp,
+            label: "Authenticator",
+            lookupDigest: Data(repeating: 1, count: 32),
+            createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        try await fixture.database.saveFactor(factor, now: Date(timeIntervalSince1970: 1_750_000_000))
+        let appPassword = try await issuePassword(fixture)
+        try await app(fixture).test(.router) { client in
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createSession",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string:
+                    "{\"identifier\":\"\(self.handle)\",\"password\":\"\(appPassword)\"}"
+                )
+            ) { response in
+                XCTAssertEqual(response.status, .ok, self.body(response))
+                let payload = try self.json(response)
+                XCTAssertEqual(payload["did"] as? String, self.did)
+            }
+        }
+    }
+
+    /// Directory-level channel semantics verification:
+    /// 1. `.legacy` channel + factor enrolled + correct password → `.authenticated(requiresFactor: true)`
+    /// 2. `.oauth` channel + factor enrolled + correct password → `.authenticated(requiresFactor: true)`
+    /// 3. `.portal` channel + factor enrolled + correct password (without token) → `.rejected`
+    /// 4. No factor enrolled + correct password → `.authenticated(requiresFactor: false)` across all channels
+    func testDirectoryChannelAuthenticationSemantics() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let hasher = try LibsodiumArgon2idHasher()
+        let factorTokens = FactorTokenService(store: fixture.database)
+        let accounts = DurableAccountDirectory(
+            store: fixture.database,
+            passwordHasher: hasher,
+            verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher),
+            loginFactorTokenVerifier: factorTokens,
+            authenticationFactors: fixture.database
+        )
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+
+        // 1. Without factors enrolled
+        let legacyNoFactor = try await accounts.authenticateForLogin(
+            handle: self.handle,
+            password: Self.accountPassword,
+            authFactorToken: nil,
+            authorizationContext: try AccountAuthorizationContext(channel: .legacy, sessionID: "s1", purpose: "managementLogin"),
+            now: now
+        )
+        guard case let .authenticated(legacyNoFactorSuccess) = legacyNoFactor else {
+            XCTFail("expected .authenticated for legacy without factors")
+            return
+        }
+        XCTAssertFalse(legacyNoFactorSuccess.requiresFactor)
+        XCTAssertNotNil(legacyNoFactorSuccess.authorizationGrantDigest)
+
+        let portalNoFactor = try await accounts.authenticateForLogin(
+            handle: self.handle,
+            password: Self.accountPassword,
+            authFactorToken: nil,
+            authorizationContext: try AccountAuthorizationContext(channel: .portal, sessionID: "s2", purpose: "managementLogin"),
+            now: now
+        )
+        guard case let .authenticated(portalNoFactorSuccess) = portalNoFactor else {
+            XCTFail("expected .authenticated for portal without factors")
+            return
+        }
+        XCTAssertFalse(portalNoFactorSuccess.requiresFactor)
+        XCTAssertNotNil(portalNoFactorSuccess.authorizationGrantDigest)
+
+        // 2. Enroll a factor
+        let factor = try AuthenticationFactorMetadata(
+            id: "totp-factor",
+            accountDID: did,
+            kind: .totp,
+            label: "Authenticator",
+            lookupDigest: Data(repeating: 1, count: 32),
+            createdAt: now
+        )
+        try await fixture.database.saveFactor(factor, now: now)
+
+        // Legacy channel with factor enrolled + correct password → requiresFactor: true
+        let legacyWithFactor = try await accounts.authenticateForLogin(
+            handle: self.handle,
+            password: Self.accountPassword,
+            authFactorToken: nil,
+            authorizationContext: try AccountAuthorizationContext(channel: .legacy, sessionID: "s3", purpose: "managementLogin"),
+            now: now
+        )
+        guard case let .authenticated(legacyWithFactorSuccess) = legacyWithFactor else {
+            XCTFail("expected .authenticated(requiresFactor: true) for legacy with factor enrolled")
+            return
+        }
+        XCTAssertTrue(legacyWithFactorSuccess.requiresFactor)
+
+        // OAuth channel with factor enrolled + correct password → requiresFactor: true
+        let oauthContext = try AccountAuthorizationContext(
+            channel: .oauth,
+            sessionID: "s4",
+            csrfDigest: Data(repeating: 0xAA, count: 32),
+            clientID: "client.example",
+            requestDigest: Data(repeating: 0xBB, count: 32),
+            purpose: "oauthToken"
+        )
+        let oauthWithFactor = try await accounts.authenticateForLogin(
+            handle: self.handle,
+            password: Self.accountPassword,
+            authFactorToken: nil,
+            authorizationContext: oauthContext,
+            now: now
+        )
+        guard case let .authenticated(oauthWithFactorSuccess) = oauthWithFactor else {
+            XCTFail("expected .authenticated(requiresFactor: true) for oauth with factor enrolled")
+            return
+        }
+        XCTAssertTrue(oauthWithFactorSuccess.requiresFactor)
+
+        // Portal channel with factor enrolled + correct password (no token) → .rejected
+        let portalWithFactor = try await accounts.authenticateForLogin(
+            handle: self.handle,
+            password: Self.accountPassword,
+            authFactorToken: nil,
+            authorizationContext: try AccountAuthorizationContext(channel: .portal, sessionID: "s5", purpose: "managementLogin"),
+            now: now
+        )
+        XCTAssertEqual(portalWithFactor, .rejected)
+
+        // Wrong password with factor enrolled → .rejected on all channels
+        let legacyWrongPassword = try await accounts.authenticateForLogin(
+            handle: self.handle,
+            password: "wrong-password",
+            authFactorToken: nil,
+            authorizationContext: try AccountAuthorizationContext(channel: .legacy, sessionID: "s6", purpose: "managementLogin"),
+            now: now
+        )
+        XCTAssertEqual(legacyWrongPassword, .rejected)
     }
 
     func testRateLimitedLoginIsRefused() async throws {

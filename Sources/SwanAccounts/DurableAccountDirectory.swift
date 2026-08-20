@@ -17,8 +17,10 @@ public struct AccountAuthenticationSuccess: Sendable, Equatable {
     /// for source-compatible account-only callers and never contains a raw
     /// credential.
     public let authorizationGrantDigest: Data?
-    /// Password verification has succeeded and an OAuth MFA phase has been
-    /// admitted, but no protected session or token may be issued yet.
+    /// Password verification has succeeded and an active second factor is
+    /// required (for OAuth MFA phase admission or legacy session
+    /// AuthFactorTokenRequired), but no protected session or token may be
+    /// issued yet.
     public let requiresFactor: Bool
 
     public init(
@@ -586,25 +588,42 @@ public actor DurableAccountDirectory {
                         authorizationGrantDigest: grant.grantDigest
                     ))
                 } catch let error as AccountControlStoreError where error == .notFound {
-                    guard !activeFactors.isEmpty,
-                          authorizationContext.channel == .oauth,
-                          let phaseStore = store as? any OAuthMFAAdmissionStore else {
+                    guard !activeFactors.isEmpty else {
                         return .rejected
                     }
-                    do {
-                        _ = try await phaseStore.beginOAuthMFAAdmission(
-                            accountDID: finalized.account.did,
-                            context: authorizationContext,
-                            now: now
-                        )
-                    } catch {
-                        throw AccountLoginAuthenticationError.unavailable
+                    if authorizationContext.channel == .oauth {
+                        guard let phaseStore = store as? any OAuthMFAAdmissionStore else {
+                            return .rejected
+                        }
+                        do {
+                            _ = try await phaseStore.beginOAuthMFAAdmission(
+                                accountDID: finalized.account.did,
+                                context: authorizationContext,
+                                now: now
+                            )
+                        } catch {
+                            throw AccountLoginAuthenticationError.unavailable
+                        }
+                        return .authenticated(AccountAuthenticationSuccess(
+                            account: finalized.account,
+                            credentialWasRehashed: finalized.credentialWasReplaced,
+                            requiresFactor: true
+                        ))
                     }
-                    return .authenticated(AccountAuthenticationSuccess(
-                        account: finalized.account,
-                        credentialWasRehashed: finalized.credentialWasReplaced,
-                        requiresFactor: true
-                    ))
+                    if authorizationContext.channel == .legacy {
+                        // The account password verified successfully, but the account
+                        // has active authentication factors and no factor token was
+                        // presented. For the legacy XRPC channel (com.atproto.server.createSession),
+                        // this outcome signals that the caller must present an
+                        // authFactorToken to proceed. The legacy XRPC handler maps
+                        // this to HTTP 401 AuthFactorTokenRequired.
+                        return .authenticated(AccountAuthenticationSuccess(
+                            account: finalized.account,
+                            credentialWasRehashed: finalized.credentialWasReplaced,
+                            requiresFactor: true
+                        ))
+                    }
+                    return .rejected
                 } catch {
                     throw AccountLoginAuthenticationError.unavailable
                 }

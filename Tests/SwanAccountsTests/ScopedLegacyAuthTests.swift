@@ -94,8 +94,11 @@ final class ScopedLegacyAuthTests: XCTestCase {
         XCTAssertTrue(GeneratedLegacyMethodRegistry.declarations.keys.contains("com.atproto.server.createSession"))
         XCTAssertTrue(GeneratedLegacyMethodRegistry.routing["com.atproto.server.createSession"] == .local)
         XCTAssertFalse(GeneratedLegacyMethodRegistry.declarations.keys.contains("app.bsky.actor.defs"))
-        XCTAssertEqual(GeneratedLegacyMethodRegistry.declarations.count, 193)
-        XCTAssertEqual(GeneratedLegacyMethodRegistry.sourceDigest, "fc9ba90293fbe238224c0cf7456d3ea83750adf1ef1c63727be9fdea8c38f605")
+        XCTAssertEqual(GeneratedLegacyMethodRegistry.declarations.count, 259)
+        XCTAssertEqual(GeneratedLegacyMethodRegistry.sourceDigest, "12749bd4e4f1f33da823c24705b30a9f59a2c1300fbf87c763ee5f7ce152ec19")
+        XCTAssertEqual(GeneratedLegacyMethodRegistry.sourceRevision, "d6296a1cfdb40a773319cb59061300e4e8e52f26")
+        XCTAssertTrue(GeneratedLegacyMethodRegistry.declarations.keys.contains("chat.bsky.convo.getUnreadCounts"))
+        XCTAssertTrue(GeneratedLegacyMethodRegistry.declarations.keys.contains("app.bsky.video.getUploadStatus"))
         for (method, scopes) in GeneratedLegacyMethodRegistry.declarations {
             XCTAssertTrue(DeclaredMethodScopePolicy.isCanonicalMethod(method))
             for scope in scopes {
@@ -106,6 +109,8 @@ final class ScopedLegacyAuthTests: XCTestCase {
         XCTAssertTrue(GeneratedLegacyMethodRegistry.routing["com.atproto.repo.getRecord"] == .local)
         XCTAssertTrue(GeneratedLegacyMethodRegistry.routing["app.bsky.feed.getFeed"] == .proxyDefault)
         XCTAssertTrue(GeneratedLegacyMethodRegistry.routing["com.atproto.moderation.createReport"] == .proxyExplicit)
+        XCTAssertTrue(GeneratedLegacyMethodRegistry.routing["chat.bsky.convo.getUnreadCounts"] == .proxyDefault)
+        XCTAssertTrue(GeneratedLegacyMethodRegistry.routing["app.bsky.video.getUploadStatus"] == .proxyDefault)
     }
 
     func testAppPasswordSecretPresentedOnceAndScopeEditRevokesDerivedSession() async throws {

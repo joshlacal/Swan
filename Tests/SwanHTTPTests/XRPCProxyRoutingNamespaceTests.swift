@@ -14,16 +14,26 @@ final class XRPCProxyRoutingNamespaceTests: XCTestCase {
     private let chatProxy = "did:web:api.bsky.chat#bsky_chat"
 
     func testAnExplicitlyProxiedMethodMissingFromThePinnedRegistryIsStillForwarded() throws {
-        // Observed live: bsky.app asked for this and got a 404 because the
-        // pinned lexicons predate the method. It is published upstream and
-        // lives at the chat service, which the client named.
-        XCTAssertNil(GeneratedLegacyMethodRegistry.routing["chat.bsky.convo.getUnreadCounts"])
+        // Admission is by namespace prefix, so future or unlisted methods published
+        // upstream are forwarded even when absent from the method registry.
+        XCTAssertNil(GeneratedLegacyMethodRegistry.routing["chat.bsky.convo.futureUnregisteredMethod"])
+        XCTAssertEqual(
+            try router.route(nsid: "chat.bsky.convo.futureUnregisteredMethod", proxyHeader: chatProxy),
+            .resolvedService(did: "did:web:api.bsky.chat", fragment: "bsky_chat")
+        )
+        // Same for AppView methods absent from the registry, with and without a header.
+        XCTAssertNil(GeneratedLegacyMethodRegistry.routing["app.bsky.video.futureUnregisteredMethod"])
+        XCTAssertEqual(
+            try router.route(nsid: "app.bsky.video.futureUnregisteredMethod", proxyHeader: nil),
+            .configuredAppView(did: "did:web:api.bsky.app")
+        )
+        // Methods refreshed from upstream are present in the registry and route correctly.
+        XCTAssertEqual(GeneratedLegacyMethodRegistry.routing["chat.bsky.convo.getUnreadCounts"], .proxyDefault)
         XCTAssertEqual(
             try router.route(nsid: "chat.bsky.convo.getUnreadCounts", proxyHeader: chatProxy),
             .resolvedService(did: "did:web:api.bsky.chat", fragment: "bsky_chat")
         )
-        // Same for AppView methods newer than the pin, with and without a header.
-        XCTAssertNil(GeneratedLegacyMethodRegistry.routing["app.bsky.video.getUploadStatus"])
+        XCTAssertEqual(GeneratedLegacyMethodRegistry.routing["app.bsky.video.getUploadStatus"], .proxyDefault)
         XCTAssertEqual(
             try router.route(nsid: "app.bsky.video.getUploadStatus", proxyHeader: nil),
             .configuredAppView(did: "did:web:api.bsky.app")

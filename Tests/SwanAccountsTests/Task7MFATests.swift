@@ -555,6 +555,95 @@ final class Task7MFATests: XCTestCase {
         XCTAssertEqual(result.publicKey.x963Representation, x963)
         XCTAssertThrowsError(try WebAuthnRegistrationVerifier.verify(clientDataJSON: clientData, authenticatorData: authData, challenge: challenge, accountDID: "did:plc:bob", challengeRecord: record, expectedOrigin: "https://example.com", relyingPartyID: "example.com", now: Date(timeIntervalSince1970: 2)))
     }
+
+    func testLegacyChannelAuthenticationRequiresFactorWhenEnrolled() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("swan-legacy-channel-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
+
+        let hasher = try LibsodiumArgon2idHasher()
+        let verifier = try hasher.hash("hunter2-correct-password")
+        // Registered through the store's own API rather than raw INSERTs: the
+        // credential row, its state machine and the handle uniqueness
+        // constraint are the store's invariants, and hand-written SQL here
+        // depended on a schema shape that is not this store's.
+        _ = try await database.createAccount(
+            try AccountControlRegistration(
+                did: "did:plc:mfauser2345677abcdefghij",
+                canonicalHandle: "mfauser.example",
+                passwordVerifier: verifier,
+                signingKey: try AccountControlKeyReference(purpose: .signing, generation: 1),
+                rotationKey: try AccountControlKeyReference(purpose: .rotation, generation: 1),
+                createdAt: Date(timeIntervalSince1970: 1)
+            )
+        )
+
+        let factorTokens = FactorTokenService(store: database)
+        let directory = DurableAccountDirectory(
+            store: database,
+            passwordHasher: hasher,
+            verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher),
+            loginFactorTokenVerifier: factorTokens,
+            authenticationFactors: database
+        )
+        let now = Date(timeIntervalSince1970: 100)
+        let legacyContext = try AccountAuthorizationContext(
+            channel: .legacy,
+            sessionID: "legacy-session-1",
+            purpose: "managementLogin"
+        )
+
+        // 1. Correct password, no factors enrolled → authenticated with requiresFactor: false
+        let noFactorOutcome = try await directory.authenticateForLogin(
+            handle: "mfauser.example",
+            password: "hunter2-correct-password",
+            authFactorToken: nil,
+            authorizationContext: legacyContext,
+            now: now
+        )
+        guard case let .authenticated(noFactorSuccess) = noFactorOutcome else {
+            XCTFail("expected .authenticated for account without MFA factors")
+            return
+        }
+        XCTAssertFalse(noFactorSuccess.requiresFactor)
+        XCTAssertNotNil(noFactorSuccess.authorizationGrantDigest)
+
+        // 2. Enroll a TOTP factor
+        let factor = try AuthenticationFactorMetadata(
+            id: "mfa-totp",
+            accountDID: "did:plc:mfauser2345677abcdefghij",
+            kind: .totp,
+            label: "Authenticator",
+            lookupDigest: Data(repeating: 0x55, count: 32),
+            createdAt: now
+        )
+        try await database.saveFactor(factor, now: now)
+
+        // 3. Correct password, factor enrolled, no token → authenticated with requiresFactor: true
+        let factorRequiredOutcome = try await directory.authenticateForLogin(
+            handle: "mfauser.example",
+            password: "hunter2-correct-password",
+            authFactorToken: nil,
+            authorizationContext: legacyContext,
+            now: now
+        )
+        guard case let .authenticated(factorRequiredSuccess) = factorRequiredOutcome else {
+            XCTFail("expected .authenticated(requiresFactor: true) when active factor is enrolled")
+            return
+        }
+        XCTAssertTrue(factorRequiredSuccess.requiresFactor)
+
+        // 4. Wrong password, factor enrolled → rejected (enumeration prevention)
+        let wrongPasswordOutcome = try await directory.authenticateForLogin(
+            handle: "mfauser.example",
+            password: "wrong-password",
+            authFactorToken: nil,
+            authorizationContext: legacyContext,
+            now: now
+        )
+        XCTAssertEqual(wrongPasswordOutcome, .rejected)
+    }
 }
 
 private actor InMemoryRecoveryCodeStore: RecoveryCodeStore {

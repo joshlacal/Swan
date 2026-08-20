@@ -43,6 +43,10 @@ public enum SwanLegacySessionXRPCFailure: Error, Sendable, Equatable {
     /// does not authorize it. **One code for all of them**, so the boundary is
     /// not an account-existence oracle.
     case authenticationRequired
+    /// The account password verified successfully, but the account has active
+    /// authentication factors and no `authFactorToken` was presented on the
+    /// request. Lexicon: `AuthFactorTokenRequired`.
+    case authFactorTokenRequired
     case invalidToken
     case expiredToken
     case payloadTooLarge
@@ -67,6 +71,9 @@ enum LegacyLoginStage: String, Sendable {
     /// The identifier resolved, but neither the account password nor any app
     /// password matched.
     case noCredentialMatched = "no_credential_matched"
+    /// The account password verified, but the account has active authentication
+    /// factors and no factor token was presented.
+    case authFactorTokenRequired = "auth_factor_token_required"
     case rateLimited = "rate_limited"
     case malformedRequest = "malformed_request"
     case tokenRejected = "token_rejected"
@@ -87,6 +94,7 @@ func legacyLoginStage(for error: any Error) -> LegacyLoginStage {
     case .invalidToken, .expiredToken: return .tokenRejected
     case .invalidRequest, .payloadTooLarge: return .malformedRequest
     case .authenticationRequired: return .noCredentialMatched
+    case .authFactorTokenRequired: return .authFactorTokenRequired
     }
 }
 
@@ -375,6 +383,29 @@ private struct Handlers: Sendable {
         }
 
         if case let .authenticated(success) = outcome, let resolved {
+            if success.requiresFactor {
+                // The account password verified successfully, but the account
+                // has active authentication factors and no factor token was
+                // presented on this request. We signal `AuthFactorTokenRequired`
+                // so standard ATProto clients (such as bsky.app) know to prompt
+                // the user for their 2FA factor token.
+                //
+                // Enumeration defense:
+                // This branch is reachable only because password verification
+                // succeeded. A wrong password on a factor-enrolled account
+                // returns `.rejected`, which falls through to step 2 (app passwords)
+                // and ultimately returns opaque `AuthenticationRequired`. The
+                // endpoint therefore never acts as an existence-or-MFA oracle
+                // when probed with incorrect credentials.
+                //
+                // An invalid, expired, or wrong-purpose `authFactorToken` likewise
+                // returns `.rejected` from factor verification, keeping the opaque
+                // `AuthenticationRequired` response instead of this error.
+                throw LegacyLoginRejection(
+                    stage: .authFactorTokenRequired,
+                    failure: .authFactorTokenRequired
+                )
+            }
             // Full legacy authority, upstream's `AuthScope.Access`. The
             // revision-bound grant created by the directory is consumed at
             // family insertion.
@@ -748,8 +779,10 @@ private struct Handlers: Sendable {
     }
 
     private func response(for error: any Error) -> Response {
-        // A staged rejection is still exactly `AuthenticationRequired` on the
-        // wire: the stage exists for the operator log, never for the client.
+        // A staged rejection uses its configured failure on the wire.
+        // For noCredentialMatched / identifierUnresolved, failure is
+        // AuthenticationRequired. For authFactorTokenRequired, failure is
+        // AuthFactorTokenRequired (HTTP 401).
         let failure =
             (error as? LegacyLoginRejection)?.failure
             ?? (error as? SwanLegacySessionXRPCFailure)
@@ -759,6 +792,8 @@ private struct Handlers: Sendable {
             return errorResponse(.badRequest, "InvalidRequest")
         case .authenticationRequired:
             return errorResponse(.unauthorized, "AuthenticationRequired")
+        case .authFactorTokenRequired:
+            return errorResponse(.unauthorized, "AuthFactorTokenRequired")
         case .invalidToken:
             return errorResponse(.badRequest, "InvalidToken")
         case .expiredToken:

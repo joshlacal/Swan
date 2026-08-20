@@ -126,6 +126,12 @@ sequenceDiagram
 - **Private Key JWT Client Authentication (RFC 7523):** Confidential clients authenticate using client assertions signed with their registered keys.
 - **Dynamic Client Metadata Discovery:** Client configurations are fetched securely over HTTPS from `client_id` URLs with strict loopback/private IP blocking to prevent Server-Side Request Forgery (SSRF).
 - **Fine-Grained Scope Resolution:** Supports `atproto`, `include:<nsid>`, `space:<type>`, and collection-scoped permissions with cryptographic lexicon validation.
+### OAuth Browser Pages & Inlined Style Security
+Swan's interactive OAuth browser surfaces—the sign-in page, client authorization consent, and second-factor MFA ceremony—are rendered by a unified HTML implementation in `Sources/SwanHTTP/SwanBrowserPages.swift` shared across both the production authorization server and localhost development endpoints.
+- **Inlined daisyUI Stylesheet:** The markup is styled with daisyUI 5 (built on Tailwind CSS v4). The compiled CSS is embedded directly into `Sources/SwanHTTP/SwanBrowserStyleSheet.swift` and inlined into `<style>` tags on served pages, eliminating static asset routes and remote stylesheet requests during authentication.
+- **Dynamic CSP Hash Derivation:** To enforce `default-src 'none'` without resorting to `'unsafe-inline'` or external style origins, `SwanBrowserPages.browserStyleCSPSource` derives a SHA-256 base64 digest of the exact inlined stylesheet string at runtime. Hummingbird injects this hash as `style-src 'sha256-…'` in the response `Content-Security-Policy` header. Per-response nonces (`script-src 'nonce-…'`) protect inline WebAuthn ceremony scripts.
+- **Stylesheet Build Process:** The stylesheet is tree-shaken against class names in `Sources/SwanHTTP/SwanBrowserPages.swift` and `Sources/SwanHTTP/ScopeDescription.swift`. Whenever class names in either file are modified, `Scripts/build-browser-css.sh` must be executed to regenerate `SwanBrowserStyleSheet.swift`.
+- **System Theme Adaptation:** Pages declare `<meta name="color-scheme" content="light dark">` and utilize semantic daisyUI theme variables (`bg-base-200`, `text-base-content`, `card bg-base-100`), automatically adapting to the user's `prefers-color-scheme` setting.
 
 ---
 
@@ -159,6 +165,15 @@ graph TD
 - **Diff CAR Packaging:** Firehose commit events carry minimal diff CAR slices containing only newly created/modified blocks, minimizing network overhead.
 - **Subscriber Connection Budgeting:** Connection quotas reserve 75% of available capacity for standard API calls and assign a dedicated 25% quota for firehose WebSocket consumers (`PublicFirehoseSubscriberAdmission`).
 - **Configurable Retention Reaper:** Automatically reaps expired firehose entries based on age (default: 72h), row count (default: 1,000,000), or byte limits (default: 1 GiB).
+
+### Public Identity & Foreign Handle Resolution
+The AT Protocol endpoint `com.atproto.identity.resolveHandle` resolves user handles to canonical DIDs. By default, Swan answers exclusively for accounts locally provisioned in `control.sqlite`. Queries for third-party handles return an immediate `InvalidRequest` error without contacting the network.
+
+Passing `--enable-foreign-handle-resolution` (default off) enables Swan to resolve external handles across the network:
+- **Pinned Verification Engine:** External handles are resolved using the same verified DNS TXT record (`_atproto.<handle>`) and HTTPS `/.well-known/atproto-did` mechanisms that validate `did:web` identity documents.
+- **Network Boundary & SSRF Defense:** This flag is the sole mechanism that allows the anonymous `resolveHandle` endpoint to initiate outbound network traffic. Before any DNS query or HTTP connection is initiated, the resolver verifies the target domain against strict SSRF rules, immediately rejecting reserved TLDs and non-public IP address ranges.
+- **Deduplicated In-Memory Caching:** Resolved DIDs are cached in memory for 5 minutes (300 seconds), while failed resolutions are cached for 30 seconds to mitigate denial-of-service amplification. Concurrent requests for the same handle share a single in-flight resolution task.
+- **Reference PDS Divergence:** Reference PDS implementations (such as `bsky.social`) answer foreign handle queries with HTTP 200 and the resolved DID by default. Swan defaults to rejecting unhosted handles with `InvalidRequest` unless foreign handle resolution is explicitly enabled by the operator.
 
 ---
 
@@ -205,13 +220,13 @@ flowchart TD
 
 Swan includes an integrated account management interface built with SvelteKit.
 
-- **Static Pre-Rendering:** The account portal is compiled into zero-dependency static assets located at `/usr/local/share/swan/account` (or configurable via `--account-portal-directory`).
+- **Static Pre-Rendering & Build:** The account portal is implemented as a SvelteKit single-page application under `web/`. It is compiled in container environments by the Dockerfile's `account-web-build` stage (`FROM node:22-bookworm-slim ... AS account-web-build`) and copied to `/usr/local/share/swan/account` in the runtime image (configurable via `--account-portal-directory`).
 - **Hummingbird Asset Handler:** Hummingbird serves `/account/**` SPA routes with secure headers (`Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`).
+- **daisyUI Component Styling:** The portal interface is built using daisyUI components, sharing visual tokens with the server-rendered OAuth browser pages. Standalone static CSS files such as `web/static/auth-tokens.css` and the `/account/auth-tokens.css` route have been removed in favor of the unified build.
 - **Session Security:**
   - `__Host-swan-session`: `HTTPOnly`, `Secure`, `SameSite=Lax` cookie storing cryptographically signed session identifiers.
   - `__Host-swan-csrf`: Anti-CSRF token validated via double-submit header checks (`X-Swan-CSRF`).
   - Strict pre-auth isolation prevents unauthenticated users from accessing any account data before factor verification.
-
 ---
 
 ## 7. Permissioned Data / Spaces Subsystem
@@ -229,3 +244,17 @@ Swan's permissioned-data plane provides structured collaboration spaces with cry
 
 - **Legacy App Passwords:** Enables third-party AT Protocol clients that do not yet support OAuth 2.1 to authenticate via `com.atproto.server.createSession` using scoped, revocable app passwords.
 - **Transparent AppView Proxying:** Unmatched `app.bsky.*` read queries are proxied upstream to the official Bluesky AppView (`https://api.bsky.app`) with minted service-auth JWTs, providing complete feed and social graph access out of the box.
+
+### XRPC Proxy Routing & Namespace Admission
+The XRPC proxy router (`SwanXRPCProxyRouter`) transparently routes unsupported XRPC endpoints to upstream AT Protocol services while safeguarding local state.
+
+- **Namespace-Based Admission:** Method admission is decided strictly by namespace prefix (`app.bsky.`, `chat.bsky.`, `tools.ozone.`) and exact moderation methods (`com.atproto.moderation.createReport`, `com.atproto.label.queryLabels`), rather than membership in the generated method registry. Because the generated method registry reflects a static lexicon pin that lags behind upstream releases, gating on registry membership previously caused published upstream methods (such as `chat.bsky.convo.getUnreadCounts` and `app.bsky.video.*`) to return unexpected 404 errors.
+- **Protected Local State:** Swan-owned namespaces (`com.atproto.space.`, `blue.catbird.`) and local state methods within proxyable namespaces (`app.bsky.actor.getPreferences`, `app.bsky.actor.putPreferences`) are denied and never forwarded upstream.
+- **Destination Routing via `atproto-proxy`:**
+  - When the client includes an `atproto-proxy` header (`did:web:...#service_id`), the proxy resolves the target service endpoint and admits any method within the allowable namespaces. Methods in `chat.bsky.*` and `tools.ozone.*` require this header.
+  - When no `atproto-proxy` header is present, the proxy admits only the configured AppView's own namespace (`app.bsky.*`) and forwards requests directly to the configured upstream AppView (`--appview-url` / `--appview-did`). Requests for other namespaces without an explicit destination header fail closed with HTTP 404 (unrouted).
+
+### Operator Diagnostics & Failure Observability
+To ensure diagnostic traceability for authentication and proxy failures without leaking credentials or violating timing invariants, Swan emits structured log events:
+- **`legacy createSession rejected`:** Emitted when legacy authentication on `com.atproto.server.createSession` fails. To prevent account enumeration, client responses remain constant-time opaque errors. The log entry includes a fixed-vocabulary `stage` parameter (`identifier_unresolved`, `no_credential_matched`, `auth_factor_token_required`, `rate_limited`, `malformed_request`, `token_rejected`, `unavailable`) and a `factorToken` descriptor (`absent`, `empty`, or `present`). No identifiers, passwords, or token strings are recorded. This allows operators to distinguish wrong-password attempts from clients sending empty or misconfigured second-factor tokens.
+- **`xrpc pipethrough upstream failed`:** Emitted when an outbound HTTP request to an upstream service (such as the AppView or an `atproto-proxy` target) fails. While clients receive a generic HTTP 502 Bad Gateway response, the log records `nsid` (the requested XRPC method), `host` (the target upstream host), and `reason` (the underlying transport failure, such as DNS lookup errors, connection timeouts, or TLS handshakes). Minted service authentication JWTs are never logged.

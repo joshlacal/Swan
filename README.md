@@ -210,6 +210,41 @@ SWAN_DYNAMIC_DELEGATION_NO_BUILD=1 \
 Scripts/run-reference-member-dynamic-delegation-acceptance.sh
 ```
 
+## Server Operation and Exposed Surfaces
+
+### Foreign handle resolution
+
+By default, Swan's `com.atproto.identity.resolveHandle` route answers only for accounts provisioned locally in `control.sqlite`. A query for any handle this host does not hold fails immediately with `InvalidRequest`.
+
+Passing `--enable-foreign-handle-resolution` (default off) makes `com.atproto.identity.resolveHandle` answer for handles this host does not hold, using the pinned DNS TXT and `/.well-known/atproto-did` resolver that also verifies did:web claims. This flag is the only thing that makes that anonymous route reach the network. To prevent Server-Side Request Forgery (SSRF) and scanning of internal infrastructure, reserved TLDs and non-public addresses are refused before any lookup is performed. Results are cached in memory (5 minutes for hits, 30 seconds for misses, with single-flight deduplication across concurrent lookups for the same handle).
+
+With the flag off, a client asking about someone else's handle gets `InvalidRequest` — which is a divergence from a reference PDS, since bsky.social answers such a handle with 200 and its DID.
+
+### OAuth browser surfaces and stylesheet maintenance
+
+The interactive OAuth browser surfaces — login, consent, and the second-factor ceremony — are one shared daisyUI implementation in `Sources/SwanHTTP/SwanBrowserPages.swift` used by both the production authorization server and the localhost development bridge.
+
+The stylesheet is inlined directly into served HTML and admitted by a `style-src 'sha256-…'` CSP hash derived at run time from the inlined stylesheet bytes (`SwanBrowserPages.browserStyleCSPSource`), so `default-src 'none'` holds with no `'unsafe-inline'` and no external origin. Themes follow `prefers-color-scheme` automatically.
+
+The stylesheet is embedded in `Sources/SwanHTTP/SwanBrowserStyleSheet.swift` and is tree-shaken during compilation. `Scripts/build-browser-css.sh` regenerates the stylesheet and MUST be run after changing any class name in `SwanBrowserPages.swift` or `ScopeDescription.swift`, because unused classes are omitted from the build.
+
+### Account portal
+
+The account portal at `/account` is a SvelteKit app in `web/`, built by the Dockerfile's `account-web-build` stage and served from the runtime image (at `/usr/local/share/swan/account`, or configured via `--account-portal-directory`). It is also styled with daisyUI to match the browser login surfaces. The legacy standalone stylesheet `web/static/auth-tokens.css` and the `/account/auth-tokens.css` route were removed in favor of this unified static frontend build.
+
+### XRPC proxy routing and destination dispatch
+
+Swan transparently proxies unsupported XRPC requests to upstream AT Protocol services. The XRPC proxy admits methods by namespace (`app.bsky.`, `chat.bsky.`, `tools.ozone.`, plus `com.atproto.moderation.createReport` and `com.atproto.label.queryLabels`), NOT by membership in the generated method registry, because that registry's lexicon pin trails upstream. When proxying was gated on registry membership, newly added upstream methods like `chat.bsky.convo.getUnreadCounts` and `app.bsky.video.*` were rejected with 404 because the local lexicon pin had not yet incorporated them.
+
+Methods in `chat.bsky.*` and `tools.ozone.*` require the client to name a destination with `atproto-proxy` (formatted as `<did>#<service-id>`). With no header only the configured AppView's own namespace is admissible, forwarding directly to the configured AppView (`--appview-url` / `--appview-did`). Requests for any other namespace without an explicit `atproto-proxy` header fail closed with 404. Swan-owned namespaces (`com.atproto.space.`, `blue.catbird.`) and local state methods within proxyable namespaces (`app.bsky.actor.getPreferences`, `app.bsky.actor.putPreferences`) are denied and never leave this host.
+
+### Operator diagnostics and failure logs
+
+To provide operational traceability without logging credentials or altering constant-time failure paths, Swan emits structured log lines for operations that previously left no server-side trace:
+
+- `legacy createSession rejected`: Logged when legacy password or app-password authentication fails on `com.atproto.server.createSession`. The log carries a fixed-vocabulary `stage=` (`identifier_unresolved`, `no_credential_matched`, `auth_factor_token_required`, `rate_limited`, `malformed_request`, `token_rejected`, `unavailable`) plus `factorToken=absent|empty|present`, never a credential. A failed password login previously produced an opaque 401 with no server-side trace at all; this log allows operators to distinguish bad passwords from clients submitting empty or unexpected factor tokens.
+- `xrpc pipethrough upstream failed`: Logged when an outbound request to an upstream service (such as the AppView or an `atproto-proxy` target) fails. The log carries `nsid=` (the requested XRPC method), `host=` (the destination hostname), and the transport `reason=` (such as DNS failure, connection timeout, or TLS handshake error). An upstream proxy 502 previously left no server-side trace at all; minted service tokens are never logged.
+
 ## Disposable Compose interoperability lab
 
 The lab accepts no secret values through Compose environment interpolation.
