@@ -4351,7 +4351,14 @@ extension SwanCommand {
                             tokens: accountProxyServiceTokenIssuer,
                             sender: SwanPeerPinnedProxySender(
                                 policy: fetchPolicy,
-                                resolver: SystemOAuthHostnameResolver(),
+                                // A proxied screen resolves one host a dozen
+                                // times in parallel. Coalescing those into a
+                                // single lookup keeps the four-permit blocking
+                                // DNS bound — which fails closed as a 502 —
+                                // out of the normal request path.
+                                resolver: try CachingOAuthHostnameResolver(
+                                    upstream: SystemOAuthHostnameResolver()
+                                ),
                                 transport: try SwanNIOPeerPinnedProxyTransport(
                                     maximumTransportTimeout: limits.timeout,
                                     // Stated explicitly: the proxy owns its
