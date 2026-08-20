@@ -817,6 +817,75 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     }
   }
 
+  func testRemotePARAdmitsQueryResponseModeAndRefusesOtherModes() async throws {
+    let fixture = try await makeFixture(metadata: try publicMetadata())
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    // `@atproto/oauth-client-node` defaults `responseMode` to `query` and puts
+    // it in every PAR body, so refusing the parameter refuses every client
+    // built on that library — observed live as bulletin.my returning 500 while
+    // swan.place logged `invalid_request` at `stage=form_parse`. `query` is the
+    // only mode this server implements: it appends `code`/`state` to the
+    // client's redirect URI, so `fragment` must still be refused rather than
+    // accepted and then silently ignored.
+    do {
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.responseMode"))
+      try await app.test(.router) { client in
+        let dpopKey = P256.Signing.PrivateKey()
+        let dpopJWK = try jwk(dpopKey)
+        let verifier = "remote-oauth-server-test-verifier-000000000000000000"
+        let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64URLEncodedString()
+        func parBody(responseMode: String) -> String {
+          form([
+            ("client_id", clientID.absoluteString), ("redirect_uri", redirectURI.absoluteString),
+            ("response_type", "code"), ("scope", "atproto"), ("state", "response-mode-state"),
+            ("code_challenge", challenge), ("code_challenge_method", "S256"),
+            ("response_mode", responseMode),
+          ])
+        }
+        var nonce: String?
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(),
+          body: ByteBuffer(string: parBody(responseMode: "query"))
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+          XCTAssertEqual(
+            try self.error(response.body),
+            "use_dpop_nonce",
+            "response_mode=query must parse and draw the nonce challenge"
+          )
+          nonce = response.headers[dpopNonceHeader]
+        }
+        let proof = try dpop(
+          dpopKey, dpopJWK, jti: "remote-par-response-mode", nonce: try XCTUnwrap(nonce),
+          target: try OAuthDPoPProofValidator.normalizedTarget(issuer.appending(path: "oauth/par"))
+        )
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(dpop: proof),
+          body: ByteBuffer(string: parBody(responseMode: "query"))
+        ) { response in
+          XCTAssertEqual(response.status, .created)
+          let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(buffer: response.body)) as? [String: Any])
+          XCTAssertTrue(
+            try XCTUnwrap(object["request_uri"] as? String)
+              .hasPrefix("urn:ietf:params:oauth:request_uri:"))
+        }
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(),
+          body: ByteBuffer(string: parBody(responseMode: "fragment"))
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+          XCTAssertEqual(try self.error(response.body), "invalid_request")
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
   func testCompleteOAuthConfigurationRejectsDefaultHTTPSIssuerPort() async throws {
     let fixture = try await makeFixture(metadata: try publicMetadata())
     defer { try? FileManager.default.removeItem(at: fixture.root) }

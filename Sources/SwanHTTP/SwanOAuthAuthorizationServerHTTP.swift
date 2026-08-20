@@ -1083,14 +1083,22 @@ private func parseOAuthServerPARForm(
   // conforming answer to `login`, `consent`, and `select_account` — but not
   // to `none`, which demands a silent answer this server can never give, so
   // `none` stays refused rather than dishonestly accepted.
+  // `response_mode` is sent unconditionally by `@atproto/oauth-client-node`,
+  // which defaults it to `query`. Refusing the parameter refuses every client
+  // built on that library — including Bulletin — with `invalid_request` before
+  // the request reaches DPoP. Only `query` is accepted: this server appends
+  // `code`/`state` to the client's redirect URI as query parameters, so
+  // accepting `fragment` or `form_post` would promise a delivery it does not
+  // implement.
   let optional: Set<String> = [
-    "client_assertion_type", "client_assertion", "login_hint", "prompt",
+    "client_assertion_type", "client_assertion", "login_hint", "prompt", "response_mode",
   ]
   guard fields.keys.allSatisfy({ required.contains($0) || optional.contains($0) }),
     required.isSubset(of: Set(fields.keys)),
     (fields["client_assertion_type"] == nil) == (fields["client_assertion"] == nil),
     fields["login_hint"].map({ !$0.isEmpty && $0.utf8.count <= 2_048 }) ?? true,
     fields["prompt"].map({ ["login", "consent", "select_account"].contains($0) }) ?? true,
+    fields["response_mode"].map({ $0 == "query" }) ?? true,
     fields["response_type"] == "code", fields["code_challenge_method"] == "S256",
     let clientText = fields["client_id"], let redirectText = fields["redirect_uri"],
     let state = fields["state"], let challenge = fields["code_challenge"],

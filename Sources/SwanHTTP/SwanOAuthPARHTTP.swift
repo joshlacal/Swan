@@ -312,14 +312,22 @@ private func validateLocalhostPARFields(_ fields: [String: String]) throws -> Lo
     // interactive login form — a conforming answer to `login`, `consent`,
     // and `select_account`, but not to `none`, which demands a silent
     // answer it can never give, so `none` stays refused.
+    // `response_mode` is sent unconditionally by `@atproto/oauth-client-node`,
+    // which defaults it to `query`. Refusing the parameter refuses every client
+    // built on that library before it can even reach the DPoP stage. Only
+    // `query` is accepted: this server hands the code back as query parameters
+    // on the client's redirect URI, so accepting `fragment` or `form_post`
+    // would promise a delivery it does not implement.
     let permitted: Set<String> = [
         "client_id", "redirect_uri", "response_type", "scope", "state",
         "code_challenge", "code_challenge_method", "login_hint", "prompt",
+        "response_mode",
     ]
     guard fields.keys.allSatisfy({ permitted.contains($0) }),
           required.subtracting(["scope"]).isSubset(of: Set(fields.keys)),
           fields["login_hint"].map({ !$0.isEmpty && $0.utf8.count <= 2_048 }) ?? true,
           fields["prompt"].map({ ["login", "consent", "select_account"].contains($0) }) ?? true,
+          fields["response_mode"].map({ $0 == "query" }) ?? true,
           fields["response_type"] == "code",
           fields["code_challenge_method"] == "S256",
           let clientIDText = fields["client_id"],
