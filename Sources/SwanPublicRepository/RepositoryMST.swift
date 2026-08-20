@@ -100,8 +100,14 @@ public struct RepositoryMST: Sendable {
     }
 
     public func get(_ path: PublicRepositoryPath) async throws -> CID? {
+        let (cid, _) = try await getWithTree(path)
+        return cid
+    }
+
+    public func getWithTree(_ path: PublicRepositoryPath) async throws -> (cid: CID?, tree: Self) {
         var copy = self
-        return try await copy.getMutating(path)
+        let cid = try await copy.getMutating(path)
+        return (cid, copy)
     }
 
     private mutating func getMutating(_ path: PublicRepositoryPath) async throws -> CID? {
@@ -112,7 +118,9 @@ public struct RepositoryMST: Sendable {
         }
         if case let .tree(subtree)? = entry(at: index - 1, in: entries) {
             var child = subtree
-            return try await child.getMutating(path)
+            let cid = try await child.getMutating(path)
+            knownEntries?[index - 1] = .tree(child)
+            return cid
         }
         return nil
     }
@@ -427,7 +435,6 @@ public struct RepositoryMST: Sendable {
             limits: limits
         ).checked()
     }
-
     // MARK: Loading and encoding
     private mutating func loadNode() async throws -> (entries: [Entry], layer: Int) {
         if let knownEntries, let knownLayer {
@@ -570,6 +577,7 @@ public struct RepositoryMST: Sendable {
         try collector.add(cid: cid, bytes: bytes)
         return cid
     }
+
     private mutating func appendLeaves(to result: inout [RepositoryMSTLeaf]) async throws {
         let (entries, _) = try await loadNode()
         for entry in entries {

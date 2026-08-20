@@ -143,7 +143,9 @@ public enum PublicRepositoryEngine {
         for write in batch.writes {
             let currentRecordCID: CID?
             do {
-                currentRecordCID = try await tree.get(write.path)
+                let lookup = try await tree.getWithTree(write.path)
+                currentRecordCID = lookup.cid
+                tree = lookup.tree
             } catch let error as RepositoryMSTMutationError {
                 throw PublicRepositoryEngineError.mst(error)
             } catch {
