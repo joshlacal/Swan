@@ -932,8 +932,6 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
             )
             try Data("<!doctype html><title>Swan account</title>".utf8)
                 .write(to: portalDirectory.appending(path: "index.html"))
-            try Data("body { color: black; }".utf8)
-                .write(to: portalDirectory.appending(path: "auth-tokens.css"))
             let configuration = try SwanAccountPortalConfiguration(
                 publicOrigin: publicURL,
                 staticDirectory: portalDirectory,

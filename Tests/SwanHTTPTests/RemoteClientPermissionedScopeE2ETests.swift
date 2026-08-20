@@ -541,14 +541,14 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
         // not a permission, and rendering it as one trains users to approve
         // lists they cannot read.
         XCTAssertFalse(
-            html.contains("<article><h3>"),
+            html.contains("<h3 class=\"card-title"),
             "S4.1a: bare `atproto` must produce no permission card at all"
         )
         // ... while still appearing in the advanced raw list, which is
         // unconditional (S4.4). Asserting its total absence would forbid that,
         // and the two obligations are different.
         XCTAssertTrue(
-            html.contains("<li><code>atproto</code>"),
+            html.contains(">atproto</code>"),
             "S4.4: the raw scope list is unconditional — `atproto` still appears there"
         )
     }

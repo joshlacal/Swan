@@ -769,8 +769,6 @@ final class AccountPortalSecurityHTTPTests: XCTestCase, @unchecked Sendable {
         )
         try Data("<!doctype html><title>Swan account</title>".utf8)
             .write(to: buildDirectory.appending(path: "index.html"))
-        try Data(":root { color-scheme: light dark; }".utf8)
-            .write(to: buildDirectory.appending(path: "auth-tokens.css"))
         addTeardownBlock {
             try? FileManager.default.removeItem(at: buildDirectory)
         }

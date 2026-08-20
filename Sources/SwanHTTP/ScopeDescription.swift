@@ -277,9 +277,17 @@ enum ScopeDescription {
         if !transitionRaws.isEmpty { cards.append(transitionCard(transitionRaws)) }
         if !unrecognizedRaws.isEmpty { cards.append(unrecognizedCard(unrecognizedRaws)) }
 
-        let cardsHTML = cards.isEmpty ? "" : "<p>Requested access:</p>" + cards.joined()
-        let rawItems = sortedRaw.map { "<li><code>\(escape($0))</code></li>" }.joined()
-        let advanced = "<details><summary>Advanced: raw scopes</summary><ul>\(rawItems)</ul></details>"
+        let cardsHTML = cards.isEmpty
+            ? ""
+            : "<p class=\"text-sm text-base-content/60\">Requested access:</p>" + cards.joined()
+        let rawItems = sortedRaw.map {
+            "<li><code class=\"font-mono\">\(escape($0))</code></li>"
+        }.joined()
+        let advanced = """
+        <details class="collapse collapse-arrow border-base-300 bg-base-100 border text-sm">\
+        <summary class="collapse-title min-h-0 py-2 text-sm font-medium">Advanced: raw scopes</summary>\
+        <ul class="collapse-content flex flex-wrap gap-2 pb-2">\(rawItems)</ul></details>
+        """
         return cardsHTML + advanced
     }
 
@@ -290,7 +298,7 @@ enum ScopeDescription {
             let verb = entry.actions.contains("manage") ? "Read and update" : "Read"
             return "<li>\(verb) your account's <code>\(escape(entry.attr))</code>.</li>"
         }.joined()
-        return card(title: "Account", bodyHTML: "<ul>\(rows)</ul>")
+        return card(title: "Account", bodyHTML: "<ul class=\"list-disc pl-5 flex flex-col gap-1\">\(rows)</ul>")
     }
 
     private static func blobCard(_ acceptLists: [[String]]) -> String {
@@ -333,7 +341,7 @@ enum ScopeDescription {
             let service = entry.aud == "*" ? "any service" : "<code>\(escape(entry.aud))</code>"
             return "<li>Call \(methods) on \(service).</li>"
         }.joined()
-        return card(title: "External service calls", bodyHTML: "<ul>\(rows)</ul>")
+        return card(title: "External service calls", bodyHTML: "<ul class=\"list-disc pl-5 flex flex-col gap-1\">\(rows)</ul>")
     }
 
     /// S4.1b (one card, verbs in prose per grant) + S4.1c (universal-grant
@@ -407,7 +415,7 @@ enum ScopeDescription {
             "<li><b>Requested permission set \(escape(nsid)).</b> "
                 + "Swan does not currently grant capabilities derived from this set.</li>"
         }.joined()
-        return card(title: "Requested permission sets", bodyHTML: "<ul>\(rows)</ul>")
+        return card(title: "Requested permission sets", bodyHTML: "<ul class=\"list-disc pl-5 flex flex-col gap-1\">\(rows)</ul>")
     }
 
     /// D11 / §9-D19 — `transition:*` is recognised and parses, but grants
@@ -418,7 +426,7 @@ enum ScopeDescription {
             "<li><b>Legacy compatibility scope <code>\(escape(raw))</code>.</b> "
                 + "Swan recognises this scope but does not currently grant any capability from it.</li>"
         }.joined()
-        return card(title: "Legacy compatibility", bodyHTML: "<ul>\(rows)</ul>")
+        return card(title: "Legacy compatibility", bodyHTML: "<ul class=\"list-disc pl-5 flex flex-col gap-1\">\(rows)</ul>")
     }
 
     /// D19: "never drop an undescribable row." Anything this bridge parser
@@ -426,13 +434,17 @@ enum ScopeDescription {
     /// vanishing from the semantic section.
     private static func unrecognizedCard(_ raws: [String]) -> String {
         let rows = raws.map { "<li><code>\(escape($0))</code></li>" }.joined()
-        return card(title: "Other requested permissions", bodyHTML: "<ul>\(rows)</ul>")
+        return card(title: "Other requested permissions", bodyHTML: "<ul class=\"list-disc pl-5 flex flex-col gap-1\">\(rows)</ul>")
     }
 
     // MARK: - Shared plumbing
 
     private static func card(title: String, bodyHTML: String) -> String {
-        "<article><h3>\(escape(title))</h3>\(bodyHTML)</article>"
+        """
+        <article class="card card-border bg-base-200/60 text-sm">\
+        <div class="card-body gap-2 p-4"><h3 class="card-title text-base">\(escape(title))</h3>\
+        \(bodyHTML)</div></article>
+        """
     }
 
     private static func joinedProse(_ items: [String]) -> String {

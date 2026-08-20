@@ -688,7 +688,7 @@ private func completeOAuthServerAuthorizationMFA(
     oauthServerLogEmptyExpansions(expansion.emptyExpansions, context: context, stage: "consent")
     return oauthServerHTML(
       .ok,
-      oauthServerConsentPage(
+      SwanBrowserPages.consent(
         csrf: issued.session.csrfToken,
         subject: authenticated.account.did,
         clientID: pushed.binding.clientID,
@@ -1508,20 +1508,29 @@ private func oauthServerMFAChallengePage(csrf: String, handle: String, factor: S
   let factorID = factor.factorID ?? ""
   let challenge = factor.challenge ?? ""
   let kind = factor.factorKind ?? (factor.challenge == nil ? .totp : .passkey)
-  let passkey = kind == .passkey
-  let recovery = kind == .recoveryCode
   let proof: String
-  if passkey {
+  switch kind {
+  case .passkey:
     // The inline script carries the same per-response nonce the CSP
     // `script-src 'nonce-…'` allows, so the ceremony executes under the
     // strict policy instead of being blocked by `default-src 'none'`.
     proof = "<input type=\"hidden\" name=\"challenge\" id=\"swan-challenge\" value=\"\(SwanBrowserPages.escape(challenge))\"><input type=\"hidden\" name=\"clientDataJSON\" id=\"swan-client-data\"><input type=\"hidden\" name=\"authenticatorData\" id=\"swan-auth-data\"><input type=\"hidden\" name=\"credentialID\" id=\"swan-credential\"><input type=\"hidden\" name=\"signature\" id=\"swan-signature\"><script nonce=\"\(SwanBrowserPages.escape(nonce))\">(async()=>{const f=document.forms[0],b=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/').padEnd(Math.ceil(s.length/4)*4,'=')),c=>c.charCodeAt(0)),e=a=>{let s='';new Uint8Array(a).forEach(c=>s+=String.fromCharCode(c));return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'')};try{const c=await navigator.credentials.get({publicKey:{challenge:b(document.getElementById('swan-challenge').value),rp:{id:location.hostname},user:{id:b('swan-user'),name:'Swan',displayName:'Swan'},pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],timeout:300000,authenticatorSelection:{userVerification:'preferred'},allowCredentials:[]}});document.getElementById('swan-client-data').value=e(c.response.clientDataJSON);document.getElementById('swan-auth-data').value=e(c.response.authenticatorData);document.getElementById('swan-credential').value=e(c.response.rawId);document.getElementById('swan-signature').value=e(c.response.signature);f.submit()}catch(err){document.getElementById('swan-auth-data').value='error:'+err.name}})();</script>"
-  } else if recovery {
-    proof = "<label>Recovery code <input name=\"code\" autocomplete=\"one-time-code\" required></label>"
-  } else {
-    proof = "<label>One-time code <input name=\"code\" autocomplete=\"one-time-code\" required></label>"
+  case .recoveryCode:
+    proof = oauthServerCodeField(label: "Recovery code")
+  default:
+    proof = oauthServerCodeField(label: "One-time code")
   }
-  return "<!doctype html><html><head><meta charset=\"utf-8\"><title>Swan factor verification</title></head><body><main><h1>Verify your factor</h1><form method=\"post\" action=\"/oauth/authorize/mfa\"><input type=\"hidden\" name=\"csrf\" value=\"\(SwanBrowserPages.escape(csrf))\"><input type=\"hidden\" name=\"handle\" value=\"\(SwanBrowserPages.escape(handle))\"><input type=\"hidden\" name=\"kind\" value=\"\(kind.rawValue)\"><input type=\"hidden\" name=\"factorID\" value=\"\(SwanBrowserPages.escape(factorID))\">\(proof)<button type=\"submit\">Verify securely</button></form></main></body></html>"
+  return SwanBrowserPages.factorChallenge(
+    csrf: csrf, handle: handle, kind: kind.rawValue, factorID: factorID, proofHTML: proof)
+}
+
+/// A daisyUI one-time-code field. The label is a fixed literal, never request
+/// data, so it needs no escaping.
+private func oauthServerCodeField(label: String) -> String {
+  """
+  <fieldset class="fieldset gap-1"><legend class="fieldset-legend">\(label)</legend>\
+  <input name="code" class="input w-full" autocomplete="one-time-code" inputmode="numeric" required autofocus></fieldset>
+  """
 }
 
 /// Per-response CSP nonce. The value is single-use, unguessable, and only

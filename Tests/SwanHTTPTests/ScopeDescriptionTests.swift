@@ -190,7 +190,7 @@ struct ScopeDescriptionTests {
             // silently dropped from the page.
             let rendered = ScopeDescription.render(scopes: [input])
             #expect(
-                rendered.contains("<code>\(htmlEscapeForTest(input))</code>"),
+                rendered.contains(">\(htmlEscapeForTest(input))</code>"),
                 "corpus entry \(input.debugDescription) missing from the advanced raw-scope list")
             allEntriesChecked += 1
 
@@ -248,7 +248,7 @@ struct ScopeDescriptionTests {
     func atprotoAloneRendersNoCard() {
         let html = ScopeDescription.render(scopes: ["atproto"])
         #expect(!html.contains("Requested access:"))
-        #expect(html.contains("<code>atproto</code>"))
+        #expect(html.contains(">atproto</code>"))
     }
 
     @Test("atproto alongside a real scope still gets no card of its own")
@@ -385,9 +385,9 @@ struct ScopeDescriptionTests {
     @Test("raw scope bytes remain available below the semantic cards")
     func rawScopesSurviveAsAdvancedDetail() {
         let html = ScopeDescription.render(scopes: ["space:app.bulleted.space", "identity:handle"])
-        #expect(html.contains("<details>"))
-        #expect(html.contains("<code>space:app.bulleted.space</code>"))
-        #expect(html.contains("<code>identity:handle</code>"))
+        #expect(html.contains("<details"))
+        #expect(html.contains(">space:app.bulleted.space</code>"))
+        #expect(html.contains(">identity:handle</code>"))
     }
 
     // MARK: - S4.5 — one renderer, deterministic output

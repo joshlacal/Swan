@@ -484,7 +484,6 @@ public struct SwanAccountPortalHTTP: Sendable {
 
     public func registerAssets(on router: Router<SwanHTTPRequestContext>) {
         router.get("/account") { [configuration] _, _ -> Response in staticAccountResponse(configuration: configuration, requestPath: "/account") }
-        router.get("/account/auth-tokens.css") { [configuration] _, _ -> Response in staticAuthCSSResponse(configuration: configuration) }
         router.get("/account/**") { [configuration] request, _ -> Response in staticAccountResponse(configuration: configuration, requestPath: request.uri.path) }
     }
 
@@ -561,12 +560,6 @@ private func staticContentType(for path: String) -> String {
     case "woff2": "font/woff2"
     default: "application/octet-stream"
     }
-}
-
-private func staticAuthCSSResponse(configuration: SwanAccountPortalConfiguration) -> Response {
-    let file = configuration.staticDirectory.appending(path: "auth-tokens.css")
-    guard let data = try? Data(contentsOf: file) else { return accountError(.serviceUnavailable) }
-    return Response(status: .ok, headers: [.contentType: "text/css; charset=utf-8", .cacheControl: "public, max-age=3600"], body: .init(byteBuffer: ByteBuffer(data: data)))
 }
 
 private func mutationHeadersAllow(_ request: Request, expectedOrigin: URL) -> Bool {
