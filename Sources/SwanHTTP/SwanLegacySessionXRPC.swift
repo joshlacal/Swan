@@ -53,6 +53,43 @@ public enum SwanLegacySessionXRPCFailure: Error, Sendable, Equatable {
     case unavailable
 }
 
+/// Why a `createSession` was refused, for the operator log only.
+///
+/// The wire response is one fixed error for every value here — the boundary is
+/// still not an account-existence oracle — but a failed password login that
+/// leaves no server-side trace is undiagnosable, which is how a live 401 from
+/// bsky.app ended up unattributable.
+enum LegacyLoginStage: String, Sendable {
+    /// The identifier is not a DID or handle of an account this server
+    /// authorizes. An email address lands here too: this server resolves DIDs
+    /// and handles only.
+    case identifierUnresolved = "identifier_unresolved"
+    /// The identifier resolved, but neither the account password nor any app
+    /// password matched.
+    case noCredentialMatched = "no_credential_matched"
+    case rateLimited = "rate_limited"
+    case malformedRequest = "malformed_request"
+    case tokenRejected = "token_rejected"
+    case unavailable = "unavailable"
+}
+
+/// A refusal that carries its stage. `failure` is what reaches the client.
+struct LegacyLoginRejection: Error {
+    let stage: LegacyLoginStage
+    var failure: SwanLegacySessionXRPCFailure = .authenticationRequired
+}
+
+func legacyLoginStage(for error: any Error) -> LegacyLoginStage {
+    if let rejection = error as? LegacyLoginRejection { return rejection.stage }
+    switch (error as? SwanLegacySessionXRPCFailure) ?? .invalidRequest {
+    case .rateLimited: return .rateLimited
+    case .unavailable: return .unavailable
+    case .invalidToken, .expiredToken: return .tokenRejected
+    case .invalidRequest, .payloadTooLarge: return .malformedRequest
+    case .authenticationRequired: return .noCredentialMatched
+    }
+}
+
 /// Resolves a login identifier to an account.
 public protocol SwanLegacySessionDirectory: Sendable {
     /// Handle, DID, or email → the DID of an account whose status authorizes it.
@@ -238,6 +275,17 @@ private struct Handlers: Sendable {
             // leak whether the identifier exists. Applied to failures only:
             // padding successes would slow every legitimate sign-in for nothing.
             await padTo(minimumFailedLoginDuration, since: started)
+            // The wire response stays the fixed opaque error; the operator gets
+            // the stage. Without this a failed password login is invisible
+            // server-side — the state that made a live bsky.app 401 impossible
+            // to attribute. `LegacyLoginStage` is a fixed vocabulary and never
+            // carries an identifier, a password, or a token.
+            context.logger.info(
+                "legacy createSession rejected",
+                metadata: [
+                    "stage": .string(legacyLoginStage(for: error).rawValue),
+                ]
+            )
             return response(for: error)
         }
     }
@@ -318,7 +366,7 @@ private struct Handlers: Sendable {
             )
         }
         guard let resolved else {
-            throw SwanLegacySessionXRPCFailure.authenticationRequired
+            throw LegacyLoginRejection(stage: .identifierUnresolved)
         }
         let record: AppPasswordRecord?
         do {
@@ -327,7 +375,10 @@ private struct Handlers: Sendable {
             throw SwanLegacySessionXRPCFailure.unavailable
         }
         guard let record else {
-            throw SwanLegacySessionXRPCFailure.authenticationRequired
+            // Step 1 already refused the account password, and no app password
+            // matches either. Which of the two the caller intended is not
+            // knowable here, so the stage names the last gate that ran.
+            throw LegacyLoginRejection(stage: .noCredentialMatched)
         }
         // An app-password session's authority is the live credential row: it
         // is re-read on every use, so no revision-bound grant exists for this
@@ -677,7 +728,12 @@ private struct Handlers: Sendable {
     }
 
     private func response(for error: any Error) -> Response {
-        let failure = (error as? SwanLegacySessionXRPCFailure) ?? .invalidRequest
+        // A staged rejection is still exactly `AuthenticationRequired` on the
+        // wire: the stage exists for the operator log, never for the client.
+        let failure =
+            (error as? LegacyLoginRejection)?.failure
+            ?? (error as? SwanLegacySessionXRPCFailure)
+            ?? .invalidRequest
         switch failure {
         case .invalidRequest:
             return errorResponse(.badRequest, "InvalidRequest")
