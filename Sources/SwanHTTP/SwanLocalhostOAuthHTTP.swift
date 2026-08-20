@@ -168,7 +168,7 @@ private func beginLocalhostAuthorization(
         )
         return localhostHTML(
             .ok,
-            loginPage(csrf: issued.session.csrfToken),
+            SwanBrowserPages.login(csrf: issued.session.csrfToken),
             setCookie: browserCookie(issued.value)
         )
     } catch {
@@ -228,7 +228,7 @@ private func loginLocalhostAuthorization(
         )
         return localhostHTML(
             .ok,
-            consentPage(
+            SwanBrowserPages.consent(
                 csrf: issued.session.csrfToken,
                 subject: authenticated.account.did,
                 clientID: pushed.binding.clientID,
@@ -804,34 +804,6 @@ private func localUntrustedDPoPNonce(from proof: String) -> String? {
     return claims.nonce
 }
 
-private func loginPage(csrf: String) -> String {
-    """
-    <!doctype html><html><head><meta charset="utf-8"><title>Swan sign in</title></head><body><main><h1>Sign in to Swan</h1><form method="post" action="/oauth/authorize"><input type="hidden" name="csrf" value="\(csrf)"><label>Handle <input name="handle" autocomplete="username" required></label><label>Password <input name="password" type="password" autocomplete="current-password" required></label><button type="submit">Continue</button></form></main></body></html>
-    """
-}
-
-private func consentPage(
-    csrf: String,
-    subject: String,
-    clientID: String,
-    scopes: Set<String>
-) -> String {
-    let scopeItems = scopes.sorted().map {
-        "<li><code>\(htmlEscape($0))</code></li>"
-    }.joined()
-    return """
-    <!doctype html><html><head><meta charset="utf-8"><title>Authorize Swan client</title></head><body><main><h1>Authorize local development client</h1><p>Signed in as \(htmlEscape(subject)).</p><p>Client: <code>\(htmlEscape(clientID))</code></p><p>Requested access:</p><ul>\(scopeItems)</ul><form method="post" action="/oauth/authorize/consent"><input type="hidden" name="csrf" value="\(htmlEscape(csrf))"><button name="decision" value="approve" type="submit">Approve</button><button name="decision" value="deny" type="submit">Deny</button></form></main></body></html>
-    """
-}
-
-private func htmlEscape(_ value: String) -> String {
-    value.replacingOccurrences(of: "&", with: "&amp;")
-        .replacingOccurrences(of: "<", with: "&lt;")
-        .replacingOccurrences(of: ">", with: "&gt;")
-        .replacingOccurrences(of: "\"", with: "&quot;")
-        .replacingOccurrences(of: "'", with: "&#39;")
-}
-
 private func localhostHTML(_ status: HTTPResponse.Status, _ html: String, setCookie: String? = nil) -> Response {
     var headers = localhostBrowserHeaders(contentType: "text/html; charset=utf-8")
     if let setCookie { headers[HTTPField.Name("Set-Cookie")!] = setCookie }
@@ -854,8 +826,12 @@ private func localhostAuthorizationError(_ status: HTTPResponse.Status, clearCoo
 private func localhostBrowserHeaders(contentType: String? = nil) -> HTTPFields {
     var headers: HTTPFields = [.cacheControl: "no-store"]
     if let contentType { headers[.contentType] = contentType }
+    // `style-src` names the hash of the inlined daisyUI stylesheet, so styled
+    // pages keep `default-src 'none'` with no `'unsafe-inline'` and no
+    // external style origin.
     headers[HTTPField.Name("Content-Security-Policy")!] =
-        "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+        "default-src 'none'; style-src \(SwanBrowserPages.browserStyleCSPSource); "
+        + "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     headers[HTTPField.Name("X-Frame-Options")!] = "DENY"
     headers[HTTPField.Name("Referrer-Policy")!] = "no-referrer"
     headers[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"

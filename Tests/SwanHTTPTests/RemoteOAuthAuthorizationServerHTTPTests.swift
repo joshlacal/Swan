@@ -323,7 +323,7 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
             as: UTF8.self
           )
           XCTAssertTrue(consentHTML.contains(self.clientID.absoluteString))
-          XCTAssertTrue(consentHTML.contains("<code>atproto</code>"))
+          XCTAssertTrue(consentHTML.contains(">atproto</code>"))
           secondCookie = self.cookie(response.headers[setCookieHeader])
           secondCSRF = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(secondCookie))
             .csrfToken
@@ -1497,10 +1497,14 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     let formAction = formActionSource.map { "'self' \($0)" } ?? "'self'"
     XCTAssertEqual(
       headers[contentSecurityPolicyHeader],
-      "default-src 'none'; form-action \(formAction); frame-ancestors 'none'; base-uri 'none'",
+      "default-src 'none'; style-src \(SwanBrowserPages.browserStyleCSPSource); "
+        + "form-action \(formAction); frame-ancestors 'none'; base-uri 'none'",
       file: file,
       line: line
     )
+    // The stylesheet source must be a hash, never a relaxation.
+    XCTAssertTrue(
+      SwanBrowserPages.browserStyleCSPSource.hasPrefix("'sha256-"), file: file, line: line)
     XCTAssertEqual(headers[xFrameOptionsHeader], "DENY", file: file, line: line)
     XCTAssertEqual(headers[referrerPolicyHeader], "no-referrer", file: file, line: line)
     XCTAssertEqual(headers[xContentTypeOptionsHeader], "nosniff", file: file, line: line)
