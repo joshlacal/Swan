@@ -127,13 +127,30 @@ public struct SwanXRPCProxyRouter: Sendable {
             throw SwanXRPCProxyRoutingFailure.denied
         }
         if let proxyHeader {
-            // Allow-list before the header is even parsed. A namespace Swan
-            // does not proxy is unrouted whether or not the client named a
-            // destination, and it reports the same 404 an unknown namespace
-            // gets so this cannot be used to enumerate what Swan reserves.
-            guard let disposition = GeneratedLegacyMethodRegistry.routing[nsid],
-                  disposition != .local
-            else {
+            // Namespace allow-list before the header is even parsed. A
+            // namespace Swan does not proxy is unrouted whether or not the
+            // client named a destination, and it reports the same 404 an
+            // unknown namespace gets so this cannot be used to enumerate what
+            // Swan reserves.
+            //
+            // Admission is by namespace, NOT by membership in the generated
+            // method registry. The registry is derived from a pinned lexicon
+            // tree, and that pin trails upstream: 52 published methods were
+            // missing from it here, so `chat.bsky.convo.getUnreadCounts` and
+            // `app.bsky.video.*` 404'd for clients that legitimately asked for
+            // them. A stale pin must not silently shrink what this host will
+            // forward. The registry stays authoritative for scope
+            // declarations, where lexicon truth is the whole point.
+            //
+            // This does not reopen the hazard the allow-list exists to close.
+            // That hazard is a conditionally-registered *local* route
+            // vanishing and its NSID becoming forwardable — the measured case
+            // was `com.atproto.server.createSession` carrying an identifier
+            // and password. `com.atproto.*` is deliberately absent from
+            // `proxyablePrefixes`, so it is still unrouted here no matter what
+            // the client names, and everything Swan owns inside a proxyable
+            // namespace is covered by `deniedPrefixes`/`deniedMethods` above.
+            guard Self.isProxyableNamespace(nsid) else {
                 throw SwanXRPCProxyRoutingFailure.unrouted
             }
             let (did, fragment) = try Self.parseProxyHeader(proxyHeader)
@@ -152,11 +169,16 @@ public struct SwanXRPCProxyRouter: Sendable {
         // admissible set is narrower still than `proxyablePrefixes`: only the
         // AppView's own namespace. `chat.bsky.` and `tools.ozone.` live at
         // other services and a client must name them explicitly.
-        guard GeneratedLegacyMethodRegistry.routing[nsid] == .proxyDefault,
-              nsid.hasPrefix(Self.appViewPrefix) else {
+        guard nsid.hasPrefix(Self.appViewPrefix) else {
             throw SwanXRPCProxyRoutingFailure.unrouted
         }
         return .configuredAppView(did: appViewDID)
+    }
+
+    /// A namespace this host forwards, ignoring the destination.
+    static func isProxyableNamespace(_ nsid: String) -> Bool {
+        proxyablePrefixes.contains(where: { nsid.hasPrefix($0) })
+            || proxyableMethods.contains(nsid)
     }
 
     private static func parseProxyHeader(_ value: String) throws -> (did: String, fragment: String) {
