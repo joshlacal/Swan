@@ -136,17 +136,8 @@ public enum RepositoryMSTCodec {
     }
 
     public static func encode(_ node: RepositoryMSTNode) throws -> Data {
-        if let left = node.leftTreeCID {
-            try PublicRepositoryCID.validate(left)
-        }
-        _ = try reconstructedLeaves(from: node)
-
-        let entries: [Any] = try node.entries.map { entry in
-            try PublicRepositoryCID.validate(entry.valueCID)
-            if let right = entry.rightTreeCID {
-                try PublicRepositoryCID.validate(right)
-            }
-            return OrderedCBORMap(entries: [
+        let entries: [Any] = node.entries.map { entry in
+            OrderedCBORMap(entries: [
                 (key: "p", value: UInt64(entry.prefixLength)),
                 (key: "k", value: entry.keySuffix),
                 (key: "v", value: ATProtoLink(cid: entry.valueCID)),
