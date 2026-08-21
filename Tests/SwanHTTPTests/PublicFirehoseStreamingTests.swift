@@ -556,6 +556,40 @@ final class PublicFirehoseStreamingTests: XCTestCase {
     let delivered = await recorder.snapshot()
     XCTAssertTrue(delivered.isEmpty, "cancellation mid-idle must deliver nothing")
   }
+  func testTailerDropsSlowWriteAtDeadline() async throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
+    defer { Task { try? await firehose.close() } }
+    _ = try await firehose.appendBatch([identityItem(sourceKey: "slow-write-test")], now: epoch)
+
+    let limits = try PublicFirehoseStreamingLimits(
+      maximumWriteDuration: .milliseconds(50),
+      idlePollInterval: 0.01
+    )
+    let tailer = PublicFirehoseTailer(database: firehose, limits: limits, logger: logger)
+    let clock = ContinuousClock()
+    let started = clock.now
+    do {
+      try await tailer.run(
+        lastSent: 0,
+        outbound: { _ in try await Task.sleep(for: .seconds(2)) },
+        waitForWakeup: { nil }
+      )
+      XCTFail("a stalled write must be dropped at deadline")
+    } catch let error as PublicFirehoseTailerError {
+      guard case .writeTooSlow(let duration) = error else {
+        return XCTFail("expected writeTooSlow, got \(error)")
+      }
+      XCTAssertEqual(duration, .milliseconds(50))
+    }
+    let elapsed = clock.now - started
+    XCTAssertLessThan(
+      elapsed,
+      .seconds(1),
+      "the drop must happen at the deadline, not once the write returns"
+    )
+  }
 
   // MARK: - Wakeup hub
 
