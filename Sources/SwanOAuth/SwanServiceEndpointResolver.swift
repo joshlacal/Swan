@@ -154,18 +154,23 @@ public struct SwanServiceEndpointResolver: Sendable {
         private struct CacheEntry: Sendable {
             let document: Document
             let expiresAt: ContinuousClock.Instant
+            let generation: UInt64
         }
 
         private struct Flight: Sendable {
             let identity: UUID
+            let generation: UInt64
             let task: Task<SwanDIDDocumentResolutionPayload, Error>
             var waiters: [DIDDocumentFlightWait]
             var waiterCount: Int { waiters.count }
+            var activeWaiters: Int
+            var result: Result<SwanDIDDocumentResolutionPayload, Error>?
         }
 
         private let documents: any SwanDIDDocumentFetching
         private let configuration: CacheConfiguration
         private let clock: MonotonicClock
+        private var nextGeneration: UInt64 = 0
         private var cache: [String: CacheEntry] = [:]
         private var inFlight: [String: Flight] = [:]
 
@@ -204,13 +209,44 @@ public struct SwanServiceEndpointResolver: Sendable {
             }
 
             if var flight = inFlight[did] {
-                let wait = DIDDocumentFlightWait()
-                flight.waiters.append(wait)
-                inFlight[did] = flight
-                let payload = try await awaitFlight(wait)
-                return try resolveAndAdmit(payload: payload, did: did, fragment: fragment)
+                if let result = flight.result {
+                    switch result {
+                    case let .success(payload):
+                        return try resolveAndAdmit(
+                            payload: payload,
+                            did: did,
+                            fragment: fragment,
+                            flightIdentity: flight.identity,
+                            generation: flight.generation
+                        )
+                    case let .failure(error):
+                        throw error
+                    }
+                } else {
+                    let wait = DIDDocumentFlightWait()
+                    flight.waiters.append(wait)
+                    flight.activeWaiters += 1
+                    inFlight[did] = flight
+                    let identity = flight.identity
+                    let generation = flight.generation
+                    do {
+                        let payload = try await awaitFlight(wait)
+                        return try resolveAndAdmit(
+                            payload: payload,
+                            did: did,
+                            fragment: fragment,
+                            flightIdentity: identity,
+                            generation: generation
+                        )
+                    } catch {
+                        waiterExited(identity: identity, for: did)
+                        throw error
+                    }
+                }
             }
 
+            nextGeneration += 1
+            let generation = nextGeneration
             let wait = DIDDocumentFlightWait()
             let identity = UUID()
             let documents = self.documents
@@ -228,8 +264,11 @@ public struct SwanServiceEndpointResolver: Sendable {
 
             let flight = Flight(
                 identity: identity,
+                generation: generation,
                 task: task,
-                waiters: [wait]
+                waiters: [wait],
+                activeWaiters: 1,
+                result: nil
             )
             inFlight[did] = flight
 
@@ -238,15 +277,31 @@ public struct SwanServiceEndpointResolver: Sendable {
                 await self?.finishFlight(identity: identity, for: did, result: result)
             }
 
-            let payload = try await awaitFlight(wait)
-            return try resolveAndAdmit(payload: payload, did: did, fragment: fragment)
+            do {
+                let payload = try await awaitFlight(wait)
+                return try resolveAndAdmit(
+                    payload: payload,
+                    did: did,
+                    fragment: fragment,
+                    flightIdentity: identity,
+                    generation: generation
+                )
+            } catch {
+                waiterExited(identity: identity, for: did)
+                throw error
+            }
         }
 
         private func resolveAndAdmit(
             payload: SwanDIDDocumentResolutionPayload,
             did: String,
-            fragment: String
+            fragment: String,
+            flightIdentity: UUID,
+            generation: UInt64
         ) throws -> URL {
+            defer {
+                waiterExited(identity: flightIdentity, for: did)
+            }
             guard let url = SwanServiceEndpointResolver.resolveEndpoint(
                 document: payload.document,
                 did: did,
@@ -255,10 +310,26 @@ public struct SwanServiceEndpointResolver: Sendable {
                 throw SwanServiceResolutionFailure.unresolvableService
             }
             if !payload.fetchResult.noStore {
-                storeInCache(payload.document, fetchResult: payload.fetchResult, for: did)
+                storeInCache(payload.document, fetchResult: payload.fetchResult, for: did, generation: generation)
+                if inFlight[did]?.identity == flightIdentity {
+                    inFlight.removeValue(forKey: did)
+                }
             }
             return url
         }
+
+        private func waiterExited(identity: UUID, for did: String) {
+            guard var flight = inFlight[did], flight.identity == identity else {
+                return
+            }
+            flight.activeWaiters -= 1
+            if flight.activeWaiters <= 0 {
+                inFlight.removeValue(forKey: did)
+            } else {
+                inFlight[did] = flight
+            }
+        }
+
         private func awaitFlight(_ wait: DIDDocumentFlightWait) async throws -> SwanDIDDocumentResolutionPayload {
             let outcome = await withTaskCancellationHandler(
                 operation: {
@@ -286,19 +357,37 @@ public struct SwanServiceEndpointResolver: Sendable {
             for did: String,
             result: Result<SwanDIDDocumentResolutionPayload, Error>
         ) {
-            guard let flight = inFlight[did], flight.identity == identity else {
+            guard var flight = inFlight[did], flight.identity == identity else {
                 return
             }
-            inFlight.removeValue(forKey: did)
-            for waiter in flight.waiters {
-                waiter.complete(.completed(result))
+            flight.result = result
+            switch result {
+            case .success:
+                if flight.activeWaiters <= 0 {
+                    inFlight.removeValue(forKey: did)
+                } else {
+                    inFlight[did] = flight
+                }
+                for waiter in flight.waiters {
+                    waiter.complete(.completed(result))
+                }
+            case .failure:
+                inFlight.removeValue(forKey: did)
+                for waiter in flight.waiters {
+                    waiter.complete(.completed(result))
+                }
             }
         }
+
         private func storeInCache(
             _ document: Document,
             fetchResult: SwanDIDDocumentFetchResult,
-            for did: String
+            for did: String,
+            generation: UInt64
         ) {
+            if let existing = cache[did], existing.generation > generation {
+                return
+            }
             let now = clock.now()
             let effectiveLifetime: TimeInterval
             if let maxAge = fetchResult.maxAge {
@@ -320,7 +409,8 @@ public struct SwanServiceEndpointResolver: Sendable {
 
             cache[did] = CacheEntry(
                 document: document,
-                expiresAt: expiresAt
+                expiresAt: expiresAt,
+                generation: generation
             )
         }
     }
@@ -432,6 +522,17 @@ public struct SwanPeerPinnedDIDDocumentFetcher: SwanDIDDocumentFetching {
         return SwanDIDDocumentFetchResult(data: data, maxAge: maxAge, noStore: noStore)
     }
 
+    private static func parseDeltaSeconds(_ string: String) -> TimeInterval? {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.allSatisfy({ $0 >= "0" && $0 <= "9" }) else {
+            return nil
+        }
+        if let seconds = Double(trimmed) {
+            return seconds.isFinite ? seconds : .greatestFiniteMagnitude
+        }
+        return .greatestFiniteMagnitude
+    }
+
     static func parseCacheControl(headers: [String: [String]]) -> (maxAge: TimeInterval?, noStore: Bool) {
         var noStore = false
         var maxAge: TimeInterval?
@@ -442,9 +543,9 @@ public struct SwanPeerPinnedDIDDocumentFetcher: SwanDIDDocumentFetching {
                     if directive == "no-store" || directive == "no-cache" {
                         noStore = true
                     } else if directive.hasPrefix("max-age=") {
-                        let numberPart = directive.dropFirst("max-age=".count).trimmingCharacters(in: .whitespacesAndNewlines)
-                        if let seconds = Double(numberPart), seconds >= 0 {
-                            maxAge = seconds.isFinite ? seconds : .greatestFiniteMagnitude
+                        let numberPart = String(directive.dropFirst("max-age=".count))
+                        if let seconds = parseDeltaSeconds(numberPart) {
+                            maxAge = seconds
                         }
                     }
                 }
@@ -453,11 +554,10 @@ public struct SwanPeerPinnedDIDDocumentFetcher: SwanDIDDocumentFetching {
         var age: TimeInterval = 0
         if let ageValues = headers["age"] {
             for value in ageValues {
-                let parts = value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                let parts = value.split(separator: ",")
                 for part in parts {
-                    if let seconds = Double(part), seconds >= 0 {
-                        let clamped = seconds.isFinite ? seconds : .greatestFiniteMagnitude
-                        age = max(age, clamped)
+                    if let seconds = parseDeltaSeconds(String(part)) {
+                        age = max(age, seconds)
                     }
                 }
             }
