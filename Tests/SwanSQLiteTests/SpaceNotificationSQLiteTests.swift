@@ -630,6 +630,176 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             XCTAssertEqual(actual, 6)
         }
     }
+    /// Reopening a database with a substantially lower oplog retention
+    /// must prune the excess oplog entries and request receipts down to the new
+    /// retention limit on the next commit without performing an unbounded scan.
+    func testLoweringOplogRetentionPrunesToNewDepthAndReplaysOlderReceiptsAsConflicts() async throws {
+        let fixture = try NotificationFixture()
+        let highRetentionDatabase = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root,
+            did: fixture.writer,
+            oplogRetention: 20
+        )
+
+        let uri = try SpaceRecordURI(
+            space: fixture.space,
+            author: fixture.writer,
+            collection: "app.bsky.feed.post",
+            rkey: "retention-reduction"
+        )
+        var requestIDs: [UUID] = []
+        for index in 1 ... 15 {
+            let requestID = UUID()
+            requestIDs.append(requestID)
+            let value1 = Data([0xA1, 0x61, 0x61, UInt8(index)])
+            let value2 = Data([0xA1, 0x61, 0x62, UInt8(index)])
+            let uri2 = try SpaceRecordURI(
+                space: fixture.space,
+                author: fixture.writer,
+                collection: "app.bsky.feed.post",
+                rkey: "retention-reduction-\(index)"
+            )
+            _ = try await highRetentionDatabase.apply(
+                space: fixture.space,
+                author: fixture.writer,
+                expectedRevision: UInt64(index - 1),
+                requestID: requestID,
+                wireRevision: try fixture.tid(index),
+                writes: [
+                    .put(
+                        uri: uri,
+                        value: value1,
+                        cid: CID.fromDAGCBOR(value1).string
+                    ),
+                    .put(
+                        uri: uri2,
+                        value: value2,
+                        cid: CID.fromDAGCBOR(value2).string
+                    ),
+                ]
+            )
+        }
+
+        let initialRequests = try await highRetentionDatabase.connection.query(
+            "SELECT COUNT(*) AS count FROM permissioned_space_requests WHERE space_uri = ? AND author_did = ?",
+            [.text(fixture.space.rawValue), .text(fixture.writer)]
+        )
+        XCTAssertEqual(initialRequests.first?.column("count")?.integer, 15)
+
+        let initialOplog = try await highRetentionDatabase.connection.query(
+            "SELECT COUNT(*) AS count FROM permissioned_space_oplog WHERE space_uri = ? AND author_did = ?",
+            [.text(fixture.space.rawValue), .text(fixture.writer)]
+        )
+        XCTAssertEqual(initialOplog.first?.column("count")?.integer, 20)
+        try await highRetentionDatabase.close()
+
+        // Reopen with oplogRetention lowered to 4
+        let lowRetentionDatabase = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root,
+            did: fixture.writer,
+            oplogRetention: 4
+        )
+        defer { Task { try? await lowRetentionDatabase.close() } }
+
+        // Commit revision 16 under the new low retention limit
+        let nextRequestID = UUID()
+        let nextValue = Data([0xA1, 0x61, 0x61, 0x10])
+        _ = try await lowRetentionDatabase.apply(
+            space: fixture.space,
+            author: fixture.writer,
+            expectedRevision: 15,
+            requestID: nextRequestID,
+            wireRevision: try fixture.tid(16),
+            writes: [
+                .put(
+                    uri: uri,
+                    value: nextValue,
+                    cid: CID.fromDAGCBOR(nextValue).string
+                ),
+            ]
+        )
+
+        // Requests should now be pruned to exactly 4 (revisions 13, 14, 15, 16)
+        let retainedRequests = try await lowRetentionDatabase.connection.query(
+            """
+            SELECT request_id, final_revision
+            FROM permissioned_space_requests
+            WHERE space_uri = ? AND author_did = ?
+            ORDER BY final_revision ASC
+            """,
+            [.text(fixture.space.rawValue), .text(fixture.writer)]
+        )
+        XCTAssertEqual(retainedRequests.count, 4)
+        XCTAssertEqual(
+            retainedRequests.compactMap { $0.column("final_revision")?.integer },
+            [13, 14, 15, 16]
+        )
+
+        // Oplog entries should be pruned down to the retention window (revisions >= 15)
+        let retainedOplog = try await lowRetentionDatabase.connection.query(
+            """
+            SELECT revision, operation_index
+            FROM permissioned_space_oplog
+            WHERE space_uri = ? AND author_did = ?
+            ORDER BY revision ASC, operation_index ASC
+            """,
+            [.text(fixture.space.rawValue), .text(fixture.writer)]
+        )
+        // Revisions >= 14 hold the 4 newest operations (rev 16 has 1, rev 15 has 2, rev 14 has 2)
+        XCTAssertTrue(retainedOplog.allSatisfy { ($0.column("revision")?.integer ?? 0) >= 14 })
+
+        // Replay of an evicted request (e.g. revision 1) must be refused as a revision conflict
+        let duplicateValue = Data([0xA1, 0x61, 0x61, 0x01])
+        do {
+            _ = try await lowRetentionDatabase.apply(
+                space: fixture.space,
+                author: fixture.writer,
+                expectedRevision: 0,
+                requestID: try XCTUnwrap(requestIDs.first),
+                wireRevision: try fixture.tid(17),
+                writes: [
+                    .put(
+                        uri: uri,
+                        value: duplicateValue,
+                        cid: CID.fromDAGCBOR(duplicateValue).string
+                    ),
+                ]
+            )
+            XCTFail("a pruned receipt must not admit its stale replay")
+        } catch {
+            guard case let .conflict(expected, actual) = error as? SwanError else {
+                XCTFail("expected a revision conflict, got \(error)")
+                return
+            }
+            XCTAssertEqual(expected, 0)
+            XCTAssertEqual(actual, 16)
+        }
+
+        // Replay of a retained request (revision 16) must be refused as a duplicate
+        do {
+            _ = try await lowRetentionDatabase.apply(
+                space: fixture.space,
+                author: fixture.writer,
+                expectedRevision: 16,
+                requestID: nextRequestID,
+                wireRevision: try fixture.tid(17),
+                writes: [
+                    .put(
+                        uri: uri,
+                        value: duplicateValue,
+                        cid: CID.fromDAGCBOR(duplicateValue).string
+                    ),
+                ]
+            )
+            XCTFail("a retained receipt must reject its replay as a duplicate")
+        } catch {
+            XCTAssertEqual(
+                error as? SQLiteRepositoryError,
+                .duplicateRequest(nextRequestID)
+            )
+        }
+    }
+
 
     /// Receipts written before the retention column exists carry no timestamp.
     /// They must survive the upgrade and prune first, never win retention over

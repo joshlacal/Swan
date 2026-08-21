@@ -4032,19 +4032,36 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
             if newOplogCount > oplogRetention {
                 let excess = newOplogCount - oplogRetention
-                let cutoffRows = try await connection.query(
-                    """
-                    SELECT revision
-                    FROM permissioned_space_oplog
-                    WHERE space_uri = ? AND author_did = ?
-                    ORDER BY revision ASC, operation_index ASC
-                    LIMIT 1 OFFSET ?
-                    """,
-                    [
-                        .text(space.rawValue), .text(author),
-                        .integer(excess),
-                    ]
-                )
+                let cutoffRows: [SQLiteRow]
+                if excess <= oplogRetention - 1 {
+                    cutoffRows = try await connection.query(
+                        """
+                        SELECT revision
+                        FROM permissioned_space_oplog
+                        WHERE space_uri = ? AND author_did = ?
+                        ORDER BY revision ASC, operation_index ASC
+                        LIMIT 1 OFFSET ?
+                        """,
+                        [
+                            .text(space.rawValue), .text(author),
+                            .integer(excess),
+                        ]
+                    )
+                } else {
+                    cutoffRows = try await connection.query(
+                        """
+                        SELECT revision
+                        FROM permissioned_space_oplog
+                        WHERE space_uri = ? AND author_did = ?
+                        ORDER BY revision DESC, operation_index DESC
+                        LIMIT 1 OFFSET ?
+                        """,
+                        [
+                            .text(space.rawValue), .text(author),
+                            .integer(oplogRetention - 1),
+                        ]
+                    )
+                }
                 if let cutoffRow = cutoffRows.first {
                     let oldestRetainedRevision = try requiredRevision(
                         cutoffRow,
@@ -4079,19 +4096,36 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             // revision breaks ties and orders unstamped pre-upgrade rows.
             if newRequestCount > oplogRetention {
                 let excessRequests = newRequestCount - oplogRetention
-                let receiptCutoffRows = try await connection.query(
-                    """
-                    SELECT created_at, final_revision
-                    FROM permissioned_space_requests
-                    WHERE space_uri = ? AND author_did = ?
-                    ORDER BY created_at ASC, final_revision ASC
-                    LIMIT 1 OFFSET ?
-                    """,
-                    [
-                        .text(space.rawValue), .text(author),
-                        .integer(excessRequests),
-                    ]
-                )
+                let receiptCutoffRows: [SQLiteRow]
+                if excessRequests <= oplogRetention - 1 {
+                    receiptCutoffRows = try await connection.query(
+                        """
+                        SELECT created_at, final_revision
+                        FROM permissioned_space_requests
+                        WHERE space_uri = ? AND author_did = ?
+                        ORDER BY created_at ASC, final_revision ASC
+                        LIMIT 1 OFFSET ?
+                        """,
+                        [
+                            .text(space.rawValue), .text(author),
+                            .integer(excessRequests),
+                        ]
+                    )
+                } else {
+                    receiptCutoffRows = try await connection.query(
+                        """
+                        SELECT created_at, final_revision
+                        FROM permissioned_space_requests
+                        WHERE space_uri = ? AND author_did = ?
+                        ORDER BY created_at DESC, final_revision DESC
+                        LIMIT 1 OFFSET ?
+                        """,
+                        [
+                            .text(space.rawValue), .text(author),
+                            .integer(oplogRetention - 1),
+                        ]
+                    )
+                }
                 if let receiptCutoffRow = receiptCutoffRows.first {
                     let oldestRetainedStamp = try requiredNonnegativeInteger(
                         receiptCutoffRow,
