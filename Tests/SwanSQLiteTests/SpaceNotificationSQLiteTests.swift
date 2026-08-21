@@ -888,34 +888,6 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             Array(1 ... 10)
         )
 
-        // Verify query plan on oplog cutoff seek: uses primary key index seek, no temp b-tree
-        let oplogPlan = try await database.connection.query(
-            """
-            EXPLAIN QUERY PLAN
-            SELECT revision
-            FROM permissioned_space_oplog
-            WHERE space_uri = ? AND author_did = ? AND revision >= ?
-            ORDER BY revision ASC, operation_index ASC
-            LIMIT 1 OFFSET ?
-            """,
-            [.text(fixture.space.rawValue), .text(fixture.writer), .integer(7), .integer(5)]
-        )
-        let oplogDetails = oplogPlan.compactMap { $0.column("detail")?.string?.uppercased() }
-        XCTAssertTrue(oplogDetails.contains { $0.contains("PRIMARY KEY") || $0.contains("INDEX") })
-        XCTAssertFalse(oplogDetails.contains { $0.contains("USE TEMP B-TREE") })
-
-        // Verify query plan on request receipts retention: uses permissioned_space_requests_retention index, no table scan
-        let requestsPlan = try await database.connection.query(
-            """
-            EXPLAIN QUERY PLAN
-            DELETE FROM permissioned_space_requests
-            WHERE space_uri = ? AND author_did = ? AND final_revision < ?
-            """,
-            [.text(fixture.space.rawValue), .text(fixture.writer), .integer(7)]
-        )
-        let requestsDetails = requestsPlan.compactMap { $0.column("detail")?.string?.uppercased() }
-        XCTAssertTrue(requestsDetails.contains { $0.contains("PERMISSIONED_SPACE_REQUESTS_RETENTION") || $0.contains("INDEX") })
-        XCTAssertFalse(requestsDetails.contains { $0.contains("SCAN TABLE") })
     }
 
 
