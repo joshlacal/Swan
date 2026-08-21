@@ -48,7 +48,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         try await waitForFetchCount(1, from: plc)
         clock.advance(seconds: 30)
         await plc.releaseNext(with: .success)
-        let firstKey = try await first.value
+        let firstKey = try await withinDeadline { try await first.value }
         XCTAssertNotNil(firstKey)
 
         let immediatelyCached = try await resolver.publicKey(
@@ -77,7 +77,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         }
         try await waitForFetchCount(2, from: plc)
         await plc.releaseNext(with: .success)
-        let refreshedKey = try await refresh.value
+        let refreshedKey = try await withinDeadline { try await refresh.value }
         XCTAssertNotNil(refreshedKey)
     }
 
@@ -100,7 +100,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         try await waitForFetchCount(1, from: plc)
         clock.advance(seconds: 30)
         await plc.releaseNext(with: .failure)
-        await XCTAssertThrowsSingleFlightError(try await first.value)
+        await XCTAssertThrowsSingleFlightError(try await withinDeadline { try await first.value })
 
         await XCTAssertThrowsSingleFlightError(try await resolver.publicKey(
             for: issuer,
@@ -126,7 +126,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         }
         try await waitForFetchCount(2, from: plc)
         await plc.releaseNext(with: .success)
-        let retriedKey = try await retry.value
+        let retriedKey = try await withinDeadline { try await retry.value }
         XCTAssertNotNil(retriedKey)
     }
 
@@ -151,7 +151,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         }
         try await waitForFetchCount(1, from: plc)
         await plc.releaseNext(with: .success)
-        let initialKey = try await initial.value
+        let initialKey = try await withinDeadline { try await initial.value }
         XCTAssertNotNil(initialKey)
 
         clock.advance(seconds: 2)
@@ -163,7 +163,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         }
         try await waitForFetchCount(2, from: plc)
         await plc.releaseNext(with: .failure)
-        await XCTAssertThrowsSingleFlightError(try await failedRefresh.value)
+        await XCTAssertThrowsSingleFlightError(try await withinDeadline { try await failedRefresh.value })
 
         await XCTAssertThrowsSingleFlightError(try await resolver.publicKey(
             for: issuer,
@@ -202,8 +202,8 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         initiatingWaiter.cancel()
         await plc.releaseNext(with: .success)
 
-        await XCTAssertThrowsSingleFlightError(try await initiatingWaiter.value)
-        let survivingKey = try await survivingWaiter.value
+        await XCTAssertThrowsSingleFlightError(try await withinDeadline { try await initiatingWaiter.value })
+        let survivingKey = try await withinDeadline { try await survivingWaiter.value }
         XCTAssertNotNil(survivingKey)
         let fetchCount = await plc.fetchCount()
         let peakFetchCount = await plc.peakConcurrentFetchCount()
@@ -237,7 +237,8 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         await plc.releaseAll(with: .success)
         var successes = 0
         for lookup in lookups {
-            if await lookup.value {
+            let succeeded = try await withinDeadline { await lookup.value }
+            if succeeded {
                 successes += 1
             }
         }
@@ -285,7 +286,8 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         await plc.releaseAll(with: .success)
         var successes = 0
         for lookup in lookups {
-            if await lookup.value {
+            let succeeded = try await withinDeadline { await lookup.value }
+            if succeeded {
                 successes += 1
             }
         }
@@ -492,6 +494,7 @@ private actor SingleFlightCheckpointStore:
 
 private enum SingleFlightTestTimeout: Error {
     case fetchCount(Int)
+    case taskValue
 }
 
 private func waitForFetchCount(
@@ -517,4 +520,43 @@ private func XCTAssertThrowsSingleFlightError<T>(
         _ = try await expression()
         XCTFail("expected an error", file: file, line: line)
     } catch {}
+}
+
+/// Awaits `body` with a deadline, failing rather than parking forever.
+///
+/// corelibs-xctest bridges an `async` test body through an expectation with no
+/// timeout, so one release that never arrives suspends the whole suite instead
+/// of failing it: two amd64 gate runs stalled for forty minutes each inside
+/// this file, and neither reported which test was stuck — that had to be
+/// recovered with lldb. Every task await here goes through this helper so the
+/// same situation costs seconds and names itself.
+///
+/// The bound is deliberately loose. It is not a performance assertion; it is
+/// the difference between a diagnosable failure and a hung gate.
+private func withinDeadline<T: Sendable>(
+    _ seconds: Double = 10,
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ body: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    try await withThrowingTaskGroup(of: T?.self) { group in
+        group.addTask { try await body() }
+        group.addTask {
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            return nil
+        }
+        defer { group.cancelAll() }
+        while let outcome = try await group.next() {
+            guard let value = outcome else {
+                XCTFail(
+                    "timed out after \(seconds)s waiting for a task to finish",
+                    file: file,
+                    line: line
+                )
+                throw SingleFlightTestTimeout.taskValue
+            }
+            return value
+        }
+        throw SingleFlightTestTimeout.taskValue
+    }
 }
