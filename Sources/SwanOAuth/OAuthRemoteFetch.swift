@@ -300,8 +300,17 @@ func resolveOAuthHostname(
         } catch {
             return
         }
-        resolutionTask.cancel()
+        // Record the deadline's own outcome *before* cancelling the resolve,
+        // because `complete` is first-wins. Cancelling first lets the resolver's
+        // own `CancellationError` land first whenever cancellation propagates
+        // faster than this task's next statement, and that raw error then
+        // escapes an API whose contract is a typed `SwanError`. It is a race
+        // that a fast machine almost always wins and a loaded x86_64 does not:
+        // the deadline test failed on the amd64 gate with `CancellationError`
+        // while passing on arm64. Completing first makes the outcome the same
+        // on every machine.
         completion.complete(.failure(SwanError.unavailable("OAuth DNS resolution timed out")))
+        resolutionTask.cancel()
     }
     defer {
         resolutionTask.cancel()
@@ -314,9 +323,12 @@ func resolveOAuthHostname(
             }
         },
         onCancel: {
+            // Same ordering rule, opposite intent: the caller was cancelled, so
+            // `CancellationError` is the correct answer and has to be recorded
+            // before the deadline task gets a chance to record `unavailable`.
+            completion.complete(.failure(CancellationError()))
             resolutionTask.cancel()
             timeoutTask.cancel()
-            completion.complete(.failure(CancellationError()))
         }
     )
 }
