@@ -17,28 +17,22 @@ private struct FailingDocuments: SwanDIDDocumentFetching {
 }
 private actor ControllableDocuments: SwanDIDDocumentFetching {
     private var json: String
-    private var maxAge: TimeInterval?
-    private var noStore: Bool
     private var count = 0
     private var releaseContinuations: [CheckedContinuation<Void, Never>] = []
     private var gated = false
 
-    init(json: String, maxAge: TimeInterval? = nil, noStore: Bool = false, gated: Bool = false) {
+    init(json: String, gated: Bool = false) {
         self.json = json
-        self.maxAge = maxAge
-        self.noStore = noStore
         self.gated = gated
     }
 
-    func setJSON(_ json: String, maxAge: TimeInterval? = nil, noStore: Bool = false) {
+    func setJSON(_ json: String) {
         self.json = json
-        self.maxAge = maxAge
-        self.noStore = noStore
     }
+
     var fetchCount: Int {
         count
     }
-
 
     func releaseAll() {
         gated = false
@@ -50,11 +44,6 @@ private actor ControllableDocuments: SwanDIDDocumentFetching {
     }
 
     func documentJSON(forDID did: String) async throws -> Data {
-        let res = try await fetchDocument(forDID: did)
-        return res.data
-    }
-
-    func fetchDocument(forDID _: String) async throws -> SwanDIDDocumentFetchResult {
         count += 1
         if gated {
             await withCheckedContinuation { continuation in
@@ -64,31 +53,8 @@ private actor ControllableDocuments: SwanDIDDocumentFetching {
                     releaseContinuations.append(continuation)
                 }
             }
-            return SwanDIDDocumentFetchResult(data: Data(json.utf8), maxAge: maxAge, noStore: noStore)
-        } else {
-            return SwanDIDDocumentFetchResult(data: Data(json.utf8), maxAge: maxAge, noStore: noStore)
         }
-    }
-}
-
-private final class TestMonotonicClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var currentInstant: ContinuousClock.Instant = .now
-
-    var clock: SwanServiceEndpointResolver.MonotonicClock {
-        SwanServiceEndpointResolver.MonotonicClock { [weak self] in
-            self?.now() ?? .now
-        }
-    }
-
-    func now() -> ContinuousClock.Instant {
-        lock.withLock { currentInstant }
-    }
-
-    func advance(by seconds: TimeInterval) {
-        lock.withLock {
-            currentInstant = currentInstant.advanced(by: .seconds(seconds))
-        }
+        return Data(json.utf8)
     }
 }
 private struct TestTimeoutError: Error, Sendable {}
@@ -167,8 +133,8 @@ private func boundedJoin<T: Sendable>(_ task: Task<T, Error>, timeoutSeconds: Ti
 }
 
 final class SwanServiceEndpointResolverTests: XCTestCase {
-    private func resolver(_ json: String) throws -> SwanServiceEndpointResolver {
-        try SwanServiceEndpointResolver(documents: StubDocuments(json: json))
+    private func resolver(_ json: String) -> SwanServiceEndpointResolver {
+        SwanServiceEndpointResolver(documents: StubDocuments(json: json))
     }
 
     private let document = """
@@ -390,7 +356,7 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
 
     func testConcurrentResolutionsOfSameDIDCoalesceToOneUpstreamFetch() async throws {
         let docs = ControllableDocuments(json: document, gated: true)
-        let resolver = try SwanServiceEndpointResolver(documents: docs)
+        let resolver = SwanServiceEndpointResolver(documents: docs)
 
         let tasks = (0 ..< 10).map { _ in
             Task {
@@ -419,44 +385,9 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
         XCTAssertEqual(count, 1, "all 10 concurrent resolutions must coalesce to exactly one upstream fetch")
     }
 
-    func testPositiveCacheServesWithinLifetimeAndRefetchesAfterExpiry() async throws {
-        let clock = TestMonotonicClock()
-        let docs = ControllableDocuments(json: document)
-        let resolver = try SwanServiceEndpointResolver(
-            documents: docs,
-            cacheConfiguration: .init(lifetime: 60, maximumEntries: 256),
-            monotonicClock: clock.clock
-        )
-
-        let first = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        XCTAssertEqual(first, URL(string: "https://api.bsky.app"))
-        var count = await docs.fetchCount
-        XCTAssertEqual(count, 1)
-
-        // Within TTL (30s < 60s)
-        clock.advance(by: 30)
-        let cached = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        XCTAssertEqual(cached, URL(string: "https://api.bsky.app"))
-        count = await docs.fetchCount
-        XCTAssertEqual(count, 1)
-
-        // Different fragment on same cached document also hits cache
-        let cachedOther = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "other")
-        XCTAssertEqual(cachedOther, URL(string: "https://other.example"))
-        count = await docs.fetchCount
-        XCTAssertEqual(count, 1)
-
-        // Past TTL (30s + 31s = 61s > 60s)
-        clock.advance(by: 31)
-        let refetched = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        XCTAssertEqual(refetched, URL(string: "https://api.bsky.app"))
-        count = await docs.fetchCount
-        XCTAssertEqual(count, 2, "must refetch after cache lifetime expires")
-    }
-
     func testCancellingOneWaiterDoesNotCancelSharedFetchForOtherWaiters() async throws {
         let docs = ControllableDocuments(json: document, gated: true)
-        let resolver = try SwanServiceEndpointResolver(documents: docs)
+        let resolver = SwanServiceEndpointResolver(documents: docs)
 
         let waiter1 = Task {
             try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
@@ -506,7 +437,7 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
 
     func testFetchFailureIsNotCachedAndDeliveredToAllWaiters() async throws {
         let docs = ControllableDocuments(json: "invalid json", gated: true)
-        let resolver = try SwanServiceEndpointResolver(documents: docs)
+        let resolver = SwanServiceEndpointResolver(documents: docs)
 
         let waiter1 = Task {
             try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
@@ -553,114 +484,9 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
         XCTAssertEqual(count, 2, "must fetch again after failure repair")
     }
 
-    func testCacheCapacityEviction() async throws {
-        let clock = TestMonotonicClock()
-        let docs = ControllableDocuments(json: document)
-        let resolver = try SwanServiceEndpointResolver(
-            documents: docs,
-            cacheConfiguration: .init(lifetime: 60, maximumEntries: 2),
-            monotonicClock: clock.clock
-        )
-
-        let doc1 = """
-        {"id":"did:web:one.example","service":[{"id":"#svc","type":"S","serviceEndpoint":"https://one.example"}]}
-        """
-        let doc2 = """
-        {"id":"did:web:two.example","service":[{"id":"#svc","type":"S","serviceEndpoint":"https://two.example"}]}
-        """
-        let doc3 = """
-        {"id":"did:web:three.example","service":[{"id":"#svc","type":"S","serviceEndpoint":"https://three.example"}]}
-        """
-
-        await docs.setJSON(doc1)
-        _ = try await resolver.endpoint(did: "did:web:one.example", fragment: "svc")
-        var count = await docs.fetchCount
-        XCTAssertEqual(count, 1)
-
-        // Advance 10s (doc1 expires at t=60)
-        clock.advance(by: 10)
-        await docs.setJSON(doc2)
-        _ = try await resolver.endpoint(did: "did:web:two.example", fragment: "svc")
-        count = await docs.fetchCount
-        XCTAssertEqual(count, 2)
-
-        // Advance 10s to t=20. BOTH doc1 (expires at 60) and doc2 (expires at 70) are LIVE!
-        clock.advance(by: 10)
-
-        // Insert doc3 at t=20; capacity is 2; both entries are live, so oldest entry (doc1) is evicted
-        await docs.setJSON(doc3)
-        _ = try await resolver.endpoint(did: "did:web:three.example", fragment: "svc")
-        count = await docs.fetchCount
-        XCTAssertEqual(count, 3)
-
-        // doc2 is still live and cached
-        await docs.setJSON(doc2)
-        let url2 = try await resolver.endpoint(did: "did:web:two.example", fragment: "svc")
-        XCTAssertEqual(url2, URL(string: "https://two.example"))
-        count = await docs.fetchCount
-        XCTAssertEqual(count, 3, "doc2 should still be cached")
-
-        // doc3 is still live and cached
-        await docs.setJSON(doc3)
-        let url3 = try await resolver.endpoint(did: "did:web:three.example", fragment: "svc")
-        XCTAssertEqual(url3, URL(string: "https://three.example"))
-        count = await docs.fetchCount
-        XCTAssertEqual(count, 3, "doc3 should still be cached")
-
-        // Query doc1: doc1 was evicted to make room for doc3, so it MUST trigger an upstream fetch!
-        await docs.setJSON(doc1)
-        let url1 = try await resolver.endpoint(did: "did:web:one.example", fragment: "svc")
-        XCTAssertEqual(url1, URL(string: "https://one.example"))
-        count = await docs.fetchCount
-        XCTAssertEqual(count, 4, "evicted doc1 must trigger a new upstream fetch")
-    }
-
-    func testRespectsSourceFreshnessAndNoStoreDirectives() async throws {
-        let clock = TestMonotonicClock()
-        let docs = ControllableDocuments(json: document, noStore: true)
-        let resolver = try SwanServiceEndpointResolver(
-            documents: docs,
-            cacheConfiguration: .init(lifetime: 60, maximumEntries: 256),
-            monotonicClock: clock.clock
-        )
-
-        // no-store document should resolve successfully
-        let first = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        XCTAssertEqual(first, URL(string: "https://api.bsky.app"))
-        var count = await docs.fetchCount
-        XCTAssertEqual(count, 1)
-
-        // Second request immediately after must fetch again (not cached due to no-store)
-        let second = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        XCTAssertEqual(second, URL(string: "https://api.bsky.app"))
-        count = await docs.fetchCount
-        XCTAssertEqual(count, 2, "no-store response must not be cached")
-
-        // max-age=10 document should expire at 10s even though local cap is 60s
-        await docs.setJSON(document, maxAge: 10, noStore: false)
-        let third = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        XCTAssertEqual(third, URL(string: "https://api.bsky.app"))
-        count = await docs.fetchCount
-        XCTAssertEqual(count, 3)
-
-        // Within max-age (5s < 10s)
-        clock.advance(by: 5)
-        let thirdCached = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        XCTAssertEqual(thirdCached, URL(string: "https://api.bsky.app"))
-        count = await docs.fetchCount
-        XCTAssertEqual(count, 3)
-
-        // Past max-age (5s + 6s = 11s > 10s)
-        clock.advance(by: 6)
-        let fourth = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        XCTAssertEqual(fourth, URL(string: "https://api.bsky.app"))
-        count = await docs.fetchCount
-        XCTAssertEqual(count, 4, "source max-age must take precedence when shorter than local lifetime")
-    }
-
     func testSemanticFailureIsNotCachedAndAllowsImmediateSourceRepair() async throws {
         let docs = ControllableDocuments(json: #"{"id":"did:web:x.example","service":[]}"#)
-        let resolver = try SwanServiceEndpointResolver(documents: docs)
+        let resolver = SwanServiceEndpointResolver(documents: docs)
 
         // Empty services -> semantic failure
         do {
@@ -685,259 +511,6 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
         count = await docs.fetchCount
         XCTAssertEqual(count, 2, "semantic failure must not be cached")
     }
-
-    func testInvalidConfigurationIsRejectedAtConstruction() {
-        let docs = StubDocuments(json: document)
-        XCTAssertThrowsError(try SwanServiceEndpointResolver(
-            documents: docs,
-            cacheConfiguration: .init(lifetime: 4)
-        ))
-        XCTAssertThrowsError(try SwanServiceEndpointResolver(
-            documents: docs,
-            cacheConfiguration: .init(lifetime: 301)
-        ))
-        XCTAssertThrowsError(try SwanServiceEndpointResolver(
-            documents: docs,
-            cacheConfiguration: .init(lifetime: .nan)
-        ))
-        XCTAssertThrowsError(try SwanServiceEndpointResolver(
-            documents: docs,
-            cacheConfiguration: .init(maximumEntries: 0)
-        ))
-        XCTAssertThrowsError(try SwanServiceEndpointResolver(
-            documents: docs,
-            cacheConfiguration: .init(maximumEntries: 1025)
-        ))
-    }
-    func testCoalescedWaiterAdmittedToCacheWhenCreatorCancelled() async throws {
-        let docs = ControllableDocuments(json: document, gated: true)
-        let resolver = try SwanServiceEndpointResolver(documents: docs)
-
-        let creator = Task {
-            try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        }
-        let clock = ContinuousClock()
-        let deadline1 = clock.now.advanced(by: .seconds(3))
-        while (await resolver.inFlightWaiterCount(for: "did:web:api.bsky.app") < 1) && clock.now < deadline1 {
-            await Task.yield()
-        }
-        let count1 = await resolver.inFlightWaiterCount(for: "did:web:api.bsky.app")
-        XCTAssertEqual(count1, 1)
-
-        let joined = Task {
-            try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        }
-        let deadline2 = clock.now.advanced(by: .seconds(3))
-        while (await resolver.inFlightWaiterCount(for: "did:web:api.bsky.app") < 2) && clock.now < deadline2 {
-            await Task.yield()
-        }
-        let count2 = await resolver.inFlightWaiterCount(for: "did:web:api.bsky.app")
-        XCTAssertEqual(count2, 2)
-
-        creator.cancel()
-        do {
-            _ = try await boundedJoin(creator)
-            XCTFail("creator should have thrown CancellationError")
-        } catch is CancellationError {
-            // Expected
-        } catch {
-            XCTFail("unexpected error: \(error)")
-        }
-
-        await docs.releaseAll()
-        let joinedURL = try await boundedJoin(joined)
-        XCTAssertEqual(joinedURL, URL(string: "https://api.bsky.app"))
-
-        let count = await docs.fetchCount
-        XCTAssertEqual(count, 1)
-
-        // Subsequent request must be served from cache without refetching
-        let cached = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        XCTAssertEqual(cached, URL(string: "https://api.bsky.app"))
-        let countAfter = await docs.fetchCount
-        XCTAssertEqual(countAfter, 1, "subsequent request must hit cache even though flight creator was cancelled")
-    }
-
-    func testCoalescedWaiterAdmittedToCacheWhenCreatorFragmentFails() async throws {
-        let docs = ControllableDocuments(json: document, gated: true)
-        let resolver = try SwanServiceEndpointResolver(documents: docs)
-
-        // Creator requests non-existent fragment `#nonexistent`
-        let creator = Task {
-            try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "nonexistent")
-        }
-        let clock = ContinuousClock()
-        let deadline1 = clock.now.advanced(by: .seconds(3))
-        while (await resolver.inFlightWaiterCount(for: "did:web:api.bsky.app") < 1) && clock.now < deadline1 {
-            await Task.yield()
-        }
-        let count1 = await resolver.inFlightWaiterCount(for: "did:web:api.bsky.app")
-        XCTAssertEqual(count1, 1)
-
-        // Joined caller requests valid fragment `#bsky_appview`
-        let joined = Task {
-            try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        }
-        let deadline2 = clock.now.advanced(by: .seconds(3))
-        while (await resolver.inFlightWaiterCount(for: "did:web:api.bsky.app") < 2) && clock.now < deadline2 {
-            await Task.yield()
-        }
-        let count2 = await resolver.inFlightWaiterCount(for: "did:web:api.bsky.app")
-        XCTAssertEqual(count2, 2)
-
-        await docs.releaseAll()
-
-        do {
-            _ = try await boundedJoin(creator)
-            XCTFail("creator should have thrown unresolvableService")
-        } catch let error as SwanServiceResolutionFailure {
-            XCTAssertEqual(error, .unresolvableService)
-        } catch {
-            XCTFail("unexpected error: \(error)")
-        }
-
-        let joinedURL = try await boundedJoin(joined)
-        XCTAssertEqual(joinedURL, URL(string: "https://api.bsky.app"))
-
-        // Subsequent request for `#other` fragment on the same document must hit cache
-        let otherURL = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "other")
-        XCTAssertEqual(otherURL, URL(string: "https://other.example"))
-        let count = await docs.fetchCount
-        XCTAssertEqual(count, 1, "document should be cached and serve subsequent fragment lookups")
-    }
-
-    func testCacheControlAgeHeaderSubtractsFromMaxAge() {
-        // max-age=60, Age: 59 -> remaining maxAge is 1
-        let (maxAge1, noStore1) = SwanPeerPinnedDIDDocumentFetcher.parseCacheControl(headers: [
-            "cache-control": ["max-age=60"],
-            "age": ["59"]
-        ])
-        XCTAssertEqual(maxAge1, 1)
-        XCTAssertFalse(noStore1)
-
-        // max-age=60, Age: 60 -> remaining is 0 -> noStore true, maxAge 0
-        let (maxAge2, noStore2) = SwanPeerPinnedDIDDocumentFetcher.parseCacheControl(headers: [
-            "cache-control": ["max-age=60"],
-            "age": ["60"]
-        ])
-        XCTAssertEqual(maxAge2, 0)
-        XCTAssertTrue(noStore2)
-
-        // max-age=60, Age: 100 -> remaining is 0 -> noStore true, maxAge 0
-        let (maxAge3, noStore3) = SwanPeerPinnedDIDDocumentFetcher.parseCacheControl(headers: [
-            "cache-control": ["max-age=60"],
-            "age": ["100"]
-        ])
-        XCTAssertEqual(maxAge3, 0)
-        XCTAssertTrue(noStore3)
-
-        // no Age header -> uses max-age as is
-        let (maxAge4, noStore4) = SwanPeerPinnedDIDDocumentFetcher.parseCacheControl(headers: [
-            "cache-control": ["max-age=60"]
-        ])
-        XCTAssertEqual(maxAge4, 60)
-        XCTAssertFalse(noStore4)
-
-        // no-store directive -> noStore true regardless of Age
-        let (_, noStore5) = SwanPeerPinnedDIDDocumentFetcher.parseCacheControl(headers: [
-            "cache-control": ["no-store, max-age=60"],
-            "age": ["10"]
-        ])
-        XCTAssertTrue(noStore5)
-
-        // 400-digit Age -> overflows Double to inf, clamped to greatestFiniteMagnitude -> remaining is 0 -> noStore true, maxAge 0
-        let (maxAge6, noStore6) = SwanPeerPinnedDIDDocumentFetcher.parseCacheControl(headers: [
-            "cache-control": ["max-age=60"],
-            "age": [String(repeating: "9", count: 400)]
-        ])
-        XCTAssertEqual(maxAge6, 0)
-        XCTAssertTrue(noStore6)
-
-        // Malformed Age headers (inf, Infinity, negative, non-digit) must be ignored, preserving source max-age
-        let (maxAge7, noStore7) = SwanPeerPinnedDIDDocumentFetcher.parseCacheControl(headers: [
-            "cache-control": ["max-age=60"],
-            "age": ["inf"]
-        ])
-        XCTAssertEqual(maxAge7, 60)
-        XCTAssertFalse(noStore7)
-
-        let (maxAge8, noStore8) = SwanPeerPinnedDIDDocumentFetcher.parseCacheControl(headers: [
-            "cache-control": ["max-age=60"],
-            "age": ["Infinity"]
-        ])
-        XCTAssertEqual(maxAge8, 60)
-        XCTAssertFalse(noStore8)
-
-        let (maxAge9, noStore9) = SwanPeerPinnedDIDDocumentFetcher.parseCacheControl(headers: [
-            "cache-control": ["max-age=60"],
-            "age": ["-10"]
-        ])
-        XCTAssertEqual(maxAge9, 60)
-        XCTAssertFalse(noStore9)
-
-        let (maxAge10, noStore10) = SwanPeerPinnedDIDDocumentFetcher.parseCacheControl(headers: [
-            "cache-control": ["max-age=60"],
-            "age": ["invalid"]
-        ])
-        XCTAssertEqual(maxAge10, 60)
-        XCTAssertFalse(noStore10)
-    }
-
-    func testSingleCallerFailingFragmentResolutionIsNotAdmittedToCache() async throws {
-        let docs = ControllableDocuments(json: document)
-        let resolver = try SwanServiceEndpointResolver(documents: docs)
-
-        // Single caller requests non-existent fragment
-        do {
-            _ = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "nonexistent")
-            XCTFail("should have failed with unresolvableService")
-        } catch let error as SwanServiceResolutionFailure {
-            XCTAssertEqual(error, .unresolvableService)
-        }
-
-        let count1 = await docs.fetchCount
-        XCTAssertEqual(count1, 1)
-
-        // Subsequent request for a valid fragment on the same DID must NOT hit cache (must trigger a new fetch)
-        let url = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        XCTAssertEqual(url, URL(string: "https://api.bsky.app"))
-        let count2 = await docs.fetchCount
-        XCTAssertEqual(count2, 2, "subsequent request must refetch because prior resolution failed fragment check")
-    }
-
-    func testCompletedFlightVisibleAndAdmittedByJoinedWaiter() async throws {
-        let docs = ControllableDocuments(json: document, gated: true)
-        let resolver = try SwanServiceEndpointResolver(documents: docs)
-
-        // Launch creator
-        let creator = Task {
-            try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        }
-
-        // Wait until flight is in-flight with waiter count 1
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(3))
-        while (await resolver.inFlightWaiterCount(for: "did:web:api.bsky.app") < 1) && clock.now < deadline {
-            await Task.yield()
-        }
-
-        // Release the fetch so the flight completes
-        await docs.releaseAll()
-
-        // Launch a second request: must reuse the completed flight / cache admission
-        let second = Task {
-            try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
-        }
-
-        let url1 = try await boundedJoin(creator)
-        let url2 = try await boundedJoin(second)
-        XCTAssertEqual(url1, URL(string: "https://api.bsky.app"))
-        XCTAssertEqual(url2, URL(string: "https://api.bsky.app"))
-
-        let count = await docs.fetchCount
-        XCTAssertEqual(count, 1, "completed flight must be reused without starting a second upstream fetch")
-    }
-
     func testBoundedJoinStateCompleteBeforeInstall() async throws {
         let state = BoundedJoinState<Int>()
         state.complete(with: .success(42))

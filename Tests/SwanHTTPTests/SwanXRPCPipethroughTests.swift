@@ -633,7 +633,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
             ),
             tokens: TestProxyServiceTokenIssuer(),
             sender: sender,
-            resolver: try SwanServiceEndpointResolver(documents: CancellingDIDDocuments()),
+            resolver: SwanServiceEndpointResolver(documents: CancellingDIDDocuments()),
             appView: try SwanAppViewConfiguration()
         )
         capability.register(on: router)
@@ -1571,7 +1571,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
                 ),
             tokens: TestProxyServiceTokenIssuer(),
             sender: sender,
-            resolver: try SwanServiceEndpointResolver(documents: documents),
+            resolver: SwanServiceEndpointResolver(documents: documents),
             appView: try appView ?? SwanAppViewConfiguration(),
             limits: limits
         )
