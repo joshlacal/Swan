@@ -4324,11 +4324,27 @@ final class SwanSQLiteTests: XCTestCase {
             commitment: ltHash.commitment
         )
 
+        actor InTransactionObservation {
+            var authorityRowCount: Int = -1
+            func record(count: Int) {
+                authorityRowCount = count
+            }
+            func count() -> Int { authorityRowCount }
+        }
+        let observation = InTransactionObservation()
+
         let barrier = SnapshotReadBarrier()
         await database.installTestingHooks(
             SQLiteTestingHooks(
                 afterValidatePortableRestoreStateRead: {
                     await barrier.pause()
+                },
+                onValidatePortableRestoreStreamingTransaction: { conn in
+                    let rows = try await conn.query(
+                        "SELECT COUNT(*) AS c FROM permissioned_simple_space_authorities"
+                    )
+                    let c = rows.first?.column("c")?.integer ?? -1
+                    await observation.record(count: Int(c))
                 }
             )
         )
@@ -4365,8 +4381,17 @@ final class SwanSQLiteTests: XCTestCase {
         // Release validationTask to finish validating values and closures on readConnection
         await barrier.release()
 
-        // Must succeed without error under readConnection snapshot (which saw permissioned_simple_space_authorities as empty)
+        // Must succeed without error under readConnection snapshot
         try await validationTask.value
+
+        // Assert on the in-transaction observation: inside the validation transaction
+        // on readConnection, permissioned_simple_space_authorities had 0 rows.
+        let inTransactionCount = await observation.count()
+        XCTAssertEqual(
+            inTransactionCount,
+            0,
+            "in-flight validation transaction on readConnection must observe 0 authorities from its frozen pre-commit snapshot"
+        )
 
         // Subsequent read on readConnection sees the newly committed space
         let hostedSpaces = try await database.hostedSpaceURIs(

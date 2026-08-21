@@ -1668,6 +1668,7 @@ struct SQLiteTestingHooks: Sendable {
     var beforeWireOplogValueMaterialization: (@Sendable () async throws -> Void)?
     var afterSimpleSpaceMemberPageAuthorityRead: (@Sendable () async -> Void)?
     var afterValidatePortableRestoreStateRead: (@Sendable () async -> Void)?
+    var onValidatePortableRestoreStreamingTransaction: (@Sendable (SQLiteConnection) async throws -> Void)?
     var onReaderClose: (@Sendable () async throws -> Void)?
     var incrementalReplayRetentionOperationLimit: Int?
     init(
@@ -1684,6 +1685,7 @@ struct SQLiteTestingHooks: Sendable {
         beforeWireOplogValueMaterialization: (@Sendable () async throws -> Void)? = nil,
         afterSimpleSpaceMemberPageAuthorityRead: (@Sendable () async -> Void)? = nil,
         afterValidatePortableRestoreStateRead: (@Sendable () async -> Void)? = nil,
+        onValidatePortableRestoreStreamingTransaction: (@Sendable (SQLiteConnection) async throws -> Void)? = nil,
         onReaderClose: (@Sendable () async throws -> Void)? = nil,
         incrementalReplayRetentionOperationLimit: Int? = nil
     ) {
@@ -1701,6 +1703,8 @@ struct SQLiteTestingHooks: Sendable {
         self.beforeWireOplogValueMaterialization = beforeWireOplogValueMaterialization
         self.afterSimpleSpaceMemberPageAuthorityRead = afterSimpleSpaceMemberPageAuthorityRead
         self.afterValidatePortableRestoreStateRead = afterValidatePortableRestoreStateRead
+        self.onValidatePortableRestoreStreamingTransaction =
+            onValidatePortableRestoreStreamingTransaction
         self.onReaderClose = onReaderClose
         self.incrementalReplayRetentionOperationLimit =
             incrementalReplayRetentionOperationLimit
@@ -4802,6 +4806,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         )
                     }
                 }
+                if let hook = testingHooks.onValidatePortableRestoreStreamingTransaction {
+                    try await hook(readConnection)
+                }
             }
         }
     }
@@ -7632,7 +7639,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             throw SwanError.malformed("blob export limit is invalid")
         }
         let columns = blobNamespaceColumns(reference.namespace)
-        try await withConnectionGate {
+        enum StreamPlan {
+            case legacy(StoredBlobPayload)
+            case cas(SQLiteVerifiedSpaceBlobBody)
+        }
+        let plan: StreamPlan = try await withConnectionGate {
             try await writerReadTransaction {
                 guard let stored = try await blobPayloadIfReachableWithoutGate(
                     cid: reference.cid,
@@ -7648,20 +7659,30 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 }
                 switch stored.storageKind {
                 case .legacySQLite:
+                    return .legacy(stored)
+                case .casV1:
+                    let body = try await fileBackedBlobBody(stored)
+                    return .cas(body)
+                }
+            }
+        }
+        switch plan {
+        case .legacy(let stored):
+            try await withConnectionGate {
+                try await writerReadTransaction {
                     try await streamLegacySQLiteBlobDataWithoutGate(
                         stored: stored,
                         namespaceKind: columns.kind,
                         spaceURI: columns.spaceURI,
                         consume: consume
                     )
-                case .casV1:
-                    let body = try await fileBackedBlobBody(stored)
-                    try await body.streamBody(
-                        maximumChunkBytes: SpaceCARBodySpool.maximumChunkBytes,
-                        consume: consume
-                    )
                 }
             }
+        case .cas(let body):
+            try await body.streamBody(
+                maximumChunkBytes: SpaceCARBodySpool.maximumChunkBytes,
+                consume: consume
+            )
         }
     }
 
