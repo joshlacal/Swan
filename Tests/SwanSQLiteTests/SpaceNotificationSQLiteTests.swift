@@ -738,6 +738,59 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             remaining.contains { $0.column("request_id")?.string == legacyRequestID.uuidString }
         )
     }
+
+    func testActiveRegistrationLookupReturnsTrueForRegisteredEndpointAndBindsCorrectly() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+        let now = Date(timeIntervalSince1970: 1_750_000_200)
+        let endpoint = "https://notify.example/xrpc/com.atproto.space.notifySpaceDeleted"
+        let credential = fixture.readCredential()
+
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpoint,
+                repository: fixture.writer,
+                expiresAt: now.addingTimeInterval(600)
+            ),
+            authorization: credential,
+            now: now
+        )
+
+        let isActive = try await database.isSpaceNotificationRegistrationActive(
+            space: fixture.space,
+            endpoint: endpoint,
+            repository: fixture.writer,
+            now: now
+        )
+        XCTAssertTrue(isActive, "active registered endpoint must return true")
+
+        let isExpired = try await database.isSpaceNotificationRegistrationActive(
+            space: fixture.space,
+            endpoint: endpoint,
+            repository: fixture.writer,
+            now: now.addingTimeInterval(601)
+        )
+        XCTAssertFalse(isExpired, "expired registration must return false")
+
+        let isUnregistered = try await database.isSpaceNotificationRegistrationActive(
+            space: fixture.space,
+            endpoint: "https://other.example/notify",
+            repository: nil,
+            now: now
+        )
+        XCTAssertFalse(isUnregistered, "unregistered endpoint must return false")
+
+        let isOtherSpace = try await database.isSpaceNotificationRegistrationActive(
+            space: fixture.secondarySpace,
+            endpoint: endpoint,
+            repository: nil,
+            now: now
+        )
+        XCTAssertFalse(isOtherSpace, "registration for different space must return false")
+    }
 }
 
 private struct NotificationFixture {

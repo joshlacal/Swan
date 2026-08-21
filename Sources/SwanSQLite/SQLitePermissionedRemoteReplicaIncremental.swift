@@ -17,7 +17,7 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaIncrementalStore {
             throw PermissionedRemoteReplicaRecoveryError.receiverMismatch
         }
         return try await withConnectionGate {
-            try await readTransaction {
+            try await writerReadTransaction {
                 guard let head = try await incrementalHead(target: target) else {
                     return nil
                 }

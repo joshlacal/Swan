@@ -5,6 +5,7 @@ import SQLiteNIO
 import SwanCore
 @_spi(PortableRestore) @testable import SwanSQLite
 import SwanPublicFirehose
+import SwanPublicRepository
 import SwanSpaces
 import SwanStorage
 import XCTest
@@ -4087,6 +4088,121 @@ final class SwanSQLiteTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: SQLiteLayout.controlDatabase(in: target).path
         ))
+    }
+
+    func testReadInFlightAcrossCloseWaitsForReadGate() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        _ = try await fixture.commitFirst(on: database)
+
+        let readStarted = AsyncSignal()
+        let releaseRead = AsyncSignal()
+        let readFinished = AsyncSignal()
+
+        let readTask = Task {
+            try await database.withReadConnectionGate {
+                await readStarted.signal()
+                await releaseRead.wait()
+                let rows = try await database.readConnection.query(
+                    "SELECT COUNT(*) AS c FROM permissioned_repository_state"
+                )
+                await readFinished.signal()
+                return rows.first?.column("c")?.integer
+            }
+        }
+
+        await readStarted.wait()
+
+        let closeTask = Task {
+            try await database.close()
+        }
+
+        // Give closeTask a moment to arrive at the gates
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        // Release the read
+        await releaseRead.signal()
+        await readFinished.wait()
+
+        let count = try await readTask.value
+        XCTAssertEqual(count, 1)
+        try await closeTask.value
+    }
+
+    func testConcurrentCommitDuringPublicRepositoryRecordCIDDoesNotCauseFalseCorruption() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanPublicRecordCIDTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: 0o700)]
+        )
+
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        let key = P256.Signing.PrivateKey()
+        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        defer { Task { try? await database.close() } }
+
+        let genesis = try PublicRepositoryGenesisCodec.create(
+            did: did,
+            revision: "3jzfcijpj2z2a",
+            signingKey: key
+        )
+        _ = try await database.installPublicRepositoryGenesis(
+            genesis,
+            signingPublicKey: key.publicKey,
+            installedAt: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+
+        let path = try PublicRepositoryPath(
+            collection: "app.bsky.feed.post",
+            recordKey: "test-post"
+        )
+        let record = PublicRecord(["$type": .string("app.bsky.feed.post"), "text": .string("hello")])
+        let preparedRecord = try PublicRepositoryRecordCodec.prepare(record, for: path)
+        let recordCID = preparedRecord.cid
+        // Initial query when no record exists returns nil
+        let initial = try await database.publicRepositoryRecordCID(for: path)
+        XCTAssertNil(initial)
+
+        // Reserve and apply mutation on writer connection
+        let loadedInitial = try await database.loadPublicRepositoryState()
+        let initialPublicState = try XCTUnwrap(loadedInitial)
+        let request = try PublicRepositoryMutationRequest(
+            id: "req-1",
+            canonicalDigest: Data(repeating: 0x42, count: 32),
+            baseCommitCID: initialPublicState.commitCID
+        )
+        let outcome = try await database.reservePublicRepositoryRevision(
+            request,
+            wallClockMicroseconds: 1_750_000_000_000_000
+        )
+        guard case let .reserved(reservation) = outcome else {
+            return XCTFail("expected reserved outcome")
+        }
+        let prepared = try await PublicRepositoryEngine.apply(
+            repositoryDID: did,
+            currentState: initialPublicState,
+            blocks: database,
+            revision: reservation.nextRevision,
+            batch: try PublicRepositoryWriteBatch(
+                writes: [.create(
+                    path: path,
+                    record: record
+                )],
+                expectedCommitCID: initialPublicState.commitCID
+            ),
+            signer: P256PublicRepositoryCommitSigner(privateKey: key)
+        )
+        _ = try await database.applyPublicRepositoryMutation(
+            reservation: reservation,
+            prepared: prepared
+        )
+
+        // Verify record CID on readConnection inside readTransaction
+        let cid = try await database.publicRepositoryRecordCID(for: path)
+        XCTAssertEqual(cid, recordCID)
     }
 }
 

@@ -755,7 +755,7 @@ extension SQLiteAccountDatabase:
                 let session = try await requireActiveRemoteReplicaSession(
                     id: sessionID, now: now, allowed: [.verifying]
                 )
-                let validation = try await readTransaction {
+                let validation = try await writerReadTransaction {
                     try await validateStagedRemoteReplica(
                         sessionID: sessionID,
                         binding: session.binding
@@ -864,7 +864,7 @@ extension SQLiteAccountDatabase:
             let session = try await requireActiveRemoteReplicaSession(
                 id: sessionID, now: now, allowed: [.verified]
             )
-            let validation = try await readTransaction {
+            let validation = try await writerReadTransaction {
                 try await validateStagedRemoteReplica(
                     sessionID: sessionID,
                     binding: session.binding
@@ -883,7 +883,7 @@ extension SQLiteAccountDatabase:
             )
             let currentProjection: RemoteReplicaProjectionValidation?
             if let current {
-                currentProjection = try await readTransaction {
+                currentProjection = try await writerReadTransaction {
                     try await validateRemoteReplicaGeneration(
                         target: session.binding.target,
                         generation: current.generation,
@@ -981,7 +981,7 @@ extension SQLiteAccountDatabase:
                     generation: generation,
                     now: now
                 )
-                let prepared = try await readTransaction {
+                let prepared = try await writerReadTransaction {
                     try await validateRemoteReplicaGeneration(
                         target: session.binding.target,
                         generation: generation,
@@ -1368,7 +1368,7 @@ extension SQLiteAccountDatabase:
             rkey: rkey
         )
         return try await withConnectionGate {
-            try await readTransaction {
+            try await writerReadTransaction {
                 guard let head = try await loadPermissionedRemoteReplicaHead(
                     target: target
                 ) else { return nil }

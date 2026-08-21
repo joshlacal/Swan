@@ -232,8 +232,8 @@ private struct PreparedPublicFirehoseMaterial {
 
 extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
     public func loadPublicRepositoryState() async throws -> PublicRepositoryState? {
-        try await withConnectionGate {
-            try await loadPublicRepositoryStateWithoutGate()
+        try await withReadConnectionGate {
+            try await loadPublicRepositoryStateWithoutGate(connection: readConnection)
         }
     }
 
@@ -252,8 +252,8 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         } catch {
             throw PublicRepositoryMutationStoreError.corruptRepository
         }
-        return try await withConnectionGate {
-            switch try await boundedPublicRepositoryBlock(connection: connection, cid: cid) {
+        return try await withReadConnectionGate {
+            switch try await boundedPublicRepositoryBlock(connection: readConnection, cid: cid) {
             case .missing:
                 return nil
             case .oversized:
@@ -272,36 +272,38 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
     public func publicRepositoryRecordCID(
         for path: PublicRepositoryPath
     ) async throws -> CID? {
-        try await withConnectionGate {
-            guard let state = try await loadPublicRepositoryStateWithoutGate() else {
-                throw PublicRepositoryMutationStoreError.repositoryNotInstalled
-            }
-            let rows = try await connection.query(
-                """
-                SELECT collection, rkey, record_cid
-                FROM public_repository_record_index
-                WHERE collection = ? AND rkey = ?
-                """,
-                [.text(path.collection), .text(path.recordKey)]
-            )
-            guard rows.count <= 1 else {
-                throw PublicRepositoryMutationStoreError.corruptRepository
-            }
-            let indexedCID = try rows.first.map(decodeIndexCID)
-            let mstCID: CID?
-            do {
-                let tree = try RepositoryMST.load(
-                    rootCID: state.dataCID,
-                    blocks: SQLitePublicRepositoryBlockSource(connection: connection)
+        try await withReadConnectionGate {
+            try await readTransaction {
+                guard let state = try await loadPublicRepositoryStateWithoutGate(connection: readConnection) else {
+                    throw PublicRepositoryMutationStoreError.repositoryNotInstalled
+                }
+                let rows = try await readConnection.query(
+                    """
+                    SELECT collection, rkey, record_cid
+                    FROM public_repository_record_index
+                    WHERE collection = ? AND rkey = ?
+                    """,
+                    [.text(path.collection), .text(path.recordKey)]
                 )
-                mstCID = try await tree.get(path)
-            } catch {
-                throw PublicRepositoryMutationStoreError.corruptRepository
+                guard rows.count <= 1 else {
+                    throw PublicRepositoryMutationStoreError.corruptRepository
+                }
+                let indexedCID = try rows.first.map(decodeIndexCID)
+                let mstCID: CID?
+                do {
+                    let tree = try RepositoryMST.load(
+                        rootCID: state.dataCID,
+                        blocks: SQLitePublicRepositoryBlockSource(connection: readConnection)
+                    )
+                    mstCID = try await tree.get(path)
+                } catch {
+                    throw PublicRepositoryMutationStoreError.corruptRepository
+                }
+                guard indexedCID == mstCID else {
+                    throw PublicRepositoryMutationStoreError.corruptRepository
+                }
+                return indexedCID
             }
-            guard indexedCID == mstCID else {
-                throw PublicRepositoryMutationStoreError.corruptRepository
-            }
-            return indexedCID
         }
     }
 
@@ -888,8 +890,9 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         return Data(SHA256.hash(data: bytes))
     }
 
-    func loadPublicRepositoryStateWithoutGate() async throws -> PublicRepositoryState? {
-        let rows = try await connection.query(
+    func loadPublicRepositoryStateWithoutGate(connection: SQLiteConnection? = nil) async throws -> PublicRepositoryState? {
+        let conn = connection ?? self.connection
+        let rows = try await conn.query(
             """
             SELECT did, revision, commit_cid, data_cid
             FROM public_repository_state WHERE singleton = 1
@@ -1150,9 +1153,10 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         }
     }
 
-    func blockBytesWithoutGate(_ cid: CID) async throws -> Data {
+    func blockBytesWithoutGate(_ cid: CID, connection: SQLiteConnection? = nil) async throws -> Data {
+        let conn = connection ?? self.connection
         let bytes: Data
-        switch try await boundedPublicRepositoryBlock(connection: connection, cid: cid) {
+        switch try await boundedPublicRepositoryBlock(connection: conn, cid: cid) {
         case .missing, .oversized:
             throw PublicRepositoryMutationStoreError.corruptRepository
         case let .bytes(value):
