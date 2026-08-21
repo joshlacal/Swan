@@ -1,5 +1,5 @@
 {
-  "originHash" : "051be6817b08a176e75702609fe48092ace90d7df8d2b894dd203687951bb156",
+  "originHash" : "0046950959f979ddf0c9a02231d92440011e28cf1b699ec7f9ba93c8389c5572",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -53,6 +53,14 @@
       "state" : {
         "revision" : "b7d3ef55660fefd045641293bc95d4cdc07a15d8",
         "version" : "6.0.4"
+      }
+    },
+    {
+      "identity" : "petrel",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/joshlacal/Petrel.git",
+      "state" : {
+        "revision" : "2bfd941ae82ec5975032c2e6bdf1c0607dabd5d0"
       }
     },
     {

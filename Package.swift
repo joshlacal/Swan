@@ -22,7 +22,19 @@ let package = Package(
         .executable(name: "swan", targets: ["swan"]),
     ],
     dependencies: [
-        .package(path: "../Petrel"),
+        // Petrel comes from its published repository, pinned to an exact
+        // revision, not from a sibling checkout. A `path:` dependency compiles
+        // against whatever line the neighbouring working copy happens to be
+        // sitting on, which is invisible in this manifest and unreproducible
+        // anywhere else: Swan silently built against three different Petrel
+        // lines depending on who had checked out what. The pin below is the
+        // commit that makes `CIDAsLink` public, which every record carrying a
+        // blob or a StrongRef needs. Bump it deliberately, in a commit that
+        // says why.
+        .package(
+            url: "https://github.com/joshlacal/Petrel.git",
+            revision: "2bfd941ae82ec5975032c2e6bdf1c0607dabd5d0"
+        ),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.36.0"),
