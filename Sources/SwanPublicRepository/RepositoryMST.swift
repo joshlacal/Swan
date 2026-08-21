@@ -563,7 +563,7 @@ public struct RepositoryMST: Sendable {
         let bytes: Data
         do {
             node = try RepositoryMSTCodec.node(leaves: leaves, leftTreeCID: leftTreeCID)
-            bytes = try RepositoryMSTCodec.encode(node)
+            bytes = try RepositoryMSTCodec.encodeUnchecked(node)
         } catch {
             throw RepositoryMSTMutationError.invalidNode
         }

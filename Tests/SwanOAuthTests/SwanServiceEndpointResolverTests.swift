@@ -18,7 +18,8 @@ private struct FailingDocuments: SwanDIDDocumentFetching {
 private actor ControllableDocuments: SwanDIDDocumentFetching {
     private var json: String
     private var count = 0
-    private var releaseContinuations: [CheckedContinuation<Void, Never>] = []
+    private var nextContinuationID = 0
+    private var releaseContinuations: [Int: CheckedContinuation<Void, Error>] = [:]
     private var gated = false
 
     init(json: String, gated: Bool = false) {
@@ -36,25 +37,62 @@ private actor ControllableDocuments: SwanDIDDocumentFetching {
 
     func releaseAll() {
         gated = false
-        let conts = releaseContinuations
+        let conts = Array(releaseContinuations.values)
         releaseContinuations.removeAll()
         for cont in conts {
             cont.resume()
         }
     }
 
+    private func cancelContinuation(id: Int) {
+        if let cont = releaseContinuations.removeValue(forKey: id) {
+            cont.resume(throwing: CancellationError())
+        }
+    }
+
     func documentJSON(forDID did: String) async throws -> Data {
         count += 1
+        try Task.checkCancellation()
         if gated {
-            await withCheckedContinuation { continuation in
-                if !gated {
-                    continuation.resume()
-                } else {
-                    releaseContinuations.append(continuation)
+            let id = nextContinuationID
+            nextContinuationID += 1
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    if !gated {
+                        continuation.resume()
+                    } else {
+                        releaseContinuations[id] = continuation
+                    }
+                }
+            } onCancel: {
+                Task { [weak self] in
+                    await self?.cancelContinuation(id: id)
                 }
             }
         }
+        try Task.checkCancellation()
         return Data(json.utf8)
+    }
+}
+
+private actor TestAcknowledgement {
+    private var signaled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        signaled = true
+        let continuations = waiters
+        waiters.removeAll()
+        for cont in continuations {
+            cont.resume()
+        }
+    }
+
+    func wait() async {
+        if signaled { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
     }
 }
 private struct TestTimeoutError: Error, Sendable {}
@@ -384,6 +422,54 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
         let count = await docs.fetchCount
         XCTAssertEqual(count, 1, "all 10 concurrent resolutions must coalesce to exactly one upstream fetch")
     }
+    func testCoalescedWaitersWithDifferentFragmentsDoNotStarveOnCreatorFailure() async throws {
+        let docs = ControllableDocuments(json: document, gated: true)
+        let resolver = SwanServiceEndpointResolver(documents: docs)
+
+        // Creator requests non-existent fragment `#nonexistent`
+        let creator = Task {
+            try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "nonexistent")
+        }
+        let clock = ContinuousClock()
+        let deadline1 = clock.now.advanced(by: .seconds(3))
+        while (await resolver.inFlightWaiterCount(for: "did:web:api.bsky.app") < 1) && clock.now < deadline1 {
+            await Task.yield()
+        }
+        let count1 = await resolver.inFlightWaiterCount(for: "did:web:api.bsky.app")
+        XCTAssertEqual(count1, 1)
+
+        // Joined caller requests valid fragment `#bsky_appview`
+        let joined = Task {
+            try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
+        }
+        let deadline2 = clock.now.advanced(by: .seconds(3))
+        while (await resolver.inFlightWaiterCount(for: "did:web:api.bsky.app") < 2) && clock.now < deadline2 {
+            await Task.yield()
+        }
+        let count2 = await resolver.inFlightWaiterCount(for: "did:web:api.bsky.app")
+        XCTAssertEqual(count2, 2)
+
+        // Release the shared upstream fetch
+        await docs.releaseAll()
+
+        // Creator fails with unresolvableService
+        do {
+            _ = try await boundedJoin(creator)
+            XCTFail("creator should have failed with unresolvableService")
+        } catch let error as SwanServiceResolutionFailure {
+            XCTAssertEqual(error, .unresolvableService)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        // Joined caller succeeds with the resolved URL
+        let result = try await boundedJoin(joined)
+        XCTAssertEqual(result, URL(string: "https://api.bsky.app"))
+
+        let count = await docs.fetchCount
+        XCTAssertEqual(count, 1, "both callers must share exactly 1 upstream fetch")
+    }
+
 
     func testCancellingOneWaiterDoesNotCancelSharedFetchForOtherWaiters() async throws {
         let docs = ControllableDocuments(json: document, gated: true)
@@ -511,46 +597,57 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
         count = await docs.fetchCount
         XCTAssertEqual(count, 2, "semantic failure must not be cached")
     }
+
     func testBoundedJoinStateCompleteBeforeInstall() async throws {
         let state = BoundedJoinState<Int>()
         state.complete(with: .success(42))
         // Duplicate completion must be ignored
         state.complete(with: .success(99))
-        let result = try await withCheckedThrowingContinuation { cont in
-            state.install(cont)
+        let task = Task {
+            try await withCheckedThrowingContinuation { cont in
+                state.install(cont)
+            }
         }
+        let result = try await boundedJoin(task)
         XCTAssertEqual(result, 42)
     }
 
     func testBoundedJoinStateInstallBeforeComplete() async throws {
         let state = BoundedJoinState<Int>()
+        let installed = TestAcknowledgement()
         let task = Task {
             try await withCheckedThrowingContinuation { cont in
                 state.install(cont)
+                Task {
+                    await installed.signal()
+                }
             }
         }
-        // Give task a moment to install continuation
-        try await Task.sleep(for: .milliseconds(20))
+        await installed.wait()
         state.complete(with: .success(100))
         // Duplicate completion ignored
         state.complete(with: .success(200))
-        let result = try await task.value
+        let result = try await boundedJoin(task)
         XCTAssertEqual(result, 100)
     }
 
     func testBoundedJoinStateTimeoutResumesContinuationOnce() async throws {
         let state = BoundedJoinState<Int>()
+        let installed = TestAcknowledgement()
         let task = Task {
             try await withCheckedThrowingContinuation { cont in
                 state.install(cont)
+                Task {
+                    await installed.signal()
+                }
             }
         }
-        try await Task.sleep(for: .milliseconds(20))
+        await installed.wait()
         state.complete(with: .failure(TestTimeoutError()))
         // Subsequent completion ignored
         state.complete(with: .success(42))
         do {
-            _ = try await task.value
+            _ = try await boundedJoin(task)
             XCTFail("should have failed with TestTimeoutError")
         } catch is TestTimeoutError {
             // Expected
@@ -561,17 +658,21 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
 
     func testBoundedJoinStateCancellationResumesContinuationOnce() async throws {
         let state = BoundedJoinState<Int>()
+        let installed = TestAcknowledgement()
         let task = Task {
             try await withCheckedThrowingContinuation { cont in
                 state.install(cont)
+                Task {
+                    await installed.signal()
+                }
             }
         }
-        try await Task.sleep(for: .milliseconds(20))
+        await installed.wait()
         state.complete(with: .failure(CancellationError()))
         // Subsequent completion ignored
         state.complete(with: .success(42))
         do {
-            _ = try await task.value
+            _ = try await boundedJoin(task)
             XCTFail("should have failed with CancellationError")
         } catch is CancellationError {
             // Expected
@@ -604,14 +705,16 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
     }
 
     func testBoundedJoinWhenTaskCancelled() async throws {
+        let started = TestAcknowledgement()
         let callerTask = Task {
             let task: Task<Int, Error> = Task {
+                await started.signal()
                 try await Task.sleep(for: .seconds(10))
                 return 42
             }
             return try await boundedJoin(task, timeoutSeconds: 3)
         }
-        try await Task.sleep(for: .milliseconds(20))
+        await started.wait()
         callerTask.cancel()
         do {
             _ = try await callerTask.value

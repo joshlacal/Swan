@@ -139,17 +139,13 @@ public enum RepositoryMSTCodec {
         if let left = node.leftTreeCID {
             try PublicRepositoryCID.validate(left)
         }
-        let entries: [Any] = try node.entries.map { entry in
-            guard entry.prefixLength >= 0,
-                  entry.prefixLength <= PublicRepositoryPath.maximumMSTKeyBytes,
-                  !entry.keySuffix.isEmpty else {
-                throw RepositoryMSTValidationError.invalidPrefixCompression
-            }
-            try PublicRepositoryCID.validate(entry.valueCID)
-            if let right = entry.rightTreeCID {
-                try PublicRepositoryCID.validate(right)
-            }
-            return OrderedCBORMap(entries: [
+        _ = try reconstructedLeaves(from: node)
+        return try encodeUnchecked(node)
+    }
+
+    package static func encodeUnchecked(_ node: RepositoryMSTNode) throws -> Data {
+        let entries: [Any] = node.entries.map { entry in
+            OrderedCBORMap(entries: [
                 (key: "p", value: UInt64(entry.prefixLength)),
                 (key: "k", value: entry.keySuffix),
                 (key: "v", value: ATProtoLink(cid: entry.valueCID)),
@@ -172,7 +168,7 @@ public enum RepositoryMSTCodec {
             throw RepositoryMSTValidationError.invalidNodeSchema
         }
         _ = try reconstructedLeaves(from: node)
-        let canonical = try encode(node)
+        let canonical = try encodeUnchecked(node)
         guard canonical == bytes else {
             throw RepositoryMSTValidationError.nonCanonicalNode
         }

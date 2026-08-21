@@ -44,6 +44,47 @@ final class RepositoryMSTVectorTests: XCTestCase {
             XCTAssertEqual(error as? RepositoryMSTValidationError, .invalidPrefixCompression)
         }
     }
+    func testEncodeRejectsNonZeroFirstPrefixCompression() throws {
+        let recordCID = CID.fromDAGCBOR(Data([0xa0]))
+        let node = RepositoryMSTNode(leftTreeCID: nil, entries: [
+            .init(prefixLength: 1, keySuffix: Data("app.bsky.feed.post/0".utf8), valueCID: recordCID, rightTreeCID: nil),
+        ])
+        XCTAssertThrowsError(try RepositoryMSTCodec.encode(node)) { error in
+            XCTAssertEqual(error as? RepositoryMSTValidationError, .invalidPrefixCompression)
+        }
+    }
+
+    func testEncodeRejectsNonMinimalPrefixCompression() throws {
+        let recordCID = CID.fromDAGCBOR(Data([0xa0]))
+        let node = RepositoryMSTNode(leftTreeCID: nil, entries: [
+            .init(prefixLength: 0, keySuffix: Data("app.bsky.feed.post/a".utf8), valueCID: recordCID, rightTreeCID: nil),
+            .init(prefixLength: 0, keySuffix: Data("app.bsky.feed.post/b".utf8), valueCID: recordCID, rightTreeCID: nil),
+        ])
+        XCTAssertThrowsError(try RepositoryMSTCodec.encode(node)) { error in
+            XCTAssertEqual(error as? RepositoryMSTValidationError, .invalidPrefixCompression)
+        }
+    }
+
+    func testEncodeRejectsKeysNotStrictlyIncreasing() throws {
+        let recordCID = CID.fromDAGCBOR(Data([0xa0]))
+        let node = RepositoryMSTNode(leftTreeCID: nil, entries: [
+            .init(prefixLength: 0, keySuffix: Data("app.bsky.feed.post/2".utf8), valueCID: recordCID, rightTreeCID: nil),
+            .init(prefixLength: 19, keySuffix: Data("1".utf8), valueCID: recordCID, rightTreeCID: nil),
+        ])
+        XCTAssertThrowsError(try RepositoryMSTCodec.encode(node)) { error in
+            XCTAssertEqual(error as? RepositoryMSTValidationError, .keysNotStrictlyIncreasing)
+        }
+    }
+    func testEncodeRejectsInvalidPathSyntax() throws {
+        let recordCID = CID.fromDAGCBOR(Data([0xa0]))
+        let node = RepositoryMSTNode(leftTreeCID: nil, entries: [
+            .init(prefixLength: 0, keySuffix: Data("invalid-collection-no-slash".utf8), valueCID: recordCID, rightTreeCID: nil),
+        ])
+        XCTAssertThrowsError(try RepositoryMSTCodec.encode(node)) { error in
+            XCTAssertEqual(error as? RepositoryMSTValidationError, .invalidPath)
+        }
+    }
+
 
     func testCanonicalPrefixCompressedNodeVector() throws {
         let first = try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "0")
