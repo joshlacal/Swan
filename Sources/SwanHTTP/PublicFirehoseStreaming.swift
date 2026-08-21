@@ -202,6 +202,9 @@ public struct PublicFirehoseTailer: Sendable {
       }
       do {
         try await writerTask.value
+        if let timeoutDuration = watchdog.checkTimedOutDuration() {
+          throw PublicFirehoseTailerError.writeTooSlow(duration: timeoutDuration)
+        }
       } catch is CancellationError {
         if let timeoutDuration = watchdog.checkTimedOutDuration() {
           throw PublicFirehoseTailerError.writeTooSlow(duration: timeoutDuration)
@@ -274,12 +277,12 @@ public struct PublicFirehoseTailer: Sendable {
       let pageClock = ContinuousClock()
       let pageStarted = pageClock.now
       for row in rows {
-        watchdog.beginWrite()
+        try watchdog.beginWrite()
         do {
           try await outbound(row.frameBytes)
-          watchdog.endWrite()
+          try watchdog.endWrite()
         } catch {
-          watchdog.endWrite()
+          try? watchdog.endWrite()
           throw error
         }
         cursor = row.seq
@@ -301,16 +304,22 @@ public struct PublicFirehoseTailer: Sendable {
 /// a single long-lived watchdog task is spawned per subscriber `run` invocation.
 /// When a frame write begins, the watchdog is informed of the deadline. If the write
 /// completes before the deadline, the watchdog is returned to idle. If the write
-/// exceeds the deadline, the watchdog marks the timeout, logs the drop, and cancels
-/// the writer task.
+/// exceeds the deadline, the watchdog atomically transitions to timedOut, logs the
+/// drop, and cancels the writer task. `endWrite` and timeout arbitrate one atomic
+/// terminal decision under a single lock.
 private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
   private let lock = NSLock()
   private let timeout: Duration
   private let logger: Logger
-  private var isWriting: Bool = false
-  private var currentDeadline: ContinuousClock.Instant?
-  private var isTerminated: Bool = false
-  private var timedOutDuration: Duration?
+
+  private enum State {
+    case idle
+    case writing(deadline: ContinuousClock.Instant)
+    case timedOut(duration: Duration)
+    case terminated
+  }
+
+  private var state: State = .idle
   private var writerTask: Task<Void, any Error>?
   private var idleContinuation: CheckedContinuation<Void, Never>?
 
@@ -325,27 +334,39 @@ private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
     }
   }
 
-  func beginWrite() {
-    let continuation: CheckedContinuation<Void, Never>? = lock.withLock {
-      self.isWriting = true
-      self.currentDeadline = ContinuousClock.now + timeout
-      let cont = self.idleContinuation
-      self.idleContinuation = nil
-      return cont
+  func beginWrite() throws {
+    let continuation: CheckedContinuation<Void, Never>? = try lock.withLock {
+      switch self.state {
+      case .terminated:
+        throw CancellationError()
+      case .timedOut(let duration):
+        throw PublicFirehoseTailerError.writeTooSlow(duration: duration)
+      case .idle, .writing:
+        self.state = .writing(deadline: ContinuousClock.now + timeout)
+        let cont = self.idleContinuation
+        self.idleContinuation = nil
+        return cont
+      }
     }
     continuation?.resume()
   }
 
-  func endWrite() {
-    lock.withLock {
-      self.isWriting = false
-      self.currentDeadline = nil
+  func endWrite() throws {
+    try lock.withLock {
+      switch self.state {
+      case .timedOut(let duration):
+        throw PublicFirehoseTailerError.writeTooSlow(duration: duration)
+      case .terminated:
+        throw CancellationError()
+      case .writing, .idle:
+        self.state = .idle
+      }
     }
   }
 
   func terminate() {
     let continuation: CheckedContinuation<Void, Never>? = lock.withLock {
-      self.isTerminated = true
+      self.state = .terminated
       let cont = self.idleContinuation
       self.idleContinuation = nil
       return cont
@@ -355,7 +376,10 @@ private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
 
   func checkTimedOutDuration() -> Duration? {
     lock.withLock {
-      self.timedOutDuration
+      if case .timedOut(let duration) = self.state {
+        return duration
+      }
+      return nil
     }
   }
 
@@ -369,13 +393,14 @@ private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
       }
 
       let action: Action = lock.withLock {
-        if self.isTerminated {
+        switch self.state {
+        case .terminated, .timedOut:
           return .terminate
-        }
-        guard self.isWriting, let deadline = self.currentDeadline else {
+        case .idle:
           return .waitForBegin
+        case .writing(let deadline):
+          return .sleep(until: deadline)
         }
-        return .sleep(until: deadline)
       }
 
       switch action {
@@ -386,9 +411,10 @@ private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
         await withCheckedContinuation { continuation in
           var shouldResumeImmediately = false
           lock.withLock {
-            if self.isTerminated || self.isWriting {
+            switch self.state {
+            case .terminated, .timedOut, .writing:
               shouldResumeImmediately = true
-            } else {
+            case .idle:
               assert(self.idleContinuation == nil)
               self.idleContinuation = continuation
             }
@@ -409,15 +435,18 @@ private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
         }
 
         let targetToCancel: Task<Void, any Error>? = lock.withLock {
-          if self.isTerminated {
+          switch self.state {
+          case .writing(let activeDeadline):
+            if clock.now >= activeDeadline {
+              self.state = .timedOut(duration: self.timeout)
+              return self.writerTask
+            }
+            return nil
+          case .idle, .terminated, .timedOut:
             return nil
           }
-          if self.isWriting, let activeDeadline = self.currentDeadline, clock.now >= activeDeadline {
-            self.timedOutDuration = self.timeout
-            return self.writerTask
-          }
-          return nil
         }
+
         if let targetToCancel {
           logger.warning("dropping slow public firehose write")
           targetToCancel.cancel()
