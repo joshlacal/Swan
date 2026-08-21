@@ -469,6 +469,53 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
         try await reopened.close()
     }
 
+    func testCancelledCommittedResultReplayRethrowsCancellation() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let binding = try binding(
+            requestID: "replay-cancellation",
+            baseCID: fixture.initial.commitCID
+        )
+        let car = try await encodeCAR(
+            root: fixture.prepared.state.commitCID,
+            frames: try await fixture.blocks()
+        )
+        _ = try await testCoordinator(fixture.database)
+            .importRepository(
+                from: InstrumentedCARSource(data: car, chunkBytes: 31),
+                binding: binding,
+                verifier: P256PublicRepositoryCommitVerifier(publicKey: fixture.key.publicKey),
+                createdAt: 100,
+                expiresAt: 200
+            )
+
+        let database = fixture.database
+        let key = fixture.key
+        let coordinator = SQLitePublicRepositoryImportCoordinator(
+            database: database,
+            beforePublish: nil,
+            now: { 201 }
+        )
+        let task = Task {
+            try Task.checkCancellation()
+            return try await coordinator.importRepository(
+                from: InstrumentedCARSource(data: Data(), chunkBytes: 1),
+                binding: binding,
+                verifier: P256PublicRepositoryCommitVerifier(publicKey: key.publicKey),
+                createdAt: 201,
+                expiresAt: 202
+            )
+        }
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("cancelled replay succeeded")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        try await fixture.database.close()
+    }
+
     func testCancellationAcrossFramingVerificationAndPrePublishLeavesNoLiveChange() async throws {
         // Canonical header ends at byte 59. The first frame then has a
         // multi-byte length prefix, a 36-byte CID, and a commit body.

@@ -1080,6 +1080,8 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                 requestID: requestID,
                 expectedBinding: expectedBinding
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as PublicRepositoryImportStagingError {
             throw error
         } catch {
@@ -1158,6 +1160,8 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
             else {
                 throw PublicRepositoryImportStagingError.corruptRepository
             }
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as PublicRepositoryImportStagingError {
             throw error
         } catch {
