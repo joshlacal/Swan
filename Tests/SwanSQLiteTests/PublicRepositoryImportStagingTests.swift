@@ -496,8 +496,9 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
             beforePublish: nil,
             now: { 201 }
         )
+        let barrier = AsyncBarrier()
         let task = Task {
-            try Task.checkCancellation()
+            await barrier.wait()
             return try await coordinator.importRepository(
                 from: InstrumentedCARSource(data: Data(), chunkBytes: 1),
                 binding: binding,
@@ -507,6 +508,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
             )
         }
         task.cancel()
+        await barrier.open()
         do {
             _ = try await task.value
             XCTFail("cancelled replay succeeded")
@@ -1816,6 +1818,27 @@ private struct CancellingVerifier: PublicRepositoryCommitVerifier {
         did _: String
     ) async throws {
         throw CancellationError()
+    }
+}
+
+private actor AsyncBarrier {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        let list = waiters
+        waiters.removeAll()
+        for waiter in list {
+            waiter.resume()
+        }
     }
 }
 
