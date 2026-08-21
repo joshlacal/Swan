@@ -50,6 +50,15 @@ private final class DIDDocumentFlightWait: @unchecked Sendable {
     private var continuation: CheckedContinuation<DIDDocumentFlightWaitOutcome, Never>?
     private var outcome: DIDDocumentFlightWaitOutcome?
 
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if case .waiterCancelled? = outcome {
+            return true
+        }
+        return false
+    }
+
     func install(_ continuation: CheckedContinuation<DIDDocumentFlightWaitOutcome, Never>) {
         lock.lock()
         if let outcome {
@@ -199,7 +208,7 @@ public struct SwanServiceEndpointResolver: Sendable {
                 flight.waiters.append(wait)
                 inFlight[did] = flight
                 let payload = try await awaitFlight(wait)
-                return try evaluateEndpoint(payload: payload, did: did, fragment: fragment, shouldCache: false)
+                return try evaluateEndpoint(document: payload.document, did: did, fragment: fragment)
             }
 
             let wait = DIDDocumentFlightWait()
@@ -230,28 +239,23 @@ public struct SwanServiceEndpointResolver: Sendable {
             }
 
             let payload = try await awaitFlight(wait)
-            return try evaluateEndpoint(payload: payload, did: did, fragment: fragment, shouldCache: true)
+            return try evaluateEndpoint(document: payload.document, did: did, fragment: fragment)
         }
 
         private func evaluateEndpoint(
-            payload: SwanDIDDocumentResolutionPayload,
+            document: Document,
             did: String,
-            fragment: String,
-            shouldCache: Bool
+            fragment: String
         ) throws -> URL {
             guard let url = SwanServiceEndpointResolver.resolveEndpoint(
-                document: payload.document,
+                document: document,
                 did: did,
                 fragment: fragment
             ) else {
                 throw SwanServiceResolutionFailure.unresolvableService
             }
-            if shouldCache && !payload.fetchResult.noStore {
-                storeInCache(payload.document, fetchResult: payload.fetchResult, for: did)
-            }
             return url
         }
-
         private func awaitFlight(_ wait: DIDDocumentFlightWait) async throws -> SwanDIDDocumentResolutionPayload {
             let outcome = await withTaskCancellationHandler(
                 operation: {
@@ -283,11 +287,14 @@ public struct SwanServiceEndpointResolver: Sendable {
                 return
             }
             inFlight.removeValue(forKey: did)
+            let hasActiveWaiter = flight.waiters.contains { !$0.isCancelled }
+            if case let .success(payload) = result, hasActiveWaiter, !payload.fetchResult.noStore {
+                storeInCache(payload.document, fetchResult: payload.fetchResult, for: did)
+            }
             for waiter in flight.waiters {
                 waiter.complete(.completed(result))
             }
         }
-
         private func storeInCache(
             _ document: Document,
             fetchResult: SwanDIDDocumentFetchResult,
@@ -426,21 +433,42 @@ public struct SwanPeerPinnedDIDDocumentFetcher: SwanDIDDocumentFetching {
         return SwanDIDDocumentFetchResult(data: data, maxAge: maxAge, noStore: noStore)
     }
 
-    private static func parseCacheControl(headers: [String: [String]]) -> (maxAge: TimeInterval?, noStore: Bool) {
-        guard let values = headers["cache-control"] else { return (nil, false) }
+    static func parseCacheControl(headers: [String: [String]]) -> (maxAge: TimeInterval?, noStore: Bool) {
         var noStore = false
         var maxAge: TimeInterval?
-        for value in values {
-            let directives = value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-            for directive in directives {
-                if directive == "no-store" || directive == "no-cache" {
-                    noStore = true
-                } else if directive.hasPrefix("max-age=") {
-                    let numberPart = directive.dropFirst("max-age=".count).trimmingCharacters(in: .whitespacesAndNewlines)
-                    if let seconds = Double(numberPart), seconds >= 0, seconds.isFinite {
-                        maxAge = seconds
+        if let values = headers["cache-control"] {
+            for value in values {
+                let directives = value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                for directive in directives {
+                    if directive == "no-store" || directive == "no-cache" {
+                        noStore = true
+                    } else if directive.hasPrefix("max-age=") {
+                        let numberPart = directive.dropFirst("max-age=".count).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if let seconds = Double(numberPart), seconds >= 0, seconds.isFinite {
+                            maxAge = seconds
+                        }
                     }
                 }
+            }
+        }
+        var age: TimeInterval = 0
+        if let ageValues = headers["age"] {
+            for value in ageValues {
+                let parts = value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                for part in parts {
+                    if let seconds = Double(part), seconds >= 0, seconds.isFinite {
+                        age = max(age, seconds)
+                    }
+                }
+            }
+        }
+        if let rawMaxAge = maxAge {
+            let remaining = max(0, rawMaxAge - age)
+            if remaining <= 0 {
+                noStore = true
+                maxAge = 0
+            } else {
+                maxAge = remaining
             }
         }
         return (maxAge, noStore)
