@@ -1023,6 +1023,10 @@ public enum SQLiteLayout {
         )
         """,
         """
+        CREATE INDEX IF NOT EXISTS permissioned_space_requests_retention
+        ON permissioned_space_requests(space_uri, author_did, final_revision)
+        """,
+        """
         CREATE TABLE IF NOT EXISTS permissioned_space_outbox (
             id TEXT PRIMARY KEY,
             space_uri TEXT NOT NULL,
@@ -2765,6 +2769,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
         _ = try await connection.query(
             """
+            CREATE INDEX IF NOT EXISTS permissioned_space_requests_retention
+            ON permissioned_space_requests(space_uri, author_did, final_revision)
+            """
+        )
+        _ = try await connection.query(
+            """
             INSERT INTO permissioned_repository_migrations(version, applied_at)
             VALUES (?, ?)
             """,
@@ -4030,131 +4040,94 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
             try await testingHooks.beforeApplyCommit?()
 
+            let minimumRetainedCommitRevision = max(1, storedFinalRevision - oplogRetention + 1)
+
+            // The receipt ledger is a replay reservation: every commit writes exactly
+            // one request keyed by monotonic final_revision. The retention cutoff is
+            // calculated directly in memory without any SELECT query or OFFSET scan.
+            if minimumRetainedCommitRevision > 1 {
+                _ = try await connection.query(
+                    """
+                    DELETE FROM permissioned_space_requests
+                    WHERE space_uri = ? AND author_did = ? AND final_revision < ?
+                    """,
+                    [
+                        .text(space.rawValue), .text(author),
+                        .integer(minimumRetainedCommitRevision),
+                    ]
+                )
+                let deletedRequests = try await connection.query(
+                    "SELECT changes() AS count"
+                )
+                if let first = deletedRequests.first {
+                    let deletedCount = try requiredNonnegativeInteger(first, "count")
+                    newRequestCount = max(0, newRequestCount - deletedCount)
+                }
+
+                // Revisions older than the retention depth window are guaranteed to
+                // have >= oplogRetention operations after them. Prune them directly.
+                _ = try await connection.query(
+                    """
+                    DELETE FROM permissioned_space_oplog
+                    WHERE space_uri = ? AND author_did = ? AND revision < ?
+                    """,
+                    [
+                        .text(space.rawValue), .text(author),
+                        .integer(minimumRetainedCommitRevision),
+                    ]
+                )
+                let deletedOplog = try await connection.query(
+                    "SELECT changes() AS count"
+                )
+                if let first = deletedOplog.first {
+                    let deletedCount = try requiredNonnegativeInteger(first, "count")
+                    newOplogCount = max(0, newOplogCount - deletedCount)
+                }
+            }
+
+            // If multi-operation commits in the retained window cause oplog entries to
+            // exceed oplogRetention, find the cutoff revision using a strictly bounded
+            // keyset scan from the oldest retained revision (at most 512 entries).
             if newOplogCount > oplogRetention {
                 let excess = newOplogCount - oplogRetention
-                let cutoffRows: [SQLiteRow]
-                if excess <= oplogRetention - 1 {
-                    cutoffRows = try await connection.query(
-                        """
-                        SELECT revision
-                        FROM permissioned_space_oplog
-                        WHERE space_uri = ? AND author_did = ?
-                        ORDER BY revision ASC, operation_index ASC
-                        LIMIT 1 OFFSET ?
-                        """,
-                        [
-                            .text(space.rawValue), .text(author),
-                            .integer(excess),
-                        ]
-                    )
-                } else {
-                    cutoffRows = try await connection.query(
-                        """
-                        SELECT revision
-                        FROM permissioned_space_oplog
-                        WHERE space_uri = ? AND author_did = ?
-                        ORDER BY revision DESC, operation_index DESC
-                        LIMIT 1 OFFSET ?
-                        """,
-                        [
-                            .text(space.rawValue), .text(author),
-                            .integer(oplogRetention - 1),
-                        ]
-                    )
-                }
+                let batchScanLimit = min(excess, 512)
+                let cutoffRows = try await connection.query(
+                    """
+                    SELECT revision
+                    FROM permissioned_space_oplog
+                    WHERE space_uri = ? AND author_did = ? AND revision >= ?
+                    ORDER BY revision ASC, operation_index ASC
+                    LIMIT 1 OFFSET ?
+                    """,
+                    [
+                        .text(space.rawValue), .text(author),
+                        .integer(minimumRetainedCommitRevision),
+                        .integer(batchScanLimit),
+                    ]
+                )
                 if let cutoffRow = cutoffRows.first {
                     let oldestRetainedRevision = try requiredRevision(
                         cutoffRow,
                         "revision"
                     )
-                    _ = try await connection.query(
-                        """
-                        DELETE FROM permissioned_space_oplog
-                        WHERE space_uri = ? AND author_did = ? AND revision < ?
-                        """,
-                        [
-                            .text(space.rawValue), .text(author),
-                            .integer(try sqliteRevision(oldestRetainedRevision)),
-                        ]
-                    )
-                    let deletedRows = try await connection.query(
-                        "SELECT changes() AS count"
-                    )
-                    if let first = deletedRows.first {
-                        let deletedCount = try requiredNonnegativeInteger(first, "count")
-                        newOplogCount = max(0, newOplogCount - deletedCount)
-                    }
-                }
-            }
-
-            // The receipt ledger is a replay reservation, not the state guard:
-            // the revision CAS above is what refuses a stale write, so a
-            // request older than this window is answered as a conflict instead
-            // of a duplicate. Retain it to the same depth as the oplog rather
-            // than by age, so one retention knob governs both and neither
-            // outlives the other. `created_at` orders the window; the final
-            // revision breaks ties and orders unstamped pre-upgrade rows.
-            if newRequestCount > oplogRetention {
-                let excessRequests = newRequestCount - oplogRetention
-                let receiptCutoffRows: [SQLiteRow]
-                if excessRequests <= oplogRetention - 1 {
-                    receiptCutoffRows = try await connection.query(
-                        """
-                        SELECT created_at, final_revision
-                        FROM permissioned_space_requests
-                        WHERE space_uri = ? AND author_did = ?
-                        ORDER BY created_at ASC, final_revision ASC
-                        LIMIT 1 OFFSET ?
-                        """,
-                        [
-                            .text(space.rawValue), .text(author),
-                            .integer(excessRequests),
-                        ]
-                    )
-                } else {
-                    receiptCutoffRows = try await connection.query(
-                        """
-                        SELECT created_at, final_revision
-                        FROM permissioned_space_requests
-                        WHERE space_uri = ? AND author_did = ?
-                        ORDER BY created_at DESC, final_revision DESC
-                        LIMIT 1 OFFSET ?
-                        """,
-                        [
-                            .text(space.rawValue), .text(author),
-                            .integer(oplogRetention - 1),
-                        ]
-                    )
-                }
-                if let receiptCutoffRow = receiptCutoffRows.first {
-                    let oldestRetainedStamp = try requiredNonnegativeInteger(
-                        receiptCutoffRow,
-                        "created_at"
-                    )
-                    let oldestRetainedReceipt = try requiredRevision(
-                        receiptCutoffRow,
-                        "final_revision"
-                    )
-                    _ = try await connection.query(
-                        """
-                        DELETE FROM permissioned_space_requests
-                        WHERE space_uri = ? AND author_did = ?
-                          AND (created_at < ?
-                               OR (created_at = ? AND final_revision < ?))
-                        """,
-                        [
-                            .text(space.rawValue), .text(author),
-                            .integer(oldestRetainedStamp),
-                            .integer(oldestRetainedStamp),
-                            .integer(try sqliteRevision(oldestRetainedReceipt)),
-                        ]
-                    )
-                    let deletedRows = try await connection.query(
-                        "SELECT changes() AS count"
-                    )
-                    if let first = deletedRows.first {
-                        let deletedCount = try requiredNonnegativeInteger(first, "count")
-                        newRequestCount = max(0, newRequestCount - deletedCount)
+                    if oldestRetainedRevision > minimumRetainedCommitRevision {
+                        _ = try await connection.query(
+                            """
+                            DELETE FROM permissioned_space_oplog
+                            WHERE space_uri = ? AND author_did = ? AND revision < ?
+                            """,
+                            [
+                                .text(space.rawValue), .text(author),
+                                .integer(try sqliteRevision(oldestRetainedRevision)),
+                            ]
+                        )
+                        let deletedRows = try await connection.query(
+                            "SELECT changes() AS count"
+                        )
+                        if let first = deletedRows.first {
+                            let deletedCount = try requiredNonnegativeInteger(first, "count")
+                            newOplogCount = max(0, newOplogCount - deletedCount)
+                        }
                     }
                 }
             }

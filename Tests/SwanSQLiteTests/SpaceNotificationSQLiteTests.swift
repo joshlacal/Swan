@@ -745,8 +745,15 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             """,
             [.text(fixture.space.rawValue), .text(fixture.writer)]
         )
-        // Revisions >= 14 hold the 4 newest operations (rev 16 has 1, rev 15 has 2, rev 14 has 2)
-        XCTAssertTrue(retainedOplog.allSatisfy { ($0.column("revision")?.integer ?? 0) >= 14 })
+        let retainedEntries = retainedOplog.compactMap { row -> String? in
+            guard let rev = row.column("revision")?.integer,
+                  let idx = row.column("operation_index")?.integer else { return nil }
+            return "\(rev):\(idx)"
+        }
+        XCTAssertEqual(
+            retainedEntries,
+            ["14:0", "14:1", "15:0", "15:1", "16:0"]
+        )
 
         // Replay of an evicted request (e.g. revision 1) must be refused as a revision conflict
         let duplicateValue = Data([0xA1, 0x61, 0x61, 0x01])
