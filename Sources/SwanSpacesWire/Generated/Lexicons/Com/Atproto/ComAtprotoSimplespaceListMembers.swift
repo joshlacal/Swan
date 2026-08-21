@@ -67,12 +67,12 @@ public struct Member: ATProtocolCodable, ATProtocolValue {
         }
     }    
 public struct Parameters: Parametrizable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let limit: Int?
         public let cursor: String?
         
         public init(
-            space: ATProtocolURI, 
+            space: SpaceRef, 
             limit: Int? = nil, 
             cursor: String? = nil
             ) {
@@ -179,7 +179,6 @@ public struct Output: ATProtocolCodable {
         
 public enum Error: String, Swift.Error, ATProtoErrorType, CustomStringConvertible {
                 case spaceNotFound = "SpaceNotFound"
-                case notSpaceOwner = "NotSpaceOwner"
             public var description: String {
                 return self.rawValue
             }
@@ -200,7 +199,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
     public static let endpointDescriptor = XRPCMethodDescriptor(
         nsid: "com.atproto.simplespace.listMembers", kind: "query",
         inputEncoding: nil, outputEncoding: "application/json",
-        declaredErrors: ["SpaceNotFound", "NotSpaceOwner"]
+        declaredErrors: ["SpaceNotFound"]
     )
 
     public protocol ServerHandler: Sendable {
@@ -220,7 +219,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
 extension ATProtoClient.Com.Atproto.Simplespace {
     // MARK: - listMembers
 
-    /// List the members in a space's host-internal member list. Must be called on the space owner's PDS, by the space owner. This reflects the simplespace member list, not a protocol-level reader set.
+    /// List the members in a space's host-internal member list. Must be called on the space authority's PDS. Requires OAuth with a covering read grant; a space credential is not sufficient, so members hosted elsewhere cannot enumerate the list. This reflects the simplespace member list, not a protocol-level reader set.
     /// 
     /// - Parameter input: The input parameters for the request
     /// 

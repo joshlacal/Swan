@@ -11,17 +11,17 @@ public struct ComAtprotoSimplespaceDeleteSpace {
 
     public static let typeIdentifier = "com.atproto.simplespace.deleteSpace"
 public struct Input: ATProtocolCodable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
 
         /// Standard public initializer
-        public init(space: ATProtocolURI) {
+        public init(space: SpaceRef) {
             self.space = space
         }
         
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.space = try container.decode(ATProtocolURI.self, forKey: .space)
+            self.space = try container.decode(SpaceRef.self, forKey: .space)
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -81,7 +81,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
 extension ATProtoClient.Com.Atproto.Simplespace {
     // MARK: - deleteSpace
 
-    /// Tombstone a space. The authenticated user must be the space owner. After deletion, all reads and writes against the space will fail with SpaceNotFound. Requires auth, implemented by PDS.
+    /// Delete a space. The authenticated user must be the space owner. The authority's own repo in the space is deleted along with it, since the space host and the repo host are the same service here; other members' repos are flagged as belonging to a deleted space rather than erased. After deletion, all reads and writes against the space fail with SpaceNotFound, and getSpaceCredential answers SpaceDeleted so a syncer that missed the notification still learns to drop its copy. Idempotent. Requires auth, implemented by PDS.
     /// 
     /// - Parameter input: The input parameters for the request
     

@@ -11,17 +11,17 @@ public struct ComAtprotoSpaceNotifySpaceDeleted {
 
     public static let typeIdentifier = "com.atproto.space.notifySpaceDeleted"
 public struct Input: ATProtocolCodable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
 
         /// Standard public initializer
-        public init(space: ATProtocolURI) {
+        public init(space: SpaceRef) {
             self.space = space
         }
         
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.space = try container.decode(ATProtocolURI.self, forKey: .space)
+            self.space = try container.decode(SpaceRef.self, forKey: .space)
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -70,7 +70,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
 extension ATProtoClient.Com.Atproto.Space {
     // MARK: - notifySpaceDeleted
 
-    /// Notify a repo host or syncing service that a space has been deleted. Sent by the space authority, best-effort. Authenticated with service auth.
+    /// Notify a syncing service that a space has been deleted, and that it should drop every copy of the space's data it holds. Sent by the space authority to the services registered for the space, best-effort. Authenticated with service auth addressed to the receiving service.
     /// 
     /// - Parameter input: The input parameters for the request
     

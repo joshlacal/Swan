@@ -251,9 +251,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
             ComAtprotoSpaceGetLatestCommit.Output.self,
             from: response.body
         )
-        guard let commit = output.commit else {
-            throw InteropHTTPError.unexpectedStatus(404)
-        }
+        let commit = output.commit
         return try PermissionedRemoteReplicaIncrementalVerifier.verifyCommit(
             commit,
             target: target,

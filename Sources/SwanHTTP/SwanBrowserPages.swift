@@ -28,15 +28,19 @@ enum SwanBrowserPages {
         )
     }
 
+    /// - Parameter emptyPermissionSets: NSIDs of `include:` scopes that resolved
+    ///   and expanded to zero grants (§5.7.5). `ScopeDescription` renders them
+    ///   through the same card as an unexpanded `include:`, so the person
+    ///   authorizing still sees a set that contributes nothing.
     static func consent(
         csrf: String,
         subject: String,
         clientID: String,
-        scopes: Set<String>
+        scopes: Set<String>,
+        emptyPermissionSets: [String] = []
     ) -> String {
-        let scopeItems = scopes.sorted().map {
-            "<li><code class=\"badge badge-neutral badge-sm font-mono\">\(escape($0))</code></li>"
-        }.joined()
+        let scopeSection = ScopeDescription.render(
+            scopes: scopes, emptyPermissionSets: emptyPermissionSets)
         return page(
             title: "Authorize client",
             body: """
@@ -45,12 +49,40 @@ enum SwanBrowserPages {
             <div class="font-mono break-all">\(escape(subject))</div></div>\
             <div class="text-sm"><span class="text-base-content/60">Client</span>\
             <div class="font-mono break-all">\(escape(clientID))</div></div>\
-            <div class="flex flex-col gap-2"><span class="text-sm text-base-content/60">Requested access</span>\
-            <ul class="flex flex-wrap gap-2">\(scopeItems)</ul></div>\
+            <div class="flex flex-col gap-3">\(scopeSection)</div>\
             <form method="post" action="/oauth/authorize/consent" class="card-actions justify-end gap-2">\
             <input type="hidden" name="csrf" value="\(escape(csrf))">\
             <button name="decision" value="deny" type="submit" class="btn btn-outline">Deny</button>\
             <button name="decision" value="approve" type="submit" class="btn btn-primary">Approve</button>\
+            </form>
+            """
+        )
+    }
+
+    /// The second-factor ceremony page.
+    ///
+    /// - Parameter proofHTML: the factor-specific proof markup, already built and
+    ///   escaped by the caller — a code field for TOTP and recovery codes, or the
+    ///   passkey hidden fields plus their nonced inline script. It is inserted
+    ///   verbatim, so a caller MUST escape every untrusted value it embeds.
+    static func factorChallenge(
+        csrf: String,
+        handle: String,
+        kind: String,
+        factorID: String,
+        proofHTML: String
+    ) -> String {
+        page(
+            title: "Verify your factor",
+            body: """
+            <h1 class="card-title text-xl">Verify your factor</h1>\
+            <form method="post" action="/oauth/authorize/mfa" class="flex flex-col gap-4">\
+            <input type="hidden" name="csrf" value="\(escape(csrf))">\
+            <input type="hidden" name="handle" value="\(escape(handle))">\
+            <input type="hidden" name="kind" value="\(escape(kind))">\
+            <input type="hidden" name="factorID" value="\(escape(factorID))">\
+            \(proofHTML)\
+            <button type="submit" class="btn btn-primary w-full">Verify</button>\
             </form>
             """
         )

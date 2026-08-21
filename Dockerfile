@@ -1,3 +1,10 @@
+FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS account-web-build
+WORKDIR /workspace/Swan/web
+COPY Swan/web/package.json Swan/web/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY Swan/web/ ./
+RUN npm run prepare && npm run check && npm run build
+
 FROM swift:6.1-jammy@sha256:12be34a341945adb64914405ed7b568fcb2d35edbd63a3755007e47dce59456e AS build
 # Keep the Swift 6.1/Jammy build baseline explicit and install the same
 # system-library development surface SwiftPM uses on a clean Linux builder.
@@ -8,7 +15,6 @@ RUN apt-get update \
         libglib2.0-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace
-COPY Petrel /workspace/Petrel
 COPY Swan /workspace/Swan
 WORKDIR /workspace/Swan
 RUN swift build -c release --product swan
@@ -19,6 +25,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --home-dir /var/lib/swan swan
 COPY --from=build /workspace/Swan/.build/release/swan /usr/local/bin/swan
+COPY --from=account-web-build /workspace/Swan/web/build /usr/local/share/swan/account
 COPY Swan/Profiles /usr/local/share/swan/Profiles
 COPY Swan/interop/bootstrap-local-space.sh /usr/local/bin/swan-interop-bootstrap
 COPY Swan/interop/prepare-interop-secrets.sh /usr/local/bin/swan-interop-prepare-secrets

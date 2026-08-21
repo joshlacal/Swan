@@ -169,10 +169,12 @@ public struct SwanLocalhostPARConfiguration: Sendable, Equatable {
 public struct SwanLocalhostOAuthConfiguration: Sendable {
     public let issuer: URL
     public let accounts: DurableAccountDirectory
+    public let mfaService: (any SwanOAuthMFAService)?
 
-    public init(issuer: URL, accounts: DurableAccountDirectory) throws {
+    public init(issuer: URL, accounts: DurableAccountDirectory, mfaService: (any SwanOAuthMFAService)? = nil) throws {
         self.issuer = try OAuthAuthorizationServerMetadata(issuer: issuer).issuer
         self.accounts = accounts
+        self.mfaService = mfaService
     }
 }
 
@@ -187,13 +189,15 @@ public struct SwanOAuthAuthorizationServerConfiguration: Sendable {
     public let accounts: DurableAccountDirectory
     public let clientMetadataLoader: OAuthClientMetadataLoader
     public let remoteFetchPolicy: OAuthRemoteFetchPolicy
+    public let mfaService: (any SwanOAuthMFAService)?
 
     public init(
         issuer: URL,
         protectedResource: URL,
         accounts: DurableAccountDirectory,
         clientMetadataLoader: OAuthClientMetadataLoader,
-        scopesSupported: [String] = ["atproto"]
+        scopesSupported: [String] = ["atproto"],
+        mfaService: (any SwanOAuthMFAService)? = nil
     ) throws {
         let metadata = try OAuthAuthorizationServerMetadata(
             issuer: issuer,
@@ -210,6 +214,7 @@ public struct SwanOAuthAuthorizationServerConfiguration: Sendable {
         // This immutable policy is retained as construction evidence only;
         // the loader remains the sole remote-fetch capability.
         remoteFetchPolicy = clientMetadataLoader.fetchPolicy
+        self.mfaService = mfaService
     }
 }
 
@@ -277,30 +282,38 @@ public struct SwanSpaceRepositorySyncHTTPConfiguration: Sendable {
 }
 
 /// Explicitly enables only the local/pinned service-JWT verification needed
-/// by the writer notification endpoints. It contains no remote DID resolver;
-/// service claims can never turn an XRPC request into a network lookup.
+/// by the writer notification endpoints. Incoming service CLAIMS still never
+/// turn an XRPC request into a network lookup; the one resolver here is used
+/// solely by `registerNotify` (Erratum 03) to resolve the credentialed
+/// caller's OWN `service` identifier through its DID document — a lookup the
+/// caller explicitly requested by naming it.
 public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
     public let serviceAuthentication: any SpaceServiceAuthenticationVerifier
     let recipientBindings: SwanSpaceNotificationRecipientBindings
     let notificationJSONDecodeObserver: (@Sendable () async -> Void)?
+    let serviceEndpointResolver: SwanServiceEndpointResolver?
 
     public init(
         serviceAuthentication: any SpaceServiceAuthenticationVerifier,
-        recipientBindings: SwanSpaceNotificationRecipientBindings = .empty
+        recipientBindings: SwanSpaceNotificationRecipientBindings = .empty,
+        serviceEndpointResolver: SwanServiceEndpointResolver? = nil
     ) {
         self.serviceAuthentication = serviceAuthentication
         self.recipientBindings = recipientBindings
         notificationJSONDecodeObserver = nil
+        self.serviceEndpointResolver = serviceEndpointResolver
     }
 
     init(
         serviceAuthentication: any SpaceServiceAuthenticationVerifier,
         recipientBindings: SwanSpaceNotificationRecipientBindings = .empty,
+        serviceEndpointResolver: SwanServiceEndpointResolver? = nil,
         notificationJSONDecodeObserver: @escaping @Sendable () async -> Void
     ) {
         self.serviceAuthentication = serviceAuthentication
         self.recipientBindings = recipientBindings
         self.notificationJSONDecodeObserver = notificationJSONDecodeObserver
+        self.serviceEndpointResolver = serviceEndpointResolver
     }
 }
 
@@ -411,6 +424,21 @@ public struct SwanHTTPServer: Sendable {
     /// capability is nil unless the caller has assembled the proof codec,
     /// control-store adapter, rate limiter, and SMTP worker at startup.
     public let accountEmailXRPC: SwanAccountEmailXRPCServer?
+    public let legacySessionXRPC: SwanLegacySessionXRPCServer?
+    /// Optional account portal bundle. Its registration owns `/account/api/**`
+    /// and `/account/**` and is installed before every XRPC or proxy fallback.
+    public let accountPortalHTTP: SwanAccountPortalHTTP?
+    /// Optional account lifecycle XRPC adapter. When present, its
+    /// `com.atproto.server.createAccount` route is registered before the
+    /// unknown-public guards; the lifecycle methods (activate/status/
+    /// deactivate/delete/invite/listInvites) are operator/management-session
+    /// authorized and are not registered as live public routes in this task.
+    public let accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter?
+    /// Optional did:web identity surface. When present, its public one-time
+    /// claim endpoint and management-session-authenticated reserve/claim/
+    /// rotate/remove/reverify/admission routes are registered before the
+    /// unknown-public guards and the `/xrpc/**` proxy fallback.
+    public let didWebIdentityHTTP: SwanDidWebIdentityHTTP?
     /// Local `app.bsky.actor.getPreferences` / `app.bsky.actor.putPreferences`
     /// routes. These can never be proxied to an AppView — the AppView does
     /// not store preferences, the PDS does — so this capability is nil unless
@@ -477,6 +505,14 @@ public struct SwanHTTPServer: Sendable {
         publicBlobSpoolAdmission: PublicRepositorySpoolAdmission? = nil,
         blobStreamAdmission: PublicRepositorySpoolAdmission? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
+        legacySessionXRPC: SwanLegacySessionXRPCServer? = nil,
+        accountPortalHTTP: SwanAccountPortalHTTP? = nil,
+        accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter? = nil,
+        didWebIdentityHTTP: SwanDidWebIdentityHTTP? = nil,
+        // Kept as a source-compatible, inert parameter for callers compiled
+        // against the account-program merge. Legacy XRPC is owned solely by
+        // `SwanLegacySessionXRPCServer`; this adapter is never registered.
+        legacyAuthXRPC: SwanLegacyAuthXRPCAdapter? = nil,
         actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
         xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
@@ -485,7 +521,12 @@ public struct SwanHTTPServer: Sendable {
         publicBlobRequestBodyAdmission: PublicRepositoryJSONWriteAdmission? = nil,
         jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
         publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil,
-        publicFirehoseSubscriberAdmission: PublicFirehoseSubscriberAdmission? = nil
+        publicFirehoseSubscriberAdmission: PublicFirehoseSubscriberAdmission? = nil,
+        identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil,
+        /// Resolves handles this host does not hold, for
+        /// `com.atproto.identity.resolveHandle`. Absent keeps that anonymous
+        /// route off the network entirely.
+        foreignHandleResolution: (any SwanForeignHandleResolving)? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -494,9 +535,15 @@ public struct SwanHTTPServer: Sendable {
         self.loginClientIdentityPolicy = loginClientIdentityPolicy
         self.publicRepositoryReadDirectory = publicRepositoryReadDirectory
         publicHandleResolution = accountControlStore.map {
-            SwanPublicHandleResolutionCapability(controlStore: $0)
+            SwanPublicHandleResolutionCapability(
+                controlStore: $0, foreign: foreignHandleResolution)
         }
         self.accountEmailXRPC = accountEmailXRPC
+        self.legacySessionXRPC = legacySessionXRPC
+        self.accountPortalHTTP = accountPortalHTTP
+        self.accountLifecycleXRPC = accountLifecycleXRPC
+        self.didWebIdentityHTTP = didWebIdentityHTTP
+        _ = legacyAuthXRPC
         self.actorPreferencesXRPC = actorPreferencesXRPC
         self.xrpcPipethrough = xrpcPipethrough
         self.publicFirehoseStreaming = publicFirehoseStreaming
@@ -575,11 +622,26 @@ public struct SwanHTTPServer: Sendable {
            let authorizer = try? SwanOAuthResourceAuthorizer(
                publicURL: configuration.publicURL,
                runtime: oauthRuntime,
-               accountControlStore: accountControlStore
+               accountControlStore: accountControlStore,
+               // `nil` unless the deployment enabled legacy sessions, which
+               // leaves this authorizer DPoP-only exactly as before.
+               legacySessions: legacySessionXRPC?.sessions
            ) {
+            // Formed once, ahead of every capability that verifies compact
+            // space credentials — including the description endpoint, whose
+            // live contract admits a member hosted elsewhere by credential.
+            let getSpaceCredentialVerifier: (any SpaceCredentialAuthorizationVerifier)?
+            if let spaceCredentialConfiguration {
+                getSpaceCredentialVerifier = DurableSpaceCredentialVerifier(
+                    publicKeys: spaceCredentialConfiguration.credentialPublicKeys
+                )
+            } else {
+                getSpaceCredentialVerifier = nil
+            }
             authenticatedGetSpace = SwanAuthenticatedGetSpaceCapability(
                 authorizer: authorizer,
-                directory: authenticatedGetSpaceDirectory
+                directory: authenticatedGetSpaceDirectory,
+                credentialAuthorizer: getSpaceCredentialVerifier
             )
             if let mutationDirectory = publicRepositoryMutationDirectory,
                let signerProvider = publicRepositoryMutationSignerProvider {
@@ -589,21 +651,15 @@ public struct SwanHTTPServer: Sendable {
                     signerProvider: signerProvider,
                     publicBlobSpoolAdmission: publicBlobSpoolAdmission,
                     jsonWriteAdmission: resolvedJSONWriteAdmission,
-                    jsonWriteBodyPolicy: resolvedJSONWriteBodyPolicy
+                    jsonWriteBodyPolicy: resolvedJSONWriteBodyPolicy,
+                    identityAdmission: identityAdmission
                 )
             } else {
                 publicRepositoryMutations = nil
             }
             if let repositoryDirectory = authenticatedGetSpaceDirectory
                 as? any AuthorizedSpaceRepositoryDirectory {
-                let credentialVerifier: (any SpaceCredentialAuthorizationVerifier)?
-                if let spaceCredentialConfiguration {
-                    credentialVerifier = DurableSpaceCredentialVerifier(
-                        publicKeys: spaceCredentialConfiguration.credentialPublicKeys
-                    )
-                } else {
-                    credentialVerifier = nil
-                }
+                let credentialVerifier = getSpaceCredentialVerifier
                 authenticatedSpaceRecords = SwanAuthenticatedSpaceRecordsCapability(
                     authorizer: authorizer,
                     directory: repositoryDirectory,
@@ -725,7 +781,9 @@ public struct SwanHTTPServer: Sendable {
                     serviceAuthentication: spaceNotificationConfiguration.serviceAuthentication,
                     recipientBindings: spaceNotificationConfiguration.recipientBindings,
                     notificationJSONDecodeObserver:
-                        spaceNotificationConfiguration.notificationJSONDecodeObserver
+                        spaceNotificationConfiguration.notificationJSONDecodeObserver,
+                    serviceEndpointResolver:
+                        spaceNotificationConfiguration.serviceEndpointResolver
                 )
             } else {
                 authenticatedSpaceNotifications = nil
@@ -769,25 +827,27 @@ public struct SwanHTTPServer: Sendable {
     /// supported server assembly boundary.
     public func buildRouter() -> Router<SwanHTTPRequestContext> {
         let router = Router(context: SwanHTTPRequestContext.self)
+        // MUST precede every route registration below. Hummingbird bakes the
+        // middleware stack into each responder as the route is added
+        // (`Router.swift:90`), so a middleware registered later silently binds
+        // to nothing. Registering it first also covers the not-found responder
+        // (`Router.swift:70`), which is the exact path a preflight takes when
+        // a path matches but the method has no responder.
+        router.add(middleware: SwanCORSMiddleware<SwanHTTPRequestContext>())
         let requestBodyAdmission = SwanRequestBodyAdmissionConfiguration(
             admission: jsonWriteAdmission,
             policy: jsonWriteBodyPolicy
         )
         router.get("/health") { _, _ in "OK" }
 
+        // Reserve discovery paths before installing account or XRPC routes.
+        // The values below are captured once so the DID document and
+        // describeServer cannot drift apart during composition.
         let publicURL = configuration.publicURL
         let profile = profile
         let oauthPublicationGate = oauthPublicationGate
-        // One derivation, read by both the DID document and describeServer.
-        // A resolver reads `describeServer.did`, fetches the document that DID
-        // names, and compares the two; formatting the identity twice is how
-        // those two answers silently drift apart.
         let serviceIdentity = SwanServiceIdentity(publicURL: publicURL)
         let inviteCodeRequired = configuration.inviteCodeRequired
-        // `did:web:<authority>` resolves to
-        // `https://<authority>/.well-known/did.json`, so this route is the
-        // other half of the DID Swan publishes everywhere else. The body is
-        // public, static, non-secret identity data.
         router.get("/.well-known/did.json") { _, _ -> Response in
             oauthMetadataJSONResponse(SwanServiceDIDDocument(identity: serviceIdentity))
         }
@@ -819,6 +879,131 @@ public struct SwanHTTPServer: Sendable {
             return oauthMetadataCORSPreflightResponse()
         }
 
+        // Phase 1: reserve public discovery, including the one-time did:web
+        // claim endpoint. The claim is public by design; the external domain
+        // operator must fetch it without a Swan credential.
+        if let didWebIdentityHTTP {
+            registerSwanDidWebPublicClaimRoute(
+                on: router,
+                didWeb: didWebIdentityHTTP
+            )
+        }
+
+        // Phase 2: every exact account API route. Portal and did:web helpers
+        // deliberately do not install their broad API/static guards here.
+        accountPortalHTTP?.registerAPI(on: router)
+        if let didWebIdentityHTTP {
+            registerSwanDidWebIdentityAPIRoutes(
+                on: router,
+                didWeb: didWebIdentityHTTP,
+                publicOrigin: configuration.publicURL,
+                requestBodyAdmission: requestBodyAdmission
+            )
+        }
+
+        // Phase 3: the account SPA/assets fallback, after all account API
+        // exact routes and before local XRPC/OAuth/repository routes.
+        accountPortalHTTP?.registerAssets(on: router)
+
+        router.get("/xrpc/com.atproto.server.describeServer") { _, _ -> Response in
+            jsonResponse(ServerDescription(
+                did: serviceIdentity.did,
+                availableUserDomains: [],
+                inviteCodeRequired: inviteCodeRequired,
+                swanProfile: profile.id
+            ))
+        }
+
+        // `community.lexicon.service.describe` — the community proposal that
+        // lets a caller ask which XRPC methods a service serves instead of
+        // trying each one and reading the failures. Clients gate on it:
+        // bulleted.app refuses to enable its spaces support when this answer
+        // is missing, because a 404 here is indistinguishable from a server
+        // with no spaces plane. The answer is derived from the same two
+        // inputs that install routes below — the selected permissioned
+        // profile and the public route surface — so it cannot drift from the
+        // router the way a hand-kept list would. Profile methods whose
+        // capability is absent still appear: they are routed (as
+        // method-correct unavailability gates), and this deployment speaks
+        // them.
+        var describedMethodSet = Set(
+            PermissionedData0016.methods
+                .filter { profile.endpoints.contains($0.nsid) }
+                .map(\.nsid)
+        )
+        .union(configuration.publicRouteSurface.servedMethodNSIDs)
+        .union([
+            "com.atproto.server.describeServer",
+            // This method itself: a description that omitted it would be the
+            // one claim a caller could disprove from the response in hand.
+            "community.lexicon.service.describe",
+        ])
+        // The `getRepoState` alias is listed exactly when its route is live —
+        // the sync capability exists and the profile declares the canonical
+        // name (see `registerAuthenticatedGetLatestCommitEndpoint`). Listing
+        // one routed name but not the other would 404 the very probe this
+        // endpoint exists to answer.
+        if authenticatedSpaceRepositorySync != nil,
+           describedMethodSet.contains(ComAtprotoSpaceGetLatestCommit.typeIdentifier) {
+            describedMethodSet.insert(spaceGetRepoStateAliasNSID)
+        }
+        let describedMethodNSIDs = describedMethodSet.sorted()
+        router.get("/xrpc/community.lexicon.service.describe") { _, _ -> Response in
+            jsonResponse(CommunityServiceDescription(
+                roles: ["pds"],
+                methods: describedMethodNSIDs.map(CommunityServiceMethodReference.init(value:))
+            ))
+        }
+
+        // `com.atproto.server.createAccount` is Swan's own PDS method and is
+        // registered before the unknown-public guards and the `/xrpc/**`
+        // proxy fallback. The adapter fails closed (503) when the signup
+        // runtime is not assembled; a registered route is never a bare 404.
+        if let accountLifecycleXRPC {
+            let adapter = accountLifecycleXRPC
+            router.post("/xrpc/com.atproto.server.createAccount") { request, context async -> Response in
+                let now = Date()
+                do {
+                    let input: SwanCreateAccountXRPCInput = try await decodeCreateAccountBody(
+                        request,
+                        context: context,
+                        requestBodyAdmission: requestBodyAdmission
+                    )
+                    let result = try await adapter.createAccount(
+                        input,
+                        peerAddress: context.remoteAddress,
+                        now: now
+                    )
+                    return jsonResponseWithStatus(.ok, body: CreateAccountResponse(
+                        did: result.account.did,
+                        handle: result.account.canonicalHandle,
+                        accessJwt: "",
+                        refreshJwt: ""
+                    ))
+                } catch {
+                    return lifecycleErrorResponse(for: error)
+                }
+            }
+        }
+
+        // The exact local account, identity, and canonical legacy XRPC
+        // methods are all installed before OAuth and repository registration.
+        // They therefore remain Swan-owned even when a broad repository or
+        // proxy surface is enabled below.
+        accountEmailXRPC?.register(
+            on: router,
+            requestBodyAdmission: requestBodyAdmission,
+            servedMethods: configuration.publicRouteSurface.servedMethodNSIDs
+        )
+        legacySessionXRPC?.register(
+            on: router,
+            requestBodyAdmission: requestBodyAdmission
+        )
+        actorPreferencesXRPC?.register(
+            on: router,
+            requestBodyAdmission: requestBodyAdmission
+        )
+
         if let authorizationServerConfiguration {
             registerOAuthAuthorizationServerEndpoints(
                 on: router,
@@ -831,6 +1016,7 @@ public struct SwanHTTPServer: Sendable {
                 on: router,
                 configuration: authorizationServerConfiguration,
                 runtime: oauthRuntime,
+                loginClientIdentityPolicy: loginClientIdentityPolicy,
                 requestBodyAdmission: requestBodyAdmission
             )
         } else if let localhostOAuthConfiguration {
@@ -868,15 +1054,6 @@ public struct SwanHTTPServer: Sendable {
             )
         }
 
-        router.get("/xrpc/com.atproto.server.describeServer") { _, _ -> Response in
-            jsonResponse(ServerDescription(
-                did: serviceIdentity.did,
-                availableUserDomains: [],
-                inviteCodeRequired: inviteCodeRequired,
-                swanProfile: profile.id
-            ))
-        }
-
         // Do not route permissioned traffic to the in-memory repository store
         // while durable OAuth and account control have no HTTP entry points.
         // The checked-in wire registry is the sole source for this coverage:
@@ -893,7 +1070,7 @@ public struct SwanHTTPServer: Sendable {
         // answer 404 rather than 503 when one is written.
         for descriptor in PermissionedData0016.methods
             .filter({ profile.endpoints.contains($0.nsid) }) {
-            if descriptor.nsid == ComAtprotoSpaceGetSpace.typeIdentifier,
+            if descriptor.nsid == ComAtprotoSimplespaceGetSpace.typeIdentifier,
                let authenticatedGetSpace {
                 registerAuthenticatedGetSpaceEndpoint(on: router, capability: authenticatedGetSpace)
             } else if descriptor.nsid == ComAtprotoSpaceGetDelegationToken.typeIdentifier,
@@ -915,6 +1092,9 @@ public struct SwanHTTPServer: Sendable {
             } else if descriptor.nsid == ComAtprotoSpaceListRecords.typeIdentifier,
                       let authenticatedSpaceRecords {
                 registerAuthenticatedListRecordsEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if descriptor.nsid == ComAtprotoSpaceListBlobs.typeIdentifier,
+                      let authenticatedSpaceRecords {
+                registerAuthenticatedListBlobsEndpoint(on: router, capability: authenticatedSpaceRecords)
             } else if descriptor.nsid == ComAtprotoSpaceListSpaces.typeIdentifier,
                       let authenticatedSpaceList {
                 registerAuthenticatedListSpacesEndpoint(on: router, capability: authenticatedSpaceList)
@@ -967,6 +1147,13 @@ public struct SwanHTTPServer: Sendable {
                     capability: authenticatedSpaceNotifications,
                     requestBodyAdmission: requestBodyAdmission
                 )
+            } else if descriptor.nsid == ComAtprotoSpaceUnregisterNotify.typeIdentifier,
+                      let authenticatedSpaceNotifications {
+                registerAuthenticatedUnregisterSpaceNotifyEndpoint(
+                    on: router,
+                    capability: authenticatedSpaceNotifications,
+                    requestBodyAdmission: requestBodyAdmission
+                )
             } else if descriptor.nsid == ComAtprotoSpaceNotifyWrite.typeIdentifier,
                       let authenticatedSpaceNotifications {
                 registerAuthenticatedNotifySpaceWriteEndpoint(
@@ -1000,13 +1187,6 @@ public struct SwanHTTPServer: Sendable {
                 registerUnavailablePermissionedEndpoint(descriptor, on: router)
             }
         }
-
-        // Reject future/unknown permissioned methods explicitly instead of
-        // allowing a later generic XRPC route to become an accidental public
-        // fallback. Exact profile routes above have higher router precedence,
-        // so a wrong method on a known endpoint remains unavailable (404),
-        // rather than being mistaken for its method-correct 503 gate.
-        registerUnknownPermissionedEndpointGuards(on: router)
 
         // Public repository/sync stays a finite, separately generated surface.
         // P1 deliberately installs only method-correct unavailable gates; no
@@ -1086,15 +1266,20 @@ public struct SwanHTTPServer: Sendable {
             // writes off no longer replaces image serving with a 503.
             registerUnavailablePublicEndpoint(descriptor, on: router)
         }
-        accountEmailXRPC?.register(
-            on: router,
-            requestBodyAdmission: requestBodyAdmission,
-            servedMethods: servedPublicMethods
-        )
-        actorPreferencesXRPC?.register(
-            on: router,
-            requestBodyAdmission: requestBodyAdmission
-        )
+        // Reject future/unknown permissioned methods explicitly instead of
+        // allowing a later generic XRPC route to become an accidental public
+        // fallback. Exact profile routes above have higher router precedence,
+        // so a wrong method on a known endpoint remains unavailable (404),
+        // rather than being mistaken for its method-correct 503 gate.
+        registerUnknownPermissionedEndpointGuards(on: router)
+
+        // All exact public XRPC routes (including account, identity, legacy,
+        // and repository methods) are now installed. Only the namespace guards
+        // follow, and the proxy is last.
+        // Account API unknowns are installed in this same guard phase rather
+        // than inside the portal API helper, making the complete source order
+        // explicit for review.
+        accountPortalHTTP?.registerUnknownGuards(on: router)
         registerUnknownPublicEndpointGuards(on: router)
         // Registered last, and lowest priority in the trie. Every exact route
         // and every `<prefix>.*` guard above resolves ahead of it, so this can
@@ -1224,6 +1409,32 @@ private struct ServerDescription: Encodable {
     }
 }
 
+/// Output of `community.lexicon.service.describe`.
+private struct CommunityServiceDescription: Encodable {
+    let roles: [String]
+    let methods: [CommunityServiceMethodReference]
+}
+
+/// One entry in `methods`. The proposal allows an NSID, an AT-URI, or a
+/// strongRef; every method Swan serves is standardised and resolvable by
+/// NSID, so that is the only form emitted — an AT-URI or strongRef would pin
+/// a schema record this server does not publish. The `$type` discriminator is
+/// required or a client cannot tell which of the three forms it received.
+private struct CommunityServiceMethodReference: Encodable {
+    let value: String
+
+    enum CodingKeys: String, CodingKey {
+        case type = "$type"
+        case value
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode("community.lexicon.service.describe#nsid", forKey: .type)
+        try container.encode(value, forKey: .value)
+    }
+}
+
 /// The one derivation of Swan's own service identity from its configured
 /// public URL.
 ///
@@ -1232,18 +1443,18 @@ private struct ServerDescription: Encodable {
 /// `/.well-known/did.json` and `com.atproto.server.describeServer` read this
 /// value so that a resolver following the DID from one to the other cannot
 /// observe two identities for a single deployment.
-struct SwanServiceIdentity: Sendable, Equatable {
+public struct SwanServiceIdentity: Sendable, Equatable {
     /// `did:web:<host>` — with `%3A<port>` appended when the public URL names
     /// a port other than its scheme's default. Dropping a non-default port
     /// would publish an identity that resolves to a *different* origin than
     /// the one actually serving, which is a silent misdirection rather than a
     /// visible failure.
-    let did: String
+    public let did: String
     /// The scheme/host/port origin, with no path, query, or trailing slash.
     /// This is what the `AtprotoPersonalDataServer` service entry advertises.
-    let serviceEndpoint: String
+    public let serviceEndpoint: String
 
-    init(publicURL: URL) {
+    public init(publicURL: URL) {
         let scheme = publicURL.scheme?.lowercased() ?? "https"
         let host = (publicURL.host ?? "localhost").lowercased()
         let defaultPort = scheme == "http" ? 80 : 443
@@ -1417,4 +1628,133 @@ private func permissionedDataUnavailable() -> Response {
 func jsonResponseWithStatus(_ status: HTTPResponse.Status, body: some Encodable) -> Response {
     let data = (try? SwanJSONEncoders.default.encode(body)) ?? Data("{}".utf8)
     return Response(status: status, headers: [.contentType: "application/json", .cacheControl: "no-store"], body: .init(byteBuffer: ByteBuffer(data: data)))
+}
+
+/// Wire response for `com.atproto.server.createAccount`. The durable signup
+/// path returns the account and a management session digest; the reference
+/// response shape carries empty JWTs because the OAuth session issuance is a
+/// later task.
+private struct CreateAccountResponse: Encodable {
+    let did: String
+    let handle: String
+    let accessJwt: String
+    let refreshJwt: String
+}
+
+/// Maps signup/lifecycle failures to the spec §3.3 status codes: 401
+/// authentication_required, 403 request_not_allowed, 422 field-safe codes,
+/// 409 duplicate, 429 rate limit, 503 service_unavailable. There is no
+/// fallback to weaker authentication.
+private func lifecycleErrorResponse(for error: any Error) -> Response {
+    let status: HTTPResponse.Status
+    let code: String
+    switch error {
+    case is TurnstileVerificationError:
+        status = .forbidden
+        code = "turnstile_verification_failed"
+    case SignupServiceError.closed:
+        status = .forbidden
+        code = "request_not_allowed"
+    case SignupServiceError.inviteRequired:
+        status = .forbidden
+        code = "invite_required"
+    case SignupServiceError.emailProofRequired:
+        status = .forbidden
+        code = "email_proof_required"
+    case SignupServiceError.turnstileRequired:
+        status = .forbidden
+        code = "turnstile_required"
+    case SignupServiceError.invalidIdentity:
+        status = HTTPResponse.Status(code: 422)
+        code = "invalid_identity"
+    case SignupServiceError.duplicateRequest:
+        status = .conflict
+        code = "duplicate_request"
+    case SignupServiceError.rateLimited:
+        status = .tooManyRequests
+        code = "rate_limited"
+    case AccountControlStoreError.duplicateDID:
+        status = .conflict
+        code = "duplicate_did"
+    case AccountControlStoreError.duplicateHandle:
+        status = .conflict
+        code = "duplicate_handle"
+    case AccountControlStoreError.invalidInput:
+        status = HTTPResponse.Status(code: 422)
+        code = "invalid_input"
+    case SwanError.invalidIdentifier:
+        status = HTTPResponse.Status(code: 422)
+        code = "invalid_request"
+    case SwanError.unauthorized:
+        status = .unauthorized
+        code = "authentication_required"
+    case SwanError.expired:
+        status = HTTPResponse.Status(code: 422)
+        code = "expired"
+    case is CancellationError:
+        status = .serviceUnavailable
+        code = "service_unavailable"
+    default:
+        status = .serviceUnavailable
+        code = "service_unavailable"
+    }
+    return jsonResponseWithStatus(status, body: ["error": code])
+}
+
+/// Decodes the `com.atproto.server.createAccount` body under the same strict
+/// JSON admission as the account-email XRPC surface: exact key set, no null
+/// values, bounded bytes. A malformed body surfaces as a 422 invalid_request
+/// through `lifecycleErrorResponse`.
+private func decodeCreateAccountBody(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> SwanCreateAccountXRPCInput {
+    let buffer: SwanAdmittedRequestBody
+    do {
+        buffer = try await collectAdmittedRequestBody(
+            request,
+            mediaType: .json,
+            admission: requestBodyAdmission.admission,
+            policy: requestBodyAdmission.policy,
+            maximumBytes: 8 * 1024,
+            termination: context.jsonWriteBodyTermination
+        )
+    } catch {
+        throw SwanError.invalidIdentifier("createAccount body")
+    }
+    defer { withExtendedLifetime(buffer) {} }
+    guard buffer.readableBytes > 0,
+          let bytes = buffer.getBytes(
+              at: buffer.readerIndex,
+              length: buffer.readableBytes
+          ) else {
+        throw SwanError.invalidIdentifier("createAccount body")
+    }
+    let data = Data(bytes)
+    do {
+        try StrictJSON.validate(data)
+        guard let object = try JSONSerialization.jsonObject(
+            with: data,
+            options: []
+        ) as? [String: Any] else {
+            throw SwanError.invalidIdentifier("createAccount body")
+        }
+        let keys = Set(object.keys)
+        let required: Set<String> = ["handle", "password"]
+        let optional: Set<String> = [
+            "email", "inviteCode", "verificationCode", "did",
+            "recoveryKey", "plcOp", "verificationPhone", "turnstileToken",
+        ]
+        guard required.isSubset(of: keys),
+              keys.isSubset(of: required.union(optional)),
+              !object.values.contains(where: { $0 is NSNull }) else {
+            throw SwanError.invalidIdentifier("createAccount body")
+        }
+        return try JSONDecoder().decode(SwanCreateAccountXRPCInput.self, from: data)
+    } catch let error as SwanError {
+        throw error
+    } catch {
+        throw SwanError.invalidIdentifier("createAccount body")
+    }
 }

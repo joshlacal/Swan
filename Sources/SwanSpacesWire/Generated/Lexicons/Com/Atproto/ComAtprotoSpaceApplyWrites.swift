@@ -471,13 +471,13 @@ public struct DeleteResult: ATProtocolCodable, ATProtocolValue {
         }
     }
 public struct Input: ATProtocolCodable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let repo: DID
         public let validate: Bool?
         public let writes: [InputWritesUnion]
 
         /// Standard public initializer
-        public init(space: ATProtocolURI, repo: DID, validate: Bool? = nil, writes: [InputWritesUnion]) {
+        public init(space: SpaceRef, repo: DID, validate: Bool? = nil, writes: [InputWritesUnion]) {
             self.space = space
             self.repo = repo
             self.validate = validate
@@ -487,7 +487,7 @@ public struct Input: ATProtocolCodable {
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.space = try container.decode(ATProtocolURI.self, forKey: .space)
+            self.space = try container.decode(SpaceRef.self, forKey: .space)
             self.repo = try container.decode(DID.self, forKey: .repo)
             if container.contains(.validate) {
                 guard try !container.decodeNil(forKey: .validate) else {
@@ -613,6 +613,10 @@ public struct Output: ATProtocolCodable {
         
 public enum Error: String, Swift.Error, ATProtoErrorType, CustomStringConvertible {
                 case spaceNotFound = "SpaceNotFound"
+                /// An update or delete targeted a record that does not exist.
+                case recordNotFound = "RecordNotFound"
+                /// A create targeted a collection and rkey that already holds a record.
+                case recordAlreadyExists = "RecordAlreadyExists"
             public var description: String {
                 return self.rawValue
             }
@@ -633,7 +637,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
     public static let endpointDescriptor = XRPCMethodDescriptor(
         nsid: "com.atproto.space.applyWrites", kind: "procedure",
         inputEncoding: "application/json", outputEncoding: "application/json",
-        declaredErrors: ["SpaceNotFound"]
+        declaredErrors: ["SpaceNotFound", "RecordNotFound", "RecordAlreadyExists"]
     )
 
     public protocol ServerHandler: Sendable {

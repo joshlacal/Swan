@@ -1,6 +1,7 @@
 import Foundation
 @testable import SwanOAuth
 import XCTest
+import Testing
 
 private struct StubDocuments: SwanDIDDocumentFetching {
     let json: String
@@ -756,4 +757,112 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
             XCTFail("unexpected error: \(error)")
         }
     }
+    // MARK: - Whole service identifiers (`did` / `did#fragment`, Erratum 03)
+
+    func testServiceIdentifierWithAFragmentMatchesTheFragmentForm() async throws {
+        let url = try await resolver(document).endpoint(
+            serviceIdentifier: "did:web:api.bsky.app#bsky_appview"
+        )
+        XCTAssertEqual(url, URL(string: "https://api.bsky.app"))
+    }
+
+    /// Fragment-less identifiers keep the refuse-ambiguity posture: exactly
+    /// one declared service resolves; two refuse regardless of order (the
+    /// reference's first-entry rule would answer differently depending on
+    /// document ordering).
+    func testFragmentlessIdentifierResolvesOnlyASingleServiceDocument() async throws {
+        let single = """
+        {"id":"did:web:solo.example","service":[
+          {"id":"#events","serviceEndpoint":"https://solo.example"}]}
+        """
+        let url = try await SwanServiceEndpointResolver(
+            documents: StubDocuments(json: single)
+        ).endpoint(serviceIdentifier: "did:web:solo.example")
+        XCTAssertEqual(url, URL(string: "https://solo.example"))
+
+        do {
+            _ = try await resolver(document).endpoint(serviceIdentifier: "did:web:api.bsky.app")
+            XCTFail("two service entries with no fragment must refuse")
+        } catch {
+            XCTAssertEqual(error as? SwanServiceResolutionFailure, .unresolvableService)
+        }
+    }
+
+    func testMalformedServiceIdentifiersAreUnresolvable() async {
+        for identifier in ["", "did:web:x#", "#frag", "did:web:x#a#b", String(repeating: "a", count: 1_025)] {
+            do {
+                _ = try await resolver(document).endpoint(serviceIdentifier: identifier)
+                XCTFail("expected \(identifier) to be unresolvable")
+            } catch {
+                XCTAssertEqual(error as? SwanServiceResolutionFailure, .unresolvableService)
+            }
+        }
+    }
+
+    func testFragmentlessIdentifierStillBindsTheDocumentSubject() async {
+        let foreign = """
+        {"id":"did:web:other.example","service":[
+          {"id":"#events","serviceEndpoint":"https://other.example"}]}
+        """
+        do {
+            _ = try await SwanServiceEndpointResolver(
+                documents: StubDocuments(json: foreign)
+            ).endpoint(serviceIdentifier: "did:web:solo.example")
+            XCTFail("a document for another subject must not resolve")
+        } catch {
+            XCTAssertEqual(error as? SwanServiceResolutionFailure, .unresolvableService)
+        }
+    }
+
+    func testFragmentlessIdentifierRefusesANonHTTPSSingleEntry() async {
+        let insecure = """
+        {"id":"did:web:solo.example","service":[
+          {"id":"#events","serviceEndpoint":"http://solo.example"}]}
+        """
+        do {
+            _ = try await SwanServiceEndpointResolver(
+                documents: StubDocuments(json: insecure)
+            ).endpoint(serviceIdentifier: "did:web:solo.example")
+            XCTFail("a cleartext endpoint must not resolve")
+        } catch {
+            XCTAssertEqual(error as? SwanServiceResolutionFailure, .unresolvableService)
+        }
+    }
+}
+
+@Test("Concurrent resolutions of one DID coalesce into a single document fetch")
+func concurrentResolutionsCoalesceIntoOneFetch() async throws {
+    actor CountingFetcher: SwanDIDDocumentFetching {
+        private var calls = 0
+        private let payload: Data
+        init(payload: Data) { self.payload = payload }
+        func documentJSON(forDID did: String) async throws -> Data {
+            calls += 1
+            try await Task.sleep(for: .milliseconds(50))
+            return payload
+        }
+        func callCount() -> Int { calls }
+    }
+
+    let document = Data("""
+    {"id":"did:plc:test","service":[{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example.com"}]}
+    """.utf8)
+    let fetcher = CountingFetcher(payload: document)
+    let resolver = SwanServiceEndpointResolver(documents: fetcher)
+
+    try await withThrowingTaskGroup(of: URL.self) { group in
+        for _ in 0 ..< 16 {
+            group.addTask {
+                try await resolver.endpoint(did: "did:plc:test", fragment: "atproto_pds")
+            }
+        }
+        var seen = 0
+        for try await url in group {
+            #expect(url.absoluteString == "https://pds.example.com")
+            seen += 1
+        }
+        #expect(seen == 16)
+    }
+
+    #expect(await fetcher.callCount() == 1)
 }

@@ -357,7 +357,7 @@ private struct HTTPIncrementalFixture {
         valueBytes = try DAGCBOR.encodeValue(value.toCBORValue())
         let cid = CID.fromDAGCBOR(valueBytes)
         operation = .init(
-            rev: revision.toString(),
+            rev: revision,
             collection: try NSID(nsidString: "app.bsky.feed.post"),
             rkey: try RecordKey(keyString: "one"),
             cid: cid,
@@ -450,7 +450,7 @@ private struct HTTPIncrementalFixture {
             ikm: Bytes(data: envelope.context.ikm),
             sig: Bytes(data: envelope.contextSignature),
             mac: Bytes(data: envelope.contentBinding),
-            rev: envelope.context.rev
+            rev: try TID(tidString: envelope.context.rev)
         )
     }
 }

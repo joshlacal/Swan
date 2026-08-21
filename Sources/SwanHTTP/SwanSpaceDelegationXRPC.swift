@@ -75,13 +75,23 @@ private struct AuthenticatedGetSpaceDelegationTokenHandler:
             throw SpaceDelegationMintingFailure.unavailable
         }
 
-        guard case let .accountOAuth(subject, scopes) = authorization,
-              PermissionedSpaceScopeSyntax.permitsWholeSpaceRead(
-                  scopes,
-                  spaceType: space.spaceType,
-                  authority: space.authority,
-                  skey: space.skey
-              ) else {
+        // The DELEGATION FENCE (§5.6.3, §6.2). `space` is already a validated
+        // `SpaceURI` at `:56`, so the three-`String` argument list collapses to
+        // one value — removing the argument-order bug the current
+        // `spaceType:authority:skey:` signature admits, all three being
+        // `String`.
+        //
+        // A whole-space read grant is what an app EXCHANGES for a credential;
+        // it is not itself one (`packages/pds/src/api/com/atproto/space/util.ts:102-108`).
+        // Swan's fence is a documented HARDENING of that upstream rule, not an
+        // invention: upstream accepts both a bare `space:<type>` and a
+        // collection-qualified read here (`getDelegationToken.ts:22`,
+        // `space-permission.ts:104-107` and `:207-211`); Swan refuses both.
+        //
+        // Denial is this route's existing opaque code, identical to a bad token
+        // (§6.5.8, §9-D6).
+        guard case let .accountOAuth(subject, permissions) = authorization,
+              permissions.allowsSpace(.delegationExchange(space)) else {
             throw SpaceDelegationMintingFailure.denied
         }
 
@@ -219,7 +229,7 @@ private func parseAuthenticatedGetSpaceDelegationTokenParameters(
         guard rawSpace.utf8.count <= 2_048 else {
             throw SpaceDelegationMintingFailure.invalidRequest
         }
-        let uri = try ATProtocolURI(uriString: rawSpace)
+        let uri = try SpaceRef(uriString: rawSpace)
         _ = try SpaceURI(uri.uriString())
         return .init(space: uri)
     } catch {

@@ -11,6 +11,10 @@ public struct OAuthValidatedSession: Sendable, Equatable {
     public let client: OAuthResolvedClientMetadata
     public let redirectURI: URL
     public let scopes: Set<String>
+    /// Which parameters the client physically wrote, witnessed by the admission
+    /// parse below and carried into the durable binding. It is never re-derived
+    /// from a scope string afterwards (§9-D23).
+    public let scopeProvenance: OAuthScopeProvenance
     public let dpopProof: OAuthValidatedDPoPProof
     public let clientAssertion: OAuthValidatedClientAssertion?
 
@@ -25,11 +29,30 @@ public struct OAuthValidatedSession: Sendable, Equatable {
     ) throws {
         guard !issuer.isEmpty, issuer.utf8.count <= 4_096, !issuer.utf8.contains(0),
               client.metadata.matchesRedirectURI(redirectURI),
-              Self.hasATProtocolResourceScope(scopes),
-              scopes.isSubset(of: client.metadata.scopes),
               Self.validThumbprint(dpopProof.keyThumbprint) else {
             throw SwanError.unauthorized("OAuth session binding is invalid")
         }
+        // Stages B, C and E (§6.3). These replace the two predicates that stood
+        // here — `hasATProtocolResourceScope` and a raw `isSubset` — with the
+        // one admission policy, so the base-scope floor and the
+        // requested-⊆-declared check cannot drift between call sites again.
+        //
+        // The subset check now canonicalises both sides (§9-D7): a client may
+        // legitimately spell the same grant differently in its metadata and its
+        // request, and after §9-D21 the registered set is "strings the client
+        // typed", so comparing raw bytes would produce false negatives that
+        // registration no longer catches.
+        //
+        // `OAuthScopeAdmissionError` is deliberately allowed to propagate rather
+        // than being flattened into `SwanError.unauthorized`: the HTTP layer maps
+        // it to `invalid_scope` for a malformed request and keeps
+        // `invalid_request` for the subset failure, which would otherwise leak
+        // the client's registration.
+        let admission = try OAuthScopeAdmissionPolicy.admit(
+            requested: scopes,
+            declaredBy: client.metadata.scopes
+        )
+        scopeProvenance = admission.provenance
 
         switch client.metadata.tokenEndpointAuthMethod {
         case .none:
@@ -71,7 +94,12 @@ public struct OAuthValidatedSession: Sendable, Equatable {
                     keyThumbprint: $0.keyThumbprint
                 )
             },
-            refreshTokenAllowed: client.metadata.grantTypes.contains("refresh_token")
+            refreshTokenAllowed: client.metadata.grantTypes.contains("refresh_token"),
+            // A PAR binding is by definition the as-requested set — it has no
+            // subject to resolve `self` against — so `scopesRequested` stays
+            // absent here and is filled in at mint, by stage F, where the two
+            // first diverge.
+            scopeProvenance: scopeProvenance
         )
     }
 
@@ -82,15 +110,4 @@ public struct OAuthValidatedSession: Sendable, Equatable {
         }
     }
 
-    /// A complete client metadata document must still advertise `atproto`,
-    /// but an issued access token may carry only one profile-specific
-    /// permissioned-space grant. The resource boundary and SwanSpaces parse
-    /// its exact authority/skey/action/collection later; this layer admits
-    /// only a qualified tuple, rather than accepting a bare type grant with
-    /// no trusted authority or action binding.
-    private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
-        scopes.contains("atproto") || scopes.contains { scope in
-            PermissionedSpaceScopeSyntax.isQualified(scope)
-        }
-    }
 }

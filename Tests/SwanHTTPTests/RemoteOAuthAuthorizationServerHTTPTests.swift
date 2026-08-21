@@ -400,9 +400,15 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
           XCTAssertFalse(Data(buffer: response.body).description.contains(self.password))
         }
         let originalRefresh = try XCTUnwrap(refreshToken)
+        // The rotation uses the shape the atproto-oauth Rust crate actually
+        // sends — `redirect_uri` included — which the parser accepts and
+        // ignores (RFC 6749 gives it no role in this grant). Refusing it
+        // failed every Bulleted session at its first refresh. The reuse
+        // attempt below keeps the bare RFC shape so both stay exercised.
         let refreshForm = self.form([
           ("grant_type", "refresh_token"), ("client_id", self.clientID.absoluteString),
           ("refresh_token", originalRefresh),
+          ("redirect_uri", self.redirectURI.absoluteString),
         ])
         let refreshProof = try self.dpop(
           dpopKey, dpopJWK, jti: "remote-public-refresh", nonce: try XCTUnwrap(tokenNonce),
@@ -419,9 +425,13 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
         let reuseProof = try self.dpop(
           dpopKey, dpopJWK, jti: "remote-public-reuse", nonce: try XCTUnwrap(tokenNonce),
           target: tokenTarget)
+        let bareRefreshForm = self.form([
+          ("grant_type", "refresh_token"), ("client_id", self.clientID.absoluteString),
+          ("refresh_token", originalRefresh),
+        ])
         try await client.execute(
           uri: "/oauth/token", method: .post, headers: formHeaders(dpop: reuseProof),
-          body: ByteBuffer(string: refreshForm)
+          body: ByteBuffer(string: bareRefreshForm)
         ) { response in
           XCTAssertEqual(response.status, .badRequest)
           XCTAssertEqual(try self.error(response.body), "invalid_grant")
@@ -441,6 +451,199 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
         ) { response in
           XCTAssertEqual(response.status, .ok)
           XCTAssertEqual(response.headers[.cacheControl], "no-store")
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
+  func testRemoteOAuthMFAIsAdmittedTwoPhaseAndTOTPReceiptIsOneTime() async throws {
+    let fixture = try await makeFixture(metadata: try publicMetadata(), withTOTP: true)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let resolved = try await fixture.completeConfiguration.clientMetadataLoader.load(clientID: clientID)
+      let session = try OAuthValidatedSession(
+        issuer: issuer.absoluteString, client: resolved, redirectURI: redirectURI,
+        scopes: ["atproto"], dpopProof: .init(
+          keyThumbprint: String(repeating: "m", count: 43), jwtID: "remote-mfa-flow", issuedAt: Date()))
+      let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
+        session: session, state: "remote-mfa-state", codeChallengeS256: String(repeating: "a", count: 43))
+      let authorize = "/oauth/authorize?client_id=\(encode(clientID.absoluteString))&request_uri=\(encode(requestURI))"
+      let app = fixture.server.buildApplication(logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.mfa"))
+      try await app.test(.live) { client in
+        var cookie: String?
+        var csrf: String?
+        try await client.execute(uri: authorize, method: .get) { response in
+          XCTAssertEqual(response.status, .ok)
+          cookie = self.cookie(response.headers[setCookieHeader])
+          csrf = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(cookie)).csrfToken
+        }
+        let direct = self.form([
+          ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle),
+          ("kind", "totp"), ("factorID", "oauth-totp-factor"), ("code", "000000")
+        ])
+        try await client.execute(
+          uri: "/oauth/authorize/mfa", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(cookie)), body: ByteBuffer(string: direct)
+        ) { response in
+          XCTAssertEqual(response.status, .unauthorized)
+        }
+
+        var phaseCookie: String?
+        var phaseCSRF: String?
+        try await client.execute(uri: authorize, method: .get) { response in
+          XCTAssertEqual(response.status, .ok)
+          phaseCookie = self.cookie(response.headers[setCookieHeader])
+          phaseCSRF = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(phaseCookie)).csrfToken
+        }
+        try await client.execute(
+          uri: "/oauth/authorize", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(phaseCookie)),
+          body: ByteBuffer(string: self.form([
+            ("csrf", try XCTUnwrap(phaseCSRF)), ("handle", self.handle), ("password", self.password)
+          ]))
+        ) { response in
+          XCTAssertEqual(response.status, .ok)
+          let html = String(decoding: Data(buffer: response.body), as: UTF8.self)
+          XCTAssertTrue(html.contains("/oauth/authorize/mfa"))
+          XCTAssertTrue(html.contains("name=\"kind\" value=\"totp\""))
+          XCTAssertFalse(html.contains("name=\"password\""))
+        }
+        // The admitted phase is browser-session/CSRF bound. A substituted
+        // CSRF must fail before TOTP work and leave the valid phase intact.
+        let wrongCSRF = self.form([
+          ("csrf", String(repeating: "z", count: 43)), ("handle", self.handle),
+          ("kind", "totp"), ("factorID", "oauth-totp-factor"), ("code", "000000")
+        ])
+        try await client.execute(
+          uri: "/oauth/authorize/mfa", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(phaseCookie)), body: ByteBuffer(string: wrongCSRF)
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+        }
+        let secret = try XCTUnwrap(fixture.totpSecret)
+        let code = try TOTPAuthenticator.code(secret: secret, counter: UInt64(Date().timeIntervalSince1970 / 30))
+        let mfa = self.form([
+          ("csrf", try XCTUnwrap(phaseCSRF)), ("handle", self.handle),
+          ("kind", "totp"), ("factorID", "oauth-totp-factor"), ("code", code)
+        ])
+        try await client.execute(
+          uri: "/oauth/authorize/mfa", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(phaseCookie)), body: ByteBuffer(string: mfa)
+        ) { response in
+          XCTAssertEqual(response.status, .ok)
+          XCTAssertTrue(String(decoding: Data(buffer: response.body), as: UTF8.self).contains("Approve"))
+        }
+        try await client.execute(
+          uri: "/oauth/authorize/mfa", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(phaseCookie)), body: ByteBuffer(string: mfa)
+        ) { response in
+          XCTAssertEqual(response.status, .unauthorized)
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
+  func testRemoteOAuthPasskeyPageUsesServerChallengeAndWebAuthnScript() async throws {
+    let fixture = try await makeFixture(metadata: try publicMetadata(), withPasskey: true)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let resolved = try await fixture.completeConfiguration.clientMetadataLoader.load(clientID: clientID)
+      let session = try OAuthValidatedSession(
+        issuer: issuer.absoluteString, client: resolved, redirectURI: redirectURI,
+        scopes: ["atproto"], dpopProof: .init(
+          keyThumbprint: String(repeating: "k", count: 43), jwtID: "remote-passkey-page", issuedAt: Date()))
+      let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
+        session: session, state: "remote-passkey-state", codeChallengeS256: String(repeating: "a", count: 43))
+      let authorize = "/oauth/authorize?client_id=\(encode(clientID.absoluteString))&request_uri=\(encode(requestURI))"
+      let app = fixture.server.buildApplication(logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.passkey"))
+      try await app.test(.live) { client in
+        var cookie: String?
+        var csrf: String?
+        try await client.execute(uri: authorize, method: .get) { response in
+          cookie = self.cookie(response.headers[setCookieHeader])
+          csrf = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(cookie)).csrfToken
+        }
+        try await client.execute(
+          uri: "/oauth/authorize", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(cookie)),
+          body: ByteBuffer(string: self.form([
+            ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle), ("password", self.password)
+          ]))
+        ) { response in
+          XCTAssertEqual(response.status, .ok)
+          let html = String(decoding: Data(buffer: response.body), as: UTF8.self)
+          XCTAssertTrue(html.contains("navigator.credentials.get"))
+          XCTAssertTrue(html.contains("name=\"challenge\""))
+          XCTAssertTrue(html.contains("name=\"clientDataJSON\""))
+          XCTAssertTrue(html.contains("name=\"authenticatorData\""))
+          XCTAssertTrue(html.contains("name=\"credentialID\""))
+          XCTAssertTrue(html.contains("name=\"signature\""))
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
+  func testRemoteOAuthRecoveryOnlyRendersAndConsumesChannelBoundCode() async throws {
+    let fixture = try await makeFixture(metadata: try publicMetadata(), withRecovery: true)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let resolved = try await fixture.completeConfiguration.clientMetadataLoader.load(clientID: clientID)
+      let session = try OAuthValidatedSession(
+        issuer: issuer.absoluteString, client: resolved, redirectURI: redirectURI,
+        scopes: ["atproto"], dpopProof: .init(
+          keyThumbprint: String(repeating: "r", count: 43), jwtID: "remote-recovery-flow", issuedAt: Date()))
+      let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
+        session: session, state: "remote-recovery-state", codeChallengeS256: String(repeating: "a", count: 43))
+      let authorize = "/oauth/authorize?client_id=\(encode(clientID.absoluteString))&request_uri=\(encode(requestURI))"
+      let app = fixture.server.buildApplication(logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.recovery"))
+      try await app.test(.live) { client in
+        var cookie: String?
+        var csrf: String?
+        try await client.execute(uri: authorize, method: .get) { response in
+          cookie = self.cookie(response.headers[setCookieHeader])
+          csrf = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(cookie)).csrfToken
+        }
+        try await client.execute(
+          uri: "/oauth/authorize", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(cookie)),
+          body: ByteBuffer(string: self.form([
+            ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle), ("password", self.password)
+          ]))
+        ) { response in
+          XCTAssertEqual(response.status, .ok)
+          let html = String(decoding: Data(buffer: response.body), as: UTF8.self)
+          XCTAssertTrue(html.contains("name=\"code\""))
+          XCTAssertTrue(html.contains("recovery"))
+        }
+        let mfa = self.form([
+          ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle),
+          ("kind", "recoveryCode"), ("factorID", "oauth-recovery-factor"),
+          ("code", try XCTUnwrap(fixture.recoveryCode))
+        ])
+        try await client.execute(
+          uri: "/oauth/authorize/mfa", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(cookie)), body: ByteBuffer(string: mfa)
+        ) { response in
+          XCTAssertEqual(response.status, .ok)
+          XCTAssertTrue(String(decoding: Data(buffer: response.body), as: UTF8.self).contains("Approve"))
+        }
+        try await client.execute(
+          uri: "/oauth/authorize/mfa", method: .post,
+          headers: self.formHeaders(cookie: try XCTUnwrap(cookie)), body: ByteBuffer(string: mfa)
+        ) { response in
+          XCTAssertEqual(response.status, .unauthorized)
         }
       }
       try await fixture.control.close()
@@ -526,6 +729,161 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
       resource: issuer,
       authorizationServer: URL(string: "https://swan.example/oauth")!
     ))
+  }
+
+  /// The deployed composition root advertises the three transition scopes
+  /// beside `atproto` (`SwanCommand.swift`, `--enable-oauth-authorization-server`),
+  /// matching upstream's build-metadata.ts hints. Swan already parses and
+  /// admits all three at PAR (`AtprotoScope.parse`; `SwanOAuthTests` pins the
+  /// granted set) — the advertisement is what clients gate on: the
+  /// atproto-oauth Rust crate refuses to begin sign-in against a server whose
+  /// `scopes_supported` omits `transition:generic` (observed as bulleted.app
+  /// declining swan.place). This pins that the metadata type accepts and
+  /// renders the exact deployed advertisement, in the sorted order
+  /// `OAuthPublishedURL.validateScopes` imposes.
+  func testMetadataRendersTransitionScopeConformanceHints() throws {
+    let advertised = ["atproto", "transition:generic", "transition:email", "transition:chat.bsky"]
+    let metadata = try OAuthAuthorizationServerMetadata(issuer: issuer, scopesSupported: advertised)
+    XCTAssertEqual(
+      metadata.scopesSupported,
+      ["atproto", "transition:chat.bsky", "transition:email", "transition:generic"]
+    )
+    let rendered = try JSONSerialization.jsonObject(
+      with: OAuthMetadataRenderer.render(metadata)
+    ) as? [String: Any]
+    XCTAssertEqual(
+      try XCTUnwrap(rendered)["scopes_supported"] as? [String],
+      ["atproto", "transition:chat.bsky", "transition:email", "transition:generic"]
+    )
+  }
+
+  func testRemotePARAdmitsLoginHintAndInteractivePromptHints() async throws {
+    let fixture = try await makeFixture(metadata: try publicMetadata())
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    // The atproto-oauth Rust crate appends the typed handle as `login_hint`
+    // on every sign-in, so a parser that refuses the hint refuses the client
+    // before DPoP ever gets its nonce challenge — observed live as
+    // bulleted.app failing against swan.place with `invalid_request` at
+    // `stage=form_parse`. The server ignores both hints (it always presents
+    // the login form): the hinted form must draw the nonce challenge and
+    // then persist.
+    do {
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.hints"))
+      try await app.test(.router) { client in
+        let dpopKey = P256.Signing.PrivateKey()
+        let dpopJWK = try jwk(dpopKey)
+        let verifier = "remote-oauth-server-test-verifier-000000000000000000"
+        let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64URLEncodedString()
+        let body = form([
+          ("client_id", clientID.absoluteString), ("redirect_uri", redirectURI.absoluteString),
+          ("response_type", "code"), ("scope", "atproto"), ("state", "hinted-state"),
+          ("code_challenge", challenge), ("code_challenge_method", "S256"),
+          ("login_hint", "someone.example.com"), ("prompt", "login"),
+        ])
+        var nonce: String?
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(),
+          body: ByteBuffer(string: body)
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+          XCTAssertEqual(
+            try self.error(response.body),
+            "use_dpop_nonce",
+            "a hinted form must parse and draw the nonce challenge, not invalid_request"
+          )
+          nonce = response.headers[dpopNonceHeader]
+        }
+        let proof = try dpop(
+          dpopKey, dpopJWK, jti: "remote-par-hinted", nonce: try XCTUnwrap(nonce),
+          target: try OAuthDPoPProofValidator.normalizedTarget(issuer.appending(path: "oauth/par"))
+        )
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(dpop: proof),
+          body: ByteBuffer(string: body)
+        ) { response in
+          XCTAssertEqual(response.status, .created)
+          let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(buffer: response.body)) as? [String: Any])
+          XCTAssertTrue(
+            try XCTUnwrap(object["request_uri"] as? String)
+              .hasPrefix("urn:ietf:params:oauth:request_uri:"))
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
+  func testRemotePARAdmitsQueryResponseModeAndRefusesOtherModes() async throws {
+    let fixture = try await makeFixture(metadata: try publicMetadata())
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    // `@atproto/oauth-client-node` defaults `responseMode` to `query` and puts
+    // it in every PAR body, so refusing the parameter refuses every client
+    // built on that library — observed live as bulletin.my returning 500 while
+    // swan.place logged `invalid_request` at `stage=form_parse`. `query` is the
+    // only mode this server implements: it appends `code`/`state` to the
+    // client's redirect URI, so `fragment` must still be refused rather than
+    // accepted and then silently ignored.
+    do {
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.responseMode"))
+      try await app.test(.router) { client in
+        let dpopKey = P256.Signing.PrivateKey()
+        let dpopJWK = try jwk(dpopKey)
+        let verifier = "remote-oauth-server-test-verifier-000000000000000000"
+        let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64URLEncodedString()
+        func parBody(responseMode: String) -> String {
+          form([
+            ("client_id", clientID.absoluteString), ("redirect_uri", redirectURI.absoluteString),
+            ("response_type", "code"), ("scope", "atproto"), ("state", "response-mode-state"),
+            ("code_challenge", challenge), ("code_challenge_method", "S256"),
+            ("response_mode", responseMode),
+          ])
+        }
+        var nonce: String?
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(),
+          body: ByteBuffer(string: parBody(responseMode: "query"))
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+          XCTAssertEqual(
+            try self.error(response.body),
+            "use_dpop_nonce",
+            "response_mode=query must parse and draw the nonce challenge"
+          )
+          nonce = response.headers[dpopNonceHeader]
+        }
+        let proof = try dpop(
+          dpopKey, dpopJWK, jti: "remote-par-response-mode", nonce: try XCTUnwrap(nonce),
+          target: try OAuthDPoPProofValidator.normalizedTarget(issuer.appending(path: "oauth/par"))
+        )
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(dpop: proof),
+          body: ByteBuffer(string: parBody(responseMode: "query"))
+        ) { response in
+          XCTAssertEqual(response.status, .created)
+          let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(buffer: response.body)) as? [String: Any])
+          XCTAssertTrue(
+            try XCTUnwrap(object["request_uri"] as? String)
+              .hasPrefix("urn:ietf:params:oauth:request_uri:"))
+        }
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(),
+          body: ByteBuffer(string: parBody(responseMode: "fragment"))
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+          XCTAssertEqual(try self.error(response.body), "invalid_request")
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
   }
 
   func testCompleteOAuthConfigurationRejectsDefaultHTTPSIssuerPort() async throws {
@@ -1179,26 +1537,205 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     }
   }
 
+  // MARK: - §5.7.5 call site 1 — PAR / authorize
+
+  /// The PAR leg of §5.7.5's failure matrix, at the real call site.
+  ///
+  /// `invalid_scope` here is half of the deliberate asymmetry — the token leg
+  /// answers `invalid_request` for the same root cause
+  /// (`request-manager.ts:293-312` vs `token-manager.ts:135-138`). The unit-level
+  /// twin is `OAuthLexiconScopeResolutionTests.testSameRootCauseReportsDifferentCodesOnTheTwoLegs`;
+  /// this one proves the code survives the HTTP layer's `catch` chain rather than
+  /// being flattened into `invalid_request` alongside the subset failure.
+  func testPARRejectsAnUnresolvableIncludeWithInvalidScope() async throws {
+    let include = "include:com.example.forum.auth"
+    let metadata = try publicMetadata(scopes: ["atproto", include])
+    let resolver = StubHTTPLexiconResolver([:])
+    let fixture = try await makeFixture(metadata: metadata, lexiconResolver: resolver)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.includeUnresolvable"))
+      try await app.test(.live) { client in
+        let (proof, parForm) = try await self.parHandshake(
+          client: client, scope: "atproto \(include)", jti: "include-unresolvable")
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(dpop: proof),
+          body: ByteBuffer(string: parForm)
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+          XCTAssertEqual(
+            try self.error(response.body), "invalid_scope",
+            """
+            §5.7.5: an `include:` that cannot be resolved is `invalid_scope` at \
+            PAR. `invalid_request` here would be the token-mint code, and \
+            unifying the two is the divergence this asymmetry exists to prevent.
+            """
+          )
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
+  /// §5.7.5 call site 1's second job, and the row that says an empty expansion is
+  /// **not** an error.
+  ///
+  /// One request carries two permission sets: one that expands to a real grant
+  /// and one whose every entry drops. The consent page must show the *expanded
+  /// capability* for the first — `include:` → concrete happens before the
+  /// renderer extracts anything for display (`lexicon-manager.ts:21-36`) — and
+  /// §5.7.2's canonical string, naming the NSID, for the second. A `.warn`
+  /// reaches an operator; the person authorizing never sees it.
+  func testConsentRendersTheExpansionAndNamesAnEmptyPermissionSet() async throws {
+    let productive = "include:com.example.forum.auth"
+    let barren = "include:com.example.empty.auth"
+    let metadata = try publicMetadata(scopes: ["atproto", productive, barren])
+    let resolver = StubHTTPLexiconResolver([
+      "com.example.forum.auth": .permissionSet(
+        LexiconPermissionSet(permissions: [
+          LexiconPermission(
+            resource: "repo",
+            fields: ["collection": .list([.string("com.example.forum.thread")])]
+          )
+        ])
+      ),
+      // Every entry drops: `blob` is not a family expansion admits (gate 1).
+      "com.example.empty.auth": .permissionSet(
+        LexiconPermissionSet(permissions: [
+          LexiconPermission(resource: "blob", fields: ["accept": .list([.string("image/*")])])
+        ])
+      ),
+    ])
+    let fixture = try await makeFixture(metadata: metadata, lexiconResolver: resolver)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.includeConsent"))
+      try await app.test(.live) { client in
+        let (proof, parForm) = try await self.parHandshake(
+          client: client, scope: "atproto \(productive) \(barren)", jti: "include-consent")
+        var requestURI: String?
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(dpop: proof),
+          body: ByteBuffer(string: parForm)
+        ) { response in
+          XCTAssertEqual(response.status, .created)
+          requestURI = try self.json(response.body)["request_uri"] as? String
+        }
+        let authorize =
+          "/oauth/authorize?client_id=\(encode(self.clientID.absoluteString))&request_uri=\(encode(try XCTUnwrap(requestURI)))"
+        var cookieValue: String?
+        var csrf: String?
+        try await client.execute(uri: authorize, method: .get) { response in
+          XCTAssertEqual(response.status, .ok)
+          cookieValue = self.cookie(response.headers[setCookieHeader])
+          csrf = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(cookieValue))
+            .csrfToken
+        }
+        try await client.execute(
+          uri: "/oauth/authorize", method: .post,
+          headers: formHeaders(cookie: try XCTUnwrap(cookieValue)),
+          body: ByteBuffer(
+            string: self.form([
+              ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle),
+              ("password", self.password),
+            ]))
+        ) { response in
+          XCTAssertEqual(response.status, .ok)
+          let html = String(decoding: Data(buffer: response.body), as: UTF8.self)
+          XCTAssertTrue(
+            html.contains("com.example.forum.thread"),
+            "the productive set must render as the capability it expands to, not as its NSID"
+          )
+          XCTAssertFalse(
+            html.contains("Requested permission set com.example.forum.auth"),
+            "an include that DID expand must not also render the 'grants nothing' wording"
+          )
+          // The card puts the NSID inside a `<b>`, so the canonical sentence is
+          // split by markup in the raw bytes; `ScopeDescriptionTests` pins it
+          // verbatim against stripped text.
+          XCTAssertTrue(
+            html.contains("Requested permission set com.example.empty.auth.")
+              && html.contains(
+                "Swan does not currently grant capabilities derived from this set."),
+            """
+            §5.7.5: an empty expansion is not an error, and it is not silent \
+            either. Without this line the permission set simply vanishes from \
+            the screen that authorises it.
+            """
+          )
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
+  /// Drives the nonce challenge and returns a usable proof plus the PAR form for
+  /// `scope`. The challenge round trip is not what these two tests are about.
+  private func parHandshake(
+    client: some TestClientProtocol,
+    scope: String,
+    jti: String
+  ) async throws -> (proof: String, form: String) {
+    let dpopKey = P256.Signing.PrivateKey()
+    let dpopJWK = try jwk(dpopKey)
+    let verifier = "remote-oauth-server-test-verifier-000000000000000000"
+    let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64URLEncodedString()
+    let body = form([
+      ("client_id", clientID.absoluteString), ("redirect_uri", redirectURI.absoluteString),
+      ("response_type", "code"), ("scope", scope), ("state", "lexicon-state"),
+      ("code_challenge", challenge), ("code_challenge_method", "S256"),
+    ])
+    var nonce: String?
+    try await client.execute(
+      uri: "/oauth/par", method: .post, headers: formHeaders(),
+      body: ByteBuffer(string: body)
+    ) { response in
+      XCTAssertEqual(response.status, .badRequest)
+      nonce = response.headers[dpopNonceHeader]
+    }
+    let proof = try dpop(
+      dpopKey, dpopJWK, jti: jti, nonce: try XCTUnwrap(nonce),
+      target: try OAuthDPoPProofValidator.normalizedTarget(issuer.appending(path: "oauth/par"))
+    )
+    return (proof, body)
+  }
+
   private func makeFixture(
     metadata: OAuthClientMetadata,
     resolverAnswers: [[OAuthIPAddress]]? = nil,
     loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
     includeEmailRecovery: Bool = false,
+    withTOTP: Bool = false,
+    withPasskey: Bool = false,
+    withRecovery: Bool = false,
     jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
-    maximumConnections: Int = 256
+    maximumConnections: Int = 256,
+    lexiconResolver: (any SwanLexiconResolving)? = nil
   ) async throws -> Fixture {
     let root = FileManager.default.temporaryDirectory.appending(
       path: "RemoteOAuthAuthorizationServerHTTPTests-\(UUID().uuidString)")
     let control = try await SQLiteControlDatabase(dataDirectory: root)
     do {
       let hasher = try LibsodiumArgon2idHasher(policy: .interactive)
+      let factorTokenService = FactorTokenService(store: control)
       let accounts = DurableAccountDirectory(
         store: control, passwordHasher: hasher,
         verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher),
         loginAdmissionService: AccountLoginAdmissionService(
           store: control,
           key: try AccountLoginAdmissionKey(Data(repeating: 0xE2, count: 32))
-        ))
+        ),
+        loginFactorTokenVerifier: factorTokenService,
+        authenticationFactors: control
+      )
       _ = try await accounts.registerProvisionedAccount(
         did: did, canonicalHandle: handle, password: password,
         signingReference: try AccountKeyReference(
@@ -1220,9 +1757,62 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
         controlStore: control
       )
       let runtime = try SwanOAuthRuntime(
-        controlStore: control, serverKey: Data(repeating: 0xE2, count: 32))
+        controlStore: control, serverKey: Data(repeating: 0xE2, count: 32),
+        lexiconResolver: lexiconResolver)
+      var totpSecret: Data?
+      var recoveryCode: String?
+      var mfaService: (any SwanOAuthMFAService)?
+      let factorID: String
+      if withTOTP {
+        let secret = Data("12345678901234567890".utf8)
+        factorID = "oauth-totp-factor"
+        try await control.saveFactor(
+          try AuthenticationFactorMetadata(
+            id: factorID, accountDID: did, kind: .totp, label: "Authenticator",
+            lookupDigest: Data(repeating: 0x5A, count: 32), createdAt: Date()),
+          now: Date())
+        try await control.saveTOTPEnvelope(
+          try TOTPEnvelopeCrypto.seal(
+            secret: secret, factorID: factorID, keyReference: "account-kek:primary",
+            key: Data(repeating: 0x4B, count: 32)),
+          now: Date())
+        totpSecret = secret
+      } else if withPasskey {
+        factorID = "oauth-passkey-factor"
+        try await control.saveFactor(
+          try AuthenticationFactorMetadata(
+            id: factorID, accountDID: did, kind: .passkey, label: "Passkey",
+            lookupDigest: Data(repeating: 0x5B, count: 32), createdAt: Date()),
+          now: Date())
+      } else if withRecovery {
+        factorID = "oauth-recovery-factor"
+        try await control.saveFactor(
+          try AuthenticationFactorMetadata(
+            id: factorID, accountDID: did, kind: .recoveryCode, label: "Recovery",
+            lookupDigest: Data(repeating: 0x5C, count: 32), createdAt: Date()),
+          now: Date())
+        let code = "RECOVERY-CODE-REMOTE-ONLY"
+        try await control.replaceRecoveryCodeDigests(
+          accountDID: did,
+          digests: [try RecoveryCodeDigest(
+            accountDID: did, digest: RecoveryCodeService.digest(code), issuedAt: Date())],
+          now: Date())
+        recoveryCode = code
+      } else {
+        factorID = ""
+      }
+      if withTOTP || withPasskey || withRecovery {
+        let accountMFA = try SwanAccountPortalMFARuntime(
+          factors: control, totpSecrets: control, replayStore: control,
+          recoveryStore: control, webAuthnCredentials: control,
+          webAuthnChallenges: control, webAuthnEnrollmentStore: control,
+          factorTokens: factorTokenService, accountKEK: Data(repeating: 0x4B, count: 32),
+          accountKEKID: "primary", relyingPartyID: "swan.example", origin: issuer.absoluteString)
+        mfaService = SwanOAuthMFAServiceAdapter(factors: control, oauthMFA: accountMFA)
+      }
       let complete = try SwanOAuthAuthorizationServerConfiguration(
-        issuer: issuer, protectedResource: issuer, accounts: accounts, clientMetadataLoader: loader)
+        issuer: issuer, protectedResource: issuer, accounts: accounts, clientMetadataLoader: loader,
+        mfaService: mfaService)
       let profile = try ProtocolProfile.load(
         from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json"))
       let emailDelivery: CapturedPasswordRecoveryDelivery?
@@ -1298,7 +1888,9 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
         root: root,
         transport: transport,
         emailRecovery: emailRecovery,
-        emailDelivery: emailDelivery
+        emailDelivery: emailDelivery,
+        totpSecret: totpSecret,
+        recoveryCode: recoveryCode
       )
     } catch {
       try? await control.close()
@@ -1306,11 +1898,13 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     }
   }
 
-  private func publicMetadata() throws -> OAuthClientMetadata {
+  private func publicMetadata(
+    scopes: Set<String> = ["atproto"]
+  ) throws -> OAuthClientMetadata {
     try OAuthClientMetadata(
       clientID: clientID, redirectURIs: [redirectURI],
       grantTypes: ["authorization_code", "refresh_token"], responseTypes: ["code"],
-      scopes: ["atproto"], dpopBoundAccessTokens: true)
+      scopes: scopes, dpopBoundAccessTokens: true)
   }
 
   private func parForm(challenge: String, assertion: String?) -> String {
@@ -1524,6 +2118,8 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     let transport: RemoteOAuthTransport
     let emailRecovery: AccountEmailRecoveryService?
     let emailDelivery: CapturedPasswordRecoveryDelivery?
+    let totpSecret: Data?
+    let recoveryCode: String?
   }
 }
 
@@ -1595,4 +2191,22 @@ private func encode(_ value: String) -> String {
     default: String(format: "%%%02X", byte)
     }
   }.joined()
+}
+
+/// A `SwanLexiconResolving` answering from a fixed table, for the two §5.7.5
+/// call-site-1 tests above. Deliberately not a proof-performing resolver: the
+/// proof chain is P2-G's subject, and re-asserting it here would test the stub.
+private struct StubHTTPLexiconResolver: SwanLexiconResolving {
+  private let documents: [String: SwanLexiconDocument]
+
+  init(_ documents: [String: SwanLexiconDocument]) { self.documents = documents }
+
+  func resolve(_ nsid: String) async throws -> SwanLexiconResolution {
+    guard let document = documents[nsid] else { return .unresolvable }
+    return .resolved(
+      document,
+      sourceURI: "at://did:plc:authorityauthorityauth/com.atproto.lexicon.schema/\(nsid)",
+      verifiedCID: "bafyreistubstubstubstubstubstubstubstubstubstubstubstubstub"
+    )
+  }
 }

@@ -1600,7 +1600,7 @@ private struct ExporterFixture {
                 expectedRevision: 0,
                 requestID: UUID(),
                 wireRevision: try TID(tidString: "3jzfcijpj2z\(index + 2)a"),
-                authorization: .accountOAuth(
+                authorization: .accountOAuthForTesting(
                     subject: did,
                     scopes: [
                         "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&action=create&collection=app.bsky.feed.post",

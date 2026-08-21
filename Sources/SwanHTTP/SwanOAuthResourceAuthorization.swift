@@ -39,6 +39,12 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
     private let publicURL: URL
     private let runtime: SwanOAuthRuntime
     private let accountControlStore: any AccountControlStore
+    /// Legacy (app-password) sessions, when the deployment enables them.
+    ///
+    /// `nil` leaves this authorizer DPoP-only, which is what every deployment
+    /// without `--enable-legacy-sessions` gets: a `Bearer` credential then falls
+    /// through to the DPoP parser and is refused exactly as it is today.
+    private let legacySessions: DurableLegacySessionService?
 
     /// `publicURL` is the process's configured canonical public identity, not
     /// a request-derived origin. It must be a scheme/host root URL so each
@@ -46,7 +52,8 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
     public init(
         publicURL: URL,
         runtime: SwanOAuthRuntime,
-        accountControlStore: any AccountControlStore
+        accountControlStore: any AccountControlStore,
+        legacySessions: DurableLegacySessionService? = nil
     ) throws {
         guard Self.validPublicURL(publicURL) else {
             throw SwanError.malformed("resource authorization public URL is invalid")
@@ -54,6 +61,7 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         self.publicURL = publicURL
         self.runtime = runtime
         self.accountControlStore = accountControlStore
+        self.legacySessions = legacySessions
     }
 
     /// Issues a challenge nonce from the exact OAuth runtime used by
@@ -79,6 +87,21 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         fixedPath: String,
         now: Date = Date()
     ) async throws -> AuthorizationContext {
+        // A legacy session presents `Bearer`, an OAuth token presents `DPoP`.
+        // The two prefixes are disjoint, so this dispatch cannot mistake one for
+        // the other, and it is the ONLY place a bearer credential enters the
+        // resource plane — every route already funnels through here.
+        //
+        // The legacy path deliberately performs no DPoP work: these tokens are
+        // not sender-constrained, which is the price of the feature. What it
+        // does NOT do is relax anything on the OAuth path below.
+        if let legacySessions, let bearer = Self.bearerToken(from: request.headers) {
+            do {
+                return try await legacySessions.authorize(accessJWT: bearer, now: now)
+            } catch {
+                throw SwanResourceAuthorizationFailure.denied
+            }
+        }
         let accessToken: String
         do {
             accessToken = try Self.accessToken(from: request.headers)
@@ -142,7 +165,31 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         // collection decision for the selected operation. Do not let a
         // malformed or legacy stored binding reach that domain policy merely
         // because its DPoP proof and opaque token digest were otherwise valid.
-        guard Self.hasATProtocolResourceScope(grant.scopes) else {
+        //
+        // Parse ONCE, here, and hand a frozen value to the domain layer
+        // (§6.5.1, §6.5.2). `hasResourceScope` is `atproto`-or-`space:` only —
+        // deliberately NOT "any recognised family" (§6.1). Several routes
+        // perform no further scope check at all, so widening this floor would
+        // hand an `identity:`- or `blob:`-only token an unguarded route.
+        //
+        // `statedKeys` is DURABLE provenance (§9-D23), read from the token
+        // family's stored record via `AccessGrant.scopeProvenance`. It must
+        // NEVER be derived here: re-parsing `grant.scopes` would INVENT
+        // provenance for a mint-resolved `self` (flipping the delegation fence
+        // open) and DESTROY it for a canonical `skey=*` (silently disabling the
+        // listing fence). The two failures run in opposite directions, which is
+        // why no parser change can substitute for the stored bits.
+        //
+        // `statedScopeKeys` is non-optional and keyed by the effective scope
+        // string, i.e. the members of `grant.scopes`. A family with no
+        // persisted record yields `[:]`, which is the fail-closed case: absent
+        // bits deny, they never grant.
+        let permissions = SwanScopePermissions(
+            rawScopes: grant.scopes,
+            subject: grant.subject,
+            statedKeys: grant.statedScopeKeys
+        )
+        guard permissions.hasResourceScope else {
             throw SwanResourceAuthorizationFailure.denied
         }
 
@@ -157,7 +204,22 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
             throw Self.accountFailure(for: error)
         }
 
-        return .accountOAuth(subject: grant.subject, scopes: grant.scopes)
+        return .accountOAuth(subject: grant.subject, permissions: permissions)
+    }
+
+    /// A `Bearer` credential, or `nil` when the header is absent, malformed, or
+    /// carries a different scheme.
+    ///
+    /// Returning `nil` rather than throwing keeps a `DPoP` header falling
+    /// through to the OAuth path unchanged.
+    private static func bearerToken(from headers: HTTPFields) -> String? {
+        let values = headers[values: .authorization]
+        guard values.count == 1 else { return nil }
+        let prefix = "Bearer "
+        guard values[0].hasPrefix(prefix) else { return nil }
+        let token = String(values[0].dropFirst(prefix.count))
+        guard !token.isEmpty, token.utf8.count <= maximumAccessTokenBytes else { return nil }
+        return token
     }
 
     private static func accessToken(from headers: HTTPFields) throws -> String {
@@ -201,12 +263,6 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
             }
         }
         return true
-    }
-
-    private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
-        scopes.contains("atproto") || scopes.contains { scope in
-            PermissionedSpaceScopeSyntax.isQualified(scope)
-        }
     }
 
     private static func dpopProof(from headers: HTTPFields) -> String? {

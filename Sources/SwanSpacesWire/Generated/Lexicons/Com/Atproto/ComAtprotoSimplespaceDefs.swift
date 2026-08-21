@@ -11,70 +11,120 @@ public struct ComAtprotoSimplespaceDefs {
 
     public static let typeIdentifier = "com.atproto.simplespace.defs"
         
-public struct SpaceConfig: ATProtocolCodable, ATProtocolValue {
-            public static let typeIdentifier = "com.atproto.simplespace.defs#spaceConfig"
-            public let policy: String
-            public let appAccess: SpaceConfigAppAccessUnion
-            public let managingApp: String?
+public struct PublicPolicy: ATProtocolCodable, ATProtocolValue {
+            public static let typeIdentifier = "com.atproto.simplespace.defs#publicPolicy"
 
         public init(
-            policy: String, appAccess: SpaceConfigAppAccessUnion, managingApp: String?
+            
         ) {
-            self.policy = policy
-            self.appAccess = appAccess
+        }
+
+        public init(from decoder: Decoder) throws {
+            
+            let _ = decoder
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(Self.typeIdentifier, forKey: .typeIdentifier)
+        }
+
+        public func hash(into hasher: inout Hasher) {
+        }
+
+        public func isEqual(to other: any ATProtocolValue) -> Bool {
+            
+            return other is Self
+        }
+
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            return lhs.isEqual(to: rhs)
+        }
+
+        public func toCBORValue() throws -> Any {
+            var map = OrderedCBORMap()
+            map = map.adding(key: "$type", value: Self.typeIdentifier)
+            return map
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case typeIdentifier = "$type"
+        }
+    }
+        
+public struct MemberListPolicy: ATProtocolCodable, ATProtocolValue {
+            public static let typeIdentifier = "com.atproto.simplespace.defs#memberListPolicy"
+
+        public init(
+            
+        ) {
+        }
+
+        public init(from decoder: Decoder) throws {
+            
+            let _ = decoder
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(Self.typeIdentifier, forKey: .typeIdentifier)
+        }
+
+        public func hash(into hasher: inout Hasher) {
+        }
+
+        public func isEqual(to other: any ATProtocolValue) -> Bool {
+            
+            return other is Self
+        }
+
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            return lhs.isEqual(to: rhs)
+        }
+
+        public func toCBORValue() throws -> Any {
+            var map = OrderedCBORMap()
+            map = map.adding(key: "$type", value: Self.typeIdentifier)
+            return map
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case typeIdentifier = "$type"
+        }
+    }
+        
+public struct ManagingAppPolicy: ATProtocolCodable, ATProtocolValue {
+            public static let typeIdentifier = "com.atproto.simplespace.defs#managingAppPolicy"
+            public let managingApp: String
+
+        public init(
+            managingApp: String
+        ) {
             self.managingApp = managingApp
         }
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             do {
-                self.policy = try container.decode(String.self, forKey: .policy)
+                self.managingApp = try container.decode(String.self, forKey: .managingApp)
             } catch {
-                LogManager.logError("Decoding error for required property 'policy': \(error)")
+                LogManager.logError("Decoding error for required property 'managingApp': \(error)")
                 throw error
-            }
-            do {
-                self.appAccess = try container.decode(SpaceConfigAppAccessUnion.self, forKey: .appAccess)
-            } catch {
-                LogManager.logError("Decoding error for required property 'appAccess': \(error)")
-                throw error
-            }
-            do {
-                self.managingApp = try container.decodeIfPresent(String.self, forKey: .managingApp)
-            } catch {
-                // Forward compatibility: a malformed or unknown-shaped optional field
-                // must not fail the whole response.
-                LogManager.logWarning("Decoding error for optional property 'managingApp' — degrading to nil: \(error)")
-                self.managingApp = nil
             }
         }
 
         public func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(Self.typeIdentifier, forKey: .typeIdentifier)
-            try container.encode(policy, forKey: .policy)
-            try container.encode(appAccess, forKey: .appAccess)
-            try container.encodeIfPresent(managingApp, forKey: .managingApp)
+            try container.encode(managingApp, forKey: .managingApp)
         }
 
         public func hash(into hasher: inout Hasher) {
-            hasher.combine(policy)
-            hasher.combine(appAccess)
-            if let value = managingApp {
-                hasher.combine(value)
-            } else {
-                hasher.combine(nil as Int?)
-            }
+            hasher.combine(managingApp)
         }
 
         public func isEqual(to other: any ATProtocolValue) -> Bool {
             guard let other = other as? Self else { return false }
-            if policy != other.policy {
-                return false
-            }
-            if appAccess != other.appAccess {
-                return false
-            }
             if managingApp != other.managingApp {
                 return false
             }
@@ -88,21 +138,13 @@ public struct SpaceConfig: ATProtocolCodable, ATProtocolValue {
         public func toCBORValue() throws -> Any {
             var map = OrderedCBORMap()
             map = map.adding(key: "$type", value: Self.typeIdentifier)
-            let policyValue = try policy.toCBORValue()
-            map = map.adding(key: "policy", value: policyValue)
-            let appAccessValue = try appAccess.toCBORValue()
-            map = map.adding(key: "appAccess", value: appAccessValue)
-            if let value = managingApp {
-                let managingAppValue = try value.toCBORValue()
-                map = map.adding(key: "managingApp", value: managingAppValue)
-            }
+            let managingAppValue = try managingApp.toCBORValue()
+            map = map.adding(key: "managingApp", value: managingAppValue)
             return map
         }
 
         private enum CodingKeys: String, CodingKey {
             case typeIdentifier = "$type"
-            case policy
-            case appAccess
             case managingApp
         }
     }
@@ -204,136 +246,6 @@ public struct AllowList: ATProtocolCodable, ATProtocolValue {
         }
     }
 
-
-
-
-
-public enum SpaceConfigAppAccessUnion: Codable, ATProtocolCodable, ATProtocolValue, Sendable, Equatable {
-    case comAtprotoSimplespaceDefsOpen(ComAtprotoSimplespaceDefs.Open)
-    case comAtprotoSimplespaceDefsAllowList(ComAtprotoSimplespaceDefs.AllowList)
-    case unexpected(ATProtocolValueContainer)
-    public init(_ value: ComAtprotoSimplespaceDefs.Open) {
-        self = .comAtprotoSimplespaceDefsOpen(value)
-    }
-    public init(_ value: ComAtprotoSimplespaceDefs.AllowList) {
-        self = .comAtprotoSimplespaceDefsAllowList(value)
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        let typeValue = try container.decode(String.self, forKey: .type)
-
-        switch typeValue {
-        case "com.atproto.simplespace.defs#open":
-            let value = try ComAtprotoSimplespaceDefs.Open(from: decoder)
-            self = .comAtprotoSimplespaceDefsOpen(value)
-        case "com.atproto.simplespace.defs#allowList":
-            let value = try ComAtprotoSimplespaceDefs.AllowList(from: decoder)
-            self = .comAtprotoSimplespaceDefsAllowList(value)
-        default:
-            let unknownValue = try ATProtocolValueContainer(from: decoder)
-            self = .unexpected(unknownValue)
-        }
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-
-        switch self {
-        case .comAtprotoSimplespaceDefsOpen(let value):
-            try container.encode("com.atproto.simplespace.defs#open", forKey: .type)
-            try value.encode(to: encoder)
-        case .comAtprotoSimplespaceDefsAllowList(let value):
-            try container.encode("com.atproto.simplespace.defs#allowList", forKey: .type)
-            try value.encode(to: encoder)
-        case .unexpected(let container):
-            try container.encode(to: encoder)
-        }
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        switch self {
-        case .comAtprotoSimplespaceDefsOpen(let value):
-            hasher.combine("com.atproto.simplespace.defs#open")
-            hasher.combine(value)
-        case .comAtprotoSimplespaceDefsAllowList(let value):
-            hasher.combine("com.atproto.simplespace.defs#allowList")
-            hasher.combine(value)
-        case .unexpected(let container):
-            hasher.combine("unexpected")
-            hasher.combine(container)
-        }
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case type = "$type"
-    }
-    
-    public static func == (lhs: SpaceConfigAppAccessUnion, rhs: SpaceConfigAppAccessUnion) -> Bool {
-        switch (lhs, rhs) {
-        case (.comAtprotoSimplespaceDefsOpen(let lhsValue),
-              .comAtprotoSimplespaceDefsOpen(let rhsValue)):
-            return lhsValue == rhsValue
-        case (.comAtprotoSimplespaceDefsAllowList(let lhsValue),
-              .comAtprotoSimplespaceDefsAllowList(let rhsValue)):
-            return lhsValue == rhsValue
-        case (.unexpected(let lhsValue), .unexpected(let rhsValue)):
-            return lhsValue.isEqual(to: rhsValue)
-        default:
-            return false
-        }
-    }
-    
-    public func isEqual(to other: any ATProtocolValue) -> Bool {
-        guard let other = other as? SpaceConfigAppAccessUnion else { return false }
-        return self == other
-    }
-    
-    // DAGCBOR encoding with field ordering
-    public func toCBORValue() throws -> Any {
-        // Create an ordered map to maintain field order
-        var map = OrderedCBORMap()
-        
-        switch self {
-        case .comAtprotoSimplespaceDefsOpen(let value):
-            map = map.adding(key: "$type", value: "com.atproto.simplespace.defs#open")
-            
-            let valueDict = try value.toCBORValue()
-
-            // If the value is already an OrderedCBORMap, merge its entries
-            if let orderedMap = valueDict as? OrderedCBORMap {
-                for (key, value) in orderedMap.entries where key != "$type" {
-                    map = map.adding(key: key, value: value)
-                }
-            } else if let dict = valueDict as? [String: Any] {
-                // Otherwise add each key-value pair from the dictionary
-                for (key, value) in dict where key != "$type" {
-                    map = map.adding(key: key, value: value)
-                }
-            }
-            return map
-        case .comAtprotoSimplespaceDefsAllowList(let value):
-            map = map.adding(key: "$type", value: "com.atproto.simplespace.defs#allowList")
-            
-            let valueDict = try value.toCBORValue()
-
-            // If the value is already an OrderedCBORMap, merge its entries
-            if let orderedMap = valueDict as? OrderedCBORMap {
-                for (key, value) in orderedMap.entries where key != "$type" {
-                    map = map.adding(key: key, value: value)
-                }
-            } else if let dict = valueDict as? [String: Any] {
-                // Otherwise add each key-value pair from the dictionary
-                for (key, value) in dict where key != "$type" {
-                    map = map.adding(key: key, value: value)
-                }
-            }
-            return map
-        case .unexpected(let container):
-            return try container.toCBORValue()
-        }
-    }
-}
 
 
 }

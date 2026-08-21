@@ -66,8 +66,332 @@ public enum SQLiteLayout {
         "PRAGMA foreign_keys=ON",
     ]
 
+    /// Provisional bounded capacities for the account program. These values
+    /// are deliberately frozen in source until operational evidence supports
+    /// a reviewed increase; expiry indexes and the owning service's purge
+    /// operation keep rows bounded between admission checks.
+    public enum AccountControlSchemaCapacity {
+        public static let maxIdentityBindings = 100_000
+        public static let maxIdentityBindingHistory = 500_000
+        public static let maxPendingIdentityClaims = 100_000
+        public static let maxSignupAuthorizations = 100_000
+        public static let maxSignupInvites = 100_000
+        public static let maxAppPasswords = 100_000
+        public static let maxLegacySessionFamilies = 100_000
+        public static let maxLegacySessions = 500_000
+        public static let maxManagementSessions = 500_000
+        public static let maxAuthenticationFactors = 200_000
+        public static let maxFactorChallenges = 500_000
+        public static let maxTOTPEnvelopes = 200_000
+        public static let maxRecoveryCodeDigests = 500_000
+        public static let maxWebAuthnCredentials = 200_000
+        public static let maxWebAuthnChallenges = 500_000
+        public static let maxIdentityBindingsPerAccount = 1
+        public static let maxIdentityBindingHistoryPerAccount = 64
+        public static let maxPendingIdentityClaimsPerAccount = 16
+        public static let maxSignupAuthorizationsPerAccount = 16
+        public static let maxRedeemedSignupInvitesPerAccount = 32
+        public static let maxAppPasswordsPerAccount = AppPasswordStorePolicy.maximumPerAccount
+        public static let maxLegacySessionFamiliesPerAccount = 64
+        public static let maxLegacySessionsPerAccount = 256
+        public static let maxManagementSessionsPerAccount = 256
+        public static let maxAuthenticationFactorsPerAccount = 16
+        public static let maxFactorChallengesPerAccount = 64
+        public static let maxTOTPEnvelopesPerAccount = 16
+        public static let maxRecoveryCodeDigestsPerAccount = 32
+        public static let maxWebAuthnCredentialsPerAccount = 16
+        public static let maxWebAuthnChallengesPerAccount = 64
+    }
+
     public static let controlMigrations = controlConnectionPragmas + [
         "CREATE TABLE IF NOT EXISTS accounts (did TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL)",
+        // Dedicated additive marker. Version 1 records the pre-account
+        // program control schema; versions 2-7 are reserved in dependency
+        // order and must never be reordered by a later lane.
+        "CREATE TABLE IF NOT EXISTS control_schema_migrations (version INTEGER PRIMARY KEY CHECK(version > 0), applied_at INTEGER NOT NULL CHECK(applied_at >= 0))",
+        "INSERT OR IGNORE INTO control_schema_migrations(version, applied_at) VALUES (1, unixepoch())",
+        "INSERT OR IGNORE INTO control_schema_migrations(version, applied_at) VALUES (2, unixepoch())",
+        "INSERT OR IGNORE INTO control_schema_migrations(version, applied_at) VALUES (3, unixepoch())",
+        "INSERT OR IGNORE INTO control_schema_migrations(version, applied_at) VALUES (4, unixepoch())",
+        "INSERT OR IGNORE INTO control_schema_migrations(version, applied_at) VALUES (5, unixepoch())",
+        "INSERT OR IGNORE INTO control_schema_migrations(version, applied_at) VALUES (6, unixepoch())",
+        """
+        CREATE TABLE IF NOT EXISTS identity_bindings (
+            account_did TEXT PRIMARY KEY REFERENCES accounts(did) ON DELETE CASCADE,
+            identity_did TEXT NOT NULL,
+            method TEXT NOT NULL CHECK(method IN ('plc', 'did-web')),
+            handle TEXT NOT NULL,
+            document_digest BLOB CHECK(document_digest IS NULL OR length(document_digest) = 32),
+            claim_receipt_digest BLOB CHECK(claim_receipt_digest IS NULL OR length(claim_receipt_digest) = 32),
+            reserved_key_id TEXT,
+            last_validated_at INTEGER,
+            grace_expires_at INTEGER,
+            state TEXT NOT NULL CHECK(state IN ('active', 'suspended', 'released')),
+            CHECK(method = 'did-web' OR (document_digest IS NULL AND claim_receipt_digest IS NULL AND reserved_key_id IS NULL)),
+            CHECK(method = 'plc' OR (document_digest IS NOT NULL AND claim_receipt_digest IS NOT NULL AND length(reserved_key_id) > 0))
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS identity_binding_history (
+            account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            replaced_at INTEGER NOT NULL CHECK(replaced_at >= 0),
+            identity_did TEXT NOT NULL,
+            document_digest BLOB CHECK(document_digest IS NULL OR length(document_digest) = 32),
+            claim_receipt_digest BLOB CHECK(claim_receipt_digest IS NULL OR length(claim_receipt_digest) = 32),
+            reserved_key_id TEXT,
+            PRIMARY KEY(account_did, replaced_at)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS did_web_claim_transactions (
+            request_id TEXT PRIMARY KEY,
+            account_did TEXT REFERENCES accounts(did) ON DELETE CASCADE,
+            target_did TEXT NOT NULL,
+            handle TEXT NOT NULL,
+            claim_nonce_digest BLOB NOT NULL CHECK(length(claim_nonce_digest) = 32),
+            requested_document_digest BLOB CHECK(requested_document_digest IS NULL OR length(requested_document_digest) = 32),
+            reserved_key_id TEXT,
+            claim_receipt_digest BLOB CHECK(claim_receipt_digest IS NULL OR length(claim_receipt_digest) = 32),
+            state TEXT NOT NULL CHECK(state IN ('reserved', 'pendingValidation', 'committing', 'committed', 'failed', 'expired')),
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+            step_up_receipt_digest BLOB CHECK(step_up_receipt_digest IS NULL OR length(step_up_receipt_digest) = 32)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS signup_authorizations (
+            authorization_id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE,
+            account_did TEXT REFERENCES accounts(did) ON DELETE CASCADE,
+            policy TEXT NOT NULL CHECK(policy IN ('closed', 'inviteRequired', 'openProtected')),
+            handle TEXT NOT NULL,
+            email TEXT,
+            identity_did TEXT,
+            email_proof_digest BLOB CHECK(email_proof_digest IS NULL OR length(email_proof_digest) = 32),
+            invite_digest BLOB CHECK(invite_digest IS NULL OR length(invite_digest) = 32),
+            client_ip_bucket_digest BLOB NOT NULL CHECK(length(client_ip_bucket_digest) = 32),
+            state TEXT NOT NULL CHECK(state IN ('issued', 'committing', 'committed', 'failed')),
+            issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
+            expires_at INTEGER NOT NULL CHECK(expires_at >= issued_at),
+            lease_expires_at INTEGER CHECK(lease_expires_at IS NULL OR (lease_expires_at >= issued_at AND lease_expires_at <= expires_at))
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS signup_invites (
+            invite_digest BLOB PRIMARY KEY CHECK(length(invite_digest) = 32),
+            issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
+            expires_at INTEGER CHECK(expires_at IS NULL OR expires_at >= issued_at),
+            redeemed_at INTEGER,
+            redemption_account_did TEXT REFERENCES accounts(did) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS account_app_passwords (
+            id TEXT PRIMARY KEY,
+            did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            -- Deterministic Argon2id over (DID-derived salt, secret). Stored as
+            -- raw bytes and looked up by equality, so a login is one KDF
+            -- evaluation and one indexed probe rather than a verify-loop over
+            -- every row the account owns.
+            digest BLOB NOT NULL,
+            -- Verbatim canonical scope string. Refresh re-derives from HERE,
+            -- never from the session row, so editing narrows live sessions and
+            -- revoking ends them.
+            scopes TEXT NOT NULL,
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            UNIQUE(did, name)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS account_app_passwords_lookup ON account_app_passwords(digest, did)",
+        "CREATE INDEX IF NOT EXISTS account_app_passwords_by_account ON account_app_passwords(did)",
+        """
+        CREATE TABLE IF NOT EXISTS legacy_session_families (
+            family_id TEXT PRIMARY KEY,
+            did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            -- NULL means the session was opened with the account password.
+            -- App-password deletion cascades the family and its token rows.
+            app_password_id TEXT REFERENCES account_app_passwords(id) ON DELETE CASCADE,
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            revoked_at INTEGER,
+            reuse_detected_at INTEGER,
+            CHECK(reuse_detected_at IS NULL OR (revoked_at IS NOT NULL AND revoked_at >= reuse_detected_at))
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS legacy_session_tokens (
+            digest BLOB PRIMARY KEY,
+            family_id TEXT NOT NULL REFERENCES legacy_session_families(family_id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK(kind IN ('access', 'refresh')),
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+            -- Refresh tokens are single-use; a consumed row is replay evidence.
+            consumed_at INTEGER
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS legacy_session_tokens_by_family ON legacy_session_tokens(family_id)",
+        "CREATE INDEX IF NOT EXISTS legacy_session_families_by_app_password ON legacy_session_families(app_password_id)",
+        """
+        CREATE TABLE IF NOT EXISTS management_sessions (
+            session_digest BLOB PRIMARY KEY CHECK(length(session_digest) = 32),
+            account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            csrf_digest BLOB NOT NULL CHECK(length(csrf_digest) = 32),
+            issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
+            idle_expires_at INTEGER NOT NULL CHECK(idle_expires_at >= issued_at),
+            absolute_expires_at INTEGER NOT NULL CHECK(absolute_expires_at >= idle_expires_at),
+            last_step_up_at INTEGER,
+            strength TEXT NOT NULL,
+            revoked_at INTEGER
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS authentication_factors (
+            factor_id TEXT PRIMARY KEY,
+            account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK(kind IN ('passkey', 'totp', 'recoveryCode')),
+            label TEXT NOT NULL,
+            lookup_digest BLOB NOT NULL CHECK(length(lookup_digest) = 32),
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            last_used_at INTEGER,
+            disabled_at INTEGER,
+            UNIQUE(account_did, lookup_digest),
+            UNIQUE(factor_id, account_did)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS factor_challenges (
+            challenge_digest BLOB PRIMARY KEY CHECK(length(challenge_digest) = 32),
+            account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            factor_id TEXT,
+            purpose TEXT NOT NULL CHECK(purpose IN ('enrollment', 'assertion', 'stepUp')),
+            issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
+            expires_at INTEGER NOT NULL CHECK(expires_at >= issued_at),
+            consumed_at INTEGER,
+            FOREIGN KEY(factor_id, account_did) REFERENCES authentication_factors(factor_id, account_did) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS totp_secret_envelopes (
+            factor_id TEXT PRIMARY KEY,
+            account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            key_reference TEXT NOT NULL,
+            nonce BLOB NOT NULL CHECK(length(nonce) = 12),
+            ciphertext BLOB NOT NULL CHECK(length(ciphertext) > 0),
+            authentication_tag BLOB NOT NULL CHECK(length(authentication_tag) = 16),
+            FOREIGN KEY(factor_id, account_did) REFERENCES authentication_factors(factor_id, account_did) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS totp_pending_secret_envelopes (
+            factor_id TEXT PRIMARY KEY,
+            account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            key_reference TEXT NOT NULL,
+            nonce BLOB NOT NULL CHECK(length(nonce) = 12),
+            ciphertext BLOB NOT NULL CHECK(length(ciphertext) > 0),
+            authentication_tag BLOB NOT NULL CHECK(length(authentication_tag) = 16),
+            issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
+            expires_at INTEGER NOT NULL CHECK(expires_at > issued_at),
+            FOREIGN KEY(factor_id, account_did) REFERENCES authentication_factors(factor_id, account_did) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS recovery_code_digests (
+            account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            digest BLOB NOT NULL CHECK(length(digest) = 32),
+            issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
+            consumed_at INTEGER,
+            PRIMARY KEY(account_did, digest)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS webauthn_credentials (
+            credential_id_digest BLOB PRIMARY KEY CHECK(length(credential_id_digest) = 32),
+            account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            factor_id TEXT NOT NULL,
+            public_key_reference TEXT NOT NULL,
+            sign_count INTEGER NOT NULL CHECK(sign_count >= 0),
+            transports BLOB NOT NULL,
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            last_used_at INTEGER,
+            disabled_at INTEGER,
+            UNIQUE(credential_id_digest, account_did),
+            FOREIGN KEY(factor_id, account_did) REFERENCES authentication_factors(factor_id, account_did) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS webauthn_challenges (
+            challenge_digest BLOB PRIMARY KEY CHECK(length(challenge_digest) = 32),
+            account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            credential_id_digest BLOB CHECK(credential_id_digest IS NULL OR length(credential_id_digest) = 32),
+            session_id TEXT,
+            factor_id TEXT,
+            relying_party_id TEXT NOT NULL,
+            origin TEXT NOT NULL,
+            issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
+            expires_at INTEGER NOT NULL CHECK(expires_at >= issued_at),
+            consumed_at INTEGER,
+            FOREIGN KEY(credential_id_digest, account_did) REFERENCES webauthn_credentials(credential_id_digest, account_did) ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS did_web_claim_transactions_expiry ON did_web_claim_transactions(expires_at, request_id)",
+        "CREATE INDEX IF NOT EXISTS identity_binding_history_account ON identity_binding_history(account_did, replaced_at)",
+        "CREATE INDEX IF NOT EXISTS signup_authorizations_expiry ON signup_authorizations(expires_at, authorization_id)",
+        "CREATE INDEX IF NOT EXISTS signup_invites_expiry ON signup_invites(expires_at, invite_digest)",
+        "CREATE INDEX IF NOT EXISTS legacy_session_families_revocation ON legacy_session_families(revoked_at, family_id)",
+        "CREATE INDEX IF NOT EXISTS legacy_session_tokens_expiry ON legacy_session_tokens(expires_at, digest)",
+        "CREATE INDEX IF NOT EXISTS management_sessions_expiry ON management_sessions(absolute_expires_at, session_digest)",
+        "CREATE INDEX IF NOT EXISTS factor_challenges_expiry ON factor_challenges(expires_at, challenge_digest)",
+        "CREATE INDEX IF NOT EXISTS totp_secret_envelopes_account ON totp_secret_envelopes(account_did, factor_id)",
+        "CREATE INDEX IF NOT EXISTS recovery_code_digests_account ON recovery_code_digests(account_did, consumed_at, digest)",
+        "CREATE INDEX IF NOT EXISTS webauthn_credentials_account ON webauthn_credentials(account_did, credential_id_digest)",
+        "CREATE INDEX IF NOT EXISTS webauthn_challenges_expiry ON webauthn_challenges(expires_at, challenge_digest)",
+        // Admission triggers enforce the frozen global capacities. Account
+        // services purge expired rows before retrying; failure is explicit,
+        // never an unbounded insert or silent overwrite.
+        "CREATE TRIGGER IF NOT EXISTS identity_bindings_capacity BEFORE INSERT ON identity_bindings WHEN (SELECT COUNT(*) FROM identity_bindings) >= 100000 BEGIN SELECT RAISE(ABORT, 'identity binding capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS identity_binding_history_capacity BEFORE INSERT ON identity_binding_history WHEN (SELECT COUNT(*) FROM identity_binding_history) >= 500000 BEGIN SELECT RAISE(ABORT, 'identity binding history capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS did_web_claim_transactions_capacity BEFORE INSERT ON did_web_claim_transactions WHEN (SELECT COUNT(*) FROM did_web_claim_transactions) >= 100000 BEGIN SELECT RAISE(ABORT, 'identity claim capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS signup_authorizations_capacity BEFORE INSERT ON signup_authorizations WHEN (SELECT COUNT(*) FROM signup_authorizations) >= 100000 BEGIN SELECT RAISE(ABORT, 'signup authorization capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS signup_invites_capacity BEFORE INSERT ON signup_invites WHEN (SELECT COUNT(*) FROM signup_invites) >= 100000 BEGIN SELECT RAISE(ABORT, 'signup invite capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS account_app_passwords_capacity BEFORE INSERT ON account_app_passwords WHEN (SELECT COUNT(*) FROM account_app_passwords) >= 100000 BEGIN SELECT RAISE(ABORT, 'app password capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS legacy_session_families_capacity BEFORE INSERT ON legacy_session_families WHEN (SELECT COUNT(*) FROM legacy_session_families) >= 100000 BEGIN SELECT RAISE(ABORT, 'legacy session family capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS legacy_session_tokens_capacity BEFORE INSERT ON legacy_session_tokens WHEN (SELECT COUNT(*) FROM legacy_session_tokens) >= 500000 BEGIN SELECT RAISE(ABORT, 'legacy session capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS management_sessions_capacity BEFORE INSERT ON management_sessions WHEN (SELECT COUNT(*) FROM management_sessions) >= 500000 BEGIN SELECT RAISE(ABORT, 'management session capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS authentication_factors_capacity BEFORE INSERT ON authentication_factors WHEN (SELECT COUNT(*) FROM authentication_factors) >= 200000 BEGIN SELECT RAISE(ABORT, 'authentication factor capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS factor_challenges_capacity BEFORE INSERT ON factor_challenges WHEN (SELECT COUNT(*) FROM factor_challenges) >= 500000 BEGIN SELECT RAISE(ABORT, 'factor challenge capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS webauthn_credentials_capacity BEFORE INSERT ON webauthn_credentials WHEN (SELECT COUNT(*) FROM webauthn_credentials) >= 200000 BEGIN SELECT RAISE(ABORT, 'WebAuthn credential capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS webauthn_challenges_capacity BEFORE INSERT ON webauthn_challenges WHEN (SELECT COUNT(*) FROM webauthn_challenges) >= 500000 BEGIN SELECT RAISE(ABORT, 'WebAuthn challenge capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS recovery_code_digests_capacity BEFORE INSERT ON recovery_code_digests WHEN (SELECT COUNT(*) FROM recovery_code_digests) >= 500000 BEGIN SELECT RAISE(ABORT, 'recovery code capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS identity_bindings_account_capacity BEFORE INSERT ON identity_bindings WHEN (SELECT COUNT(*) FROM identity_bindings WHERE account_did = NEW.account_did) >= 1 BEGIN SELECT RAISE(ABORT, 'identity binding account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS identity_binding_history_account_capacity BEFORE INSERT ON identity_binding_history WHEN (SELECT COUNT(*) FROM identity_binding_history WHERE account_did = NEW.account_did) >= 64 BEGIN SELECT RAISE(ABORT, 'identity binding history account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS did_web_claim_transactions_account_capacity BEFORE INSERT ON did_web_claim_transactions WHEN NEW.account_did IS NOT NULL AND (SELECT COUNT(*) FROM did_web_claim_transactions WHERE account_did = NEW.account_did) >= 16 BEGIN SELECT RAISE(ABORT, 'identity claim account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS signup_authorizations_account_capacity BEFORE INSERT ON signup_authorizations WHEN NEW.account_did IS NOT NULL AND (SELECT COUNT(*) FROM signup_authorizations WHERE account_did = NEW.account_did) >= 16 BEGIN SELECT RAISE(ABORT, 'signup authorization account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS signup_invites_account_capacity BEFORE INSERT ON signup_invites WHEN NEW.redemption_account_did IS NOT NULL AND (SELECT COUNT(*) FROM signup_invites WHERE redemption_account_did = NEW.redemption_account_did) >= 32 BEGIN SELECT RAISE(ABORT, 'redeemed signup invite account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS account_app_passwords_account_capacity BEFORE INSERT ON account_app_passwords WHEN (SELECT COUNT(*) FROM account_app_passwords WHERE did = NEW.did) >= \(AppPasswordStorePolicy.maximumPerAccount) BEGIN SELECT RAISE(ABORT, 'app password account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS legacy_session_families_account_capacity BEFORE INSERT ON legacy_session_families WHEN (SELECT COUNT(*) FROM legacy_session_families WHERE did = NEW.did) >= 64 BEGIN SELECT RAISE(ABORT, 'legacy session family account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS management_sessions_account_capacity BEFORE INSERT ON management_sessions WHEN (SELECT COUNT(*) FROM management_sessions WHERE account_did = NEW.account_did) >= 256 BEGIN SELECT RAISE(ABORT, 'management session account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS authentication_factors_account_capacity BEFORE INSERT ON authentication_factors WHEN (SELECT COUNT(*) FROM authentication_factors WHERE account_did = NEW.account_did) >= 16 BEGIN SELECT RAISE(ABORT, 'authentication factor account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS factor_challenges_account_capacity BEFORE INSERT ON factor_challenges WHEN (SELECT COUNT(*) FROM factor_challenges WHERE account_did = NEW.account_did) >= 64 BEGIN SELECT RAISE(ABORT, 'factor challenge account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS totp_secret_envelopes_account_capacity BEFORE INSERT ON totp_secret_envelopes WHEN (SELECT COUNT(*) FROM totp_secret_envelopes WHERE account_did = NEW.account_did) >= 16 BEGIN SELECT RAISE(ABORT, 'TOTP envelope account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS webauthn_credentials_account_capacity BEFORE INSERT ON webauthn_credentials WHEN (SELECT COUNT(*) FROM webauthn_credentials WHERE account_did = NEW.account_did) >= 16 BEGIN SELECT RAISE(ABORT, 'WebAuthn credential account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS webauthn_challenges_account_capacity BEFORE INSERT ON webauthn_challenges WHEN (SELECT COUNT(*) FROM webauthn_challenges WHERE account_did = NEW.account_did) >= 64 BEGIN SELECT RAISE(ABORT, 'WebAuthn challenge account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS recovery_code_digests_account_capacity BEFORE INSERT ON recovery_code_digests WHEN (SELECT COUNT(*) FROM recovery_code_digests WHERE account_did = NEW.account_did) >= 32 BEGIN SELECT RAISE(ABORT, 'recovery code account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS identity_bindings_account_immutable BEFORE UPDATE OF account_did ON identity_bindings WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'identity binding account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS identity_binding_history_account_immutable BEFORE UPDATE OF account_did ON identity_binding_history WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'identity history account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS did_web_claim_transactions_account_immutable BEFORE UPDATE OF account_did ON did_web_claim_transactions WHEN NEW.account_did IS NOT OLD.account_did AND NOT (OLD.account_did IS NULL AND NEW.account_did IS NOT NULL) BEGIN SELECT RAISE(ABORT, 'identity claim account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS did_web_claim_transactions_account_transition_capacity BEFORE UPDATE OF account_did ON did_web_claim_transactions WHEN OLD.account_did IS NULL AND NEW.account_did IS NOT NULL AND (SELECT COUNT(*) FROM did_web_claim_transactions WHERE account_did = NEW.account_did) >= 16 BEGIN SELECT RAISE(ABORT, 'identity claim account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS signup_authorizations_account_immutable BEFORE UPDATE OF account_did ON signup_authorizations WHEN NEW.account_did IS NOT OLD.account_did AND NOT (OLD.account_did IS NULL AND NEW.account_did IS NOT NULL) BEGIN SELECT RAISE(ABORT, 'signup authorization account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS signup_authorizations_account_transition_capacity BEFORE UPDATE OF account_did ON signup_authorizations WHEN OLD.account_did IS NULL AND NEW.account_did IS NOT NULL AND (SELECT COUNT(*) FROM signup_authorizations WHERE account_did = NEW.account_did) >= 16 BEGIN SELECT RAISE(ABORT, 'signup authorization account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS account_app_passwords_account_immutable BEFORE UPDATE OF did ON account_app_passwords WHEN NEW.did <> OLD.did BEGIN SELECT RAISE(ABORT, 'app password account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS legacy_session_families_account_immutable BEFORE UPDATE OF did ON legacy_session_families WHEN NEW.did <> OLD.did BEGIN SELECT RAISE(ABORT, 'legacy family account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS management_sessions_account_immutable BEFORE UPDATE OF account_did ON management_sessions WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'management session account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS authentication_factors_account_immutable BEFORE UPDATE OF account_did ON authentication_factors WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'factor account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS factor_challenges_account_immutable BEFORE UPDATE OF account_did ON factor_challenges WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'factor challenge account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS totp_secret_envelopes_account_immutable BEFORE UPDATE OF account_did ON totp_secret_envelopes WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'TOTP envelope account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS recovery_code_digests_account_immutable BEFORE UPDATE OF account_did ON recovery_code_digests WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'recovery code account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS webauthn_credentials_account_immutable BEFORE UPDATE OF account_did ON webauthn_credentials WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'WebAuthn credential account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS webauthn_challenges_account_immutable BEFORE UPDATE OF account_did ON webauthn_challenges WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'WebAuthn challenge account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS signup_invites_redemption_capacity BEFORE UPDATE OF redemption_account_did ON signup_invites WHEN OLD.redemption_account_did IS NOT NULL AND NEW.redemption_account_did IS NOT OLD.redemption_account_did BEGIN SELECT RAISE(ABORT, 'signup invite redemption ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS signup_invites_redemption_account_capacity BEFORE UPDATE OF redemption_account_did ON signup_invites WHEN OLD.redemption_account_did IS NULL AND NEW.redemption_account_did IS NOT NULL AND (SELECT COUNT(*) FROM signup_invites WHERE redemption_account_did = NEW.redemption_account_did) >= 32 BEGIN SELECT RAISE(ABORT, 'redeemed signup invite account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS webauthn_sign_count_monotonic BEFORE UPDATE OF sign_count ON webauthn_credentials WHEN NEW.sign_count <= OLD.sign_count BEGIN SELECT RAISE(ABORT, 'WebAuthn sign count rollback'); END",
         "CREATE TABLE IF NOT EXISTS oauth_tokens (digest BLOB PRIMARY KEY, family_id TEXT NOT NULL, subject TEXT NOT NULL, expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS oauth_client_metadata (client_id TEXT PRIMARY KEY, document BLOB NOT NULL, expires_at INTEGER NOT NULL)",
         """
@@ -104,6 +428,20 @@ public enum SQLiteLayout {
             client_id TEXT NOT NULL,
             redirect_uri TEXT NOT NULL,
             scopes BLOB NOT NULL,
+            -- The as-requested set, present only when `self` resolution made it
+            -- differ from `scopes`. NULL means "requested == scopes" (spec
+            -- §6.7); it is the refresh baseline, not an audit column (§9-D20).
+            scopes_requested BLOB,
+            -- Which parameters the client physically stated, keyed by effective
+            -- scope string. Durable because a serialised scope is lossy in both
+            -- directions (§9-D23).
+            scope_provenance BLOB,
+            -- The same bits keyed by the REQUESTED strings, stored under the
+            -- same NULL rule as `scopes_requested`. It is the provenance half of
+            -- the baseline a refresh re-derives the grant from (§5.7.5), and it
+            -- is persisted rather than re-parsed out of `scopes_requested`
+            -- because §9-D23's rule has no exceptions.
+            scope_provenance_requested BLOB,
             dpop_jkt TEXT,
             client_assertion_key_id TEXT,
             client_assertion_algorithm TEXT,
@@ -120,6 +458,12 @@ public enum SQLiteLayout {
             client_id TEXT NOT NULL,
             redirect_uri TEXT NOT NULL,
             scopes BLOB NOT NULL,
+            -- A PAR row has no subject and so cannot hold a resolved value; its
+            -- `scopes` IS the as-requested set and it gains no
+            -- `scopes_requested` column. Provenance, however, is produced by the
+            -- parse at PAR and must be carried forward rather than re-derived
+            -- from these bytes at mint (§9-D23).
+            scope_provenance BLOB,
             dpop_jkt TEXT,
             client_assertion_key_id TEXT,
             client_assertion_algorithm TEXT,
@@ -132,6 +476,52 @@ public enum SQLiteLayout {
             expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
             consumed_at INTEGER CHECK(consumed_at >= 0)
         )
+        """,
+        """
+        -- §5.7.4. The resolved-lexicon cache: upstream's `LexiconStore`
+        -- (`oauth-provider/src/lexicon/lexicon-store.ts`, findLexicon /
+        -- storeLexicon / deleteLexicon) over upstream's `LexiconData`
+        -- (`lexicon/lexicon-data.ts:5-11`), whose construction including the
+        -- negative branch is `lexicon-getter.ts:30-40`.
+        CREATE TABLE IF NOT EXISTS oauth_lexicon_documents (
+            nsid              TEXT    PRIMARY KEY NOT NULL CHECK(length(nsid) > 0),
+            -- NULLABLE, deliberately. `lexicon-getter.ts:19-40` writes a row
+            -- with `lexicon: null` on a LexResolverError, explicitly "to avoid
+            -- hammering the resolver with requests for the same lexicon that is
+            -- known to be unavailable" (:20-23). Declaring this NOT NULL makes
+            -- that row unrepresentable and turns serve-stale-on-failure into a
+            -- refetch on EVERY request for an unresolvable NSID — the exact
+            -- failure upstream's design exists to prevent.
+            --
+            -- SWAN DEVIATION FROM THE COLUMN'S SPEC COMMENT: these are the
+            -- canonical DAG-CBOR record bytes, not re-serialised JSON. The spec
+            -- says `verified_cid` is persisted "so a cached document can be
+            -- shown to be the same document that was proved" — which is only
+            -- achievable if the stored bytes still hash to that CID. JSON does
+            -- not. Storing the proved bytes makes the row self-verifying on
+            -- read; storing JSON would make `verified_cid` an unenforceable
+            -- annotation.
+            document          BLOB,
+            source_uri        TEXT,   -- at://<did>/com.atproto.lexicon.schema/<nsid>
+            -- The CID the MST walk terminated at (`lex-resolver.ts:545`,
+            -- returned `:555`). NULLABLE for the same reason `document` is: a
+            -- negative-cache row proved nothing. On a positive row it is NOT
+            -- optional — it is the only stored value tying `document` back to a
+            -- signed commit, and it is what lets an audit answer "which record
+            -- did this grant expand from" with a content address rather than a
+            -- URI whose TXT record may since have been repointed.
+            verified_cid      TEXT,
+            created_at        INTEGER NOT NULL CHECK(created_at >= 0),
+            updated_at        INTEGER NOT NULL CHECK(updated_at >= 0),
+            last_succeeded_at INTEGER CHECK(last_succeeded_at >= 0),
+            -- A positive row is all-or-nothing: bytes without the CID that
+            -- proved them, or a CID without the bytes, is not a state the
+            -- resolver can produce, and admitting it would let a partial write
+            -- read back as a document nothing vouches for.
+            CHECK((document IS NULL) = (verified_cid IS NULL)),
+            CHECK((document IS NULL) = (source_uri IS NULL)),
+            CHECK(document IS NULL OR last_succeeded_at IS NOT NULL)
+        ) STRICT
         """,
         """
         CREATE TABLE IF NOT EXISTS oauth_control_par_state_replays (
@@ -353,6 +743,7 @@ public enum SQLiteLayout {
             repo_did TEXT,
             expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
             updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+            service_did TEXT,
             PRIMARY KEY(space_uri, endpoint),
             CHECK(length(endpoint) > 0)
         )
@@ -982,6 +1373,24 @@ public enum SQLiteLayout {
             revision INTEGER NOT NULL CHECK(revision > 0),
             PRIMARY KEY(space_uri, author_did, collection, rkey)
         )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_space_record_blobs (
+            space_uri TEXT NOT NULL,
+            author_did TEXT NOT NULL,
+            collection TEXT NOT NULL,
+            rkey TEXT NOT NULL,
+            blob_cid TEXT NOT NULL,
+            -- The wire TID of the record's last write. listBlobs' `since`
+            -- compares against this lexically, exactly as the reference
+            -- compares space_record.repoRev.
+            wire_revision TEXT NOT NULL CHECK(length(wire_revision) = 13),
+            PRIMARY KEY(space_uri, author_did, collection, rkey, blob_cid)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS permissioned_space_record_blobs_page
+        ON permissioned_space_record_blobs(space_uri, author_did, blob_cid)
         """,
         """
         CREATE TABLE IF NOT EXISTS permissioned_space_oplog (
@@ -1754,7 +2163,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let publicFirehoseCompletionAnchorMigrationVersion = 14
     private static let stagedBlobNamespaceMigrationVersion = 15
     private static let permissionedRequestReceiptRetentionMigrationVersion = 16
-    private static let permissionedOplogRetentionCutoffMigrationVersion = 17
+    private static let permissionedSpaceRecordBlobIndexMigrationVersion = 17
+    private static let permissionedOplogRetentionCutoffMigrationVersion = 18
 
     /// How long an uploaded blob no commit has claimed stays staged.
     ///
@@ -2219,6 +2629,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePublicFirehoseCompletionAnchorsIfNeeded()
             try await migratePermissionedRequestReceiptRetentionIfNeeded()
             try await migratePermissionedOplogRetentionCutoffIfNeeded()
+            try await migrateSpaceNotificationServiceIdentityIfNeeded()
+            try await backfillPermissionedSpaceRecordBlobIndexIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -2396,6 +2808,27 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             )
         }
         _ = try await connection.query("DROP TABLE public_repository_mutation_requests_pre_integrity")
+    }
+
+    /// Erratum 03's `registerNotify` service adoption: a registration may name
+    /// the subscriber's service identifier, which delivery uses as the JWT
+    /// audience. Pre-existing rows have no identifier — they stay legacy
+    /// endpoint-only registrations (never dynamic delivery destinations), so
+    /// the column is nullable and no row rewrite is needed.
+    private func migrateSpaceNotificationServiceIdentityIfNeeded() async throws {
+        // An empty PRAGMA result means the table itself is absent — this
+        // database never carries space registrations (or creates the table
+        // with the column already in place later in setup); there is nothing
+        // to migrate.
+        let columns = try await connection.query(
+            "PRAGMA table_info(permissioned_space_notification_registrations)"
+        )
+        guard !columns.isEmpty else { return }
+        let existing = Set(columns.compactMap { $0.column("name")?.string })
+        guard !existing.contains("service_did") else { return }
+        _ = try await connection.query(
+            "ALTER TABLE permissioned_space_notification_registrations ADD COLUMN service_did TEXT"
+        )
     }
 
     /// Task 42 originally shipped staging tables before the exact projection
@@ -2785,6 +3218,81 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
     }
 
+
+    /// Builds the record→blob edge index for databases whose permissioned
+    /// records predate `permissioned_space_record_blobs`. New writes maintain
+    /// the edges transactionally; this backfill parses each stored record's
+    /// canonical DAG-CBOR for raw blob links, exactly as the write path does.
+    ///
+    /// Backfilled edges are stamped with the repository's CURRENT wire
+    /// revision rather than each record's actual last-write revision (the
+    /// oplog's retention makes the latter unrecoverable in general). That is
+    /// deliberately over-inclusive for `since` filtering — a syncer may be
+    /// offered a blob it already holds — and never under-inclusive, which
+    /// would silently lose blobs during migration.
+    private func backfillPermissionedSpaceRecordBlobIndexIfNeeded() async throws {
+        // Runs inside migrateWithoutGate's single schema/upgrade transaction;
+        // starting another here would nest.
+        let version = Self.permissionedSpaceRecordBlobIndexMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        var stateRevisions: [String: String] = [:]
+        let stateRows = try await connection.query(
+            "SELECT space_uri, author_did, wire_revision FROM permissioned_repository_state"
+        )
+        for row in stateRows {
+            let space = try requiredText(row, "space_uri")
+            let author = try requiredText(row, "author_did")
+            stateRevisions["\(space)\u{0}\(author)"] =
+                try requiredText(row, "wire_revision")
+        }
+        let recordRows = try await connection.query(
+            """
+            SELECT space_uri, author_did, collection, rkey, value
+            FROM permissioned_space_records
+            """
+        )
+        for row in recordRows {
+            let space = try requiredText(row, "space_uri")
+            let author = try requiredText(row, "author_did")
+            guard let wireRevision = stateRevisions["\(space)\u{0}\(author)"] else {
+                continue
+            }
+            let value = try requiredBlob(row, "value")
+            for cid in try rawBlobCIDs(in: value) {
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_record_blobs(
+                        space_uri, author_did, collection, rkey,
+                        blob_cid, wire_revision
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(space_uri, author_did, collection, rkey, blob_cid)
+                    DO NOTHING
+                    """,
+                    [
+                        .text(space), .text(author),
+                        .text(try requiredText(row, "collection")),
+                        .text(try requiredText(row, "rkey")),
+                        .text(cid), .text(wireRevision),
+                    ]
+                )
+            }
+        }
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
 
     /// Upgrades rows written before the persistence API owned its state marker
     /// and outbox-body construction. The sentinel is committed with the row
@@ -3920,6 +4428,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             blob(value), .text(cid), .integer(storedRevision),
                         ]
                     )
+                    try await replacePermissionedRecordBlobEdges(
+                        space: space, author: author,
+                        collection: uri.collection, rkey: uri.rkey,
+                        blobCIDs: try rawBlobCIDs(in: value),
+                        wireRevision: wireRevision
+                    )
                 case let .put(_, value, cid), let .update(_, value, cid):
                     if case .update = write, old == nil {
                         throw SwanError.malformed("cannot update a missing record")
@@ -3949,6 +4463,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             blob(value), .text(cid), .integer(storedRevision),
                         ]
                     )
+                    try await replacePermissionedRecordBlobEdges(
+                        space: space, author: author,
+                        collection: uri.collection, rkey: uri.rkey,
+                        blobCIDs: try rawBlobCIDs(in: value),
+                        wireRevision: wireRevision
+                    )
                 case .delete:
                     action = .delete
                     guard let old else {
@@ -3965,6 +4485,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             .text(space.rawValue), .text(author),
                             .text(uri.collection), .text(uri.rkey),
                         ]
+                    )
+                    try await replacePermissionedRecordBlobEdges(
+                        space: space, author: author,
+                        collection: uri.collection, rkey: uri.rkey,
+                        blobCIDs: [],
+                        wireRevision: wireRevision
                     )
                 }
 
@@ -4037,6 +4563,55 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     .integer(createdAt),
                 ]
             )
+
+            // Erratum 03: when this account IS the space authority, a local
+            // write fans out to the space's service-named subscribers in the
+            // same transaction — the reference's HOP-2 enqueue
+            // (`notify.rs::enqueue_writes`), whose deliveries are
+            // authority-signed (`iss = space authority`, `aud = subscriber
+            // service`). Legacy endpoint-only rows (service_did IS NULL) are
+            // never enqueued: without a service identity the delivery JWT has
+            // no audience its receiver could verify, which is the original
+            // reason cross-host write fanout was withheld. Per-repo rows
+            // filter by this writer, matching `list_recipients`.
+            if space.authority == accountDID {
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_notification_fanout(
+                        id, source_issuer, source_event_id, kind, space_uri,
+                        repo_did, wire_revision, commitment, endpoint,
+                        attempts, created_at, available_at,
+                        lease_token, lease_expires_at
+                    )
+                    SELECT
+                        substr(h,1,8)||'-'||substr(h,9,4)||'-'||substr(h,13,4)
+                            ||'-'||substr(h,17,4)||'-'||substr(h,21,12),
+                        ?, ?, 'write', ?,
+                        ?, ?, ?, endpoint,
+                        0, ?, ?, NULL, NULL
+                    FROM (
+                        SELECT hex(randomblob(16)) AS h, endpoint
+                        FROM permissioned_space_notification_registrations
+                        WHERE space_uri = ?
+                          AND service_did IS NOT NULL
+                          AND expires_at > ?
+                          AND (repo_did IS NULL OR repo_did = ?)
+                    )
+                    WHERE true
+                    ON CONFLICT(source_issuer, source_event_id, kind, endpoint) DO NOTHING
+                    """,
+                    [
+                        .text(space.authority), .text(eventID.uuidString.lowercased()),
+                        .text(space.rawValue),
+                        .text(author), .text(wireRevision.toString()),
+                        blob(ltHash.commitment),
+                        .integer(createdAt), .integer(createdAt),
+                        .text(space.rawValue),
+                        .integer(createdAt),
+                        .text(author),
+                    ]
+                )
+            }
 
             try await testingHooks.beforeApplyCommit?()
 
@@ -5920,6 +6495,46 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// body; only the accepted keys are then decoded from the same read
     /// transaction. A page may be shorter than `limit` at the byte boundary,
     /// and the caller continues with the last returned key.
+    /// The distinct blob CIDs referenced by this repository's records within
+    /// one space, ordered ascending by CID — the exact projection
+    /// `com.atproto.space.listBlobs` serves. `since` keeps only blobs whose
+    /// referencing record was last written after that wire TID; `cursor` is
+    /// the last CID of the previous page.
+    public func spaceRecordBlobCIDPage(
+        space: SpaceURI,
+        author: String,
+        since: String?,
+        cursor: String?,
+        limit: Int
+    ) async throws -> [String] {
+        try requireAccount(author)
+        guard (1 ... 1_000).contains(limit) else {
+            throw SwanError.malformed("permissioned blob page is invalid")
+        }
+        var sql = """
+            SELECT DISTINCT blob_cid
+            FROM permissioned_space_record_blobs
+            WHERE space_uri = ? AND author_did = ?
+            """
+        var bindings: [SQLiteData] = [.text(space.rawValue), .text(author)]
+        if let since {
+            sql += " AND wire_revision > ?"
+            bindings.append(.text(since))
+        }
+        if let cursor {
+            sql += " AND blob_cid > ?"
+            bindings.append(.text(cursor))
+        }
+        sql += " ORDER BY blob_cid ASC LIMIT ?"
+        bindings.append(.integer(limit))
+        return try await withConnectionGate {
+            try await readTransaction {
+                let rows = try await connection.query(sql, bindings)
+                return try rows.map { try requiredText($0, "blob_cid") }
+            }
+        }
+    }
+
     public func repositoryRecordPage(
         space: SpaceURI,
         author: String,
@@ -6454,12 +7069,65 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     authorization: authorization,
                     operation: .create
                 )
+                // Erratum 03 addendum (instance #10), anchored to the CURRENT
+                // official permissioned-data HEAD (`bddc99fb`): deleteSpace
+                // there removes the simplespace config row while the space row
+                // survives only as a credential tombstone, and createSpace's
+                // conflict check reads that config — so a delete→recreate
+                // cycle is a FRESH create (bulleted.app's recovery path),
+                // while re-creating a LIVE space still throws
+                // SpaceAlreadyExists (`simplespace/manager.ts:27-46`,
+                // `actor-store/space/transactor.ts:67-79`). Swan keeps its
+                // single-row tombstone, so the fresh create is expressed as a
+                // revive: un-tombstone, apply the SUPPLIED configuration, and
+                // reseed the membership to just the owner.
                 let existing = try await connection.query(
-                    "SELECT 1 FROM permissioned_simple_space_authorities WHERE space_uri = ?",
+                    "SELECT owner_did, is_deleted, revision FROM permissioned_simple_space_authorities WHERE space_uri = ?",
                     [.text(space.rawValue)]
                 )
-                guard existing.isEmpty else {
-                    throw SwanError.conflict(expected: 0, actual: 1)
+                if let row = existing.first {
+                    // A foreign owner can never reach here
+                    // (requireAuthorityAccount above); the stored owner is
+                    // still checked so a corrupt row fails closed.
+                    guard row.column("owner_did")?.string == owner,
+                          (row.column("is_deleted")?.integer ?? 0) != 0 else {
+                        throw SwanError.conflict(expected: 0, actual: 1)
+                    }
+                    let storedRevision = try requiredRevision(row, "revision")
+                    let nextRevision = try nextSimpleSpaceRevision(storedRevision)
+                    _ = try await connection.query(
+                        """
+                        UPDATE permissioned_simple_space_authorities
+                        SET is_deleted = 0, revision = ?,
+                            policy = ?, app_access = ?, managing_app = ?,
+                            updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
+                        WHERE space_uri = ?
+                        """,
+                        [
+                            .integer(try sqliteRevision(nextRevision)),
+                            .text(configuration.policy.rawValue),
+                            .text(simpleSpaceAppAccessName(configuration.appAccess)),
+                            configuration.managingApp.map(SQLiteData.text) ?? .null,
+                            .integer(timestamp), .integer(timestamp),
+                            .text(space.rawValue),
+                        ]
+                    )
+                    _ = try await connection.query(
+                        "DELETE FROM permissioned_simple_space_members WHERE space_uri = ?",
+                        [.text(space.rawValue)]
+                    )
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO permissioned_simple_space_members(space_uri, member_did)
+                        VALUES (?, ?)
+                        """,
+                        [.text(space.rawValue), .text(owner)]
+                    )
+                    try await replaceSimpleSpaceClients(
+                        space: space,
+                        appAccess: configuration.appAccess
+                    )
+                    return try await requiredSimpleSpace(space).state
                 }
                 _ = try await connection.query(
                     """
@@ -6503,10 +7171,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try requireAuthorityAccount(space: space)
         return try await withReadConnectionGate {
             try await readTransaction {
-                try requireAuthorityManagement(
+                // The live `simplespace.getSpace` read contract: authority
+                // OAuth with read_self (ambient `atproto` bypass included) or
+                // a space credential bound to this exact space — not the
+                // management verbs, which stay on the mutation paths.
+                try SpaceAuthorizationPolicy.requireSpaceDescriptionRead(
                     space: space,
-                    authorization: authorization,
-                    operation: .update
+                    authorization: authorization
                 )
                 return try await loadSimpleSpace(space, connection: readConnection)?.state
             }
@@ -7170,6 +7841,39 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// keyed by the delivery endpoint, matching the pinned PDS. Re-registering
     /// with a different optional repo replaces it; expiry cleanup below acts
     /// as removal without accepting a broad administration endpoint.
+    /// Withdraws a subscriber's registrations by service identity, the live
+    /// `unregisterNotify` contract: idempotent (succeeds whether or not a
+    /// matching registration existed), gated on a space credential for this
+    /// exact space and on the space still being active.
+    public func unregisterSpaceNotification(
+        space: SpaceURI,
+        service: String,
+        authorization: AuthorizationContext
+    ) async throws {
+        guard Self.isValidNotificationServiceIdentity(service) else {
+            throw SwanError.invalidIdentifier("notification service identity")
+        }
+        try requireAuthorityAccount(space: space)
+        guard case let .spaceCredential(grant) = authorization,
+              grant.space == space else {
+            throw SwanError.unauthorized("space credential is required")
+        }
+        try grant.allows(.read)
+        try await withConnectionGate {
+            try await transaction {
+                let state = try await requiredSimpleSpace(space)
+                try requireActiveSimpleSpace(state.state)
+                _ = try await connection.query(
+                    """
+                    DELETE FROM permissioned_space_notification_registrations
+                    WHERE space_uri = ? AND service_did = ?
+                    """,
+                    [.text(space.rawValue), .text(service)]
+                )
+            }
+        }
+    }
+
     public func registerSpaceNotification(
         _ registration: AuthorizedSpaceNotificationRegistration,
         authorization: AuthorizationContext,
@@ -7179,6 +7883,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         if let repository = registration.repository {
             guard isValidSimpleSpaceDID(repository) else {
                 throw SwanError.invalidIdentifier("notification repository")
+            }
+        }
+        if let service = registration.service {
+            guard Self.isValidNotificationServiceIdentity(service) else {
+                throw SwanError.invalidIdentifier("notification service identity")
             }
         }
         let timestamp = try simpleSpaceTimestamp(now)
@@ -7236,19 +7945,86 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_notification_registrations(
-                        space_uri, endpoint, repo_did, expires_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
+                        space_uri, endpoint, repo_did, expires_at, updated_at, service_did
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(space_uri, endpoint) DO UPDATE SET
                         repo_did = excluded.repo_did,
                         expires_at = excluded.expires_at,
-                        updated_at = excluded.updated_at
+                        updated_at = excluded.updated_at,
+                        service_did = excluded.service_did
                     """,
                     [
                         .text(registration.space.rawValue), .text(endpoint),
                         registration.repository.map(SQLiteData.text) ?? .null,
                         .integer(expiry), .integer(timestamp),
+                        registration.service.map(SQLiteData.text) ?? .null,
                     ]
                 )
+            }
+        }
+    }
+
+    /// A subscriber service identifier: a DID with an optional single
+    /// `#fragment`. Charset-bounded here so a stored identity can always be a
+    /// service-JWT audience; the HTTP layer has already resolved it to an
+    /// endpoint through the DID document.
+    static func isValidNotificationServiceIdentity(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 640,
+              value.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7F }) else {
+            return false
+        }
+        let parts = value.split(separator: "#", omittingEmptySubsequences: false)
+        guard (1 ... 2).contains(parts.count),
+              parts.allSatisfy({ !$0.isEmpty }),
+              parts[0].hasPrefix("did:") else {
+            return false
+        }
+        return true
+    }
+
+    /// The active registration's service identity for one `(space, endpoint)`
+    /// row, or `nil` when the row is absent, expired, filtered out by its
+    /// per-repo binding, or a legacy endpoint-only registration. Delivery
+    /// treats `nil` as "not a dynamic destination" — a replaced or withdrawn
+    /// service registration turns a leased fanout row into a safe no-op.
+    public func spaceNotificationRegistrationService(
+        space: SpaceURI,
+        endpoint: String,
+        repository: String?,
+        now: Date = Date()
+    ) async throws -> String? {
+        let endpoint = try validNotificationEndpoint(endpoint)
+        if let repository {
+            guard isValidSimpleSpaceDID(repository) else {
+                throw SwanError.invalidIdentifier("notification repository")
+            }
+        }
+        let timestamp = try simpleSpaceTimestamp(now)
+        try requireAuthorityAccount(space: space)
+        return try await withConnectionGate {
+            try await readTransaction {
+                let rows = try await connection.query(
+                    """
+                    SELECT repo_did, expires_at, service_did
+                    FROM permissioned_space_notification_registrations
+                    WHERE space_uri = ? AND endpoint = ?
+                    """,
+                    [.text(space.rawValue), .text(endpoint)]
+                )
+                guard let row = rows.first,
+                      try requiredNonnegativeInteger(row, "expires_at") > timestamp else {
+                    return nil
+                }
+                let selectedRepository = row.column("repo_did")?.string
+                guard repository == nil || selectedRepository == nil
+                    || selectedRepository == repository else {
+                    return nil
+                }
+                guard let service = row.column("service_did")?.string,
+                      Self.isValidNotificationServiceIdentity(service) else {
+                    return nil
+                }
+                return service
             }
         }
     }
@@ -7404,13 +8180,53 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     ]
                 )
 
-                // Do not enqueue an authority-signed `notifyWrite` fanout.
-                // The pinned TypeScript receiver requires `iss == repo`, but
-                // this authority has only its own key and cannot truthfully
-                // sign for another member writer. Registrations remain local
-                // discovery/authority state; cross-host write fanout awaits a
-                // compatible upstream receiver contract. Deletion fanout is
-                // separate and remains authority-signed by definition.
+                // Erratum 03: fan the accepted member write out to the
+                // space's SERVICE-NAMED subscribers, authority-signed —
+                // the reference contract (`notify.rs::enqueue_writes`,
+                // `iss = space authority`, `aud = subscriber service`). The
+                // old refusal reasoned from the pinned TypeScript PDS
+                // receiver (`iss == repo`), but a registered subscriber is a
+                // service that named itself in a DID document, not a PDS;
+                // its verifier checks the audience it registered. Legacy
+                // endpoint-only rows still get nothing: with no service
+                // identity there is no audience a receiver could verify.
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_notification_fanout(
+                        id, source_issuer, source_event_id, kind, space_uri,
+                        repo_did, wire_revision, commitment, endpoint,
+                        attempts, created_at, available_at,
+                        lease_token, lease_expires_at
+                    )
+                    SELECT
+                        substr(h,1,8)||'-'||substr(h,9,4)||'-'||substr(h,13,4)
+                            ||'-'||substr(h,17,4)||'-'||substr(h,21,12),
+                        ?, ?, 'write', ?,
+                        ?, ?, ?, endpoint,
+                        0, ?, ?, NULL, NULL
+                    FROM (
+                        SELECT hex(randomblob(16)) AS h, endpoint
+                        FROM permissioned_space_notification_registrations
+                        WHERE space_uri = ?
+                          AND service_did IS NOT NULL
+                          AND expires_at > ?
+                          AND (repo_did IS NULL OR repo_did = ?)
+                    )
+                    WHERE true
+                    ON CONFLICT(source_issuer, source_event_id, kind, endpoint) DO NOTHING
+                    """,
+                    [
+                        .text(notification.space.authority), .text(eventID),
+                        .text(notification.space.rawValue),
+                        .text(notification.repository),
+                        .text(notification.wireRevision),
+                        blob(notification.commitment),
+                        .integer(timestamp), .integer(timestamp),
+                        .text(notification.space.rawValue),
+                        .integer(timestamp),
+                        .text(notification.repository),
+                    ]
+                )
             }
         }
     }
@@ -9534,6 +10350,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     "credential requester does not match the requested user"
                 )
             }
+        case .accountLegacySession:
+            // Minting a space credential is the permissioned-data surface, which
+            // app-password sessions do not reach — the same position
+            // `SpaceAuthorizationPolicy.require` states. Matching the subject
+            // would not make it safe: the objection is the credential type, not
+            // who is holding it.
+            throw SwanError.unauthorized(
+                "app-password sessions cannot request space credentials"
+            )
         case let .spaceDelegation(subject, delegatedSpace):
             guard subject == user, delegatedSpace == space else {
                 throw SwanError.unauthorized(
@@ -9553,6 +10378,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     "self-read grant does not match the requested user"
                 )
             }
+        case .accountManagement, .accountLegacySession:
+            throw SwanError.unauthorized(
+                "account session cannot mint permissioned-space credentials"
+            )
         case .public, .service:
             throw SwanError.unauthorized(
                 "credential issuance requires a user OAuth or delegated grant"
@@ -10685,6 +11514,46 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// The staged upload edge is consumed unconditionally: a permissioned
     /// record has claimed those bytes, and a later same-CID re-upload creates
     /// a fresh staged edge that is likewise never anonymously reachable. A
+    /// Replaces the record→blob edges for one permissioned record inside the
+    /// caller's write transaction. The edge set mirrors the record's current
+    /// raw blob links exactly; `wire_revision` is the committing batch's TID,
+    /// which is what `listBlobs`' `since` filter compares against.
+    private func replacePermissionedRecordBlobEdges(
+        space: SpaceURI,
+        author: String,
+        collection: String,
+        rkey: String,
+        blobCIDs: [String],
+        wireRevision: TID
+    ) async throws {
+        _ = try await connection.query(
+            """
+            DELETE FROM permissioned_space_record_blobs
+            WHERE space_uri = ? AND author_did = ?
+              AND collection = ? AND rkey = ?
+            """,
+            [
+                .text(space.rawValue), .text(author),
+                .text(collection), .text(rkey),
+            ]
+        )
+        for cid in blobCIDs {
+            _ = try await connection.query(
+                """
+                INSERT INTO permissioned_space_record_blobs(
+                    space_uri, author_did, collection, rkey,
+                    blob_cid, wire_revision
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    .text(space.rawValue), .text(author),
+                    .text(collection), .text(rkey),
+                    .text(cid), .text(wireRevision.toString()),
+                ]
+            )
+        }
+    }
+
     /// CID a validated public record also references keeps (or has restored)
     /// its public reference — that blob is genuinely published and
     /// `com.atproto.sync.getBlob` must keep serving it. Existing private
@@ -11411,7 +12280,12 @@ public actor DurableSpaceRepository {
             let expectedRecord = expectedRecords[uri]
             switch write {
             case let .put(uri, value):
-                let permission: SpacePermission = expectedRecord == nil ? .create : .update
+                // Qualified: SwanCore's OAuth-grammar `SpacePermission` (§5.6.2)
+                // and SwanSpaces' domain `SpacePermission` (`SwanSpaces.swift:175-182`)
+                // share a name, and this module imports both (§9-D2 ruling:
+                // qualify at use, do not rename the domain type). This is the
+                // DOMAIN permission — a record verb, not an OAuth `action=` value.
+                let permission: SwanSpaces.SpacePermission = expectedRecord == nil ? .create : .update
                 try requireWrite(
                     uri: uri,
                     authorization: authorization,
@@ -11720,14 +12594,13 @@ public actor DurableSpaceRepository {
         )
     }
 
-    /// The declared length of that same blob, under the identical aggregate
-    /// repository-read check.  A collection-qualified OAuth grant cannot use
-    /// this to learn whether a blob exists any more than it can open one.
+    /// The declared length of that same blob, under the identical single-blob
+    /// read check (Erratum 03) — the two calls cannot answer differently.
     public func permissionedBlobMetadata(
         cid: String,
         authorization: AuthorizationContext
     ) async throws -> AuthorizedSpaceBlobMetadata? {
-        try requireRead(uri: nil, authorization: authorization)
+        try requireBlobRead(authorization: authorization)
         return try await database.permissionedBlobMetadata(
             space: space,
             author: author,
@@ -11736,14 +12609,18 @@ public actor DurableSpaceRepository {
     }
 
     /// Opens one already-authorized, file-backed blob body.  Blob retrieval is
-    /// an aggregate repository read: a collection-qualified OAuth grant may
-    /// read its individual records but cannot be repurposed into an arbitrary
-    /// blob oracle.
+    /// a SINGLE-blob read (Erratum 03), not an aggregate repository read: a
+    /// collection-qualified OAuth grant that can read its records can fetch
+    /// the blobs they reference — post-Erratum-02 the same grant reaches these
+    /// bytes through a whole-space credential anyway, so the old aggregate
+    /// classification refused conformant clients while protecting nothing.
+    /// The CAR snapshot above keeps the aggregate rule: it really does export
+    /// every collection.
     public func permissionedBlob(
         cid: String,
         authorization: AuthorizationContext
     ) async throws -> AuthorizedSpaceBlob? {
-        try requireRead(uri: nil, authorization: authorization)
+        try requireBlobRead(authorization: authorization)
         return try await database.permissionedBlob(
             space: space,
             author: author,
@@ -11828,6 +12705,29 @@ public actor DurableSpaceRepository {
     /// is checked against a synthetic, valid record URI before the durable
     /// snapshot is queried. An omitted collection therefore cannot silently
     /// downgrade an aggregate response to a censored list.
+    /// The distinct blob CIDs referenced by this repository's records within
+    /// the space. Authorization mirrors an aggregate record read: the blobs a
+    /// caller can enumerate here are exactly the ones whose records a
+    /// cross-collection `listRecords` would show it.
+    public func listBlobCIDs(
+        since: String?,
+        cursor: String?,
+        limit: Int,
+        authorization: AuthorizationContext
+    ) async throws -> [String] {
+        guard (1 ... 1_000).contains(limit) else {
+            throw SwanError.malformed("permissioned blob page limit is invalid")
+        }
+        try requireRead(uri: nil, authorization: authorization)
+        return try await database.spaceRecordBlobCIDPage(
+            space: space,
+            author: author,
+            since: since,
+            cursor: cursor,
+            limit: limit
+        )
+    }
+
     public func listRecords(
         collection: String?,
         limit: Int,
@@ -11918,10 +12818,20 @@ public actor DurableSpaceRepository {
         )
     }
 
+    private func requireBlobRead(authorization: AuthorizationContext) throws {
+        try SpaceAuthorizationPolicy.requireBlobRead(
+            space: space,
+            author: author,
+            authorization: authorization
+        )
+    }
+
     private func requireWrite(
         uri: SpaceRecordURI,
         authorization: AuthorizationContext,
-        permission: SpacePermission
+        // Qualified for the same reason as the call site above (§9-D2): this is
+        // the SwanSpaces DOMAIN permission, not SwanCore's OAuth grammar type.
+        permission: SwanSpaces.SpacePermission
     ) throws {
         if case .service = authorization {
             throw SwanError.unauthorized(

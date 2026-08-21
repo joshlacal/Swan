@@ -151,7 +151,7 @@ private struct Fixture {
         let secondCID = CID.fromDAGCBOR(secondBytes)
         operations = [
             .init(
-                rev: firstRevision.toString(),
+                rev: firstRevision,
                 collection: try NSID(nsidString: "app.bsky.feed.post"),
                 rkey: try RecordKey(keyString: "one"),
                 cid: firstCID,
@@ -159,7 +159,7 @@ private struct Fixture {
                 value: firstValue
             ),
             .init(
-                rev: secondRevision.toString(),
+                rev: secondRevision,
                 collection: try NSID(nsidString: "app.bsky.feed.post"),
                 rkey: try RecordKey(keyString: "two"),
                 cid: secondCID,
@@ -187,7 +187,7 @@ private struct Fixture {
             ikm: Bytes(data: envelope.context.ikm),
             sig: Bytes(data: envelope.contextSignature),
             mac: Bytes(data: envelope.contentBinding),
-            rev: envelope.context.rev
+            rev: try TID(tidString: envelope.context.rev)
         )
     }
 }

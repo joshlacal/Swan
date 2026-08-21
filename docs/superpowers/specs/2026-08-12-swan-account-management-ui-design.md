@@ -1,256 +1,92 @@
-# Swan Account Management UI — Design
+# Swan Account Management UI — Historical draft reconciled
 
-**Date:** 2026-08-12
-**Status:** Draft for review
-**Depends on:** `2026-08-12-swan-scoped-app-passwords-design.md`. Scoped app
-passwords are unusable without a way to create them; this is that way.
+**Original date:** 2026-08-12  
+**Current status:** Superseded; retained as a historical decision record  
+**Authoritative contract:**
+[`2026-08-16-swan-account-identity-reference-parity-design.md`](2026-08-16-swan-account-identity-reference-parity-design.md)
 
-## Goal
+The 2026-08-16 design is the only implementation authority. This file preserves
+the useful UI decisions from the earlier draft and explicitly resolves the
+parts that became stale after the security remediation and approved four-release
+program.
 
-A web UI at `swan.place` where an account holder can manage **credentials**:
-create scoped app passwords, see what exists, and revoke live sessions.
+## Reconciliation
 
-v1 is credentials only. Handle, email, password change, export and migration are
-deliberately out — each touches machinery with its own sharp edges (a handle
-change is a live `plc.directory` write; email recovery is disabled in production
-today).
+The earlier “credentials only” v1 is replaced by the approved milestones:
+M1 compatibility + portal (signup, invites, `did:web`, recovery, legacy
+sessions, app passwords, portal), M2 MFA, M3 remaining reference breadth, and
+M4 operations. Dependencies may be staged internally but milestone content is
+not redefined. Each sensitive mutation requires the authoritative design's
+fresh-step-up and evidence rules.
 
-## Architecture
+The following decisions remain binding:
 
-**SvelteKit frontend, Hummingbird backend — not a SvelteKit server.**
+* SvelteKit is build-only with `adapter-static`; Hummingbird serves baked
+  assets. There is no SvelteKit server or Node runtime in production.
+* `/account/api/*` is a separate, cookie-only management surface. Cookies do
+  not authenticate `/xrpc/*`, and OAuth/DPoP, service, bearer, or app-password
+  credentials do not authenticate the management API.
+* The API route group wins over the `/account/*` SPA fallback. Unknown API
+  routes return `404` rather than a static page.
+* Management sessions are opaque, revocable, and distinct from OAuth browser
+  sessions and legacy sessions. The exact cookie, CSRF, Origin, CSP, and
+  failure contract is frozen in Section 3 of the authoritative design.
+* OAuth browser pages retain their script-free strict CSP. Account pages have a
+  separate self-only policy and never widen OAuth CSP.
+* Secrets are shown once and never appear in list responses, logs, or errors.
+  “Revoke all others” never revokes the management session issuing the request.
 
-```
-                     build time
-               ┌──────────────────┐
-               │ SvelteKit / Vite │   Node lives here and only here
-               └────────┬─────────┘
-                        │ npm ci && npm run build
-                        ▼
-                 web/build/  →  copied into the Swift image
+## Frozen account API groups
 
-                     production
-   ┌──── Browser ────┐
-   │ SvelteKit app   │
-   │    fetch()      │
-   └────────┬────────┘
-            │ HTTPS, same origin, HttpOnly cookie
-            ▼
-   ┌────────────────────────────────────────────┐
-   │            Swan / Hummingbird              │
-   │  /account/*      → static assets / 200.html│
-   │  /account/api/*  → cookie-authenticated    │
-   │  /xrpc/*         → bearer/DPoP only        │
-   │  /oauth/*        → Swift-rendered          │
-   └────────────────────────────────────────────┘
-```
+The exact route list is maintained in the authoritative design; these groups
+are its compatibility summary:
 
-**The deployed container contains no Node executable.** Node is a build
-dependency alongside the Swift toolchain; the final image is the Swift binary
-plus SvelteKit's static output. The container stays `--read-only` with `/data`
-as the only writable mount — static assets are baked in, not written at runtime.
-
-### D1 — `adapter-static` in SPA-fallback mode
-
-```js
-adapter({ fallback: '200.html' })
-```
-
-Routing:
-
-| Path | Served as |
+| Group | Routes |
 |---|---|
-| `/_app/*`, `/assets/*` | actual static files, long-cache |
-| `/account/*` | `200.html`; the SvelteKit client router takes over |
-| `/account/api/*` | Swift, cookie-authenticated |
-| `/xrpc/*` | Swift, bearer/DPoP |
-| `/oauth/*` | Swift, server-rendered |
+| Public onboarding | `bootstrap`, `signup/policy`, `signup/email/request`, `signup/authorize`, `signup`, `login` |
+| Session | `session`, `logout`, `sessions`, `sessions/:id`, `sessions/revoke-others` |
+| Account/identity | `profile`, `identity`, `connected-apps`, `export`, `migration`, `lifecycle/delete` |
+| Credentials | `app-passwords`, `app-passwords/:name`, `scope-presets`, `scopes/validate` |
+| Factors | `factors`, `factors/passkeys/:id`, `factors/totp`, `factors/recovery-codes/rotate`, `step-up` |
 
-Fallback mode rather than full prerender: the UI is behind auth and inherently
-dynamic, so prerendering each route buys nothing and adds a build-time route
-manifest to keep in sync.
+All mutating routes require exact configured Origin, matching CSRF cookie/header,
+same-origin fetch-site when present, JSON body admission, and bounded rate
+limits. Failure bodies use stable safe codes and do not disclose account
+existence or credential material.
 
-The `/account/*` fallback must not shadow `/account/api/*`. Register the API
-routes as exact paths so Hummingbird's trie prefers them over the wildcard —
-the same precedence property the firehose WebSocket route relies on.
+`GET /account/api/bootstrap` issues the pre-auth CSRF cookie/token. Login and
+all signup POSTs require exact Origin, JSON, `Sec-Fetch-Site: same-origin` or
+`none`, and a matching pre-auth CSRF cookie/header; successful authentication
+consumes it and rotates to the management CSRF token. There is no wholesale
+public-POST exemption. Once MFA is enabled, password management/OAuth/legacy
+login requires a valid factor assertion; an app password remains scoped legacy
+access only. Recovery/email alone cannot remove factors or authorize identity
+or deletion.
 
-### D2 — The management API is a separate, cookie-only surface
+## Historical architecture sketch
 
-**The UI does not call `/xrpc/*`.** It calls `/account/api/*`.
-
-This is the load-bearing decision in this document. The obvious shortcut — have
-the SPA call `com.atproto.server.listAppPasswords` with the session cookie —
-costs two things that are not worth it:
-
-1. **XRPC would accept two authentication schemes.** Every existing guard site
-   was written and reviewed against exactly one. This codebase has already
-   produced two production security bugs from a surface silently widening
-   underneath checks that only looked at one thing, which is why legacy sessions
-   get their own `AuthorizationContext` case rather than reusing
-   `.accountOAuth`. The same reasoning applies here, more strongly: a cookie is
-   ambient authority that the browser attaches automatically.
-2. **It drags CSRF onto XRPC.** Bearer/DPoP authentication is CSRF-immune by
-   construction — the browser never attaches those credentials on its own. The
-   moment a cookie is honoured on `/xrpc/*`, every mutating XRPC method becomes
-   a CSRF target, including ones that have nothing to do with this UI.
-
-So: cookies are honoured **only** under `/account/api/*`, CSRF policy is applied
-to that route group as a whole, and `/xrpc/*` stays single-auth.
-
-The API is small and shaped for the UI rather than mirroring lexicons:
-
-```
-GET    /account/api/session           who am I (DID, handle, status)
-POST   /account/api/login             password → sets cookie
-POST   /account/api/logout
-GET    /account/api/app-passwords     list (never returns secrets)
-POST   /account/api/app-passwords     create → returns the secret ONCE
-DELETE /account/api/app-passwords/:name
-GET    /account/api/sessions          OAuth families + legacy sessions
-DELETE /account/api/sessions/:id
-POST   /account/api/sessions/revoke-others
-GET    /account/api/scope-presets     presets + validation vocabulary
-POST   /account/api/scopes/validate   parse a custom scope string
+```text
+build:       SvelteKit/Vite --(npm ci, npm run build)--> web/build
+production:  browser --HTTPS--> Hummingbird
+             /account/*     -> static fallback
+             /account/api/* -> management cookie + CSRF + Origin
+             /xrpc/*         -> existing bearer/DPoP authorization only
+             /oauth/*        -> existing Swift-rendered OAuth pages
 ```
 
-Where these overlap the lexicon endpoints (`createAppPassword`,
-`listAppPasswords`, `revokeAppPassword`, which the official Bluesky app's
-settings screen calls), both surfaces call the **same underlying service**. The
-lexicon endpoints remain bearer-authenticated; only the transport and auth
-differ.
+This sketch remains accurate only with the route and credential isolation
+above. It does not authorize deployment or imply that the portal exists in the
+current source; as of 2026-08-16 it remains unimplemented.
 
-### D3 — Management authentication requires the real account password
+## Verification retained from the draft
 
-**No delegated credential may reach this surface.** Not an app password, not an
-OAuth token, not a service token.
+Implementation must test route precedence, management/OAuth/app-password auth
+isolation, exact cookie attributes, Origin and CSRF rejection, CSP separation,
+one-time secret presentation, immediate revocation, and local HTTPS browser
+flows. A clean build is not acceptance. The official-client post/read/delete
+and session-revocation flow is a required live gate when a disposable local
+environment is available; otherwise the gap is recorded explicitly.
 
-If a scoped app password could reach the page that creates app passwords, every
-scope becomes advisory — a narrow credential simply mints itself a wide one. The
-same holds for the session list: a credential must never be able to revoke the
-constraint that binds it.
-
-So the management session is established only by `POST /account/api/login` with
-the account password, and it produces a **distinct** session type — not a legacy
-session, not an OAuth grant. It gets its own `AuthorizationContext` case for the
-same compile-time-enumeration reason as legacy sessions: adding a case to a
-switch with no `default:` forces every existing consumer to state its position
-rather than silently inheriting a grant.
-
-Login reuses `DurableAccountDirectory.authenticateForLogin`, which is already
-enumeration-resistant (exactly one Argon2id verification on every path,
-including unknown accounts), and inherits the existing login rate limiting and
-the `X-Swan-Client-IP` trusted-proxy handling.
-
-Second-factor and step-up are out of scope for v1, but the session type exists
-partly so they have somewhere to attach later.
-
-### D4 — Cookie and CSRF policy
-
-Cookie: `HttpOnly; Secure; SameSite=Strict; Path=/account`. Svelte never reads
-it; the browser attaches it and Hummingbird authenticates it.
-
-`SameSite=Strict` is most of the CSRF defence, but not all of it — it does not
-protect against same-site subdomain attacks, and the Caddy block serves
-`*.swan.place`. So mutating `/account/api/*` requests additionally require:
-
-- an `Origin` header matching the configured public URL exactly, and
-- a CSRF token issued at login, echoed in a custom request header.
-
-A custom header alone would be sufficient against classic form CSRF (it forces a
-preflight), but the token is cheap and the origin check is the part that closes
-the subdomain gap.
-
-Applied as one middleware over the route group, so a new endpoint cannot forget
-it. This is the inverse of the pattern that has bitten this codebase: opt-out,
-not opt-in.
-
-### D5 — CSP
-
-`/oauth/authorize` and the OAuth browser pages **keep** `default-src 'none'` and
-stay Swift-rendered. They are small, unusually high-value, and have no need of
-JavaScript — a genuine defence-in-depth case, unrelated to rendering taste.
-
-`/account/*` gets its own policy allowing `script-src 'self'` and `style-src
-'self'` with SvelteKit's build-time hashes (nonces need a server; static output
-uses hashes). `connect-src 'self'`, `default-src 'none'`, `frame-ancestors
-'none'`, `base-uri 'none'` as before.
-
-Two distinct policies, selected by route group. The existing strict-header test
-must be extended rather than relaxed, so a future change cannot quietly widen
-the OAuth pages' policy.
-
-## What the UI shows
-
-**App passwords.** Name, scopes (preset name where it matches one, otherwise the
-raw string), created, last used. Create with a preset picker plus a custom
-field validated server-side before submission. The secret is shown **once**, with
-no way to retrieve it later.
-
-**Sessions.** Client, credential type (OAuth / app password / management),
-started, last seen, and for OAuth the granted scopes. Revoke individually, plus
-"revoke all others" — which must never revoke the current management session,
-since locking yourself out of the revocation UI from the revocation UI is a
-trap.
-
-A revoked OAuth family revokes the whole family, matching the existing
-reuse-detection semantics.
-
-## Build pipeline
-
-`web/` at the repo root: a SvelteKit project with `adapter-static`. The
-Dockerfile gains a Node builder stage that runs `npm ci && npm run build` and
-copies `web/build` into the final Swift image.
-
-`npm ci` — not `npm install` — so the lockfile is authoritative and the build is
-reproducible. The dependency tree is a new supply-chain surface for this repo
-and should be kept deliberately small.
-
-The Swift build must not depend on the Node stage's output existing during
-development: a missing `web/build` degrades to serving nothing under `/account`,
-never a build failure. `swift test` must not require Node.
-
-## Testing
-
-**Route precedence.** `/account/api/*` resolves to the API, not the SPA
-fallback. `/account/anything` returns `200.html`. `/xrpc/*` is unaffected.
-
-**Auth isolation — the tests that matter most.** A valid OAuth bearer token is
-**rejected** by `/account/api/*`. A valid app password is rejected. A management
-cookie is **rejected** by `/xrpc/*`. Each of these is a separate test, because
-each is a way the surfaces could quietly merge.
-
-**CSRF.** A mutating request with no CSRF token is refused; with a mismatched
-`Origin` is refused; a `GET` is unaffected.
-
-**Secrets.** The created app-password secret appears in exactly one response and
-never in a list response, a log line, or an error body.
-
-**Revocation.** Revoking a session invalidates it immediately. "Revoke all
-others" leaves the current management session alive. Revoking an app password
-kills the sessions derived from it.
-
-**Live.** Log in at `swan.place/account`, create a "Bluesky app" preset
-password, sign the official Bluesky app in with it, then see that session listed
-and revoke it — and confirm the app is signed out. Per the project's
-verification rules, a clean build is not "done".
-
-## Risks
-
-1. **New supply chain.** This is the repo's first npm dependency tree. Keep it
-   small, pin with `npm ci`, and treat additions as decisions rather than
-   conveniences.
-2. **Two auth surfaces on one origin.** Correct by construction only as long as
-   the isolation tests exist. They are the load-bearing tests in this document.
-3. **`*.swan.place` is proxied and served by the same Caddy block**, so
-   `SameSite=Strict` alone is not sufficient. D4's origin check is what closes
-   that, and it depends on the configured public URL being exact.
-4. **The UI grows.** v1 is credentials only, but sessions, export, migration and
-   permissioned-data controls are all plausibly next. SvelteKit is chosen partly
-   for that trajectory; the API shape should not assume credentials are the only
-   resource.
-
-## Non-goals
-
-No SvelteKit server runtime. No Node in the production image. No cookie
-authentication on `/xrpc/*`. No account creation, handle change, email change,
-or password change in v1. No change to the OAuth browser pages' rendering or
-CSP.
+See the authoritative design for current source reality, signup/identity
+contracts, factor semantics, migration ownership, jj lane boundaries, and the
+no-deploy rule.

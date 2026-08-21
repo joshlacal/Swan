@@ -1,4 +1,5 @@
 import Foundation
+import SwanStorage
 
 /// Where a proxied XRPC request should be sent.
 public enum SwanXRPCProxyRoute: Sendable, Equatable {
@@ -126,13 +127,30 @@ public struct SwanXRPCProxyRouter: Sendable {
             throw SwanXRPCProxyRoutingFailure.denied
         }
         if let proxyHeader {
-            // Allow-list before the header is even parsed. A namespace Swan
-            // does not proxy is unrouted whether or not the client named a
-            // destination, and it reports the same 404 an unknown namespace
-            // gets so this cannot be used to enumerate what Swan reserves.
-            guard Self.proxyablePrefixes.contains(where: { nsid.hasPrefix($0) })
-                || Self.proxyableMethods.contains(nsid)
-            else {
+            // Namespace allow-list before the header is even parsed. A
+            // namespace Swan does not proxy is unrouted whether or not the
+            // client named a destination, and it reports the same 404 an
+            // unknown namespace gets so this cannot be used to enumerate what
+            // Swan reserves.
+            //
+            // Admission is by namespace, NOT by membership in the generated
+            // method registry. The registry is derived from a pinned lexicon
+            // tree, and that pin trails upstream: 52 published methods were
+            // missing from it here, so `chat.bsky.convo.getUnreadCounts` and
+            // `app.bsky.video.*` 404'd for clients that legitimately asked for
+            // them. A stale pin must not silently shrink what this host will
+            // forward. The registry stays authoritative for scope
+            // declarations, where lexicon truth is the whole point.
+            //
+            // This does not reopen the hazard the allow-list exists to close.
+            // That hazard is a conditionally-registered *local* route
+            // vanishing and its NSID becoming forwardable — the measured case
+            // was `com.atproto.server.createSession` carrying an identifier
+            // and password. `com.atproto.*` is deliberately absent from
+            // `proxyablePrefixes`, so it is still unrouted here no matter what
+            // the client names, and everything Swan owns inside a proxyable
+            // namespace is covered by `deniedPrefixes`/`deniedMethods` above.
+            guard Self.isProxyableNamespace(nsid) else {
                 throw SwanXRPCProxyRoutingFailure.unrouted
             }
             let (did, fragment) = try Self.parseProxyHeader(proxyHeader)
@@ -155,6 +173,12 @@ public struct SwanXRPCProxyRouter: Sendable {
             throw SwanXRPCProxyRoutingFailure.unrouted
         }
         return .configuredAppView(did: appViewDID)
+    }
+
+    /// A namespace this host forwards, ignoring the destination.
+    static func isProxyableNamespace(_ nsid: String) -> Bool {
+        proxyablePrefixes.contains(where: { nsid.hasPrefix($0) })
+            || proxyableMethods.contains(nsid)
     }
 
     private static func parseProxyHeader(_ value: String) throws -> (did: String, fragment: String) {

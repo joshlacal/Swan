@@ -45,7 +45,7 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         )
         let loaded = try await directory.space(
             space,
-            authorization: .accountOAuth(subject: alice, scopes: ["atproto"])
+            authorization: .accountOAuthForTesting(subject: alice, scopes: ["atproto"])
         )
         let description = try XCTUnwrap(loaded)
         XCTAssertEqual(description.space, space)
@@ -167,12 +167,12 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
 
         let unknownResult = try await directory.space(
             unknownSpace,
-            authorization: .accountOAuth(subject: unknown, scopes: ["atproto"])
+            authorization: .accountOAuthForTesting(subject: unknown, scopes: ["atproto"])
         )
         XCTAssertNil(unknownResult)
         let inactiveForeignResult = try await directory.space(
             bobSpace,
-            authorization: .accountOAuth(subject: bob, scopes: ["atproto"])
+            authorization: .accountOAuthForTesting(subject: bob, scopes: ["atproto"])
         )
         XCTAssertNil(inactiveForeignResult)
         assertNoAccountDatabase(root: root, did: bob)
@@ -187,7 +187,7 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         await XCTAssertSwanUnavailableAsync(
             try await directory.space(
                 bobSpace,
-                authorization: .accountOAuth(subject: bob, scopes: ["atproto"])
+                authorization: .accountOAuthForTesting(subject: bob, scopes: ["atproto"])
             )
         )
         assertNoAccountDatabase(root: root, did: bob)
@@ -208,7 +208,7 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
             controlStore: control,
             publicIdentityVerifier: nil
         )
-        let authorization: AuthorizationContext = .accountOAuth(
+        let authorization: AuthorizationContext = .accountOAuthForTesting(
             subject: alice,
             scopes: ["atproto"]
         )
@@ -276,7 +276,7 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         await XCTAssertSwanUnavailableAsync(
             try await directory.space(
                 space,
-                authorization: .accountOAuth(subject: alice, scopes: ["atproto"])
+                authorization: .accountOAuthForTesting(subject: alice, scopes: ["atproto"])
             )
         )
         // The existing preopened connection may retain its original WAL/SHM
@@ -303,15 +303,27 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         await XCTAssertSwanUnauthorizedAsync(
             try await directory.space(
                 space,
-                authorization: .accountOAuth(subject: bob, scopes: ["atproto"])
+                authorization: .accountOAuthForTesting(subject: bob, scopes: ["atproto"])
             )
         )
+        // The live simplespace.getSpace contract gates the owner's OAuth on a
+        // read_self-satisfying space grant — a scoped read for exactly this
+        // space now succeeds where the retired manage-gated endpoint refused.
+        let scopedDescription = try await directory.space(
+            space,
+            authorization: .accountOAuthForTesting(
+                subject: alice,
+                scopes: ["space:app.bsky.bookmarks?authority=\(alice)&skey=directory&action=read"]
+            )
+        )
+        XCTAssertEqual(scopedDescription?.space, space)
+        // A grant for a different skey binds another space entirely.
         await XCTAssertSwanUnauthorizedAsync(
             try await directory.space(
                 space,
-                authorization: .accountOAuth(
+                authorization: .accountOAuthForTesting(
                     subject: alice,
-                    scopes: ["space:app.bsky.bookmarks?authority=\(alice)&skey=directory&action=read"]
+                    scopes: ["space:app.bsky.bookmarks?authority=\(alice)&skey=other&action=read"]
                 )
             )
         )
@@ -334,7 +346,7 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         await XCTAssertSwanUnavailableAsync(
             try await reopened.space(
                 space,
-                authorization: .accountOAuth(subject: alice, scopes: ["atproto"])
+                authorization: .accountOAuthForTesting(subject: alice, scopes: ["atproto"])
             )
         )
         try await reopened.close()
@@ -371,7 +383,7 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         await XCTAssertSwanUnavailableAsync(
             try await directory.space(
                 space,
-                authorization: .accountOAuth(
+                authorization: .accountOAuthForTesting(
                     subject: alice,
                     scopes: ["atproto"]
                 )
@@ -438,7 +450,7 @@ private extension PreMigratedAccountDirectoryTests {
             space: space,
             owner: did,
             configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
-            authorization: .accountOAuth(subject: did, scopes: ["atproto"]),
+            authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"]),
             now: Date(timeIntervalSince1970: 1_750_000_000)
         )
         try await database.close()

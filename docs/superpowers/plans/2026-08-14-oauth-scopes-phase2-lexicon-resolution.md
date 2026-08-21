@@ -1,0 +1,565 @@
+# OAuth permission scopes — Phase 2: lexicon resolution
+
+> **For agentic workers:** the sealed spec
+> `docs/superpowers/specs/2026-08-14-oauth-permission-scopes-design.md` (commit
+> `168b14a5`) is the implementation authority. This plan decomposes §5.7.3-§5.7.6
+> into lanes and fixes the interfaces between them. Where the spec gives Swift,
+> that Swift is the target. Where this plan and the spec disagree, the spec wins
+> and the disagreement is worth reporting.
+
+**Goal:** resolve `include:<nsid>` permission sets and bare `space:<type>`
+collection declarations from their authority's *cryptographically proved* repo
+record, and wire both into PAR and token mint.
+
+**Architecture:** a `SwanLexiconResolving` orchestrator performs 15 steps, six of
+which are proofs over a `com.atproto.sync.getRecord` CAR. Trust flows from the
+DID document through commit signature → MST membership → record bytes. Never
+from "the server said so."
+
+## Global Constraints
+
+- **`sync.getRecord`, never `repo.getRecord`.** The latter has no cryptographic
+  linkage to repo state; a dishonest PDS can return any JSON it likes, and Phase 2
+  feeds that straight into what a grant materialises to. This is the reason the
+  first spec draft was rewritten rather than annotated (§5.7.4).
+- **A resolver that does steps 1-7 and skips 8-13 is not a partial
+  implementation — it is a different, unsafe protocol wearing this one's name.**
+  Say so in the doc comment. "Proof verification in a follow-up" is the exact
+  shortcut §5.7.4 exists to forbid.
+- **A proof failure NEVER degrades to a silent drop.** Silent-drop rows apply to
+  entries *within a successfully proved document*. If a proof failure reaches a
+  drop path, an attacker-controlled PDS chooses which of a user's permissions
+  survive by selectively corrupting proofs (§5.7.5).
+- **All outbound I/O goes through `OAuthRemoteFetchPolicy`.** Adding a second
+  fetch path that bypasses its URL policy, public-address peer check, redirect
+  policy, admission control, or body cap is the one refactor §5.7.4 forbids
+  outright.
+- **Arity is part of the value.** Never collapse `.scalar` into a one-element
+  `.list`. Stringifying a scalar `collection` expands a rejected entry into a live
+  `repo:` create/update/delete grant (§5.7.3 gate 3).
+- **Two separately-named budgets.** RAW-INPUT measures wire bytes; EXPANDED-GRANT
+  measures what Swan holds after its own transformations. Everything in Phase 2 is
+  EXPANDED-GRANT. Caps: 4 distinct `include:` NSIDs, 8 distinct space-type NSIDs,
+  10 s group deadline, 256 KiB CAR.
+- **Asymmetric error codes are deliberate.** Same root cause → `invalid_scope` at
+  PAR, `invalid_request` at token mint. Match upstream for interop; comment the
+  asymmetry rather than unifying it.
+- VCS: jj-colocated, git read-only. **Seal → `jj new` immediately → then report.**
+- Never bare `swift build`; use `xcrun --toolchain XcodeDefault`.
+
+---
+
+## Verified starting facts
+
+Each was checked against the tree, not inferred. They set lane sizes.
+
+| claim | status |
+|---|---|
+| `withDefaultCollections` has zero production callers (tests only) | **confirmed** — expansion is unwired; the L1 guard is pre-positioned |
+| `RepositoryMSTValidation.validate` AND `validateProjection` are both full-tree walks | **confirmed** — `validateProjection`'s own doc says "the same strict validation as `validate`"; both route through `requiredBlock`, which throws `missingBlock`. A single-record proof CAR contains only the root→record path, so **both reject a legitimate proof**. New walker needed; `RepositoryMSTCodec` is reusable |
+| `OAuthRemoteFetch` has no bytes-returning fetch | **confirmed** — only `fetchJSON` (`:564`, `:587`, `:623`) |
+| `PublicRepositoryDIDResolver` is `did:plc:`-only | **confirmed** — `repositoryDID.hasPrefix("did:plc:")` guard in `resolveCommitVerifier` |
+| no `sync.getRecord` client exists | **confirmed** — `LiveInterop.swift:1419` uses `repo.getRecord` for an unrelated purpose |
+
+---
+
+## Interfaces — fixed before dispatch
+
+Lanes work against these. Changing one is a cross-lane event: report it, don't
+absorb it silently.
+
+```swift
+// P2-C produces, P2-E consumes.
+public protocol SwanLexiconAuthorityResolving: Sendable {
+    /// Steps 5-6. Accepts did:plc: AND did:web:, gated by operator policy
+    /// `allowedLexiconAuthorityDIDMethods` (default [.plc, .web], §9-D22).
+    /// Throws if no PDS endpoint or no `atproto` verification method.
+    func resolveAuthority(did: String) async throws -> SwanLexiconAuthority
+}
+
+public struct SwanLexiconAuthority: Sendable, Equatable {
+    public let pdsEndpoint: URL
+    public let commitVerifier: PermissionedDataPublicRepositoryCommitVerifier
+}
+
+// P2-B produces, P2-E consumes.
+public enum RepositoryMSTProof {
+    /// Step 12. Walks ONLY the path from `rootCID` to `key`, tolerating absent
+    /// sibling subtrees — which is what distinguishes a proof walk from
+    /// `validate`/`validateProjection`. Returns the record CID the key maps to,
+    /// or nil if the key is provably absent. Bounded by the SAME
+    /// `PublicRepositoryLimits` the full validators use — do not introduce a
+    /// second MST budget.
+    public static func membership(
+        rootCID: CID, key: String,
+        blocks: any PublicRepositoryBlockSource,
+        limits: PublicRepositoryLimits = .standard
+    ) async throws -> CID?
+}
+
+// P2-D produces, P2-E consumes.
+extension OAuthRemoteDocumentFetcher {
+    /// Sibling of fetchJSON, through the SAME OAuthRemoteFetchPolicy.
+    public func fetchBytes(from url: URL) async throws -> Data
+}
+
+// P2-A produces, P2-F consumes. Spec §5.7.3 gives the full Swift.
+extension IncludeScope {
+    public func expand(_ set: LexiconPermissionSet) -> [IncludedPermission]
+    public func isParentAuthorityOf(_ other: String) -> Bool
+}
+
+// P2-E produces, P2-F consumes. Spec §5.7.4 gives the full Swift.
+public protocol SwanLexiconResolving: Sendable {
+    func resolve(_ nsid: String) async throws -> SwanLexiconResolution
+}
+```
+
+---
+
+## Lanes
+
+Dependency order: **P2-A, P2-B, P2-C, P2-D run concurrently** (no shared files).
+**P2-E** joins B+C+D. **P2-F** joins A+E. **P2-G** verifies E.
+
+### P2-A — expansion (pure, zero network) · SwanCore
+
+§5.7.3 in full: `LexiconPermissionSet`, `LexiconValue`, `LexiconPermission`,
+`LexPermissionSyntax`, a `ScopeParameterSchema.parse(_:LexPermissionSyntax)`
+overload, `IncludeScope.expand`, `isParentAuthorityOf`, `isAllowed`,
+`lexSyntax(for:)`.
+
+The four behaviours that are not optional — implement any three and no upstream
+vector passes, while two upstream *rejections* invert into grants:
+`spaceType`→`type` remap; reserved-key filtering; the scalar-vs-array tri-state;
+`ParamValue = string | number | boolean`.
+
+Vectors: the `include-scope.test.ts` `describe` blocks named in §5.7.6, plus the
+four written-out vectors — especially **scalar-where-array** (`:494-508` → `[]`)
+and **one-valid-one-invalid-authority** (`:558-578` → a one-element array, the
+only vector proving the authority gate is per-entry rather than per-set).
+
+`isParentAuthorityOf` must use **UTF-8 byte units throughout** — the first draft
+mixed `Character` distance with byte count. It is `public` and reachable with
+unvalidated input, and upstream calls it "a security feature."
+
+### P2-B — MST membership proof walker · SwanPublicRepository
+
+The single-key walker above, plus the **proof-CAR test fixture builder** the
+whole of P2-G depends on: build a signed commit, an MST path, and a CAR — and
+the adversarial variants (two roots, cross-repo, bad signature, wrong key,
+record-present-but-unlinked, `$type` mismatch).
+
+The fixture builder is the reason this lane is not small. Without it P2-G cannot
+assert anything, and P2-G contains the single most important vector in Phase 2.
+
+### P2-C — did:web authority resolution · SwanInterop
+
+Lift the `did:plc:` hard-requirement for lexicon-authority resolution. Extract the
+`atproto` verification method **and** the `#atproto_pds` service endpoint from a
+`did:web` document. Add `allowedLexiconAuthorityDIDMethods` as operator policy
+(default `[.plc, .web]`, §9-D22) — PLC-only is a knob, not the protocol.
+
+Do **not** tie the PDS host to the DID host: `extractPdsUrl` is just
+`new URL(service.serviceEndpoint)` and nothing constrains its host. A `did:web`
+authority whose PDS lives on another host is legitimate and is exactly the
+independence the proof chain exists for.
+
+### P2-D — `fetchBytes` · SwanOAuth
+
+A bytes-returning sibling to `fetchJSON` through the same policy object, with an
+explicit 256 KiB cap at this call site treated as an **anti-DoS control on
+MST-walk and signature work**, not as a document-size preference.
+
+### P2-E — resolver orchestrator + cache · **SwanInterop** (corrected)
+
+> **Module correction.** This lane originally said "SwanOAuth + SwanSQLite".
+> That was impossible: `Package.swift` has **SwanInterop → SwanOAuth**, not the
+> reverse, and `PermissionedDataPublicRepositoryCommitVerifier` — named by the
+> fixed `SwanLexiconAuthority` interface — is defined in
+> `SwanInterop/PublicRepositoryCARReplication.swift:282`. P2-E in SwanOAuth
+> could never have consumed P2-C. SwanInterop already depends on SwanOAuth,
+> SwanSQLite, SwanPublicRepository and SwanCore, so P2-E moves there with **zero
+> `Package.swift` change**. Found by P2-C, not by me — and it is the second time
+> this plan-level mistake has been made (Phase 1 put `SwanScopePermissions` in
+> SwanOAuth and hit the same cycle). Check `Package.swift` before assigning a
+> module, not the module's apparent subject matter.
+
+All 15 steps including all 6 proofs. DNS TXT `_lexicon.<authority>` reusing
+`ATHandleDNSResolving.txtRecords(name:)` (new call site, **not** new DNS
+plumbing) with **exactly-one** `did=` selection. The `oauth_lexicon_documents`
+table exactly as specified — `document` **NULLABLE**, because a negative-cache
+row is the mechanism that stops the resolver being hammered for a known-broken
+NSID.
+
+`.unresolvable` has **constrained reachability**: only the enumerated
+resolver-class failures. Everything else — programming error, cancellation,
+storage fault — throws and propagates. Widening it to catch-all converts a bug
+into a cached "this lexicon doesn't exist" for five minutes.
+
+Two caches, not one: domain-keyed for steps 1-6, document-keyed for steps 7-15.
+Cache the DID document, not the proof result — the proof must be re-verified
+against whatever key the document currently names.
+
+### P2-F — wiring · SwanOAuth + SwanHTTP
+
+PAR: every `include:` must resolve or the request is `invalid_scope`; expand
+before extracting space types for consent display.
+
+Token mint, in order: (a) `include:`→concrete; (b) `expandSpaceCollections`;
+(c) `resolveSpaceSelfAuthority`. **(b) is not include-specific** — it iterates
+every scope in the token, and bulleted.app's `space:` scope contains no
+`include:` and is affected.
+
+(b) **throws** when the declaration cannot be resolved, deliberately: passing the
+bare grant through would let an unreachable or hostile authority silently *widen*
+what it covers. An empty declared collection list is **not** an error — the bare
+grant passes through. `type=*` is skipped.
+
+Record the **Phase-1 divergence** this closes: with no materialisation step, a
+plain `space:app.bulleted.space` token can never write. §7.4 Stage 6 currently
+pins that as upstream conformance; it is not — it is a divergence, and it is why
+bulleted.app authorizes and then cannot create a record.
+
+Consent must render an empty expansion with §5.7.2's canonical string naming the
+NSID — a `.warn` reaches an operator, and the person authorizing never sees it.
+
+### P2-G — resolver negative vectors · SwanOAuthTests
+
+Every row of §5.7.6's resolver table. These are **negative** vectors by design: a
+resolver that passes every happy-path test and skips proof verification is worse
+than no resolver, because it launders an attacker-controlled response into a
+signed-looking grant.
+
+**`cross-repo substitution` is the single most important vector in Phase 2** — a
+correctly self-signed commit from the attacker's own repo, presented as this
+DID's data. It is the one a proof-free implementation passes every other test
+while failing.
+
+Plus: negative caching performs **no** network I/O and no MST walk on the second
+attempt within 5 minutes; and a `did:web` authority resolves.
+
+---
+
+## Errata against the sealed spec
+
+Two contradictions found by implementation, each verified against upstream source
+rather than adjudicated from the spec's own prose. Recorded here; **no sealed
+spec text has been edited** — that is the spec owner's call.
+
+### E1 — §5.7.6's per-entry authority vector is wrong on both halves
+
+§5.7.6 describes `include-scope.test.ts:558-578` as *"a two-entry repo set"*
+yielding *"a **one**-element array holding only the in-namespace grant"*, and
+calls it *"the only vector proving the authority gate is per-entry, not
+per-set."* Read at
+`.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354/…/include-scope.test.ts:557-574`,
+it is a **one-entry** set whose `collection` array holds
+`['com.example.calendar.event', 'app.bsky.feed.post']`, inside a
+`describe('rejects')` block, expecting **`[]`**. `isAllowedPermission` applies
+`.every` over the entry's own collections (`include-scope.ts:125`), so the entry
+drops whole.
+
+The consequence matters more than the miscitation: **the fixture cannot witness
+the property §5.7.6 assigns it.** P2-A proved this by mutation — replacing the
+per-entry gate with a per-set gate leaves the upstream-verbatim assertion
+*passing*; only Swan-authored vectors fail. A per-set implementation passes every
+upstream include vector.
+
+**Resolution taken:** implement upstream-verbatim (`[]`), and add Swan-authored
+vectors that genuinely witness per-entry behaviour — a two-entry set (one wholly
+in-namespace, one wholly foreign) → one surviving grant, plus a five-entry mixed
+set where a blob drop, a gate-2 parse failure and a wildcard-space drop coexist
+with two survivors. Those are what fail under a per-set gate.
+
+### E2 — §5.7.1's `include:` `aud` contradicts its own citation
+
+§5.7.1 validates `IncludeScope`'s `aud` as `{ $0 == "*" || isValidAtprotoDIDRefAbsolute($0) }`
+while its comment claims the *"same `@atproto/did` predicate as `rpc:`'s `aud`"*
+and cites `include-scope.ts:184-188`. Upstream at `:183-187` is
+`validate: isAtprotoDidRefAbsolute` — **no wildcard**; the declared type at `:30`
+is `undefined | AtprotoDidRefAbsolute`. Swan's `IncludeScope.swift:46`
+(`audRaw == "*" ? .any : .service(audRaw)`) accepts a scope upstream rejects at
+parse.
+
+This is a divergence in the **accepting** direction — Swan would admit and
+persist a grant no conformant AS would issue. Not pinned by the golden corpus
+(4 include entries, none with a wildcard `aud`).
+
+**Currently fail-closed, so not urgent:** P2-A's `inheritAud` splice requires a
+concrete service DID-ref, so `.any` does not splice and the entry drops —
+upstream's reachable behaviour. **Open decision:** whether §5.7.1 should lose the
+`"*"`. It is Phase-1 wire grammar.
+
+### E3 — §5.7.4's `LexiconSpace` transcription drops a field
+
+The citation is exact but the Swift block beneath it is lossy. Upstream
+`lib/lexicon.ts:23-29`:
+
+```ts
+export type LexiconSpace = {
+  readonly type: 'space'
+  readonly name: string
+  readonly 'name:lang'?: LangMap      // <- omitted by §5.7.4
+  readonly collections: readonly string[]
+  readonly description?: string
+}
+```
+
+Harmless as implemented — a synthesized `Decodable` keyed container ignores keys
+it has no case for, so a localised space document still decodes — but that is a
+property of the mechanism, not of anyone's intent, and a later "add strict
+unknown-key rejection" change would silently start refusing legitimate localised
+authorities. Now pinned by `testSpaceDocumentCarryingNameLangStillDecodes` and
+its sibling `testPermissionSetCarryingTitleLangStillDecodes`.
+
+Found by P2-E only *after* correcting a wrong-tree reading — see the tree table
+above; the same lane first concluded `LexiconSpace` had no upstream backing at
+all, from a checkout whose `lexicon.ts` is 21 lines against the pinned tree's 29.
+
+## P2-G findings — why the adversarial lane was kept separate
+
+P2-E reported every §5.7.6 vector covered by its own tests. That was true and
+still left two things only an independent attacker found.
+
+### G1 — cancellation laundered into `.unresolvable` (real, fixed)
+
+`.unresolvable` reachability was designed to be a **type fact**: internal steps
+throw a closed `SwanLexiconResolverFailure`, and only that is converted.
+Cancellation was supposed to propagate. It didn't, at a measured **5 of 10 runs**.
+
+The taxonomy was defeated from **underneath**: `OAuthRemoteDocumentFetcher`
+re-wraps every non-`SwanError` transport throw as
+`SwanError.unavailable("OAuth remote fetch failed")` (`OAuthRemoteFetch.swift:674-677`),
+so a `CancellationError` arrives indistinguishable from a genuine fetch failure.
+The only bare `CancellationError` came from the deadline's sleeper task, making
+visibility a race on `group.next()`.
+
+Impact, which is what makes it a soundness bug rather than hygiene: `resolveAll`
+calls `group.cancelAll()` on the 10 s group deadline, so **one slow authority
+negative-caches its innocent siblings for five minutes**, and the next request
+answers `.unresolvable` for them with no I/O. An attacker choosing which of a
+user's permissions survive — arriving through the *cache* rather than the drop
+path §5.7.4 guards.
+
+Fix: `classify(_:as:)` — reject `CancellationError`, then
+`try Task.checkCancellation()`, then classify — at all six resolution-path
+catch-alls. **The `checkCancellation()` line is the load-bearing one**: it
+re-detects cancellation even after the error was laundered into a `SwanError`.
+Vector loops 20× so a regression cannot hide in the coin flip.
+
+**Transferable rule:** an error-taxonomy guarantee at layer N is void if layer
+N−1 re-wraps errors. Catching a specific error type is not enough when something
+below you normalises throws — re-check the *state* (`Task.isCancelled`), not just
+the error identity.
+
+### G2 — a vacuous cache-integrity test (test-only)
+
+`testACachedRowWhoseBytesDoNotHashToItsVerifiedCIDIsNotServed` substituted
+`Data(repeating: 0xA1, count: 8)`, which fails **both** the CID re-hash and
+`decodeDocument` — so the re-hash was never what refused it. Deleting the CID
+comparison left it passing. Replaced with a second **valid** document for the
+same NSID declaring a broader `collection: ["*"]` grant, so only the CID
+comparison can tell it is not the proved bytes.
+
+Fifth test in this program that passed while proving less than it claimed. All
+five were found by someone reading code they did not write.
+
+### G3 — step-10 isolation (strengthened)
+
+P2-E's cross-repo vector wired the authority to the *document* key, so two checks
+rejected the CAR and it could not show `commit.did == did` was load-bearing
+alone. P2-G's wires the authority to the *substitute commit's own* key so the
+signature verifies; deleting step 10 then makes the resolver **resolve a document
+from the attacker's repo**.
+
+### Open, minor
+
+- `.carRootCountInvalid` is the catch-all name for every `parseIncrementally`
+  throw (≥6 framing faults), not just a bad root count. Sound today; a future
+  vector must not read more into the name.
+- The authority cache key is case-sensitive while DNS is not, so
+  `com.Example.foo.auth` takes a second slot for the same DNS name. Bounded by a
+  256-entry cache and the per-request caps; costs duplicated DNS work, never a
+  weakened trust decision.
+
+## Known flake — not a regression
+
+`SwanOAuthTests.NIOPeerPinnedOAuthPostTransportTests.testPostTransportRejectsResponseBeyondConfiguredBound`
+fails intermittently **only under full-suite load**, with `"I/O on closed channel"`
+at `NIOPeerPinnedOAuthPostTransport.swift:228`.
+
+Evidence it is a flake rather than a Phase-2 regression:
+- the file is untouched by **all six** Phase-2 commits (checked per-commit by name);
+- it passes 3/3 in isolation in **6 ms**, against **2.677 s** in the failing
+  full-suite run — the duration gap shows it took a timeout path under contention;
+- a second unfiltered full-suite run is 1810/0, exit 0.
+
+Do not "fix" it by loosening the bound assertion; the bound is the thing under
+test. If it becomes frequent, the fix is in the test's channel lifecycle.
+
+## Accepted divergences from upstream
+
+Both are **fail-closed** — they refuse documents upstream would accept, never the
+reverse — and both are documented in-code with a pinning test. Recorded here so
+they are visible rather than buried in a lane report.
+
+| divergence | upstream | Swan | why accepted |
+|---|---|---|---|
+| **Multikey-only verification methods** | also accepts `EcdsaSecp256r1VerificationKey2019` / `EcdsaSecp256k1VerificationKey2019`, whose `publicKeyMultibase` carries *raw* key bytes with no multicodec prefix and takes its curve from `type` | Multikey only | supporting the legacy forms needs a bare base58 decoder plus a second raw-point grammar, and `Base58BTC` is deliberately `private` to `SwanAccounts/PLCOperation.swift` so curve/point-encoding proof stays in one place. Every atproto producer in reach emits Multikey. Pinned by `testWebAuthorityWithLegacyVerificationMethodTypeIsRejected` |
+| **Exactly-one `#atproto` / `#atproto_pds`** | `Array.find` (first match wins) | refuses a document declaring either twice; also requires https, non-empty host, no embedded credentials on the PDS endpoint, where upstream requires only `URL.canParse` | matches `SwanServiceEndpointResolver`'s existing rule for services |
+
+**Open, not blocking:** full legacy-verification-method parity is available by
+making `Base58BTC` public. It is an interop-availability question (a legitimate
+authority publishing a legacy key type would fail to resolve → `invalid_scope`),
+not a security one. Decide before Phase 2 closes.
+
+## Running the golden-corpus gate — and a durability warning
+
+```bash
+SWAN_UPSTREAM_ATPROTO=/Users/joshlacalamito/Developer/Catbird+Petrel/Swan/.interop-cache/atproto-bddc99fb24c34b4078b9bf65837283f37b49ab66 \
+  Scripts/upstream-scope-goldens/verify-corpus-zero-diff.sh
+```
+
+**Resolved:** the `bddc99fb` tree now lives at that path — in the **main Swan
+checkout's** `.interop-cache/`, not a workspace's, following the existing
+`atproto-<commit>` convention beside `atproto-3f6c96d5…`. `.interop-cache/` is
+gitignored (`.gitignore:6`), so this adds 37 MB of untracked cache and touches no
+VCS state. Verified from that path: zero diff. It previously existed only in an
+ephemeral job scratch directory.
+
+Note `interop/fetch-reference.sh` pins `3f6c96d5…`, a *different* commit for a
+different purpose. Do not repoint it at `bddc99fb`; the two trees serve different
+gates and both are needed.
+
+Without `SWAN_UPSTREAM_ATPROTO` the corpus-integrity test **silently skips** —
+it does not fail — so a green suite says nothing about corpus/upstream agreement.
+
+**Only one tree on this machine is `bddc99fb`**, and it currently sits in an
+ephemeral job scratch directory that is deleted with the job. Of the four other
+`atproto` checkouts present:
+
+| tree | verdict |
+|---|---|
+| `.interop-cache/atproto-3f6c96d5…` | has `space-permission.ts`, but is the **wrong commit** — needs 80 type-only-import rewrites and produces six different `values` rows |
+| `Catbird+Petrel/atproto` | no `space-permission.ts` — predates the space plane |
+| `Catbird+Petrel/Petrel/atproto` | no `space-permission.ts`; also spells the `include:` `aud` rule as `isAtprotoAudience` rather than `isAtprotoDidRefAbsolute` |
+| `Developer/atproto-oauth-debug` | unverified |
+
+**Action needed:** move a `bddc99fb` checkout somewhere durable, or the gate
+becomes unrunnable and the corpus drifts undetected. The `space-permission.ts`
+presence check is the cheap positive control — a tree without it is not
+`bddc99fb`, and every `space:` vector generated from it would be *wrong rather
+than absent*.
+
+Note the two predicate spellings are not a contradiction: `isAtprotoAudience` is
+`` `${AtprotoDid}#${string}` `` — DID plus exactly one fragment. **Neither
+predicate accepts `*`**, so E2 holds across every tree checked.
+
+## P2-F findings — wiring
+
+### F1 — §7.4 Stage 6 check 3 was already labelled a divergence; nothing to re-label
+
+P2-F was briefed to re-label §7.4 Stage 6 check 3, which "currently pins [a bare
+`space:` grant having no write targets] as upstream conformance". Read at
+`docs/superpowers/specs/2026-08-14-oauth-permission-scopes-design.md:5661-5670`,
+it already says, in bold, *"Assert this as a Phase-1 DIVERGENCE, not as
+conformance"*, names `expandSpaceCollections` and `lexicon-manager.ts:74-95` as
+what a conformant AS runs, and even prescribes the test name. The test
+(`RemoteClientPermissionedScopeE2ETests.testBareSpaceGrantHasNoWriteTargetsUntilPhase2`)
+carries the same framing in its own doc comment and assertion message.
+
+The instruction was written against an earlier state of the spec and the fix had
+already landed with §5.7.5 itself. **No spec text was edited.** What P2-F added
+instead is the *closing* half: that test's doc comment now names what closes the
+divergence (a configured resolver), and points at the two unit vectors that pin
+both sides — `testABareGrantIsWritableAfterMaterialisation` (with a resolver: the
+same grant comes out writable) and
+`testWithoutAResolverBothTransformationsArePhase1PassThroughs` (without one: the
+E2E assertion restated at unit level, so the two cannot drift).
+
+### F2 — refresh does not re-derive the token scope (divergence, NOT closed by this lane)
+
+> **Status update (2026-08-14, P2-H): CLOSED.** Refresh now re-derives the
+> effective scope from `scopes_requested ?? scopes` before the rotation, writing
+> the rewritten grant inside the rotation transaction after the `used_at` CAS.
+> A re-derivation failure fails the refresh **without consuming the refresh
+> token** (`invalid_request`). One deliberate residual: **families minted before
+> P2-H have no requested-side provenance (`scope_provenance_requested` is NULL)
+> and stay frozen at their mint-time grant for the rest of their ≤14-day life.**
+> A frozen legacy family is expected behaviour during that window, not this
+> defect recurring. Everything below is the pre-P2-H analysis, kept for the
+> record.
+
+§5.7.5 names the second call site "**token mint / refresh**", and §5.7.4's
+24-hour hard-expiry rationale argues explicitly from *"the token scope is
+re-derived on every refresh (`token-manager.ts:260-263`)"*. **Swan's refresh does
+not re-derive anything.** `DurableOAuthTokenService.redeemRefreshForClient`
+returns `family.binding.scopes` — the set frozen at mint — and
+`redeemRefresh`/`controlStore.redeemRefreshToken` rotate token digests without
+touching the binding. Verified by reading both, not inferred.
+
+Two consequences worth stating separately:
+
+1. The hard expiry does not do the job §5.7.4 assigns it. Its stated purpose is
+   that a permission set **narrowed** upstream stops minting the wider grant;
+   with no re-derivation, a 14-day refresh family keeps the mint-time grant for
+   its whole life regardless of what the authority now declares. The expiry still
+   bounds *serving a stale cached document at the next mint*, which is a
+   different and smaller property.
+2. It is not a small addition. Re-deriving at refresh means writing a new scope
+   set into an existing family row, and `redeemRefreshToken` is a fixed durable
+   rotation transaction that takes token digests and nothing else. That is a
+   control-store change, not a call-site change, so P2-F did not absorb it —
+   scope for this lane is the two call sites §5.7.5 enumerates.
+
+### F3 — resolution is opt-in, and a `nil` resolver is a documented pass-through
+
+`--enable-lexicon-resolution` (off by default) is what constructs a
+`SwanLexiconResolver` in the composition root. With no resolver, **both**
+transformations pass through: `include:` persists and grants nothing (§9-D4's
+stated cost, still pinned by
+`testIncludeScopesAuthorizeSuccessfullyThenGrantNothing`) and a bare
+`space:<type>` materialises no write targets (F1).
+
+The alternative — refusing an `include:` outright when no resolver is configured
+— was considered and rejected: it converts an operator's *absence* of
+configuration into a hard rejection of clients that authorize successfully today,
+which is an outage rather than a correctness fix. The divergence is recorded in
+three places (the flag's help text, `OAuthLexiconScopeResolution`'s doc comment,
+and the two tests above) rather than traded for one.
+
+Opt-in rather than default-on for two reasons that are not preference: turning it
+on adds DNS + a DID-document read + a CAR fetch to the PAR path, and it changes
+what an *already-registered* scope string mints. Neither is a change to make on
+an operator's behalf.
+
+### F4 — the consent payload is re-derived, not carried
+
+§5.7.5 describes PAR/authorize as one call site doing both jobs, which is true
+upstream because `oauth-provider.ts:744-762` builds the consent payload in the
+same request. In Swan the consent page renders in a **different HTTP request**
+(`POST /oauth/authorize`, after login) than PAR. P2-F therefore runs the gate at
+PAR and re-derives the expansion at consent render, which costs one document-cache
+read — the row was proved seconds earlier, well inside the 5-minute refresh
+threshold, and the PAR lifetime is 90 s.
+
+The alternative was persisting a rendered payload into the PAR row. That was
+rejected because §6.7 defines the binding's scope columns as the client's own
+requested bytes; a display artifact in the durable binding would be exactly the
+kind of derived-value-in-storage §9-D23 spends its length arguing against.
+
+## Completion gate
+
+Phase 2 is not done until all of these are green **and** independently measured
+(three `swift test` invocations in one shell command contaminate each other —
+run them separately):
+
+- `xcrun --toolchain XcodeDefault swift build --product swan`
+- `swift build --build-tests`
+- the §7.6 narrow repeated scope-suite gate
+- the wider SwanSpaces/SwanSQLite gate
+- the bulleted.app E2E — which for the first time should be able to **write**
+- golden-corpus regenerate-and-zero-diff
+- every §5.7.6 resolver negative vector, cross-repo substitution named explicitly
+- D23 provenance and D20 refresh-survival still green (Phase 1 regressions)

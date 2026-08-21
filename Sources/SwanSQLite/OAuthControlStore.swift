@@ -185,7 +185,7 @@ public enum SQLiteControlDatabaseOpenMode: Sendable, Equatable {
 /// records deliberately never flow through this type. The actor serializes one
 /// process while `BEGIN IMMEDIATE` makes consume/rotate/revoke semantics hold
 /// across independently reopened Swan processes as well.
-public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
+public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantStore, AccountControlStore,
     AccountControlKeyRotationStore,
     SpaceDelegationReplayStore, SpaceClientAttestationReplayStore
 {
@@ -666,16 +666,19 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                     """
                     INSERT INTO oauth_control_par_requests(
                         request_digest, issuer, client_id, redirect_uri, scopes,
+                        scope_provenance,
                         dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
                         client_assertion_jkt, refresh_token_allowed, state, state_digest,
                         code_challenge_method, code_challenge_s256,
                         expires_at, consumed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                     """,
                     [
                         blob(request.requestDigest), .text(request.binding.issuer),
                         .text(request.binding.clientID), .text(request.binding.redirectURI),
-                        blob(scopes), optionalText(request.binding.dpopJKT),
+                        blob(scopes),
+                        try encodeProvenance(request.binding.scopeProvenance),
+                        optionalText(request.binding.dpopJKT),
                         optionalText(request.binding.confidentialClientKey?.keyID),
                         optionalText(request.binding.confidentialClientKey?.algorithm),
                         optionalText(request.binding.confidentialClientKey?.keyThumbprint),
@@ -709,7 +712,8 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 try await purgeExpiredLocked(now: now)
                 let rows = try await connection.query(
                     """
-                    SELECT issuer, client_id, redirect_uri, scopes, dpop_jkt,
+                    SELECT issuer, client_id, redirect_uri, scopes,
+                           scope_provenance, dpop_jkt,
                            client_assertion_key_id, client_assertion_algorithm,
                            client_assertion_jkt, refresh_token_allowed, state, state_digest,
                            code_challenge_method, code_challenge_s256,
@@ -721,7 +725,11 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 )
                 guard let row = rows.first else { throw OAuthControlStoreError.notFound }
                 let request = try decodePAR(row, digest: requestDigest)
-                guard request.binding == binding else {
+                // Identity, not whole-value equality: the caller may rebuild
+                // this binding from a fresh session rather than round-trip it
+                // through storage, and provenance is derived from the scope set
+                // that is compared here anyway (SwanStorage `matchesIdentity`).
+                guard request.binding.matchesIdentity(of: binding) else {
                     throw OAuthControlStoreError.bindingMismatch
                 }
                 guard request.expiresAt > now else { throw OAuthControlStoreError.expired }
@@ -751,7 +759,8 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 try await purgeExpiredLocked(now: now)
                 let rows = try await connection.query(
                     """
-                    SELECT issuer, client_id, redirect_uri, scopes, dpop_jkt,
+                    SELECT issuer, client_id, redirect_uri, scopes,
+                           scope_provenance, dpop_jkt,
                            client_assertion_key_id, client_assertion_algorithm,
                            client_assertion_jkt, refresh_token_allowed, state, state_digest,
                            code_challenge_method, code_challenge_s256,
@@ -798,9 +807,36 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         )
     }
 
+    /// Account-program authorization-code issuance consumes the signed
+    /// browser grant inside the same SQLite transaction as the family/code
+    /// insert. A factor revision change therefore invalidates the grant before
+    /// any OAuth bearer material can be published.
+    public func storeAuthorizationCode(
+        _ code: OAuthAuthorizationCode,
+        requiringActiveSubjectRevisionMicroseconds revision: Int64,
+        authorizationGrantDigest: Data,
+        authorizationContext: AccountAuthorizationContext,
+        now: Date = Date()
+    ) async throws {
+        guard authorizationGrantDigest.count == 32 else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        guard revision >= 0, revision <= Int64(Int.max) else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        try await storeAuthorizationCode(
+            code,
+            activeSubjectRevisionMicroseconds: Int(revision),
+            authorizationGrantDigest: authorizationGrantDigest,
+            authorizationContext: authorizationContext,
+            now: now)
+    }
+
     private func storeAuthorizationCode(
         _ code: OAuthAuthorizationCode,
         activeSubjectRevisionMicroseconds: Int?,
+        authorizationGrantDigest: Data? = nil,
+        authorizationContext: AccountAuthorizationContext? = nil,
         now: Date
     ) async throws {
         try validate(code: code, now: now)
@@ -813,6 +849,15 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         try await withConnectionGate {
             try await transaction {
                 try await purgeExpiredLocked(now: now)
+                // Account-program authorization grants are provisioned by the
+                // additive MFA migration.  OAuth code issuance is also a
+                // valid first touch for a current-main database, so make the
+                // additive tables available inside the same connection gate
+                // before consuming the grant.  The grant consume and code /
+                // family inserts remain one transaction below.
+                if authorizationGrantDigest != nil {
+                    try await ensureTask7DurableTables()
+                }
                 if let activeSubjectRevisionMicroseconds {
                     let rows = try await connection.query(
                         """
@@ -829,7 +874,17 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                         throw OAuthControlStoreError.bindingMismatch
                     }
                 }
-                try await insertFamily(family)
+                if let authorizationGrantDigest {
+                    guard let authorizationContext else {
+                        throw OAuthControlStoreError.bindingMismatch
+                    }
+                    _ = try await consumeAuthorizationGrantLocked(
+                        grantDigest: authorizationGrantDigest,
+                        accountDID: code.subject,
+                        context: authorizationContext,
+                        now: now)
+                }
+                try await insertFamily(family, now: now)
                 try await requireInsertionCapacity(
                     table: "oauth_control_authorization_codes",
                     keyColumn: "code_digest",
@@ -954,7 +1009,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         try await withConnectionGate {
             try await transaction {
                 try await purgeExpiredLocked(now: now)
-                try await insertFamily(family)
+                try await insertFamily(family, now: now)
                 try await insertTokenPair(tokens)
             }
         }
@@ -972,9 +1027,11 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 let rows = try await connection.query(
                     """
                     SELECT f.family_id, f.subject, f.issuer, f.client_id,
-                           f.redirect_uri, f.scopes, f.dpop_jkt,
+                           f.redirect_uri, f.scopes, f.scopes_requested,
+                           f.scope_provenance, f.scope_provenance_requested, f.dpop_jkt,
                            f.client_assertion_key_id, f.client_assertion_algorithm,
                            f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at, f.revoked_at,
+                           f.created_at,
                            a.expires_at AS token_expires_at
                     FROM oauth_control_access_tokens a
                     JOIN oauth_control_token_families f ON f.family_id = a.family_id
@@ -1042,9 +1099,11 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 let rows = try await connection.query(
                     """
                     SELECT f.family_id, f.subject, f.issuer, f.client_id,
-                           f.redirect_uri, f.scopes, f.dpop_jkt,
+                           f.redirect_uri, f.scopes, f.scopes_requested,
+                           f.scope_provenance, f.scope_provenance_requested, f.dpop_jkt,
                            f.client_assertion_key_id, f.client_assertion_algorithm,
                            f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at, f.revoked_at,
+                           f.created_at,
                            t.expires_at AS token_expires_at
                     FROM \(table) t
                     JOIN oauth_control_token_families f ON f.family_id = t.family_id
@@ -1066,6 +1125,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     public func redeemRefreshToken(
         refreshTokenDigest: Data,
         replacement: OAuthIssuedTokenDigests,
+        rewrittenGrant: OAuthRefreshedGrant? = nil,
         requireActiveSubject: Bool,
         now: Date = Date()
     ) async throws {
@@ -1100,6 +1160,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                     [.integer(try timestamp(now)), blob(refreshTokenDigest)]
                 )
                 try await insertTokenPair(replacement)
+                try await rewriteGrant(rewrittenGrant, of: family)
                 return false
             }
         }
@@ -1137,6 +1198,50 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 try await purgeExpiredLocked(now: now)
                 try await revokeFamily(familyID, now: now)
             }
+        }
+    }
+
+    public func revokeTokenFamily(
+        familyID: UUID,
+        subject: String,
+        now: Date = Date()
+    ) async throws {
+        guard !subject.isEmpty else { throw OAuthControlStoreError.invalidInput }
+        try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                _ = try await connection.query(
+                    """
+                    UPDATE oauth_control_token_families
+                    SET revoked_at = COALESCE(revoked_at, ?)
+                    WHERE family_id = ? AND subject = ?
+                    """,
+                    [.integer(try timestamp(now)), .text(familyID.uuidString), .text(subject)]
+                )
+            }
+        }
+    }
+
+    public func tokenFamilies(subject: String, now: Date = Date()) async throws -> [OAuthTokenFamily] {
+        guard !subject.isEmpty else { throw OAuthControlStoreError.invalidInput }
+        let instant = try timestamp(now)
+        return try await withConnectionGate {
+            let rows = try await connection.query(
+                """
+                SELECT family_id, subject, issuer, client_id, redirect_uri, scopes,
+                       scopes_requested, scope_provenance, scope_provenance_requested,
+                       dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
+                       client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at,
+                       created_at
+                FROM oauth_control_token_families
+                WHERE subject = ?
+                  AND revoked_at IS NULL
+                  AND expires_at > ?
+                ORDER BY created_at, family_id
+                """,
+                [.text(subject), .integer(instant)]
+            )
+            return try rows.map(decodeFamily)
         }
     }
 
@@ -1288,7 +1393,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
 
     // MARK: Transactional helpers
 
-    private func requireInsertionCapacity(
+    func requireInsertionCapacity(
         table: String,
         keyColumn: String,
         key: SQLiteData,
@@ -1495,6 +1600,55 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 table: "oauth_control_par_requests",
                 column: "refresh_token_allowed",
                 definition: "INTEGER NOT NULL DEFAULT 1 CHECK(refresh_token_allowed IN (0, 1))"
+            )
+            // Additive `created_at` for the portal connected-apps projection.
+            // Existing families (NULL) fall back to their expiry; new inserts
+            // always write the column.
+            try await addColumnIfMissing(
+                table: "oauth_control_token_families",
+                column: "created_at",
+                definition: "INTEGER"
+            )
+            _ = try await connection.query(
+                "UPDATE oauth_control_token_families SET created_at = expires_at WHERE created_at IS NULL"
+            )
+            // Additive schema, but review it as an AUTHORIZATION change: unlike
+            // `dpop_jkt` / `client_assertion_*`, which are inert until a binding
+            // is presented, `scopes_requested` sits on the refresh path from the
+            // moment the first resolved grant is written (spec §6.7). NULL means
+            // "requested == scopes", never "unknown" — which is what makes
+            // `family.scopesRequested ?? family.scopes` total for every
+            // pre-migration row (§9-D20).
+            try await addColumnIfMissing(
+                table: "oauth_control_token_families",
+                column: "scopes_requested",
+                definition: "BLOB"
+            )
+            // Provenance is durable because a serialised scope string is a lossy
+            // projection in both directions (§9-D23): resolving `self` invents
+            // statedness, canonical serialisation destroys it.
+            try await addColumnIfMissing(
+                table: "oauth_control_token_families",
+                column: "scope_provenance",
+                definition: "BLOB"
+            )
+            try await addColumnIfMissing(
+                table: "oauth_control_par_requests",
+                column: "scope_provenance",
+                definition: "BLOB"
+            )
+            // Additive, and on the same authorization path as `scopes_requested`
+            // rather than beside it: refresh re-derives the grant from the
+            // requested set, and this is the provenance that derivation carries
+            // forward (§5.7.5). NULL beside a NON-NULL `scopes_requested` is the
+            // one shape that means "written before this column existed", and
+            // refresh reads it as "leave this family's grant frozen" — not as
+            // "the client stated nothing", which would close both §9-D23 fences
+            // on a live grant.
+            try await addColumnIfMissing(
+                table: "oauth_control_token_families",
+                column: "scope_provenance_requested",
+                definition: "BLOB"
             )
             try await addColumnIfMissing(
                 table: "oauth_control_client_metadata_freshness",
@@ -1904,7 +2058,13 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         }
     }
 
-    private func insertFamily(_ family: OAuthTokenFamily) async throws {
+    private func insertFamily(_ family: OAuthTokenFamily, now: Date) async throws {
+        // Every caller of this is a MINT — `storeAuthorizationCode` and
+        // `issueTokenPair` — so stage G's strict half belongs here. Rotation
+        // now DOES rewrite a family row (`rewriteGrant`), and deliberately does
+        // not repeat this gate: see that method for why re-parsing on a rewrite
+        // would lock a live session out.
+        try validateNewlyMintedScopes(family.binding.scopes)
         try await requireInsertionCapacity(
             table: "oauth_control_token_families",
             keyColumn: "family_id",
@@ -1915,14 +2075,24 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
             """
             INSERT INTO oauth_control_token_families(
                 family_id, subject, issuer, client_id, redirect_uri, scopes,
+                scopes_requested, scope_provenance, scope_provenance_requested,
                 dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
-                client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 .text(family.familyID.uuidString), .text(family.subject),
                 .text(family.binding.issuer), .text(family.binding.clientID),
                 .text(family.binding.redirectURI), blob(try encodeScopes(family.binding.scopes)),
+                try encodeOptionalScopes(family.binding.scopesRequested),
+                try encodeProvenance(family.binding.scopeProvenance),
+                // `encodePresentProvenance`, not `encodeProvenance`: an EMPTY
+                // requested-side map is a real answer ("the client stated
+                // nothing anywhere") and must not collapse to NULL, which on
+                // this column means "written by an older binary" and freezes the
+                // grant on every future refresh.
+                try encodePresentProvenance(family.binding.scopeProvenanceRequested),
                 optionalText(family.binding.dpopJKT),
                 optionalText(family.binding.confidentialClientKey?.keyID),
                 optionalText(family.binding.confidentialClientKey?.algorithm),
@@ -1930,6 +2100,53 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 .integer(family.binding.refreshTokenAllowed ? 1 : 0),
                 .integer(try timestamp(family.expiresAt)),
                 family.revokedAt.map { try? timestamp($0) }.flatMap { $0 }.map(SQLiteData.integer) ?? .null,
+                .integer(try timestamp(family.createdAt ?? now)),
+            ]
+        )
+    }
+
+    /// Writes a refresh-time re-derived grant into its family row.
+    ///
+    /// **Called only from inside the rotation transaction**, after the `used_at`
+    /// CAS has been won. That placement is the whole atomicity argument: a
+    /// concurrent redemption of the same token either loses the CAS — in which
+    /// case it revokes the family and never reaches here — or has not started,
+    /// because `BEGIN IMMEDIATE` serialises the two. There is no interleaving in
+    /// which one refresh's digests pair with another's scopes.
+    ///
+    /// `nil`, or a grant equal to the stored one, writes nothing at all. A
+    /// resolver that keeps answering the same document is the common case, and
+    /// re-writing an identical row on every rotation is pure churn.
+    ///
+    /// The scopes are validated as `validScope` (via `encodeScopes`) and for the
+    /// base-scope floor, but **deliberately not re-parsed**. Stage G's strict
+    /// half belongs to mint: a live family may legitimately hold a scope a newer
+    /// grammar cannot parse, and rejecting one here would lock that session out
+    /// permanently over a scope the client is not using (§9-D5, §7.5 item 4).
+    /// The floor check is not optional in the same way — a set that fails it
+    /// would decode as `malformedRecord` on the very next read, so refusing the
+    /// rotation is strictly better than writing a row nothing can load.
+    private func rewriteGrant(
+        _ grant: OAuthRefreshedGrant?,
+        of family: OAuthTokenFamily
+    ) async throws {
+        guard let grant,
+              grant.scopes != family.binding.scopes
+                  || grant.scopeProvenance != (family.binding.scopeProvenance ?? OAuthScopeProvenance())
+        else { return }
+        guard hasATProtocolResourceScope(grant.scopes) else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        _ = try await connection.query(
+            """
+            UPDATE oauth_control_token_families
+            SET scopes = ?, scope_provenance = ?
+            WHERE family_id = ?
+            """,
+            [
+                blob(try encodeScopes(grant.scopes)),
+                try encodeProvenance(grant.scopeProvenance.restricted(to: grant.scopes)),
+                .text(family.familyID.uuidString),
             ]
         )
     }
@@ -1998,8 +2215,10 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         let rows = try await connection.query(
             """
             SELECT family_id, subject, issuer, client_id, redirect_uri, scopes,
+                   scopes_requested, scope_provenance, scope_provenance_requested,
                    dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
-                   client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at
+                   client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at,
+                   created_at
             FROM oauth_control_token_families
             WHERE family_id = ?
             """,
@@ -2014,9 +2233,10 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         SELECT c.family_id, c.code_challenge_method, c.code_challenge_s256, c.expires_at,
                c.reuse_expires_at, c.consumed_at,
                f.subject, f.issuer, f.client_id, f.redirect_uri, f.scopes,
+               f.scopes_requested, f.scope_provenance, f.scope_provenance_requested,
                f.dpop_jkt, f.client_assertion_key_id, f.client_assertion_algorithm,
                f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at AS family_expires_at,
-               f.revoked_at
+               f.revoked_at, f.created_at
         FROM oauth_control_authorization_codes c
         JOIN oauth_control_token_families f ON f.family_id = c.family_id
         WHERE c.code_digest = ?
@@ -2026,9 +2246,11 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     private var refreshSelectSQL: String {
         """
         SELECT f.family_id, f.subject, f.issuer, f.client_id, f.redirect_uri,
-               f.scopes, f.dpop_jkt, f.client_assertion_key_id,
+               f.scopes, f.scopes_requested, f.scope_provenance,
+               f.scope_provenance_requested,
+               f.dpop_jkt, f.client_assertion_key_id,
                f.client_assertion_algorithm, f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at,
-               f.revoked_at, r.expires_at AS token_expires_at, r.used_at
+               f.revoked_at, f.created_at, r.expires_at AS token_expires_at, r.used_at
         FROM oauth_control_refresh_tokens r
         JOIN oauth_control_token_families f ON f.family_id = r.family_id
         WHERE r.token_digest = ?
@@ -2095,7 +2317,8 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
             subject: try requiredText(row, "subject"),
             binding: try decodeBinding(row),
             expiresAt: try requiredDate(row, "expires_at"),
-            revokedAt: try optionalDate(row, "revoked_at")
+            revokedAt: try optionalDate(row, "revoked_at"),
+            createdAt: try optionalDate(row, "created_at")
         )
         do {
             try validate(family: family, now: Date.distantPast, permitExpired: true)
@@ -2129,7 +2352,18 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
             scopes: try decodeScopes(try requiredBlob(row, "scopes")),
             dpopJKT: try optionalText(row, "dpop_jkt"),
             confidentialClientKey: confidentialClientKey,
-            refreshTokenAllowed: try requiredBoolean(row, "refresh_token_allowed")
+            refreshTokenAllowed: try requiredBoolean(row, "refresh_token_allowed"),
+            // Both are absent for a PAR row (which has no subject and so cannot
+            // hold a resolved grant) and for any row written before the
+            // migration. Absent is the correct answer in both cases, not an
+            // error: NULL means "requested == scopes" (§6.7).
+            scopesRequested: try decodeOptionalScopes(row, "scopes_requested"),
+            scopeProvenance: try decodeProvenance(row, "scope_provenance"),
+            // NULL here is load-bearing rather than tolerated: beside a non-NULL
+            // `scopes_requested` it is the only signal that this row predates
+            // refresh-time re-derivation, and `requestedBaseline()` refuses to
+            // re-derive without it.
+            scopeProvenanceRequested: try decodeProvenance(row, "scope_provenance_requested")
         )
         do {
             try validate(binding: binding)
@@ -2239,6 +2473,74 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         }
     }
 
+    /// `nil` in, `.null` out — writing an empty blob for "same as `scopes`"
+    /// would make absent and "requested nothing" indistinguishable on reload
+    /// and silently point the refresh baseline at the wrong operand (§6.7).
+    private func encodeOptionalScopes(_ scopes: Set<String>?) throws -> SQLiteData {
+        guard let scopes else { return .null }
+        return blob(try encodeScopes(scopes))
+    }
+
+    private func decodeOptionalScopes(_ row: SQLiteRow, _ column: String) throws -> Set<String>? {
+        guard let value = row.column(column), !value.isNull,
+              let data = Data(sqliteData: value) else {
+            // A missing column is a row written by an older schema, which is
+            // exactly the NULL case: requested == stored.
+            return nil
+        }
+        return try decodeScopes(data)
+    }
+
+    /// Provenance persists as `{ "<effective scope>": ["<stated key>", ...] }`,
+    /// with both levels sorted so the blob is a deterministic function of the
+    /// value.
+    private func encodeProvenance(_ provenance: OAuthScopeProvenance?) throws -> SQLiteData {
+        guard let provenance, !provenance.isEmpty else { return .null }
+        let canonical = provenance.statedParameterKeys.mapValues { $0.sorted() }
+        guard canonical.keys.allSatisfy(validScope) else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            return blob(try encoder.encode(canonical))
+        } catch {
+            throw OAuthControlStoreError.invalidInput
+        }
+    }
+
+    /// `encodeProvenance` for a column where **absent and empty differ**.
+    ///
+    /// `scope_provenance` may collapse an empty map to NULL because both answer
+    /// the same question there — nothing was stated, and the fences deny either
+    /// way. `scope_provenance_requested` cannot: NULL is how a pre-migration row
+    /// is recognised, so an empty map written as NULL would make every grant
+    /// whose client stated no parameters at all look pre-migration and never
+    /// re-derive on refresh. That is the common shape, not a corner case.
+    private func encodePresentProvenance(
+        _ provenance: OAuthScopeProvenance?
+    ) throws -> SQLiteData {
+        guard let provenance else { return .null }
+        guard !provenance.isEmpty else { return blob(Data("{}".utf8)) }
+        return try encodeProvenance(provenance)
+    }
+
+    private func decodeProvenance(
+        _ row: SQLiteRow,
+        _ column: String
+    ) throws -> OAuthScopeProvenance? {
+        guard let value = row.column(column), !value.isNull,
+              let data = Data(sqliteData: value) else {
+            return nil
+        }
+        do {
+            let canonical = try JSONDecoder().decode([String: [String]].self, from: data)
+            return OAuthScopeProvenance(canonical.mapValues(Set.init))
+        } catch {
+            throw OAuthControlStoreError.malformedRecord
+        }
+    }
+
     private func decodeScopes(_ data: Data) throws -> Set<String> {
         do {
             let values = try JSONDecoder().decode([String].self, from: data)
@@ -2342,16 +2644,42 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         !value.isEmpty && value.utf8.count <= 4_096 && !value.utf8.contains(0)
     }
 
+    /// Per-element persistence gate. The byte cap is 1024, not 256 (§9-D9): one
+    /// cap at every surviving layer, because a `space:` grant with a
+    /// multi-valued `collection` list blows past 256 bytes with three or four
+    /// NSIDs and upstream imposes no length limit at all. Raising it is
+    /// read-compatible — every existing row is ≤ 256 bytes and re-validates
+    /// under the larger bound, so there is no data rewrite.
     private func validScope(_ value: String) -> Bool {
-        validText(value) && value.utf8.count <= 256 &&
+        validText(value) && value.utf8.count <= 1_024 &&
             value.unicodeScalars.allSatisfy {
                 !$0.properties.isWhitespace && !CharacterSet.controlCharacters.contains($0)
             }
     }
 
+    /// The third copy of the floor, routed through the same facade as the other
+    /// two (§6.1) so the accept set cannot drift between layers. `subject: nil`
+    /// and no provenance: this asks only `hasResourceScope` and never reaches a
+    /// fence, and a persistence check has no request subject to resolve against.
     private func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
-        scopes.contains("atproto") || scopes.contains { scope in
-            PermissionedSpaceScopeSyntax.isQualified(scope)
+        SwanScopePermissions(rawScopes: scopes, subject: nil).hasResourceScope
+    }
+
+    /// Stage G, INSERT half (§6.3): a newly-minted grant must parse in full.
+    ///
+    /// This is deliberately not in `validate(binding:)`, which also runs on
+    /// DECODE. The only per-element gate Swan ever had was `validScope`, and the
+    /// resource-scope check beside it is an OR over the set, so a live family
+    /// may legitimately hold an unparseable companion scope. Gating the read
+    /// path on a full re-parse would fail `decodeFamily` and permanently lock
+    /// that session out — the opposite of §9-D5, which rules that a *held*
+    /// unparseable scope silently grants nothing.
+    ///
+    /// New tokens are entirely under the new grammar's control, so the tightening
+    /// here has no back-compat surface.
+    private func validateNewlyMintedScopes(_ scopes: Set<String>) throws {
+        guard scopes.allSatisfy({ (try? AtprotoScope.parse($0)) != nil }) else {
+            throw OAuthControlStoreError.invalidInput
         }
     }
 

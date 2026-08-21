@@ -225,6 +225,17 @@ public enum PublicRepositoryRecordCodec {
             return .object(fields)
         }
         if let link = value as? ATProtoLink { return .link(try validatedLink(link.cid)) }
+        // What Petrel's `toCBORValue()` actually returns for a CID, and the
+        // reason a record carrying a blob or a StrongRef used to be refused:
+        // neither arrives as `ATProtoLink`. `ATProtoLink` yields `.link` (tag
+        // 42, `$link` in JSON) and a bare `CID` field yields `.string`, so the
+        // representation — not the Swift type — decides which one this is.
+        if let link = value as? CIDAsLink {
+            switch link.representation {
+            case .link: return .link(try validatedLink(link.cid))
+            case .string: return .string(link.cid.string)
+            }
+        }
         if let data = value as? Data { return .bytes(data) }
         if let string = value as? String { return .string(string) }
         if let bool = value as? Bool { return .bool(bool) }

@@ -903,6 +903,99 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         try await connection.close()
     }
 
+    /// The live failure: bsky.app uploads an avatar (200) and then `putRecord`
+    /// of `app.bsky.actor.profile` answered 400. Petrel hands a CID to
+    /// `toCBORValue()` as `CIDAsLink`, never `ATProtoLink`, so the record
+    /// converter refused every blob and every StrongRef — an avatar, an image
+    /// post, a like, a repost, a reply, a quote.
+    func testProfileRecordsCarryingBlobsAndStrongRefsCommit() async throws {
+        let fixture = try await makeFixture(
+            scopes: [
+                "atproto", "repo:app.bsky.actor.profile", "repo:app.bsky.feed.like", "blob:*/*",
+            ]
+        )
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let putPath = "/xrpc/com.atproto.repo.putRecord"
+        @Sendable func body(collection: String, rkey: String, record: String) -> String {
+            "{\"repo\":\"" + Self.did + "\",\"collection\":\"" + collection + "\","
+                + "\"rkey\":\"" + rkey + "\",\"validate\":true,\"record\":" + record + "}"
+        }
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.blobRecords")
+        ).test(.router) { client in
+            var uploadHeaders = try fixture.headers(
+                jti: "profile-upload", method: "POST", path: Self.uploadPath
+            )
+            uploadHeaders[.contentType] = "image/jpeg"
+            let uploaded = try await client.execute(
+                uri: Self.uploadPath, method: .post, headers: uploadHeaders,
+                body: ByteBuffer(data: Data("fake-avatar-bytes".utf8))
+            )
+            XCTAssertEqual(uploaded.status, .ok)
+            let blob = try XCTUnwrap(self.jsonObject(uploaded.body)["blob"] as? [String: Any])
+            let uploadedCID = try XCTUnwrap((blob["ref"] as? [String: Any])?["$link"] as? String)
+            let uploadedSize = try XCTUnwrap(blob["size"] as? Int)
+
+            // The avatar the upload just returned commits.
+            let avatarRecord = """
+                {"$type":"app.bsky.actor.profile","displayName":"Swan","avatar":\
+                {"$type":"blob","ref":{"$link":"\(uploadedCID)"},\
+                "mimeType":"image/jpeg","size":\(uploadedSize)}}
+                """
+            let avatar = try await client.execute(
+                uri: putPath, method: .post,
+                headers: try fixture.headers(jti: "profile-avatar", method: "POST", path: putPath),
+                body: ByteBuffer(string: body(
+                    collection: "app.bsky.actor.profile", rkey: "self", record: avatarRecord))
+            )
+            XCTAssertEqual(
+                avatar.status, .ok,
+                String(decoding: avatar.body.readableBytesView, as: UTF8.self)
+            )
+
+            // A StrongRef is the same defect's other half: its `cid` is a plain
+            // string, and refusing it broke every like, repost and reply.
+            let likeRecord = """
+                {"$type":"app.bsky.feed.like","createdAt":"2026-08-20T19:00:00.000Z",\
+                "subject":{"uri":"at://\(Self.did)/app.bsky.feed.post/abc",\
+                "cid":"bafyreiae5sz3cd4ohalt7yiwrdfke4wjof3rbnufaxo533zzxocygc3uwa"}}
+                """
+            let like = try await client.execute(
+                uri: putPath, method: .post,
+                headers: try fixture.headers(jti: "profile-like", method: "POST", path: putPath),
+                body: ByteBuffer(string: body(
+                    collection: "app.bsky.feed.like", rkey: "like1", record: likeRecord))
+            )
+            XCTAssertEqual(
+                like.status, .ok,
+                String(decoding: like.body.readableBytesView, as: UTF8.self)
+            )
+
+            // A blob nobody uploaded is still refused: the fix restores link
+            // conversion, it does not weaken reachability.
+            let unknownBlobRecord = """
+                {"$type":"app.bsky.actor.profile","displayName":"Swan","avatar":\
+                {"$type":"blob","ref":\
+                {"$link":"bafkreibvjvcv745gig4mkfmqhslwlbmiqi5pj7cmvlpvw3ffhvlnxlbmiq"},\
+                "mimeType":"image/jpeg","size":1234}}
+                """
+            let unknown = try await client.execute(
+                uri: putPath, method: .post,
+                headers: try fixture.headers(jti: "profile-unknown", method: "POST", path: putPath),
+                body: ByteBuffer(string: body(
+                    collection: "app.bsky.actor.profile", rkey: "self", record: unknownBlobRecord))
+            )
+            XCTAssertEqual(unknown.status, .badRequest)
+        }
+    }
+
     func testExplicitRKeyPutDeleteNoOpAndSwapSemantics() async throws {
         let fixture = try await makeFixture()
         defer {
@@ -1531,13 +1624,133 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    // MARK: - Scope enforcement (§6.5.10 port of assertRepo / assertBlob)
+
+    /// The identity scope grants nothing. Before the port this token could write
+    /// any collection; upstream has always refused it
+    /// (`ScopePermissions.allowsRepo` finds no `repo:` grant), and now so does
+    /// Swan.
+    func testRepoWriteDeniedWithoutRepoOrTransitionScope() async throws {
+        let fixture = try await makeFixture(scopes: ["atproto"])
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.scope-denied")
+        ).test(.live) { client in
+            let response = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "scope-denied-create",
+                    method: "POST",
+                    path: Self.mutationPath
+                ),
+                body: ByteBuffer(string: self.putBody(rkey: "denied", text: "nope"))
+            )
+            XCTAssertEqual(response.status, .unauthorized)
+            // §9-D6: the body stays the route's own opaque code. The needed
+            // scope goes to the server log and NEVER to the caller.
+            let body = String(decoding: response.body.readableBytesView, as: UTF8.self)
+            XCTAssertEqual(body, "{\"error\":\"Unauthorized\"}")
+            XCTAssertFalse(body.contains("repo:"), "must not echo the needed scope")
+            XCTAssertFalse(body.contains(Self.collection), "must not echo the collection")
+        }
+    }
+
+    /// A narrow modern grant admits its own collection and refuses its
+    /// neighbour — the property the whole port exists to give app passwords.
+    func testRepoWriteHonoursNarrowCollectionGrant() async throws {
+        let fixture = try await makeFixture(
+            scopes: ["atproto", "repo:\(Self.collection)?action=create"]
+        )
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.scope-narrow")
+        ).test(.live) { client in
+            let granted = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "scope-narrow-granted",
+                    method: "POST",
+                    path: Self.mutationPath
+                ),
+                body: ByteBuffer(string: self.putBody(rkey: "granted", text: "ok"))
+            )
+            XCTAssertEqual(
+                granted.status,
+                .ok,
+                String(decoding: granted.body.readableBytesView, as: UTF8.self)
+            )
+
+            // Same token, a collection it was never granted.
+            let otherCollection = "app.bsky.feed.like"
+            let refused = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "scope-narrow-refused",
+                    method: "POST",
+                    path: Self.mutationPath
+                ),
+                body: ByteBuffer(string:
+                    "{\"repo\":\"" + Self.did + "\",\"collection\":\"" + otherCollection
+                        + "\",\"rkey\":\"refused\",\"record\":{\"text\":\"nope\"}}"
+                )
+            )
+            XCTAssertEqual(refused.status, .unauthorized)
+        }
+    }
+
+    /// `uploadBlob` asserts from the Content-Type HEADER. `transition:generic`
+    /// covers any mime; the identity scope alone covers none.
+    func testBlobUploadDeniedWithoutBlobOrTransitionScope() async throws {
+        let fixture = try await makeFixture(scopes: ["atproto"])
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.blob-scope-denied")
+        ).test(.live) { client in
+            var headers = try fixture.headers(
+                jti: "blob-scope-denied",
+                method: "POST",
+                path: Self.uploadPath
+            )
+            headers[.contentType] = "image/png"
+            let response = try await client.execute(
+                uri: Self.uploadPath,
+                method: .post,
+                headers: headers,
+                body: ByteBuffer(bytes: [0x89, 0x50, 0x4E, 0x47])
+            )
+            XCTAssertEqual(response.status, .unauthorized)
+        }
+    }
+
     private func makeFixture(
         includePublicBlobSpoolAdmission: Bool = true,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
         jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
         mutationBarrier: MutationTargetBarrier? = nil,
         mutationStatusSequence: [AccountControlStatus] = [],
-        blobQuota: AccountBlobQuota = .conservative
+        blobQuota: AccountBlobQuota = .conservative,
+        scopes: Set<String> = PublicRepositoryMutationHTTPTests.realisticClientScopes
     ) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "SwanPublicRepositoryMutationHTTPTests-" + UUID().uuidString)
@@ -1570,7 +1783,7 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
                 controlStore: control,
                 serverKey: Data(repeating: 0x41, count: 32)
             )
-            let token = try await issueToken(runtime: runtime)
+            let token = try await issueToken(runtime: runtime, scopes: scopes)
             let directory = TestMutationDirectory(
                 did: Self.did,
                 database: database,
@@ -1647,7 +1860,26 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         )
     }
 
-    private func issueToken(runtime: SwanOAuthRuntime) async throws -> TokenMaterial {
+    /// The scope set every real Swan client actually holds.
+    ///
+    /// `atproto` ALONE grants nothing on the repo surface — it is the identity
+    /// scope, and since the `assertRepo`/`assertBlob` port it no longer admits a
+    /// write. That is upstream's rule, not a Swan tightening: upstream's
+    /// `ScopePermissions.allowsRepo` finds no `repo:` grant on such a token
+    /// either. Real credentials carry a transition scope beside it — the live
+    /// server advertises all three in `scopes_supported`, Catbird's
+    /// `AuthManager` requests `"atproto transition:generic transition:chat.bsky"`,
+    /// and nest's `default.toml` the same — so this default is what production
+    /// looks like, not a convenience.
+    ///
+    /// Tests that need to prove the narrow case pass their own set; see
+    /// `testRepoWriteDeniedWithoutRepoOrTransitionScope`.
+    static let realisticClientScopes: Set<String> = ["atproto", "transition:generic"]
+
+    private func issueToken(
+        runtime: SwanOAuthRuntime,
+        scopes: Set<String> = PublicRepositoryMutationHTTPTests.realisticClientScopes
+    ) async throws -> TokenMaterial {
         let key = P256.Signing.PrivateKey()
         let jwk = try makeJWK(key)
         let now = Date()
@@ -1659,13 +1891,13 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
                     redirectURIs: [URL(string: "https://client.example/callback")!],
                     grantTypes: ["authorization_code", "refresh_token"],
                     responseTypes: ["code"],
-                    scopes: ["atproto"],
+                    scopes: scopes,
                     dpopBoundAccessTokens: true
                 ),
                 keySet: nil
             ),
             redirectURI: URL(string: "https://client.example/callback")!,
-            scopes: ["atproto"],
+            scopes: scopes,
             dpopProof: OAuthValidatedDPoPProof(
                 keyThumbprint: jwk.thumbprint(),
                 jwtID: "issue-" + UUID().uuidString,

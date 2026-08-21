@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import SwanAccounts
 import SwanCore
 import SwanStorage
 
@@ -32,15 +33,38 @@ public struct SwanOAuthRuntime: Sendable {
     /// never crosses into `OAuthControlStore`; validators receive this service
     /// from the runtime rather than accepting arbitrary caller text as a nonce.
     public let dpopNonceService: DPoPNonceService
+    /// §5.7.4's resolver, or `nil` when this deployment has no lexicon authority
+    /// configured.
+    ///
+    /// It is carried on the runtime rather than reached for at a call site
+    /// because BOTH §5.7.5 call sites need the same instance: PAR/consent lives
+    /// in SwanHTTP and token mint lives in ``DurableOAuthTokenService``, and two
+    /// resolvers would mean two caches — so a document proved at PAR would be
+    /// re-proved, over the network, at mint.
+    ///
+    /// The concrete `SwanLexiconResolver` is in **SwanInterop**, which depends on
+    /// SwanOAuth and not the reverse; only the protocol (SwanCore) is nameable
+    /// here. The composition root (`swan`) depends on both and injects one into
+    /// the other. No source target's `Package.swift` dependencies change.
+    ///
+    /// `nil` is Phase-1 behaviour, deliberately and with a recorded cost: an
+    /// `include:` grants nothing and a bare `space:<type>` materialises no write
+    /// targets. See ``OAuthLexiconScopeResolution``.
+    public let lexiconResolver: (any SwanLexiconResolving)?
 
     public init(
         controlStore: any OAuthControlStore & SpaceDelegationReplayStore,
-        serverKey: Data
+        serverKey: Data,
+        lexiconResolver: (any SwanLexiconResolving)? = nil,
+        identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil
     ) throws {
         tokenService = try DurableOAuthTokenService(
             controlStore: controlStore,
-            serverKey: serverKey
+            serverKey: serverKey,
+            lexiconResolver: lexiconResolver,
+            identityAdmission: identityAdmission
         )
+        self.lexiconResolver = lexiconResolver
         dpopReplayStore = try DurableDPoPReplayStore(
             controlStore: controlStore,
             serverKey: serverKey
@@ -70,6 +94,15 @@ public actor DurableOAuthTokenService {
 
     private let controlStore: any OAuthControlStore
     private let macKey: SymmetricKey
+    /// §5.7.5 call site 2. `nil` leaves this service in Phase-1 behaviour — see
+    /// ``SwanOAuthRuntime/lexiconResolver``.
+    private let lexiconResolver: (any SwanLexiconResolving)?
+    /// Narrow durable identity admission for new-token issuance. `nil` keeps
+    /// the token-mechanics surface source-compatible; production composition
+    /// always supplies it and every issuance path denies (fails closed) when
+    /// the identity is a suspended or failed-grace did:web account, or when
+    /// the store/resolver is unavailable.
+    private let identityAdmission: (any SwanIdentityAdmissionEvaluating)?
 
     /// A resource-facing grant deliberately includes the DPoP binding instead
     /// of looking like a plain bearer-token result. Resource middleware must
@@ -77,11 +110,30 @@ public actor DurableOAuthTokenService {
     /// binding before this value can be obtained.
     public struct AccessGrant: Sendable, Equatable {
         public let subject: String
+        /// The **effective** grant — post-`self`-resolution (§9-D8). This, and
+        /// never `scopesRequested`, is what the matcher enforces against.
         public let scopes: Set<String>
         public let issuer: String
         public let clientID: String
         public let redirectURI: String
         public let dpopJKT: String?
+        /// The pre-resolution set — the bytes the client asked for (§6.7). Equal
+        /// to `scopes` for a grant Swan did not rewrite; never `nil`, because
+        /// the durable NULL means "requested == stored", not "unknown".
+        public let scopesRequested: Set<String>
+        /// The durable §9-D23 provenance bits: for each effective scope string,
+        /// which parameter keys the client physically wrote.
+        ///
+        /// These ride on the grant because `SwanScopePermissions` cannot recover
+        /// them any other way. A persisted scope string is lossy in **both**
+        /// directions: mint writes a literal `authority=did:plc:…` where the
+        /// client wrote nothing, so a re-parse reports `authority` as *stated*
+        /// and the delegation fence flips open; and canonical serialisation
+        /// deletes a value equal to its default, so a literally-written
+        /// `skey=*` disappears and the listing fence can never fire again.
+        /// Provenance is therefore carried from the parse that produced it,
+        /// through mint and persistence, to here — never reconstructed.
+        public let scopeProvenance: OAuthScopeProvenance
 
         fileprivate init(family: OAuthTokenFamily) {
             subject = family.subject
@@ -90,15 +142,56 @@ public actor DurableOAuthTokenService {
             clientID = family.binding.clientID
             redirectURI = family.binding.redirectURI
             dpopJKT = family.binding.dpopJKT
+            scopesRequested = family.binding.requestedScopes
+            // Absent bits mean "nothing was stated", which is the fail-closed
+            // direction for both fences: a missing record denies, never grants.
+            scopeProvenance = family.binding.scopeProvenance ?? OAuthScopeProvenance()
+        }
+
+        /// The durable stated-key bits in exactly the shape
+        /// `SwanScopePermissions.init(rawScopes:subject:statedKeys:)` takes.
+        ///
+        /// A plain dictionary rather than `OAuthScopeProvenance` because
+        /// `SwanScopePermissions` lives in SwanCore, which sits *beneath*
+        /// SwanStorage and so cannot name that type.
+        public var statedScopeKeys: [String: Set<String>] {
+            scopeProvenance.statedParameterKeys
         }
     }
 
-    public init(controlStore: any OAuthControlStore, serverKey: Data) throws {
+    public init(
+        controlStore: any OAuthControlStore,
+        serverKey: Data,
+        lexiconResolver: (any SwanLexiconResolving)? = nil,
+        identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil
+    ) throws {
         guard serverKey.count == 32 else {
             throw SwanError.malformed("OAuth server key must be exactly 32 bytes")
         }
         self.controlStore = controlStore
+        self.lexiconResolver = lexiconResolver
+        self.identityAdmission = identityAdmission
         macKey = SymmetricKey(data: serverKey)
+    }
+
+    /// Fails closed for new-token issuance: a suspended or failed-grace
+    /// did:web identity denies new tokens, and a store/resolver failure is
+    /// treated as a denial rather than a permissive fallback. PLC-only and
+    /// active identities pass through unchanged.
+    private func requireIdentityAdmission(subject: String, now: Date) async throws {
+        guard let identityAdmission else { return }
+        do {
+            let decision = try await identityAdmission.identityAdmission(
+                accountDID: subject, now: now
+            )
+            guard decision.allowsTokenIssuance else {
+                throw SwanError.unauthorized("identity does not admit token issuance")
+            }
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("identity admission is unavailable")
+        }
     }
 
     /// Creates an opaque access/refresh pair in a new durable family.
@@ -110,7 +203,16 @@ public actor DurableOAuthTokenService {
         familyID: UUID = UUID(),
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
-        let binding = session.durableBinding
+        try await requireIdentityAdmission(subject: subject, now: now)
+        // §5.7.5 call site 2, as at `_issueAuthorizationCode`: this is a mint, so
+        // the family row must hold the RESOLVED grant or it would grant nothing.
+        // (a) `include:` → concrete, (b) `expandSpaceCollections`, (c) stage F's
+        // `self` → subject, in that order.
+        let binding = try await OAuthLexiconScopeResolution.resolvingLexiconGrants(
+            session.durableBinding,
+            subject: subject,
+            resolver: lexiconResolver
+        )
         try requireOAuthDPoPBinding(binding)
         let pair = try makeTokenPair(
             familyID: familyID,
@@ -291,6 +393,8 @@ public actor DurableOAuthTokenService {
         binding: OAuthClientBinding,
         codeChallengeS256: String,
         activeSubjectRevisionMicroseconds: Int64,
+        authorizationGrantDigest: Data? = nil,
+        authorizationContext: AccountAuthorizationContext? = nil,
         codeLifetime: TimeInterval = 60,
         refreshLifetime: TimeInterval = 14 * 24 * 60 * 60,
         familyID: UUID = UUID(),
@@ -304,7 +408,9 @@ public actor DurableOAuthTokenService {
             codeLifetime: codeLifetime,
             refreshLifetime: refreshLifetime,
             familyID: familyID,
-            now: now
+            now: now,
+            authorizationGrantDigest: authorizationGrantDigest,
+            authorizationContext: authorizationContext
         )
     }
 
@@ -338,33 +444,73 @@ public actor DurableOAuthTokenService {
         codeLifetime: TimeInterval,
         refreshLifetime: TimeInterval,
         familyID: UUID,
-        now: Date
+        now: Date,
+        authorizationGrantDigest: Data? = nil,
+        authorizationContext: AccountAuthorizationContext? = nil
     ) async throws -> String {
+        try await requireIdentityAdmission(subject: subject, now: now)
         guard codeLifetime > 0, refreshLifetime > 0,
               codeLifetime.isFinite, refreshLifetime.isFinite else {
             throw SwanError.malformed("authorization code lifetimes must be positive")
         }
-        try requireOAuthDPoPBinding(binding)
+        // Stage F (§6.4). This is the first point at which the subject DID meets
+        // the client binding — `createPushedAuthorizationRequest` has no subject,
+        // so a PAR row genuinely cannot hold a resolved scope.
+        //
+        // Resolution is mandatory rather than cosmetic: an unresolved `self`
+        // matches NOTHING (`SpacePermission.matches` returns false on
+        // `.unresolvedSelf`), so a family storing `authority=self` would grant
+        // nothing at all on every request. The requested bytes are preserved
+        // separately on the binding, and provenance is carried rather than
+        // re-derived — resolving `self` changes the value, never the statedness.
+        //
+        // Stage F is (c) of §5.7.5's three transformations, and it does not run
+        // alone: (a) `include:` → concrete and (b) `expandSpaceCollections` run
+        // first, in that order, inside `resolvingLexiconGrants`. All three land
+        // here rather than earlier because §6.3 stage C compares *raw requested*
+        // against *registered* and both sides must still be in `include:` form
+        // for that comparison to mean anything.
+        let resolved = try await OAuthLexiconScopeResolution.resolvingLexiconGrants(
+            binding,
+            subject: subject,
+            resolver: lexiconResolver
+        )
+        try requireOAuthDPoPBinding(resolved)
         let code = Self.randomOpaqueValue()
         let record = OAuthAuthorizationCode(
             codeDigest: digest(code, purpose: .authorizationCode),
             familyID: familyID,
             subject: subject,
-            binding: binding,
+            binding: resolved,
             codeChallengeS256: codeChallengeS256,
             expiresAt: now.addingTimeInterval(codeLifetime),
             familyExpiresAt: now.addingTimeInterval(refreshLifetime)
         )
         do {
-            if let activeSubjectRevisionMicroseconds {
-                try await controlStore.storeAuthorizationCode(
+            if let authorizationGrantDigest {
+                guard let authorizationContext,
+                      authorizationGrantDigest.count == 32,
+                      let grantStore = controlStore as? any OAuthAuthorizationGrantStore,
+                      let activeSubjectRevisionMicroseconds else {
+                    throw OAuthControlStoreError.bindingMismatch
+                }
+                try await grantStore.storeAuthorizationCode(
                     record,
-                    requiringActiveSubjectRevisionMicroseconds:
-                        activeSubjectRevisionMicroseconds,
-                    now: now
-                )
+                    requiringActiveSubjectRevisionMicroseconds: activeSubjectRevisionMicroseconds,
+                    authorizationGrantDigest: authorizationGrantDigest,
+                    authorizationContext: authorizationContext,
+                    now: now)
             } else {
-                try await controlStore.storeAuthorizationCode(record, now: now)
+                if let activeSubjectRevisionMicroseconds {
+                    try await controlStore.storeAuthorizationCode(
+                        record,
+                        requiringActiveSubjectRevisionMicroseconds:
+                            activeSubjectRevisionMicroseconds,
+                        now: now
+                    )
+                } else {
+                    try await controlStore.storeAuthorizationCode(record, now: now)
+                }
             }
         } catch {
             throw secureControlError(error)
@@ -421,6 +567,7 @@ public actor DurableOAuthTokenService {
               PKCE.verifyS256(verifier: verifier, challenge: record.codeChallengeS256) else {
             throw SwanError.unauthorized("authorization code rejected")
         }
+        try await requireIdentityAdmission(subject: record.subject, now: now)
         let refreshLifetime = record.familyExpiresAt.timeIntervalSince(now)
         let pair = try makeTokenPair(
             familyID: record.familyID,
@@ -506,6 +653,7 @@ public actor DurableOAuthTokenService {
         let refreshLifetime = record.familyExpiresAt.timeIntervalSince(now)
         let issueRefresh = record.binding.refreshTokenAllowed
             && client.metadata.grantTypes.contains("refresh_token")
+        try await requireIdentityAdmission(subject: record.subject, now: now)
         let grant: OAuthTokenGrantMaterial
         do {
             grant = try makeTokenGrant(
@@ -529,7 +677,10 @@ public actor DurableOAuthTokenService {
             accessExpiresAt: grant.accessExpiresAt,
             scopes: record.binding.scopes,
             subject: record.subject,
-            refreshToken: grant.refreshToken
+            refreshToken: grant.refreshToken,
+            // The pre-resolution bytes, so a caller can tell preservation from
+            // mutation (§6.7). Stage F rewrote `binding.scopes` in place.
+            scopesRequested: record.binding.requestedScopes
         )
     }
 
@@ -611,6 +762,7 @@ public actor DurableOAuthTokenService {
         )
     }
 
+    @discardableResult
     func redeemRefresh(
         _ refreshToken: String,
         dpopProof: OAuthValidatedDPoPProof,
@@ -620,6 +772,26 @@ public actor DurableOAuthTokenService {
         requireActiveSubject: Bool,
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
+        try await rotateRefresh(
+            refreshToken,
+            dpopProof: dpopProof,
+            clientAssertion: clientAssertion,
+            metadataLoader: metadataLoader,
+            accessLifetime: accessLifetime,
+            requireActiveSubject: requireActiveSubject,
+            now: now
+        ).pair
+    }
+
+    private func rotateRefresh(
+        _ refreshToken: String,
+        dpopProof: OAuthValidatedDPoPProof,
+        clientAssertion: OAuthValidatedClientAssertion?,
+        metadataLoader: OAuthClientMetadataLoader,
+        accessLifetime: TimeInterval,
+        requireActiveSubject: Bool,
+        now: Date
+    ) async throws -> (pair: OAuthTokenPair, scopes: Set<String>) {
         let refreshDigest = digest(refreshToken, purpose: .refreshToken)
         let family: OAuthTokenFamily
         do {
@@ -646,6 +818,11 @@ public actor DurableOAuthTokenService {
         } catch {
             throw secureControlError(error)
         }
+        try await requireIdentityAdmission(subject: family.subject, now: now)
+        // BEFORE the rotation, deliberately: re-derivation performs network I/O
+        // and can fail, and a failure must leave the presented refresh token
+        // still usable rather than burning it on a rotation that then refuses.
+        let rederived = try await rederivedGrant(for: family)
         let remainingLifetime = family.expiresAt.timeIntervalSince(now)
         let pair = try makeTokenPair(
             familyID: family.familyID,
@@ -657,13 +834,70 @@ public actor DurableOAuthTokenService {
             try await controlStore.redeemRefreshToken(
                 refreshTokenDigest: refreshDigest,
                 replacement: tokenDigests(for: pair),
+                rewrittenGrant: rederived,
                 requireActiveSubject: requireActiveSubject,
                 now: now
             )
         } catch {
             throw secureControlError(error)
         }
-        return pair
+        return (pair, rederived?.scopes ?? family.binding.scopes)
+    }
+
+    /// §5.7.5's second call site, the half F2 found missing: **refresh
+    /// re-derives the token scope**, exactly as `rotateToken` does upstream
+    /// (`token-manager.ts:260-263` → `buildTokenScope(parameters.scope!, did)`).
+    ///
+    /// The input is the **requested** baseline (`scopes_requested ?? scopes`,
+    /// §9-D20), never `binding.scopes`: the latter holds the post-`self`
+    /// resolution grant (§9-D8), so re-deriving from it would re-resolve an
+    /// already-resolved value and drift a little further on every rotation.
+    /// Upstream's operand is the same one — `parameters.scope` is the
+    /// authorization request's own bytes.
+    ///
+    /// **Why this matters more than "we hadn't wired refresh yet."** §5.7.4
+    /// introduced Swan's 24-hour hard cache expiry with a rationale that argues
+    /// *from* re-derivation: without it, a permission set that was **narrowed**
+    /// upstream would keep minting the wider grant. With the scope frozen at
+    /// mint, that safeguard was inert — a 14-day refresh family kept its
+    /// mint-time grant for its whole life whether or not the resolver was
+    /// reachable, and whatever the authority now declares.
+    ///
+    /// **Failure policy: a re-derivation failure fails the refresh.** It is not
+    /// a fall-back-to-stored, and the two are genuinely different layers:
+    /// serving a stale document on a fetch failure is the *cache's* job
+    /// (§5.7.5's matrix, first row), so by the time a failure reaches here the
+    /// cache has already declined to answer — either it has nothing or its 24 h
+    /// hard expiry has passed. Continuing at that point would mint the wider
+    /// grant precisely when Swan can no longer show it is still granted, which
+    /// is the outcome the hard expiry exists to prevent. Upstream makes the same
+    /// call in the same place and says so (`token-manager.ts:257-259`: "it's
+    /// fine to propagate a 500 here"). Swan's code is `invalid_request` rather
+    /// than `server_error`, carried by the stage on
+    /// ``OAuthScopeResolutionError`` (§5.7.5's asymmetry).
+    ///
+    /// Returns `nil` — leave the stored grant exactly as it is — in two cases:
+    /// the re-derivation reproduced what is already stored, which is the common
+    /// case and must not churn the row; or the family predates
+    /// `scope_provenance_requested` and has no baseline to derive from, which is
+    /// bounded by the 14-day family lifetime and preserves today's behaviour for
+    /// those rows rather than narrowing a live grant on a guess.
+    /// `internal` rather than `private` so the two decisions that produce `nil` —
+    /// no change, and no baseline — can be asserted directly. Neither is
+    /// observable from the rotation's outputs: both look exactly like a refresh
+    /// that re-derived and happened to agree.
+    func rederivedGrant(for family: OAuthTokenFamily) async throws -> OAuthRefreshedGrant? {
+        guard let baseline = family.binding.requestedBaseline() else { return nil }
+        let resolved = try await OAuthLexiconScopeResolution.resolvingLexiconGrants(
+            baseline,
+            subject: family.subject,
+            resolver: lexiconResolver
+        )
+        let provenance = resolved.scopeProvenance ?? OAuthScopeProvenance()
+        guard resolved.scopes != family.binding.scopes
+            || provenance != (family.binding.scopeProvenance ?? OAuthScopeProvenance())
+        else { return nil }
+        return OAuthRefreshedGrant(scopes: resolved.scopes, scopeProvenance: provenance)
     }
 
     /// Authorization-server refresh adapter. It reuses the existing durable
@@ -700,7 +934,7 @@ public actor DurableOAuthTokenService {
         } catch {
             throw secureControlError(error)
         }
-        let pair = try await redeemRefresh(
+        let rotated = try await rotateRefresh(
             refreshToken,
             dpopProof: dpopProof,
             clientAssertion: clientAssertion,
@@ -710,11 +944,19 @@ public actor DurableOAuthTokenService {
             now: now
         )
         return OAuthTokenGrantResult(
-            accessToken: pair.accessToken,
-            accessExpiresAt: pair.accessExpiresAt,
-            scopes: family.binding.scopes,
+            accessToken: rotated.pair.accessToken,
+            accessExpiresAt: rotated.pair.accessExpiresAt,
+            // The RE-DERIVED grant, not the one the family held on the way in:
+            // a rotation that narrowed the stored scope and then reported the
+            // old one would tell the client it still holds capabilities the
+            // access token no longer carries. Upstream reports the same value it
+            // just persisted (`token-manager.ts:266-295`).
+            scopes: rotated.scopes,
             subject: family.subject,
-            refreshToken: pair.refreshToken
+            // Unchanged by rotation, and that is the point: it is the baseline
+            // the NEXT refresh re-derives from (§9-D20).
+            refreshToken: rotated.pair.refreshToken,
+            scopesRequested: family.binding.requestedScopes
         )
     }
 
@@ -765,9 +1007,20 @@ public actor DurableOAuthTokenService {
             throw secureControlError(error)
         }
         do {
+            // The baseline is the REQUESTED set, never `binding.scopes` (§9-D20).
+            // `binding.scopes` holds the post-`self`-resolution grant (§9-D8),
+            // which the client has never seen; `authority=self` is the grammar's
+            // default, so comparing against it would fail refresh for
+            // essentially every grant Swan issues. The comparison itself stays
+            // raw-string equality — only the operand changes, and there is no
+            // canonical fallback in this rollout.
+            //
+            // `requestedScopes` on the binding is `scopesRequested ?? scopes`,
+            // total by §6.7's NULL rule: a pre-migration family compares against
+            // its own unchanged `scopes`, exactly as it does today.
             guard family.binding.clientID == metadata.clientID.absoluteString,
                   family.binding.confidentialClientKey == nil,
-                  requestedScopes.map({ $0 == family.binding.scopes }) ?? true else {
+                  requestedScopes.map({ $0 == family.binding.requestedScopes }) ?? true else {
                 throw OAuthControlStoreError.bindingMismatch
             }
             try requirePresentedBindings(
@@ -779,6 +1032,12 @@ public actor DurableOAuthTokenService {
         } catch {
             throw secureControlError(error)
         }
+        try await requireIdentityAdmission(subject: family.subject, now: now)
+        // The localhost bridge rotates through the same durable transaction and
+        // therefore re-derives on the same terms. Exempting it would leave one
+        // refresh path minting a frozen grant, which is the defect, not a
+        // simplification.
+        let rederived = try await rederivedGrant(for: family)
         let remainingLifetime = family.expiresAt.timeIntervalSince(now)
         let pair = try makeTokenPair(
             familyID: family.familyID,
@@ -790,6 +1049,7 @@ public actor DurableOAuthTokenService {
             try await controlStore.redeemRefreshToken(
                 refreshTokenDigest: refreshDigest,
                 replacement: tokenDigests(for: pair),
+                rewrittenGrant: rederived,
                 requireActiveSubject: requireActiveSubject,
                 now: now
             )
@@ -1110,7 +1370,22 @@ public actor DurableOAuthTokenService {
               redirectURI.absoluteString == binding.redirectURI,
               client.metadata.matchesRedirectURI(redirectURI),
               !binding.scopes.isEmpty,
-              binding.scopes.isSubset(of: client.metadata.scopes) else {
+              // Stage C compares REQUESTED against REGISTERED — both supplied by
+              // the client in the same generation (§9-D7). It must not compare
+              // `binding.scopes`, which under §9-D8 holds the post-`self`
+              // resolution grant: the resolved DID was never in the client's
+              // registered set, so this guard would reject every `self`-bearing
+              // family at the token endpoint. That is the same operand defect
+              // §9-D20 fixes at `:770`, at a second site the stage table lists
+              // under stage C.
+              //
+              // Both sides are canonicalised so a client that spells the same
+              // grant differently in its metadata and its request is not
+              // rejected by the canonical form itself.
+              OAuthScopeAdmissionPolicy.isCanonicalSubset(
+                  binding.requestedScopes,
+                  of: client.metadata.scopes
+              ) else {
             throw OAuthControlStoreError.bindingMismatch
         }
         switch client.metadata.tokenEndpointAuthMethod {
@@ -1243,10 +1518,15 @@ public actor DurableOAuthTokenService {
         }
     }
 
+    /// One of the three copies of this predicate that must not drift apart
+    /// again (§6.1); all three now route through the same facade.
+    ///
+    /// `subject: nil` is correct here (§6.5.2): this layer may run before `self`
+    /// is resolvable, and a `self` grant must not be counted as satisfying the
+    /// floor before it is. No provenance is passed because this site reads only
+    /// `hasResourceScope` and never reaches a fence.
     private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
-        scopes.contains("atproto") || scopes.contains { scope in
-            PermissionedSpaceScopeSyntax.isQualified(scope)
-        }
+        SwanScopePermissions(rawScopes: scopes, subject: nil).hasResourceScope
     }
 
     private func constantTimeTextEqual(_ lhs: String, _ rhs: String) -> Bool {

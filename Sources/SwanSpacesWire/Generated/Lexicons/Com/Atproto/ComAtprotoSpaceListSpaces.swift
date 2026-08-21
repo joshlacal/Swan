@@ -13,28 +13,20 @@ public struct ComAtprotoSpaceListSpaces {
         
 public struct SpaceView: ATProtocolCodable, ATProtocolValue {
             public static let typeIdentifier = "com.atproto.space.listSpaces#spaceView"
-            public let uri: ATProtocolURI
-            public let isOwner: Bool
+            public let uri: SpaceRef
 
         public init(
-            uri: ATProtocolURI, isOwner: Bool
+            uri: SpaceRef
         ) {
             self.uri = uri
-            self.isOwner = isOwner
         }
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             do {
-                self.uri = try container.decode(ATProtocolURI.self, forKey: .uri)
+                self.uri = try container.decode(SpaceRef.self, forKey: .uri)
             } catch {
                 LogManager.logError("Decoding error for required property 'uri': \(error)")
-                throw error
-            }
-            do {
-                self.isOwner = try container.decode(Bool.self, forKey: .isOwner)
-            } catch {
-                LogManager.logError("Decoding error for required property 'isOwner': \(error)")
                 throw error
             }
         }
@@ -43,20 +35,15 @@ public struct SpaceView: ATProtocolCodable, ATProtocolValue {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(Self.typeIdentifier, forKey: .typeIdentifier)
             try container.encode(uri, forKey: .uri)
-            try container.encode(isOwner, forKey: .isOwner)
         }
 
         public func hash(into hasher: inout Hasher) {
             hasher.combine(uri)
-            hasher.combine(isOwner)
         }
 
         public func isEqual(to other: any ATProtocolValue) -> Bool {
             guard let other = other as? Self else { return false }
             if uri != other.uri {
-                return false
-            }
-            if isOwner != other.isOwner {
                 return false
             }
             return true
@@ -71,15 +58,12 @@ public struct SpaceView: ATProtocolCodable, ATProtocolValue {
             map = map.adding(key: "$type", value: Self.typeIdentifier)
             let uriValue = try uri.toCBORValue()
             map = map.adding(key: "uri", value: uriValue)
-            let isOwnerValue = try isOwner.toCBORValue()
-            map = map.adding(key: "isOwner", value: isOwnerValue)
             return map
         }
 
         private enum CodingKeys: String, CodingKey {
             case typeIdentifier = "$type"
             case uri
-            case isOwner
         }
     }    
 public struct Parameters: Parametrizable {
@@ -228,7 +212,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
 extension ATProtoClient.Com.Atproto.Space {
     // MARK: - listSpaces
 
-    /// List the spaces the authenticated user holds a repo in (i.e. spaces the user has written data to), optionally filtered by type and/or owner DID. Note this is not 'spaces I'm a member of' — a member's PDS only tracks spaces its user has written to. Requires auth, implemented by PDS.
+    /// List the spaces the authenticated user holds a repo in (i.e. spaces the user has written data to), optionally filtered by type and/or authority DID. Note this is not 'spaces I'm a member of' — a member's PDS only tracks spaces its user has written to. Requires auth, implemented by PDS.
     /// 
     /// - Parameter input: The input parameters for the request
     /// 

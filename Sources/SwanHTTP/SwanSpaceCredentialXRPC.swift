@@ -298,6 +298,53 @@ func exactBearerToken(from headers: HTTPFields) throws -> String? {
     return nil
 }
 
+/// A compact space-credential candidate presented under EITHER the `Bearer`
+/// or the `DPoP` scheme (Erratum 03 addendum — defect class instance #8).
+///
+/// The reference contract presents a space credential under `DPoP` ("a space
+/// credential is bound to a key"), and its own history carries the lesson
+/// verbatim: "`bearer_token` used to read this, which refuses the DPoP scheme
+/// outright — a conformant presentation could not reach the handler." Swan's
+/// credentials carry no key binding today, so the accompanying proof is
+/// surplus rather than verifiable; accepting the presentation SCHEME grants
+/// nothing the same token under `Bearer` does not already grant.
+///
+/// A `DPoP`-scheme value is returned ONLY when its (unverified) JOSE header
+/// names the space-credential type — a DPoP OAuth access token stays `nil`
+/// and flows to the caller's own OAuth proof policy exactly as before. The
+/// `typ` peek routes; every security decision still happens in the verifier.
+func spaceCredentialSchemeToken(from headers: HTTPFields) throws -> String? {
+    if let bearer = try exactBearerToken(from: headers) { return bearer }
+    let values = headers[values: .authorization]
+    guard let raw = values.first else { return nil }
+    let dpopPrefix = "DPoP "
+    guard raw.count >= dpopPrefix.count,
+          raw.prefix(dpopPrefix.count)
+              .caseInsensitiveCompare(dpopPrefix) == .orderedSame else {
+        return nil
+    }
+    let token = String(raw.dropFirst(dpopPrefix.count))
+    guard !token.isEmpty,
+          token.utf8.count <= PermissionedDataJWT.maximumCompactDelegationBytes,
+          token.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }),
+          unverifiedCompactJOSEType(of: token) == PermissionedDataJWT.credentialType else {
+        return nil
+    }
+    return token
+}
+
+/// The JOSE header `typ` of a compact token, decoded WITHOUT verification —
+/// usable only to route a presentation, never to trust one.
+private func unverifiedCompactJOSEType(of compact: String) -> String? {
+    guard let first = compact.split(separator: ".").first,
+          let data = Data(base64URLEncoded: String(first)),
+          data.count <= 4_096,
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return nil
+    }
+    return object["typ"] as? String
+}
+
 private struct GetSpaceCredentialWireOutput: Encodable {
     let credential: String
 }

@@ -11,11 +11,11 @@ public struct ComAtprotoSpaceGetSpaceCredential {
 
     public static let typeIdentifier = "com.atproto.space.getSpaceCredential"
 public struct Input: ATProtocolCodable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let clientAttestation: String?
 
         /// Standard public initializer
-        public init(space: ATProtocolURI, clientAttestation: String? = nil) {
+        public init(space: SpaceRef, clientAttestation: String? = nil) {
             self.space = space
             self.clientAttestation = clientAttestation
         }
@@ -23,7 +23,7 @@ public struct Input: ATProtocolCodable {
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.space = try container.decode(ATProtocolURI.self, forKey: .space)
+            self.space = try container.decode(SpaceRef.self, forKey: .space)
             if container.contains(.clientAttestation) {
                 guard try !container.decodeNil(forKey: .clientAttestation) else {
                     throw DecodingError.valueNotFound(
@@ -134,7 +134,7 @@ public enum Error: String, Swift.Error, ATProtoErrorType, CustomStringConvertibl
                 case userNotAuthorized = "UserNotAuthorized"
                 /// Refused on the basis of the requesting app.
                 case appNotAuthorized = "AppNotAuthorized"
-                /// Refused for a reason not attributable to a single axis.
+                /// Refused without attributing the refusal to the user or the app. Authorities that do not wish to disclose which perimeter failed may return this in place of UserNotAuthorized or AppNotAuthorized.
                 case notAuthorized = "NotAuthorized"
                 case invalidDelegationToken = "InvalidDelegationToken"
                 case invalidClientAttestation = "InvalidClientAttestation"
@@ -176,7 +176,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
 extension ATProtoClient.Com.Atproto.Space {
     // MARK: - getSpaceCredential
 
-    /// Exchange a delegation token for a space credential. Called on the space authority, with the delegation token as the request's authorization token. The resulting space credential reads repos across the space. Requires a delegation token, plus a client attestation when the space gates on app identity.
+    /// Exchange a delegation token for a space credential. Called on the space authority, with the delegation token as the request's authorization token and a DPoP proof signed by the key to bind the credential to. The resulting space credential reads repos across the space. Requires a delegation token and DPoP proof, plus a client attestation when the space gates on app identity.
     /// 
     /// - Parameter input: The input parameters for the request
     

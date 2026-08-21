@@ -300,8 +300,17 @@ func resolveOAuthHostname(
         } catch {
             return
         }
-        resolutionTask.cancel()
+        // Record the deadline's own outcome *before* cancelling the resolve,
+        // because `complete` is first-wins. Cancelling first lets the resolver's
+        // own `CancellationError` land first whenever cancellation propagates
+        // faster than this task's next statement, and that raw error then
+        // escapes an API whose contract is a typed `SwanError`. It is a race
+        // that a fast machine almost always wins and a loaded x86_64 does not:
+        // the deadline test failed on the amd64 gate with `CancellationError`
+        // while passing on arm64. Completing first makes the outcome the same
+        // on every machine.
         completion.complete(.failure(SwanError.unavailable("OAuth DNS resolution timed out")))
+        resolutionTask.cancel()
     }
     defer {
         resolutionTask.cancel()
@@ -314,9 +323,12 @@ func resolveOAuthHostname(
             }
         },
         onCancel: {
+            // Same ordering rule, opposite intent: the caller was cancelled, so
+            // `CancellationError` is the correct answer and has to be recorded
+            // before the deadline task gets a chance to record `unavailable`.
+            completion.complete(.failure(CancellationError()))
             resolutionTask.cancel()
             timeoutTask.cancel()
-            completion.complete(.failure(CancellationError()))
         }
     )
 }
@@ -564,6 +576,10 @@ struct OAuthAdmittedRemoteDocumentFetcher: Sendable {
     func fetchJSON(from url: URL) async throws -> Data {
         try await fetcher.fetchJSONWithoutAdmission(from: url)
     }
+
+    func fetchBytes(from url: URL) async throws -> Data {
+        try await fetcher.fetchBytesWithoutAdmission(from: url)
+    }
 }
 
 /// Applies the complete local policy around a single GET. It intentionally has
@@ -588,6 +604,29 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         _ = try policy.validateURL(url)
         return try await withAdmission { admittedFetcher in
             try await admittedFetcher.fetchJSON(from: url)
+        }
+    }
+
+    /// Bytes-returning sibling of `fetchJSON(from:)` for binary payloads —
+    /// e.g. the CAR bytes `com.atproto.sync.getRecord` returns — that cannot
+    /// be interpreted as a JSON document. It goes through the identical
+    /// `OAuthRemoteFetchPolicy` machinery as `fetchJSON`: URL policy, DNS
+    /// resolution raced against the same deadline, the public-address-only
+    /// peer check, redirect policy, admission control, and the body cap, all
+    /// via the shared `fetchValidatedResponse` core the two methods call.
+    /// Adding a second fetch path that bypasses any of those controls is
+    /// exactly what this sibling must not do.
+    ///
+    /// The body cap is not a document-size preference here: it is an
+    /// anti-DoS control on downstream MST-walk and commit-signature
+    /// verification work. A proof CAR (one commit block plus an MST path) is
+    /// a few KiB by construction, so the cap — 256 KiB by policy default —
+    /// bounds the CPU a hostile response can force the caller to spend, not
+    /// the size of a legitimate document.
+    public func fetchBytes(from url: URL) async throws -> Data {
+        _ = try policy.validateURL(url)
+        return try await withAdmission { admittedFetcher in
+            try await admittedFetcher.fetchBytes(from: url)
         }
     }
 
@@ -620,7 +659,17 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         )
     }
 
-    fileprivate func fetchJSONWithoutAdmission(from url: URL) async throws -> Data {
+    /// The complete network-and-policy core shared by `fetchJSON` and
+    /// `fetchBytes`: URL policy was already checked by the caller before
+    /// admission; this performs DNS preflight, the transport GET, DNS
+    /// postflight, the exact-URL/no-redirect/200 check, the dual-answer-set
+    /// peer proof, header canonicalization, the content-length cross-check,
+    /// and the body-size cap. It deliberately does not interpret the body —
+    /// content-type and payload-syntax checks are the caller's job, because
+    /// they differ between a JSON document and a binary payload like a CAR.
+    fileprivate func fetchValidatedResponse(from url: URL) async throws
+        -> (body: Data, headers: [String: [String]])
+    {
         let host = try policy.validateURL(url)
         let preflightPeers = Set(try await resolveOAuthHostname(
             resolver, host: host, timeout: policy.timeout
@@ -660,10 +709,6 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         let headers = response.headers.reduce(into: [String: [String]]()) { output, item in
             output[item.key.lowercased(), default: []].append(contentsOf: item.value)
         }
-        guard let contentType = headers["content-type"], contentType.count == 1,
-              isJSONContentType(contentType[0]) else {
-            throw SwanError.unauthorized("OAuth remote document has non-JSON content type")
-        }
         if let lengths = headers["content-length"] {
             guard lengths.count == 1, let declared = strictDecimal(lengths[0]),
                   declared <= policy.maximumBodyBytes, declared == response.body.count else {
@@ -673,16 +718,56 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         guard !response.body.isEmpty, response.body.count <= policy.maximumBodyBytes else {
             throw SwanError.unauthorized("OAuth remote document body is out of bounds")
         }
+        return (response.body, headers)
+    }
+
+    fileprivate func fetchJSONWithoutAdmission(from url: URL) async throws
+        -> Data
+    {
+        let (body, headers) = try await fetchValidatedResponse(from: url)
+        guard let contentType = headers["content-type"], contentType.count == 1,
+              isJSONContentType(contentType[0]) else {
+            throw SwanError.unauthorized("OAuth remote document has non-JSON content type")
+        }
         // The duplicate-member scanner also verifies complete JSON syntax. Keep
         // the bytes unmodified so metadata/JWKS decoders see exactly what was
         // validated and any caller can bind an audit hash if needed.
-        try StrictJSON.validate(response.body)
-        return response.body
+        try StrictJSON.validate(body)
+        return body
     }
 
+    /// Bytes path for binary payloads (e.g. a CAR file). Shares every network
+    /// control with `fetchJSONWithoutAdmission` through `fetchValidatedResponse`
+    /// and intentionally skips the JSON-only checks — content-type-is-JSON and
+    /// `StrictJSON.validate` — which do not apply to a non-JSON body.
+    fileprivate func fetchBytesWithoutAdmission(from url: URL) async throws
+        -> Data
+    {
+        try await fetchValidatedResponse(from: url).body
+    }
+
+    /// `application/json` or any RFC 6839 `+json` structured-syntax suffix.
+    ///
+    /// DID documents are served as `application/did+ld+json` — the
+    /// W3C-registered type; bulleted.app and plc.directory both use it — and
+    /// the exact-match here made every DID-document resolution answer
+    /// `ServiceNotResolvable` (Erratum 03 addendum, defect class instance
+    /// #9). The suffix declares the payload IS JSON, and the protection was
+    /// never the media-type string: `StrictJSON.validate` runs on the bytes
+    /// either way, and the domain decoder still decides what those bytes may
+    /// mean.
     private func isJSONContentType(_ value: String) -> Bool {
         let mediaType = value.split(separator: ";", maxSplits: 1)[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return mediaType == "application/json"
+        if mediaType == "application/json" { return true }
+        guard mediaType.hasSuffix("+json"), mediaType.utf8.count <= 127,
+              let slash = mediaType.firstIndex(of: "/"),
+              slash != mediaType.startIndex else {
+            return false
+        }
+        let subtype = mediaType[mediaType.index(after: slash)...]
+        return subtype.count > "+json".count
+            && !subtype.contains("/")
+            && mediaType.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7F })
     }
 
     private func strictDecimal(_ value: String) -> Int? {
@@ -760,6 +845,19 @@ public final class AsyncHTTPClientOAuthPostTransport: OAuthRemotePostTransport {
     }
 }
 
+/// A verified-peer HTTP 4xx on an outbound notification POST. The receiver
+/// answered and refused: retrying cannot succeed, and a queue that retries it
+/// anyway grinds forever on a permanent failure (the nest push-stall lesson;
+/// bulleted.app's absent deletion receiver produced exactly that here).
+/// Callers acknowledge these rather than retrying.
+public struct OAuthOutboundPostPermanentlyRejected: Error, Sendable, Equatable {
+    public let status: Int
+
+    public init(status: Int) {
+        self.status = status
+    }
+}
+
 /// Applies the same URL, DNS re-resolution, peer-address, redirect, timeout,
 /// and response-size policy as OAuth metadata discovery to a small JSON POST.
 /// It intentionally does not inspect a success body: service notifications
@@ -816,7 +914,6 @@ public struct OAuthBoundedJSONPoster: Sendable {
         try policy.validateResolved(Array(finalAddresses), host: host)
         guard response.redirectCount == 0,
               response.responseURL.absoluteString == url.absoluteString,
-              (200 ... 299).contains(response.status),
               response.body.count <= policy.maximumBodyBytes else {
             throw SwanError.unauthorized("outbound notification response is invalid")
         }
@@ -825,6 +922,14 @@ public struct OAuthBoundedJSONPoster: Sendable {
               finalAddresses.contains(peer),
               policy.permits(peer, forHost: host) else {
             throw SwanError.unauthorized("outbound notification peer is forbidden")
+        }
+        // Status is classified only AFTER the peer proof above: a forged
+        // response must never be able to acknowledge (4xx) a delivery.
+        if (400 ... 499).contains(response.status) {
+            throw OAuthOutboundPostPermanentlyRejected(status: response.status)
+        }
+        guard (200 ... 299).contains(response.status) else {
+            throw SwanError.unavailable("outbound notification response status is retryable")
         }
         let normalized = response.headers.reduce(into: [String: [String]]()) { output, item in
             output[item.key.lowercased(), default: []].append(contentsOf: item.value)

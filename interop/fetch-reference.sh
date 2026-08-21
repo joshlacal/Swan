@@ -1,35 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly COMMIT="3f6c96d5d2d25438bd40fa89d6ecc37865f8e354"
-readonly ARCHIVE_SHA256="1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea"
-readonly DESTINATION=".interop-cache/atproto-${COMMIT}"
-readonly ARCHIVE=".interop-cache/atproto-${COMMIT}.tar.gz"
-readonly STAGING=".interop-cache/.atproto-${COMMIT}.staging"
+# Two pinned reference archives coexist deliberately:
+#  - bddc99fb… is the wire/profile pin (permissioned-data-0016-2026-08-15):
+#    lexicons, generated wire sources, and contract tests read this tree.
+#  - 3f6c96d5… is the interop-lab pin: the dockerized reference PDS and its
+#    overlay patches still build from this tree until the lab is re-pinned.
+# Fetching is idempotent per pin; an already-materialized tree is left alone.
+readonly PINS=(
+  "bddc99fb24c34b4078b9bf65837283f37b49ab66 84b9a245be65758c577020dbe68a78039ce2d8acb5ead052043ed30c314f4d7e"
+  "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354 1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea"
+)
 
 mkdir -p .interop-cache
-if [[ -e "${DESTINATION}" ]]; then
-  echo "${DESTINATION} already exists; remove or archive it explicitly before refetching" >&2
-  exit 1
-fi
-curl --fail --location --retry 3 \
-  "https://github.com/bluesky-social/atproto/archive/${COMMIT}.tar.gz" \
-  -o "${ARCHIVE}"
-actual_sha256="$(shasum -a 256 "${ARCHIVE}" | awk '{print $1}')"
-if [[ "${actual_sha256}" != "${ARCHIVE_SHA256}" ]]; then
-  echo "reference archive checksum mismatch" >&2
-  exit 1
-fi
-rm -rf "${STAGING}"
-mkdir -p "${STAGING}"
-trap 'rm -rf "${STAGING}"' EXIT
-tar -xzf "${ARCHIVE}" --strip-components=1 -C "${STAGING}"
-for required in package.json pnpm-lock.yaml services/pds/Dockerfile packages/pds/package.json; do
-  if [[ ! -f "${STAGING}/${required}" ]]; then
-    echo "verified reference archive is missing required PDS source" >&2
+for pin in "${PINS[@]}"; do
+  commit="${pin%% *}"
+  archive_sha256="${pin##* }"
+  destination=".interop-cache/atproto-${commit}"
+  archive=".interop-cache/atproto-${commit}.tar.gz"
+  staging=".interop-cache/.atproto-${commit}.staging"
+
+  if [[ -e "${destination}" ]]; then
+    echo "${destination} already materialized"
+    continue
+  fi
+  curl --fail --location --retry 3 \
+    "https://github.com/bluesky-social/atproto/archive/${commit}.tar.gz" \
+    -o "${archive}"
+  actual_sha256="$(shasum -a 256 "${archive}" | awk '{print $1}')"
+  if [[ "${actual_sha256}" != "${archive_sha256}" ]]; then
+    echo "reference archive checksum mismatch for ${commit}" >&2
     exit 1
   fi
+  rm -rf "${staging}"
+  mkdir -p "${staging}"
+  trap 'rm -rf "${staging}"' EXIT
+  tar -xzf "${archive}" --strip-components=1 -C "${staging}"
+  for required in package.json pnpm-lock.yaml services/pds/Dockerfile packages/pds/package.json; do
+    if [[ ! -f "${staging}/${required}" ]]; then
+      echo "verified reference archive is missing required PDS source" >&2
+      exit 1
+    fi
+  done
+  mv "${staging}" "${destination}"
+  trap - EXIT
+  echo "verified ${archive}"
 done
-mv "${STAGING}" "${DESTINATION}"
-trap - EXIT
-echo "verified ${ARCHIVE}"

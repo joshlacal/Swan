@@ -1,6 +1,7 @@
 import Crypto
 import Foundation
 import XCTest
+@testable import SwanCore
 @testable import SwanOAuth
 @testable import SwanSQLite
 @testable import SwanSpaces
@@ -8,20 +9,119 @@ import SwanCore
 import SwanStorage
 
 final class SwanOAuthTests: XCTestCase {
-    func testLocalhostQualifiedScopeEnvelopeRejectsAmbientAndMalformedTuples() throws {
-        let valid = "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=read"
+    /// Re-aimed for §9-D21. The envelope (`localhostRequestedScopes`) used to
+    /// carry a second issuance gate — `value == "atproto" || isIssuableQualified(value)`
+    /// — and this test asserted eight shapes bounced off it. D21 **deletes**
+    /// that gate rather than re-expressing it: the envelope is now a tokenizer
+    /// and a byte budget, nothing semantic. So every one of those shapes is
+    /// admitted here.
+    ///
+    /// **None of them is thereby granted anything.** Each was re-measured against
+    /// every layer, and each is still refused — the denial moved, it did not
+    /// disappear, which is exactly the claim §6.2 says must be checked rather
+    /// than assumed. Split accordingly: five are refused by the PARSER, three
+    /// are admitted by design and refused by the FENCES.
+    func testLocalhostScopeEnvelopeIsLexicalOnlyAndSemanticsMoveDownstream() throws {
+        let subject = "did:plc:abcdefghijklmnopqrstuvwx"
+        let valid = "space:app.example.space?authority=\(subject)&skey=whole-space&action=read"
         XCTAssertEqual(try OAuthClientMetadata.localhostRequestedScopes(valid), Set([valid]))
-        for invalid in [
+
+        // ── The envelope admits every one of them (D21 layer 1) ──────────────
+        let admittedByTheEnvelope = [
             "space:app.example.space",
             "space:*?authority=*&skey=*&action=read",
             "space:app.example.space?authority=not-a-did&skey=whole-space&action=read",
-            "space:not-an-nsid?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=read",
-            "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=*&action=read",
-            "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=anything",
-            "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=read&unknown=value",
-            "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&%61uthority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=read",
+            "space:not-an-nsid?authority=\(subject)&skey=whole-space&action=read",
+            "space:app.example.space?authority=\(subject)&skey=*&action=read",
+            "space:app.example.space?authority=\(subject)&skey=whole-space&action=anything",
+            "space:app.example.space?authority=\(subject)&skey=whole-space&action=read&unknown=value",
+            "space:app.example.space?authority=\(subject)&%61uthority=\(subject)&skey=whole-space&action=read",
+        ]
+        for scope in admittedByTheEnvelope {
+            XCTAssertNoThrow(
+                try OAuthClientMetadata.localhostRequestedScopes(scope),
+                """
+                §9-D21: the envelope is lexical + budget only. If this throws, a \
+                semantic gate has grown back at registration — the exact thing \
+                D21 deletes rather than relocates.
+                """
+            )
+        }
+
+        // ── Five are refused by the PARSER, each for its own stated reason ───
+        // Asserted with the reason, not merely "it throws": a vector that began
+        // failing for a different reason would otherwise look identical, and
+        // these five cover five different validator branches.
+        let refusedByTheParser: [(scope: String, because: String)] = [
+            ("space:app.example.space?authority=not-a-did&skey=whole-space&action=read",
+             "authority is not a DID"),
+            ("space:not-an-nsid?authority=\(subject)&skey=whole-space&action=read",
+             "the positional type is not an NSID"),
+            ("space:app.example.space?authority=\(subject)&skey=whole-space&action=anything",
+             "`anything` is not a SpaceAction"),
+            ("space:app.example.space?authority=\(subject)&skey=whole-space&action=read&unknown=value",
+             "`unknown` is not a declared parameter"),
+            // §7.3 D8 — a percent-decoded key collision. The two keys decode to
+            // the same name, so `single(\"authority\")` is `.repeated`. This is a
+            // real attack surface and the row §7.3 requires to STAY rejected.
+            ("space:app.example.space?authority=\(subject)&%61uthority=\(subject)&skey=whole-space&action=read",
+             "authority is single-valued and was supplied twice"),
+        ]
+        for vector in refusedByTheParser {
+            XCTAssertThrowsError(
+                try AtprotoScope.parse(vector.scope),
+                "must be refused at the parser — \(vector.because)"
+            )
+        }
+
+        // ── Three PARSE, and are held by the fences instead ──────────────────
+        // These are the shapes D21 deliberately admits. The property that
+        // replaced the gate is that they amplify into nothing: no delegation
+        // exchange, no aggregate listing, no write target.
+        for scope in [
+            "space:app.example.space",
+            "space:*?authority=*&skey=*&action=read",
+            "space:app.example.space?authority=\(subject)&skey=*&action=read",
         ] {
-            XCTAssertThrowsError(try OAuthClientMetadata.localhostRequestedScopes(invalid), invalid)
+            XCTAssertNoThrow(try AtprotoScope.parse(scope), "D21 admits this shape")
+            let permissions = SwanScopePermissions(rawScopes: ["atproto", scope], subject: subject)
+            XCTAssertTrue(permissions.rejected.isEmpty, scope)
+
+            // No write target, in any collection (M5): an empty `collection`
+            // list means NONE, not all.
+            for verb in [SpaceScopeTarget.Operation.RecordWrite.create, .update, .delete] {
+                XCTAssertFalse(
+                    permissions.allowsSpace(
+                        SpaceScopeTarget(
+                            type: "app.example.space",
+                            authority: subject,
+                            skey: "whole-space",
+                            operation: .write(verb, collection: "app.example.record")
+                        )
+                    ),
+                    "M5: \(scope) must have no write targets"
+                )
+            }
+            // No aggregate listing: the §6.1 fence needs literally-stated
+            // `skey=*` and a literal single `action=read`, carried as DURABLE
+            // provenance (§9-D23). A value reconstructed from the scope string —
+            // which is what this is — must never satisfy it.
+            XCTAssertFalse(
+                permissions.allowsSpaceListing(type: "app.example.space", authority: nil),
+                "§6.1: an aggregate listing needs stated provenance, not a re-parsed string"
+            )
+            // No delegation exchange, for the same reason (§5.6.3).
+            XCTAssertFalse(
+                permissions.allowsSpace(
+                    SpaceScopeTarget(
+                        type: "app.example.space",
+                        authority: subject,
+                        skey: "whole-space",
+                        operation: .delegationExchange
+                    )
+                ),
+                "§5.6.3: the delegation fence needs stated provenance"
+            )
         }
     }
 
@@ -1255,7 +1355,12 @@ final class SwanOAuthTests: XCTestCase {
         let badResponses: [OAuthRemoteHTTPResponse] = [
             .init(status: 302, headers: ["content-type": ["application/json"]], body: body, responseURL: url),
             .init(status: 200, headers: ["content-type": ["text/html"]], body: body, responseURL: url),
-            .init(status: 200, headers: ["content-type": ["application/problem+json"]], body: body, responseURL: url),
+            // Erratum 03 addendum: `+json` suffix types are JSON and now pass
+            // the content-type gate (pinned in
+            // testHardenedRemoteFetcherAcceptsStructuredJSONSuffixTypes), so
+            // this rejection vector uses a genuinely non-JSON type instead of
+            // the former `application/problem+json`.
+            .init(status: 200, headers: ["content-type": ["application/xml"]], body: body, responseURL: url),
             .init(status: 200, headers: ["content-type": ["application/json"]], body: Data(repeating: 0x20, count: 1_025), responseURL: url),
             .init(status: 200, headers: ["content-type": ["application/json"]], body: body, responseURL: URL(string: "https://other.example/")!),
             .init(status: 200, headers: ["content-type": ["application/json"]], body: body, responseURL: url, redirectCount: 1),
@@ -1279,6 +1384,191 @@ final class SwanOAuthTests: XCTestCase {
             )
         )
         await XCTAssertThrowsErrorAsync(try await nilPeerFetcher.fetchJSON(from: url))
+    }
+
+    /// Erratum 03 addendum (defect class instance #9): `fetchJSON` accepts
+    /// `application/json` and any RFC 6839 `+json` structured-syntax suffix —
+    /// DID documents arrive as `application/did+ld+json` from bulleted.app
+    /// and plc.directory alike, and the exact match made every DID-document
+    /// resolution unresolvable. Non-JSON types still refuse, as does a bare
+    /// suffix with no subtype name.
+    func testHardenedRemoteFetcherAcceptsStructuredJSONSuffixTypes() async throws {
+        let url = URL(string: "https://metadata.example/.well-known/did.json")!
+        let publicAddress = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+        let body = Data(#"{"id":"did:web:metadata.example"}"#.utf8)
+        let policy = try OAuthRemoteFetchPolicy(maximumBodyBytes: 1_024, timeout: 2)
+
+        for accepted in [
+            "application/did+ld+json; charset=utf-8",
+            "application/did+json",
+            "application/json",
+        ] {
+            let fetcher = OAuthRemoteDocumentFetcher(
+                policy: policy,
+                resolver: TestResolver(answers: [[publicAddress], [publicAddress]]),
+                transport: TestTransport(responses: [url.absoluteString: .init(
+                    status: 200,
+                    headers: ["Content-Type": [accepted]],
+                    body: body,
+                    responseURL: url,
+                    connectedPeerAddress: publicAddress
+                )])
+            )
+            let fetched = try await fetcher.fetchJSON(from: url)
+            XCTAssertEqual(fetched, body, "content-type \(accepted) must be accepted")
+        }
+
+        for refused in ["text/html", "application/+json", "text/json", "application/jsonx"] {
+            let fetcher = OAuthRemoteDocumentFetcher(
+                policy: policy,
+                resolver: TestResolver(answers: [[publicAddress], [publicAddress]]),
+                transport: TestTransport(responses: [url.absoluteString: .init(
+                    status: 200,
+                    headers: ["Content-Type": [refused]],
+                    body: body,
+                    responseURL: url,
+                    connectedPeerAddress: publicAddress
+                )])
+            )
+            do {
+                _ = try await fetcher.fetchJSON(from: url)
+                XCTFail("content-type \(refused) must be refused")
+            } catch {}
+        }
+    }
+
+    /// `fetchBytes` must inherit every control `fetchJSON` has except the
+    /// JSON-specific ones (content-type-is-JSON, `StrictJSON.validate`),
+    /// which do not apply to a binary payload like a CAR. A test that only
+    /// asserted "bytes come back" would pass even if `fetchBytes` bypassed
+    /// URL policy, the peer proof, redirect policy, or the body cap — so
+    /// each control gets its own assertion, mirroring
+    /// `testHardenedRemoteFetcherRejectsUnsafeDNSAndBadResponses` above but
+    /// through the bytes path.
+    func testHardenedRemoteFetcherFetchBytesInheritsControls() async throws {
+        let url = URL(string: "https://metadata.example/proof.car")!
+        let publicAddress = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+        let privateAddress = try XCTUnwrap(OAuthIPAddress(literal: "10.0.0.7"))
+        let privateV6 = try XCTUnwrap(OAuthIPAddress(literal: "fc00::7"))
+        let body = Data([0x01, 0x71, 0xA0, 0xE4, 0x02, 0x20])
+        let policy = try OAuthRemoteFetchPolicy(maximumBodyBytes: 1_024, timeout: 2)
+
+        // Happy path: non-JSON content type succeeds for fetchBytes even
+        // though it would fail fetchJSON, proving fetchBytes genuinely skips
+        // only the JSON-specific checks rather than accidentally becoming
+        // permissive elsewhere.
+        let safeResolver = TestResolver(answers: [[publicAddress], [publicAddress]])
+        let safeTransport = TestTransport(responses: [url.absoluteString: .init(
+            status: 200,
+            headers: ["Content-Type": ["application/vnd.ipld.car"]],
+            body: body,
+            responseURL: url,
+            connectedPeerAddress: publicAddress
+        )])
+        let fetcher = OAuthRemoteDocumentFetcher(policy: policy, resolver: safeResolver, transport: safeTransport)
+        let fetched = try await fetcher.fetchBytes(from: url)
+        XCTAssertEqual(fetched, body)
+
+        // Private-address peer is refused, same as fetchJSON.
+        for unsafe in [privateAddress, privateV6] {
+            let resolver = TestResolver(answers: [[unsafe]])
+            let transport = TestTransport(responses: [:])
+            let unsafeFetcher = OAuthRemoteDocumentFetcher(policy: policy, resolver: resolver, transport: transport)
+            await XCTAssertThrowsErrorAsync(try await unsafeFetcher.fetchBytes(from: url))
+        }
+
+        // DNS-rebinding peer mismatch between preflight and postflight answer
+        // sets is refused, same as fetchJSON.
+        let rebindingResolver = TestResolver(answers: [[publicAddress], [privateAddress]])
+        let rebindingTransport = TestTransport(responses: [url.absoluteString: .init(
+            status: 200,
+            headers: ["content-type": ["application/vnd.ipld.car"]],
+            body: body,
+            responseURL: url,
+            connectedPeerAddress: publicAddress
+        )])
+        let rebindingFetcher = OAuthRemoteDocumentFetcher(
+            policy: policy, resolver: rebindingResolver, transport: rebindingTransport
+        )
+        await XCTAssertThrowsErrorAsync(try await rebindingFetcher.fetchBytes(from: url))
+
+        // Over-cap body, redirect, wrong response URL, and a nil connected
+        // peer are all refused, same as fetchJSON. Content type is
+        // deliberately NOT included here since it is JSON-only.
+        let badResponses: [OAuthRemoteHTTPResponse] = [
+            .init(status: 302, headers: ["content-type": ["application/vnd.ipld.car"]], body: body, responseURL: url),
+            .init(status: 200, headers: ["content-type": ["application/vnd.ipld.car"]], body: Data(repeating: 0x20, count: 1_025), responseURL: url),
+            .init(status: 200, headers: ["content-type": ["application/vnd.ipld.car"]], body: body, responseURL: URL(string: "https://other.example/")!),
+            .init(status: 200, headers: ["content-type": ["application/vnd.ipld.car"]], body: body, responseURL: url, redirectCount: 1),
+            .init(status: 200, headers: ["content-type": ["application/vnd.ipld.car"]], body: body, responseURL: url, connectedPeerAddress: privateAddress),
+        ]
+        for response in badResponses {
+            let resolver = TestResolver(answers: [[publicAddress], [publicAddress]])
+            let transport = TestTransport(responses: [url.absoluteString: response])
+            let badFetcher = OAuthRemoteDocumentFetcher(policy: policy, resolver: resolver, transport: transport)
+            await XCTAssertThrowsErrorAsync(try await badFetcher.fetchBytes(from: url))
+        }
+        let nilPeerFetcher = OAuthRemoteDocumentFetcher(
+            policy: policy,
+            resolver: TestResolver(answers: [[publicAddress], [publicAddress]]),
+            transport: TestTransport(
+                responses: [url.absoluteString: .init(
+                    status: 200, headers: ["content-type": ["application/vnd.ipld.car"]],
+                    body: body, responseURL: url
+                )],
+                reportsConnectedPeer: false
+            )
+        )
+        await XCTAssertThrowsErrorAsync(try await nilPeerFetcher.fetchBytes(from: url))
+
+        // Malformed/non-HTTPS URLs are refused before any network work,
+        // same as fetchJSON's policy.validateURL gate.
+        let insecureURL = URL(string: "http://metadata.example/proof.car")!
+        await XCTAssertThrowsErrorAsync(try await fetcher.fetchBytes(from: insecureURL))
+    }
+
+    /// Confirms the DNS-preflight/postflight deadline race — the mechanism
+    /// most likely to be silently dropped by a naive refactor — applies to
+    /// `fetchBytes` exactly as it does to `fetchJSON` in
+    /// `testHardenedRemoteFetcherBoundsPreAndPostDNSResolution` below.
+    func testHardenedRemoteFetcherFetchBytesBoundsPreAndPostDNSResolution() async throws {
+        let url = URL(string: "https://metadata.example/proof.car")!
+        let publicAddress = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+        let body = Data([0x01, 0x71, 0xA0, 0xE4])
+        let policy = try OAuthRemoteFetchPolicy(maximumBodyBytes: 1_024, timeout: 0.05)
+        let response = OAuthRemoteHTTPResponse(
+            status: 200,
+            headers: ["content-type": ["application/vnd.ipld.car"]],
+            body: body,
+            responseURL: url,
+            connectedPeerAddress: publicAddress
+        )
+
+        let slowPreflightTransport = TestTransport(responses: [url.absoluteString: response])
+        let slowPreflight = OAuthRemoteDocumentFetcher(
+            policy: policy,
+            resolver: DelayedTestResolver(
+                address: publicAddress, delay: 0.75, delayFirstResolution: true),
+            transport: slowPreflightTransport
+        )
+        let preflightStart = Date()
+        await XCTAssertThrowsErrorAsync(try await slowPreflight.fetchBytes(from: url))
+        XCTAssertLessThan(Date().timeIntervalSince(preflightStart), 0.4)
+        let preflightRequests = await slowPreflightTransport.requestCount()
+        XCTAssertEqual(preflightRequests, 0)
+
+        let slowPostflightTransport = TestTransport(responses: [url.absoluteString: response])
+        let slowPostflight = OAuthRemoteDocumentFetcher(
+            policy: policy,
+            resolver: DelayedTestResolver(
+                address: publicAddress, delay: 0.75, delayFirstResolution: false),
+            transport: slowPostflightTransport
+        )
+        let postflightStart = Date()
+        await XCTAssertThrowsErrorAsync(try await slowPostflight.fetchBytes(from: url))
+        XCTAssertLessThan(Date().timeIntervalSince(postflightStart), 0.4)
+        let postflightRequests = await slowPostflightTransport.requestCount()
+        XCTAssertEqual(postflightRequests, 1)
     }
 
     func testHardenedRemoteFetcherBoundsPreAndPostDNSResolution() async throws {

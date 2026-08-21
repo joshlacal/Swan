@@ -162,7 +162,25 @@ public struct OAuthTokenPair: Sendable, Equatable {
 public struct OAuthTokenGrantResult: Sendable, Equatable {
     public let accessToken: String
     public let accessExpiresAt: Date
+    /// The **effective** grant this token carries — post-`self` resolution
+    /// (§9-D8). This is what the resource plane enforces against, and what the
+    /// OAuth `scope` response member reports.
     public let scopes: Set<String>
+    /// The **pre-resolution** set: exactly the bytes the client asked for.
+    ///
+    /// Exposed because `scopes` alone cannot answer the question §6.7's dual-field
+    /// guarantee exists to answer. For an `authority=self` grant — the grammar's
+    /// default, so nearly every grant Swan issues — the two deliberately differ,
+    /// and a caller comparing only `scopes` against what it requested can tell
+    /// that *something* changed but not *what*: "the pre-resolution set was
+    /// preserved" and "the set was mutated some other way" are indistinguishable.
+    /// That distinction is exactly what §9-D20's refresh baseline turns on, so it
+    /// has to be observable from the value a caller actually receives.
+    ///
+    /// Equal to `scopes` when nothing was rewritten — the same total-function
+    /// rule as the durable `scopes_requested ?? scopes` (§6.7), surfaced here
+    /// already resolved so no caller re-implements the `??`.
+    public let scopesRequested: Set<String>
     public let subject: String
     /// Omitted when the metadata that authorized this code did not declare
     /// the `refresh_token` grant. The durable token pair is intentionally not
@@ -174,13 +192,18 @@ public struct OAuthTokenGrantResult: Sendable, Equatable {
         accessExpiresAt: Date,
         scopes: Set<String>,
         subject: String,
-        refreshToken: String?
+        refreshToken: String?,
+        /// Omit when the caller has no pre-resolution set to report; it then
+        /// equals `scopes`, which is the correct answer for a grant Swan did
+        /// not rewrite.
+        scopesRequested: Set<String>? = nil
     ) {
         self.accessToken = accessToken
         self.accessExpiresAt = accessExpiresAt
         self.scopes = scopes
         self.subject = subject
         self.refreshToken = refreshToken
+        self.scopesRequested = scopesRequested ?? scopes
     }
 }
 

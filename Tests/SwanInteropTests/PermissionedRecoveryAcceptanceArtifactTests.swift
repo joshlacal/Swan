@@ -49,10 +49,10 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
             ikm: Bytes(data: envelope.context.ikm),
             sig: Bytes(data: envelope.contextSignature),
             mac: Bytes(data: envelope.contentBinding),
-            rev: revision
+            rev: try TID(tidString: revision)
         )
         let op = ComAtprotoSpaceListRepoOps.OpEntry(
-            rev: revision,
+            rev: try TID(tidString: revision),
             collection: try NSID(nsidString: collection),
             rkey: try RecordKey(keyString: rkey),
             cid: cid,
@@ -142,7 +142,7 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
 
         XCTAssertEqual(artifact.applyStatus, 200)
         XCTAssertEqual(artifact.witnessStatus, 200)
-        XCTAssertEqual(artifact.profileID, "permissioned-data-0016-2026-07-30")
+        XCTAssertEqual(artifact.profileID, "permissioned-data-0016-2026-08-15")
         XCTAssertTrue(artifact.fixturePolicy.hasPrefix("summary-only"))
         XCTAssertEqual(artifact.terminalRevision, "3lqjz7x4abc2m")
         XCTAssertEqual(artifact.operationCount, 3)
@@ -210,7 +210,7 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
             errorCode: nil
         )
 
-        XCTAssertEqual(artifact.profileID, "permissioned-data-0016-2026-07-30")
+        XCTAssertEqual(artifact.profileID, "permissioned-data-0016-2026-08-15")
         XCTAssertEqual(artifact.gapErrorCode, "full_repo_recovery_required")
         XCTAssertEqual(artifact.priorCommitment, digest)
         XCTAssertTrue(artifact.replacementCASAdvanced)

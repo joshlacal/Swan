@@ -172,14 +172,17 @@ private struct AuthenticatedGetLatestCommitHandler:
             author: target.author,
             authorization: authorization
         )
-        return .init(
-            commit: try await signedCommit(
-                state: state,
-                expectedSpace: target.space,
-                expectedAuthor: target.author,
-                capability: capability
-            )
-        )
+        guard let commit = try await signedCommit(
+            state: state,
+            expectedSpace: target.space,
+            expectedAuthor: target.author,
+            capability: capability
+        ) else {
+            // The live lexicon requires `commit` and declares RepoNotFound
+            // for an account holding no repo in the space.
+            throw AuthenticatedSpaceRepositorySyncFailure.repoNotFound
+        }
+        return .init(commit: commit)
     }
 }
 
@@ -212,7 +215,7 @@ private struct AuthenticatedListRepoOpsHandler:
             read = try await capability.directory.repositoryOplog(
                 space: target.space,
                 author: target.author,
-                since: parameters.since,
+                since: parameters.since?.toString(),
                 limit: limit,
                 includeValues: parameters.excludeValues != true,
                 maximumAggregateValueBytes: PublicRepositoryJSONReadLimits
@@ -260,7 +263,7 @@ private struct AuthenticatedListRepoOpsHandler:
 }
 
 private func syncTarget(
-    _ spaceValue: ATProtocolURI,
+    _ spaceValue: SpaceRef,
     _ repoValue: DID
 ) throws -> (space: SpaceURI, author: String) {
     do {
@@ -304,7 +307,7 @@ private func authorizeRepositorySyncRead(
 ) async throws -> AuthorizationContext {
     let bearerToken: String?
     do {
-        bearerToken = try exactBearerToken(from: request.headers)
+        bearerToken = try spaceCredentialSchemeToken(from: request.headers)
     } catch {
         throw AuthenticatedSpaceRepositorySyncFailure.denied
     }
@@ -408,14 +411,14 @@ private func signedCommit(
         ikm: Bytes(data: envelope.context.ikm),
         sig: Bytes(data: envelope.contextSignature),
         mac: Bytes(data: envelope.contentBinding),
-        rev: envelope.context.rev
+        rev: try TID(tidString: envelope.context.rev)
     )
 }
 
 private func syncWireOperation(
     _ entry: AuthorizedSpaceRepositoryOplogEntry
 ) throws -> ComAtprotoSpaceListRepoOps.OpEntry {
-    let revision = try TID(tidString: entry.wireRevision).toString()
+    let revision = try TID(tidString: entry.wireRevision)
     let collection = try NSID(nsidString: entry.collection)
     let rkey = try RecordKey(keyString: entry.rkey)
     let cid = try entry.cid.map(CID.parse)
@@ -457,29 +460,43 @@ private func syncWireOperation(
     )
 }
 
+/// The alias name for `com.atproto.space.getLatestCommit`.
+///
+/// `getLatestCommit` is the canonical proposal name; `getRepoState` is the
+/// name the atproto-crates reference PDS shipped before the draft settled,
+/// kept there (and in pds.js) as an alias to the same handler. Clients built
+/// on those crates — bulleted.app — probe for the alias and treat a 404 as
+/// "no spaces plane", so Swan serves both names for the one method.
+let spaceGetRepoStateAliasNSID = "com.atproto.space.getRepoState"
+
 func registerAuthenticatedGetLatestCommitEndpoint(
     on router: Router<BasicRequestContext>,
     capability: SwanAuthenticatedSpaceRepositorySyncCapability
 ) {
     let handler = AuthenticatedGetLatestCommitHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.space.getLatestCommit"
-    router.get(path) { request, _ async -> Response in
-        let parameters: ComAtprotoSpaceGetLatestCommit.Parameters
-        do {
-            parameters = try parseAuthenticatedGetLatestCommitParameters(request)
-        } catch {
-            return authenticatedRepositorySyncError(.badRequest, code: "InvalidRequest")
+    let paths: [RouterPath] = [
+        "/xrpc/com.atproto.space.getLatestCommit",
+        RouterPath("/xrpc/\(spaceGetRepoStateAliasNSID)"),
+    ]
+    for path in paths {
+        router.get(path) { request, _ async -> Response in
+            let parameters: ComAtprotoSpaceGetLatestCommit.Parameters
+            do {
+                parameters = try parseAuthenticatedGetLatestCommitParameters(request)
+            } catch {
+                return authenticatedRepositorySyncError(.badRequest, code: "InvalidRequest")
+            }
+            do {
+                let output = try await handler.handle(parameters: parameters, input: (), context: request)
+                return authenticatedGetLatestCommitJSON(.ok, output)
+            } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
+                return authenticatedRepositorySyncResponse(for: failure, capability: capability)
+            } catch {
+                return authenticatedRepositorySyncError(.serviceUnavailable, code: "temporarily_unavailable")
+            }
         }
-        do {
-            let output = try await handler.handle(parameters: parameters, input: (), context: request)
-            return authenticatedGetLatestCommitJSON(.ok, output)
-        } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
-            return authenticatedRepositorySyncResponse(for: failure, capability: capability)
-        } catch {
-            return authenticatedRepositorySyncError(.serviceUnavailable, code: "temporarily_unavailable")
-        }
+        registerAuthenticatedRepositorySyncWrongMethods(on: router, path: path)
     }
-    registerAuthenticatedRepositorySyncWrongMethods(on: router, path: path)
 }
 
 func registerAuthenticatedListRepoOpsEndpoint(
@@ -574,7 +591,7 @@ private func parseAuthenticatedGetLatestCommitParameters(
         request,
         schema: spaceGetLatestCommitQuerySchema
     )
-    let space = try ATProtocolURI(
+    let space = try SpaceRef(
         uriString: try requiredQueryValue("space", in: query, maximumBytes: 2_048)
     )
     let repo = try DID(
@@ -591,7 +608,7 @@ private func parseAuthenticatedListRepoOpsParameters(
         request,
         schema: spaceListRepoOpsQuerySchema
     )
-    let space = try ATProtocolURI(
+    let space = try SpaceRef(
         uriString: try requiredQueryValue("space", in: query, maximumBytes: 2_048)
     )
     let repo = try DID(
@@ -600,7 +617,7 @@ private func parseAuthenticatedListRepoOpsParameters(
     _ = try syncTarget(space, repo)
     let since = try query["since"].map {
         let value = try bounded($0, maximumBytes: 32)
-        return try TID(tidString: value).toString()
+        return try TID(tidString: value)
     }
     let limit = try query["limit"].map(strictRepositoryOplogLimit)
     let excludeValues = try query["excludeValues"].map(strictBoolean)
@@ -620,7 +637,7 @@ private func parseAuthenticatedGetRepoParameters(
         request,
         schema: spaceGetRepoQuerySchema
     )
-    let space = try ATProtocolURI(
+    let space = try SpaceRef(
         uriString: try requiredQueryValue("space", in: query, maximumBytes: 2_048)
     )
     let repo = try DID(
@@ -748,7 +765,7 @@ private func signedCommitWire(
             ikm: $0.ikm,
             sig: $0.sig,
             mac: $0.mac,
-            rev: $0.rev
+            rev: $0.rev.toString()
         )
     }
 }
@@ -773,7 +790,7 @@ private func authenticatedListRepoOpsJSON(
         RepoOplogWireOutput(
             ops: output.ops.map {
                 RepoOplogWireEntry(
-                    rev: $0.rev,
+                    rev: $0.rev.toString(),
                     collection: $0.collection.nsidString(),
                     rkey: $0.rkey.value,
                     cid: $0.cid?.string,

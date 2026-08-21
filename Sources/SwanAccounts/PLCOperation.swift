@@ -62,6 +62,106 @@ public enum PLCDIDKeyCodec {
         return .secp256k1(point)
     }
 
+    /// The curve of a legacy W3C verification method, which — unlike a
+    /// `Multikey` — is carried in the document's `type` field rather than in
+    /// the key encoding itself.
+    public enum LegacyVerificationKeyCurve: Sendable, Equatable {
+        /// `EcdsaSecp256r1VerificationKey2019`.
+        case p256
+        /// `EcdsaSecp256k1VerificationKey2019`.
+        case secp256k1
+    }
+
+    /// Decodes the two **legacy** `publicKeyMultibase` spellings upstream
+    /// accepts alongside `Multikey`
+    /// (`ATPROTO_VERIFICATION_METHOD_TYPES`, `packages/did/src/atproto.ts:189-192`;
+    /// consumed by `getDidKeyFromMultibase`, `lex-resolver.ts:558-577`).
+    ///
+    /// **Why this lives here rather than behind a public `Base58BTC`.** The
+    /// lexicon-authority resolver needs these, and the obvious way to give it
+    /// them is to widen `Base58BTC`. That would defeat the reason this file
+    /// concentrates key parsing: a bare base58 decoder in a caller's hands can
+    /// accept a key-shaped string without ever proving its curve or point
+    /// encoding. So the whole proof stays in this file and callers get a
+    /// function that cannot be used without it.
+    ///
+    /// **How legacy differs from `Multikey`.** A `Multikey`'s bytes are
+    /// self-describing — a multicodec prefix names the curve, which is why
+    /// `decode(_:)` above can reject a mismatch outright. A legacy method's
+    /// bytes are a *raw* point with no prefix, and the curve comes from a
+    /// string in a document. That is weaker in principle but not exploitable
+    /// in this position: the key still has to verify a real commit signature
+    /// downstream, so a mistyped or attacker-chosen curve fails to construct
+    /// here or fails to verify there.
+    ///
+    /// Both point encodings are accepted and normalised to compressed, because
+    /// upstream normalises too — `formatMultikey` (`crypto/src/did.ts:26-41`)
+    /// calls `plugin.compressPubkey`, and `compressPubkey`
+    /// (`crypto/src/p256/encoding.ts:3-6`) is `ProjectivePoint.fromHex`, which
+    /// takes 33-byte compressed and 65-byte uncompressed alike. Accepting only
+    /// compressed here would have refused documents upstream resolves.
+    ///
+    /// **Residual divergence, deliberate and narrow.** Upstream's
+    /// `multibaseToBytes` (`crypto/src/multibase.ts:4-20`) handles several
+    /// multibase prefixes; this accepts only `z` (base58btc). That is the
+    /// encoding DID Core and every atproto producer actually emit for
+    /// `publicKeyMultibase`, and it keeps one alphabet in this file instead of
+    /// four. Recorded rather than hidden — a `did:web` document publishing a
+    /// base16 or base32 key is still refused.
+    public static func decodeLegacyMultibase(
+        _ multibase: String, curve: LegacyVerificationKeyCurve
+    ) throws -> PLCDIDVerificationKey {
+        guard multibase.hasPrefix("z"), multibase.utf8.count <= 256 else {
+            throw SwanError.invalidIdentifier("legacy verification method multibase")
+        }
+        let encoded = String(multibase.dropFirst())
+        let decoded = try Base58BTC.decode(encoded)
+        // Same canonical-form requirement the `did:key` path enforces: a
+        // non-canonical base58 spelling of the same bytes is refused, so a
+        // document cannot carry two encodings of one key.
+        guard Base58BTC.encode(decoded) == encoded else {
+            throw SwanError.invalidIdentifier("legacy verification method multibase")
+        }
+        switch curve {
+        case .p256:
+            do {
+                let key: P256.Signing.PublicKey
+                switch decoded.count {
+                case 33: key = try P256.Signing.PublicKey(compressedRepresentation: decoded)
+                case 65: key = try P256.Signing.PublicKey(x963Representation: decoded)
+                default: throw SwanError.invalidIdentifier("P-256 legacy verification method")
+                }
+                return .p256(key)
+            } catch {
+                throw SwanError.invalidIdentifier("P-256 legacy verification method")
+            }
+        case .secp256k1:
+            let compressed: Data
+            switch decoded.count {
+            case 33:
+                compressed = decoded
+            case 65:
+                // 0x04 ‖ X ‖ Y → (0x02 | lsb(Y)) ‖ X.
+                guard decoded[decoded.startIndex] == 0x04 else {
+                    throw SwanError.invalidIdentifier("secp256k1 legacy verification method")
+                }
+                let x = Data(decoded.dropFirst().prefix(32))
+                let yIsOdd = (decoded[decoded.index(decoded.startIndex, offsetBy: 64)] & 1) == 1
+                compressed = Data([yIsOdd ? 0x03 : 0x02]) + x
+            default:
+                throw SwanError.invalidIdentifier("secp256k1 legacy verification method")
+            }
+            do {
+                _ = try secp256k1.Signing.PublicKey(
+                    dataRepresentation: compressed, format: .compressed
+                )
+            } catch {
+                throw SwanError.invalidIdentifier("secp256k1 legacy verification method")
+            }
+            return .secp256k1(compressed)
+        }
+    }
+
     public static func validate(_ value: String) throws {
         _ = try decode(value)
     }

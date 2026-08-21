@@ -1,3 +1,4 @@
+import Crypto
 import Foundation
 import HTTPTypes
 import Hummingbird
@@ -44,6 +45,31 @@ private struct OAuthServerLoginForm {
   let csrf: String
   let handle: String
   let password: String
+  let authFactorToken: String?
+}
+
+private struct OAuthServerMFAForm {
+  let csrf: String
+  let handle: String
+  let kind: AuthenticationFactorKind
+  let factorID: String
+  let code: String?
+  let challenge: String?
+  let clientDataJSON: String?
+  let authenticatorData: String?
+  let credentialID: String?
+  let signature: String?
+
+  func payload() throws -> Data {
+    var value: [String: Any] = ["kind": kind.rawValue, "factorID": factorID]
+    if let code { value["code"] = code }
+    if let challenge { value["challenge"] = challenge }
+    if let clientDataJSON { value["clientDataJSON"] = clientDataJSON }
+    if let authenticatorData { value["authenticatorData"] = authenticatorData }
+    if let credentialID { value["credentialID"] = credentialID }
+    if let signature { value["signature"] = signature }
+    return try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+  }
 }
 
 private enum OAuthServerConsentDecision: String {
@@ -54,6 +80,19 @@ private enum OAuthServerConsentDecision: String {
 private struct OAuthServerConsentForm {
   let csrf: String
   let decision: OAuthServerConsentDecision
+}
+
+private func oauthServerAuthorizationContext(
+  session: OAuthBrowserApprovalSession,
+  binding: OAuthClientBinding
+) throws -> AccountAuthorizationContext {
+  try AccountAuthorizationContext(
+    channel: .oauth,
+    sessionID: session.csrfToken,
+    csrfDigest: Data(SHA256.hash(data: Data(session.csrfToken.utf8))),
+    clientID: binding.clientID,
+    requestDigest: Data(SHA256.hash(data: Data(session.requestURI.utf8))),
+    purpose: "oauthToken")
 }
 
 private enum OAuthServerTokenGrant: String {
@@ -132,6 +171,11 @@ func registerOAuthAuthorizationServerEndpoints(
       loginClientIdentityPolicy: loginClientIdentityPolicy,
       requestBodyAdmission: requestBodyAdmission)
   }
+  router.post("/oauth/authorize/mfa") { request, context async -> Response in
+    await completeOAuthServerAuthorizationMFA(
+      request: request, context: context, configuration: configuration, runtime: runtime,
+      requestBodyAdmission: requestBodyAdmission)
+  }
   router.post("/oauth/authorize/consent") { request, context async -> Response in
     await consentOAuthServerAuthorization(
       request: request, context: context, configuration: configuration, runtime: runtime,
@@ -158,16 +202,16 @@ func registerOAuthAuthorizationServerEndpoints(
 }
 
 /// - Parameter loginClientIdentityPolicy: How PAR resolves the requesting
-///   client's address for its admission budget. `nil` means the caller has not
-///   supplied one, and every PAR request then shares the single unidentified
-///   bucket — the budget still holds, but it is global rather than per peer.
-///   This is the degraded mode, not the intended one; pass the server's policy
-///   to get per-peer accounting.
+///   client's address for its admission budget. Deliberately required and
+///   deliberately not defaulted to `.direct`: behind a trusted proxy, `.direct`
+///   returns the proxy's own socket address for every request, so the budget
+///   would silently collapse from per-peer to one global bucket while still
+///   compiling and still passing its tests.
 func registerOAuthAuthorizationServerPAREndpoint(
   on router: Router<BasicRequestContext>,
   configuration: SwanOAuthAuthorizationServerConfiguration,
   runtime: SwanOAuthRuntime,
-  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy? = nil,
+  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy,
   requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
   router.post("/oauth/par") { request, context async -> Response in
@@ -186,7 +230,7 @@ private func handleOAuthServerPAR(
   context: SwanHTTPRequestContext,
   configuration: SwanOAuthAuthorizationServerConfiguration,
   runtime: SwanOAuthRuntime,
-  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy?,
+  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy,
   requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
   let form: OAuthServerPARForm
@@ -201,6 +245,19 @@ private func handleOAuthServerPAR(
         "failure": .string(String(describing: failure)),
       ])
     return oauthServerBodyFailurePAR(failure)
+  } catch let error as OAuthScopeAdmissionError {
+    // `invalid_scope` is new to Swan and describes the request's own text, so
+    // it discloses nothing server-side (§4.8). The subset failure keeps
+    // `invalid_request` — that one WOULD leak the client's registration — and
+    // the mapping lives on the error, not here, so the two cannot drift.
+    context.logger.info(
+      "oauth par rejected",
+      metadata: [
+        "stage": .string("scope_admission"),
+        "reason": .string(error.description),
+      ])
+    return oauthServerPARJSON(
+      .badRequest, OAuthServerPARError(error: error.oauthErrorCode))
   } catch let error as OAuthServerRequestError {
     context.logger.info(
       "oauth par rejected",
@@ -220,11 +277,7 @@ private func handleOAuthServerPAR(
     request: request, context: context, policy: loginClientIdentityPolicy) == .rateLimited
   {
     context.logger.info(
-      "oauth par rejected",
-      metadata: [
-        "stage": .string("peer_admission"),
-        "identity": .string(loginClientIdentityPolicy == nil ? "unwired" : "policy"),
-      ])
+      "oauth par rejected", metadata: ["stage": .string("peer_admission")])
     return oauthServerJSON(
       .tooManyRequests, OAuthServerPARError(error: "temporarily_unavailable"),
       headers: oauthServerRetryAfterHeaders())
@@ -255,9 +308,14 @@ private func handleOAuthServerPAR(
   }
   do {
     let client = try await configuration.clientMetadataLoader.load(clientID: form.clientID)
-    guard client.metadata.matchesRedirectURI(form.redirectURI),
-      form.scopes.isSubset(of: client.metadata.scopes)
-    else {
+    // The raw `form.scopes.isSubset(of: client.metadata.scopes)` that stood here
+    // is now stage C inside `OAuthScopeAdmissionPolicy`, reached through
+    // `OAuthValidatedSession` below, because the subset check must canonicalise
+    // both sides (§9-D7). Leaving the raw comparison in front of it would reject
+    // a client that spelled the same grant differently in its metadata and its
+    // request before the canonical form ever ran — the exact false negative the
+    // canonicalisation exists to remove.
+    guard client.metadata.matchesRedirectURI(form.redirectURI) else {
       // `invalid_request` is deliberately opaque on the wire; record the
       // distinguishing detail server-side so an operator can tell a redirect
       // mismatch from a scope mismatch without instrumenting the client.
@@ -266,10 +324,7 @@ private func handleOAuthServerPAR(
         metadata: [
           "stage": .string("client_binding"),
           "client_id": .string(form.clientID.absoluteString),
-          "redirect_matches": .string(
-            client.metadata.matchesRedirectURI(form.redirectURI) ? "true" : "false"),
-          "scopes_subset": .string(
-            form.scopes.isSubset(of: client.metadata.scopes) ? "true" : "false"),
+          "redirect_matches": .string("false"),
         ]
       )
       return oauthServerPARJSON(.badRequest, OAuthServerPARError(error: "invalid_request"))
@@ -289,6 +344,27 @@ private func handleOAuthServerPAR(
       dpopProof: dpop,
       clientAssertion: assertion
     )
+    // §5.7.5 call site 1. Alongside `OAuthValidatedSession.init` — after stages
+    // B/C/E have run over the raw set, because stage C compares *raw requested*
+    // against *registered* and both sides must still be in `include:` form.
+    //
+    // Two jobs, and this is the first: every `include:` must resolve, or the
+    // request is refused with `invalid_scope`. It fails HERE rather than at mint
+    // so a client learns its permission set is unresolvable while it can still
+    // do something about it, instead of after a user has authorized.
+    //
+    // The second job — building the consent payload — is finished at the consent
+    // render below (`loginOAuthServerAuthorization`), which is a different HTTP
+    // request in Swan than it is upstream. The expansion is not persisted into
+    // the PAR row: the binding must keep the client's own `include:` bytes for
+    // §6.7 / §9-D20, and the resolver's document cache serves the render for
+    // free inside the 90-second PAR lifetime.
+    let expansion = try await OAuthLexiconScopeResolution.expandIncludes(
+      form.scopes,
+      resolver: runtime.lexiconResolver,
+      stage: .pushedAuthorizationRequest
+    )
+    oauthServerLogEmptyExpansions(expansion.emptyExpansions, context: context, stage: "par")
     let requestURI = try await runtime.tokenService.createPushedAuthorizationRequest(
       session: session,
       state: form.state,
@@ -297,6 +373,36 @@ private func handleOAuthServerPAR(
     )
     return oauthServerPARJSON(
       .created, OAuthServerPARSuccess(requestURI: requestURI, expiresIn: 90))
+  } catch let error as OAuthScopeAdmissionError {
+    // Stages B, C and E reach the wire here. `invalid_scope` names a fault in
+    // the request's own text; `invalid_request` is retained for the subset
+    // failure so the client's registration stays undisclosed (§4.8).
+    context.logger.info(
+      "oauth par rejected",
+      metadata: [
+        "stage": .string("scope_admission"),
+        "client_id": .string(form.clientID.absoluteString),
+        "reason": .string(error.description),
+      ]
+    )
+    return oauthServerPARJSON(
+      .badRequest, OAuthServerPARError(error: error.oauthErrorCode))
+  } catch let error as OAuthScopeResolutionError {
+    // §5.7.5: `invalid_scope` here, `invalid_request` at token mint, for the
+    // SAME root cause. The asymmetry is upstream's
+    // (`request-manager.ts:293-312` vs `token-manager.ts:135-138`) and is kept
+    // for interop rather than silently unified; the code comes off the error's
+    // stage so the two legs cannot drift.
+    context.logger.info(
+      "oauth par rejected",
+      metadata: [
+        "stage": .string("lexicon_resolution"),
+        "client_id": .string(form.clientID.absoluteString),
+        "reason": .string(error.description),
+      ]
+    )
+    return oauthServerPARJSON(
+      .badRequest, OAuthServerPARError(error: error.oauthErrorCode))
   } catch let error as SwanError {
     if case .unavailable = error {
       context.logger.info(
@@ -389,12 +495,50 @@ private func loginOAuthServerAuthorization(
     case .allowed:
       break
     }
+    let authorizationContext = try oauthServerAuthorizationContext(
+      session: session, binding: pushed.binding)
     let authenticated: AccountAuthenticationSuccess
-    switch try await configuration.accounts.authenticateForLogin(
-      handle: form.handle,
-      password: form.password
-    ) {
+    let outcome: AccountLoginAuthenticationOutcome
+    if let grantDirectory = configuration.accounts as? any SwanAccountPortalAuthorizationGrantAccountDirectory {
+      outcome = try await grantDirectory.authenticateForLogin(
+        handle: form.handle,
+        password: form.password,
+        authFactorToken: form.authFactorToken,
+        authorizationContext: authorizationContext,
+        now: Date())
+    } else {
+      outcome = try await configuration.accounts.authenticateForLogin(
+        handle: form.handle,
+        password: form.password,
+        authFactorToken: form.authFactorToken,
+        authFactorSessionID: session.csrfToken)
+    }
+    switch outcome {
+    case let .authenticated(passwordProof) where passwordProof.requiresFactor:
+      guard let mfa = configuration.mfaService else {
+        return oauthServerAuthorizationError(.unauthorized)
+      }
+      let challenge = try await mfa.beginOAuthFactor(
+        accountDID: passwordProof.account.did,
+        sessionID: session.csrfToken,
+        context: authorizationContext,
+        factorID: nil,
+        now: Date())
+      let nonce = oauthServerCSPNonce()
+      return oauthServerHTML(
+        .ok,
+        oauthServerMFAChallengePage(
+          csrf: session.csrfToken,
+          handle: form.handle,
+          factor: challenge,
+          nonce: nonce),
+        formActionSource: oauthServerFormActionSource(pushed.binding.redirectURI),
+        cspNonce: nonce)
     case .rejected:
+      // A rejected phase-one attempt is terminal. Do not run a second
+      // password verification here: doing so would turn a browser form into
+      // an unbounded Argon2 oracle and would bypass the single admitted
+      // password phase required by the OAuth MFA protocol.
       return oauthServerAuthorizationError(.unauthorized)
     case let .authenticated(success):
       authenticated = success
@@ -403,15 +547,37 @@ private func loginOAuthServerAuthorization(
       requestURI: session.requestURI,
       subject: authenticated.account.did,
       subjectUpdatedAt: authenticated.account.updatedAt,
+      authorizationGrantDigest: authenticated.authorizationGrantDigest,
+      csrfToken: session.csrfToken,
       lifetime: session.expiresAt.timeIntervalSinceNow
     )
+    // §5.7.5 call site 1's second job. `include:` → concrete grants happens
+    // BEFORE the renderer extracts space types for display
+    // (`lexicon-manager.ts:21-36`), so the person authorizing sees the actual
+    // capabilities rather than an opaque permission-set name.
+    //
+    // Re-resolving here rather than carrying the PAR-time expansion is
+    // deliberate: it costs one cache read (the row was proved seconds ago, well
+    // inside the 5-minute refresh threshold), and the alternative — persisting a
+    // rendered payload into the PAR row — would put a display artifact in the
+    // durable binding that §6.7 defines as the client's own requested bytes.
+    //
+    // A failure here is fatal to the flow rather than a degraded render: a
+    // consent page that cannot say what is being granted must not be shown.
+    let expansion = try await OAuthLexiconScopeResolution.expandIncludes(
+      pushed.binding.scopes,
+      resolver: runtime.lexiconResolver,
+      stage: .pushedAuthorizationRequest
+    )
+    oauthServerLogEmptyExpansions(expansion.emptyExpansions, context: context, stage: "consent")
     return oauthServerHTML(
       .ok,
       SwanBrowserPages.consent(
         csrf: issued.session.csrfToken,
         subject: authenticated.account.did,
         clientID: pushed.binding.clientID,
-        scopes: pushed.binding.scopes
+        scopes: expansion.scopes,
+        emptyPermissionSets: expansion.emptyExpansions
       ),
       setCookie: oauthServerCookie(issued.value),
       formActionSource: oauthServerFormActionSource(pushed.binding.redirectURI)
@@ -432,6 +598,17 @@ private func loginOAuthServerAuthorization(
     context.logger.info(
       "oauth authorize rejected", metadata: ["stage": .string("login_client_identity")])
     return oauthServerAuthorizationError(.serviceUnavailable)
+  } catch let error as OAuthScopeResolutionError {
+    // The browser gets the same opaque page every other authorize failure gets —
+    // this is not the leg that reports OAuth error codes to the client, which
+    // already had its `invalid_scope` answer at PAR. The operator gets the NSID.
+    context.logger.info(
+      "oauth authorize rejected",
+      metadata: [
+        "stage": .string("lexicon_resolution"),
+        "reason": .string(error.description),
+      ])
+    return oauthServerAuthorizationError(.badRequest)
   } catch let failure as SwanRequestBodyCollectionFailure {
     context.logger.info(
       "oauth authorize rejected",
@@ -445,6 +622,86 @@ private func loginOAuthServerAuthorization(
     context.logger.info(
       "oauth authorize rejected", metadata: ["stage": .string("unexpected")])
     return oauthServerAuthorizationError(.badRequest)
+  }
+}
+
+private func completeOAuthServerAuthorizationMFA(
+  request: Request,
+  context: SwanHTTPRequestContext,
+  configuration: SwanOAuthAuthorizationServerConfiguration,
+  runtime: SwanOAuthRuntime,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async -> Response {
+  do {
+    guard let mfa = configuration.mfaService else {
+      return oauthServerAuthorizationError(.unauthorized)
+    }
+    let form = try await parseOAuthServerMFAForm(
+      request, context: context, requestBodyAdmission: requestBodyAdmission)
+    let session = try oauthServerBrowserSession(request, runtime: runtime)
+    guard session.subject == nil,
+      form.csrf == session.csrfToken,
+      let pushed = try await runtime.tokenService.activePushedAuthorizationRequest(session.requestURI),
+      pushed.binding.issuer == configuration.issuer.absoluteString,
+      let account = try await configuration.accounts.resolve(handle: form.handle),
+      account.status.authorizesAccount
+    else {
+      return oauthServerAuthorizationError(.badRequest)
+    }
+    let authorizationContext = try oauthServerAuthorizationContext(
+      session: session, binding: pushed.binding)
+    let proof = try await mfa.verifyOAuthFactor(
+      accountDID: account.did,
+      sessionID: session.csrfToken,
+      context: authorizationContext,
+      payload: try form.payload(),
+      now: Date())
+    guard let token = proof.factorToken else {
+      return oauthServerAuthorizationError(.unauthorized)
+    }
+    guard let grantDirectory = configuration.accounts as? any SwanAccountPortalAuthorizationGrantAccountDirectory else {
+      return oauthServerAuthorizationError(.serviceUnavailable)
+    }
+    let authenticated: AccountAuthenticationSuccess
+    switch try await grantDirectory.authenticateFactorForLogin(
+      accountDID: account.did,
+      authFactorToken: token,
+      authorizationContext: authorizationContext,
+      now: Date()) {
+    case .rejected:
+      return oauthServerAuthorizationError(.unauthorized)
+    case let .authenticated(value):
+      authenticated = value
+    }
+    guard authenticated.account.did == account.did else {
+      return oauthServerAuthorizationError(.unauthorized)
+    }
+    let issued = try runtime.browserSessionService.issue(
+      requestURI: session.requestURI,
+      subject: authenticated.account.did,
+      subjectUpdatedAt: authenticated.account.updatedAt,
+      authorizationGrantDigest: authenticated.authorizationGrantDigest,
+      csrfToken: session.csrfToken,
+      lifetime: session.expiresAt.timeIntervalSinceNow)
+    let expansion = try await OAuthLexiconScopeResolution.expandIncludes(
+      pushed.binding.scopes, resolver: runtime.lexiconResolver, stage: .pushedAuthorizationRequest)
+    oauthServerLogEmptyExpansions(expansion.emptyExpansions, context: context, stage: "consent")
+    return oauthServerHTML(
+      .ok,
+      SwanBrowserPages.consent(
+        csrf: issued.session.csrfToken,
+        subject: authenticated.account.did,
+        clientID: pushed.binding.clientID,
+        scopes: expansion.scopes,
+        emptyPermissionSets: expansion.emptyExpansions),
+      setCookie: oauthServerCookie(issued.value),
+      formActionSource: oauthServerFormActionSource(pushed.binding.redirectURI))
+  } catch is SwanRequestBodyCollectionFailure {
+    return oauthServerAuthorizationError(.badRequest)
+  } catch is AccountLoginAuthenticationError {
+    return oauthServerAuthorizationError(.serviceUnavailable)
+  } catch {
+    return oauthServerAuthorizationError(.unauthorized)
   }
 }
 
@@ -478,14 +735,21 @@ private func consentOAuthServerAuthorization(
       session.requestURI,
       binding: pushed.binding
     )
+    let authorizationContext = try oauthServerAuthorizationContext(
+      session: session, binding: consumed.binding)
     let destination: URL
     switch form.decision {
     case .approve:
+      guard let authorizationGrantDigest = session.authorizationGrantDigest else {
+        return fallback
+      }
       let code = try await runtime.tokenService.issueAuthorizationCode(
         subject: account.did,
         binding: consumed.binding,
         codeChallengeS256: consumed.codeChallengeS256,
-        activeSubjectRevisionMicroseconds: subjectRevision
+        activeSubjectRevisionMicroseconds: subjectRevision,
+        authorizationGrantDigest: authorizationGrantDigest,
+        authorizationContext: authorizationContext
       )
       destination = try oauthServerAuthorizationRedirect(
         base: consumed.binding.redirectURI,
@@ -739,16 +1003,24 @@ private func revokeOAuthServerToken(
 /// fetch first. Refusing the request instead leaves the replay namespace
 /// global over the `jti`, which is what RFC 9449 requires.
 ///
-/// A peer whose address cannot be resolved — because the policy rejected the
-/// forwarded header, or because no policy was supplied — is charged to one
-/// shared bucket rather than admitted or rejected; see
-/// `OAuthPeerAdmissionService`.
+/// A peer whose address cannot be resolved is charged to one shared bucket
+/// rather than admitted or rejected; see `OAuthPeerAdmissionService`.
+///
+/// Placement matters and is not arbitrary. This runs *after* the form has been
+/// fully collected, so a refusal leaves no half-read body holding a listener
+/// connection slot, and needs no drain. Moving it ahead of body collection
+/// would require `drainRejectedRequestBody`, which reserves from the very JSON
+/// write pool an earlier check would be protecting — an admission control that
+/// drains through the resource it guards is not a control. The body's own
+/// lease is already released by then: `collectAdmittedRequestBody` hands back a
+/// `SwanAdmittedRequestBody` whose `deinit` releases it, and that happens when
+/// `oauthServerForm` returns.
 private func oauthServerPeerAdmission(
   request: Request,
   context: SwanHTTPRequestContext,
-  policy: SwanLoginClientIdentityPolicy?
+  policy: SwanLoginClientIdentityPolicy
 ) async -> OAuthPeerAdmissionDecision {
-  let peer = try? policy?.clientIPAddress(
+  let peer = try? policy.clientIPAddress(
     directPeer: context.remoteAddress?.ipAddress,
     headers: request.headers
   )
@@ -804,10 +1076,29 @@ private func parseOAuthServerPARForm(
     "client_id", "redirect_uri", "response_type", "scope", "state", "code_challenge",
     "code_challenge_method",
   ]
-  let optional: Set<String> = ["client_assertion_type", "client_assertion"]
+  // `login_hint` and `prompt` are hints ATProto clients send with every
+  // sign-in (the atproto-oauth Rust crate includes the typed handle as
+  // `login_hint` unconditionally), so refusing them refuses those clients
+  // outright. Swan always presents the interactive login form, which is a
+  // conforming answer to `login`, `consent`, and `select_account` — but not
+  // to `none`, which demands a silent answer this server can never give, so
+  // `none` stays refused rather than dishonestly accepted.
+  // `response_mode` is sent unconditionally by `@atproto/oauth-client-node`,
+  // which defaults it to `query`. Refusing the parameter refuses every client
+  // built on that library — including Bulletin — with `invalid_request` before
+  // the request reaches DPoP. Only `query` is accepted: this server appends
+  // `code`/`state` to the client's redirect URI as query parameters, so
+  // accepting `fragment` or `form_post` would promise a delivery it does not
+  // implement.
+  let optional: Set<String> = [
+    "client_assertion_type", "client_assertion", "login_hint", "prompt", "response_mode",
+  ]
   guard fields.keys.allSatisfy({ required.contains($0) || optional.contains($0) }),
     required.isSubset(of: Set(fields.keys)),
     (fields["client_assertion_type"] == nil) == (fields["client_assertion"] == nil),
+    fields["login_hint"].map({ !$0.isEmpty && $0.utf8.count <= 2_048 }) ?? true,
+    fields["prompt"].map({ ["login", "consent", "select_account"].contains($0) }) ?? true,
+    fields["response_mode"].map({ $0 == "query" }) ?? true,
     fields["response_type"] == "code", fields["code_challenge_method"] == "S256",
     let clientText = fields["client_id"], let redirectText = fields["redirect_uri"],
     let state = fields["state"], let challenge = fields["code_challenge"],
@@ -855,14 +1146,42 @@ private func parseOAuthServerLoginForm(
 ) async throws -> OAuthServerLoginForm {
   let fields = try await oauthServerForm(
     request, context: context, requestBodyAdmission: requestBodyAdmission)
-  guard Set(fields.keys) == ["csrf", "handle", "password"],
+  guard Set(fields.keys) == ["csrf", "handle", "password"]
+      || Set(fields.keys) == ["csrf", "handle", "password", "authFactorToken"],
     let csrf = fields["csrf"], let handle = fields["handle"], let password = fields["password"],
     oauthServerBrowserOpaque(csrf), !handle.isEmpty, handle.utf8.count <= 253,
     !password.isEmpty, password.utf8.count <= 1_024, !password.utf8.contains(0)
   else {
     throw OAuthServerRequestError.malformed
   }
-  return .init(csrf: csrf, handle: handle, password: password)
+  let authFactorToken = fields["authFactorToken"]
+  if let authFactorToken, !oauthServerOpaqueToken(authFactorToken) {
+    throw OAuthServerRequestError.malformed
+  }
+  return .init(csrf: csrf, handle: handle, password: password, authFactorToken: authFactorToken)
+}
+
+private func parseOAuthServerMFAForm(
+  _ request: Request,
+  context: SwanHTTPRequestContext,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> OAuthServerMFAForm {
+  let fields = try await oauthServerForm(
+    request, context: context, requestBodyAdmission: requestBodyAdmission)
+  // `password` remains an accepted legacy field for clients that cached the
+  // old form, but it is never read or verified in phase two.
+  let allowed: Set<String> = ["csrf", "handle", "password", "kind", "factorID", "code", "challenge", "clientDataJSON", "authenticatorData", "credentialID", "signature"]
+  guard Set(fields.keys).isSubset(of: allowed),
+    let csrf = fields["csrf"], oauthServerBrowserOpaque(csrf),
+    let handle = fields["handle"], !handle.isEmpty, handle.utf8.count <= 253,
+    let kindText = fields["kind"], let kind = AuthenticationFactorKind(rawValue: kindText),
+    let factorID = fields["factorID"], !factorID.isEmpty, factorID.utf8.count <= 128,
+    fields.values.allSatisfy({ $0.utf8.count <= 16 * 1024 && !$0.utf8.contains(0) })
+  else { throw OAuthServerRequestError.malformed }
+  return OAuthServerMFAForm(
+    csrf: csrf, handle: handle, kind: kind, factorID: factorID,
+    code: fields["code"], challenge: fields["challenge"], clientDataJSON: fields["clientDataJSON"],
+    authenticatorData: fields["authenticatorData"], credentialID: fields["credentialID"], signature: fields["signature"])
 }
 
 private func parseOAuthServerConsentForm(
@@ -914,9 +1233,21 @@ private func parseOAuthServerTokenForm(
       refreshToken: nil, clientAssertionType: fields["client_assertion_type"],
       clientAssertion: fields["client_assertion"])
   case .refreshToken:
+    // The atproto-oauth Rust crate sends the registered redirect_uri with
+    // every refresh. RFC 6749 gives it no role in this grant — the family
+    // is already bound to its client — so it is bounds-checked and ignored
+    // rather than refused: refusing it broke every Bulleted session at its
+    // first refresh while the sign-in that minted the family succeeded.
+    var keys = Set(fields.keys)
+    if let redirectText = fields["redirect_uri"] {
+      guard redirectText.utf8.count <= 4_096, oauthServerExactURL(redirectText) != nil else {
+        throw OAuthServerRequestError.malformed
+      }
+      keys.remove("redirect_uri")
+    }
     let expected = common.union(["refresh_token"])
     let expectedWithAssertion = expected.union(["client_assertion_type", "client_assertion"])
-    guard Set(fields.keys) == expected || Set(fields.keys) == expectedWithAssertion,
+    guard keys == expected || keys == expectedWithAssertion,
       let refresh = fields["refresh_token"], oauthServerOpaqueToken(refresh)
     else {
       throw OAuthServerRequestError.malformed
@@ -1052,16 +1383,19 @@ private func oauthServerExactURL(_ raw: String) -> URL? {
   return url
 }
 
+/// Stage A — the remote authorization server's wire tokenizer.
+///
+/// Delegates to the one tokenizer shared with the localhost bridge (§6.3 stages
+/// A / A′) so the two cannot drift apart again: the same RFC 6749 §3.3 charset
+/// (`$0 > 0x20 && $0 < 0x7F` admitted `"` and `\`), the same 1024-byte per-token
+/// and 8192-byte whole-request RAW-INPUT budget in place of this path's 256, and
+/// the literal `openid` rejection.
+///
+/// The thrown error is deliberately NOT collapsed into
+/// `OAuthServerRequestError.malformed`: `openid` must surface as
+/// `invalid_scope`, not `invalid_request` (§4.8).
 private func oauthServerScopes(_ raw: String) throws -> Set<String> {
-  let values = raw.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-  guard !values.isEmpty, values.count <= 64, values.count == Set(values).count,
-    values.allSatisfy({
-      !$0.isEmpty && $0.utf8.count <= 256 && $0.utf8.allSatisfy { $0 > 0x20 && $0 < 0x7F }
-    })
-  else {
-    throw OAuthServerRequestError.malformed
-  }
-  return Set(values)
+  try OAuthScopeTokenizer.tokenize(raw)
 }
 
 private func oauthServerS256Challenge(_ value: String) -> Bool {
@@ -1153,12 +1487,78 @@ private func oauthServerExpiredCookie() -> String {
   "\(SwanOAuthAuthorizationServerHTTP.cookieName)=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0"
 }
 
+/// §5.7.5's "every entry dropped → empty expansion" row: **not** an error, and
+/// **not** silent either.
+///
+/// A permission set that resolves and expands to zero grants is indistinguishable
+/// from success on the wire — the client asked for it, the request succeeded, and
+/// the token carries nothing derived from it. `.warn` is the level because an
+/// operator seeing this repeatedly is looking at either a permission set written
+/// against a different AS's families or an authority gate rejecting every entry,
+/// and both are worth acting on. The consent renderer carries the other half
+/// (`emptyPermissionSets`), because this log never reaches the person
+/// authorizing.
+private func oauthServerLogEmptyExpansions(
+  _ nsids: [String],
+  context: SwanHTTPRequestContext,
+  stage: String
+) {
+  guard !nsids.isEmpty else { return }
+  context.logger.warning(
+    "oauth permission set expanded to no capabilities",
+    metadata: [
+      "stage": .string(stage),
+      "nsids": .string(nsids.joined(separator: ",")),
+    ])
+}
+
+private func oauthServerMFAChallengePage(csrf: String, handle: String, factor: SwanAccountPortalMutation, nonce: String) -> String {
+  let factorID = factor.factorID ?? ""
+  let challenge = factor.challenge ?? ""
+  let kind = factor.factorKind ?? (factor.challenge == nil ? .totp : .passkey)
+  let proof: String
+  switch kind {
+  case .passkey:
+    // The inline script carries the same per-response nonce the CSP
+    // `script-src 'nonce-…'` allows, so the ceremony executes under the
+    // strict policy instead of being blocked by `default-src 'none'`.
+    proof = "<input type=\"hidden\" name=\"challenge\" id=\"swan-challenge\" value=\"\(SwanBrowserPages.escape(challenge))\"><input type=\"hidden\" name=\"clientDataJSON\" id=\"swan-client-data\"><input type=\"hidden\" name=\"authenticatorData\" id=\"swan-auth-data\"><input type=\"hidden\" name=\"credentialID\" id=\"swan-credential\"><input type=\"hidden\" name=\"signature\" id=\"swan-signature\"><script nonce=\"\(SwanBrowserPages.escape(nonce))\">(async()=>{const f=document.forms[0],b=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/').padEnd(Math.ceil(s.length/4)*4,'=')),c=>c.charCodeAt(0)),e=a=>{let s='';new Uint8Array(a).forEach(c=>s+=String.fromCharCode(c));return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'')};try{const c=await navigator.credentials.get({publicKey:{challenge:b(document.getElementById('swan-challenge').value),rp:{id:location.hostname},user:{id:b('swan-user'),name:'Swan',displayName:'Swan'},pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],timeout:300000,authenticatorSelection:{userVerification:'preferred'},allowCredentials:[]}});document.getElementById('swan-client-data').value=e(c.response.clientDataJSON);document.getElementById('swan-auth-data').value=e(c.response.authenticatorData);document.getElementById('swan-credential').value=e(c.response.rawId);document.getElementById('swan-signature').value=e(c.response.signature);f.submit()}catch(err){document.getElementById('swan-auth-data').value='error:'+err.name}})();</script>"
+  case .recoveryCode:
+    proof = oauthServerCodeField(label: "Recovery code")
+  default:
+    proof = oauthServerCodeField(label: "One-time code")
+  }
+  return SwanBrowserPages.factorChallenge(
+    csrf: csrf, handle: handle, kind: kind.rawValue, factorID: factorID, proofHTML: proof)
+}
+
+/// A daisyUI one-time-code field. The label is a fixed literal, never request
+/// data, so it needs no escaping.
+private func oauthServerCodeField(label: String) -> String {
+  """
+  <fieldset class="fieldset gap-1"><legend class="fieldset-legend">\(label)</legend>\
+  <input name="code" class="input w-full" autocomplete="one-time-code" inputmode="numeric" required autofocus></fieldset>
+  """
+}
+
+/// Per-response CSP nonce. The value is single-use, unguessable, and only
+/// echoed into the exact response that carries it; it is never persisted.
+private func oauthServerCSPNonce() -> String {
+  var generator = SystemRandomNumberGenerator()
+  let bytes = (0 ..< 16).map { _ in UInt8.random(in: .min ... .max, using: &generator) }
+  return Data(bytes).base64EncodedString()
+    .replacingOccurrences(of: "+", with: "-")
+    .replacingOccurrences(of: "/", with: "_")
+    .replacingOccurrences(of: "=", with: "")
+}
+
 private func oauthServerHTML(
   _ status: HTTPResponse.Status, _ body: String, setCookie: String? = nil,
-  formActionSource: String? = nil
+  formActionSource: String? = nil, cspNonce: String? = nil
 ) -> Response {
   var headers = oauthServerBrowserHeaders(
-    contentType: "text/html; charset=utf-8", formActionSource: formActionSource)
+    contentType: "text/html; charset=utf-8", formActionSource: formActionSource,
+    nonce: cspNonce)
   if let setCookie { headers[HTTPField.Name("Set-Cookie")!] = setCookie }
   return Response(
     status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(string: body)))
@@ -1214,7 +1614,7 @@ private func oauthServerAuthorizationError(_ status: HTTPResponse.Status, clearC
 }
 
 private func oauthServerBrowserHeaders(
-  contentType: String? = nil, formActionSource: String? = nil
+  contentType: String? = nil, formActionSource: String? = nil, nonce: String? = nil
 ) -> HTTPFields {
   var headers: HTTPFields = [.cacheControl: "no-store"]
   if let contentType { headers[.contentType] = contentType }
@@ -1222,9 +1622,16 @@ private func oauthServerBrowserHeaders(
   // `style-src` names the hash of the inlined daisyUI stylesheet, so styled
   // pages keep `default-src 'none'` with no `'unsafe-inline'` and no external
   // style origin.
-  headers[HTTPField.Name("Content-Security-Policy")!] =
-    "default-src 'none'; style-src \(SwanBrowserPages.browserStyleCSPSource); "
+  var policy = "default-src 'none'; style-src \(SwanBrowserPages.browserStyleCSPSource); "
     + "form-action \(formAction); frame-ancestors 'none'; base-uri 'none'"
+  // A per-response nonce admits exactly the inline ceremony script in the
+  // page that carries it. The policy is never widened with `unsafe-inline`.
+  if let nonce, !nonce.isEmpty {
+    policy = "default-src 'none'; script-src 'nonce-\(nonce)'; "
+      + "style-src \(SwanBrowserPages.browserStyleCSPSource); "
+      + "form-action \(formAction); frame-ancestors 'none'; base-uri 'none'"
+  }
+  headers[HTTPField.Name("Content-Security-Policy")!] = policy
   headers[HTTPField.Name("X-Frame-Options")!] = "DENY"
   headers[HTTPField.Name("Referrer-Policy")!] = "no-referrer"
   headers[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"

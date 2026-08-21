@@ -8,10 +8,33 @@ import SwanStorage
 public struct AccountAuthenticationSuccess: Sendable, Equatable {
     public let account: AccountControlAccount
     public let credentialWasRehashed: Bool
+    /// Strength earned by the complete login transaction. Password-only
+    /// callers retain the historical `.password` value; factor-token callers
+    /// receive the durable factor service's authenticated strength.
+    public let strength: AuthenticationStrength
+    /// A one-time durable authorization grant created by the canonical login
+    /// transaction when the caller supplied an issuance context. It is absent
+    /// for source-compatible account-only callers and never contains a raw
+    /// credential.
+    public let authorizationGrantDigest: Data?
+    /// Password verification has succeeded and an active second factor is
+    /// required (for OAuth MFA phase admission or legacy session
+    /// AuthFactorTokenRequired), but no protected session or token may be
+    /// issued yet.
+    public let requiresFactor: Bool
 
-    public init(account: AccountControlAccount, credentialWasRehashed: Bool) {
+    public init(
+        account: AccountControlAccount,
+        credentialWasRehashed: Bool,
+        strength: AuthenticationStrength = .password,
+        authorizationGrantDigest: Data? = nil,
+        requiresFactor: Bool = false
+    ) {
         self.account = account
         self.credentialWasRehashed = credentialWasRehashed
+        self.strength = strength
+        self.authorizationGrantDigest = authorizationGrantDigest
+        self.requiresFactor = requiresFactor
     }
 }
 
@@ -53,6 +76,8 @@ public actor DurableAccountDirectory {
     private let verificationExecutor: Argon2idVerificationExecutor
     private let keyProvisioner: AccountKeyProvisioner?
     private let loginAdmissionService: AccountLoginAdmissionService?
+    private let loginFactorTokenVerifier: (any AccountLoginFactorTokenVerifying)?
+    private let authenticationFactors: (any AuthenticationFactorStore)?
     private let dummyPasswordVerifier: String?
 
     public init(
@@ -60,13 +85,17 @@ public actor DurableAccountDirectory {
         passwordHasher: any PasswordHasher,
         verificationExecutor: Argon2idVerificationExecutor,
         keyProvisioner: AccountKeyProvisioner? = nil,
-        loginAdmissionService: AccountLoginAdmissionService? = nil
+        loginAdmissionService: AccountLoginAdmissionService? = nil,
+        loginFactorTokenVerifier: (any AccountLoginFactorTokenVerifying)? = nil,
+        authenticationFactors: (any AuthenticationFactorStore)? = nil
     ) {
         self.store = store
         self.passwordHasher = passwordHasher
         self.verificationExecutor = verificationExecutor
         self.keyProvisioner = keyProvisioner
         self.loginAdmissionService = loginAdmissionService
+        self.loginFactorTokenVerifier = loginFactorTokenVerifier
+        self.authenticationFactors = authenticationFactors
         var generator = SystemRandomNumberGenerator()
         let dummyPassword = Data(
             (0 ..< 32).map { _ in
@@ -258,7 +287,7 @@ public actor DurableAccountDirectory {
     }
 
     /// Compatibility wrapper for non-HTTP callers. OAuth login must use
-    /// ``authenticateForLogin(handle:password:now:)`` so capacity and storage
+    /// ``authenticateForLogin(handle:password:authFactorToken:now:)`` so capacity and storage
     /// unavailability cannot collapse into a bad-credentials response.
     public func authenticate(
         handle: String,
@@ -269,7 +298,7 @@ public actor DurableAccountDirectory {
             handle: handle,
             password: password,
             now: now
-        ), case let .authenticated(success) = outcome else {
+        ), case let .authenticated(success) = outcome, !success.requiresFactor else {
             return nil
         }
         return success
@@ -286,7 +315,143 @@ public actor DurableAccountDirectory {
     public func authenticateForLogin(
         handle: String,
         password: String,
+        now: Date
+    ) async throws -> AccountLoginAuthenticationOutcome {
+        try await authenticateForLoginInternal(
+            handle: handle,
+            password: password,
+            authFactorToken: nil,
+            authFactorSessionID: nil,
+            authorizationContext: nil,
+            now: now,
+            enforceActiveFactors: true
+        )
+    }
+
+    public func authenticateForLogin(
+        handle: String,
+        password: String,
+        authFactorToken: String? = nil,
         now: Date = Date()
+    ) async throws -> AccountLoginAuthenticationOutcome {
+        try await authenticateForLoginInternal(
+            handle: handle,
+            password: password,
+            authFactorToken: authFactorToken,
+            authFactorSessionID: nil,
+            authorizationContext: nil,
+            now: now,
+            enforceActiveFactors: true
+        )
+    }
+
+    /// Portal management login supplies the pre-auth session that issued the
+    /// factor receipt. The canonical account-only overload above remains for
+    /// OAuth/legacy callers that do not have a management session cookie.
+    public func authenticateForLogin(
+        handle: String,
+        password: String,
+        authFactorToken: String?,
+        authFactorSessionID: String?,
+        now: Date = Date()
+    ) async throws -> AccountLoginAuthenticationOutcome {
+        try await authenticateForLoginInternal(
+            handle: handle,
+            password: password,
+            authFactorToken: authFactorToken,
+            authFactorSessionID: authFactorSessionID,
+            authorizationContext: nil,
+            now: now,
+            enforceActiveFactors: true
+        )
+    }
+
+    /// Channel-aware login used by the production portal, OAuth browser, and
+    /// legacy issuance paths. The returned grant is created at the same
+    /// durable linearization point as factor-token consumption (or the
+    /// active-factor decision for password-only login).
+    public func authenticateForLogin(
+        handle: String,
+        password: String,
+        authFactorToken: String?,
+        authorizationContext: AccountAuthorizationContext,
+        now: Date = Date()
+    ) async throws -> AccountLoginAuthenticationOutcome {
+        try await authenticateForLoginInternal(
+            handle: handle,
+            password: password,
+            authFactorToken: authFactorToken,
+            authFactorSessionID: authorizationContext.sessionID,
+            authorizationContext: authorizationContext,
+            now: now,
+            enforceActiveFactors: true
+        )
+    }
+
+    /// Verifies only the password half of a two-step MFA login. It returns
+    /// the same account metadata as normal login but never creates a session
+    /// or issues a bearer token; the caller must immediately complete a
+    /// factor ceremony and use the resulting management-login token.
+    public func authenticatePasswordForMFAChallenge(
+        handle: String,
+        password: String,
+        now: Date = Date()
+    ) async throws -> AccountLoginAuthenticationOutcome {
+        try await authenticateForLoginInternal(
+            handle: handle,
+            password: password,
+            authFactorToken: nil,
+            authFactorSessionID: nil,
+            authorizationContext: nil,
+            now: now,
+            enforceActiveFactors: false
+        )
+    }
+
+    /// Completes a previously admitted OAuth/portal factor ceremony without
+    /// running password verification a second time. The durable factor store
+    /// consumes the exact channel-bound receipt and creates the one-time grant
+    /// in the same transaction.
+    public func authenticateFactorForLogin(
+        accountDID: String,
+        authFactorToken: String,
+        authorizationContext: AccountAuthorizationContext,
+        now: Date = Date()
+    ) async throws -> AccountLoginAuthenticationOutcome {
+        guard !accountDID.isEmpty, !authFactorToken.isEmpty,
+              let verifier = loginFactorTokenVerifier as? any AccountLoginAuthorizationGrantVerifying,
+              let account = try await store.account(did: accountDID),
+              account.status.authorizesAccount else {
+            throw AccountLoginAuthenticationError.unavailable
+        }
+        do {
+            let grant = try await verifier.authorizeLoginWithFactorToken(
+                token: authFactorToken,
+                accountDID: accountDID,
+                context: authorizationContext,
+                now: now
+            )
+            return .authenticated(AccountAuthenticationSuccess(
+                account: account,
+                credentialWasRehashed: false,
+                strength: grant.strength,
+                authorizationGrantDigest: grant.grantDigest
+            ))
+        } catch let error as AccountLoginAuthenticationError {
+            throw error
+        } catch {
+            return .rejected
+        }
+    }
+
+    private func authenticateForLoginInternal(
+        handle: String,
+        password: String,
+        authFactorToken: String?,
+        authFactorSessionID: String?,
+        authorizationContext: AccountAuthorizationContext?,
+        now: Date,
+        enforceActiveFactors: Bool
     ) async throws -> AccountLoginAuthenticationOutcome {
         guard let dummyPasswordVerifier else {
             throw AccountLoginAuthenticationError.unavailable
@@ -371,9 +536,169 @@ public actor DurableAccountDirectory {
             ) else {
                 return .rejected
             }
+            let strength: AuthenticationStrength
+            let activeFactors: [AuthenticationFactorMetadata]
+            do {
+                activeFactors = try await authenticationFactors?.listFactors(
+                    accountDID: finalized.account.did,
+                    now: now
+                ) ?? []
+            } catch {
+                throw AccountLoginAuthenticationError.unavailable
+            }
+
+            if let authorizationContext {
+                guard let grantStore = store as? any AccountAuthorizationGrantStore else {
+                    throw AccountLoginAuthenticationError.unavailable
+                }
+                if let authFactorToken {
+                    guard let grantVerifier = loginFactorTokenVerifier as? any AccountLoginAuthorizationGrantVerifying else {
+                        return .rejected
+                    }
+                    do {
+                        let grant = try await grantVerifier.authorizeLoginWithFactorToken(
+                            token: authFactorToken,
+                            accountDID: finalized.account.did,
+                            context: authorizationContext,
+                            now: now
+                        )
+                        return .authenticated(AccountAuthenticationSuccess(
+                            account: finalized.account,
+                            credentialWasRehashed: finalized.credentialWasReplaced,
+                            strength: grant.strength,
+                            authorizationGrantDigest: grant.grantDigest
+                        ))
+                    } catch let error as AccountLoginAuthenticationError {
+                        throw error
+                    } catch {
+                        return .rejected
+                    }
+                }
+                do {
+                    let grant = try await grantStore.createPasswordAuthorizationGrant(
+                        grantDigest: Self.randomGrantDigest(),
+                        accountDID: finalized.account.did,
+                        context: authorizationContext,
+                        now: now
+                    )
+                    return .authenticated(AccountAuthenticationSuccess(
+                        account: finalized.account,
+                        credentialWasRehashed: finalized.credentialWasReplaced,
+                        strength: grant.strength,
+                        authorizationGrantDigest: grant.grantDigest
+                    ))
+                } catch let error as AccountControlStoreError where error == .notFound {
+                    guard !activeFactors.isEmpty else {
+                        return .rejected
+                    }
+                    if authorizationContext.channel == .oauth {
+                        guard let phaseStore = store as? any OAuthMFAAdmissionStore else {
+                            return .rejected
+                        }
+                        do {
+                            _ = try await phaseStore.beginOAuthMFAAdmission(
+                                accountDID: finalized.account.did,
+                                context: authorizationContext,
+                                now: now
+                            )
+                        } catch {
+                            throw AccountLoginAuthenticationError.unavailable
+                        }
+                        return .authenticated(AccountAuthenticationSuccess(
+                            account: finalized.account,
+                            credentialWasRehashed: finalized.credentialWasReplaced,
+                            requiresFactor: true
+                        ))
+                    }
+                    if authorizationContext.channel == .legacy {
+                        // The account password verified successfully, but the account
+                        // has active authentication factors and no factor token was
+                        // presented. For the legacy XRPC channel (com.atproto.server.createSession),
+                        // this outcome signals that the caller must present an
+                        // authFactorToken to proceed. The legacy XRPC handler maps
+                        // this to HTTP 401 AuthFactorTokenRequired.
+                        return .authenticated(AccountAuthenticationSuccess(
+                            account: finalized.account,
+                            credentialWasRehashed: finalized.credentialWasReplaced,
+                            requiresFactor: true
+                        ))
+                    }
+                    return .rejected
+                } catch {
+                    throw AccountLoginAuthenticationError.unavailable
+                }
+            }
+            if enforceActiveFactors && !activeFactors.isEmpty && authFactorToken == nil {
+                // Once a factor is active, password verification alone is
+                // never a management/OAuth/legacy login. The caller must
+                // first complete a factor ceremony and present the opaque
+                // management-login receipt on this same request.
+                return .rejected
+            }
+            if let authFactorToken {
+                guard let loginFactorTokenVerifier else {
+                    // A presented factor token must never silently downgrade
+                    // to password authority when the MFA capability is absent.
+                    return .rejected
+                }
+                do {
+                    if let authFactorSessionID {
+                        guard let sessionVerifier = loginFactorTokenVerifier as? any AccountLoginFactorTokenSessionVerifying else {
+                            return .rejected
+                        }
+                        if let atomicVerifier = loginFactorTokenVerifier as? any AccountLoginFactorTokenAtomicVerifying {
+                            strength = try await atomicVerifier.verifyLoginFactorTokenAtomically(token: authFactorToken, accountDID: finalized.account.did, sessionID: authFactorSessionID, now: now)
+                        } else {
+                            strength = try await sessionVerifier.verifyLoginFactorToken(token: authFactorToken, accountDID: finalized.account.did, sessionID: authFactorSessionID, now: now)
+                        }
+                    } else {
+                        if let atomicVerifier = loginFactorTokenVerifier as? any AccountLoginFactorTokenAtomicVerifying {
+                            strength = try await atomicVerifier.verifyLoginFactorTokenAtomically(token: authFactorToken, accountDID: finalized.account.did, now: now)
+                        } else {
+                            strength = try await loginFactorTokenVerifier.verifyLoginFactorToken(token: authFactorToken, accountDID: finalized.account.did, now: now)
+                        }
+                    }
+                } catch let error as AccountLoginAuthenticationError {
+                    throw error
+                } catch {
+                    // Invalid, expired, replayed, or wrong-purpose tokens are
+                    // indistinguishable from a rejected credential. Stores
+                    // must fail closed; only explicit account infrastructure
+                    // unavailability is surfaced as unavailable.
+                    return .rejected
+                }
+                guard !enforceActiveFactors || (activeFactors.isEmpty || allowsLoginStrength(strength, activeFactors: activeFactors)) else {
+                    // A recovery code is a login factor only when recovery is
+                    // the account's sole active factor. It must never
+                    // downgrade a mixed TOTP/passkey account to email-level
+                    // authentication.
+                    return .rejected
+                }
+            } else {
+                strength = .password
+            }
+            if enforceActiveFactors {
+                // Re-read immediately before returning the authenticated
+                // result. Factor activation is durable and may race the
+                // password hash; a password-only outcome must never be
+                // issued from a stale pre-Argon2 factor snapshot.
+                let finalActiveFactors: [AuthenticationFactorMetadata]
+                do {
+                    finalActiveFactors = try await authenticationFactors?.listFactors(
+                        accountDID: finalized.account.did,
+                        now: now
+                    ) ?? []
+                } catch {
+                    throw AccountLoginAuthenticationError.unavailable
+                }
+                guard finalActiveFactors.isEmpty || allowsLoginStrength(strength, activeFactors: finalActiveFactors) else {
+                    return .rejected
+                }
+            }
             return .authenticated(AccountAuthenticationSuccess(
                 account: finalized.account,
-                credentialWasRehashed: finalized.credentialWasReplaced
+                credentialWasRehashed: finalized.credentialWasReplaced,
+                strength: strength
             ))
         } catch let error as AccountControlStoreError {
             if error == .unavailable {
@@ -383,6 +708,25 @@ public actor DurableAccountDirectory {
         } catch {
             throw AccountLoginAuthenticationError.unavailable
         }
+    }
+
+    private func ifStepUpMFA(_ strength: AuthenticationStrength) -> Bool {
+        if case .stepUpMFA = strength { return true }
+        return false
+    }
+
+    private func allowsLoginStrength(
+        _ strength: AuthenticationStrength,
+        activeFactors: [AuthenticationFactorMetadata]
+    ) -> Bool {
+        if ifStepUpMFA(strength) { return true }
+        guard strength == .emailRecovery, !activeFactors.isEmpty else { return false }
+        return activeFactors.allSatisfy { $0.kind == .recoveryCode && $0.disabledAt == nil }
+    }
+
+    private static func randomGrantDigest() -> Data {
+        var generator = SystemRandomNumberGenerator()
+        return Data((0 ..< 32).map { _ in UInt8.random(in: .min ... .max, using: &generator) })
     }
 
     /// Applies the mandatory login abuse boundary using the actual accepted

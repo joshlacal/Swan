@@ -22,7 +22,19 @@ let package = Package(
         .executable(name: "swan", targets: ["swan"]),
     ],
     dependencies: [
-        .package(path: "../Petrel"),
+        // Petrel comes from its published repository, pinned to an exact
+        // revision, not from a sibling checkout. A `path:` dependency compiles
+        // against whatever line the neighbouring working copy happens to be
+        // sitting on, which is invisible in this manifest and unreproducible
+        // anywhere else: Swan silently built against three different Petrel
+        // lines depending on who had checked out what. The pin below is the
+        // commit that makes `CIDAsLink` public, which every record carrying a
+        // blob or a StrongRef needs. Bump it deliberately, in a commit that
+        // says why.
+        .package(
+            url: "https://github.com/joshlacal/Petrel.git",
+            revision: "2bfd941ae82ec5975032c2e6bdf1c0607dabd5d0"
+        ),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.36.0"),
@@ -37,6 +49,11 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.3"),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.37.2"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
+        // Direct dependency for the SwanCLITests composition tests (Task 1):
+        // the credential-isolation assertions steer `atproto-proxy` headers,
+        // which requires `HTTPField.Name` from HTTPTypes. Pinned to the
+        // version Hummingbird already resolves.
+        .package(url: "https://github.com/apple/swift-http-types.git", exact: "1.6.0"),
         // The pinned TypeScript PDS signs AT Protocol repository and space
         // JWTs with secp256k1 (`ES256K`). Keep verification in SwanOAuth
         // explicit rather than inheriting an unstable transitive product from
@@ -123,7 +140,7 @@ let package = Package(
         .target(
             name: "SwanSQLite",
             dependencies: [
-                "SwanStorage", "SwanPublicRepository", "SwanPublicFirehose",
+                "SwanAccounts", "SwanCore", "SwanStorage", "SwanPublicRepository", "SwanPublicFirehose",
                 .product(name: "Petrel", package: "Petrel"),
                 .product(name: "SQLiteNIO", package: "sqlite-nio"),
                 .product(name: "Crypto", package: "swift-crypto"),
@@ -203,6 +220,17 @@ let package = Package(
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
             ]
         ),
+        // Test support, deliberately not a package product: it builds proof
+        // CARs that production code must refuse, so it must never be linkable
+        // from `swan`.
+        .target(
+            name: "SwanPublicRepositoryTestSupport",
+            dependencies: [
+                "SwanCore", "SwanPublicRepository",
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "Petrel", package: "Petrel"),
+            ]
+        ),
         .testTarget(name: "SwanCoreTests", dependencies: ["SwanCore", "SwanSpacesWire"]),
         .testTarget(
             name: "SwanSpacesTests",
@@ -224,7 +252,8 @@ let package = Package(
         .testTarget(
             name: "SwanOAuthTests",
             dependencies: [
-                "SwanAccounts", "SwanOAuth", "SwanSQLite", "SwanStorage", "SwanSpaces",
+                "SwanAccounts", "SwanOAuth", "SwanPublicRepository",
+                "SwanPublicRepositoryTestSupport", "SwanSQLite", "SwanStorage", "SwanSpaces",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOEmbedded", package: "swift-nio"),
@@ -262,6 +291,16 @@ let package = Package(
             dependencies: [
                 "SwanAccountExport", "SwanAccounts", "SwanPublicRepository",
                 "SwanSQLite", "SwanSpaces", "SwanStorage",
+                // Task 1 (runtime integration): the composition tests construct
+                // the production `SwanHTTPServer` the way `swan serve` does, so
+                // the test target needs the server type, the CLI module it
+                // mirrors, and the direct module dependencies Swift requires
+                // (no transitive imports).
+                "swan", "SwanHTTP", "SwanCore", "SwanOAuth", "SwanPublicFirehose",
+                .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HummingbirdTesting", package: "hummingbird"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
@@ -292,9 +331,12 @@ let package = Package(
         .testTarget(
             name: "SwanInteropTests",
             dependencies: [
-                "SwanAccounts", "SwanInterop", "SwanOAuth", "SwanSpaces",
+                "SwanAccounts", "SwanCore", "SwanInterop", "SwanOAuth",
+                "SwanPublicRepository", "SwanPublicRepositoryTestSupport",
+                "SwanSpaces", "SwanSQLite",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "Petrel", package: "Petrel"),
             ]
         ),
         .testTarget(
@@ -316,7 +358,7 @@ let package = Package(
         .testTarget(
             name: "SwanPublicRepositoryTests",
             dependencies: [
-                "SwanPublicRepository",
+                "SwanPublicRepository", "SwanPublicRepositoryTestSupport",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Petrel", package: "Petrel"),
                 .product(name: "secp256k1", package: "secp256k1.swift"),

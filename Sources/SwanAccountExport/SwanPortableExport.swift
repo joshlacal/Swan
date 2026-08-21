@@ -20,6 +20,7 @@ public enum SwanPortableExportFileType: String, Codable, Sendable, CaseIterable 
     case publicBlob = "public-blob"
     case spaceBlob = "space-blob"
     case plcHistory = "plc-history"
+    case identitySnapshot = "identity-snapshot"
 }
 
 public struct SwanPortableExportFile: Codable, Sendable, Equatable {
@@ -287,6 +288,8 @@ public enum SwanPortableExportVerifier {
             let maximumBytes = switch entry.type {
             case .plcHistory:
                 64 * 1_024
+            case .identitySnapshot:
+                64 * 1_024
             default:
                 Self.maximumSynchronousArtifactBytes
             }
@@ -333,6 +336,9 @@ public enum SwanPortableExportVerifier {
                 try verifyBlob(data, cid: cid)
             case .plcHistory:
                 plcHistory = data
+            case .identitySnapshot:
+                let snapshot = try SwanIdentitySnapshot.decode(data)
+                _ = try snapshot.validatedForRestore(accountDID: manifest.did)
             }
         }
         guard let verifiedPublicGenesis, let plcHistory else {
@@ -386,6 +392,8 @@ public enum SwanPortableExportVerifier {
             try validatePlacement(entry, manifest: manifest)
             let maximumBytes = switch entry.type {
             case .plcHistory:
+                64 * 1_024
+            case .identitySnapshot:
                 64 * 1_024
             case .publicCAR:
                 4 * 1_024 * 1_024
@@ -493,6 +501,18 @@ public enum SwanPortableExportVerifier {
                     throw SwanPortableExportError.invalidArchive
                 }
                 plcHistory = data
+            case .identitySnapshot:
+                let data = try SwanPortableExportFilesystem.read(
+                    path: entry.path,
+                    root: directoryDescriptor,
+                    maximumBytes: maximumBytes
+                )
+                guard data.count == entry.byteCount,
+                      SwanPortableExportDigest.hex(data) == entry.sha256 else {
+                    throw SwanPortableExportError.invalidArchive
+                }
+                let snapshot = try SwanIdentitySnapshot.decode(data)
+                _ = try snapshot.validatedForRestore(accountDID: manifest.did)
             }
         }
         guard let verifiedPublicGenesis, let plcHistory else {
@@ -641,6 +661,8 @@ public enum SwanPortableExportVerifier {
             guard entry.path == "public/repository.car" else { throw SwanPortableExportError.invalidManifest }
         case .plcHistory:
             guard entry.path == "plc/history.json" else { throw SwanPortableExportError.invalidManifest }
+        case .identitySnapshot:
+            guard entry.path == "identity/snapshot.json" else { throw SwanPortableExportError.invalidManifest }
         case .spaceCAR:
             guard parts.count == 3, parts[0] == "spaces", parts[2].hasSuffix(".car") else {
                 throw SwanPortableExportError.invalidManifest
@@ -806,12 +828,14 @@ public struct SwanPortableAccountExporter: Sendable {
     private let now: @Sendable () -> Date
     private let afterArtifactWrite: (@Sendable (Int) throws -> Void)?
     private let afterRenameBeforeParentSync: (@Sendable () throws -> Void)?
+    private let identitySnapshotProvider: (@Sendable (String) async throws -> SwanIdentitySnapshot)?
 
     public init(
         profileID: String = PermissionedData0016.profileID,
         database: SQLiteAccountDatabase,
         keyStore: any AccountKeyMaterialReader,
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        identitySnapshotProvider: (@Sendable (String) async throws -> SwanIdentitySnapshot)? = nil
     ) throws {
         guard profileID == PermissionedData0016.profileID else {
             throw SwanPortableExportError.invalidManifest
@@ -822,6 +846,7 @@ public struct SwanPortableAccountExporter: Sendable {
         self.now = now
         afterArtifactWrite = nil
         afterRenameBeforeParentSync = nil
+        self.identitySnapshotProvider = identitySnapshotProvider
     }
 
     init(
@@ -840,6 +865,7 @@ public struct SwanPortableAccountExporter: Sendable {
         self.now = now
         self.afterArtifactWrite = afterArtifactWrite
         afterRenameBeforeParentSync = nil
+        identitySnapshotProvider = nil
     }
 
     init(
@@ -858,6 +884,7 @@ public struct SwanPortableAccountExporter: Sendable {
         self.now = now
         afterArtifactWrite = nil
         self.afterRenameBeforeParentSync = afterRenameBeforeParentSync
+        identitySnapshotProvider = nil
     }
 
     public func export(
@@ -988,6 +1015,15 @@ public struct SwanPortableAccountExporter: Sendable {
                 type: SwanPortableExportFileType.plcHistory,
                 data: plcHistory
             )
+            if let identitySnapshotProvider {
+                let snapshot = try await identitySnapshotProvider(account.did)
+                _ = try snapshot.validatedForRestore(accountDID: account.did)
+                try writer.write(
+                    path: "identity/snapshot.json",
+                    type: SwanPortableExportFileType.identitySnapshot,
+                    data: try snapshot.encoded()
+                )
+            }
 
             let files = writer.files.sorted { $0.path < $1.path }
             let manifest = try SwanPortableExportManifest(

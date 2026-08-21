@@ -570,7 +570,7 @@ public struct SwanOperatorAccountRestorer: Sendable {
                         )
                     )
                 )
-            case .publicCAR, .plcHistory:
+            case .publicCAR, .plcHistory, .identitySnapshot:
                 continue
             }
         }

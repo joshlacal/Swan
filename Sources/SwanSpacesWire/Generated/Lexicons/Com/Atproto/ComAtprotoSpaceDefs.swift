@@ -18,10 +18,10 @@ public struct SignedCommit: ATProtocolCodable, ATProtocolValue {
             public let ikm: Bytes
             public let sig: Bytes
             public let mac: Bytes
-            public let rev: String
+            public let rev: TID
 
         public init(
-            ver: Int, hash: Bytes, ikm: Bytes, sig: Bytes, mac: Bytes, rev: String
+            ver: Int, hash: Bytes, ikm: Bytes, sig: Bytes, mac: Bytes, rev: TID
         ) {
             self.ver = ver
             self.hash = hash
@@ -64,7 +64,7 @@ public struct SignedCommit: ATProtocolCodable, ATProtocolValue {
                 throw error
             }
             do {
-                self.rev = try container.decode(String.self, forKey: .rev)
+                self.rev = try container.decode(TID.self, forKey: .rev)
             } catch {
                 LogManager.logError("Decoding error for required property 'rev': \(error)")
                 throw error

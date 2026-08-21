@@ -206,6 +206,505 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
     /// wire change the pinned reference PDS does not emit and is deliberately
     /// not made here; this pins the residual so the durable participation
     /// precondition stays the control that bounds it.
+    /// Erratum 03: `registerNotify` accepts the lexicon's `service`
+    /// identifier, resolves it through the subscriber's DID document, and
+    /// stores the resolved endpoint beside the identity. Every refusal shape
+    /// is pinned here too: no locator at all, a malformed identifier, an
+    /// unresolvable one, and a server with no resolver.
+    func testRegisterNotifyServiceIdentifierResolutionAndItsRefusals() async throws {
+        let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
+        defer { fixture.cleanup() }
+        do {
+            let subscriber = "did:web:events.bulleted.example"
+            let document = """
+            {"id":"\(subscriber)","service":[
+                {"id":"#bulleted_events","serviceEndpoint":"https://events.bulleted.example"},
+                {"id":"#other","serviceEndpoint":"https://other.bulleted.example"}
+            ]}
+            """
+            let resolver = SwanServiceEndpointResolver(
+                documents: StubNotificationDIDDocumentFetcher(
+                    documents: [subscriber: Data(document.utf8)]
+                )
+            )
+            let app = try fixture.server(serviceEndpointResolver: resolver)
+                .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.service"))
+            let credentialHeaders = try fixture.bearerHeaders()
+            let spaceURI = fixture.space.rawValue
+            let registerBody: @Sendable (String) -> ByteBuffer = { fields in
+                ByteBuffer(string: "{\"space\":\"\(spaceURI)\",\(fields)}")
+            }
+            try await app.test(.router) { client in
+                // Fragment-qualified service → the matching entry's endpoint.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: credentialHeaders,
+                    body: registerBody("\"service\":\"\(subscriber)#bulleted_events\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(Set(try notificationJSONObject(response.body).keys), ["expiresAt"])
+                }
+                // `service` decides when both are sent: the supplied endpoint
+                // is ignored in favour of the resolved one.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: credentialHeaders,
+                    body: registerBody(
+                        "\"service\":\"\(subscriber)#other\",\"endpoint\":\"https://attacker.example/sink\""
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                // Neither locator: nothing to register.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: credentialHeaders,
+                    body: registerBody("\"repo\":\"\(self.writer)\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "InvalidRequest")
+                }
+                // Malformed identifiers never reach the resolver.
+                for bad in ["https://not-a-did.example", "did:web:x#", "#frag", "did:web:x#a#b"] {
+                    try await client.execute(
+                        uri: "/xrpc/com.atproto.space.registerNotify",
+                        method: .post,
+                        headers: credentialHeaders,
+                        body: registerBody("\"service\":\"\(bad)\"")
+                    ) { response in
+                        XCTAssertEqual(response.status, .badRequest, "service=\(bad)")
+                        XCTAssertEqual(try notificationErrorCode(response.body), "InvalidRequest")
+                    }
+                }
+                // A well-formed identifier that does not resolve — absent
+                // fragment entry — is the lexicon's one named error.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: credentialHeaders,
+                    body: registerBody("\"service\":\"\(subscriber)#missing\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "ServiceNotResolvable")
+                }
+            }
+            let registered = await fixture.directory.registrations()
+            XCTAssertEqual(registered.count, 2)
+            XCTAssertEqual(
+                registered.first { $0.service == "\(subscriber)#bulleted_events" }?.endpoint,
+                "https://events.bulleted.example"
+            )
+            XCTAssertEqual(
+                registered.first { $0.service == "\(subscriber)#other" }?.endpoint,
+                "https://other.bulleted.example",
+                "the resolved endpoint must win over the supplied one"
+            )
+            XCTAssertFalse(
+                registered.contains { $0.endpoint.contains("attacker.example") },
+                "a caller-supplied endpoint must never survive beside a service identifier"
+            )
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    /// `unregisterNotify` (live lexicon at bddc99fb): withdraws a subscriber
+    /// by service identity, idempotently, under the same space-credential
+    /// gate as `registerNotify`. Mirrors the reference handler, which deletes
+    /// by (space, serviceDid) without resolving the identifier again — a
+    /// subscriber whose DID document has since changed must still be able to
+    /// withdraw.
+    func testUnregisterNotifyWithdrawsByServiceIdempotentlyUnderCredentialGate() async throws {
+        let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
+        defer { fixture.cleanup() }
+        do {
+            let subscriber = "did:web:events.bulleted.example"
+            let document = """
+            {"id":"\(subscriber)","service":[
+                {"id":"#a","serviceEndpoint":"https://a.bulleted.example"},
+                {"id":"#b","serviceEndpoint":"https://b.bulleted.example"}
+            ]}
+            """
+            let resolver = SwanServiceEndpointResolver(
+                documents: StubNotificationDIDDocumentFetcher(
+                    documents: [subscriber: Data(document.utf8)]
+                )
+            )
+            let app = try fixture.server(serviceEndpointResolver: resolver)
+                .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.unregister"))
+            let credentialHeaders = try fixture.bearerHeaders()
+            let spaceURI = fixture.space.rawValue
+            let body: @Sendable (String) -> ByteBuffer = { fields in
+                ByteBuffer(string: "{\"space\":\"\(spaceURI)\",\(fields)}")
+            }
+            try await app.test(.router) { client in
+                for fragment in ["#a", "#b"] {
+                    try await client.execute(
+                        uri: "/xrpc/com.atproto.space.registerNotify",
+                        method: .post,
+                        headers: credentialHeaders,
+                        body: body("\"service\":\"\(subscriber)\(fragment)\"")
+                    ) { response in
+                        XCTAssertEqual(response.status, .ok)
+                    }
+                }
+                let afterRegister = await fixture.directory.registrations()
+                XCTAssertEqual(afterRegister.count, 2)
+
+                // Withdraw exactly one subscriber; the other survives.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.unregisterNotify",
+                    method: .post,
+                    headers: credentialHeaders,
+                    body: body("\"service\":\"\(subscriber)#a\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(response.headers[.cacheControl], "no-store")
+                    XCTAssertEqual(response.body.readableBytes, 0)
+                }
+                let remaining = await fixture.directory.registrations()
+                XCTAssertEqual(remaining.map(\.service), ["\(subscriber)#b"])
+
+                // Idempotent: withdrawing again, or a never-registered
+                // service, still succeeds — no existence oracle.
+                for target in ["\(subscriber)#a", "did:web:never.example#x"] {
+                    try await client.execute(
+                        uri: "/xrpc/com.atproto.space.unregisterNotify",
+                        method: .post,
+                        headers: credentialHeaders,
+                        body: body("\"service\":\"\(target)\"")
+                    ) { response in
+                        XCTAssertEqual(response.status, .ok, target)
+                    }
+                }
+                let afterIdempotent = await fixture.directory.registrations()
+                XCTAssertEqual(afterIdempotent.count, 1)
+
+                // The strict body fence: `service` is required, unknown keys
+                // and the retired `endpoint` locator are refused, and a
+                // malformed identifier never reaches storage.
+                for bad in [
+                    "\"repo\":\"\(self.writer)\"",
+                    "\"endpoint\":\"https://a.bulleted.example\"",
+                    "\"service\":\"https://not-a-did.example\"",
+                    "\"service\":\"\(subscriber)#a\",\"extra\":1",
+                ] {
+                    try await client.execute(
+                        uri: "/xrpc/com.atproto.space.unregisterNotify",
+                        method: .post,
+                        headers: credentialHeaders,
+                        body: body(bad)
+                    ) { response in
+                        XCTAssertEqual(response.status, .badRequest, bad)
+                        XCTAssertEqual(try notificationErrorCode(response.body), "InvalidRequest")
+                    }
+                }
+                // No credential (JSON content type, no Authorization):
+                // denied, nothing withdrawn.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.unregisterNotify",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: body("\"service\":\"\(subscriber)#b\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+                // Wrong method stays on the opaque closed shape.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.unregisterNotify",
+                    method: .get,
+                    headers: credentialHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "permissioned_endpoint_unavailable")
+                }
+            }
+            let final = await fixture.directory.registrations()
+            XCTAssertEqual(final.count, 1)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    /// Erratum 03 addendum (defect class instance #8): the reference presents
+    /// a space credential under the `DPoP` scheme, and Swan's Bearer-only
+    /// reader answered a conformant presentation with 401 — the reference's
+    /// own recorded lesson about its `bearer_token`. The DPoP-scheme
+    /// presentation registers; a DPoP-scheme OAUTH-shaped token still routes
+    /// to OAuth policy and is refused here.
+    func testRegisterNotifyAcceptsTheDPoPSchemeCredentialPresentation() async throws {
+        let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
+        defer { fixture.cleanup() }
+        do {
+            let subscriber = "did:web:events.dpop.example"
+            let document = """
+            {"id":"\(subscriber)","service":[
+                {"id":"#events","serviceEndpoint":"https://events.dpop.example"}
+            ]}
+            """
+            let resolver = SwanServiceEndpointResolver(
+                documents: StubNotificationDIDDocumentFetcher(
+                    documents: [subscriber: Data(document.utf8)]
+                )
+            )
+            let app = try fixture.server(serviceEndpointResolver: resolver)
+                .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.dpopScheme"))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: try fixture.dpopSchemeCredentialHeaders(),
+                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"service\":\"\(subscriber)#events\"}")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                // A non-credential token under DPoP is NOT routed to the
+                // credential verifier: it stays with OAuth policy, which this
+                // fixture leaves unconfigured for the route → denied.
+                var oauthShaped: HTTPFields = [.contentType: "application/json"]
+                oauthShaped[.authorization] = "DPoP not-a-credential-jwt"
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: oauthShaped,
+                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"service\":\"\(subscriber)#events\"}")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+            }
+            let registered = await fixture.directory.registrations()
+            XCTAssertEqual(registered.count, 1)
+            XCTAssertEqual(registered[0].service, "\(subscriber)#events")
+            XCTAssertEqual(registered[0].endpoint, "https://events.dpop.example")
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    /// A server with NO resolver answers a service registration exactly like
+    /// an unresolvable identifier — from the caller's seat that is what it is
+    /// — while legacy endpoint registrations keep working untouched.
+    func testRegisterNotifyServiceWithoutAResolverIsUnresolvable() async throws {
+        let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
+        defer { fixture.cleanup() }
+        do {
+            let app = try fixture.server()
+                .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.noResolver"))
+            let credentialHeaders = try fixture.bearerHeaders()
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: credentialHeaders,
+                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"service\":\"did:web:events.example#e\"}")
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "ServiceNotResolvable")
+                }
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: credentialHeaders,
+                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            let registered = await fixture.directory.registrations()
+            XCTAssertEqual(registered.count, 1)
+            XCTAssertNil(registered[0].service, "a legacy registration carries no service identity")
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    /// Erratum 03 end-to-end at the delivery seam: a `write` fanout row for a
+    /// service-named registration posts the reference `notifyWrite` shape to
+    /// the REGISTERED endpoint with the service identifier as the JWT
+    /// audience and the space authority as issuer — no operator destination
+    /// map involved. A legacy row delivers nothing, and a withdrawn
+    /// registration turns the leased row into a silent no-op.
+    func testFanoutTransportDeliversWriteRowsToServiceDestinations() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanNotifyDelivery-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let authorityDID = authority
+        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: authorityDID)
+        defer { Task { try? await database.close() } }
+        let space = try SpaceURI(authority: authorityDID, spaceType: "app.bsky.bookmarks", skey: "delivery")
+        let lifecycle = DurableSimpleSpaceAuthority(lifecycleDatabase: database)
+        _ = try await lifecycle.create(
+            space: space,
+            owner: authorityDID,
+            configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+            authorization: .accountOAuthForTesting(subject: authorityDID, scopes: ["atproto"])
+        )
+        let credential = AuthorizationContext.spaceCredential(.init(
+            subject: writer,
+            space: space,
+            permissions: [.read],
+            expiresAt: Date(timeIntervalSinceNow: 3_600)
+        ))
+        let serviceIdentity = "did:web:events.bulleted.example#bulleted_events"
+        let serviceEndpoint = "https://events.bulleted.example"
+        let legacyEndpoint = "https://legacy.example/sink"
+        try await database.registerSpaceNotification(
+            .init(
+                space: space,
+                endpoint: serviceEndpoint,
+                repository: nil,
+                expiresAt: Date(timeIntervalSinceNow: 3_600),
+                service: serviceIdentity
+            ),
+            authorization: credential
+        )
+        try await database.registerSpaceNotification(
+            .init(
+                space: space,
+                endpoint: legacyEndpoint,
+                repository: nil,
+                expiresAt: Date(timeIntervalSinceNow: 3_600)
+            ),
+            authorization: credential
+        )
+
+        let recordingTransport = RecordingPostTransport()
+        let recordingIssuer = RecordingServiceIssuer()
+        let publicAddress = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+        let transport = HTTPPermissionedSpaceNotificationFanoutTransport(
+            database: database,
+            destinations: try StaticSwanSpaceNotificationDestinations(),
+            serviceAuthentication: recordingIssuer,
+            poster: OAuthBoundedJSONPoster(
+                policy: try OAuthRemoteFetchPolicy(maximumBodyBytes: 4_096, timeout: 2),
+                resolver: FixedHostnameResolver(answer: publicAddress),
+                transport: recordingTransport
+            )
+        )
+        let writeRow = PersistedSpaceNotificationFanout(
+            id: UUID(),
+            sourceIssuer: authorityDID,
+            sourceEventID: UUID().uuidString.lowercased(),
+            kind: .write,
+            space: space,
+            repository: writer,
+            wireRevision: "2222222222222",
+            commitment: Data(repeating: 0x2C, count: 32),
+            endpoint: serviceEndpoint,
+            attempts: 0
+        )
+        try await transport.deliver(writeRow)
+
+        let posts = await recordingTransport.posts()
+        XCTAssertEqual(posts.count, 1)
+        let post = try XCTUnwrap(posts.first)
+        XCTAssertEqual(
+            post.url.absoluteString,
+            "\(serviceEndpoint)/xrpc/com.atproto.space.notifyWrite"
+        )
+        let body = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: post.body) as? [String: Any]
+        )
+        XCTAssertEqual(body["space"] as? String, space.rawValue)
+        XCTAssertEqual(body["repo"] as? String, writer)
+        XCTAssertEqual(body["rev"] as? String, "2222222222222")
+        XCTAssertNotNil(body["hash"], "the commit hash closes the listRepos propagation loop")
+        let issued = await recordingIssuer.issued()
+        XCTAssertEqual(issued.count, 1)
+        XCTAssertEqual(issued.first?.issuer, authorityDID)
+        XCTAssertEqual(issued.first?.audience, serviceIdentity)
+        XCTAssertEqual(issued.first?.method, "com.atproto.space.notifyWrite")
+
+        // A write row whose registration is LEGACY delivers nothing and does
+        // not throw — the lease worker acknowledges it as done.
+        let legacyRow = PersistedSpaceNotificationFanout(
+            id: UUID(),
+            sourceIssuer: authorityDID,
+            sourceEventID: UUID().uuidString.lowercased(),
+            kind: .write,
+            space: space,
+            repository: writer,
+            wireRevision: "2222222222223",
+            commitment: Data(repeating: 0x2D, count: 32),
+            endpoint: legacyEndpoint,
+            attempts: 0
+        )
+        try await transport.deliver(legacyRow)
+        let afterLegacy = await recordingTransport.posts()
+        XCTAssertEqual(afterLegacy.count, 1, "a legacy registration is not a dynamic destination")
+
+        // Withdrawn (expired) registration: the same service row becomes a
+        // safe no-op rather than a send to a stale endpoint.
+        try await database.registerSpaceNotification(
+            .init(
+                space: space,
+                endpoint: serviceEndpoint,
+                repository: nil,
+                expiresAt: Date(timeIntervalSinceNow: 61),
+                service: serviceIdentity
+            ),
+            authorization: credential
+        )
+        let staleRow = PersistedSpaceNotificationFanout(
+            id: UUID(),
+            sourceIssuer: authorityDID,
+            sourceEventID: UUID().uuidString.lowercased(),
+            kind: .write,
+            space: space,
+            repository: writer,
+            wireRevision: "2222222222224",
+            commitment: Data(repeating: 0x2E, count: 32),
+            endpoint: serviceEndpoint,
+            attempts: 0
+        )
+        // Not expired yet — delivers; this is the positive control that the
+        // stale probe below refuses for the RIGHT reason.
+        try await transport.deliver(staleRow)
+        let afterStale = await recordingTransport.posts()
+        XCTAssertEqual(afterStale.count, 2)
+
+        // Withdrawal-by-replacement: the subscriber re-registers the same
+        // endpoint WITHOUT a service identity, so the stored row loses it.
+        try await database.registerSpaceNotification(
+            .init(
+                space: space,
+                endpoint: serviceEndpoint,
+                repository: nil,
+                expiresAt: Date(timeIntervalSinceNow: 3_600)
+            ),
+            authorization: credential
+        )
+        let withdrawnRow = PersistedSpaceNotificationFanout(
+            id: UUID(),
+            sourceIssuer: authorityDID,
+            sourceEventID: UUID().uuidString.lowercased(),
+            kind: .write,
+            space: space,
+            repository: writer,
+            wireRevision: "2222222222225",
+            commitment: Data(repeating: 0x2F, count: 32),
+            endpoint: serviceEndpoint,
+            attempts: 0
+        )
+        try await transport.deliver(withdrawnRow)
+        let afterWithdrawal = await recordingTransport.posts()
+        XCTAssertEqual(
+            afterWithdrawal.count, 2,
+            "a withdrawn registration must be a silent no-op"
+        )
+    }
+
     func testDeletionTokenIsNotBoundToTheBodySpace() async throws {
         let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
         defer { fixture.cleanup() }
@@ -386,13 +885,14 @@ private struct NotificationHTTPFixture {
     func server(
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
         decodeObserver: (@Sendable () async -> Void)? = nil,
-        recipientBindings: SwanSpaceNotificationRecipientBindings = .empty
+        recipientBindings: SwanSpaceNotificationRecipientBindings = .empty,
+        serviceEndpointResolver: SwanServiceEndpointResolver? = nil
     ) throws -> SwanHTTPServer {
         let credentialKeys = try PinnedSpaceCredentialPublicKeyResolver(pins: [
             try .init(authority: authority, generation: 1, publicKey: key.publicKey),
         ])
         return SwanHTTPServer(
-            profile: try ProtocolProfile.load(from: notificationPackageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")),
+            profile: try ProtocolProfile.load(from: notificationPackageRoot().appending(path: "Profiles/permissioned-data-0016-2026-08-15.json")),
             configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: URL(string: "https://swan.example")!),
             oauthRuntime: runtime,
             authenticatedGetSpaceDirectory: directory,
@@ -406,11 +906,13 @@ private struct NotificationHTTPFixture {
                 SwanSpaceNotificationHTTPConfiguration(
                     serviceAuthentication: NotificationServiceVerifier(authority: authority, writer: writer),
                     recipientBindings: recipientBindings,
+                    serviceEndpointResolver: serviceEndpointResolver,
                     notificationJSONDecodeObserver: $0
                 )
             } ?? .init(
                 serviceAuthentication: NotificationServiceVerifier(authority: authority, writer: writer),
-                recipientBindings: recipientBindings
+                recipientBindings: recipientBindings,
+                serviceEndpointResolver: serviceEndpointResolver
             ),
             jsonWriteAdmission: jsonWriteAdmission
         )
@@ -420,6 +922,16 @@ private struct NotificationHTTPFixture {
         let credential = try PermissionedDataJWT.createSpaceCredential(issuer: authority, space: space, key: key)
         var headers: HTTPFields = [.contentType: "application/json"]
         headers[.authorization] = "Bearer \(credential)"
+        return headers
+    }
+
+    /// The reference presentation: the credential under the `DPoP` scheme
+    /// ("a space credential is bound to a key"), proof header included.
+    func dpopSchemeCredentialHeaders() throws -> HTTPFields {
+        let credential = try PermissionedDataJWT.createSpaceCredential(issuer: authority, space: space, key: key)
+        var headers: HTTPFields = [.contentType: "application/json"]
+        headers[.authorization] = "DPoP \(credential)"
+        headers[.init("DPoP")!] = "surplus-proof-swan-credentials-are-unbound"
         return headers
     }
 
@@ -483,12 +995,12 @@ private struct NotificationRecoveryFixture {
             space: space,
             owner: authority,
             configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
-            authorization: .accountOAuth(subject: authority, scopes: ["atproto"])
+            authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"])
         )
         _ = try await lifecycle.addMember(
             space: space,
             member: writer,
-            authorization: .accountOAuth(subject: authority, scopes: ["atproto"])
+            authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"])
         )
         let now = Date()
         try await database.registerSpaceNotification(
@@ -616,7 +1128,7 @@ private struct PreopenedRecoveryFixture {
                 space: space,
                 owner: authority,
                 configuration: try .init(policy: .public, appAccess: .open),
-                authorization: .accountOAuth(subject: authority, scopes: ["atproto"])
+                authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"])
             )
             _ = try await database.appendOplogAndOutbox(
                 space: space,
@@ -712,6 +1224,17 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
         registrationsValue.append(registration)
     }
 
+    func unregisterSpaceNotification(
+        space: SpaceURI,
+        service: String,
+        authorization _: AuthorizationContext
+    ) async throws {
+        guard space.authority == authority else {
+            throw AuthorizedSimpleSpaceLifecycleError.notFound
+        }
+        registrationsValue.removeAll { $0.space == space && $0.service == service }
+    }
+
     func receiveSpaceWriteNotification(_ notification: AuthorizedSpaceWriteNotification) async throws {
         guard notification.space.authority == authority, notification.repository == writer else {
             throw SwanError.unauthorized("notification is invalid")
@@ -748,6 +1271,79 @@ struct RecordedSpaceDeletion: Sendable, Equatable {
 
 private struct NotificationNoSigningKeyResolver: SpaceCredentialSigningKeyResolver {
     func signingKey(for _: String) async throws -> SpaceCredentialAuthoritySigningKey? { nil }
+}
+
+/// Canned DID documents for the register-time service resolution tests —
+/// resolution logic runs for real, only the network fetch is substituted.
+private struct StubNotificationDIDDocumentFetcher: SwanDIDDocumentFetching {
+    let documents: [String: Data]
+
+    func documentJSON(forDID did: String) async throws -> Data {
+        guard let data = documents[did] else {
+            throw SwanServiceResolutionFailure.unresolvableService
+        }
+        return data
+    }
+}
+
+/// Answers every hostname with one fixed public address, so the poster's
+/// pre- and post-request DNS policy both approve the same peer.
+private struct FixedHostnameResolver: OAuthHostnameResolving {
+    let answer: OAuthIPAddress
+    func resolve(host _: String) async throws -> [OAuthIPAddress] { [answer] }
+}
+
+private actor RecordingPostTransport: OAuthRemotePostTransport {
+    struct RecordedPost: Sendable {
+        let url: URL
+        let headers: [String: String]
+        let body: Data
+    }
+
+    private var recorded: [RecordedPost] = []
+
+    func post(
+        url: URL,
+        approvedPeers: Set<OAuthIPAddress>,
+        headers: [String: String],
+        body: Data,
+        timeout _: TimeInterval,
+        maximumResponseBodyBytes _: Int
+    ) async throws -> OAuthRemoteHTTPResponse {
+        recorded.append(.init(url: url, headers: headers, body: body))
+        return .init(
+            status: 200,
+            headers: ["content-length": ["0"]],
+            body: Data(),
+            responseURL: url,
+            connectedPeerAddress: approvedPeers.first
+        )
+    }
+
+    func posts() -> [RecordedPost] { recorded }
+}
+
+private actor RecordingServiceIssuer: SpaceServiceAuthenticationIssuer {
+    struct Issued: Sendable {
+        let issuer: String
+        let audience: String
+        let method: String
+    }
+
+    private var recorded: [Issued] = []
+
+    func issue(
+        issuer: String,
+        audience: String,
+        method: String,
+        eventID _: String,
+        now _: Date
+    ) async throws -> String {
+        recorded.append(.init(issuer: issuer, audience: audience, method: method))
+        return "recorded-service-token"
+    }
+
+    func issued() -> [Issued] { recorded }
 }
 
 private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {

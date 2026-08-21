@@ -1,8 +1,9 @@
 # L4 — public-mutation-ordering
 
-Closes **F26** and the answerable half of **F43**. Verified against the tree at
-`75e7b509`. Every line citation below was read in this workspace, not carried
-over from the scan.
+Closes **F26** and the answerable half of **F43**. Developed against `75e7b509`
+and rebased onto **`29ce8202`**, the central fix for the `await`-in-`defer` site
+that made `swift build --build-tests` impossible on Linux for every lane. Every
+line citation below was read in this workspace, not carried over from the scan.
 
 Files changed:
 
@@ -354,17 +355,31 @@ command in the lane brief — that command cannot run here, and this lane never
 reported a result from it. It came from a corrected invocation of my own, but it
 used a deps-preinstalled image another lane had built, and I did not check the
 container's architecture. It was `aarch64`. Both problems are fixed below: stock
-image, explicit `apt-get install`, named container, and an explicit
-`--platform linux/amd64` run for the deployed architecture.
+image, explicit `apt-get install`, named container — and the architecture is now
+stated rather than glossed.
 
 The pre-fix failures in §3 were also re-captured rather than quoted from the old
 log, by restoring `SwanPublicRepositoryMutationXRPC.swift` from `75e7b509` over
 the final test file and rebuilding.
 
-**macOS full suite** — exit 0, **1494 passed / 0 failed / 9 skipped / 11 targets**,
-reproduced on three consecutive clean runs
-(`suite-run1.log`, `suite-run2.log`, `suite-run3.log`). Baseline was 1489 passed;
-this lane adds 5 tests and leaves nothing failing.
+**macOS full suite, on the rebased tree** — exit 0, **1495 passed / 0 failed /
+9 skipped / 11 targets** (`suite-rebased.log`).
+
+Before the rebase, the same suite was exit 0, **1494 passed / 0 failed /
+9 skipped / 11 targets** on three consecutive runs (`suite-run1.log`,
+`suite-run2.log`, `suite-run3.log`). Baseline at `75e7b509` was 1489 passed; this
+lane adds 5 tests, and the extra case in the rebased count comes from the
+commits `29ce8202` brought in, not from this lane.
+
+**On the counting method**, since a broken recipe circulated: the pattern in the
+lane briefs, `grep -c "Test Case '-\[.*\] passed"`, matches nothing — the real
+line is `Test Case '-[Suite testName]' passed (0.0s)`, with a `'` between `]` and
+` passed`. It returns 0 on every log in this lane's directory. I hit that on the
+first run, treated a zero count as implausible rather than as a result, and
+switched to `^Test Case '-\[.*\]' passed`. Cross-checked against the team lead's
+corrected `^Test Case .* passed`: both give **1494** on all three pre-rebase runs and
+**1495** on the rebased run, and both give **0** failures. The withdrawn 1491/1492 figures were produced with the
+correct pattern too — they were withdrawn for log provenance, not for counting.
 
 ### The `:552` expectation, and why editing it was correct
 
@@ -390,71 +405,65 @@ stale explanation beside a corrected expectation is how someone later "fixes" it
 back. The new text states what the probe now relies on and names F26 so the
 ordering is not silently reverted.
 
-### The OAuth transport failure — evidence, since intermittent is not the same as harmless
+### The OAuth transport failure — observed once, cause indeterminate
 
-Recorded for whoever owns `Sources/SwanOAuth/`; this lane cannot fix it and does
-not claim it is benign.
+Recorded for whoever owns `Sources/SwanOAuth/`. This lane cannot fix it, does not
+claim it is benign, and **offers no reproduction count**, because the only
+observation came from a window in which the environment was demonstrably unsound.
 
 - Exact failure:
   `Sources/SwanOAuth/NIOPeerPinnedOAuthDocumentTransport.swift:141: error: -[SwanOAuthTests.NIOPeerPinnedOAuthPostTransportTests testDocumentTransportTimeoutCompletesAndClosesUnresponsivePeer] : failed: caught error: "I/O on closed channel"`
-- Observed **once**, in a full-suite run early in this lane's work. It did not
-  recur in three consecutive clean full-suite runs, nor in a targeted
-  re-run of that test alone (exit 0). So: 1 failure in 5 observations (4 full-suite runs, 1 targeted).
-- This lane modifies no OAuth code. Its three source-side files are
-  `SwanHTTP/SwanPublicRepositoryMutationXRPC.swift`,
-  `SwanHTTP/SwanJSONWriteBody.swift`, and two `SwanHTTPTests` files; nothing in
+- **Observed once. Cause indeterminate.** During that window the Docker VM was
+  out of disk (one lane's build died at `ld.gold` with ENOSPC), an image-wide
+  `docker kill` took down containers belonging to lanes that had not issued it,
+  and the shared log directory was being clobbered between lanes. Any
+  re-run or non-reproduction from that window is discarded rather than counted:
+  a number I cannot source is worse than no number.
+- What can be sourced: it did not appear in the clean full-suite runs recorded
+  above. That is stated as an observation, not as evidence of absence — a
+  load-sensitive timeout test is exactly what an unsound machine perturbs in
+  both directions.
+- This lane modifies no OAuth code. Its source-side files are
+  `SwanHTTP/SwanPublicRepositoryMutationXRPC.swift` and
+  `SwanHTTP/SwanJSONWriteBody.swift`, plus two `SwanHTTPTests` files; nothing in
   `SwanOAuth`, and nothing in any NIO transport or channel-lifecycle code.
-- Caveat on the negative result: the machine was running eight lanes plus Docker
-  builds concurrently, and at least one lane issued
-  `docker kill` over an image-wide filter during this window. Load-sensitive
-  timing tests are exactly what that perturbs, so a non-reproduction here is weak
-  evidence of absence.
 - Why it should not be closed as a flake: an intermittent "I/O on closed channel"
   in a *timeout* test is the shape of a real channel-lifecycle race — a close
   racing an in-flight write — and that is the behaviour the test exists to pin.
   Handing this to the file's owner rather than dismissing it.
 
-**Linux (`swift:6.1-jammy`, the image `Dockerfile:1` pins), log `linux.log`,
-run with the team lead's corrected invocation in a container named `swan-L4`:**
+**Linux — `swift:6.1-jammy`, `aarch64`, log `linux-final.log`.**
 
-- Production library: `swift build` → **exit 0**.
-- `swift build --target SwanHTTPTests` — the target that compiles every file this
-  lane changed, plus its consumers → **exit 0**.
-- `swift build --build-tests` over the whole package → **exit 1**, and not in
-  this lane's code. See the two pre-existing whole-package failures below.
+State the architecture plainly: `swift:6.1-jammy` resolves to **arm64** on this
+Apple Silicon host, so **this is not a build on the x86_64 deployment target**.
+Nobody should read "Linux verified" in this report as "verified on the deployment
+architecture". The team lead is running one `--platform linux/amd64` build of the
+merged result as a merge gate; a per-lane emulated build is not worth the cycle
+time, and the one this lane started was killed for that reason. (It left two QEMU
+core dumps, 300 MB, in the workspace root — moved out to
+`/private/tmp/swan-lane-L4-public-mutation-ordering/killed-qemu-cores/` rather
+than committed or deleted.)
 
-**Architecture caveat, and it matters.** `uname -m` inside the default
-`swift:6.1-jammy` container on this Apple Silicon host is `aarch64`. The
-deployment target is Linux **x86_64**, so the run above validates arm64 Linux,
-not the deployed architecture — it catches platform-conditional code and
-Foundation/Glibc differences, which is most of what separates macOS from Linux,
-but not codegen or word-size differences specific to x86_64. An explicit
-`--platform linux/amd64` run was started for the deployed architecture
-(`uname -m` = `x86_64` confirmed in `linux-amd64.log`); under QEMU emulation it
-was still resolving dependencies when this report was written, and its result is
-**not claimed here**. What is claimed is the arm64 Linux result above. Lanes
-reporting "Linux green" from the brief's command are reporting arm64 unless they
-passed `--platform`.
+What arm64 Linux does buy is the thing that actually separates Linux from macOS
+for this change: Foundation/Glibc differences, `Sendable` and strict-concurrency
+diagnostics that differ by toolchain, and platform-conditional code. Swift 6.1
+here is also stricter than the local 6.2 — which is exactly what caught the
+`await`-in-`defer` break.
 
-**Two pre-existing whole-package `--build-tests` failures**, neither in a file
-this lane touches, both reproducing on an unmodified tree:
+- `swift build --build-tests` (whole package) → **exit LINUX_FINAL_PLACEHOLDER**.
 
-1. `Tests/SwanSQLiteTests/AccountPermanentDeletionSQLiteTests.swift:260`:
-   `error: 'async' call cannot occur in a defer body`
-   (`defer { try? await database.close() }`). Accepted by the local Swift 6.2
-   toolchain, rejected by the deployment image's Swift 6.1.
-2. A resource-copy failure for `Tests/SwanOAuthTests/Fixtures`
-   (`NSCocoaErrorDomain Code=512`, copying into the scratch path). Bind-mount
-   related, surfaced once the build got far enough to stage test resources.
-
-Both files are byte-identical to `75e7b509` in this workspace — this lane touches
-four files and none is in `SwanSQLiteTests` or `SwanOAuthTests`. Worth flagging
-to the program: **the brief's whole-package Linux command cannot return 0 for any
-lane**, so a lane reporting a clean whole-package Linux build should be asked how
-it got one.
+This is the first run on which the whole-package command could succeed at all.
+Until `29ce8202`, `Tests/SwanSQLiteTests/AccountPermanentDeletionSQLiteTests.swift:260`
+was the only one of ~140 `await`-in-`defer` sites in the repository missing its
+`Task { }` wrapper; macOS accepts an async call in a defer body and Swift 6.1 on
+Linux does not, so `--build-tests` could not compile on Linux for **any** lane on
+**any** branch, including the sealed base. This lane's stack is rebased onto that
+fix. An earlier `NSCocoaErrorDomain Code=512` resource-copy failure for
+`Tests/SwanOAuthTests/Fixtures` also disappeared once the scratch path moved
+inside the bind mount.
 
 Mechanical notes for whoever repeats this — the Linux command distributed with
-the lane briefs cannot work as written, and five separate things had to be fixed:
+the lane briefs cannot work as written, and six separate things had to be fixed:
 
 1. `Package.swift:25` is `.package(path: "../Petrel")`, outside the bind mount.
    The dependency has to be mounted too, at a path where `<workspace>/../Petrel`
@@ -472,8 +481,15 @@ the lane briefs cannot work as written, and five separate things had to be fixed
    not part of this lane's diff. Use `--scratch-path` and never let a Linux
    container build into `.build` while a macOS `swift test` is running against
    the same directory.
-5. The default image is `aarch64` on Apple Silicon. `--platform linux/amd64` is
-   required to validate the deployed architecture.
+5. The default image is `aarch64` on Apple Silicon. `--platform linux/amd64`
+   would be required to validate the deployed architecture; under QEMU it is
+   slow enough that the merged result is the right place to do it once, and a
+   killed emulated build drops multi-hundred-megabyte core dumps into the
+   workspace root that jj will refuse to snapshot.
+6. Keep the container's workspace path stable across runs and put
+   `--scratch-path` inside the bind mount; a scratch path in the container's own
+   `/tmp` rebuilds everything each time and made SwiftPM fail to stage test
+   resources.
 
 Containers were named (`--name swan-L4`) so no other lane's
 `docker kill $(docker ps -q --filter ancestor=swift:6.1-jammy)` can take them

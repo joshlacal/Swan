@@ -279,6 +279,95 @@ final class NIOPeerPinnedOAuthPostTransportTests: XCTestCase {
         }
     }
 
+    /// Erratum 03's dynamic peer selection: an endpoint with NO configured
+    /// pin connects to a member of the policy-approved DNS answer set — the
+    /// full path including TLS hostname verification against the local CA —
+    /// while the same configuration with dynamic selection OFF refuses
+    /// before any socket I/O.
+    func testDynamicPeerSelectionConnectsUnpinnedEndpointFromApprovedAnswers() async throws {
+        let server = try await LocalTLSPeer.start()
+        defer { Task { await server.close() } }
+
+        let dynamicConnector = NIOPeerPinnedOAuthPostTransport(configuration: try .init(
+            endpointPeers: [:],
+            allowsDynamicPeerSelection: true,
+            additionalTrustRootsPEM: Data(LocalTLSCertificate.authority.utf8)
+        ))
+        let policy = try OAuthRemoteFetchPolicy(
+            networkAllowlist: .init(addresses: [server.peer]),
+            timeout: 2
+        )
+        let dynamicPoster = OAuthBoundedJSONPoster(
+            policy: policy,
+            resolver: PeerTestResolver(answers: [[server.peer], [server.peer]]),
+            transport: dynamicConnector
+        )
+        try await dynamicPoster.postJSON(
+            to: server.endpoint,
+            headers: ["content-type": "application/json"],
+            body: Data("{}".utf8)
+        )
+        let received = try await server.receivedRequest()
+        XCTAssertEqual(received, 1)
+
+        let staticConnector = NIOPeerPinnedOAuthPostTransport(configuration: try .init(
+            endpointPeers: [:],
+            additionalTrustRootsPEM: Data(LocalTLSCertificate.authority.utf8)
+        ))
+        let staticPoster = OAuthBoundedJSONPoster(
+            policy: policy,
+            resolver: PeerTestResolver(answers: [[server.peer], [server.peer]]),
+            transport: staticConnector
+        )
+        do {
+            try await staticPoster.postJSON(
+                to: server.endpoint,
+                headers: ["content-type": "application/json"],
+                body: Data("{}".utf8)
+            )
+            XCTFail("an unpinned endpoint without dynamic selection must refuse")
+        } catch {}
+        XCTAssertEqual(
+            server.connectionCount(), 1,
+            "the refusal must happen before any socket I/O — only the dynamic post connected"
+        )
+    }
+
+    /// A configured pin keeps priority under dynamic selection, and a pin
+    /// missing from the approved answers still refuses — dynamic mode must
+    /// not become a fallback around a failed pin check.
+    func testConfiguredPinStillGovernsUnderDynamicSelection() async throws {
+        let server = try await LocalTLSPeer.start()
+        defer { Task { await server.close() } }
+
+        let foreign = try XCTUnwrap(OAuthIPAddress(literal: "8.8.8.8"))
+        let connector = NIOPeerPinnedOAuthPostTransport(configuration: try .init(
+            endpointPeers: [server.endpoint.absoluteString: foreign],
+            allowsDynamicPeerSelection: true,
+            additionalTrustRootsPEM: Data(LocalTLSCertificate.authority.utf8)
+        ))
+        let poster = OAuthBoundedJSONPoster(
+            policy: try OAuthRemoteFetchPolicy(
+                networkAllowlist: .init(addresses: [server.peer]),
+                timeout: 2
+            ),
+            resolver: PeerTestResolver(answers: [[server.peer], [server.peer]]),
+            transport: connector
+        )
+        do {
+            try await poster.postJSON(
+                to: server.endpoint,
+                headers: ["content-type": "application/json"],
+                body: Data("{}".utf8)
+            )
+            XCTFail("a pin outside the approved answers must refuse")
+        } catch {}
+        // Synchronous snapshots — `receivedRequest()` AWAITS a request, and
+        // this test's whole point is that none is ever made.
+        XCTAssertEqual(server.connectionCount(), 0, "no socket may open for a refused pin")
+        XCTAssertEqual(server.receivedBodyByteCount(), 0)
+    }
+
     private func makePoster(
         endpoint: URL,
         resolver: any OAuthHostnameResolving,

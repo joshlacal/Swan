@@ -802,8 +802,13 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
         } catch {
             throw AccountEmailXRPCFailure.unavailable
         }
-        guard case let .accountOAuth(subject, scopes) = authorization,
-              scopes.contains("atproto") else {
+        // NOT YET PORTED (§6.5.10): `requestEmailConfirmation` is the ONE
+        // non-space family with a live Swan counterpart —
+        // `server/requestEmailConfirmation.ts:18` asserts
+        // `assertAccount({attr:'email', action:'manage'})`. It is the cheapest
+        // `account:` port and the natural first one. Base scope only until then.
+        guard case let .accountOAuth(subject, permissions) = authorization,
+              permissions.hasBaseATProtocolScope else {
             throw AccountEmailXRPCFailure.unauthorized
         }
         return subject

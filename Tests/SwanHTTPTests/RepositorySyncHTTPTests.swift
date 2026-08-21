@@ -314,6 +314,11 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertFalse(String(decoding: response.body.readableBytesView, as: UTF8.self).contains(fixture.blobCID))
                 }
 
+                // Erratum 03: a collection-qualified read grant FETCHES a
+                // single blob — the aggregate classification that refused it
+                // protected nothing once the same grant could exchange for a
+                // whole-space credential reading the identical bytes. The
+                // foreign-subject refusal above is the boundary that remains.
                 let narrowHeaders = try self.dpopHeaders(
                     token: narrow.token, key: narrow.key, jwk: narrow.jwk,
                     nonce: fixture.runtime.dpopNonceService.issue(),
@@ -323,8 +328,8 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID),
                     method: .get, headers: narrowHeaders
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
-                    self.assertNoStore(response)
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(response.headers[.contentType], "application/octet-stream")
                 }
 
                 let replayHeaders = try self.dpopHeaders(
@@ -510,6 +515,37 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     self.assertNoStore(response)
                     let commit = try XCTUnwrap((try self.jsonObject(response.body))["commit"] as? [String: Any])
                     try self.assertCommit(commit, fixture: fixture, author: Self.bob)
+                }
+
+                // The pre-rename `getRepoState` alias answers identically to
+                // the canonical name: clients built on the atproto-crates
+                // lineage (bulleted.app) know only the alias.
+                try await client.execute(
+                    uri: self.latestURI(space: fixture.space, repo: Self.bob)
+                        .replacingOccurrences(
+                            of: "com.atproto.space.getLatestCommit",
+                            with: "com.atproto.space.getRepoState"
+                        ),
+                    method: .get,
+                    headers: self.bearerHeaders(credential, dpop: "not-a-dpop-proof")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let commit = try XCTUnwrap((try self.jsonObject(response.body))["commit"] as? [String: Any])
+                    try self.assertCommit(commit, fixture: fixture, author: Self.bob)
+                }
+
+                // And the service description lists the alias here, where its
+                // route is live.
+                try await client.execute(
+                    uri: "/xrpc/community.lexicon.service.describe", method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let object = try XCTUnwrap(
+                        try self.jsonObject(response.body) as? [String: Any])
+                    let values = try XCTUnwrap(object["methods"] as? [[String: Any]])
+                        .compactMap { $0["value"] as? String }
+                    XCTAssertTrue(values.contains("com.atproto.space.getRepoState"))
+                    XCTAssertTrue(values.contains("com.atproto.space.getLatestCommit"))
                 }
 
                 let pageHeaders = try self.dpopHeaders(
@@ -1376,7 +1412,7 @@ private struct Fixture: Sendable {
             )
             let tids = try [0, 1, 2, 3, 4].map(tid)
             let scopeBase = "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)"
-            let authorization: AuthorizationContext = .accountOAuth(
+            let authorization: AuthorizationContext = .accountOAuthForTesting(
                 subject: RepositorySyncHTTPTests.alice,
                 scopes: [
                     "atproto",
@@ -1418,7 +1454,7 @@ private struct Fixture: Sendable {
             let bobDatabase = try await SQLiteAccountDatabase(dataDirectory: root, did: RepositorySyncHTTPTests.bob, oplogRetention: retention)
             let bobRepository = try DurableSpaceRepository(database: bobDatabase, space: space, author: RepositorySyncHTTPTests.bob)
             let bobRecord = try SpaceRecordURI(space: space, author: RepositorySyncHTTPTests.bob, collection: "app.bsky.feed.post", rkey: "bob")
-            _ = try await bobRepository.apply(.put(uri: bobRecord, value: recordCBOR("bob")), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: tids[0]), authorization: .accountOAuth(subject: RepositorySyncHTTPTests.bob, scopes: ["\(scopeBase)&action=create&collection=app.bsky.feed.post"]))
+            _ = try await bobRepository.apply(.put(uri: bobRecord, value: recordCBOR("bob")), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: tids[0]), authorization: .accountOAuthForTesting(subject: RepositorySyncHTTPTests.bob, scopes: ["\(scopeBase)&action=create&collection=app.bsky.feed.post"]))
             try await bobDatabase.close()
 
             let hasher = try LibsodiumArgon2idHasher(policy: .interactive)
@@ -1509,6 +1545,8 @@ private actor CorruptSyncDirectory: AuthorizedSimpleSpaceDirectory, AuthorizedSp
     func close() async throws {}
     func record(_ uri: SpaceRecordURI, authorization _: AuthorizationContext) async throws -> SpaceRecord? { nil }
     func records(space _: SpaceURI, author _: String, collection _: String?, limit _: Int, cursor _: String?, reverse _: Bool, authorization _: AuthorizationContext) async throws -> [SpaceRecord] { [] }
+
+    func repositoryBlobCIDs(space _: SpaceURI, author _: String, since _: String?, limit _: Int, cursor _: String?, authorization _: AuthorizationContext) async throws -> [String] { [] }
     func repositoryCommitState(space: SpaceURI, author: String, authorization _: AuthorizationContext) async throws -> AuthorizedSpaceRepositoryCommitState {
         .init(space: space, author: author, wireRevision: "2222222222222", commitment: Data(repeating: 0x01, count: 32))
     }

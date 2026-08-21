@@ -339,17 +339,25 @@ public struct AuthorizedSpaceNotificationRegistration: Sendable, Equatable {
     public let endpoint: String
     public let repository: String?
     public let expiresAt: Date
+    /// The subscriber's service identifier (`did` or `did#fragment`) when the
+    /// registration named one — the audience `notifyWrite` deliveries are
+    /// addressed to, and the marker that the endpoint has DID-document
+    /// provenance. `nil` for a legacy endpoint-only registration, which stays
+    /// local discovery state and is never a dynamic delivery destination.
+    public let service: String?
 
     public init(
         space: SpaceURI,
         endpoint: String,
         repository: String?,
-        expiresAt: Date
+        expiresAt: Date,
+        service: String? = nil
     ) {
         self.space = space
         self.endpoint = endpoint
         self.repository = repository
         self.expiresAt = expiresAt
+        self.service = service
     }
 }
 
@@ -398,6 +406,16 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
 
     func registerSpaceNotification(
         _ registration: AuthorizedSpaceNotificationRegistration,
+        authorization: AuthorizationContext
+    ) async throws
+
+    /// Withdraws a subscriber's registration by service identity
+    /// (`com.atproto.space.unregisterNotify`). Idempotent: succeeds whether or
+    /// not a matching registration existed. Implementations gate on a space
+    /// credential for exactly this space and on the space still being active.
+    func unregisterSpaceNotification(
+        space: SpaceURI,
+        service: String,
         authorization: AuthorizationContext
     ) async throws
 
@@ -519,6 +537,19 @@ public protocol AuthorizedSpaceRepositoryDirectory: Sendable {
         _ uri: SpaceRecordURI,
         authorization: AuthorizationContext
     ) async throws -> SpaceRecord?
+
+    /// The distinct blob CIDs referenced by one account's records within a
+    /// space, ordered ascending (`com.atproto.space.listBlobs`). `since`
+    /// filters by the referencing record's last-write wire TID; `cursor` is
+    /// the last CID of the previous page.
+    func repositoryBlobCIDs(
+        space: SpaceURI,
+        author: String,
+        since: String?,
+        limit: Int,
+        cursor: String?,
+        authorization: AuthorizationContext
+    ) async throws -> [String]
 
     /// Returns a bounded, deterministic page from one durable permissioned
     /// repository. `cursor` is already syntactically bounded by the HTTP

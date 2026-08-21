@@ -165,11 +165,18 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
             eventID: notification.id.uuidString,
             now: Date()
         )
-        try await poster.postJSON(
-            to: endpoint,
-            headers: notificationHeaders(token),
-            body: body
-        )
+        do {
+            try await poster.postJSON(
+                to: endpoint,
+                headers: notificationHeaders(token),
+                body: body
+            )
+        } catch is OAuthOutboundPostPermanentlyRejected {
+            // A verified peer answered 4xx: the receiver refused this
+            // delivery and a retry cannot change its mind. Acknowledge
+            // rather than grinding the queue on a permanent failure.
+            return
+        }
     }
 }
 
@@ -202,13 +209,6 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
     }
 
     public func deliver(_ notification: PersistedSpaceNotificationFanout) async throws {
-        guard notification.kind == .deleted else {
-            // Rows created by pre-interoperability builds are safe to retire:
-            // their authority-signed `notifyWrite` shape is rejected by the
-            // pinned TypeScript receiver and must not be retried as if it
-            // offered cross-host convergence.
-            return
-        }
         // A replacement, expiry, or future explicit removal wins over a row
         // that was already queued. Treat the stale delivery as a successful
         // no-op; the lease worker will acknowledge it without network I/O.
@@ -220,14 +220,63 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
         ) else {
             return
         }
-        guard let destination = try await destinations.destination(
-            forRegisteredEndpoint: notification.endpoint
-        ) else {
+        // Erratum 03: a SERVICE-NAMED registration is its own destination —
+        // the endpoint carries DID-document provenance from registration-time
+        // resolution, and the identifier is the verifiable JWT audience. The
+        // poster still applies the full egress policy per request, so a
+        // resolved endpoint gets the same SSRF refusals as a configured one.
+        // Endpoint-only legacy rows keep requiring the operator map: with no
+        // service identity there is no audience a receiver could verify, and
+        // their raw URLs never became network destinations before.
+        let service = try await database.spaceNotificationRegistrationService(
+            space: notification.space,
+            endpoint: notification.endpoint,
+            repository: notification.repository,
+            now: Date()
+        )
+        let destination: SwanSpaceNotificationDestination
+        if let service {
+            guard let registered = URL(string: notification.endpoint) else {
+                throw SwanError.malformed("registered notification endpoint is invalid")
+            }
+            destination = try SwanSpaceNotificationDestination(
+                endpoint: registered,
+                audience: service
+            )
+        } else if notification.kind == .deleted,
+                  let configured = try await destinations.destination(
+                      forRegisteredEndpoint: notification.endpoint
+                  ) {
+            destination = configured
+        } else if notification.kind == .write {
+            // A write row for a registration that lost (or never had) its
+            // service identity: nothing verifiable to deliver. Pre-Erratum-03
+            // rows are also retired through here.
+            return
+        } else {
             throw SwanError.unavailable("registered notification destination is unavailable")
         }
-        let method = ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
+        let method: String
+        let body: Data
+        switch notification.kind {
+        case .write:
+            guard let repository = notification.repository,
+                  let wireRevision = notification.wireRevision,
+                  let commitment = notification.commitment else {
+                throw SwanError.malformed("write fanout row is incomplete")
+            }
+            method = ComAtprotoSpaceNotifyWrite.typeIdentifier
+            body = try notificationJSON(
+                space: notification.space,
+                repository: repository,
+                wireRevision: wireRevision,
+                commitment: commitment
+            )
+        case .deleted:
+            method = ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
+            body = try deletionJSON(space: notification.space)
+        }
         let endpoint = try notificationEndpoint(destination.endpoint, method: method)
-        let body = try deletionJSON(space: notification.space)
         let token = try await serviceAuthentication.issue(
             issuer: notification.space.authority,
             audience: destination.audience,
@@ -235,11 +284,17 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
             eventID: notification.id.uuidString,
             now: Date()
         )
-        try await poster.postJSON(
-            to: endpoint,
-            headers: notificationHeaders(token),
-            body: body
-        )
+        do {
+            try await poster.postJSON(
+                to: endpoint,
+                headers: notificationHeaders(token),
+                body: body
+            )
+        } catch is OAuthOutboundPostPermanentlyRejected {
+            // A verified peer answered 4xx (bulleted.app has no deletion
+            // receiver at all, for instance): permanent, acknowledge.
+            return
+        }
     }
 }
 
@@ -283,13 +338,13 @@ private func notificationJSON(
     commitment: Data
 ) throws -> Data {
     guard commitment.count == 32,
-          (try? TID(tidString: wireRevision)) != nil else {
+          let revision = try? TID(tidString: wireRevision) else {
         throw SwanError.malformed("writer notification is invalid")
     }
     let input = try ComAtprotoSpaceNotifyWrite.Input(
-        space: ATProtocolURI(uriString: space.rawValue),
+        space: SpaceRef(uriString: space.rawValue),
         repo: DID(didString: repository),
-        rev: wireRevision,
+        rev: revision,
         hash: Bytes(data: commitment)
     )
     return try SwanJSONEncoders.sortedNoEscaping.encode(input)
@@ -297,7 +352,7 @@ private func notificationJSON(
 
 private func deletionJSON(space: SpaceURI) throws -> Data {
     let input = try ComAtprotoSpaceNotifySpaceDeleted.Input(
-        space: ATProtocolURI(uriString: space.rawValue)
+        space: SpaceRef(uriString: space.rawValue)
     )
     return try SwanJSONEncoders.sortedNoEscaping.encode(input)
 }

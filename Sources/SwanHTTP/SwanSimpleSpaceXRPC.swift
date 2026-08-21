@@ -38,20 +38,88 @@ private enum AuthenticatedSimpleSpaceLifecycleFailure: Error {
     case invalidRequest
     case spaceNotFound
     case spaceAlreadyExists
+    case unsupportedPolicy
+    case unsupportedAppAccess
     case denied
     case nonceChallenge
     case unavailable
 }
 
-private struct AuthenticatedSimpleSpaceCreateHandler: ComAtprotoSimplespaceCreateSpace.ServerHandler {
-    typealias Context = Request
+/// A `policy` value in either dialect the shipped surface accepts: the live
+/// lexicon's typed union (`#publicPolicy` / `#memberListPolicy` /
+/// `#managingAppPolicy`, the latter carrying its own `managingApp`), or the
+/// retired string form (`"public"` / `"member-list"` / `"managing-app"`) that
+/// pre-bddc99fb clients still emit. An unrecognized union `$type` is the
+/// lexicon's `UnsupportedPolicy`, not a malformed request.
+private enum SimpleSpacePolicyWire: Decodable {
+    case union(SimpleSpacePolicy, managingApp: String?)
+    case legacy(SimpleSpacePolicy)
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let raw = try? container.decode(String.self) {
+            guard let policy = SimpleSpacePolicy(rawValue: raw) else {
+                throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
+            }
+            self = .legacy(policy)
+            return
+        }
+        let union = try ComAtprotoSimplespaceUpdateSpace.InputPolicyUnion(from: decoder)
+        switch union {
+        case .comAtprotoSimplespaceDefsPublicPolicy:
+            self = .union(.public, managingApp: nil)
+        case .comAtprotoSimplespaceDefsMemberListPolicy:
+            self = .union(.memberList, managingApp: nil)
+        case let .comAtprotoSimplespaceDefsManagingAppPolicy(value):
+            self = .union(.managingApp, managingApp: value.managingApp)
+        case .unexpected:
+            throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
+        }
+    }
+}
+
+/// The retired nested `config` object from the pre-bddc99fb createSpace
+/// dialect. The live lexicon lifts `policy`/`appAccess` to the input's top
+/// level; this remains accepted as shipped-surface leniency.
+private struct LegacySimpleSpaceConfigWireInput: Decodable {
+    let policy: String
+    let appAccess: ComAtprotoSimplespaceUpdateSpace.InputAppAccessUnion
+    let managingApp: String?
+}
+
+/// The wire input for `createSpace`, admitting both the live lexicon shape
+/// (`type`, optional `skey`, top-level `policy`/`appAccess` unions) and the
+/// retired dialect (`did` defaulting to the caller, nested `config`). The key
+/// fence rejects a body that mixes the two dialects; `requireLifecycleAuthority`
+/// still rejects a foreign `did` either way.
+private struct SimpleSpaceCreateWireInput: Decodable {
+    let did: DID?
+    let type: NSID
+    let skey: String?
+    let config: LegacySimpleSpaceConfigWireInput?
+    let policy: SimpleSpacePolicyWire?
+    let appAccess: ComAtprotoSimplespaceUpdateSpace.InputAppAccessUnion?
+}
+
+private struct AuthenticatedSimpleSpaceCreateHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
     func handle(
-        parameters: Void,
-        input: ComAtprotoSimplespaceCreateSpace.Input,
+        parameters _: Void,
+        input: SimpleSpaceCreateWireInput,
         context request: Request
     ) async throws -> ComAtprotoSimplespaceCreateSpace.Output {
+        // Authorization runs before the space URI is built: the authority
+        // defaults to the caller, so identity must be known first. The
+        // token is still validated exactly once.
+        let authorization = try await lifecycleAuthorization(
+            capability.authorizer,
+            request: request,
+            fixedPath: "/xrpc/com.atproto.simplespace.createSpace"
+        )
+        guard case let .accountOAuth(subject, _) = authorization else {
+            throw AuthenticatedSimpleSpaceLifecycleFailure.spaceNotFound
+        }
         let space: SpaceURI
         do {
             let skey: String
@@ -61,25 +129,15 @@ private struct AuthenticatedSimpleSpaceCreateHandler: ComAtprotoSimplespaceCreat
                 skey = try await capability.tidAllocator.next().toString()
             }
             space = try SpaceURI(
-                authority: input.did.didString(),
+                authority: input.did?.didString() ?? subject,
                 spaceType: input.type.nsidString(),
                 skey: skey
             )
         } catch {
             throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
         }
-        let authorization = try await lifecycleAuthorization(
-            capability.authorizer,
-            request: request,
-            fixedPath: "/xrpc/com.atproto.simplespace.createSpace"
-        )
         try requireLifecycleAuthority(authorization, space: space)
-        let configuration: SimpleSpaceConfiguration
-        do {
-            configuration = try simpleSpaceConfiguration(input.config)
-        } catch {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-        }
+        let configuration = try simpleSpaceConfiguration(input)
         do {
             try await capability.directory.createSimpleSpace(
                 space,
@@ -90,20 +148,29 @@ private struct AuthenticatedSimpleSpaceCreateHandler: ComAtprotoSimplespaceCreat
             throw lifecycleFailure(for: error)
         }
         do {
-            return try .init(uri: ATProtocolURI(uriString: space.rawValue))
+            return try .init(uri: SpaceRef(uriString: space.rawValue))
         } catch {
             throw AuthenticatedSimpleSpaceLifecycleFailure.unavailable
         }
     }
 }
 
-private struct AuthenticatedSimpleSpaceUpdateHandler: ComAtprotoSimplespaceUpdateSpace.ServerHandler {
-    typealias Context = Request
+/// The wire input for `updateSpace`, admitting the live lexicon shape
+/// (`space`, optional `policy`/`appAccess` unions) and the retired dialect's
+/// string `policy` plus top-level `managingApp`.
+private struct SimpleSpaceUpdateWireInput: Decodable {
+    let space: SpaceRef
+    let policy: SimpleSpacePolicyWire?
+    let appAccess: ComAtprotoSimplespaceUpdateSpace.InputAppAccessUnion?
+    let managingApp: String?
+}
+
+private struct AuthenticatedSimpleSpaceUpdateHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
     func handle(
-        parameters: Void,
-        input: ComAtprotoSimplespaceUpdateSpace.Input,
+        parameters _: Void,
+        input: SimpleSpaceUpdateWireInput,
         context request: Request
     ) async throws {
         let space = try lifecycleSpace(input.space)
@@ -113,12 +180,7 @@ private struct AuthenticatedSimpleSpaceUpdateHandler: ComAtprotoSimplespaceUpdat
             fixedPath: "/xrpc/com.atproto.simplespace.updateSpace"
         )
         try requireLifecycleAuthority(authorization, space: space)
-        let patch: SimpleSpaceConfigurationPatch
-        do {
-            patch = try simpleSpacePatch(input)
-        } catch {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-        }
+        let patch = try simpleSpacePatch(input)
         do {
             try await capability.directory.updateSimpleSpace(
                 space,
@@ -274,10 +336,10 @@ private func registerSimpleSpaceCreate(
         await withSimpleSpaceInput(
             request,
             context: context,
-            as: ComAtprotoSimplespaceCreateSpace.Input.self,
+            as: SimpleSpaceCreateWireInput.self,
             capability: capability,
-            required: ["did", "type"],
-            allowed: ["did", "type", "skey", "config"]
+            required: ["type"],
+            allowed: ["did", "type", "skey", "config", "policy", "appAccess"]
         ) { input in
             authenticatedGetSpaceJSON(
                 .ok,
@@ -298,7 +360,7 @@ private func registerSimpleSpaceUpdate(
         await withSimpleSpaceInput(
             request,
             context: context,
-            as: ComAtprotoSimplespaceUpdateSpace.Input.self,
+            as: SimpleSpaceUpdateWireInput.self,
             capability: capability,
             required: ["space"],
             allowed: ["space", "policy", "managingApp", "appAccess"]
@@ -431,7 +493,7 @@ private func requireLifecycleAuthority(
     }
 }
 
-private func lifecycleSpace(_ uri: ATProtocolURI) throws -> SpaceURI {
+private func lifecycleSpace(_ uri: SpaceRef) throws -> SpaceURI {
     do {
         return try SpaceURI(uri.uriString())
     } catch {
@@ -453,55 +515,94 @@ private func lifecycleFailure(for error: Error) -> AuthenticatedSimpleSpaceLifec
 }
 
 private func simpleSpaceConfiguration(
-    _ config: ComAtprotoSimplespaceDefs.SpaceConfig?
+    _ input: SimpleSpaceCreateWireInput
 ) throws -> SimpleSpaceConfiguration {
-    guard let config else { return try .init() }
-    guard let policy = SimpleSpacePolicy(rawValue: config.policy) else {
+    // The key fence has already rejected a body mixing the two dialects.
+    do {
+        if let config = input.config {
+            guard let policy = SimpleSpacePolicy(rawValue: config.policy) else {
+                throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
+            }
+            return try .init(
+                policy: policy,
+                appAccess: try simpleSpaceAppAccess(config.appAccess),
+                managingApp: config.managingApp
+            )
+        }
+        switch (input.policy, input.appAccess) {
+        case (nil, nil):
+            // Retired-dialect leniency: the live lexicon requires both, but
+            // the shipped crate client's canonical body is {"type","skey"}.
+            // Absent fields take the host defaults, matching that client's
+            // own server.
+            return try .init()
+        case let (policy, appAccess):
+            var resolvedPolicy = SimpleSpacePolicy.memberList
+            var managingApp: String? = nil
+            switch policy {
+            case let .union(value, app):
+                resolvedPolicy = value
+                managingApp = app
+            case let .legacy(value):
+                resolvedPolicy = value
+            case nil:
+                break
+            }
+            return try .init(
+                policy: resolvedPolicy,
+                appAccess: try appAccess.map(simpleSpaceAppAccess) ?? .open,
+                managingApp: managingApp
+            )
+        }
+    } catch let failure as AuthenticatedSimpleSpaceLifecycleFailure {
+        throw failure
+    } catch {
         throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
     }
-    return try .init(
-        policy: policy,
-        appAccess: try simpleSpaceAppAccess(config.appAccess),
-        managingApp: config.managingApp
-    )
 }
 
 private func simpleSpacePatch(
-    _ input: ComAtprotoSimplespaceUpdateSpace.Input
+    _ input: SimpleSpaceUpdateWireInput
 ) throws -> SimpleSpaceConfigurationPatch {
-    let policy = try input.policy.map {
-        guard let policy = SimpleSpacePolicy(rawValue: $0) else {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+    do {
+        let policy: SimpleSpacePolicy?
+        let managingApp: SimpleSpaceConfigurationPatch.ManagingApp
+        switch input.policy {
+        case let .union(value, .some(app)):
+            // A #managingAppPolicy union replaces the policy wholesale and
+            // carries its own target; the other variants leave the stored
+            // managing app in place (it is not emitted under them anyway).
+            policy = value
+            guard !app.isEmpty, app.utf8.count <= 2_048 else {
+                throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+            }
+            managingApp = .set(app)
+        case let .union(value, nil), let .legacy(value):
+            policy = value
+            managingApp = try legacyManagingAppPatch(input.managingApp)
+        case nil:
+            policy = nil
+            managingApp = try legacyManagingAppPatch(input.managingApp)
         }
-        return policy
-    }
-    let appAccess = try input.appAccess.map(simpleSpaceAppAccess)
-    let managingApp: SimpleSpaceConfigurationPatch.ManagingApp
-    if let value = input.managingApp {
-        guard value.utf8.count <= 2_048 else {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-        }
-        managingApp = .set(value.isEmpty ? nil : value)
-    } else {
-        managingApp = .unchanged
-    }
-    return .init(policy: policy, appAccess: appAccess, managingApp: managingApp)
-}
-
-private func simpleSpaceAppAccess(
-    _ wire: ComAtprotoSimplespaceDefs.SpaceConfigAppAccessUnion
-) throws -> SimpleSpaceAppAccess {
-    switch wire {
-    case .comAtprotoSimplespaceDefsOpen:
-        return .open
-    case let .comAtprotoSimplespaceDefsAllowList(value):
-        guard value.allowed.count <= 1_000 else {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-        }
-        return .allowList(Set(value.allowed))
-    case .unexpected:
+        let appAccess = try input.appAccess.map(simpleSpaceAppAccess)
+        return .init(policy: policy, appAccess: appAccess, managingApp: managingApp)
+    } catch let failure as AuthenticatedSimpleSpaceLifecycleFailure {
+        throw failure
+    } catch {
         throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
     }
+}
+
+/// The retired dialect's top-level `managingApp`: empty is the explicit clear
+/// sentinel, absent leaves the stored value unchanged.
+private func legacyManagingAppPatch(
+    _ value: String?
+) throws -> SimpleSpaceConfigurationPatch.ManagingApp {
+    guard let value else { return .unchanged }
+    guard value.utf8.count <= 2_048 else {
+        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+    }
+    return .set(value.isEmpty ? nil : value)
 }
 
 private func simpleSpaceAppAccess(
@@ -516,7 +617,7 @@ private func simpleSpaceAppAccess(
         }
         return .allowList(Set(value.allowed))
     case .unexpected:
-        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+        throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedAppAccess
     }
 }
 
@@ -561,6 +662,18 @@ private func withSimpleSpaceInput<Value: Decodable>(
                 Set(root.keys).isSubset(of: allowed),
                 required.isSubset(of: Set(root.keys)),
                 !root.values.contains(where: { $0 is NSNull }) else {
+                // Key names only — never field values, which may hold DIDs
+                // or space configuration the caller expects to stay private.
+                if let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    context.logger.info(
+                        "simplespace write rejected",
+                        metadata: [
+                            "stage": .string("key_set"),
+                            "received": .string(root.keys.sorted().joined(separator: ",")),
+                            "required": .string(required.sorted().joined(separator: ",")),
+                            "allowed": .string(allowed.sorted().joined(separator: ",")),
+                        ])
+                }
                 throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
             }
             try validateSimpleSpaceJSON(root)
@@ -617,17 +730,26 @@ private func simpleSpaceLifecycleResponse(
 /// decoder sees it. The duplicate-key parser above applies recursively; this
 /// semantic pass rejects unknown/nullable nested configuration fields too.
 private func validateSimpleSpaceJSON(_ root: [String: Any]) throws {
-    for key in ["did", "type", "skey", "space", "policy", "managingApp"] {
+    // One dialect per body: the live lexicon's top-level `policy`/`appAccess`
+    // and the retired nested `config` must not mix — a body carrying both has
+    // no unambiguous author intent.
+    if root["config"] != nil, root["policy"] != nil || root["appAccess"] != nil {
+        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+    }
+    for key in ["did", "type", "skey", "space", "managingApp"] {
         if let value = root[key] {
             guard let string = value as? String,
                   // The reference handler uses an empty `managingApp` on an
                   // update as an explicit clear sentinel. Every other string
-                  // field is an identifier/policy and must remain nonempty.
+                  // field is an identifier and must remain nonempty.
                   (key == "managingApp" || !string.isEmpty),
                   string.utf8.count <= 2_048 else {
                 throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
             }
         }
+    }
+    if let policy = root["policy"] {
+        try validateSimpleSpacePolicyJSON(policy)
     }
     if let config = root["config"] {
         guard let object = config as? [String: Any] else {
@@ -640,6 +762,38 @@ private func validateSimpleSpaceJSON(_ root: [String: Any]) throws {
             throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
         }
         try validateSimpleSpaceAppAccessJSON(object)
+    }
+}
+
+/// A top-level `policy` in either dialect: the retired string form, or the
+/// live lexicon's typed union. An unknown union `$type` is the lexicon's
+/// `UnsupportedPolicy`; anything else malformed is a plain invalid request.
+private func validateSimpleSpacePolicyJSON(_ value: Any) throws {
+    if let string = value as? String {
+        guard SimpleSpacePolicy(rawValue: string) != nil else {
+            throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
+        }
+        return
+    }
+    guard let object = value as? [String: Any],
+          let type = object["$type"] as? String else {
+        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+    }
+    switch type {
+    case ComAtprotoSimplespaceDefs.PublicPolicy.typeIdentifier,
+         ComAtprotoSimplespaceDefs.MemberListPolicy.typeIdentifier:
+        guard Set(object.keys) == Set(["$type"]) else {
+            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+        }
+    case ComAtprotoSimplespaceDefs.ManagingAppPolicy.typeIdentifier:
+        guard Set(object.keys) == Set(["$type", "managingApp"]),
+              let managingApp = object["managingApp"] as? String,
+              !managingApp.isEmpty,
+              managingApp.utf8.count <= 2_048 else {
+            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+        }
+    default:
+        throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
     }
 }
 
@@ -719,7 +873,7 @@ private func parseSimpleSpaceListMembersParameters(
           rawSpace.utf8.count <= 2_048 else {
         throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
     }
-    let space = try ATProtocolURI(uriString: rawSpace)
+    let space = try SpaceRef(uriString: rawSpace)
     _ = try lifecycleSpace(space)
     let limit: Int?
     if let rawLimit = values["limit"] {
@@ -769,6 +923,10 @@ private func simpleSpaceLifecycleResponse(
         simpleSpaceLifecycleError(.notFound, code: "SpaceNotFound")
     case .spaceAlreadyExists:
         simpleSpaceLifecycleError(.badRequest, code: "SpaceAlreadyExists")
+    case .unsupportedPolicy:
+        simpleSpaceLifecycleError(.badRequest, code: "UnsupportedPolicy")
+    case .unsupportedAppAccess:
+        simpleSpaceLifecycleError(.badRequest, code: "UnsupportedAppAccess")
     case .denied:
         simpleSpaceLifecycleError(.unauthorized, code: "Unauthorized")
     case .nonceChallenge:

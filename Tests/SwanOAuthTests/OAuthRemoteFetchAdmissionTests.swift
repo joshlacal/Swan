@@ -980,6 +980,48 @@ final class OAuthRemoteFetchAdmissionTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(cached?.document, Data("second-valid".utf8))
     }
 
+    /// A release path that needs the resource its own exhaustion consumed is
+    /// not a release path. Abandoning must still work with the freshness table
+    /// at its cap — that is exactly the state it exists to recover from.
+    func testAbandonSucceedsWithTheFreshnessTableAtCapacity() async throws {
+        let fixture = try await OAuthRemoteFetchAdmissionFixture(
+            clientMetadataFreshnessLimit: 2
+        )
+        addTeardownBlock {
+            try? await fixture.database.close()
+            fixture.cleanup()
+        }
+        let first = try await fixture.database.beginClientMetadataFetch(
+            clientID: "https://hostile-a.example/oauth/client.json",
+            now: now
+        )
+        let second = try await fixture.database.beginClientMetadataFetch(
+            clientID: "https://hostile-b.example/oauth/client.json",
+            now: now
+        )
+        _ = first
+        do {
+            _ = try await fixture.database.beginClientMetadataFetch(
+                clientID: "https://legitimate.example/oauth/client.json",
+                now: now
+            )
+            XCTFail("the freshness table must be at capacity for this test")
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                return XCTFail("expected typed unavailable, got \(error)")
+            }
+        }
+
+        try await fixture.database.abandonClientMetadataFetch(
+            ticket: second,
+            now: now
+        )
+        _ = try await fixture.database.beginClientMetadataFetch(
+            clientID: "https://legitimate.example/oauth/client.json",
+            now: now
+        )
+    }
+
     /// An abandoned ticket is dead: it must not be able to publish afterwards.
     func testAnAbandonedTicketCannotPublishLater() async throws {
         let fixture = try await OAuthRemoteFetchAdmissionFixture()

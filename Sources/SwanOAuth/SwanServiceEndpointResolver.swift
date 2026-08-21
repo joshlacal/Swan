@@ -99,7 +99,7 @@ public struct SwanServiceEndpointResolver: Sendable {
             inFlight[did]?.waiterCount ?? 0
         }
 
-        func endpoint(did: String, fragment: String) async throws -> URL {
+        func document(forDID did: String) async throws -> Document {
             try Task.checkCancellation()
 
             let wait = DIDDocumentFlightWait()
@@ -136,6 +136,11 @@ public struct SwanServiceEndpointResolver: Sendable {
             }
 
             let document = try await awaitFlight(wait)
+            return document
+        }
+
+        func endpoint(did: String, fragment: String) async throws -> URL {
+            let document = try await self.document(forDID: did)
             guard let url = SwanServiceEndpointResolver.resolveEndpoint(
                 document: document,
                 did: did,
@@ -143,6 +148,31 @@ public struct SwanServiceEndpointResolver: Sendable {
             ) else {
                 throw SwanServiceResolutionFailure.unresolvableService
             }
+            return url
+        }
+
+        func endpoint(serviceIdentifier: String) async throws -> URL {
+            guard !serviceIdentifier.isEmpty, serviceIdentifier.utf8.count <= 1_024 else {
+                throw SwanServiceResolutionFailure.unresolvableService
+            }
+            if let separator = serviceIdentifier.firstIndex(of: "#") {
+                let did = String(serviceIdentifier[..<separator])
+                let fragment = String(serviceIdentifier[serviceIdentifier.index(after: separator)...])
+                guard !did.isEmpty, !fragment.isEmpty, !fragment.contains("#") else {
+                    throw SwanServiceResolutionFailure.unresolvableService
+                }
+                return try await endpoint(did: did, fragment: fragment)
+            }
+            let did = serviceIdentifier
+            let document = try await self.document(forDID: did)
+            guard let services = document.service,
+                  services.count == 1,
+                  let only = services.first,
+                  let url = URL(string: only.serviceEndpoint),
+                  url.scheme?.lowercased() == "https",
+                  let host = url.host, !host.isEmpty,
+                  url.user == nil, url.password == nil
+            else { throw SwanServiceResolutionFailure.unresolvableService }
             return url
         }
 
@@ -222,6 +252,29 @@ public struct SwanServiceEndpointResolver: Sendable {
             url.user == nil, url.password == nil
         else { return nil }
         return url
+    }
+
+    /// Resolves a whole service identifier — `did` or `did#fragment` — as the
+    /// spaces `registerNotify` contract names its subscriber (the reference
+    /// implementation's `resolve_service_endpoint`).
+    ///
+    /// With a fragment this is exactly ``endpoint(did:fragment:)``. Without
+    /// one, the reference selects the document's FIRST service entry; Swan
+    /// keeps its refuse-ambiguity posture instead: a fragment-less identifier
+    /// resolves only when the document declares exactly one service entry, so
+    /// the answer can never depend on entry ordering. A subscriber whose
+    /// document has several services must name one with a fragment.
+    ///
+    /// The endpoint checks (https, host, no credentials) are identical to the
+    /// fragment form — a DID document is not this server's to trust either.
+    public func endpoint(serviceIdentifier: String) async throws -> URL {
+        do {
+            return try await resolverActor.endpoint(serviceIdentifier: serviceIdentifier)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw SwanServiceResolutionFailure.unresolvableService
+        }
     }
 }
 

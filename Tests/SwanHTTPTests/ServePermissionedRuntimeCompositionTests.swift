@@ -87,7 +87,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                        path: "Profiles/permissioned-data-0016-2026-08-15.json"
                     )
                 ),
                 configuration: .init(
@@ -165,7 +165,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(
-                    path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                    path: "Profiles/permissioned-data-0016-2026-08-15.json"
                 )
             )
             let server = composition.makeServer(
@@ -191,7 +191,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.simplespace.updateSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.updateSpace", body: "{\"space\":\"\(lifecycle.rawValue)\",\"policy\":\"public\"}", authorization: .oauth, invariant: .emptyBody),
                 .init(nsid: "com.atproto.simplespace.addMember", method: .post, uri: "/xrpc/com.atproto.simplespace.addMember", body: "{\"space\":\"\(lifecycle.rawValue)\",\"did\":\"\(remoteDID)\"}", authorization: .oauth, invariant: .emptyBody),
                 .init(nsid: "com.atproto.simplespace.listMembers", method: .get, uri: "/xrpc/com.atproto.simplespace.listMembers?space=\(encodedLifecycle)", body: nil, authorization: .oauth, invariant: .jsonArrayContains("members", field: "did", value: remoteDID)),
-                .init(nsid: "com.atproto.space.getSpace", method: .get, uri: "/xrpc/com.atproto.space.getSpace?space=\(encodedSpace)", body: nil, authorization: .oauth, invariant: .jsonString("uri", space.rawValue)),
+                .init(nsid: "com.atproto.simplespace.getSpace", method: .get, uri: "/xrpc/com.atproto.simplespace.getSpace?space=\(encodedSpace)", body: nil, authorization: .oauth, invariant: .jsonString("uri", space.rawValue)),
                 .init(nsid: "com.atproto.space.listSpaces", method: .get, uri: "/xrpc/com.atproto.space.listSpaces", body: nil, authorization: .oauth, invariant: .jsonArrayContains("spaces", field: "uri", value: lifecycle.rawValue)),
                 .init(nsid: "com.atproto.space.getDelegationToken", method: .get, uri: "/xrpc/com.atproto.space.getDelegationToken?space=\(encodedSpace)", body: nil, authorization: .oauth, invariant: .jsonNonEmptyString("token")),
                 .init(nsid: "com.atproto.space.getSpaceCredential", method: .post, uri: "/xrpc/com.atproto.space.getSpaceCredential", body: "{\"space\":\"\(space.rawValue)\"}", authorization: .delegation, invariant: .jsonNonEmptyString("credential")),
@@ -200,11 +200,13 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.space.applyWrites", method: .post, uri: "/xrpc/com.atproto.space.applyWrites", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"writes\":[{\"$type\":\"com.atproto.space.applyWrites#create\",\"collection\":\"app.bsky.feed.post\",\"rkey\":\"matrix-batch\",\"value\":{\"$type\":\"app.bsky.feed.post\",\"text\":\"matrix-batch\"}}]}", authorization: .oauth, invariant: .jsonArrayContains("results", field: "uri", value: "\(space.rawValue)/\(localDID)/app.bsky.feed.post/matrix-batch")),
                 .init(nsid: "com.atproto.space.getRecord", method: .get, uri: "/xrpc/com.atproto.space.getRecord?space=\(encodedSpace)&repo=\(localDID)&collection=app.bsky.feed.post&rkey=seed", body: nil, authorization: .oauth, invariant: .jsonNestedString("value", "text", "matrix-put")),
                 .init(nsid: "com.atproto.space.listRecords", method: .get, uri: "/xrpc/com.atproto.space.listRecords?space=\(encodedSpace)&repo=\(localDID)&collection=app.bsky.feed.post", body: nil, authorization: .oauth, invariant: .jsonArrayContains("records", field: "rkey", value: "matrix-created")),
+                .init(nsid: "com.atproto.space.listBlobs", method: .get, uri: "/xrpc/com.atproto.space.listBlobs?space=\(encodedSpace)&repo=\(localDID)", body: nil, authorization: .oauth, invariant: .jsonKey("cids")),
                 .init(nsid: "com.atproto.space.getLatestCommit", method: .get, uri: "/xrpc/com.atproto.space.getLatestCommit?space=\(encodedSpace)&repo=\(localDID)", body: nil, authorization: .oauth, invariant: .jsonKey("commit")),
                 .init(nsid: "com.atproto.space.listRepoOps", method: .get, uri: "/xrpc/com.atproto.space.listRepoOps?space=\(encodedSpace)&repo=\(localDID)&excludeValues=true", body: nil, authorization: .oauth, invariant: .jsonArray("ops", minimumCount: 1)),
                 .init(nsid: "com.atproto.space.getRepo", method: .get, uri: "/xrpc/com.atproto.space.getRepo?space=\(encodedSpace)&repo=\(localDID)", body: nil, authorization: .oauth, invariant: .car),
                 .init(nsid: "com.atproto.space.getBlob", method: .get, uri: "/xrpc/com.atproto.space.getBlob?space=\(encodedSpace)&repo=\(localDID)&cid=\(blobCID)", body: nil, authorization: .oauth, invariant: .blob(blobPayload)),
                 .init(nsid: "com.atproto.space.registerNotify", method: .post, uri: "/xrpc/com.atproto.space.registerNotify", body: "{\"space\":\"\(space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}", authorization: .credential, invariant: .jsonNonEmptyString("expiresAt")),
+                .init(nsid: "com.atproto.space.unregisterNotify", method: .post, uri: "/xrpc/com.atproto.space.unregisterNotify", body: "{\"space\":\"\(space.rawValue)\",\"service\":\"did:web:receiver.example#notify\"}", authorization: .credential, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.notifyWrite", method: .post, uri: "/xrpc/com.atproto.space.notifyWrite", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"rev\":\"222222222222z\",\"hash\":{\"$bytes\":\"\(Data(repeating: 0x31, count: 32).base64EncodedString())\"}}", authorization: .notifyWrite, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.listRepos", method: .get, uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)", body: nil, authorization: .credential, invariant: .jsonArrayContains("repos", field: "did", value: localDID)),
                 .init(nsid: "com.atproto.simplespace.checkUserAccess", method: .get, uri: "/xrpc/com.atproto.simplespace.checkUserAccess?space=\(encodedSpace)&user=\(remoteDID)", body: nil, authorization: .checkUserAccess, invariant: .jsonBoolean("authorized", false)),
@@ -217,9 +219,9 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let profileSet = Set(profile.endpoints)
             let generatedSet = Set(PermissionedData0016.methods.map(\.nsid))
             let matrixSet = Set(cases.map(\.nsid))
-            XCTAssertEqual(profile.endpoints.count, 25)
-            XCTAssertEqual(PermissionedData0016.methods.count, 25)
-            XCTAssertEqual(cases.count, 25)
+            XCTAssertEqual(profile.endpoints.count, 27)
+            XCTAssertEqual(PermissionedData0016.methods.count, 27)
+            XCTAssertEqual(cases.count, 27)
             XCTAssertEqual(profileSet, generatedSet)
             XCTAssertEqual(profileSet, matrixSet)
             XCTAssertEqual(matrixSet.count, cases.count, "matrix contains a duplicate NSID")
@@ -430,7 +432,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 did: localDID
             )
             do {
-                let authorization = AuthorizationContext.accountOAuth(
+                let authorization = AuthorizationContext.accountOAuthForTesting(
                     subject: localDID,
                     scopes: fixture.semanticScopes
                 )
@@ -749,7 +751,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                        path: "Profiles/permissioned-data-0016-2026-08-15.json"
                     )
                 ),
                 configuration: .init(
@@ -777,7 +779,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             try await app.test(.router) { client in
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.getSpace",
+                    uri: "/xrpc/com.atproto.simplespace.getSpace",
                     method: .get
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -1511,7 +1513,7 @@ private struct Fixture {
                     "\(base)&action=update&collection=app.bsky.feed.post",
                     "\(base)&action=delete&collection=app.bsky.feed.post",
                 ]
-                let authorization = AuthorizationContext.accountOAuth(
+                let authorization = AuthorizationContext.accountOAuthForTesting(
                     subject: localDID,
                     scopes: scopes
                 )

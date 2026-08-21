@@ -18,13 +18,13 @@ final class SwanHTTPTests: XCTestCase {
     func testProfileAndGeneratedWireHaveTheSamePermissionedCoverage() throws {
         let profile = try ProtocolProfile.load(
             from: packageRoot().appending(
-                path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                path: "Profiles/permissioned-data-0016-2026-08-15.json"
             )
         )
         let generated = PermissionedData0016.methods
 
         XCTAssertEqual(profile.id, PermissionedData0016.profileID)
-        XCTAssertEqual(profile.endpoints.count, 25)
+        XCTAssertEqual(profile.endpoints.count, 27)
         XCTAssertEqual(profile.endpoints, generated.map(\.nsid))
         XCTAssertEqual(Set(profile.endpoints).count, profile.endpoints.count)
     }
@@ -163,6 +163,55 @@ final class SwanHTTPTests: XCTestCase {
                     try await client.execute(uri: path, method: .get) { response in
                         XCTAssertEqual(response.status, path == "/v1/accounts" ? .notFound : .ok)
                     }
+                }
+            }
+            try await controlDatabase.close()
+        } catch {
+            try? await controlDatabase.close()
+            throw error
+        }
+    }
+
+    func testCommunityServiceDescribeListsRoutedMethods() async throws {
+        let profile = try loadPinnedProfile()
+        let (server, controlDatabase, root) = try await makeServer(profile: profile)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let app = server.buildApplication(logger: Logger(label: "SwanHTTPTests"))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/xrpc/community.lexicon.service.describe", method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(response.headers[.cacheControl], "no-store")
+                    let object = try XCTUnwrap(
+                        JSONSerialization.jsonObject(with: Data(buffer: response.body))
+                            as? [String: Any])
+                    XCTAssertEqual(object["roles"] as? [String], ["pds"])
+                    let methods = try XCTUnwrap(object["methods"] as? [[String: Any]])
+                    let values = methods.compactMap { $0["value"] as? String }
+                    XCTAssertEqual(values, values.sorted(), "deterministic order")
+                    XCTAssertTrue(
+                        methods.allSatisfy {
+                            $0["$type"] as? String == "community.lexicon.service.describe#nsid"
+                        },
+                        "every entry discriminates its union member"
+                    )
+                    // The spaces plane is the reason callers ask: bulleted.app
+                    // gates its spaces support on this answer.
+                    XCTAssertTrue(values.contains("com.atproto.space.getRecord"))
+                    // The `getRepoState` alias is listed only where its route
+                    // is live; this fixture wires no sync capability, so
+                    // listing it here would claim a method that 404s.
+                    XCTAssertFalse(values.contains("com.atproto.space.getRepoState"))
+                    // A description that omitted this method itself would be
+                    // the one claim disprovable from the response in hand.
+                    XCTAssertTrue(values.contains("community.lexicon.service.describe"))
+                    XCTAssertTrue(values.contains("com.atproto.server.describeServer"))
+                    XCTAssertFalse(
+                        values.contains { $0.hasPrefix("app.bsky.") || $0.hasPrefix("chat.bsky.") },
+                        "proxied namespaces are forwarded, not implemented here"
+                    )
                 }
             }
             try await controlDatabase.close()
@@ -824,7 +873,7 @@ final class SwanHTTPTests: XCTestCase {
 
     private func loadPinnedProfile() throws -> ProtocolProfile {
         try ProtocolProfile.load(from: packageRoot()
-            .appending(path: "Profiles/permissioned-data-0016-2026-07-03.json"))
+            .appending(path: "Profiles/permissioned-data-0016-2026-08-15.json"))
     }
 
     private func makeServer(profile: ProtocolProfile) async throws -> (SwanHTTPServer, SQLiteControlDatabase, URL) {

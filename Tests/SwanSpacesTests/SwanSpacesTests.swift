@@ -54,7 +54,7 @@ final class SwanSpacesTests: XCTestCase {
             _ = try await repository.apply(.put(uri: first, value: Data("first".utf8)), authorization: .public)
             XCTFail("a public context must never write a space repository")
         } catch {}
-        let author = AuthorizationContext.accountOAuth(
+        let author = AuthorizationContext.accountOAuthForTesting(
             subject: "did:plc:alice",
             scopes: [
                 "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=create&collection=app.bsky.feed.post",
@@ -88,13 +88,13 @@ final class SwanSpacesTests: XCTestCase {
         let createScope = "space:app.bsky.bookmarks?authority=did:plc:alice&skey=scope-boundary&action=create&collection=app.bsky.feed.post"
         _ = try await repository.apply(
             .put(uri: uri, value: Data("private".utf8)),
-            authorization: .accountOAuth(subject: author, scopes: [createScope])
+            authorization: .accountOAuthForTesting(subject: author, scopes: [createScope])
         )
 
         await XCTAssertThrowsErrorAsync(
             try await repository.record(
                 uri,
-                authorization: .accountOAuth(subject: author, scopes: ["atproto"])
+                authorization: .accountOAuthForTesting(subject: author, scopes: ["atproto"])
             )
         )
     }
@@ -126,7 +126,7 @@ final class SwanSpacesTests: XCTestCase {
             rkey: "wildcard"
         )
         let repository = try SpaceRepository(space: space, author: author)
-        let resourceAuthorization = AuthorizationContext.accountOAuth(
+        let resourceAuthorization = AuthorizationContext.accountOAuthForTesting(
             subject: author,
             scopes: [
                 "space:*?authority=*&skey=*&action=create&collection=app.bsky.feed.post",
@@ -146,7 +146,7 @@ final class SwanSpacesTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(
             try await repository.record(
                 record,
-                authorization: .accountOAuth(
+                authorization: .accountOAuthForTesting(
                     subject: author,
                     scopes: [
                         "space:*?authority=*&skey=*&action=read&unexpected=ignored"
@@ -157,7 +157,7 @@ final class SwanSpacesTests: XCTestCase {
         XCTAssertNoThrow(
             try SpaceAuthorizationPolicy.requireManagement(
                 space: space,
-                authorization: .accountOAuth(
+                authorization: .accountOAuthForTesting(
                     subject: author,
                     scopes: ["space:*?authority=*&skey=*&manage=create"]
                 ),
@@ -261,7 +261,7 @@ final class SwanSpacesTests: XCTestCase {
         let first = try SpaceRecordURI(space: space, author: "did:plc:alice", collection: "app.bsky.feed.post", rkey: "one")
         let missing = try SpaceRecordURI(space: space, author: "did:plc:alice", collection: "app.bsky.feed.post", rkey: "missing")
         let repository = try SpaceRepository(space: space, author: "did:plc:alice")
-        let authorization = AuthorizationContext.accountOAuth(
+        let authorization = AuthorizationContext.accountOAuthForTesting(
             subject: "did:plc:alice",
             scopes: [
                 "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=create&collection=app.bsky.feed.post",
@@ -291,7 +291,7 @@ final class SwanSpacesTests: XCTestCase {
             skey: "bounded"
         )
         let repository = try SpaceRepository(space: space, author: "did:plc:alice")
-        let authorization = AuthorizationContext.accountOAuth(
+        let authorization = AuthorizationContext.accountOAuthForTesting(
             subject: "did:plc:alice",
             scopes: [
                 "space:app.bsky.bookmarks?authority=did:plc:alice&skey=bounded&action=create&collection=app.bsky.feed.post"
@@ -488,7 +488,7 @@ final class SwanSpacesTests: XCTestCase {
         let space = try SpaceURI(authority: "did:plc:alice", spaceType: "app.bsky.bookmarks", skey: "shared")
         let uri = try SpaceRecordURI(space: space, author: "did:plc:alice", collection: "app.bsky.feed.post", rkey: "one")
         let repository = try SpaceRepository(space: space, author: "did:plc:alice")
-        let authorization = AuthorizationContext.accountOAuth(
+        let authorization = AuthorizationContext.accountOAuthForTesting(
             subject: "did:plc:alice",
             scopes: [
                 "space:app.bsky.bookmarks?authority=did:plc:alice&skey=shared&action=create&collection=app.bsky.feed.post",
@@ -663,12 +663,33 @@ final class SwanSpacesTests: XCTestCase {
                 expectedRevision: 0,
                 requestID: UUID(),
                 wireRevision: try fixture.tid(0),
-                authorization: .accountOAuth(subject: "did:plc:other", scopes: ["atproto"])
+                authorization: .accountOAuthForTesting(subject: "did:plc:other", scopes: ["atproto"])
             )
         )
 
+        // A spoofed scope must not authorize a write. The VECTOR changed with
+        // the grammar port; the assertion did not.
+        //
+        // This used to duplicate `action=create&action=create`. The retired
+        // grammar rejected duplicate keys wholesale (`SwanCore.swift:224`), so
+        // that string was unparseable and the write was denied. Under the new
+        // grammar `action` has arity `.multiple` — repeats are its wire
+        // encoding for a list — so `["create","create"]` normalizes to
+        // `["create"]` and the grant becomes identical in effect to the
+        // `scopedCreate` scope below, which this same test expects to SUCCEED.
+        // It stopped being a rejection, and a test that can only fail because
+        // of a retired parser artifact is not testing anything real (§5.6.3's
+        // comment block names this exact string; §7.3 row W4 replaces the
+        // grammar-artifact denial with a semantic one).
+        //
+        // Duplicating a SINGLE-arity key is still a hard rejection, and it is
+        // the one that matters: `authority` selects WHICH space's records the
+        // grant reaches, so a parser that accepted two of them — or picked
+        // either — would be a real privilege confusion.
+        // `ScopeParameterSchema.swift:155-157` throws
+        // `.repeatedSingleValuedParameter` here, citing `parser.ts:121-122`.
         let spoofedScope = """
-        space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=create&action=create&collection=\(fixture.first.collection)
+        space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&authority=did:plc:other&skey=\(fixture.space.skey)&action=create&collection=\(fixture.first.collection)
         """
         await XCTAssertThrowsErrorAsync(
             try await durable.apply(
@@ -676,7 +697,7 @@ final class SwanSpacesTests: XCTestCase {
                 expectedRevision: 0,
                 requestID: UUID(),
                 wireRevision: try fixture.tid(0),
-                authorization: .accountOAuth(subject: fixture.author, scopes: [spoofedScope])
+                authorization: .accountOAuthForTesting(subject: fixture.author, scopes: [spoofedScope])
             )
         )
 
@@ -688,7 +709,7 @@ final class SwanSpacesTests: XCTestCase {
             expectedRevision: 0,
             requestID: UUID(),
             wireRevision: try fixture.tid(0),
-            authorization: .accountOAuth(subject: fixture.author, scopes: [scopedCreate])
+            authorization: .accountOAuthForTesting(subject: fixture.author, scopes: [scopedCreate])
         )
         let serviceRead = try await durable.record(fixture.first, authorization: service)
         XCTAssertEqual(serviceRead?.value, fixture.firstValue)
@@ -739,7 +760,7 @@ final class SwanSpacesTests: XCTestCase {
             PermissionedSpaceScopeSyntax.isQualified(collectionLimitedScope),
             collectionLimitedScope.debugDescription
         )
-        let collectionLimited = AuthorizationContext.accountOAuth(
+        let collectionLimited = AuthorizationContext.accountOAuthForTesting(
             subject: fixture.author,
             scopes: [collectionLimitedScope]
         )
@@ -769,7 +790,7 @@ final class SwanSpacesTests: XCTestCase {
         let wildcardScope = """
         space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=*
         """
-        let wildcard = AuthorizationContext.accountOAuth(
+        let wildcard = AuthorizationContext.accountOAuthForTesting(
             subject: fixture.author,
             scopes: [wildcardScope]
         )
@@ -779,7 +800,7 @@ final class SwanSpacesTests: XCTestCase {
         let unspecifiedScope = """
         space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read
         """
-        let unspecified = AuthorizationContext.accountOAuth(
+        let unspecified = AuthorizationContext.accountOAuthForTesting(
             subject: fixture.author,
             scopes: [unspecifiedScope]
         )
@@ -1099,7 +1120,7 @@ final class SwanSpacesTests: XCTestCase {
             skey: "authority"
         )
         let credentialSecret = Data(repeating: 0x5A, count: 32)
-        let manage = AuthorizationContext.accountOAuth(
+        let manage = AuthorizationContext.accountOAuthForTesting(
             subject: authorityDID,
             scopes: [
                 "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&manage=create",
@@ -1131,7 +1152,7 @@ final class SwanSpacesTests: XCTestCase {
             try await authority.addMember(
                 space: space,
                 member: "did:plc:bob",
-                authorization: .accountOAuth(subject: "did:plc:mallory", scopes: ["atproto"])
+                authorization: .accountOAuthForTesting(subject: "did:plc:mallory", scopes: ["atproto"])
             )
         )
         let firstMemberMutation = try await authority.addMember(
@@ -1169,7 +1190,7 @@ final class SwanSpacesTests: XCTestCase {
                 space: space,
                 user: "did:plc:bob",
                 clientID: "https://second-reader.example/client.json",
-                authorization: .accountOAuth(
+                authorization: .accountOAuthForTesting(
                     subject: "did:plc:mallory",
                     scopes: ["atproto"]
                 )
@@ -1180,7 +1201,7 @@ final class SwanSpacesTests: XCTestCase {
             space: space,
             user: "did:plc:bob",
             clientID: "https://second-reader.example/client.json",
-            authorization: .accountOAuth(
+            authorization: .accountOAuthForTesting(
                 subject: "did:plc:bob",
                 scopes: ["atproto"]
             )
@@ -1193,7 +1214,7 @@ final class SwanSpacesTests: XCTestCase {
                 space: space,
                 user: "did:plc:bob",
                 clientID: "https://wrong.example/client.json",
-                authorization: .accountOAuth(
+                authorization: .accountOAuthForTesting(
                     subject: "did:plc:bob",
                     scopes: ["atproto"]
                 )
@@ -1202,7 +1223,7 @@ final class SwanSpacesTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(
             try await authority.space(
                 space,
-                authorization: .accountOAuth(
+                authorization: .accountOAuthForTesting(
                     subject: "did:plc:bob",
                     scopes: ["atproto"]
                 )
@@ -1228,7 +1249,7 @@ final class SwanSpacesTests: XCTestCase {
             space: space,
             user: "did:plc:bob",
             clientID: "https://second-reader.example/client.json",
-            authorization: .accountOAuth(
+            authorization: .accountOAuthForTesting(
                 subject: "did:plc:bob",
                 scopes: ["atproto"]
             )
@@ -1267,13 +1288,13 @@ final class SwanSpacesTests: XCTestCase {
                 space: space,
                 owner: bob,
                 configuration: configuration,
-                authorization: .accountOAuth(subject: bob, scopes: ["atproto"])
+                authorization: .accountOAuthForTesting(subject: bob, scopes: ["atproto"])
             )
         )
         await XCTAssertThrowsErrorAsync(
             try await aliceAuthority.space(
                 space,
-                authorization: .accountOAuth(subject: bob, scopes: ["atproto"])
+                authorization: .accountOAuthForTesting(subject: bob, scopes: ["atproto"])
             )
         )
 
@@ -1282,7 +1303,7 @@ final class SwanSpacesTests: XCTestCase {
             database: bobDatabase,
             credentialSecret: Data(repeating: 2, count: 32)
         )
-        let ownerAuthorization = AuthorizationContext.accountOAuth(
+        let ownerAuthorization = AuthorizationContext.accountOAuthForTesting(
             subject: bob,
             scopes: ["atproto"]
         )
@@ -1327,7 +1348,7 @@ final class SwanSpacesTests: XCTestCase {
             space: space,
             user: alice,
             clientID: nil,
-            authorization: .accountOAuth(subject: alice, scopes: ["atproto"])
+            authorization: .accountOAuthForTesting(subject: alice, scopes: ["atproto"])
         )
         let deleted = try await bobAuthority.delete(
             space: space,
@@ -1344,7 +1365,7 @@ final class SwanSpacesTests: XCTestCase {
                 space: space,
                 user: alice,
                 clientID: nil,
-                authorization: .accountOAuth(subject: alice, scopes: ["atproto"])
+                authorization: .accountOAuthForTesting(subject: alice, scopes: ["atproto"])
             )
         )
         try await aliceDatabase.close()
@@ -1509,7 +1530,7 @@ private struct DurableRepositoryFixture {
     let thirdValue = Data([0xa1, 0x64, 0x74, 0x65, 0x78, 0x74, 0x65, 0x74, 0x68, 0x69, 0x72, 0x64])
 
     var authorized: AuthorizationContext {
-        .accountOAuth(
+        .accountOAuthForTesting(
             subject: author,
             scopes: [
                 "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=read",
@@ -1567,4 +1588,96 @@ private struct DurableRepositoryFixture {
 
 private extension Array {
     var only: Element? { count == 1 ? first : nil }
+}
+
+/// The position `AuthorizationContext.accountLegacySession` was added to force.
+///
+/// App-password sessions carry the same payload as OAuth ones and are evaluated
+/// by the same matcher, so nothing but a separate case stops them inheriting
+/// every grant the OAuth case has. These pin the refusal so it survives someone
+/// later "simplifying" the two cases together.
+final class LegacySessionSpaceDenialTests: XCTestCase {
+    private let author = "did:plc:alice"
+
+    private func space() throws -> SpaceURI {
+        try SpaceURI(authority: author, spaceType: "app.bsky.bookmarks", skey: "key")
+    }
+
+    /// The widest scope set a legacy session could possibly present — every
+    /// transition scope, plus a wildcard space grant — still cannot reach a
+    /// space. The grant is deliberately generous so the test is measuring the
+    /// CASE, not a narrow scope set.
+    func testTheMostPermissiveLegacySessionStillCannotReachASpace() throws {
+        let space = try space()
+        let record = try SpaceRecordURI(
+            space: space,
+            author: author,
+            collection: "app.bsky.feed.post",
+            rkey: "key"
+        )
+        let legacy = AuthorizationContext.accountLegacySessionForTesting(
+            subject: author,
+            scopes: [
+                "atproto",
+                "transition:generic",
+                "transition:chat.bsky",
+                "transition:email",
+                "space:*?authority=*&skey=*&action=create&action=read",
+                "space:*?authority=*&skey=*&manage=create",
+            ],
+            statedKeys: [
+                "space:*?authority=*&skey=*&action=create&action=read":
+                    ["authority", "skey", "action"],
+            ]
+        )
+        for permission in [SpacePermission.read, .create, .update, .delete] {
+            XCTAssertThrowsError(
+                try SpaceAuthorizationPolicy.require(
+                    space: space,
+                    author: author,
+                    uri: record,
+                    authorization: legacy,
+                    permission: permission
+                ),
+                "legacy sessions must not reach a space for \(permission)"
+            )
+        }
+    }
+
+    /// The identical grant as `.accountOAuth` DOES pass, which is what proves
+    /// the refusal above comes from the credential type and not from the scopes.
+    func testTheSameGrantAsOAuthIsAdmitted() throws {
+        let space = try space()
+        let record = try SpaceRecordURI(
+            space: space,
+            author: author,
+            collection: "app.bsky.feed.post",
+            rkey: "key"
+        )
+        XCTAssertNoThrow(
+            try SpaceAuthorizationPolicy.require(
+                space: space,
+                author: author,
+                uri: record,
+                authorization: .accountOAuthForTesting(
+                    subject: author,
+                    scopes: ["space:*?authority=*&skey=*&action=create&collection=app.bsky.feed.post"]
+                ),
+                permission: .create
+            )
+        )
+    }
+
+    func testLegacySessionsAreRefusedManagement() throws {
+        XCTAssertThrowsError(
+            try SpaceAuthorizationPolicy.requireManagement(
+                space: try space(),
+                authorization: .accountLegacySessionForTesting(
+                    subject: author,
+                    scopes: ["space:*?authority=*&skey=*&manage=create"]
+                ),
+                operation: .create
+            )
+        )
+    }
 }

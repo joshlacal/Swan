@@ -11,13 +11,13 @@ public struct ComAtprotoSpaceGetRecord {
 
     public static let typeIdentifier = "com.atproto.space.getRecord"    
 public struct Parameters: Parametrizable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let repo: DID
         public let collection: NSID
         public let rkey: RecordKey
         
         public init(
-            space: ATProtocolURI, 
+            space: SpaceRef, 
             repo: DID, 
             collection: NSID, 
             rkey: RecordKey
@@ -137,6 +137,7 @@ public struct Output: ATProtocolCodable {
 public enum Error: String, Swift.Error, ATProtoErrorType, CustomStringConvertible {
                 case recordNotFound = "RecordNotFound"
                 case spaceNotFound = "SpaceNotFound"
+                case repoNotFound = "RepoNotFound"
                 case repoTakendown = "RepoTakendown"
                 case repoSuspended = "RepoSuspended"
                 case repoDeactivated = "RepoDeactivated"
@@ -160,7 +161,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
     public static let endpointDescriptor = XRPCMethodDescriptor(
         nsid: "com.atproto.space.getRecord", kind: "query",
         inputEncoding: nil, outputEncoding: "application/json",
-        declaredErrors: ["RecordNotFound", "SpaceNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]
+        declaredErrors: ["RecordNotFound", "SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]
     )
 
     public protocol ServerHandler: Sendable {
@@ -180,7 +181,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
 extension ATProtoClient.Com.Atproto.Space {
     // MARK: - getRecord
 
-    /// Get a single record from a permissioned space. Callable with either OAuth (for the authenticated user's own data) or a space credential (for syncing services).
+    /// Get a single record from a permissioned space. Callable with either OAuth (for the authenticated user's own data) or a space credential (for syncing services). Throws RepoNotFound when the account holds no repo in the space; this does not distinguish a member that has never written from a non-member.
     /// 
     /// - Parameter input: The input parameters for the request
     /// 

@@ -23,7 +23,9 @@ private enum LocalhostPARRequestError: Error {
 private struct LocalhostPARForm: Sendable {
     let clientID: URL
     let redirectURI: URL
-    let scopes: Set<String>?
+    /// Non-optional: an absent `scope` is rejected at form parse rather than
+    /// substituted with the client's registered set (§6.5.9(b)).
+    let scopes: Set<String>
     let state: String
     let codeChallenge: String
 }
@@ -152,7 +154,22 @@ private func handleLocalhostPAR(
             issuer: issuer.absoluteString,
             client: client,
             redirectURI: form.redirectURI,
-            scopes: form.scopes ?? metadata.scopes,
+            // §6.5.9(b): this used to read `form.scopes ?? metadata.scopes`, so
+            // a PAR with no `scope` parameter at all was silently granted the
+            // client's ENTIRE registered set. `parseLocalhostPARForm` now
+            // rejects an absent `scope`, matching the remote path (whose
+            // `oauthServerScopes(fields["scope"] ?? "")` rejects the empty
+            // string) and upstream (`request-manager.ts:177` → empty set → hard
+            // `InvalidScopeError` at `:241`).
+            //
+            // §9-D21 makes this a precondition rather than a cleanup: client
+            // metadata is now validated lexically only, so the registered set is
+            // "strings the client typed", not a vetted set. Substituting it for
+            // an absent request would grant an UNVETTED set, because the
+            // semantic admission checks that would have caught a malformed or
+            // unknown scope live one layer later, on the path this substitution
+            // bypassed.
+            scopes: form.scopes,
             dpopProof: dpopProof
         )
         let requestURI = try await runtime.tokenService.createPushedAuthorizationRequest(
@@ -168,6 +185,12 @@ private func handleLocalhostPAR(
                 expiresIn: Int(SwanLocalhostPARHTTP.requestLifetime)
             )
         )
+    } catch let error as OAuthScopeAdmissionError {
+        // A scope admission failure is a 400, not the 503 the generic arm below
+        // would produce. The code comes from the error so this bridge and the
+        // remote AS report the same thing; it describes the request's own text
+        // and discloses nothing about the deployment (§4.8).
+        return localhostPARError(.badRequest, error: error.oauthErrorCode)
     } catch let error as SwanError {
         if case .unavailable = error {
             return localhostPARError(.serviceUnavailable, error: "temporarily_unavailable")
@@ -283,12 +306,28 @@ private func validateLocalhostPARFields(_ fields: [String: String]) throws -> Lo
         "client_id", "redirect_uri", "response_type", "scope", "state",
         "code_challenge", "code_challenge_method",
     ]
+    // `login_hint` and `prompt` are hints ATProto clients send with every
+    // sign-in (the atproto-oauth Rust crate includes the typed handle as
+    // `login_hint` unconditionally). This server always presents the
+    // interactive login form — a conforming answer to `login`, `consent`,
+    // and `select_account`, but not to `none`, which demands a silent
+    // answer it can never give, so `none` stays refused.
+    // `response_mode` is sent unconditionally by `@atproto/oauth-client-node`,
+    // which defaults it to `query`. Refusing the parameter refuses every client
+    // built on that library before it can even reach the DPoP stage. Only
+    // `query` is accepted: this server hands the code back as query parameters
+    // on the client's redirect URI, so accepting `fragment` or `form_post`
+    // would promise a delivery it does not implement.
     let permitted: Set<String> = [
         "client_id", "redirect_uri", "response_type", "scope", "state",
-        "code_challenge", "code_challenge_method",
+        "code_challenge", "code_challenge_method", "login_hint", "prompt",
+        "response_mode",
     ]
     guard fields.keys.allSatisfy({ permitted.contains($0) }),
           required.subtracting(["scope"]).isSubset(of: Set(fields.keys)),
+          fields["login_hint"].map({ !$0.isEmpty && $0.utf8.count <= 2_048 }) ?? true,
+          fields["prompt"].map({ ["login", "consent", "select_account"].contains($0) }) ?? true,
+          fields["response_mode"].map({ $0 == "query" }) ?? true,
           fields["response_type"] == "code",
           fields["code_challenge_method"] == "S256",
           let clientIDText = fields["client_id"],
@@ -304,9 +343,11 @@ private func validateLocalhostPARFields(_ fields: [String: String]) throws -> Lo
         throw LocalhostPARRequestError.malformed
     }
     let metadata = try OAuthClientMetadata.localhostDevelopmentMetadata(clientID: clientID)
-    let scopes = try OAuthClientMetadata.localhostRequestedScopes(fields["scope"])
-    guard metadata.matchesRedirectURI(redirectURI),
-          scopes.map({ $0.isSubset(of: metadata.scopes) }) ?? true else {
+    // An absent `scope` is a malformed request, not "grant everything declared"
+    // (§6.5.9(b)). The subset check itself has moved to stage C inside
+    // `OAuthScopeAdmissionPolicy`, which canonicalises both sides (§9-D7).
+    guard let scopes = try OAuthClientMetadata.localhostRequestedScopes(fields["scope"]),
+          metadata.matchesRedirectURI(redirectURI) else {
         throw LocalhostPARRequestError.malformed
     }
     return LocalhostPARForm(

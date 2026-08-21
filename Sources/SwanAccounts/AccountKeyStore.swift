@@ -339,27 +339,34 @@ public actor FileAccountKeyStore:
         operatorRestoreDirectoryDescriptor descriptor: Int32,
         configuration: AccountKeyEncryptionConfiguration
     ) throws {
-        let descriptor = try Self.duplicateProtectedRoot(descriptor)
-        var openedLockDescriptor: Int32 = -1
-        do {
-            openedLockDescriptor = try Self.openLockFile(directoryDescriptor: descriptor)
-            try Self.withExclusiveLock(openedLockDescriptor) {
-                try Self.initializeActiveKeyMarkerIfNeeded(
-                    directoryDescriptor: descriptor,
-                    activeKeyID: configuration.activeKeyID
-                )
-                try Self.recoverProvisioningJournal(
-                    directoryDescriptor: descriptor,
-                    configuration: configuration
-                )
-            }
-        } catch {
-            if openedLockDescriptor >= 0 { _ = close(openedLockDescriptor) }
-            _ = close(descriptor)
-            throw error
-        }
-        directoryDescriptor = descriptor
-        lockDescriptor = openedLockDescriptor
+        let descriptors = try Self.openPinnedRoot(
+            descriptor,
+            configuration: configuration
+        )
+        directoryDescriptor = descriptors.directory
+        lockDescriptor = descriptors.lock
+        self.configuration = configuration
+        failAfterBatchInstallCount = nil
+        failDirectoryIterationAfterEntryCount = nil
+    }
+
+    /// Startup-only constructor for a key directory that has already been
+    /// opened and validated with `O_NOFOLLOW`. The caller owns the supplied
+    /// descriptor and may close it immediately after this initializer returns;
+    /// the store duplicates it and retains only that descriptor for its full
+    /// lifetime. In particular, this initializer never reopens a pathname or
+    /// creates a missing key root.
+    @_spi(ServeStartup)
+    public init(
+        existingRootDirectoryDescriptor descriptor: Int32,
+        configuration: AccountKeyEncryptionConfiguration
+    ) throws {
+        let descriptors = try Self.openPinnedRoot(
+            descriptor,
+            configuration: configuration
+        )
+        directoryDescriptor = descriptors.directory
+        lockDescriptor = descriptors.lock
         self.configuration = configuration
         failAfterBatchInstallCount = nil
         failDirectoryIterationAfterEntryCount = nil
@@ -1261,6 +1268,38 @@ public actor FileAccountKeyStore:
             )
         }
         return duplicate
+    }
+
+    /// Duplicates a previously opened owner-only root and initializes the
+    /// marker/journal state relative to that descriptor. Keeping this work in
+    /// one helper makes ownership explicit for both operator restore and the
+    /// serve startup interlock: on failure this function closes every
+    /// descriptor it created, while on success the returned pair is owned by
+    /// the `FileAccountKeyStore` instance.
+    private static func openPinnedRoot(
+        _ descriptor: Int32,
+        configuration: AccountKeyEncryptionConfiguration
+    ) throws -> (directory: Int32, lock: Int32) {
+        let pinnedDirectory = try duplicateProtectedRoot(descriptor)
+        var lockDescriptor: Int32 = -1
+        do {
+            lockDescriptor = try openLockFile(directoryDescriptor: pinnedDirectory)
+            try withExclusiveLock(lockDescriptor) {
+                try initializeActiveKeyMarkerIfNeeded(
+                    directoryDescriptor: pinnedDirectory,
+                    activeKeyID: configuration.activeKeyID
+                )
+                try recoverProvisioningJournal(
+                    directoryDescriptor: pinnedDirectory,
+                    configuration: configuration
+                )
+            }
+        } catch {
+            if lockDescriptor >= 0 { _ = close(lockDescriptor) }
+            _ = close(pinnedDirectory)
+            throw error
+        }
+        return (pinnedDirectory, lockDescriptor)
     }
 
     private static func openLockFile(directoryDescriptor: Int32) throws -> Int32 {

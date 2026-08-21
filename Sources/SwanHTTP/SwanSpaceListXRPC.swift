@@ -77,10 +77,20 @@ private struct AuthenticatedListSpacesHandler: ComAtprotoSpaceListSpaces.ServerH
         } catch {
             throw AuthenticatedSpaceListFailure.unavailable
         }
-        guard case let .accountOAuth(subject, scopes) = authorization,
-              PermissionedSpaceScopeSyntax.permitsAggregateSpaceList(
-                  scopes,
-                  spaceType: spaceType,
+        // The LISTING FENCE (§6.1). `spaceType` / `authority` are already
+        // `String?` here and the `?? "*"` defaulting lives in the matcher —
+        // keep it there.
+        //
+        // This is a scope shortfall rendered as this route's own already-defined
+        // opaque code (§6.5.8). `AuthenticatedSpaceListFailure` gains no new
+        // case: a shortfall is indistinguishable on the wire from a bad token or
+        // an inactive account, per `SwanOAuthResourceAuthorization.swift:9-16`
+        // and §9-D6. The needed scope
+        // (`SwanScopePermissions.spaceListingScopeNeeded(type:authority:)`) is
+        // for server-side logs only and must never be echoed to the caller.
+        guard case let .accountOAuth(subject, permissions) = authorization,
+              permissions.allowsSpaceListing(
+                  type: spaceType,
                   authority: authority
               ) else {
             throw AuthenticatedSpaceListFailure.denied
@@ -112,8 +122,7 @@ private struct AuthenticatedListSpacesHandler: ComAtprotoSpaceListSpaces.ServerH
                 cursor: page.cursor?.rawValue,
                 spaces: try page.spaces.map {
                     ComAtprotoSpaceListSpaces.SpaceView(
-                        uri: try ATProtocolURI(uriString: $0.space.rawValue),
-                        isOwner: $0.isOwner
+                        uri: try SpaceRef(uriString: $0.space.rawValue)
                     )
                 }
             )
@@ -227,7 +236,6 @@ private func authenticatedListSpacesResponse(
 private struct ListSpacesWireOutput: Encodable {
     struct Space: Encodable {
         let uri: String
-        let isOwner: Bool
     }
 
     let cursor: String?
@@ -242,7 +250,7 @@ private func authenticatedListSpacesJSON(
         status,
         ListSpacesWireOutput(
             cursor: output.cursor,
-            spaces: output.spaces.map { .init(uri: $0.uri.uriString(), isOwner: $0.isOwner) }
+            spaces: output.spaces.map { .init(uri: $0.uri.uriString()) }
         )
     )
 }

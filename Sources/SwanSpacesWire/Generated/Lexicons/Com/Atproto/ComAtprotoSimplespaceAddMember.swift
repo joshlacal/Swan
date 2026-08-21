@@ -11,11 +11,11 @@ public struct ComAtprotoSimplespaceAddMember {
 
     public static let typeIdentifier = "com.atproto.simplespace.addMember"
 public struct Input: ATProtocolCodable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let did: DID
 
         /// Standard public initializer
-        public init(space: ATProtocolURI, did: DID) {
+        public init(space: SpaceRef, did: DID) {
             self.space = space
             self.did = did
         }
@@ -23,7 +23,7 @@ public struct Input: ATProtocolCodable {
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.space = try container.decode(ATProtocolURI.self, forKey: .space)
+            self.space = try container.decode(SpaceRef.self, forKey: .space)
             self.did = try container.decode(DID.self, forKey: .did)
         }
 

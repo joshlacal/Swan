@@ -410,7 +410,7 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
                 writes: [.create(uri: record, value: value)],
                 requestID: UUID(),
                 wireRevision: "3333333333333",
-                authorization: .accountOAuth(subject: accountDID, scopes: [scope])
+                authorization: .accountOAuthForTesting(subject: accountDID, scopes: [scope])
             )
         }
         await commitBarrier.waitUntilParked()
@@ -552,7 +552,7 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
                 writes: [.create(uri: record, value: value)],
                 requestID: UUID(),
                 wireRevision: "3333333333333",
-                authorization: .accountOAuth(subject: accountDID, scopes: [scope])
+                authorization: .accountOAuthForTesting(subject: accountDID, scopes: [scope])
             )
         }
         await stagingBarrier.waitUntilParked()
@@ -636,7 +636,7 @@ private extension AccountAuthorizationLeaseTests {
                 policy: .memberList,
                 appAccess: .open
             ),
-            authorization: .accountOAuth(subject: did, scopes: ["atproto"]),
+            authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"]),
             now: Date(timeIntervalSince1970: 1_750_000_000)
         )
         try await database.close()

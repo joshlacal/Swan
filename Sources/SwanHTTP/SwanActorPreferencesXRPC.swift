@@ -3,6 +3,7 @@ import Hummingbird
 import HTTPTypes
 import NIOCore
 import Petrel
+import SwanCore
 import SwanOAuth
 import SwanSpaces
 import SwanStorage
@@ -274,8 +275,33 @@ private func authorizedActorPreferencesSubject(
     } catch {
         throw ActorPreferencesXRPCFailure.unavailable
     }
-    guard case let .accountOAuth(subject, scopes) = authorization,
-          scopes.contains("atproto") else {
+    // OPT-IN for legacy sessions (§D3). Preferences are the third and last
+    // surface opened: the official client reads them on launch, and a 401 here
+    // leaves it unable to finish signing in even though its token is valid.
+    //
+    // Reading one's OWN preferences is what the credential is for, and the
+    // subject is taken from the authenticated context — never from the request
+    // — so an admitted session can only reach its own row.
+    //
+    // `assertRpc({aud, lxm})` — upstream's `actor/getPreferences.ts:22` and
+    // `putPreferences.ts:22` — is STILL NOT PORTED here, and the `rpc:` family
+    // now being wired elsewhere does not port it: this route has no service
+    // audience plumbed to assert against, and `RpcPermission.matches` compares
+    // `aud` exactly. Porting it means threading the service DID in, not
+    // reusing the pipethrough's. Base scope only until then.
+    let subject: String
+    let permissions: SwanScopePermissions
+    switch authorization {
+    case let .accountOAuth(oauthSubject, oauthPermissions):
+        subject = oauthSubject
+        permissions = oauthPermissions
+    case let .accountLegacySession(legacySubject, legacyPermissions):
+        subject = legacySubject
+        permissions = legacyPermissions
+    default:
+        throw ActorPreferencesXRPCFailure.unauthorized
+    }
+    guard permissions.hasBaseATProtocolScope else {
         throw ActorPreferencesXRPCFailure.unauthorized
     }
     return subject

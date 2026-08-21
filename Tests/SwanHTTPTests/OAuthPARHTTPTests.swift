@@ -174,6 +174,62 @@ final class OAuthPARHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testEnabledLocalhostPARAdmitsLoginHintAndInteractivePromptHints() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        // The atproto-oauth Rust crate sends the typed handle as `login_hint`
+        // on every sign-in; refusing the hint refuses the client. The server
+        // ignores both hints (it always presents the login form), so parsing
+        // must reach the nonce challenge and then persist the request.
+        let form = validForm(state: "hinted")
+            + "&login_hint=\(formEncode("someone.example.com"))&prompt=login"
+        let key = P256.Signing.PrivateKey()
+        let jwk = try makeJWK(key)
+        do {
+            let app = fixture.server.buildApplication(logger: Logger(label: "OAuthPARHTTPTests.hints"))
+            try await app.test(.router) { client in
+                var nonce: String?
+                try await client.execute(
+                    uri: "/oauth/par",
+                    method: .post,
+                    headers: formHeaders(),
+                    body: ByteBuffer(string: form)
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(
+                        try self.errorCode(from: response.body),
+                        "use_dpop_nonce",
+                        "a hinted form must parse and be met with the nonce challenge, not invalid_request"
+                    )
+                    nonce = response.headers[dpopNonceHeader]
+                }
+                let proof = try makeDPoPProof(
+                    key: key,
+                    jwk: jwk,
+                    jti: "dpop-hinted-success",
+                    nonce: try XCTUnwrap(nonce),
+                    target: try OAuthDPoPProofValidator.normalizedTarget(issuer.appending(path: "oauth/par"))
+                )
+                try await client.execute(
+                    uri: "/oauth/par",
+                    method: .post,
+                    headers: formHeaders(dpop: proof),
+                    body: ByteBuffer(string: form)
+                ) { response in
+                    XCTAssertEqual(response.status, .created)
+                    let object = try XCTUnwrap(
+                        JSONSerialization.jsonObject(with: Data(buffer: response.body)) as? [String: Any])
+                    let value = try XCTUnwrap(object["request_uri"] as? String)
+                    XCTAssertTrue(value.hasPrefix("urn:ietf:params:oauth:request_uri:"))
+                }
+            }
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
     func testLocalhostPARPreservesRegisteredQualifiedWholeSpaceScope() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -208,24 +264,56 @@ final class OAuthPARHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    func testEnabledLocalhostPARRejectsBroadFormsWithoutOpeningAnOAuthErrorOracle() async throws {
+    /// Re-aimed for §9-D21, keeping the property the name states.
+    ///
+    /// The original list mixed two kinds of bad request and asserted a single
+    /// outcome for both: `invalid_request`, pre-DPoP, no nonce. Two of its
+    /// vectors — a bare `space:<type>` and a universal `space:*?authority=*` —
+    /// were refused there only because `isIssuableQualified` gated issuance at
+    /// registration. D21 deletes that gate, so they are no longer refused
+    /// *early*. **They are still refused**; measured, every vector below is.
+    ///
+    /// What the measurement showed, and why the new shape is a STRONGER
+    /// anti-oracle assertion than the old one:
+    ///
+    ///  * **Structurally** malformed forms (unknown parameter, duplicated
+    ///    parameter, PKCE `plain`, mismatched redirect) are still refused
+    ///    **before** DPoP, uniformly `invalid_request`, with **no** nonce. They
+    ///    leak nothing about scopes because scopes are never reached.
+    ///  * Every **scope-semantic** form is now indistinguishable from a
+    ///    perfectly valid request at that first stage: it receives the *same*
+    ///    nonce challenge. Early rejection of those forms was itself the oracle
+    ///    — it told an unauthenticated caller which scope shapes the server
+    ///    dislikes, before the caller had proved possession of any key. Deferring
+    ///    the decision behind DPoP removes that.
+    ///  * Only **after** the nonce is each one refused, and none reaches a
+    ///    `request_uri`.
+    func testEnabledLocalhostPARRefusesEveryBroadFormWithoutOpeningAnOAuthErrorOracle() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         do {
             let app = fixture.server.buildApplication(logger: Logger(label: "OAuthPARHTTPTests.strict"))
             try await app.test(.router) { client in
-                let malformedForms = [
+                // Refused BEFORE DPoP: the request is malformed as a request, so
+                // no scope is ever consulted.
+                let structurallyMalformed = [
                     validForm(state: "unknown") + "&unexpected=value",
                     validForm(state: "duplicate") + "&scope=atproto",
-                    validForm(state: "plain").replacingOccurrences(of: "code_challenge_method=S256", with: "code_challenge_method=plain"),
-                    validForm(state: "scope").replacingOccurrences(of: "scope=atproto", with: "scope=atproto%20profile"),
-                    validForm(state: "bare").replacingOccurrences(of: "scope=atproto", with: "scope=space%3Aapp.example.space"),
-                    validForm(state: "wildcard").replacingOccurrences(of: "scope=atproto", with: "scope=space%3A%2A%3Fauthority%3D%2A%26skey%3D%2A%26action%3Dread"),
-                    validForm(state: "duplicate-dimension").replacingOccurrences(of: "scope=atproto", with: "scope=space%3Aapp.example.space%3Fauthority%3Ddid%3Aplc%3Aabcdefghijklmnopqrstuvwx%26%2561uthority%3Ddid%3Aplc%3Aabcdefghijklmnopqrstuvwx%26skey%3Dwhole-space%26action%3Dread"),
-                    validForm(state: "unregistered").replacingOccurrences(of: "scope=atproto", with: "scope=space%3Aapp.example.space%3Fauthority%3Ddid%3Aplc%3Aabcdefghijklmnopqrstuvwx%26skey%3Dwhole-space%26action%3Dread"),
-                    validForm(state: "redirect").replacingOccurrences(of: formEncode(redirectURI.absoluteString), with: formEncode("https://client.example/callback")),
+                    // `prompt=none` demands a silent answer; this server always
+                    // presents the login form, so accepting it would leave the
+                    // client waiting on a redirect that needs a human.
+                    validForm(state: "prompt-none") + "&prompt=none",
+                    validForm(state: "prompt-unknown") + "&prompt=create",
+                    validForm(state: "hint-empty") + "&login_hint=",
+                    validForm(state: "plain").replacingOccurrences(
+                        of: "code_challenge_method=S256", with: "code_challenge_method=plain"
+                    ),
+                    validForm(state: "redirect").replacingOccurrences(
+                        of: formEncode(redirectURI.absoluteString),
+                        with: formEncode("https://client.example/callback")
+                    ),
                 ]
-                for form in malformedForms {
+                for form in structurallyMalformed {
                     try await client.execute(
                         uri: "/oauth/par",
                         method: .post,
@@ -234,10 +322,104 @@ final class OAuthPARHTTPTests: XCTestCase, @unchecked Sendable {
                     ) { response in
                         XCTAssertEqual(response.status, .badRequest)
                         XCTAssertEqual(response.headers[.cacheControl], "no-store")
-                        XCTAssertNil(response.headers[dpopNonceHeader])
+                        XCTAssertNil(
+                            response.headers[dpopNonceHeader],
+                            "a structurally malformed request must not be handed a nonce"
+                        )
                         XCTAssertEqual(try self.errorCode(from: response.body), "invalid_request")
                     }
                 }
+
+                // Scope-semantic forms. Each is refused, but only after DPoP —
+                // and the expected post-nonce code is recorded per vector so a
+                // change of layer or reason is visible rather than absorbed.
+                let scopeSemantic: [(state: String, form: String, code: String)] = [
+                    // An unknown scope NAME (§9-D5: rejected, never silently dropped).
+                    ("scope", validForm(state: "scope").replacingOccurrences(
+                        of: "scope=atproto", with: "scope=atproto%20profile"
+                    ), "invalid_scope"),
+                    // §7.3 D8 — a percent-decoded key collision stays rejected.
+                    ("duplicate-dimension", validForm(state: "duplicate-dimension").replacingOccurrences(
+                        of: "scope=atproto",
+                        with: "scope=space%3Aapp.example.space%3Fauthority%3Ddid%3Aplc%3Aabcdefghijklmnopqrstuvwx%26%2561uthority%3Ddid%3Aplc%3Aabcdefghijklmnopqrstuvwx%26skey%3Dwhole-space%26action%3Dread"
+                    ), "invalid_scope"),
+                    // The two RETIRED-GATE vectors. Both parse now (D21), and both
+                    // are refused for the reason that actually applies: the
+                    // localhost client registered `atproto` and nothing else, so
+                    // requested-⊄-declared fails. Registration declares, PAR
+                    // enforces the subset — which is D21's layering, working.
+                    ("bare", validForm(state: "bare").replacingOccurrences(
+                        of: "scope=atproto", with: "scope=space%3Aapp.example.space"
+                    ), "invalid_request"),
+                    ("wildcard", validForm(state: "wildcard").replacingOccurrences(
+                        of: "scope=atproto",
+                        with: "scope=space%3A%2A%3Fauthority%3D%2A%26skey%3D%2A%26action%3Dread"
+                    ), "invalid_request"),
+                    // A well-formed scope the client never registered — the same
+                    // subset refusal, stated explicitly so the two above are not
+                    // the only evidence for it.
+                    ("unregistered", validForm(state: "unregistered").replacingOccurrences(
+                        of: "scope=atproto",
+                        with: "scope=space%3Aapp.example.space%3Fauthority%3Ddid%3Aplc%3Aabcdefghijklmnopqrstuvwx%26skey%3Dwhole-space%26action%3Dread"
+                    ), "invalid_request"),
+                ]
+                let key = P256.Signing.PrivateKey()
+                let jwk = try makeJWK(key)
+                for vector in scopeSemantic {
+                    // Stage 1 — indistinguishable from a valid request.
+                    var challenge: String?
+                    try await client.execute(
+                        uri: "/oauth/par",
+                        method: .post,
+                        headers: formHeaders(),
+                        body: ByteBuffer(string: vector.form)
+                    ) { response in
+                        XCTAssertEqual(response.status, .badRequest, vector.state)
+                        XCTAssertEqual(response.headers[.cacheControl], "no-store", vector.state)
+                        XCTAssertEqual(
+                            try self.errorCode(from: response.body),
+                            "use_dpop_nonce",
+                            """
+                            ORACLE (\(vector.state)): the server answered a scope \
+                            question before the caller proved possession of a key. \
+                            Every scope-semantic form must be met with the same \
+                            nonce challenge a valid request gets.
+                            """
+                        )
+                        challenge = response.headers[dpopNonceHeader]
+                    }
+                    let nonce = try XCTUnwrap(challenge, vector.state)
+
+                    // Stage 2 — and it is still refused.
+                    let proof = try makeDPoPProof(
+                        key: key,
+                        jwk: jwk,
+                        jti: "par-oracle-\(vector.state)",
+                        nonce: nonce,
+                        target: try OAuthDPoPProofValidator.normalizedTarget(
+                            issuer.appending(path: "oauth/par")
+                        )
+                    )
+                    try await client.execute(
+                        uri: "/oauth/par",
+                        method: .post,
+                        headers: formHeaders(dpop: proof),
+                        body: ByteBuffer(string: vector.form)
+                    ) { response in
+                        XCTAssertEqual(response.status, .badRequest, vector.state)
+                        XCTAssertEqual(
+                            try self.errorCode(from: response.body),
+                            vector.code,
+                            "\(vector.state) must still be refused after the nonce"
+                        )
+                        let body = String(buffer: response.body)
+                        XCTAssertFalse(
+                            body.contains("request_uri"),
+                            "\(vector.state): a refused request must not yield a request_uri"
+                        )
+                    }
+                }
+
                 var wrongContentType = HTTPFields()
                 wrongContentType[.contentType] = "application/json"
                 try await client.execute(

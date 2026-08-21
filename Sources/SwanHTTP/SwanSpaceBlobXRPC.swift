@@ -292,7 +292,7 @@ private func authorizeBlobRead(
 ) async throws -> AuthorizationContext {
     let bearer: String?
     do {
-        bearer = try exactBearerToken(from: request.headers)
+        bearer = try spaceCredentialSchemeToken(from: request.headers)
     } catch {
         throw AuthenticatedSpaceBlobFailure.denied
     }
@@ -359,7 +359,7 @@ private func parseAuthenticatedGetSpaceBlobParameters(
         request,
         schema: spaceGetBlobQuerySchema
     )
-    let space = try ATProtocolURI(
+    let space = try SpaceRef(
         uriString: try requiredQueryValue("space", in: query, maximumBytes: 2_048)
     )
     let repo = try DID(

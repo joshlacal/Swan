@@ -29,6 +29,7 @@ public struct SwanPortableAccountRestoreStager: Sendable {
     private let synchronizeCreatedDirectoryParent:
         @Sendable (Int32) throws -> Void
     private let beforeCleanupAttempt: (@Sendable (Int) throws -> Void)?
+    private let identitySnapshotInstaller: (@Sendable (SwanIdentitySnapshot) async throws -> Void)?
 
     public init() {
         afterRenameBeforeParentSync = nil
@@ -37,6 +38,7 @@ public struct SwanPortableAccountRestoreStager: Sendable {
             try SwanPortableExportFilesystem.synchronizeParent($0)
         }
         beforeCleanupAttempt = nil
+        identitySnapshotInstaller = nil
     }
 
     init(
@@ -46,12 +48,14 @@ public struct SwanPortableAccountRestoreStager: Sendable {
             @escaping @Sendable (Int32) throws -> Void = {
                 try SwanPortableExportFilesystem.synchronizeParent($0)
             },
-        beforeCleanupAttempt: (@Sendable (Int) throws -> Void)? = nil
+        beforeCleanupAttempt: (@Sendable (Int) throws -> Void)? = nil,
+        identitySnapshotInstaller: (@Sendable (SwanIdentitySnapshot) async throws -> Void)? = nil
     ) {
         self.afterRenameBeforeParentSync = afterRenameBeforeParentSync
         self.beforeSuccessIdentityValidation = beforeSuccessIdentityValidation
         self.synchronizeCreatedDirectoryParent = synchronizeCreatedDirectoryParent
         self.beforeCleanupAttempt = beforeCleanupAttempt
+        self.identitySnapshotInstaller = identitySnapshotInstaller
     }
 
     public func stage(
@@ -115,6 +119,7 @@ public struct SwanPortableAccountRestoreStager: Sendable {
                     archiveDescriptor: existingDescriptor,
                     manifestHash: manifestHash
                 )
+                try await installIdentitySnapshotIfPresent(existing, archiveDescriptor: existingDescriptor)
                 return result(
                     verification: existing,
                     dataDirectory: canonicalDataDirectory,
@@ -167,6 +172,7 @@ public struct SwanPortableAccountRestoreStager: Sendable {
                     archiveDescriptor: stagingDescriptor,
                     manifestHash: manifestHash
                 )
+                try await installIdentitySnapshotIfPresent(installed, archiveDescriptor: stagingDescriptor)
                 _ = close(stagingDescriptor)
                 return result(
                     verification: installed,
@@ -216,6 +222,7 @@ public struct SwanPortableAccountRestoreStager: Sendable {
             try Task.checkCancellation()
             let maximumBytes = switch entry.type {
             case .plcHistory: 64 * 1_024
+            case .identitySnapshot: 64 * 1_024
             default: SwanPortableExportFilesystem.maximumArtifactBytes
             }
             try SwanPortableExportFilesystem.copyStreaming(
@@ -308,5 +315,26 @@ public struct SwanPortableAccountRestoreStager: Sendable {
                 .path,
             status: status
         )
+    }
+
+    private func installIdentitySnapshotIfPresent(
+        _ verification: SwanPortableArchiveVerification,
+        archiveDescriptor: Int32
+    ) async throws {
+        guard let entry = verification.manifest.files.first(where: {
+            $0.type == .identitySnapshot && $0.path == "identity/snapshot.json"
+        }) else { return }
+        guard let identitySnapshotInstaller else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        let data = try SwanPortableExportFilesystem.read(
+            path: entry.path, root: archiveDescriptor, maximumBytes: 64 * 1_024
+        )
+        guard data.count == entry.byteCount,
+              SwanPortableExportDigest.hex(data) == entry.sha256 else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        let snapshot = try SwanIdentitySnapshot.decode(data)
+        try await identitySnapshotInstaller(snapshot.validatedForRestore(accountDID: verification.manifest.did))
     }
 }
