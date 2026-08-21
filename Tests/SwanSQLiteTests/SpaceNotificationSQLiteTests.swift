@@ -806,6 +806,118 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             )
         }
     }
+    /// A repository with many operations per revision must prune to the exact
+    /// composite retention boundary and use covering index seeks without full-table scans.
+    func testHighOperationsPerRevisionRetentionPrunesToExactOplogBoundaryAndAvoidsFullTableScan() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root,
+            did: fixture.writer,
+            oplogRetention: 35
+        )
+        defer { Task { try? await database.close() } }
+
+        // Apply 10 commits with 10 writes each = 100 total operations across revisions 1...10
+        for revision in 1 ... 10 {
+            let requestID = UUID()
+            var writes: [SQLiteSpaceWrite] = []
+            for op in 0 ..< 10 {
+                let uri = try SpaceRecordURI(
+                    space: fixture.space,
+                    author: fixture.writer,
+                    collection: "app.bsky.feed.post",
+                    rkey: "rkey-rev\(revision)-op\(op)"
+                )
+                let value = Data([0xA1, 0x61, 0x61, UInt8(revision)])
+                writes.append(.put(
+                    uri: uri,
+                    value: value,
+                    cid: CID.fromDAGCBOR(value).string
+                ))
+            }
+            _ = try await database.apply(
+                space: fixture.space,
+                author: fixture.writer,
+                expectedRevision: UInt64(revision - 1),
+                requestID: requestID,
+                wireRevision: try fixture.tid(revision),
+                writes: writes
+            )
+        }
+
+        // With oplogRetention = 35:
+        // Revisions 10 (10 ops), 9 (10 ops), 8 (10 ops) = 30 ops.
+        // The 35th newest entry falls in Revision 7.
+        // Whole commits are retained -> revisions 7, 8, 9, 10 are retained (40 total ops).
+        // Commits 1...6 (60 ops) are pruned.
+        let retainedOplog = try await database.connection.query(
+            """
+            SELECT revision, operation_index
+            FROM permissioned_space_oplog
+            WHERE space_uri = ? AND author_did = ?
+            ORDER BY revision ASC, operation_index ASC
+            """,
+            [.text(fixture.space.rawValue), .text(fixture.writer)]
+        )
+        XCTAssertEqual(retainedOplog.count, 40)
+        let retainedEntries = retainedOplog.compactMap { row -> String? in
+            guard let rev = row.column("revision")?.integer,
+                  let idx = row.column("operation_index")?.integer else { return nil }
+            return "\(rev):\(idx)"
+        }
+        var expectedEntries: [String] = []
+        for rev in 7 ... 10 {
+            for idx in 0 ..< 10 {
+                expectedEntries.append("\(rev):\(idx)")
+            }
+        }
+        XCTAssertEqual(retainedEntries, expectedEntries)
+        // Requests ledger retains all 10 receipts since 10 <= 35
+        let retainedRequests = try await database.connection.query(
+            """
+            SELECT final_revision
+            FROM permissioned_space_requests
+            WHERE space_uri = ? AND author_did = ?
+            ORDER BY final_revision ASC
+            """,
+            [.text(fixture.space.rawValue), .text(fixture.writer)]
+        )
+        XCTAssertEqual(retainedRequests.count, 10)
+        XCTAssertEqual(
+            retainedRequests.compactMap { $0.column("final_revision")?.integer },
+            Array(1 ... 10)
+        )
+
+        // Verify query plan on oplog cutoff seek: uses primary key index seek, no temp b-tree
+        let oplogPlan = try await database.connection.query(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT revision
+            FROM permissioned_space_oplog
+            WHERE space_uri = ? AND author_did = ? AND revision >= ?
+            ORDER BY revision ASC, operation_index ASC
+            LIMIT 1 OFFSET ?
+            """,
+            [.text(fixture.space.rawValue), .text(fixture.writer), .integer(7), .integer(5)]
+        )
+        let oplogDetails = oplogPlan.compactMap { $0.column("detail")?.string?.uppercased() }
+        XCTAssertTrue(oplogDetails.contains { $0.contains("PRIMARY KEY") || $0.contains("INDEX") })
+        XCTAssertFalse(oplogDetails.contains { $0.contains("USE TEMP B-TREE") })
+
+        // Verify query plan on request receipts retention: uses permissioned_space_requests_retention index, no table scan
+        let requestsPlan = try await database.connection.query(
+            """
+            EXPLAIN QUERY PLAN
+            DELETE FROM permissioned_space_requests
+            WHERE space_uri = ? AND author_did = ? AND final_revision < ?
+            """,
+            [.text(fixture.space.rawValue), .text(fixture.writer), .integer(7)]
+        )
+        let requestsDetails = requestsPlan.compactMap { $0.column("detail")?.string?.uppercased() }
+        XCTAssertTrue(requestsDetails.contains { $0.contains("PERMISSIONED_SPACE_REQUESTS_RETENTION") || $0.contains("INDEX") })
+        XCTAssertFalse(requestsDetails.contains { $0.contains("SCAN TABLE") })
+    }
+
 
 
     /// Receipts written before the retention column exists carry no timestamp.

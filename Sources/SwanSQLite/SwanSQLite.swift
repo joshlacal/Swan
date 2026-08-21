@@ -4086,11 +4086,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
 
             // If multi-operation commits in the retained window cause oplog entries to
-            // exceed oplogRetention, find the cutoff revision using a strictly bounded
-            // keyset scan from the oldest retained revision (at most 512 entries).
+            // exceed oplogRetention, seek the exact cutoff revision from the oldest
+            // retained revision and delete the excess past that cutoff.
             if newOplogCount > oplogRetention {
                 let excess = newOplogCount - oplogRetention
-                let batchScanLimit = min(excess, 512)
                 let cutoffRows = try await connection.query(
                     """
                     SELECT revision
@@ -4102,7 +4101,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     [
                         .text(space.rawValue), .text(author),
                         .integer(minimumRetainedCommitRevision),
-                        .integer(batchScanLimit),
+                        .integer(excess),
                     ]
                 )
                 if let cutoffRow = cutoffRows.first {
