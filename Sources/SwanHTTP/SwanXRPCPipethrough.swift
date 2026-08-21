@@ -401,6 +401,8 @@ private func handleSwanXRPCPipethrough(
             audience = did
             do {
                 endpoint = try await capability.resolver.endpoint(did: did, fragment: fragment)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 throw SwanXRPCPipethroughFailure.invalidRequest
             }

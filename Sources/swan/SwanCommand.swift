@@ -3038,7 +3038,7 @@ extension SwanCommand {
                                         limits.maximumRequestBodyBytes
                                 )
                             ),
-                            resolver: SwanServiceEndpointResolver(
+                            resolver: try SwanServiceEndpointResolver(
                                 documents: try SwanPeerPinnedDIDDocumentFetcher(
                                     documents: documents,
                                     // Reuse the operator's configured PLC

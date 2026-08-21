@@ -1,11 +1,31 @@
 import Foundation
 import SwanCore
 
+public struct SwanDIDDocumentFetchResult: Sendable {
+    public let data: Data
+    public let maxAge: TimeInterval?
+    public let noStore: Bool
+
+    public init(data: Data, maxAge: TimeInterval? = nil, noStore: Bool = false) {
+        self.data = data
+        self.maxAge = maxAge
+        self.noStore = noStore
+    }
+}
+
 /// Supplies a DID document as raw JSON. Implementations must fetch through
 /// Swan's peer-pinned path; this protocol exists so resolution logic is
 /// testable without a network.
 public protocol SwanDIDDocumentFetching: Sendable {
     func documentJSON(forDID did: String) async throws -> Data
+    func fetchDocument(forDID did: String) async throws -> SwanDIDDocumentFetchResult
+}
+
+extension SwanDIDDocumentFetching {
+    public func fetchDocument(forDID did: String) async throws -> SwanDIDDocumentFetchResult {
+        let data = try await documentJSON(forDID: did)
+        return SwanDIDDocumentFetchResult(data: data)
+    }
 }
 
 public enum SwanServiceResolutionFailure: Error, Sendable, Equatable {
@@ -13,8 +33,13 @@ public enum SwanServiceResolutionFailure: Error, Sendable, Equatable {
 }
 
 private enum DIDDocumentFlightWaitOutcome: Sendable {
-    case completed(Result<SwanServiceEndpointResolver.Document, Error>)
+    case completed(Result<SwanDIDDocumentResolutionPayload, Error>)
     case waiterCancelled
+}
+
+private struct SwanDIDDocumentResolutionPayload: Sendable {
+    let document: SwanServiceEndpointResolver.Document
+    let fetchResult: SwanDIDDocumentFetchResult
 }
 
 /// Bridges one caller to an independent shared task. Cancellation settles only
@@ -81,24 +106,24 @@ public struct SwanServiceEndpointResolver: Sendable {
         }
     }
 
-    /// Monotonic time source for cache TTL.
+    /// Continuous monotonic time source for cache TTL.
     public struct MonotonicClock: Sendable {
-        private let readNanoseconds: @Sendable () -> UInt64
+        private let readInstant: @Sendable () -> ContinuousClock.Instant
 
         public init(
-            nowNanoseconds: @escaping @Sendable () -> UInt64
+            nowInstant: @escaping @Sendable () -> ContinuousClock.Instant
         ) {
-            readNanoseconds = nowNanoseconds
+            readInstant = nowInstant
         }
 
         fileprivate static let continuous = MonotonicClock(
-            nowNanoseconds: {
-                DispatchTime.now().uptimeNanoseconds
+            nowInstant: {
+                ContinuousClock.now
             }
         )
 
-        fileprivate func now() -> UInt64 {
-            readNanoseconds()
+        fileprivate func now() -> ContinuousClock.Instant {
+            readInstant()
         }
     }
 
@@ -119,13 +144,14 @@ public struct SwanServiceEndpointResolver: Sendable {
     private actor CacheActor {
         private struct CacheEntry: Sendable {
             let document: Document
-            let expiresAt: UInt64
+            let expiresAt: ContinuousClock.Instant
         }
 
         private struct Flight: Sendable {
             let identity: UUID
-            let task: Task<Document, Error>
+            let task: Task<SwanDIDDocumentResolutionPayload, Error>
             var waiters: [DIDDocumentFlightWait]
+            var waiterCount: Int { waiters.count }
         }
 
         private let documents: any SwanDIDDocumentFetching
@@ -144,41 +170,51 @@ public struct SwanServiceEndpointResolver: Sendable {
             self.clock = clock
         }
 
-        func document(forDID did: String) async throws -> Document {
+        func inFlightWaiterCount(for did: String) -> Int {
+            inFlight[did]?.waiterCount ?? 0
+        }
+
+        func endpoint(did: String, fragment: String) async throws -> URL {
             try Task.checkCancellation()
             let now = clock.now()
             if let entry = cache[did] {
                 if entry.expiresAt > now {
-                    return entry.document
+                    if let url = SwanServiceEndpointResolver.resolveEndpoint(
+                        document: entry.document,
+                        did: did,
+                        fragment: fragment
+                    ) {
+                        return url
+                    }
+                    // The cached document does not resolve this fragment.
+                    // Evict so semantic failures are not locked into the cache.
+                    cache.removeValue(forKey: did)
+                } else {
+                    cache.removeValue(forKey: did)
                 }
-                cache.removeValue(forKey: did)
             }
 
             if var flight = inFlight[did] {
                 let wait = DIDDocumentFlightWait()
                 flight.waiters.append(wait)
                 inFlight[did] = flight
-                return try await awaitFlight(wait)
+                let payload = try await awaitFlight(wait)
+                return try evaluateEndpoint(payload: payload, did: did, fragment: fragment, shouldCache: false)
             }
 
             let wait = DIDDocumentFlightWait()
             let identity = UUID()
             let documents = self.documents
             let priority = Task.currentPriority
-            let task: Task<Document, Error> = Task.detached(priority: priority) {
-                let data: Data
-                do {
-                    data = try await documents.documentJSON(forDID: did)
-                } catch {
-                    throw SwanServiceResolutionFailure.unresolvableService
-                }
-                guard let document = try? JSONDecoder().decode(Document.self, from: data),
+            let task: Task<SwanDIDDocumentResolutionPayload, Error> = Task.detached(priority: priority) {
+                let fetchResult = try await documents.fetchDocument(forDID: did)
+                guard let document = try? JSONDecoder().decode(Document.self, from: fetchResult.data),
                       document.service != nil,
                       document.id == did
                 else {
                     throw SwanServiceResolutionFailure.unresolvableService
                 }
-                return document
+                return SwanDIDDocumentResolutionPayload(document: document, fetchResult: fetchResult)
             }
 
             let flight = Flight(
@@ -193,10 +229,30 @@ public struct SwanServiceEndpointResolver: Sendable {
                 await self?.finishFlight(identity: identity, for: did, result: result)
             }
 
-            return try await awaitFlight(wait)
+            let payload = try await awaitFlight(wait)
+            return try evaluateEndpoint(payload: payload, did: did, fragment: fragment, shouldCache: true)
         }
 
-        private func awaitFlight(_ wait: DIDDocumentFlightWait) async throws -> Document {
+        private func evaluateEndpoint(
+            payload: SwanDIDDocumentResolutionPayload,
+            did: String,
+            fragment: String,
+            shouldCache: Bool
+        ) throws -> URL {
+            guard let url = SwanServiceEndpointResolver.resolveEndpoint(
+                document: payload.document,
+                did: did,
+                fragment: fragment
+            ) else {
+                throw SwanServiceResolutionFailure.unresolvableService
+            }
+            if shouldCache && !payload.fetchResult.noStore {
+                storeInCache(payload.document, fetchResult: payload.fetchResult, for: did)
+            }
+            return url
+        }
+
+        private func awaitFlight(_ wait: DIDDocumentFlightWait) async throws -> SwanDIDDocumentResolutionPayload {
             let outcome = await withTaskCancellationHandler(
                 operation: {
                     await withCheckedContinuation { continuation in
@@ -221,24 +277,31 @@ public struct SwanServiceEndpointResolver: Sendable {
         private func finishFlight(
             identity: UUID,
             for did: String,
-            result: Result<Document, Error>
+            result: Result<SwanDIDDocumentResolutionPayload, Error>
         ) {
             guard let flight = inFlight[did], flight.identity == identity else {
                 return
             }
             inFlight.removeValue(forKey: did)
-            if case let .success(document) = result {
-                storeInCache(document, for: did)
-            }
             for waiter in flight.waiters {
                 waiter.complete(.completed(result))
             }
         }
 
-        private func storeInCache(_ document: Document, for did: String) {
+        private func storeInCache(
+            _ document: Document,
+            fetchResult: SwanDIDDocumentFetchResult,
+            for did: String
+        ) {
             let now = clock.now()
-            let lifetimeNanoseconds = UInt64(configuration.lifetime * 1_000_000_000)
-            let expiresAt = now.addingReportingOverflow(lifetimeNanoseconds).partialValue
+            let effectiveLifetime: TimeInterval
+            if let maxAge = fetchResult.maxAge {
+                effectiveLifetime = min(maxAge, configuration.lifetime)
+            } else {
+                effectiveLifetime = configuration.lifetime
+            }
+            guard effectiveLifetime > 0 else { return }
+            let expiresAt = now.advanced(by: .seconds(effectiveLifetime))
 
             if cache.count >= configuration.maximumEntries {
                 cache = cache.filter { $0.value.expiresAt > now }
@@ -261,8 +324,8 @@ public struct SwanServiceEndpointResolver: Sendable {
     public init(
         documents: any SwanDIDDocumentFetching,
         cacheConfiguration: CacheConfiguration = .standard
-    ) {
-        self.init(
+    ) throws {
+        try self.init(
             documents: documents,
             cacheConfiguration: cacheConfiguration,
             monotonicClock: .continuous
@@ -273,8 +336,8 @@ public struct SwanServiceEndpointResolver: Sendable {
         documents: any SwanDIDDocumentFetching,
         cacheConfiguration: CacheConfiguration = .standard,
         monotonicClock: MonotonicClock
-    ) {
-        try? cacheConfiguration.validate()
+    ) throws {
+        try cacheConfiguration.validate()
         self.cacheActor = CacheActor(
             documents: documents,
             configuration: cacheConfiguration,
@@ -282,20 +345,27 @@ public struct SwanServiceEndpointResolver: Sendable {
         )
     }
 
+    internal func inFlightWaiterCount(for did: String) async -> Int {
+        await cacheActor.inFlightWaiterCount(for: did)
+    }
+
     public func endpoint(did: String, fragment: String) async throws -> URL {
-        let document: Document
         do {
-            document = try await cacheActor.document(forDID: did)
+            return try await cacheActor.endpoint(did: did, fragment: fragment)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
             throw SwanServiceResolutionFailure.unresolvableService
         }
-        guard let services = document.service else {
-            throw SwanServiceResolutionFailure.unresolvableService
-        }
-        guard document.id == did else {
-            throw SwanServiceResolutionFailure.unresolvableService
+    }
+
+    fileprivate static func resolveEndpoint(
+        document: Document,
+        did: String,
+        fragment: String
+    ) -> URL? {
+        guard document.id == did, let services = document.service else {
+            return nil
         }
         let matches = services.filter {
             $0.id == "#\(fragment)" || $0.id == "\(did)#\(fragment)"
@@ -307,7 +377,7 @@ public struct SwanServiceEndpointResolver: Sendable {
             url.scheme?.lowercased() == "https",
             let host = url.host, !host.isEmpty,
             url.user == nil, url.password == nil
-        else { throw SwanServiceResolutionFailure.unresolvableService }
+        else { return nil }
         return url
     }
 }
@@ -349,6 +419,32 @@ public struct SwanPeerPinnedDIDDocumentFetcher: SwanDIDDocumentFetching {
         return try await documents.fetchJSON(from: url)
     }
 
+    public func fetchDocument(forDID did: String) async throws -> SwanDIDDocumentFetchResult {
+        let url = try Self.documentURL(forDID: did, plcOrigin: plcOrigin)
+        let (data, headers) = try await documents.fetchJSONWithHeaders(from: url)
+        let (maxAge, noStore) = Self.parseCacheControl(headers: headers)
+        return SwanDIDDocumentFetchResult(data: data, maxAge: maxAge, noStore: noStore)
+    }
+
+    private static func parseCacheControl(headers: [String: [String]]) -> (maxAge: TimeInterval?, noStore: Bool) {
+        guard let values = headers["cache-control"] else { return (nil, false) }
+        var noStore = false
+        var maxAge: TimeInterval?
+        for value in values {
+            let directives = value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            for directive in directives {
+                if directive == "no-store" || directive == "no-cache" {
+                    noStore = true
+                } else if directive.hasPrefix("max-age=") {
+                    let numberPart = directive.dropFirst("max-age=".count).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let seconds = Double(numberPart), seconds >= 0, seconds.isFinite {
+                        maxAge = seconds
+                    }
+                }
+            }
+        }
+        return (maxAge, noStore)
+    }
     /// Pure, synchronous DID → document URL derivation, so the whole grammar is
     /// testable without a network.
     static func documentURL(forDID did: String, plcOrigin: URL) throws -> URL {

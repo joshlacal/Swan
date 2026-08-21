@@ -562,7 +562,11 @@ struct OAuthAdmittedRemoteDocumentFetcher: Sendable {
     fileprivate let fetcher: OAuthRemoteDocumentFetcher
 
     func fetchJSON(from url: URL) async throws -> Data {
-        try await fetcher.fetchJSONWithoutAdmission(from: url)
+        try await fetchJSONWithHeaders(from: url).data
+    }
+
+    func fetchJSONWithHeaders(from url: URL) async throws -> (data: Data, headers: [String: [String]]) {
+        try await fetcher.fetchJSONWithoutAdmissionWithHeaders(from: url)
     }
 }
 
@@ -585,9 +589,13 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
     }
 
     public func fetchJSON(from url: URL) async throws -> Data {
+        try await fetchJSONWithHeaders(from: url).data
+    }
+
+    public func fetchJSONWithHeaders(from url: URL) async throws -> (data: Data, headers: [String: [String]]) {
         _ = try policy.validateURL(url)
         return try await withAdmission { admittedFetcher in
-            try await admittedFetcher.fetchJSON(from: url)
+            try await admittedFetcher.fetchJSONWithHeaders(from: url)
         }
     }
 
@@ -620,8 +628,12 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         )
     }
 
-    fileprivate func fetchJSONWithoutAdmission(from url: URL) async throws
-        -> Data
+    fileprivate func fetchJSONWithoutAdmission(from url: URL) async throws -> Data {
+        try await fetchJSONWithoutAdmissionWithHeaders(from: url).data
+    }
+
+    fileprivate func fetchJSONWithoutAdmissionWithHeaders(from url: URL) async throws
+        -> (data: Data, headers: [String: [String]])
     {
         let host = try policy.validateURL(url)
         let preflightPeers = Set(try await resolveOAuthHostname(
@@ -679,7 +691,7 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         // the bytes unmodified so metadata/JWKS decoders see exactly what was
         // validated and any caller can bind an audit hash if needed.
         try StrictJSON.validate(response.body)
-        return response.body
+        return (data: response.body, headers: headers)
     }
 
     private func isJSONContentType(_ value: String) -> Bool {
