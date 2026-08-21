@@ -94,33 +94,45 @@ private final class TestMonotonicClock: @unchecked Sendable {
 private struct TestTimeoutError: Error, Sendable {}
 
 private final class BoundedJoinState<R: Sendable>: @unchecked Sendable {
+    private enum State {
+        case idle
+        case waiting(CheckedContinuation<R, Error>)
+        case completed(Result<R, Error>)
+    }
+
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<R, Error>?
-    private var isCompleted = false
+    private var state: State = .idle
 
     init() {}
 
     func install(_ cont: CheckedContinuation<R, Error>) {
         lock.lock()
-        if isCompleted {
+        switch state {
+        case .idle:
+            state = .waiting(cont)
             lock.unlock()
-            return
+        case .waiting:
+            lock.unlock()
+            preconditionFailure("BoundedJoinState: continuation installed more than once")
+        case let .completed(result):
+            lock.unlock()
+            cont.resume(with: result)
         }
-        self.continuation = cont
-        lock.unlock()
     }
 
     func complete(with result: Result<R, Error>) {
         lock.lock()
-        guard !isCompleted else {
+        switch state {
+        case .idle:
+            state = .completed(result)
             lock.unlock()
-            return
+        case let .waiting(cont):
+            state = .completed(result)
+            lock.unlock()
+            cont.resume(with: result)
+        case .completed:
+            lock.unlock()
         }
-        isCompleted = true
-        let cont = continuation
-        continuation = nil
-        lock.unlock()
-        cont?.resume(with: result)
     }
 }
 
@@ -832,5 +844,60 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
             "age": ["10"]
         ])
         XCTAssertTrue(noStore5)
+
+        // 400-digit Age -> overflows Double to inf, clamped to greatestFiniteMagnitude -> remaining is 0 -> noStore true, maxAge 0
+        let (maxAge6, noStore6) = SwanPeerPinnedDIDDocumentFetcher.parseCacheControl(headers: [
+            "cache-control": ["max-age=60"],
+            "age": [String(repeating: "9", count: 400)]
+        ])
+        XCTAssertEqual(maxAge6, 0)
+        XCTAssertTrue(noStore6)
+    }
+
+    func testSingleCallerFailingFragmentResolutionIsNotAdmittedToCache() async throws {
+        let docs = ControllableDocuments(json: document)
+        let resolver = try SwanServiceEndpointResolver(documents: docs)
+
+        // Single caller requests non-existent fragment
+        do {
+            _ = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "nonexistent")
+            XCTFail("should have failed with unresolvableService")
+        } catch let error as SwanServiceResolutionFailure {
+            XCTAssertEqual(error, .unresolvableService)
+        }
+
+        let count1 = await docs.fetchCount
+        XCTAssertEqual(count1, 1)
+
+        // Subsequent request for a valid fragment on the same DID must NOT hit cache (must trigger a new fetch)
+        let url = try await resolver.endpoint(did: "did:web:api.bsky.app", fragment: "bsky_appview")
+        XCTAssertEqual(url, URL(string: "https://api.bsky.app"))
+        let count2 = await docs.fetchCount
+        XCTAssertEqual(count2, 2, "subsequent request must refetch because prior resolution failed fragment check")
+    }
+
+    func testBoundedJoinWhenTaskCompletesBeforeInstall() async throws {
+        let task: Task<Int, Error> = Task {
+            return 42
+        }
+        // Allow task to finish before boundedJoin starts
+        try await Task.sleep(for: .milliseconds(50))
+        let result = try await boundedJoin(task, timeoutSeconds: 3)
+        XCTAssertEqual(result, 42)
+    }
+
+    func testBoundedJoinWhenTaskTimesOut() async throws {
+        let task: Task<Int, Error> = Task {
+            try await Task.sleep(for: .seconds(10))
+            return 42
+        }
+        do {
+            _ = try await boundedJoin(task, timeoutSeconds: 0.1)
+            XCTFail("should have timed out")
+        } catch is TestTimeoutError {
+            // Expected
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
     }
 }

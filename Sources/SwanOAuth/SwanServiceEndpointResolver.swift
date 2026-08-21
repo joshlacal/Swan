@@ -208,7 +208,7 @@ public struct SwanServiceEndpointResolver: Sendable {
                 flight.waiters.append(wait)
                 inFlight[did] = flight
                 let payload = try await awaitFlight(wait)
-                return try evaluateEndpoint(document: payload.document, did: did, fragment: fragment)
+                return try resolveAndAdmit(payload: payload, did: did, fragment: fragment)
             }
 
             let wait = DIDDocumentFlightWait()
@@ -239,20 +239,23 @@ public struct SwanServiceEndpointResolver: Sendable {
             }
 
             let payload = try await awaitFlight(wait)
-            return try evaluateEndpoint(document: payload.document, did: did, fragment: fragment)
+            return try resolveAndAdmit(payload: payload, did: did, fragment: fragment)
         }
 
-        private func evaluateEndpoint(
-            document: Document,
+        private func resolveAndAdmit(
+            payload: SwanDIDDocumentResolutionPayload,
             did: String,
             fragment: String
         ) throws -> URL {
             guard let url = SwanServiceEndpointResolver.resolveEndpoint(
-                document: document,
+                document: payload.document,
                 did: did,
                 fragment: fragment
             ) else {
                 throw SwanServiceResolutionFailure.unresolvableService
+            }
+            if !payload.fetchResult.noStore {
+                storeInCache(payload.document, fetchResult: payload.fetchResult, for: did)
             }
             return url
         }
@@ -287,10 +290,6 @@ public struct SwanServiceEndpointResolver: Sendable {
                 return
             }
             inFlight.removeValue(forKey: did)
-            let hasActiveWaiter = flight.waiters.contains { !$0.isCancelled }
-            if case let .success(payload) = result, hasActiveWaiter, !payload.fetchResult.noStore {
-                storeInCache(payload.document, fetchResult: payload.fetchResult, for: did)
-            }
             for waiter in flight.waiters {
                 waiter.complete(.completed(result))
             }
@@ -310,7 +309,7 @@ public struct SwanServiceEndpointResolver: Sendable {
             guard effectiveLifetime > 0 else { return }
             let expiresAt = now.advanced(by: .seconds(effectiveLifetime))
 
-            if cache.count >= configuration.maximumEntries {
+            if cache.count >= configuration.maximumEntries, cache[did] == nil {
                 cache = cache.filter { $0.value.expiresAt > now }
                 if cache.count >= configuration.maximumEntries {
                     if let oldest = cache.min(by: { $0.value.expiresAt < $1.value.expiresAt })?.key {
@@ -444,8 +443,8 @@ public struct SwanPeerPinnedDIDDocumentFetcher: SwanDIDDocumentFetching {
                         noStore = true
                     } else if directive.hasPrefix("max-age=") {
                         let numberPart = directive.dropFirst("max-age=".count).trimmingCharacters(in: .whitespacesAndNewlines)
-                        if let seconds = Double(numberPart), seconds >= 0, seconds.isFinite {
-                            maxAge = seconds
+                        if let seconds = Double(numberPart), seconds >= 0 {
+                            maxAge = seconds.isFinite ? seconds : .greatestFiniteMagnitude
                         }
                     }
                 }
@@ -456,8 +455,9 @@ public struct SwanPeerPinnedDIDDocumentFetcher: SwanDIDDocumentFetching {
             for value in ageValues {
                 let parts = value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 for part in parts {
-                    if let seconds = Double(part), seconds >= 0, seconds.isFinite {
-                        age = max(age, seconds)
+                    if let seconds = Double(part), seconds >= 0 {
+                        let clamped = seconds.isFinite ? seconds : .greatestFiniteMagnitude
+                        age = max(age, clamped)
                     }
                 }
             }
