@@ -4365,8 +4365,20 @@ final class SwanSQLiteTests: XCTestCase {
         // Release validationTask to finish validating values and closures on readConnection
         await barrier.release()
 
-        // Must succeed without error under readConnection snapshot
+        // Must succeed without error under readConnection snapshot (which saw permissioned_simple_space_authorities as empty)
         try await validationTask.value
+
+        // Subsequent read on readConnection sees the newly committed space
+        let hostedSpaces = try await database.hostedSpaceURIs(
+            spaceType: nil,
+            authority: nil,
+            cursor: nil,
+            limit: 100
+        )
+        XCTAssertTrue(
+            hostedSpaces.contains(space),
+            "subsequent read transaction must observe the newly committed space"
+        )
     }
 
     func testCloseSurfacesReaderCloseFailureAndTracksClosedState() async throws {
@@ -4376,11 +4388,25 @@ final class SwanSQLiteTests: XCTestCase {
 
         struct InjectedReaderCloseError: Error, Equatable {}
 
-        // Install hook that injects a failure during readConnection close
+        actor AttemptCounter {
+            var count = 0
+            func increment() -> Int {
+                count += 1
+                return count
+            }
+            func value() -> Int { count }
+        }
+        let counter = AttemptCounter()
+
+        // Install hook that injects a failure on the first reader-close attempt,
+        // and succeeds on the second attempt while recording attempt count.
         await database.installTestingHooks(
             SQLiteTestingHooks(
                 onReaderClose: {
-                    throw InjectedReaderCloseError()
+                    let attempt = await counter.increment()
+                    if attempt == 1 {
+                        throw InjectedReaderCloseError()
+                    }
                 }
             )
         )
@@ -4393,10 +4419,26 @@ final class SwanSQLiteTests: XCTestCase {
             threwInjectedError = true
         }
         XCTAssertTrue(threwInjectedError, "close() must propagate reader close failure")
+        let firstAttempts = await counter.value()
+        XCTAssertEqual(firstAttempts, 1, "first close() must attempt reader close exactly once")
 
-        // Remove the failing hook; retry close() must succeed and finish closing the database
-        await database.installTestingHooks(SQLiteTestingHooks())
+        // Second close() must retry closing the live reader handle and increment the attempt count
         try await database.close()
+        let secondAttempts = await counter.value()
+        XCTAssertEqual(
+            secondAttempts,
+            2,
+            "second close() must attempt closing the reader handle again instead of short-circuiting on isClosed"
+        )
+
+        // A third close() after successful closure is a harmless idempotent replay (isClosed is true)
+        try await database.close()
+        let thirdAttempts = await counter.value()
+        XCTAssertEqual(
+            thirdAttempts,
+            2,
+            "third close() after successful closure must be an idempotent no-op replay"
+        )
     }
 }
 

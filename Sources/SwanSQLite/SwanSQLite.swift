@@ -7632,35 +7632,36 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             throw SwanError.malformed("blob export limit is invalid")
         }
         let columns = blobNamespaceColumns(reference.namespace)
-        let stored = try await withConnectionGate {
-            try await blobPayloadIfReachableWithoutGate(
-                cid: reference.cid,
-                namespaceKind: columns.kind,
-                spaceURI: columns.spaceURI,
-                includeLegacyPayload: false,
-                connection: connection
-            )
-        }
-        guard let stored else {
-            throw SwanError.unavailable("blob is not reachable")
-        }
-        guard stored.byteCount <= maximumBytes else {
-            throw SwanError.unavailable("blob exceeds export limits")
-        }
-        switch stored.storageKind {
-        case .legacySQLite:
-            try await streamLegacySQLiteBlobData(
-                stored: stored,
-                namespaceKind: columns.kind,
-                spaceURI: columns.spaceURI,
-                consume: consume
-            )
-        case .casV1:
-            let body = try await fileBackedBlobBody(stored)
-            try await body.streamBody(
-                maximumChunkBytes: SpaceCARBodySpool.maximumChunkBytes,
-                consume: consume
-            )
+        try await withConnectionGate {
+            try await writerReadTransaction {
+                guard let stored = try await blobPayloadIfReachableWithoutGate(
+                    cid: reference.cid,
+                    namespaceKind: columns.kind,
+                    spaceURI: columns.spaceURI,
+                    includeLegacyPayload: false,
+                    connection: connection
+                ) else {
+                    throw SwanError.unavailable("blob is not reachable")
+                }
+                guard stored.byteCount <= maximumBytes else {
+                    throw SwanError.unavailable("blob exceeds export limits")
+                }
+                switch stored.storageKind {
+                case .legacySQLite:
+                    try await streamLegacySQLiteBlobDataWithoutGate(
+                        stored: stored,
+                        namespaceKind: columns.kind,
+                        spaceURI: columns.spaceURI,
+                        consume: consume
+                    )
+                case .casV1:
+                    let body = try await fileBackedBlobBody(stored)
+                    try await body.streamBody(
+                        maximumChunkBytes: SpaceCARBodySpool.maximumChunkBytes,
+                        consume: consume
+                    )
+                }
+            }
         }
     }
 
@@ -8711,7 +8712,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// the engine and returns one bounded chunk per query. A read transaction
     /// keeps the metadata, chunks, and digest verification on one snapshot;
     /// the caller's consumer is invoked only with the current chunk.
-    private func streamLegacySQLiteBlobData(
+    private func streamLegacySQLiteBlobDataWithoutGate(
         stored: StoredBlobPayload,
         namespaceKind: String,
         spaceURI: String,
@@ -8724,49 +8725,45 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 "invalid legacy blob metadata"
             )
         }
-        try await withConnectionGate {
-            try await writerReadTransaction {
-                var offset = 0
-                var digest = SHA256()
-                let chunkSize = SpaceCARBodySpool.maximumChunkBytes
-                while offset < stored.byteCount {
-                    try Task.checkCancellation()
-                    let rows = try await connection.query(
-                        """
-                        SELECT substr(blob_payloads.payload, ?, ?) AS chunk
-                        FROM blob_payloads
-                        JOIN blob_namespace_references USING(cid)
-                        WHERE blob_payloads.cid = ?
-                          AND namespace_kind = ? AND space_uri = ?
-                        """,
-                        [
-                            .integer(offset + 1), .integer(chunkSize),
-                            .text(stored.cid), .text(namespaceKind),
-                            .text(spaceURI),
-                        ]
-                    )
-                    guard let row = rows.first else {
-                        throw SwanError.unauthorized(
-                            "blob is not reachable in this namespace"
-                        )
-                    }
-                    let chunk = try requiredBlob(row, "chunk")
-                    guard !chunk.isEmpty,
-                          chunk.count <= min(chunkSize, stored.byteCount - offset) else {
-                        throw SQLiteRepositoryError.corruptDatabase(
-                            "invalid legacy blob chunk"
-                        )
-                    }
-                    digest.update(data: chunk)
-                    try await consume(chunk)
-                    offset += chunk.count
-                }
-                guard Data(digest.finalize()) == expectedDigest else {
-                    throw SQLiteRepositoryError.corruptDatabase(
-                        "legacy blob payload does not match metadata"
-                    )
-                }
+        var offset = 0
+        var digest = SHA256()
+        let chunkSize = SpaceCARBodySpool.maximumChunkBytes
+        while offset < stored.byteCount {
+            try Task.checkCancellation()
+            let rows = try await connection.query(
+                """
+                SELECT substr(blob_payloads.payload, ?, ?) AS chunk
+                FROM blob_payloads
+                JOIN blob_namespace_references USING(cid)
+                WHERE blob_payloads.cid = ?
+                  AND namespace_kind = ? AND space_uri = ?
+                """,
+                [
+                    .integer(offset + 1), .integer(chunkSize),
+                    .text(stored.cid), .text(namespaceKind),
+                    .text(spaceURI),
+                ]
+            )
+            guard let row = rows.first else {
+                throw SwanError.unauthorized(
+                    "blob is not reachable in this namespace"
+                )
             }
+            let chunk = try requiredBlob(row, "chunk")
+            guard !chunk.isEmpty,
+                  chunk.count <= min(chunkSize, stored.byteCount - offset) else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "invalid legacy blob chunk"
+                )
+            }
+            digest.update(data: chunk)
+            try await consume(chunk)
+            offset += chunk.count
+        }
+        guard Data(digest.finalize()) == expectedDigest else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "legacy blob payload does not match metadata"
+            )
         }
     }
 
