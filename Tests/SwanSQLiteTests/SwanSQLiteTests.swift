@@ -4204,6 +4204,81 @@ final class SwanSQLiteTests: XCTestCase {
         let cid = try await database.publicRepositoryRecordCID(for: path)
         XCTAssertEqual(cid, recordCID)
     }
+
+    func testSimpleSpaceMemberPageReadsAtomicSnapshotDuringConcurrentMutation() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close(); try? FileManager.default.removeItem(at: fixture.root) } }
+
+        let space = try SpaceURI(
+            authority: fixture.author,
+            spaceType: "app.bsky.bookmarks",
+            skey: "members-snapshot"
+        )
+        let authority = try DurableSimpleSpaceAuthority(
+            database: database,
+            credentialSecret: Data(repeating: 0xB5, count: 32)
+        )
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        _ = try await authority.create(
+            space: space,
+            owner: fixture.author,
+            configuration: try SimpleSpaceConfiguration(
+                policy: .memberList,
+                appAccess: .open
+            ),
+            authorization: .accountOAuth(subject: fixture.author, scopes: ["atproto"]),
+            now: now
+        )
+
+        let memberAlice = "did:plc:alice00000000000000000001"
+        _ = try await database.addSimpleSpaceMember(
+            space: space,
+            member: memberAlice,
+            authorization: .accountOAuth(subject: fixture.author, scopes: ["atproto"]),
+            now: now.addingTimeInterval(1)
+        )
+
+        // Verify member page on readConnection
+        let page = try await database.simpleSpaceMemberPage(
+            space: space,
+            limit: 100,
+            cursor: nil,
+            authorization: .accountOAuth(subject: fixture.author, scopes: ["atproto"])
+        )
+        XCTAssertEqual(Set(page.members), Set([fixture.author, memberAlice]))
+    }
+
+    func testValidatePortableRestoreStreamingReadsAtomicSnapshot() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close(); try? FileManager.default.removeItem(at: fixture.root) } }
+
+        var ltHash = LtHash()
+        ltHash.add(element: "\(fixture.first.collection)/\(fixture.first.rkey)/\(fixture.firstCID)")
+        let recovery = VerifiedSpaceCARRecovery(
+            wireRevision: try fixture.tid(0),
+            records: [
+                SpaceRecord(
+                    uri: fixture.first,
+                    value: fixture.firstValue,
+                    cid: fixture.firstCID,
+                    revision: 1
+                ),
+            ],
+            ltHash: ltHash.serialized,
+            commitment: ltHash.commitment
+        )
+        let repo = SQLitePortableRestoreRepository(
+            space: fixture.space,
+            author: fixture.author,
+            recovery: recovery
+        )
+        try await database.restorePortableRepositories([repo])
+
+        // Validation succeeds on readConnection
+        try await database.validatePortableRestore(repositories: [repo])
+    }
 }
 
 private extension SwanSQLiteTests {

@@ -2077,8 +2077,24 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     )
                     SQLiteProtectedPaths.closeDirectory(descriptor)
                 }
-                try? await readConnection.close()
-                try await connection.close()
+                var readerError: Error?
+                do {
+                    try await readConnection.close()
+                } catch {
+                    readerError = error
+                }
+                var writerError: Error?
+                do {
+                    try await connection.close()
+                } catch {
+                    writerError = error
+                }
+                if let readerError {
+                    throw readerError
+                }
+                if let writerError {
+                    throw writerError
+                }
             }
         }
     }
@@ -4643,7 +4659,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                                 collection: collection,
                                 rkey: rkey
                             )
-                            let valueRows = try await connection.query(
+                            let valueRows = try await readConnection.query(
                                 """
                                 SELECT value
                                 FROM permissioned_space_records
@@ -4720,7 +4736,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         )
                     }
                 }
-                let closures = try await connection.query(
+                let closures = try await readConnection.query(
                     """
                     SELECT space_uri, author_did, reason
                     FROM permissioned_restored_repository_closures
@@ -4756,7 +4772,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     "permissioned_space_writers",
                     "permissioned_space_notification_registrations",
                 ] {
-                    let unexpected = try await connection.query(
+                    let unexpected = try await readConnection.query(
                         "SELECT 1 FROM \(table) LIMIT 1"
                     )
                     guard unexpected.isEmpty else {
@@ -6464,7 +6480,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     throw AuthorizedSimpleSpaceLifecycleError.notFound
                 }
 
-                let memberCountRows = try await connection.query(
+                let memberCountRows = try await readConnection.query(
                     """
                     SELECT COUNT(*) AS count
                     FROM permissioned_simple_space_members
@@ -6481,7 +6497,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         "simple-space members exceed their bound"
                     )
                 }
-                let ownerRows = try await connection.query(
+                let ownerRows = try await readConnection.query(
                     """
                     SELECT 1
                     FROM permissioned_simple_space_members
@@ -6496,7 +6512,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     )
                 }
 
-                let clientCountRows = try await connection.query(
+                let clientCountRows = try await readConnection.query(
                     """
                     SELECT COUNT(*) AS count
                     FROM permissioned_simple_space_clients
@@ -6520,7 +6536,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         )
                     }
                 }
-                let decisionCountRows = try await connection.query(
+                let decisionCountRows = try await readConnection.query(
                     """
                     SELECT COUNT(*) AS count
                     FROM permissioned_simple_space_managing_app_decisions
@@ -6547,7 +6563,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
                 let memberRows: [SQLiteRow]
                 if let cursor {
-                    memberRows = try await connection.query(
+                    memberRows = try await readConnection.query(
                         """
                         SELECT member_did
                         FROM permissioned_simple_space_members
@@ -6561,7 +6577,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         ]
                     )
                 } else {
-                    memberRows = try await connection.query(
+                    memberRows = try await readConnection.query(
                         """
                         SELECT member_did
                         FROM permissioned_simple_space_members
