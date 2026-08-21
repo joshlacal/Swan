@@ -68,7 +68,7 @@ final class PublicRepositoryImportQueryPlanTests: XCTestCase {
         let plan = try await database.connection.query(
             """
             EXPLAIN QUERY PLAN
-            SELECT r.cid, r.kind, b.bytes
+            SELECT r.cid, r.kind, length(b.bytes) AS byte_count
             FROM public_repository_import_reachable r
             LEFT JOIN public_repository_import_blocks b
               ON b.session_id = r.session_id AND b.cid = r.cid
@@ -85,6 +85,18 @@ final class PublicRepositoryImportQueryPlanTests: XCTestCase {
                 .text(""), .integer(256),
             ]
         )
+
+        let blockPlan = try await database.connection.query(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT cid, bytes
+            FROM public_repository_import_blocks
+            WHERE session_id = ? AND cid IN (?, ?, ?)
+            """,
+            [
+                .text("session"), .text("c1"), .text("c2"), .text("c3")
+            ]
+        )
         let details = plan.compactMap {
             $0.column("detail")?.string?.uppercased()
         }
@@ -95,6 +107,17 @@ final class PublicRepositoryImportQueryPlanTests: XCTestCase {
         XCTAssertTrue(
             details.contains { $0.contains("PUBLIC_REPOSITORY_IMPORT_REACHABLE") || $0.contains("PRIMARY KEY") || $0.contains("INDEX") },
             "reachable projection join pagination must advance through the CID key: \(details)"
+        )
+        let blockDetails = blockPlan.compactMap {
+            $0.column("detail")?.string?.uppercased()
+        }
+        XCTAssertFalse(
+            blockDetails.contains { $0.contains("USE TEMP B-TREE") },
+            "block batch query must not sort: \(blockDetails)"
+        )
+        XCTAssertTrue(
+            blockDetails.contains { $0.contains("PRIMARY KEY") || $0.contains("INDEX") },
+            "block batch query must use primary key index: \(blockDetails)"
         )
     }
 

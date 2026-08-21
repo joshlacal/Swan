@@ -45,6 +45,11 @@ private actor SQLiteStagedCARFrameSink: PublicRepositoryCARFrameSink {
         receivedByteCount: Int,
         frameCount: Int
     ) async throws {
+        if !pendingBlocks.isEmpty &&
+            (pendingBlocks.count >= maxBatchBlocks || pendingBytes + block.bytes.count > maxBatchBytes) {
+            try await flush()
+        }
+
         pendingBlocks.append(block)
         pendingBytes += block.bytes.count
         lastReceivedByteCount = receivedByteCount
@@ -1342,7 +1347,7 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                     if let lastCID {
                         rows = try await connection.query(
                             """
-                            SELECT r.cid, r.kind, b.bytes
+                            SELECT r.cid, r.kind, length(b.bytes) AS byte_count
                             FROM public_repository_import_reachable r
                             LEFT JOIN public_repository_import_blocks b
                               ON b.session_id = r.session_id AND b.cid = r.cid
@@ -1362,7 +1367,7 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                     } else {
                         rows = try await connection.query(
                             """
-                            SELECT r.cid, r.kind, b.bytes
+                            SELECT r.cid, r.kind, length(b.bytes) AS byte_count
                             FROM public_repository_import_reachable r
                             LEFT JOIN public_repository_import_blocks b
                               ON b.session_id = r.session_id AND b.cid = r.cid
@@ -1420,6 +1425,10 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                     }
                 }
                 if rows.isEmpty { break }
+                var pageCIDsToValidate: [(cid: CID, byteCount: Int)] = []
+                if validateBlocks {
+                    pageCIDsToValidate.reserveCapacity(rows.count)
+                }
                 for row in rows {
                     let kind = requiredText(row, "kind")
                     guard kind == expectedKind else {
@@ -1444,14 +1453,61 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                     digest.append(cidString)
 
                     if validateBlocks {
-                        guard let bodyValue = row.column("bytes"),
-                              let body = Data(sqliteData: bodyValue) else {
+                        guard let byteCount = row.column("byte_count")?.integer,
+                              byteCount > 0 else {
                             throw PublicRepositoryImportStagingError.corruptStaging
                         }
-                        do {
-                            try PublicRepositoryCID.validate(cid, blockBytes: body)
-                        } catch {
-                            throw PublicRepositoryImportStagingError.corruptStaging
+                        pageCIDsToValidate.append((cid: cid, byteCount: byteCount))
+                    }
+                }
+
+                if validateBlocks, !pageCIDsToValidate.isEmpty {
+                    let maxValidationBatchBytes = 2 * 1024 * 1024
+                    var sliceStart = 0
+                    while sliceStart < pageCIDsToValidate.count {
+                        var sliceEnd = sliceStart
+                        var sliceBytes = 0
+                        while sliceEnd < pageCIDsToValidate.count {
+                            let nextBytes = pageCIDsToValidate[sliceEnd].byteCount
+                            if sliceEnd > sliceStart && sliceBytes + nextBytes > maxValidationBatchBytes {
+                                break
+                            }
+                            sliceBytes += nextBytes
+                            sliceEnd += 1
+                        }
+                        let slice = pageCIDsToValidate[sliceStart ..< sliceEnd]
+                        sliceStart = sliceEnd
+
+                        let placeholders = Array(repeating: "?", count: slice.count).joined(separator: ", ")
+                        var params: [SQLiteData] = [.text(sessionID)]
+                        params.append(contentsOf: slice.map { .text($0.cid.string) })
+                        let blockRows = try await connection.query(
+                            """
+                            SELECT cid, bytes
+                            FROM public_repository_import_blocks
+                            WHERE session_id = ? AND cid IN (\(placeholders))
+                            """,
+                            params
+                        )
+                        var blockMap: [String: Data] = [:]
+                        blockMap.reserveCapacity(blockRows.count)
+                        for blockRow in blockRows {
+                            guard let cidText = blockRow.column("cid")?.string,
+                                  let value = blockRow.column("bytes"),
+                                  let bytes = Data(sqliteData: value) else {
+                                throw PublicRepositoryImportStagingError.corruptStaging
+                            }
+                            blockMap[cidText] = bytes
+                        }
+                        for item in slice {
+                            guard let body = blockMap[item.cid.string] else {
+                                throw PublicRepositoryImportStagingError.corruptStaging
+                            }
+                            do {
+                                try PublicRepositoryCID.validate(item.cid, blockBytes: body)
+                            } catch {
+                                throw PublicRepositoryImportStagingError.corruptStaging
+                            }
                         }
                     }
                 }
