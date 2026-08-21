@@ -566,6 +566,13 @@ final class PublicRelayVerifierTests: XCTestCase {
       expected: .init(did: did, revision: "3jzfcijpj2z2b", commitCID: commit.commitCID, dataCID: mat.rootCID),
       verifier: verifier
     )
+    if state.snapshot.mstDigest != fullVerified.snapshot.mstDigest {
+      print("DEBUG relay mstDigest: \(state.snapshot.mstDigest), swan mstDigest: \(fullVerified.snapshot.mstDigest)")
+      print("DEBUG relay records: \(state.snapshot.records)")
+      print("DEBUG swan records: \(fullVerified.snapshot.records)")
+      print("DEBUG relay dataCID: \(state.snapshot.dataCID), swan dataCID: \(fullVerified.snapshot.dataCID)")
+    }
+    XCTAssertEqual(state.snapshot.mstDigest, fullVerified.snapshot.mstDigest)
     XCTAssertNoThrow(try RelayFinalStateVerifier.verify(relay: state.snapshot, swan: fullVerified.snapshot))
 
     // Commit 2: Update A, Create C
@@ -790,6 +797,191 @@ final class PublicRelayVerifierTests: XCTestCase {
       await assertAsyncError(.invalidRepositoryCAR) {
         _ = try await initial.applying(commit: missingMSTEvent, verifier: verifier)
       }
+    }
+  }
+  func testIncrementalCommitAcceptsReusedRecordBlockOmittedFromDiff() async throws {
+    let key = try P256.Signing.PrivateKey(rawRepresentation: Data(repeating: 1, count: 32))
+    let verifier = P256PublicRepositoryCommitVerifier(publicKey: key.publicKey)
+    let genesis = try PublicRepositoryGenesisCodec.create(
+      did: did,
+      revision: rev0,
+      signingKey: key
+    )
+    var state = try await RelayRepositoryVerificationState.fullSnapshot(
+      car: genesis.car,
+      expected: .init(did: did, revision: rev0, commitCID: genesis.commitCID, dataCID: genesis.emptyMSTCID),
+      verifier: verifier,
+      maximumCARBytes: genesis.car.count
+    )
+
+    let pathA = try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "a")
+    let pathB = try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "b")
+    let recordA = try PublicRepositoryRecordCodec.prepare(
+      PublicRecord(["$type": .string(pathA.collection), "text": .string("shared")]),
+      for: pathA
+    )
+
+    // Commit 1: Create pathA with recordA
+    var tree = try await RepositoryMST.empty().adding(path: pathA, recordCID: recordA.cid)
+    var mat = try await tree.materialized()
+    var commit = try await PublicRepositoryCommitCodec.prepare(
+      did: did,
+      revision: "3jzfcijpj2z2b",
+      dataCID: mat.rootCID,
+      currentRevision: rev0,
+      signer: P256PublicRepositoryCommitSigner(privateKey: key)
+    )
+    var diffBlocks = [PublicRepositoryBlock(cid: commit.commitCID, bytes: commit.signedCommitBytes)]
+    for cid in mat.newBlocks.cids {
+      let blockBytes = try await mat.newBlocks.block(for: cid)
+      diffBlocks.append(.init(cid: cid, bytes: try XCTUnwrap(blockBytes)))
+    }
+    diffBlocks.append(.init(cid: recordA.cid, bytes: recordA.bytes))
+    var sink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(diffBlocks), to: sink)
+    var event = RelayCommitEvent(
+      seq: 4, repo: did, commitCID: commit.commitCID, rev: "3jzfcijpj2z2b", since: rev0,
+      blocks: await sink.data,
+      ops: [.init(action: .create, path: pathA.mstKey, cid: recordA.cid, prev: nil)],
+      prevDataCID: genesis.emptyMSTCID, time: time
+    )
+    state = try await state.applying(commit: event, verifier: verifier)
+    XCTAssertEqual(state.snapshot.records, [pathA.mstKey: recordA.cid])
+
+    // Commit 2: Create pathB pointing to same recordA.cid, but OMITS recordA.bytes from diffBlocks!
+    let prevDataCID1 = mat.rootCID
+    tree = try await tree.adding(path: pathB, recordCID: recordA.cid)
+    mat = try await tree.materialized()
+    commit = try await PublicRepositoryCommitCodec.prepare(
+      did: did,
+      revision: "3jzfcijpj2z2c",
+      dataCID: mat.rootCID,
+      currentRevision: "3jzfcijpj2z2b",
+      signer: P256PublicRepositoryCommitSigner(privateKey: key)
+    )
+    diffBlocks = [PublicRepositoryBlock(cid: commit.commitCID, bytes: commit.signedCommitBytes)]
+    for cid in mat.newBlocks.cids {
+      let blockBytes = try await mat.newBlocks.block(for: cid)
+      diffBlocks.append(.init(cid: cid, bytes: try XCTUnwrap(blockBytes)))
+    }
+    // NOTE: recordA.bytes is NOT in diffBlocks! It is reused from previous state.
+    sink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(diffBlocks), to: sink)
+    event = RelayCommitEvent(
+      seq: 5, repo: did, commitCID: commit.commitCID, rev: "3jzfcijpj2z2c", since: "3jzfcijpj2z2b",
+      blocks: await sink.data,
+      ops: [.init(action: .create, path: pathB.mstKey, cid: recordA.cid, prev: nil)],
+      prevDataCID: prevDataCID1, time: time
+    )
+    state = try await state.applying(commit: event, verifier: verifier)
+    XCTAssertEqual(state.snapshot.records, [
+      pathA.mstKey: recordA.cid,
+      pathB.mstKey: recordA.cid,
+    ])
+  }
+
+  func testIncrementalCommitRejectionParityWithUntouchedInvalidGlobalState() async throws {
+    let key = try P256.Signing.PrivateKey(rawRepresentation: Data(repeating: 1, count: 32))
+    let verifier = P256PublicRepositoryCommitVerifier(publicKey: key.publicKey)
+    let genesis = try PublicRepositoryGenesisCodec.create(
+      did: did,
+      revision: rev0,
+      signingKey: key
+    )
+    let initial = try await RelayRepositoryVerificationState.fullSnapshot(
+      car: genesis.car,
+      expected: .init(did: did, revision: rev0, commitCID: genesis.commitCID, dataCID: genesis.emptyMSTCID),
+      verifier: verifier,
+      maximumCARBytes: genesis.car.count
+    )
+
+    let pathA = try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "a")
+    let pathB = try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "b")
+    let recordA = try PublicRepositoryRecordCodec.prepare(
+      PublicRecord(["$type": .string(pathA.collection), "text": .string("a")]),
+      for: pathA
+    )
+    let recordB = try PublicRepositoryRecordCodec.prepare(
+      PublicRecord(["$type": .string(pathB.collection), "text": .string("b")]),
+      for: pathB
+    )
+
+    // Create a valid 1-record commit state
+    let tree = try await RepositoryMST.empty().adding(path: pathA, recordCID: recordA.cid)
+    let mat = try await tree.materialized()
+    let commit = try await PublicRepositoryCommitCodec.prepare(
+      did: did,
+      revision: "3jzfcijpj2z2b",
+      dataCID: mat.rootCID,
+      currentRevision: rev0,
+      signer: P256PublicRepositoryCommitSigner(privateKey: key)
+    )
+    var diffBlocks = [PublicRepositoryBlock(cid: commit.commitCID, bytes: commit.signedCommitBytes)]
+    for cid in mat.newBlocks.cids {
+      let blockBytes = try await mat.newBlocks.block(for: cid)
+      diffBlocks.append(.init(cid: cid, bytes: try XCTUnwrap(blockBytes)))
+    }
+    diffBlocks.append(.init(cid: recordA.cid, bytes: recordA.bytes))
+    let sink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(diffBlocks), to: sink)
+    let event = RelayCommitEvent(
+      seq: 4, repo: did, commitCID: commit.commitCID, rev: "3jzfcijpj2z2b", since: rev0,
+      blocks: await sink.data,
+      ops: [.init(action: .create, path: pathA.mstKey, cid: recordA.cid, prev: nil)],
+      prevDataCID: genesis.emptyMSTCID, time: time
+    )
+    let state = try await initial.applying(commit: event, verifier: verifier)
+
+    // 1. Rejection parity on Delta Agreement against prior untouched state:
+    // Attempt to create pathA again (which already exists in prior untouched state)
+    let dupTree = try await tree.adding(path: pathB, recordCID: recordB.cid)
+    let dupMat = try await dupTree.materialized()
+    let dupCommit = try await PublicRepositoryCommitCodec.prepare(
+      did: did, revision: "3jzfcijpj2z2c", dataCID: dupMat.rootCID, currentRevision: "3jzfcijpj2z2b",
+      signer: P256PublicRepositoryCommitSigner(privateKey: key)
+    )
+    var dupBlocks = [PublicRepositoryBlock(cid: dupCommit.commitCID, bytes: dupCommit.signedCommitBytes)]
+    for cid in dupMat.newBlocks.cids {
+      let blockBytes = try await dupMat.newBlocks.block(for: cid)
+      dupBlocks.append(.init(cid: cid, bytes: try XCTUnwrap(blockBytes)))
+    }
+    dupBlocks.append(.init(cid: recordB.cid, bytes: recordB.bytes))
+    let dupSink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: dupCommit.commitCID, blocks: TestCARBlockStream(dupBlocks), to: dupSink)
+
+    // Claiming create on existing pathA
+    let dupEvent = RelayCommitEvent(
+      seq: 5, repo: did, commitCID: dupCommit.commitCID, rev: "3jzfcijpj2z2c", since: "3jzfcijpj2z2b",
+      blocks: await dupSink.data,
+      ops: [.init(action: .create, path: pathA.mstKey, cid: recordA.cid, prev: nil)],
+      prevDataCID: mat.rootCID, time: time
+    )
+    await assertAsyncError(.repositoryDeltaMismatch) {
+      _ = try await state.applying(commit: dupEvent, verifier: verifier)
+    }
+
+    // 2. Rejection parity on Subtree Boundary:
+    // A malicious commit whose signed rootCID attempts a forged boundary splicing
+    let forgedSubtreeCommit = try await PublicRepositoryCommitCodec.prepare(
+      did: did, revision: "3jzfcijpj2z2c", dataCID: genesis.emptyMSTCID, currentRevision: "3jzfcijpj2z2b",
+      signer: P256PublicRepositoryCommitSigner(privateKey: key)
+    )
+    var forgedSubtreeBlocks = [PublicRepositoryBlock(cid: forgedSubtreeCommit.commitCID, bytes: forgedSubtreeCommit.signedCommitBytes)]
+    for cid in dupMat.newBlocks.cids {
+      let blockBytes = try await dupMat.newBlocks.block(for: cid)
+      forgedSubtreeBlocks.append(.init(cid: cid, bytes: try XCTUnwrap(blockBytes)))
+    }
+    forgedSubtreeBlocks.append(.init(cid: recordB.cid, bytes: recordB.bytes))
+    let forgedSink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: forgedSubtreeCommit.commitCID, blocks: TestCARBlockStream(forgedSubtreeBlocks), to: forgedSink)
+    let forgedEvent = RelayCommitEvent(
+      seq: 5, repo: did, commitCID: forgedSubtreeCommit.commitCID, rev: "3jzfcijpj2z2c", since: "3jzfcijpj2z2b",
+      blocks: await forgedSink.data,
+      ops: [.init(action: .create, path: pathB.mstKey, cid: recordB.cid, prev: nil)],
+      prevDataCID: mat.rootCID, time: time
+    )
+    await assertAsyncError(.finalDataCIDMismatch) {
+      _ = try await state.applying(commit: forgedEvent, verifier: verifier)
     }
   }
 
