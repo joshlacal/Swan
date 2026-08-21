@@ -952,6 +952,8 @@ public enum SQLiteLayout {
             wire_revision TEXT NOT NULL,
             lthash BLOB NOT NULL CHECK(length(lthash) = 2048),
             current_commit BLOB NOT NULL,
+            oplog_entry_count INTEGER NOT NULL DEFAULT 0 CHECK(oplog_entry_count >= 0),
+            request_entry_count INTEGER NOT NULL DEFAULT 0 CHECK(request_entry_count >= 0),
             PRIMARY KEY(space_uri, author_did)
         )
         """,
@@ -1748,6 +1750,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let publicFirehoseCompletionAnchorMigrationVersion = 14
     private static let stagedBlobNamespaceMigrationVersion = 15
     private static let permissionedRequestReceiptRetentionMigrationVersion = 16
+    private static let permissionedOplogRetentionCutoffMigrationVersion = 17
 
     /// How long an uploaded blob no commit has claimed stays staged.
     ///
@@ -2211,6 +2214,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePublicFirehoseOutboxIfNeeded()
             try await migratePublicFirehoseCompletionAnchorsIfNeeded()
             try await migratePermissionedRequestReceiptRetentionIfNeeded()
+            try await migratePermissionedOplogRetentionCutoffIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -2728,6 +2732,49 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             ]
         )
     }
+    private func migratePermissionedOplogRetentionCutoffIfNeeded() async throws {
+        let version = Self.permissionedOplogRetentionCutoffMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        try await addAccountColumnIfMissing(
+            table: "permissioned_repository_state",
+            column: "oplog_entry_count",
+            definition: "INTEGER NOT NULL DEFAULT 0 CHECK(oplog_entry_count >= 0)"
+        )
+        try await addAccountColumnIfMissing(
+            table: "permissioned_repository_state",
+            column: "request_entry_count",
+            definition: "INTEGER NOT NULL DEFAULT 0 CHECK(request_entry_count >= 0)"
+        )
+        _ = try await connection.query(
+            """
+            UPDATE permissioned_repository_state AS s
+            SET oplog_entry_count = (
+                SELECT COUNT(*) FROM permissioned_space_oplog AS o
+                WHERE o.space_uri = s.space_uri AND o.author_did = s.author_did
+            ),
+            request_entry_count = (
+                SELECT COUNT(*) FROM permissioned_space_requests AS r
+                WHERE r.space_uri = s.space_uri AND r.author_did = s.author_did
+            )
+            """
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
 
     /// Upgrades rows written before the persistence API owned its state marker
     /// and outbox-body construction. The sentinel is committed with the row
@@ -3801,8 +3848,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 throw SQLiteRepositoryError.duplicateRequest(requestID)
             }
 
-            let current = try await loadState(space: space, author: author)
+            let loaded = try await loadStateWithCounts(space: space, author: author)
+            let current = loaded?.state
             let actualRevision = current?.revision ?? 0
+            var newOplogCount = (loaded?.oplogEntryCount ?? 0) + writes.count
+            var newRequestCount = (loaded?.requestEntryCount ?? 0) + 1
             guard expectedRevision == actualRevision else {
                 throw SwanError.conflict(
                     expected: expectedRevision,
@@ -3944,25 +3994,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 wireRevision: wireRevision,
                 commitment: ltHash.commitment
             )
-            _ = try await connection.query(
-                """
-                INSERT INTO permissioned_repository_state(
-                    space_uri, author_did, revision, wire_revision,
-                    lthash, current_commit
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(space_uri, author_did) DO UPDATE SET
-                    revision = excluded.revision,
-                    wire_revision = excluded.wire_revision,
-                    lthash = excluded.lthash,
-                    current_commit = excluded.current_commit
-                """,
-                [
-                    .text(space.rawValue), .text(author),
-                    .integer(storedFinalRevision),
-                    .text(wireRevision.toString()), blob(ltHash.serialized),
-                    blob(marker),
-                ]
-            )
 
             let createdAt = Int(Date().timeIntervalSince1970 * 1_000_000)
             _ = try await connection.query(
@@ -3999,34 +4030,44 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
             try await testingHooks.beforeApplyCommit?()
 
-            let cutoffRows = try await connection.query(
-                """
-                SELECT revision
-                FROM permissioned_space_oplog
-                WHERE space_uri = ? AND author_did = ?
-                ORDER BY revision DESC, operation_index DESC
-                LIMIT 1 OFFSET ?
-                """,
-                [
-                    .text(space.rawValue), .text(author),
-                    .integer(oplogRetention - 1),
-                ]
-            )
-            if let cutoffRow = cutoffRows.first {
-                let oldestRetainedRevision = try requiredRevision(
-                    cutoffRow,
-                    "revision"
-                )
-                _ = try await connection.query(
+            if newOplogCount > oplogRetention {
+                let excess = newOplogCount - oplogRetention
+                let cutoffRows = try await connection.query(
                     """
-                    DELETE FROM permissioned_space_oplog
-                    WHERE space_uri = ? AND author_did = ? AND revision < ?
+                    SELECT revision
+                    FROM permissioned_space_oplog
+                    WHERE space_uri = ? AND author_did = ?
+                    ORDER BY revision ASC, operation_index ASC
+                    LIMIT 1 OFFSET ?
                     """,
                     [
                         .text(space.rawValue), .text(author),
-                        .integer(try sqliteRevision(oldestRetainedRevision)),
+                        .integer(excess),
                     ]
                 )
+                if let cutoffRow = cutoffRows.first {
+                    let oldestRetainedRevision = try requiredRevision(
+                        cutoffRow,
+                        "revision"
+                    )
+                    _ = try await connection.query(
+                        """
+                        DELETE FROM permissioned_space_oplog
+                        WHERE space_uri = ? AND author_did = ? AND revision < ?
+                        """,
+                        [
+                            .text(space.rawValue), .text(author),
+                            .integer(try sqliteRevision(oldestRetainedRevision)),
+                        ]
+                    )
+                    let deletedRows = try await connection.query(
+                        "SELECT changes() AS count"
+                    )
+                    if let first = deletedRows.first {
+                        let deletedCount = try requiredNonnegativeInteger(first, "count")
+                        newOplogCount = max(0, newOplogCount - deletedCount)
+                    }
+                }
             }
 
             // The receipt ledger is a replay reservation, not the state guard:
@@ -4036,44 +4077,77 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             // than by age, so one retention knob governs both and neither
             // outlives the other. `created_at` orders the window; the final
             // revision breaks ties and orders unstamped pre-upgrade rows.
-            let receiptCutoffRows = try await connection.query(
-                """
-                SELECT created_at, final_revision
-                FROM permissioned_space_requests
-                WHERE space_uri = ? AND author_did = ?
-                ORDER BY created_at DESC, final_revision DESC
-                LIMIT 1 OFFSET ?
-                """,
-                [
-                    .text(space.rawValue), .text(author),
-                    .integer(oplogRetention - 1),
-                ]
-            )
-            if let receiptCutoffRow = receiptCutoffRows.first {
-                let oldestRetainedStamp = try requiredNonnegativeInteger(
-                    receiptCutoffRow,
-                    "created_at"
-                )
-                let oldestRetainedReceipt = try requiredRevision(
-                    receiptCutoffRow,
-                    "final_revision"
-                )
-                _ = try await connection.query(
+            if newRequestCount > oplogRetention {
+                let excessRequests = newRequestCount - oplogRetention
+                let receiptCutoffRows = try await connection.query(
                     """
-                    DELETE FROM permissioned_space_requests
+                    SELECT created_at, final_revision
+                    FROM permissioned_space_requests
                     WHERE space_uri = ? AND author_did = ?
-                      AND (created_at < ?
-                           OR (created_at = ? AND final_revision < ?))
+                    ORDER BY created_at ASC, final_revision ASC
+                    LIMIT 1 OFFSET ?
                     """,
                     [
                         .text(space.rawValue), .text(author),
-                        .integer(oldestRetainedStamp),
-                        .integer(oldestRetainedStamp),
-                        .integer(try sqliteRevision(oldestRetainedReceipt)),
+                        .integer(excessRequests),
                     ]
                 )
+                if let receiptCutoffRow = receiptCutoffRows.first {
+                    let oldestRetainedStamp = try requiredNonnegativeInteger(
+                        receiptCutoffRow,
+                        "created_at"
+                    )
+                    let oldestRetainedReceipt = try requiredRevision(
+                        receiptCutoffRow,
+                        "final_revision"
+                    )
+                    _ = try await connection.query(
+                        """
+                        DELETE FROM permissioned_space_requests
+                        WHERE space_uri = ? AND author_did = ?
+                          AND (created_at < ?
+                               OR (created_at = ? AND final_revision < ?))
+                        """,
+                        [
+                            .text(space.rawValue), .text(author),
+                            .integer(oldestRetainedStamp),
+                            .integer(oldestRetainedStamp),
+                            .integer(try sqliteRevision(oldestRetainedReceipt)),
+                        ]
+                    )
+                    let deletedRows = try await connection.query(
+                        "SELECT changes() AS count"
+                    )
+                    if let first = deletedRows.first {
+                        let deletedCount = try requiredNonnegativeInteger(first, "count")
+                        newRequestCount = max(0, newRequestCount - deletedCount)
+                    }
+                }
             }
 
+            _ = try await connection.query(
+                """
+                INSERT INTO permissioned_repository_state(
+                    space_uri, author_did, revision, wire_revision,
+                    lthash, current_commit, oplog_entry_count, request_entry_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(space_uri, author_did) DO UPDATE SET
+                    revision = excluded.revision,
+                    wire_revision = excluded.wire_revision,
+                    lthash = excluded.lthash,
+                    current_commit = excluded.current_commit,
+                    oplog_entry_count = excluded.oplog_entry_count,
+                    request_entry_count = excluded.request_entry_count
+                """,
+                [
+                    .text(space.rawValue), .text(author),
+                    .integer(storedFinalRevision),
+                    .text(wireRevision.toString()), blob(ltHash.serialized),
+                    blob(marker),
+                    .integer(newOplogCount),
+                    .integer(newRequestCount),
+                ]
+            )
             let state = PersistedRepositoryState(
                 space: space,
                 author: author,
@@ -10020,15 +10094,16 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    private func loadState(
+    private func loadStateWithCounts(
         space: SpaceURI,
         author: String,
         connection: SQLiteConnection? = nil
-    ) async throws -> PersistedRepositoryState? {
+    ) async throws -> (state: PersistedRepositoryState, oplogEntryCount: Int, requestEntryCount: Int)? {
         let conn = connection ?? self.connection
         let rows = try await conn.query(
             """
-            SELECT revision, wire_revision, lthash, current_commit
+            SELECT revision, wire_revision, lthash, current_commit,
+                   oplog_entry_count, request_entry_count
             FROM permissioned_repository_state
             WHERE space_uri = ? AND author_did = ?
             """,
@@ -10056,7 +10131,27 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 "invalid deterministic repository state marker"
             )
         }
-        return PersistedRepositoryState(
+        var oplogCount = (try? requiredNonnegativeInteger(row, "oplog_entry_count")) ?? 0
+        var requestCount = (try? requiredNonnegativeInteger(row, "request_entry_count")) ?? 0
+        if oplogCount == 0, revision > 0 {
+            let countRows = try await conn.query(
+                "SELECT COUNT(*) AS count FROM permissioned_space_oplog WHERE space_uri = ? AND author_did = ?",
+                [.text(space.rawValue), .text(author)]
+            )
+            if let first = countRows.first {
+                oplogCount = (try? requiredNonnegativeInteger(first, "count")) ?? 0
+            }
+        }
+        if requestCount == 0, revision > 0 {
+            let countRows = try await conn.query(
+                "SELECT COUNT(*) AS count FROM permissioned_space_requests WHERE space_uri = ? AND author_did = ?",
+                [.text(space.rawValue), .text(author)]
+            )
+            if let first = countRows.first {
+                requestCount = (try? requiredNonnegativeInteger(first, "count")) ?? 0
+            }
+        }
+        let state = PersistedRepositoryState(
             space: space,
             author: author,
             revision: revision,
@@ -10064,6 +10159,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             ltHash: ltHash,
             commit: marker
         )
+        return (state, oplogCount, requestCount)
+    }
+
+    private func loadState(
+        space: SpaceURI,
+        author: String,
+        connection: SQLiteConnection? = nil
+    ) async throws -> PersistedRepositoryState? {
+        try await loadStateWithCounts(space: space, author: author, connection: connection)?.state
     }
 
     private func loadRecord(
