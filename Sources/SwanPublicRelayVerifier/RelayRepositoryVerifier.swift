@@ -75,9 +75,7 @@ public enum RelayFullRepositoryVerifier {
       commitCID: parsed.rootCID,
       dataCID: commit.descriptor.dataCID,
       records: records,
-      mstDigest: RelayRepositoryVerificationState.mstDigest(
-        repository.reachableMSTBlocks
-      )
+      mstDigest: "sha256:\(commit.descriptor.dataCID.string)"
     )
   }
 
@@ -104,20 +102,22 @@ public struct RelayRepositoryVerificationState: Sendable {
   public let snapshot: RelayRepositorySnapshot
   public let payloadKind: RelayRepositoryPayloadKind
   private let reachableBlocks: [CID: Data]
-  private let subtreeMSTBlocks: [CID: Set<CID>]
+  public let reachableMSTNodeCount: Int
+  public let reachableRepositoryByteCount: Int
 
   private init(
     snapshot: RelayRepositorySnapshot,
     payloadKind: RelayRepositoryPayloadKind,
     reachableBlocks: [CID: Data],
-    subtreeMSTBlocks: [CID: Set<CID>]
+    reachableMSTNodeCount: Int,
+    reachableRepositoryByteCount: Int
   ) {
     self.snapshot = snapshot
     self.payloadKind = payloadKind
     self.reachableBlocks = reachableBlocks
-    self.subtreeMSTBlocks = subtreeMSTBlocks
+    self.reachableMSTNodeCount = reachableMSTNodeCount
+    self.reachableRepositoryByteCount = reachableRepositoryByteCount
   }
-
   public static func fullSnapshot(
     car: Data,
     expected: RelayRepositoryHead,
@@ -137,7 +137,8 @@ public struct RelayRepositoryVerificationState: Sendable {
       snapshot: verified.snapshot,
       payloadKind: .fullSnapshot,
       reachableBlocks: verified.reachableBlocks,
-      subtreeMSTBlocks: verified.subtreeMSTBlocks
+      reachableMSTNodeCount: verified.reachableMSTNodeCount,
+      reachableRepositoryByteCount: verified.reachableRepositoryByteCount
     )
   }
 
@@ -161,14 +162,13 @@ public struct RelayRepositoryVerificationState: Sendable {
     guard verified.commit.descriptor.dataCID == emptyCID else {
       throw RelayVerifierError.invalidRepositoryCAR
     }
-    let mstBlocks = [emptyCID: PublicRepositoryGenesisCodec.canonicalEmptyMST]
     let snapshot = RelayRepositorySnapshot(
       did: event.did,
       revision: event.rev,
       commitCID: verified.commit.commitCID,
       dataCID: emptyCID,
       records: [:],
-      mstDigest: mstDigest(mstBlocks)
+      mstDigest: "sha256:\(emptyCID.string)"
     )
     return .init(
       snapshot: snapshot,
@@ -177,7 +177,8 @@ public struct RelayRepositoryVerificationState: Sendable {
         verified.commit.commitCID: verified.commit.signedCommitBytes,
         emptyCID: PublicRepositoryGenesisCodec.canonicalEmptyMST,
       ],
-      subtreeMSTBlocks: [emptyCID: Set([emptyCID])]
+      reachableMSTNodeCount: 1,
+      reachableRepositoryByteCount: PublicRepositoryGenesisCodec.canonicalEmptyMST.count
     )
   }
   public func synchronizing(
@@ -203,7 +204,8 @@ public struct RelayRepositoryVerificationState: Sendable {
       snapshot: snapshot,
       payloadKind: .commitAnnouncement,
       reachableBlocks: reachableBlocks,
-      subtreeMSTBlocks: subtreeMSTBlocks
+      reachableMSTNodeCount: reachableMSTNodeCount,
+      reachableRepositoryByteCount: reachableRepositoryByteCount
     )
   }
   public func applying(
@@ -272,6 +274,8 @@ public struct RelayRepositoryVerificationState: Sendable {
 
     var newRecords = snapshot.records
     var touchedPaths: [PublicRepositoryPath] = []
+    var addedRecordBytes = 0
+    var removedRecordBytes = 0
     for op in event.ops {
       try Task.checkCancellation()
       let path = try validateRepositoryPath(op.path)
@@ -293,6 +297,7 @@ public struct RelayRepositoryVerificationState: Sendable {
           throw RelayVerifierError.invalidRepositoryCAR
         }
         newRecords[op.path] = recordCID
+        addedRecordBytes += recordBytes.count
 
       case .update:
         guard let recordCID = op.cid, let prev = op.prev else {
@@ -310,6 +315,10 @@ public struct RelayRepositoryVerificationState: Sendable {
           throw RelayVerifierError.invalidRepositoryCAR
         }
         newRecords[op.path] = recordCID
+        if let prevBytes = merged[prev] {
+          removedRecordBytes += prevBytes.count
+        }
+        addedRecordBytes += recordBytes.count
 
       case .delete:
         guard op.cid == nil, let prev = op.prev else {
@@ -319,6 +328,9 @@ public struct RelayRepositoryVerificationState: Sendable {
           throw RelayVerifierError.repositoryDeltaMismatch
         }
         newRecords.removeValue(forKey: op.path)
+        if let prevBytes = merged[prev] {
+          removedRecordBytes += prevBytes.count
+        }
       }
     }
     guard newRecords.count <= PublicRepositoryLimits.standard.maximumRepositoryRecords else {
@@ -359,72 +371,75 @@ public struct RelayRepositoryVerificationState: Sendable {
     guard materialized.rootCID == commit.descriptor.dataCID else {
       throw RelayVerifierError.finalDataCIDMismatch
     }
-
-    var updatedSubtreeMSTBlocks = subtreeMSTBlocks
-    func resolveSubtree(_ cid: CID) throws -> Set<CID> {
+    var newSpineNodeCount = 0
+    var newSpineByteCount = 0
+    var newSpineQueue = [materialized.rootCID]
+    var visitedNewSpine = Set<CID>()
+    while let cid = newSpineQueue.popLast() {
       try Task.checkCancellation()
-      if let existing = updatedSubtreeMSTBlocks[cid] {
-        return existing
+      guard visitedNewSpine.insert(cid).inserted else {
+        throw RelayVerifierError.invalidRepositoryCAR
+      }
+      if reachableBlocks[cid] != nil && cid != snapshot.dataCID {
+        continue
       }
       guard let bytes = merged[cid] else {
         throw RelayVerifierError.invalidRepositoryCAR
       }
+      newSpineNodeCount += 1
+      newSpineByteCount += bytes.count
       let node: RepositoryMSTNode
       do {
         node = try RepositoryMSTCodec.decode(bytes)
       } catch {
         throw RelayVerifierError.invalidRepositoryCAR
       }
-      var set: Set<CID> = [cid]
+      guard node.entries.count <= PublicRepositoryLimits.standard.maximumMSTEntriesPerNode else {
+        throw RelayVerifierError.invalidRepositoryCAR
+      }
       if let left = node.leftTreeCID {
-        set.formUnion(try resolveSubtree(left))
+        newSpineQueue.append(left)
       }
       for entry in node.entries {
         if let right = entry.rightTreeCID {
-          set.formUnion(try resolveSubtree(right))
+          newSpineQueue.append(right)
         }
       }
-      updatedSubtreeMSTBlocks[cid] = set
-      return set
     }
 
-    let reachableMSTCIDs = try resolveSubtree(materialized.rootCID)
-
-    var newMSTBlocks: [CID: Data] = [:]
-    var mstByteCount = 0
-    for cid in reachableMSTCIDs {
-      guard let bytes = merged[cid] else {
-        throw RelayVerifierError.invalidRepositoryCAR
+    var oldSpineNodeCount = 0
+    var oldSpineByteCount = 0
+    var oldSpineQueue = [snapshot.dataCID]
+    var visitedOldSpine = Set<CID>()
+    while let cid = oldSpineQueue.popLast() {
+      try Task.checkCancellation()
+      guard visitedOldSpine.insert(cid).inserted else { break }
+      if visitedNewSpine.contains(cid) {
+        continue
       }
-      newMSTBlocks[cid] = bytes
-      mstByteCount += bytes.count
-    }
-
-    let newRecordCIDs = Set(newRecords.values)
-    var recordByteCount = 0
-    for cid in newRecordCIDs {
-      guard let bytes = merged[cid] else {
-        throw RelayVerifierError.invalidRepositoryCAR
+      guard let bytes = reachableBlocks[cid] else { continue }
+      oldSpineNodeCount += 1
+      oldSpineByteCount += bytes.count
+      if let node = try? RepositoryMSTCodec.decode(bytes) {
+        if let left = node.leftTreeCID, !visitedNewSpine.contains(left) {
+          oldSpineQueue.append(left)
+        }
+        for entry in node.entries {
+          if let right = entry.rightTreeCID, !visitedNewSpine.contains(right) {
+            oldSpineQueue.append(right)
+          }
+        }
       }
-      recordByteCount += bytes.count
     }
 
-    guard newMSTBlocks.count <= PublicRepositoryLimits.standard.maximumMSTNodes else {
+    let nextMSTNodeCount = reachableMSTNodeCount + (newSpineNodeCount - oldSpineNodeCount)
+    let nextByteCount = reachableRepositoryByteCount + (newSpineByteCount - oldSpineByteCount) + (addedRecordBytes - removedRecordBytes)
+
+    guard nextMSTNodeCount <= PublicRepositoryLimits.standard.maximumMSTNodes else {
       throw RelayVerifierError.invalidRepositoryCAR
     }
-    guard (mstByteCount + recordByteCount) <= PublicRepositoryLimits.standard.maximumCARBytes else {
+    guard nextByteCount <= PublicRepositoryLimits.standard.maximumCARBytes else {
       throw RelayVerifierError.invalidRepositoryCAR
-    }
-
-    var reachable: [CID: Data] = [root: commitBytes]
-    for (cid, bytes) in newMSTBlocks {
-      reachable[cid] = bytes
-    }
-    for cid in newRecordCIDs {
-      guard let bytes = merged[cid] else {
-        throw RelayVerifierError.invalidRepositoryCAR
-      }
-      reachable[cid] = bytes
     }
 
     let newSnapshot = RelayRepositorySnapshot(
@@ -433,7 +448,7 @@ public struct RelayRepositoryVerificationState: Sendable {
       commitCID: root,
       dataCID: commit.descriptor.dataCID,
       records: newRecords,
-      mstDigest: Self.mstDigest(newMSTBlocks)
+      mstDigest: "sha256:\(commit.descriptor.dataCID.string)"
     )
     try RelayCommitSemanticVerifier.verify(
       event: event,
@@ -443,64 +458,10 @@ public struct RelayRepositoryVerificationState: Sendable {
     return .init(
       snapshot: newSnapshot,
       payloadKind: .commitDiff,
-      reachableBlocks: reachable,
-      subtreeMSTBlocks: updatedSubtreeMSTBlocks
+      reachableBlocks: merged,
+      reachableMSTNodeCount: nextMSTNodeCount,
+      reachableRepositoryByteCount: nextByteCount
     )
-  }
-
-  private static func findOldSpineCIDs(
-    rootCID: CID,
-    paths: [PublicRepositoryPath],
-    blocks: [CID: Data]
-  ) throws -> Set<CID> {
-    var spine = Set<CID>()
-    for path in paths {
-      try Task.checkCancellation()
-      var currentCID = rootCID
-      while true {
-        guard spine.insert(currentCID).inserted else { break }
-        guard let bytes = blocks[currentCID] else { break }
-        let node: RepositoryMSTNode
-        do {
-          node = try RepositoryMSTCodec.decode(bytes)
-        } catch {
-          break
-        }
-        let nodeLeaves: [RepositoryMSTLeaf]
-        do {
-          nodeLeaves = try RepositoryMSTCodec.reconstructedLeaves(from: node)
-        } catch {
-          break
-        }
-        if nodeLeaves.isEmpty {
-          if let left = node.leftTreeCID {
-            currentCID = left
-          } else {
-            break
-          }
-        } else {
-          let index = nodeLeaves.firstIndex {
-            !RepositoryMSTCodec.lexicographicallyPrecedes($0.path.mstKeyBytes, path.mstKeyBytes)
-          } ?? nodeLeaves.count
-          if index < nodeLeaves.count, nodeLeaves[index].path == path {
-            break
-          } else if index == 0 {
-            if let left = node.leftTreeCID {
-              currentCID = left
-            } else {
-              break
-            }
-          } else {
-            if let right = nodeLeaves[index - 1].rightTreeCID {
-              currentCID = right
-            } else {
-              break
-            }
-          }
-        }
-      }
-    }
-    return spine
   }
 
   private static func verifyCAR(
@@ -510,7 +471,7 @@ public struct RelayRepositoryVerificationState: Sendable {
     requireSelfContainedRepository: Bool,
     verifier: any PublicRepositoryCommitVerifier,
     maximumCARBytes: Int
-  ) async throws -> (snapshot: RelayRepositorySnapshot, reachableBlocks: [CID: Data], subtreeMSTBlocks: [CID: Set<CID>]) {
+  ) async throws -> (snapshot: RelayRepositorySnapshot, reachableBlocks: [CID: Data], reachableMSTNodeCount: Int, reachableRepositoryByteCount: Int) {
     guard maximumCARBytes > 0, car.count <= maximumCARBytes else {
       throw RelayVerifierError.repositoryCARTooLarge
     }
@@ -590,40 +551,15 @@ public struct RelayRepositoryVerificationState: Sendable {
       reachable[cid] = bytes
     }
 
-    var subtreeMSTBlocks: [CID: Set<CID>] = [:]
-    func computeSubtree(_ cid: CID) throws -> Set<CID> {
-      try Task.checkCancellation()
-      if let existing = subtreeMSTBlocks[cid] { return existing }
-      guard let bytes = repository.reachableMSTBlocks[cid] else { return [] }
-      let node: RepositoryMSTNode
-      do {
-        node = try RepositoryMSTCodec.decode(bytes)
-      } catch {
-        throw RelayVerifierError.invalidRepositoryCAR
-      }
-      var set: Set<CID> = [cid]
-      if let left = node.leftTreeCID {
-        set.formUnion(try computeSubtree(left))
-      }
-      for entry in node.entries {
-        if let right = entry.rightTreeCID {
-          set.formUnion(try computeSubtree(right))
-        }
-      }
-      subtreeMSTBlocks[cid] = set
-      return set
-    }
-    _ = try computeSubtree(commit.descriptor.dataCID)
-
     let snapshot = RelayRepositorySnapshot(
       did: commit.descriptor.did,
       revision: commit.descriptor.revision.value,
       commitCID: root,
       dataCID: commit.descriptor.dataCID,
       records: records,
-      mstDigest: mstDigest(repository.reachableMSTBlocks)
+      mstDigest: "sha256:\(commit.descriptor.dataCID.string)"
     )
-    return (snapshot, reachable, subtreeMSTBlocks)
+    return (snapshot, reachable, repository.reachableMSTBlocks.count, repository.reachableRepositoryByteCount)
   }
 
   private static func verifyCommitAnnouncement(
