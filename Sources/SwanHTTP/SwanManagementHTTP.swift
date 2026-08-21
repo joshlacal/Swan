@@ -942,9 +942,7 @@ private func managementJSON(
     _ status: HTTPResponse.Status,
     _ body: some Encodable
 ) -> Response {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
+    let data = (try? SwanJSONEncoders.sortedNoEscaping.encode(body)) ?? Data("{}".utf8)
     return Response(
         status: status,
         headers: [.contentType: "application/json", .cacheControl: "no-store"],
@@ -963,9 +961,7 @@ private func managementError(_ status: HTTPResponse.Status) -> Response {
     case .serviceUnavailable: "temporarily_unavailable"
     default: "internal_error"
     }
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys]
-    let data = (try? encoder.encode(ErrorBody(error: code))) ?? Data("{}".utf8)
+    let data = (try? SwanJSONEncoders.sortedKeys.encode(ErrorBody(error: code))) ?? Data("{}".utf8)
     return Response(
         status: status,
         headers: [.contentType: "application/json", .cacheControl: "no-store"],

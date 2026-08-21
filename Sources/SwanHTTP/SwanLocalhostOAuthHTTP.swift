@@ -842,7 +842,7 @@ private func localhostTokenNonceChallenge(runtime: SwanOAuthRuntime) -> Response
     var headers: HTTPFields = [.contentType: "application/json", .cacheControl: "no-store"]
     headers[HTTPField.Name("DPoP-Nonce")!] = runtime.dpopNonceService.issue()
     headers[.wwwAuthenticate] = "DPoP error=\"use_dpop_nonce\""
-    let data = (try? JSONEncoder().encode(LocalhostOAuthError(error: "use_dpop_nonce"))) ?? Data("{}".utf8)
+    let data = (try? SwanJSONEncoders.default.encode(LocalhostOAuthError(error: "use_dpop_nonce"))) ?? Data("{}".utf8)
     return Response(status: .badRequest, headers: headers, body: .init(byteBuffer: ByteBuffer(data: data)))
 }
 
@@ -867,9 +867,7 @@ private func localhostBodyFailure(
 }
 
 private func localhostTokenJSON(_ status: HTTPResponse.Status, _ body: some Encodable) -> Response {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
+    let data = (try? SwanJSONEncoders.sortedNoEscaping.encode(body)) ?? Data("{}".utf8)
     return Response(
         status: status,
         headers: [.contentType: "application/json", .cacheControl: "no-store"],

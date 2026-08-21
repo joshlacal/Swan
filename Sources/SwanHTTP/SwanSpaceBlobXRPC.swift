@@ -348,13 +348,16 @@ private func requireBlobReadAuthorization(
     }
 }
 
+private let spaceGetBlobQuerySchema = StrictQuerySchema(
+    required: ["space", "repo", "cid"]
+)
+
 private func parseAuthenticatedGetSpaceBlobParameters(
     _ request: Request
 ) throws -> ComAtprotoSpaceGetBlob.Parameters {
     let query = try strictAuthenticatedRecordQuery(
         request,
-        required: ["space", "repo", "cid"],
-        optional: []
+        schema: spaceGetBlobQuerySchema
     )
     let space = try ATProtocolURI(
         uriString: try requiredQueryValue("space", in: query, maximumBytes: 2_048)

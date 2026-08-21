@@ -556,13 +556,23 @@ func registerAuthenticatedGetRepoEndpoint(
     registerAuthenticatedRepositorySyncWrongMethods(on: router, path: path)
 }
 
+private let spaceGetLatestCommitQuerySchema = StrictQuerySchema(
+    required: ["space", "repo"]
+)
+private let spaceListRepoOpsQuerySchema = StrictQuerySchema(
+    required: ["space", "repo"],
+    optional: ["since", "limit", "excludeValues"]
+)
+private let spaceGetRepoQuerySchema = StrictQuerySchema(
+    required: ["space", "repo"]
+)
+
 private func parseAuthenticatedGetLatestCommitParameters(
     _ request: Request
 ) throws -> ComAtprotoSpaceGetLatestCommit.Parameters {
     let query = try strictAuthenticatedRecordQuery(
         request,
-        required: ["space", "repo"],
-        optional: []
+        schema: spaceGetLatestCommitQuerySchema
     )
     let space = try ATProtocolURI(
         uriString: try requiredQueryValue("space", in: query, maximumBytes: 2_048)
@@ -579,8 +589,7 @@ private func parseAuthenticatedListRepoOpsParameters(
 ) throws -> ComAtprotoSpaceListRepoOps.Parameters {
     let query = try strictAuthenticatedRecordQuery(
         request,
-        required: ["space", "repo"],
-        optional: ["since", "limit", "excludeValues"]
+        schema: spaceListRepoOpsQuerySchema
     )
     let space = try ATProtocolURI(
         uriString: try requiredQueryValue("space", in: query, maximumBytes: 2_048)
@@ -609,8 +618,7 @@ private func parseAuthenticatedGetRepoParameters(
 ) throws -> ComAtprotoSpaceGetRepo.Parameters {
     let query = try strictAuthenticatedRecordQuery(
         request,
-        required: ["space", "repo"],
-        optional: []
+        schema: spaceGetRepoQuerySchema
     )
     let space = try ATProtocolURI(
         uriString: try requiredQueryValue("space", in: query, maximumBytes: 2_048)

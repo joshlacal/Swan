@@ -1290,10 +1290,24 @@ private struct SwanServiceDIDServiceEntry: Encodable {
     let serviceEndpoint: String
 }
 
+package enum SwanJSONEncoders {
+    package static let sortedNoEscaping: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return encoder
+    }()
+
+    package static let sortedKeys: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
+
+    package static let `default`: JSONEncoder = JSONEncoder()
+}
+
 private func jsonResponse(_ body: some Encodable) -> Response {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
+    let data = (try? SwanJSONEncoders.sortedNoEscaping.encode(body)) ?? Data("{}".utf8)
     return Response(status: .ok, headers: [.contentType: "application/json", .cacheControl: "no-store"], body: .init(byteBuffer: ByteBuffer(data: data)))
 }
 
@@ -1327,9 +1341,7 @@ func oauthAPICORSPreflightResponse() -> Response {
 }
 
 private func oauthMetadataJSONResponse(_ body: some Encodable) -> Response {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
+    let data = (try? SwanJSONEncoders.sortedNoEscaping.encode(body)) ?? Data("{}".utf8)
     var headers: HTTPFields = [.contentType: "application/json", .cacheControl: "no-store"]
     oauthMetadataCORSHeaders(&headers)
     return Response(status: .ok, headers: headers, body: .init(byteBuffer: ByteBuffer(data: data)))
@@ -1403,7 +1415,6 @@ private func permissionedDataUnavailable() -> Response {
 }
 
 func jsonResponseWithStatus(_ status: HTTPResponse.Status, body: some Encodable) -> Response {
-    let encoder = JSONEncoder()
-    let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
+    let data = (try? SwanJSONEncoders.default.encode(body)) ?? Data("{}".utf8)
     return Response(status: status, headers: [.contentType: "application/json", .cacheControl: "no-store"], body: .init(byteBuffer: ByteBuffer(data: data)))
 }

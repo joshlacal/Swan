@@ -292,18 +292,14 @@ private func notificationJSON(
         rev: wireRevision,
         hash: Bytes(data: commitment)
     )
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    return try encoder.encode(input)
+    return try SwanJSONEncoders.sortedNoEscaping.encode(input)
 }
 
 private func deletionJSON(space: SpaceURI) throws -> Data {
     let input = try ComAtprotoSpaceNotifySpaceDeleted.Input(
         space: ATProtocolURI(uriString: space.rawValue)
     )
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    return try encoder.encode(input)
+    return try SwanJSONEncoders.sortedNoEscaping.encode(input)
 }
 
 private func notificationHeaders(_ token: String) -> [String: String] {

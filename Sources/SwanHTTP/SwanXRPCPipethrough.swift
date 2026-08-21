@@ -791,9 +791,7 @@ private func pipethroughError(
     struct Body: Encodable {
         let error: String
     }
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys]
-    let data = (try? encoder.encode(Body(error: code))) ?? Data("{}".utf8)
+    let data = (try? SwanJSONEncoders.sortedKeys.encode(Body(error: code))) ?? Data("{}".utf8)
     return Response(
         status: status,
         headers: headers ?? [

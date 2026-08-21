@@ -272,7 +272,7 @@ func authenticatedGetSpaceNonceChallenge(
     headers[.cacheControl] = "no-store"
     headers[HTTPField.Name("DPoP-Nonce")!] = authorizer.issueNonce()
     headers[.wwwAuthenticate] = "DPoP error=\"use_dpop_nonce\""
-    let data = (try? JSONEncoder().encode(["error": "use_dpop_nonce"])) ?? Data("{}".utf8)
+    let data = (try? SwanJSONEncoders.default.encode(["error": "use_dpop_nonce"])) ?? Data("{}".utf8)
     return Response(
         status: .unauthorized,
         headers: headers,
@@ -294,13 +294,11 @@ func authenticatedGetSpaceJSON(
         .maximumListRecordsResponseBytes,
     lease: PublicRepositoryJSONReadLease? = nil
 ) -> Response {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
     guard maximumBytes > 0 else {
         lease?.release()
         return authenticatedGetSpaceError(.serviceUnavailable, code: "temporarily_unavailable")
     }
-    let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
+    let data = (try? SwanJSONEncoders.sortedNoEscaping.encode(body)) ?? Data("{}".utf8)
     guard data.count <= maximumBytes else {
         lease?.release()
         return authenticatedGetSpaceError(.serviceUnavailable, code: "temporarily_unavailable")
@@ -1178,7 +1176,7 @@ enum StrictPermissionedWriteJSON {
     private struct Parser {
         let bytes: [UInt8]
         var index = 0
-
+        private let decoder = JSONDecoder()
         mutating func whitespace() {
             while index < bytes.count, bytes[index] == 0x20 || bytes[index] == 0x0a || bytes[index] == 0x0d || bytes[index] == 0x09 { index += 1 }
         }
@@ -1231,14 +1229,21 @@ enum StrictPermissionedWriteJSON {
             guard consume(0x22) else { throw AuthenticatedSpaceWriteFailure.invalidRequest }
             let start = index - 1
             var escaped = false
+            var hasEscapes = false
             while index < bytes.count {
                 let byte = bytes[index]
                 index += 1
                 if escaped { escaped = false; continue }
-                if byte == 0x5c { escaped = true; continue }
+                if byte == 0x5c { escaped = true; hasEscapes = true; continue }
                 if byte == 0x22 {
+                    if !hasEscapes {
+                        guard let value = String(validating: bytes[(start + 1) ..< (index - 1)], as: UTF8.self) else {
+                            throw AuthenticatedSpaceWriteFailure.invalidRequest
+                        }
+                        return value
+                    }
                     let encoded = Data(bytes[start ..< index])
-                    guard let value = try? JSONDecoder().decode(String.self, from: encoded) else {
+                    guard let value = try? decoder.decode(String.self, from: encoded) else {
                         throw AuthenticatedSpaceWriteFailure.invalidRequest
                     }
                     return value
@@ -1273,13 +1278,20 @@ private func registerAuthenticatedRecordWrongMethods(
     }
 }
 
+private let spaceGetRecordQuerySchema = StrictQuerySchema(
+    required: ["space", "repo", "collection", "rkey"]
+)
+private let spaceListRecordsQuerySchema = StrictQuerySchema(
+    required: ["space", "repo"],
+    optional: ["collection", "limit", "cursor", "reverse", "excludeValues"]
+)
+
 private func parseAuthenticatedGetRecordParameters(
     _ request: Request
 ) throws -> ComAtprotoSpaceGetRecord.Parameters {
     let query = try strictAuthenticatedRecordQuery(
         request,
-        required: ["space", "repo", "collection", "rkey"],
-        optional: []
+        schema: spaceGetRecordQuerySchema
     )
     let space = try ATProtocolURI(uriString: try requiredQueryValue("space", in: query, maximumBytes: 2_048))
     let repo = try DID(didString: try requiredQueryValue("repo", in: query, maximumBytes: 2_048))
@@ -1301,8 +1313,7 @@ private func parseAuthenticatedListRecordsParameters(
 ) throws -> ComAtprotoSpaceListRecords.Parameters {
     let query = try strictAuthenticatedRecordQuery(
         request,
-        required: ["space", "repo"],
-        optional: ["collection", "limit", "cursor", "reverse", "excludeValues"]
+        schema: spaceListRecordsQuerySchema
     )
     let space = try ATProtocolURI(uriString: try requiredQueryValue("space", in: query, maximumBytes: 2_048))
     let repo = try DID(didString: try requiredQueryValue("repo", in: query, maximumBytes: 2_048))
@@ -1328,10 +1339,19 @@ private func parseAuthenticatedListRecordsParameters(
     )
 }
 
-func strictAuthenticatedRecordQuery(
+package struct StrictQuerySchema: Sendable {
+    package let required: Set<String>
+    package let allowed: Set<String>
+
+    package init(required: Set<String>, optional: Set<String> = []) {
+        self.required = required
+        self.allowed = required.union(optional)
+    }
+}
+
+package func strictAuthenticatedRecordQuery(
     _ request: Request,
-    required: Set<String>,
-    optional: Set<String>
+    schema: StrictQuerySchema
 ) throws -> [String: String] {
     guard !request.uri.string.contains("#"),
           let query = request.uri.query,
@@ -1339,23 +1359,36 @@ func strictAuthenticatedRecordQuery(
           query.utf8.count <= 8 * 1_024 else {
         throw AuthenticatedSpaceRecordFailure.invalidRequest
     }
-    let allowed = required.union(optional)
     var decoded: [String: String] = [:]
     for segment in query.split(separator: "&", omittingEmptySubsequences: false) {
         let pair = segment.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
         guard pair.count == 2,
               !pair[0].isEmpty,
-              pair[0].utf8.allSatisfy({ ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "z")) || ($0 >= UInt8(ascii: "A") && $0 <= UInt8(ascii: "Z")) }),
-              allowed.contains(String(pair[0])),
-              decoded[String(pair[0])] == nil else {
+              pair[0].utf8.allSatisfy({ ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "z")) || ($0 >= UInt8(ascii: "A") && $0 <= UInt8(ascii: "Z")) }) else {
             throw AuthenticatedSpaceRecordFailure.invalidRequest
         }
-        decoded[String(pair[0])] = try strictQueryDecode(pair[1])
+        let key = String(pair[0])
+        guard schema.allowed.contains(key),
+              decoded[key] == nil else {
+            throw AuthenticatedSpaceRecordFailure.invalidRequest
+        }
+        decoded[key] = try strictQueryDecode(pair[1])
     }
-    guard required.allSatisfy({ decoded[$0] != nil }) else {
+    guard schema.required.allSatisfy({ decoded[$0] != nil }) else {
         throw AuthenticatedSpaceRecordFailure.invalidRequest
     }
     return decoded
+}
+
+func strictAuthenticatedRecordQuery(
+    _ request: Request,
+    required: Set<String>,
+    optional: Set<String> = []
+) throws -> [String: String] {
+    try strictAuthenticatedRecordQuery(
+        request,
+        schema: StrictQuerySchema(required: required, optional: optional)
+    )
 }
 
 func requiredQueryValue(
