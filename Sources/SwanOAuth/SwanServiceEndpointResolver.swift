@@ -12,14 +12,98 @@ public enum SwanServiceResolutionFailure: Error, Sendable, Equatable {
     case unresolvableService
 }
 
+private enum DIDDocumentFlightWaitOutcome: Sendable {
+    case completed(Result<SwanServiceEndpointResolver.Document, Error>)
+    case waiterCancelled
+}
+
+/// Bridges one caller to an independent shared task. Cancellation settles only
+/// this bridge; it never propagates to the task that other exact-DID callers
+/// are awaiting.
+private final class DIDDocumentFlightWait: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<DIDDocumentFlightWaitOutcome, Never>?
+    private var outcome: DIDDocumentFlightWaitOutcome?
+
+    func install(_ continuation: CheckedContinuation<DIDDocumentFlightWaitOutcome, Never>) {
+        lock.lock()
+        if let outcome {
+            lock.unlock()
+            continuation.resume(returning: outcome)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func complete(_ outcome: DIDDocumentFlightWaitOutcome) {
+        lock.lock()
+        guard self.outcome == nil else {
+            lock.unlock()
+            return
+        }
+        self.outcome = outcome
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: outcome)
+    }
+}
+
 /// Resolves a `did#fragment` service reference to its https endpoint.
 ///
 /// Every failure collapses to `.unresolvableService`: the caller turns that
 /// into a 400, and distinguishing "no such DID" from "no such fragment" would
 /// leak remote lookup detail without helping a legitimate client.
 public struct SwanServiceEndpointResolver: Sendable {
-    private struct Document: Decodable {
-        struct Service: Decodable {
+    public struct CacheConfiguration: Sendable, Equatable {
+        public static let standard = CacheConfiguration(
+            lifetime: 60,
+            maximumEntries: 256
+        )
+
+        public let lifetime: TimeInterval
+        public let maximumEntries: Int
+
+        public init(
+            lifetime: TimeInterval = 60,
+            maximumEntries: Int = 256
+        ) {
+            self.lifetime = lifetime
+            self.maximumEntries = maximumEntries
+        }
+
+        fileprivate func validate() throws {
+            guard lifetime >= 5, lifetime <= 300, lifetime.isFinite,
+                  (1 ... 1_024).contains(maximumEntries) else {
+                throw SwanError.malformed("DID document resolver cache bounds are invalid")
+            }
+        }
+    }
+
+    /// Monotonic time source for cache TTL.
+    public struct MonotonicClock: Sendable {
+        private let readNanoseconds: @Sendable () -> UInt64
+
+        public init(
+            nowNanoseconds: @escaping @Sendable () -> UInt64
+        ) {
+            readNanoseconds = nowNanoseconds
+        }
+
+        fileprivate static let continuous = MonotonicClock(
+            nowNanoseconds: {
+                DispatchTime.now().uptimeNanoseconds
+            }
+        )
+
+        fileprivate func now() -> UInt64 {
+            readNanoseconds()
+        }
+    }
+
+    fileprivate struct Document: Decodable, Sendable {
+        struct Service: Decodable, Sendable {
             let id: String
             let serviceEndpoint: String
         }
@@ -32,59 +116,187 @@ public struct SwanServiceEndpointResolver: Sendable {
         let service: [Service]?
     }
 
-    private let documents: any SwanDIDDocumentFetching
+    private actor CacheActor {
+        private struct CacheEntry: Sendable {
+            let document: Document
+            let expiresAt: UInt64
+        }
 
-    public init(documents: any SwanDIDDocumentFetching) {
-        self.documents = documents
+        private struct Flight: Sendable {
+            let identity: UUID
+            let task: Task<Document, Error>
+            var waiters: [DIDDocumentFlightWait]
+        }
+
+        private let documents: any SwanDIDDocumentFetching
+        private let configuration: CacheConfiguration
+        private let clock: MonotonicClock
+        private var cache: [String: CacheEntry] = [:]
+        private var inFlight: [String: Flight] = [:]
+
+        init(
+            documents: any SwanDIDDocumentFetching,
+            configuration: CacheConfiguration,
+            clock: MonotonicClock
+        ) {
+            self.documents = documents
+            self.configuration = configuration
+            self.clock = clock
+        }
+
+        func document(forDID did: String) async throws -> Document {
+            try Task.checkCancellation()
+            let now = clock.now()
+            if let entry = cache[did] {
+                if entry.expiresAt > now {
+                    return entry.document
+                }
+                cache.removeValue(forKey: did)
+            }
+
+            if var flight = inFlight[did] {
+                let wait = DIDDocumentFlightWait()
+                flight.waiters.append(wait)
+                inFlight[did] = flight
+                return try await awaitFlight(wait)
+            }
+
+            let wait = DIDDocumentFlightWait()
+            let identity = UUID()
+            let documents = self.documents
+            let priority = Task.currentPriority
+            let task: Task<Document, Error> = Task.detached(priority: priority) {
+                let data: Data
+                do {
+                    data = try await documents.documentJSON(forDID: did)
+                } catch {
+                    throw SwanServiceResolutionFailure.unresolvableService
+                }
+                guard let document = try? JSONDecoder().decode(Document.self, from: data),
+                      document.service != nil,
+                      document.id == did
+                else {
+                    throw SwanServiceResolutionFailure.unresolvableService
+                }
+                return document
+            }
+
+            let flight = Flight(
+                identity: identity,
+                task: task,
+                waiters: [wait]
+            )
+            inFlight[did] = flight
+
+            Task.detached { [weak self] in
+                let result = await task.result
+                await self?.finishFlight(identity: identity, for: did, result: result)
+            }
+
+            return try await awaitFlight(wait)
+        }
+
+        private func awaitFlight(_ wait: DIDDocumentFlightWait) async throws -> Document {
+            let outcome = await withTaskCancellationHandler(
+                operation: {
+                    await withCheckedContinuation { continuation in
+                        wait.install(continuation)
+                        if Task.isCancelled {
+                            wait.complete(.waiterCancelled)
+                        }
+                    }
+                },
+                onCancel: {
+                    wait.complete(.waiterCancelled)
+                }
+            )
+            switch outcome {
+            case let .completed(result):
+                return try result.get()
+            case .waiterCancelled:
+                throw CancellationError()
+            }
+        }
+
+        private func finishFlight(
+            identity: UUID,
+            for did: String,
+            result: Result<Document, Error>
+        ) {
+            guard let flight = inFlight[did], flight.identity == identity else {
+                return
+            }
+            inFlight.removeValue(forKey: did)
+            if case let .success(document) = result {
+                storeInCache(document, for: did)
+            }
+            for waiter in flight.waiters {
+                waiter.complete(.completed(result))
+            }
+        }
+
+        private func storeInCache(_ document: Document, for did: String) {
+            let now = clock.now()
+            let lifetimeNanoseconds = UInt64(configuration.lifetime * 1_000_000_000)
+            let expiresAt = now.addingReportingOverflow(lifetimeNanoseconds).partialValue
+
+            if cache.count >= configuration.maximumEntries {
+                cache = cache.filter { $0.value.expiresAt > now }
+                if cache.count >= configuration.maximumEntries {
+                    if let oldest = cache.min(by: { $0.value.expiresAt < $1.value.expiresAt })?.key {
+                        cache.removeValue(forKey: oldest)
+                    }
+                }
+            }
+
+            cache[did] = CacheEntry(
+                document: document,
+                expiresAt: expiresAt
+            )
+        }
+    }
+
+    private let cacheActor: CacheActor
+
+    public init(
+        documents: any SwanDIDDocumentFetching,
+        cacheConfiguration: CacheConfiguration = .standard
+    ) {
+        self.init(
+            documents: documents,
+            cacheConfiguration: cacheConfiguration,
+            monotonicClock: .continuous
+        )
+    }
+
+    public init(
+        documents: any SwanDIDDocumentFetching,
+        cacheConfiguration: CacheConfiguration = .standard,
+        monotonicClock: MonotonicClock
+    ) {
+        try? cacheConfiguration.validate()
+        self.cacheActor = CacheActor(
+            documents: documents,
+            configuration: cacheConfiguration,
+            clock: monotonicClock
+        )
     }
 
     public func endpoint(did: String, fragment: String) async throws -> URL {
-        let data: Data
+        let document: Document
         do {
-            data = try await documents.documentJSON(forDID: did)
+            document = try await cacheActor.document(forDID: did)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw SwanServiceResolutionFailure.unresolvableService
         }
-        guard let document = try? JSONDecoder().decode(Document.self, from: data),
-              let services = document.service
-        else { throw SwanServiceResolutionFailure.unresolvableService }
-        // Bind the document to the DID that was asked for. Without this the
-        // fetch path's answer is trusted on its own: a `did:web` host that
-        // serves (or is made to serve) some other subject's document — via a
-        // shared host, a stale cache entry, or a path that is not the one the
-        // method-specific id names — silently selects that subject's endpoint.
-        //
-        // The comparison is byte-exact against the DID string as received,
-        // and no normalisation is applied: any normalisation here would be a
-        // second, weaker grammar than the one
-        // `SwanPeerPinnedDIDDocumentFetcher` already used to derive the fetch
-        // URL, which is exactly how a mismatch gets accepted.
-        //
-        // So this also refuses two spellings that name the same `did:web`
-        // subject but are not the same string: a differently percent-encoded
-        // port (`%3A` vs `:`) and a differently cased host. DNS is
-        // case-insensitive and the fetch would succeed either way, so a caller
-        // that spells the DID differently from the document it is asking about
-        // now gets `.unresolvableService` where it previously got the
-        // endpoint. That is deliberate — the caller controls the spelling
-        // (`SwanXRPCPipethrough` passes the `atproto-proxy` header through
-        // unfolded) and the remedy is to name the subject as its document
-        // does. `testDecodedPortSpellingDoesNotMatchEncodedDocumentID` and
-        // `testHostCaseDifferenceDoesNotMatchDocumentID` pin both, so a later
-        // "helpful" normalisation fails loudly instead of silently widening
-        // what may be bound.
-        //
-        // A document with no `id` at all is rejected: `id` is required by DID
-        // Core, and a document that will not name its own subject cannot be
-        // bound to one.
+        guard let services = document.service else {
+            throw SwanServiceResolutionFailure.unresolvableService
+        }
         guard document.id == did else {
             throw SwanServiceResolutionFailure.unresolvableService
         }
-        // A service id may be written "#frag" or "did:...#frag". Exactly one
-        // entry may match: a document that declares the same service id twice
-        // is malformed, and picking the first would let a later duplicate be
-        // appended to a document to shadow-or-be-shadowed depending only on
-        // ordering. Refuse the ambiguity instead of resolving it.
         let matches = services.filter {
             $0.id == "#\(fragment)" || $0.id == "\(did)#\(fragment)"
         }
