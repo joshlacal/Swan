@@ -4239,14 +4239,52 @@ final class SwanSQLiteTests: XCTestCase {
             now: now.addingTimeInterval(1)
         )
 
-        // Verify member page on readConnection
-        let page = try await database.simpleSpaceMemberPage(
+        let barrier = SnapshotReadBarrier()
+        await database.installTestingHooks(
+            SQLiteTestingHooks(
+                afterSimpleSpaceMemberPageAuthorityRead: {
+                    await barrier.pause()
+                }
+            )
+        )
+
+        // Launch read task on readConnection in background
+        let readTask = Task {
+            try await database.simpleSpaceMemberPage(
+                space: space,
+                limit: 100,
+                cursor: nil,
+                authorization: .accountOAuth(subject: fixture.author, scopes: ["atproto"])
+            )
+        }
+
+        // Wait until readTask has opened its read transaction and read authority row
+        await barrier.waitUntilPaused()
+
+        // Concurrent mutation on writer connection adds memberBob and commits
+        let memberBob = "did:plc:bob00000000000000000000002"
+        _ = try await database.addSimpleSpaceMember(
+            space: space,
+            member: memberBob,
+            authorization: .accountOAuth(subject: fixture.author, scopes: ["atproto"]),
+            now: now.addingTimeInterval(2)
+        )
+
+        // Release readTask to continue reading members under readConnection's frozen snapshot
+        await barrier.release()
+
+        let page = try await readTask.value
+        // Atomic snapshot MUST see [owner, alice] and MUST NOT see [bob]
+        XCTAssertEqual(Set(page.members), Set([fixture.author, memberAlice]))
+
+        // Subsequent read (new transaction) sees all three
+        let updatedPage = try await database.simpleSpaceMemberPage(
             space: space,
             limit: 100,
             cursor: nil,
             authorization: .accountOAuth(subject: fixture.author, scopes: ["atproto"])
         )
-        XCTAssertEqual(Set(page.members), Set([fixture.author, memberAlice]))
+        XCTAssertEqual(Set(updatedPage.members), Set([fixture.author, memberAlice, memberBob]))
     }
 
     func testValidatePortableRestoreStreamingReadsAtomicSnapshot() async throws {
@@ -4276,8 +4314,89 @@ final class SwanSQLiteTests: XCTestCase {
         )
         try await database.restorePortableRepositories([repo])
 
-        // Validation succeeds on readConnection
-        try await database.validatePortableRestore(repositories: [repo])
+        let metadata = SQLitePortableRestoreRepositoryMetadata(
+            space: fixture.space,
+            author: fixture.author,
+            wireRevision: try fixture.tid(0),
+            recordCount: 1,
+            logicalRestoredByteCount: fixture.firstValue.count,
+            ltHash: ltHash.serialized,
+            commitment: ltHash.commitment
+        )
+
+        let barrier = SnapshotReadBarrier()
+        await database.installTestingHooks(
+            SQLiteTestingHooks(
+                afterValidatePortableRestoreStateRead: {
+                    await barrier.pause()
+                }
+            )
+        )
+
+        // Launch streaming validation task on readConnection
+        let validationTask = Task {
+            try await database.validatePortableRestoreStreaming(repositories: [metadata])
+        }
+
+        // Wait until validationTask has read state on readConnection
+        await barrier.waitUntilPaused()
+
+        // Concurrent commit on writer connection (e.g. creating another simple space)
+        let space = try SpaceURI(
+            authority: fixture.author,
+            spaceType: "app.bsky.bookmarks",
+            skey: "concurrent-commit"
+        )
+        let authority = try DurableSimpleSpaceAuthority(
+            database: database,
+            credentialSecret: Data(repeating: 0xC3, count: 32)
+        )
+        _ = try await authority.create(
+            space: space,
+            owner: fixture.author,
+            configuration: try SimpleSpaceConfiguration(
+                policy: .memberList,
+                appAccess: .open
+            ),
+            authorization: .accountOAuth(subject: fixture.author, scopes: ["atproto"]),
+            now: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+
+        // Release validationTask to finish validating values and closures on readConnection
+        await barrier.release()
+
+        // Must succeed without error under readConnection snapshot
+        try await validationTask.value
+    }
+
+    func testCloseSurfacesReaderCloseFailureAndTracksClosedState() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close(); try? FileManager.default.removeItem(at: fixture.root) } }
+
+        struct InjectedReaderCloseError: Error, Equatable {}
+
+        // Install hook that injects a failure during readConnection close
+        await database.installTestingHooks(
+            SQLiteTestingHooks(
+                onReaderClose: {
+                    throw InjectedReaderCloseError()
+                }
+            )
+        )
+
+        // First close() must surface the injected reader error and not set isClosed = true
+        var threwInjectedError = false
+        do {
+            try await database.close()
+        } catch is InjectedReaderCloseError {
+            threwInjectedError = true
+        }
+        XCTAssertTrue(threwInjectedError, "close() must propagate reader close failure")
+
+        // Remove the failing hook; retry close() must succeed and finish closing the database
+        await database.installTestingHooks(SQLiteTestingHooks())
+        try await database.close()
     }
 }
 

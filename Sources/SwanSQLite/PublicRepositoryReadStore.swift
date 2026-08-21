@@ -585,11 +585,11 @@ extension SQLiteAccountDatabase {
     func readPublicRepositoryDescription(
         generation: SQLiteVerifiedPublicRepositoryGeneration
     ) async throws -> PublicRepositoryReadDescription {
-        try await withReadConnectionGate {
-            try await readTransaction {
+        try await withConnectionGate {
+            try await writerReadTransaction {
                 _ = try await requirePublicRepositoryGenerationWithoutGate(
                     generation,
-                    connection: readConnection
+                    connection: connection
                 )
                 return generation.description
             }
@@ -601,16 +601,16 @@ extension SQLiteAccountDatabase {
         expectedCID: CID?,
         generation: SQLiteVerifiedPublicRepositoryGeneration
     ) async throws -> SQLitePublicRepositoryRecordRead {
-        try await withReadConnectionGate {
-            try await readTransaction {
+        try await withConnectionGate {
+            try await writerReadTransaction {
                 let state = try await requirePublicRepositoryGenerationWithoutGate(
                     generation,
-                    connection: readConnection
+                    connection: connection
                 )
                 let tree = try RepositoryMST.load(
                     rootCID: state.dataCID,
                     blocks: SQLitePublicRepositoryBlockSource(
-                        connection: readConnection
+                        connection: connection
                     )
                 )
                 let cid: CID?
@@ -624,7 +624,7 @@ extension SQLiteAccountDatabase {
                     try await recheckPublicRepositoryGenerationWithoutGate(
                         generation,
                         expectedState: state,
-                        connection: readConnection
+                        connection: connection
                     )
                     return SQLitePublicRepositoryRecordRead(
                         state: state,
@@ -637,7 +637,7 @@ extension SQLiteAccountDatabase {
                 // reject it in `PublicRepositoryReadRecord`.
                 let byteCount = try await
                     publicRepositoryRecordBlockByteCountWithoutGate(cid)
-                let bytes = try await blockBytesWithoutGate(cid, connection: readConnection)
+                let bytes = try await blockBytesWithoutGate(cid, connection: connection)
                 guard bytes.count == byteCount else {
                     throw PublicRepositoryReadError.unavailable(reason: .blockMaterializationFailed)
                 }
@@ -649,7 +649,7 @@ extension SQLiteAccountDatabase {
                 try await recheckPublicRepositoryGenerationWithoutGate(
                     generation,
                     expectedState: state,
-                    connection: readConnection
+                    connection: connection
                 )
                 return SQLitePublicRepositoryRecordRead(
                     state: state,
@@ -674,16 +674,16 @@ extension SQLiteAccountDatabase {
                 collection: collection, recordKey: cursor
             )
         }
-        return try await withReadConnectionGate {
-            try await readTransaction {
+        return try await withConnectionGate {
+            try await writerReadTransaction {
                 let state = try await requirePublicRepositoryGenerationWithoutGate(
                     generation,
-                    connection: readConnection
+                    connection: connection
                 )
                 let tree = try RepositoryMST.load(
                     rootCID: state.dataCID,
                     blocks: SQLitePublicRepositoryBlockSource(
-                        connection: readConnection
+                        connection: connection
                     )
                 )
                 let mstPage: RepositoryMSTPage
@@ -724,7 +724,7 @@ extension SQLiteAccountDatabase {
                     }
                     let bytes = try await blockBytesWithoutGate(
                         leaf.recordCID,
-                        connection: readConnection
+                        connection: connection
                     )
                     guard bytes.count == byteCount else {
                         throw PublicRepositoryReadError.unavailable(reason: .blockMaterializationFailed)
@@ -743,7 +743,7 @@ extension SQLiteAccountDatabase {
                 try await recheckPublicRepositoryGenerationWithoutGate(
                     generation,
                     expectedState: state,
-                    connection: readConnection
+                    connection: connection
                 )
                 return SQLitePublicRepositoryPageRead(
                     state: state,
@@ -759,7 +759,7 @@ extension SQLiteAccountDatabase {
     private func publicRepositoryRecordBlockByteCountWithoutGate(
         _ cid: CID
     ) async throws -> Int {
-        let rows = try await readConnection.query(
+        let rows = try await connection.query(
             """
             SELECT length(bytes) AS byte_count
             FROM public_repository_blocks
@@ -908,7 +908,7 @@ extension SQLiteAccountDatabase {
                 reason: .fileIdentityMismatch
             )
         }
-        guard try await publicRepositoryDataVersionWithoutGate(connection: self.connection)
+        guard try await publicRepositoryDataVersionWithoutGate(connection: conn)
             == generation.dataVersion else {
             throw PublicRepositoryReadError.unavailable(
                 reason: .generationPinStale
@@ -939,7 +939,7 @@ extension SQLiteAccountDatabase {
                 reason: .fileIdentityMismatch
             )
         }
-        guard try await publicRepositoryDataVersionWithoutGate(connection: self.connection)
+        guard try await publicRepositoryDataVersionWithoutGate(connection: conn)
             == generation.dataVersion else {
             throw PublicRepositoryReadError.unavailable(
                 reason: .generationPinStale

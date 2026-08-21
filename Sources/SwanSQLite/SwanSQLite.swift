@@ -1666,8 +1666,10 @@ struct SQLiteTestingHooks: Sendable {
     var afterRemoteReplicaMutatingSQL: (@Sendable (Int) async throws -> Void)?
     var beforePermanentDeletionClose: (@Sendable () async throws -> Void)?
     var beforeWireOplogValueMaterialization: (@Sendable () async throws -> Void)?
+    var afterSimpleSpaceMemberPageAuthorityRead: (@Sendable () async -> Void)?
+    var afterValidatePortableRestoreStateRead: (@Sendable () async -> Void)?
+    var onReaderClose: (@Sendable () async throws -> Void)?
     var incrementalReplayRetentionOperationLimit: Int?
-
     init(
         beforeApplyCommit: (@Sendable () async throws -> Void)? = nil,
         afterSnapshotStateRead: (@Sendable () async -> Void)? = nil,
@@ -1680,6 +1682,9 @@ struct SQLiteTestingHooks: Sendable {
         afterRemoteReplicaMutatingSQL: (@Sendable (Int) async throws -> Void)? = nil,
         beforePermanentDeletionClose: (@Sendable () async throws -> Void)? = nil,
         beforeWireOplogValueMaterialization: (@Sendable () async throws -> Void)? = nil,
+        afterSimpleSpaceMemberPageAuthorityRead: (@Sendable () async -> Void)? = nil,
+        afterValidatePortableRestoreStateRead: (@Sendable () async -> Void)? = nil,
+        onReaderClose: (@Sendable () async throws -> Void)? = nil,
         incrementalReplayRetentionOperationLimit: Int? = nil
     ) {
         self.beforeApplyCommit = beforeApplyCommit
@@ -1694,6 +1699,9 @@ struct SQLiteTestingHooks: Sendable {
         self.afterRemoteReplicaMutatingSQL = afterRemoteReplicaMutatingSQL
         self.beforePermanentDeletionClose = beforePermanentDeletionClose
         self.beforeWireOplogValueMaterialization = beforeWireOplogValueMaterialization
+        self.afterSimpleSpaceMemberPageAuthorityRead = afterSimpleSpaceMemberPageAuthorityRead
+        self.afterValidatePortableRestoreStateRead = afterValidatePortableRestoreStateRead
+        self.onReaderClose = onReaderClose
         self.incrementalReplayRetentionOperationLimit =
             incrementalReplayRetentionOperationLimit
     }
@@ -1810,8 +1818,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         SQLiteAccountExternalBodyLeaseGate()
     var testingHooks = SQLiteTestingHooks()
     private var activeWriteTransactions = 0
+    private var isReaderClosed = false
+    private var isWriterClosed = false
     private var isClosed = false
-
     public init(
         dataDirectory: URL,
         did: String,
@@ -2061,33 +2070,44 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         // all converge on the same actor. Closing twice must be a harmless
         // replay rather than invoking SQLiteNIO on an already-closed handle.
         guard !isClosed else { return }
-        isClosed = true
         try await withConnectionGate {
             try await withReadConnectionGate {
-                let descriptor = accountDirectoryDescriptor
-                let databaseDescriptor = databaseFileDescriptor
-                let lifecycleDescriptor = accountLifecycleLockDescriptor
-                accountDirectoryDescriptor = -1
-                databaseFileDescriptor = -1
-                accountLifecycleLockDescriptor = -1
-                defer {
-                    SQLiteProtectedPaths.closeDirectory(databaseDescriptor)
-                    SQLiteProtectedPaths.closeAccountLifecycleLock(
-                        lifecycleDescriptor
-                    )
-                    SQLiteProtectedPaths.closeDirectory(descriptor)
-                }
                 var readerError: Error?
-                do {
-                    try await readConnection.close()
-                } catch {
-                    readerError = error
+                if !isReaderClosed {
+                    do {
+                        if let hook = testingHooks.onReaderClose {
+                            try await hook()
+                        }
+                        try await readConnection.close()
+                        isReaderClosed = true
+                    } catch {
+                        readerError = error
+                    }
                 }
                 var writerError: Error?
-                do {
-                    try await connection.close()
-                } catch {
-                    writerError = error
+                if !isWriterClosed {
+                    do {
+                        try await connection.close()
+                        isWriterClosed = true
+                    } catch {
+                        writerError = error
+                    }
+                }
+                if isReaderClosed && isWriterClosed {
+                    isClosed = true
+                    let descriptor = accountDirectoryDescriptor
+                    let databaseDescriptor = databaseFileDescriptor
+                    let lifecycleDescriptor = accountLifecycleLockDescriptor
+                    accountDirectoryDescriptor = -1
+                    databaseFileDescriptor = -1
+                    accountLifecycleLockDescriptor = -1
+                    defer {
+                        SQLiteProtectedPaths.closeDirectory(databaseDescriptor)
+                        SQLiteProtectedPaths.closeAccountLifecycleLock(
+                            lifecycleDescriptor
+                        )
+                        SQLiteProtectedPaths.closeDirectory(descriptor)
+                    }
                 }
                 if let readerError {
                     throw readerError
@@ -4593,6 +4613,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             "portable restore repository validation failed"
                         )
                     }
+                    await testingHooks.afterValidatePortableRestoreStateRead?()
                     var cursorCollection: String?
                     var cursorRKey: String?
                     var count = 0
@@ -6453,6 +6474,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         "invalid simple-space owner"
                     )
                 }
+                await testingHooks.afterSimpleSpaceMemberPageAuthorityRead?()
                 let policyRaw = try requiredText(authorityRow, "policy")
                 guard let policy = SimpleSpacePolicy(rawValue: policyRaw) else {
                     throw SQLiteRepositoryError.corruptDatabase(
@@ -7610,12 +7632,18 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             throw SwanError.malformed("blob export limit is invalid")
         }
         let columns = blobNamespaceColumns(reference.namespace)
-        let stored = try await blobPayload(
-            cid: reference.cid,
-            namespaceKind: columns.kind,
-            spaceURI: columns.spaceURI,
-            includeLegacyPayload: false
-        )
+        let stored = try await withConnectionGate {
+            try await blobPayloadIfReachableWithoutGate(
+                cid: reference.cid,
+                namespaceKind: columns.kind,
+                spaceURI: columns.spaceURI,
+                includeLegacyPayload: false,
+                connection: connection
+            )
+        }
+        guard let stored else {
+            throw SwanError.unavailable("blob is not reachable")
+        }
         guard stored.byteCount <= maximumBytes else {
             throw SwanError.unavailable("blob exceeds export limits")
         }
