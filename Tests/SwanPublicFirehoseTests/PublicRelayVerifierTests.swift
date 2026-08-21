@@ -479,6 +479,319 @@ final class PublicRelayVerifierTests: XCTestCase {
     XCTAssertEqual(current.snapshot.dataCID, materialized.rootCID)
     XCTAssertEqual(current.snapshot.records, [path.mstKey: record.cid])
   }
+  func testIncrementalCommitSequenceMatchesFullRepositoryVerification() async throws {
+    let key = try P256.Signing.PrivateKey(rawRepresentation: Data(repeating: 1, count: 32))
+    let verifier = P256PublicRepositoryCommitVerifier(publicKey: key.publicKey)
+    let genesis = try PublicRepositoryGenesisCodec.create(
+      did: did,
+      revision: rev0,
+      signingKey: key
+    )
+    let initialHead = RelayRepositoryHead(
+      did: did,
+      revision: rev0,
+      commitCID: genesis.commitCID,
+      dataCID: genesis.emptyMSTCID
+    )
+    var state = try await RelayRepositoryVerificationState.fullSnapshot(
+      car: genesis.car,
+      expected: initialHead,
+      verifier: verifier,
+      maximumCARBytes: genesis.car.count
+    )
+
+    let pathA = try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "a")
+    let pathB = try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "b")
+    let pathC = try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "c")
+
+    let recA1 = try PublicRepositoryRecordCodec.prepare(
+      PublicRecord(["$type": .string(pathA.collection), "text": .string("a1")]),
+      for: pathA
+    )
+    let recB1 = try PublicRepositoryRecordCodec.prepare(
+      PublicRecord(["$type": .string(pathB.collection), "text": .string("b1")]),
+      for: pathB
+    )
+    let recA2 = try PublicRepositoryRecordCodec.prepare(
+      PublicRecord(["$type": .string(pathA.collection), "text": .string("a2")]),
+      for: pathA
+    )
+    let recC1 = try PublicRepositoryRecordCodec.prepare(
+      PublicRecord(["$type": .string(pathC.collection), "text": .string("c1")]),
+      for: pathC
+    )
+    let recC2 = try PublicRepositoryRecordCodec.prepare(
+      PublicRecord(["$type": .string(pathC.collection), "text": .string("c2")]),
+      for: pathC
+    )
+
+    // Commit 1: Create A and B
+    var tree = try await RepositoryMST.empty().adding(path: pathA, recordCID: recA1.cid)
+    tree = try await tree.adding(path: pathB, recordCID: recB1.cid)
+    var mat = try await tree.materialized()
+    var commit = try await PublicRepositoryCommitCodec.prepare(
+      did: did,
+      revision: "3jzfcijpj2z2b",
+      dataCID: mat.rootCID,
+      currentRevision: rev0,
+      signer: P256PublicRepositoryCommitSigner(privateKey: key)
+    )
+    var diffBlocks = [PublicRepositoryBlock(cid: commit.commitCID, bytes: commit.signedCommitBytes)]
+    for cid in mat.newBlocks.cids {
+      let blockBytes = try await mat.newBlocks.block(for: cid)
+      diffBlocks.append(.init(cid: cid, bytes: try XCTUnwrap(blockBytes)))
+    }
+    diffBlocks.append(.init(cid: recA1.cid, bytes: recA1.bytes))
+    diffBlocks.append(.init(cid: recB1.cid, bytes: recB1.bytes))
+    var sink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(diffBlocks), to: sink)
+    var event = RelayCommitEvent(
+      seq: 4, repo: did, commitCID: commit.commitCID, rev: "3jzfcijpj2z2b", since: rev0,
+      blocks: await sink.data,
+      ops: [
+        .init(action: .create, path: pathA.mstKey, cid: recA1.cid, prev: nil),
+        .init(action: .create, path: pathB.mstKey, cid: recB1.cid, prev: nil),
+      ],
+      prevDataCID: genesis.emptyMSTCID, time: time
+    )
+    state = try await state.applying(commit: event, verifier: verifier)
+    XCTAssertEqual(state.snapshot.records, [pathA.mstKey: recA1.cid, pathB.mstKey: recB1.cid])
+
+    // Verify full CAR export matches incremental state
+    var fullBlocks = diffBlocks
+    var fullSink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(fullBlocks), to: fullSink)
+    var fullVerified = try await RelayFullRepositoryVerifier.verify(
+      car: await fullSink.data,
+      expected: .init(did: did, revision: "3jzfcijpj2z2b", commitCID: commit.commitCID, dataCID: mat.rootCID),
+      verifier: verifier
+    )
+    XCTAssertNoThrow(try RelayFinalStateVerifier.verify(relay: state.snapshot, swan: fullVerified.snapshot))
+
+    // Commit 2: Update A, Create C
+    let prevDataCID1 = mat.rootCID
+    tree = try await tree.updating(path: pathA, recordCID: recA2.cid)
+    tree = try await tree.adding(path: pathC, recordCID: recC1.cid)
+    mat = try await tree.materialized()
+    commit = try await PublicRepositoryCommitCodec.prepare(
+      did: did,
+      revision: "3jzfcijpj2z2c",
+      dataCID: mat.rootCID,
+      currentRevision: "3jzfcijpj2z2b",
+      signer: P256PublicRepositoryCommitSigner(privateKey: key)
+    )
+    diffBlocks = [PublicRepositoryBlock(cid: commit.commitCID, bytes: commit.signedCommitBytes)]
+    for cid in mat.newBlocks.cids {
+      let blockBytes = try await mat.newBlocks.block(for: cid)
+      diffBlocks.append(.init(cid: cid, bytes: try XCTUnwrap(blockBytes)))
+    }
+    diffBlocks.append(.init(cid: recA2.cid, bytes: recA2.bytes))
+    diffBlocks.append(.init(cid: recC1.cid, bytes: recC1.bytes))
+    sink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(diffBlocks), to: sink)
+    event = RelayCommitEvent(
+      seq: 5, repo: did, commitCID: commit.commitCID, rev: "3jzfcijpj2z2c", since: "3jzfcijpj2z2b",
+      blocks: await sink.data,
+      ops: [
+        .init(action: .update, path: pathA.mstKey, cid: recA2.cid, prev: recA1.cid),
+        .init(action: .create, path: pathC.mstKey, cid: recC1.cid, prev: nil),
+      ],
+      prevDataCID: prevDataCID1, time: time
+    )
+    state = try await state.applying(commit: event, verifier: verifier)
+    XCTAssertEqual(state.snapshot.records, [
+      pathA.mstKey: recA2.cid,
+      pathB.mstKey: recB1.cid,
+      pathC.mstKey: recC1.cid,
+    ])
+
+    // Verify full CAR export after commit 2
+    let blockMap2 = try PublicRepositoryBlockMap(blocks: diffBlocks + fullBlocks)
+    let repoVal = try await RepositoryMSTValidation.validate(rootCID: mat.rootCID, blocks: blockMap2)
+    fullBlocks = [PublicRepositoryBlock(cid: commit.commitCID, bytes: commit.signedCommitBytes)]
+    for (cid, bytes) in repoVal.reachableMSTBlocks { fullBlocks.append(.init(cid: cid, bytes: bytes)) }
+    fullBlocks.append(.init(cid: recA2.cid, bytes: recA2.bytes))
+    fullBlocks.append(.init(cid: recB1.cid, bytes: recB1.bytes))
+    fullBlocks.append(.init(cid: recC1.cid, bytes: recC1.bytes))
+    fullSink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(fullBlocks), to: fullSink)
+    fullVerified = try await RelayFullRepositoryVerifier.verify(
+      car: await fullSink.data,
+      expected: .init(did: did, revision: "3jzfcijpj2z2c", commitCID: commit.commitCID, dataCID: mat.rootCID),
+      verifier: verifier
+    )
+    XCTAssertNoThrow(try RelayFinalStateVerifier.verify(relay: state.snapshot, swan: fullVerified.snapshot))
+
+    // Commit 3: Delete B, Update C
+    let prevDataCID2 = mat.rootCID
+    tree = try await tree.deleting(path: pathB)
+    tree = try await tree.updating(path: pathC, recordCID: recC2.cid)
+    mat = try await tree.materialized()
+    commit = try await PublicRepositoryCommitCodec.prepare(
+      did: did,
+      revision: "3jzfcijpj2z2d",
+      dataCID: mat.rootCID,
+      currentRevision: "3jzfcijpj2z2c",
+      signer: P256PublicRepositoryCommitSigner(privateKey: key)
+    )
+    diffBlocks = [PublicRepositoryBlock(cid: commit.commitCID, bytes: commit.signedCommitBytes)]
+    for cid in mat.newBlocks.cids {
+      let blockBytes = try await mat.newBlocks.block(for: cid)
+      diffBlocks.append(.init(cid: cid, bytes: try XCTUnwrap(blockBytes)))
+    }
+    diffBlocks.append(.init(cid: recC2.cid, bytes: recC2.bytes))
+    sink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(diffBlocks), to: sink)
+    event = RelayCommitEvent(
+      seq: 6, repo: did, commitCID: commit.commitCID, rev: "3jzfcijpj2z2d", since: "3jzfcijpj2z2c",
+      blocks: await sink.data,
+      ops: [
+        .init(action: .delete, path: pathB.mstKey, cid: nil, prev: recB1.cid),
+        .init(action: .update, path: pathC.mstKey, cid: recC2.cid, prev: recC1.cid),
+      ],
+      prevDataCID: prevDataCID2, time: time
+    )
+    state = try await state.applying(commit: event, verifier: verifier)
+    XCTAssertEqual(state.snapshot.records, [
+      pathA.mstKey: recA2.cid,
+      pathC.mstKey: recC2.cid,
+    ])
+
+    // Verify full CAR export after commit 3
+    let blockMap3 = try PublicRepositoryBlockMap(blocks: diffBlocks + fullBlocks)
+    let repoVal3 = try await RepositoryMSTValidation.validate(rootCID: mat.rootCID, blocks: blockMap3)
+    fullBlocks = [PublicRepositoryBlock(cid: commit.commitCID, bytes: commit.signedCommitBytes)]
+    for (cid, bytes) in repoVal3.reachableMSTBlocks { fullBlocks.append(.init(cid: cid, bytes: bytes)) }
+    fullBlocks.append(.init(cid: recA2.cid, bytes: recA2.bytes))
+    fullBlocks.append(.init(cid: recC2.cid, bytes: recC2.bytes))
+    fullSink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(fullBlocks), to: fullSink)
+    fullVerified = try await RelayFullRepositoryVerifier.verify(
+      car: await fullSink.data,
+      expected: .init(did: did, revision: "3jzfcijpj2z2d", commitCID: commit.commitCID, dataCID: mat.rootCID),
+      verifier: verifier
+    )
+    XCTAssertNoThrow(try RelayFinalStateVerifier.verify(relay: state.snapshot, swan: fullVerified.snapshot))
+  }
+
+  func testIncrementalCommitRejectsAdversarialMutationsAndForgedDiffs() async throws {
+    let key = try P256.Signing.PrivateKey(rawRepresentation: Data(repeating: 1, count: 32))
+    let verifier = P256PublicRepositoryCommitVerifier(publicKey: key.publicKey)
+    let genesis = try PublicRepositoryGenesisCodec.create(
+      did: did,
+      revision: rev0,
+      signingKey: key
+    )
+    let initial = try await RelayRepositoryVerificationState.fullSnapshot(
+      car: genesis.car,
+      expected: .init(did: did, revision: rev0, commitCID: genesis.commitCID, dataCID: genesis.emptyMSTCID),
+      verifier: verifier,
+      maximumCARBytes: genesis.car.count
+    )
+
+    let path = try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "a")
+    let record = try PublicRepositoryRecordCodec.prepare(
+      PublicRecord(["$type": .string(path.collection), "text": .string("hello")]),
+      for: path
+    )
+    let tree = try await RepositoryMST.empty().adding(path: path, recordCID: record.cid)
+    let mat = try await tree.materialized()
+    let commit = try await PublicRepositoryCommitCodec.prepare(
+      did: did,
+      revision: rev1,
+      dataCID: mat.rootCID,
+      currentRevision: rev0,
+      signer: P256PublicRepositoryCommitSigner(privateKey: key)
+    )
+    var validBlocks = [PublicRepositoryBlock(cid: commit.commitCID, bytes: commit.signedCommitBytes)]
+    for cid in mat.newBlocks.cids {
+      let blockBytes = try await mat.newBlocks.block(for: cid)
+      validBlocks.append(.init(cid: cid, bytes: try XCTUnwrap(blockBytes)))
+    }
+    validBlocks.append(.init(cid: record.cid, bytes: record.bytes))
+    let validSink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(validBlocks), to: validSink)
+
+    // 1. Forged dataCID in commit (pointing to genesis empty MST instead of actual mutated root)
+    let forgedCommit = try await PublicRepositoryCommitCodec.prepare(
+      did: did, revision: rev1, dataCID: genesis.emptyMSTCID, currentRevision: rev0,
+      signer: P256PublicRepositoryCommitSigner(privateKey: key)
+    )
+    var forgedBlocks = [PublicRepositoryBlock(cid: forgedCommit.commitCID, bytes: forgedCommit.signedCommitBytes)]
+    for cid in mat.newBlocks.cids {
+      let blockBytes = try await mat.newBlocks.block(for: cid)
+      forgedBlocks.append(.init(cid: cid, bytes: try XCTUnwrap(blockBytes)))
+    }
+    forgedBlocks.append(.init(cid: record.cid, bytes: record.bytes))
+    let forgedSink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: forgedCommit.commitCID, blocks: TestCARBlockStream(forgedBlocks), to: forgedSink)
+    let forgedEvent = RelayCommitEvent(
+      seq: 4, repo: did, commitCID: forgedCommit.commitCID, rev: rev1, since: rev0,
+      blocks: await forgedSink.data,
+      ops: [.init(action: .create, path: path.mstKey, cid: record.cid, prev: nil)],
+      prevDataCID: genesis.emptyMSTCID, time: time
+    )
+    await assertAsyncError(.finalDataCIDMismatch) {
+      _ = try await initial.applying(commit: forgedEvent, verifier: verifier)
+    }
+
+    // 2. Corrupted record block (record block bytes do not match expected collection type)
+    let badRecordBytes = Data([0xa1, 0x65, 0x24, 0x74, 0x79, 0x70, 0x65, 0x71, 0x61, 0x70, 0x70, 0x2e, 0x62, 0x73, 0x6b, 0x79, 0x2e, 0x67, 0x72, 0x61, 0x70, 0x68, 0x2e, 0x66, 0x6f, 0x6c, 0x6c, 0x6f, 0x77]) // wrong type graph.follow
+    let badRecordCID = CID.fromDAGCBOR(badRecordBytes)
+    let badTree = try await RepositoryMST.empty().adding(path: path, recordCID: badRecordCID)
+    let badMat = try await badTree.materialized()
+    let badCommit = try await PublicRepositoryCommitCodec.prepare(
+      did: did, revision: rev1, dataCID: badMat.rootCID, currentRevision: rev0,
+      signer: P256PublicRepositoryCommitSigner(privateKey: key)
+    )
+    var badBlocks = [PublicRepositoryBlock(cid: badCommit.commitCID, bytes: badCommit.signedCommitBytes)]
+    for cid in badMat.newBlocks.cids {
+      let blockBytes = try await badMat.newBlocks.block(for: cid)
+      badBlocks.append(.init(cid: cid, bytes: try XCTUnwrap(blockBytes)))
+    }
+    badBlocks.append(.init(cid: badRecordCID, bytes: badRecordBytes))
+    let badSink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: badCommit.commitCID, blocks: TestCARBlockStream(badBlocks), to: badSink)
+    let badEvent = RelayCommitEvent(
+      seq: 4, repo: did, commitCID: badCommit.commitCID, rev: rev1, since: rev0,
+      blocks: await badSink.data,
+      ops: [.init(action: .create, path: path.mstKey, cid: badRecordCID, prev: nil)],
+      prevDataCID: genesis.emptyMSTCID, time: time
+    )
+    await assertAsyncError(.invalidRepositoryCAR) {
+      _ = try await initial.applying(commit: badEvent, verifier: verifier)
+    }
+
+    // 3. Missing record block in diffBlocks
+    let missingRecordBlocks = validBlocks.filter { $0.cid != record.cid }
+    let missingSink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(missingRecordBlocks), to: missingSink)
+    let missingRecordEvent = RelayCommitEvent(
+      seq: 4, repo: did, commitCID: commit.commitCID, rev: rev1, since: rev0,
+      blocks: await missingSink.data,
+      ops: [.init(action: .create, path: path.mstKey, cid: record.cid, prev: nil)],
+      prevDataCID: genesis.emptyMSTCID, time: time
+    )
+    await assertAsyncError(.invalidRepositoryCAR) {
+      _ = try await initial.applying(commit: missingRecordEvent, verifier: verifier)
+    }
+
+    // 4. Missing MST block in diffBlocks
+    if let mstCID = mat.newBlocks.cids.first {
+      let missingMSTBlocks = validBlocks.filter { $0.cid != mstCID }
+      let missingMSTSink = TestCARSink()
+      _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(missingMSTBlocks), to: missingMSTSink)
+      let missingMSTEvent = RelayCommitEvent(
+        seq: 4, repo: did, commitCID: commit.commitCID, rev: rev1, since: rev0,
+        blocks: await missingMSTSink.data,
+        ops: [.init(action: .create, path: path.mstKey, cid: record.cid, prev: nil)],
+        prevDataCID: genesis.emptyMSTCID, time: time
+      )
+      await assertAsyncError(.invalidRepositoryCAR) {
+        _ = try await initial.applying(commit: missingMSTEvent, verifier: verifier)
+      }
+    }
+  }
 
   func testSyncVerifierTreatsCommitOnlyCARAsAnnouncementNotDiffOrSnapshot() async throws {
     let key = try P256.Signing.PrivateKey(rawRepresentation: Data(repeating: 1, count: 32))
