@@ -47,6 +47,57 @@ final class PublicRepositoryImportQueryPlanTests: XCTestCase {
             "reachable projection pagination must advance through the CID key: \(details)"
         )
     }
+    func testReachableProjectionPagesWithBlockJoinUseCIDPrimaryKeyWithoutTemporarySort() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "SwanPublicImportJoinPlan-\(UUID().uuidString)"
+            )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let database = try await SQLiteAccountDatabase(
+            dataDirectory: root,
+            did: "did:plc:abcdefghijklmnopqrstuvwx"
+        )
+        defer { Task { try? await database.close() } }
+
+        let plan = try await database.connection.query(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT r.cid, r.kind, b.bytes
+            FROM public_repository_import_reachable r
+            LEFT JOIN public_repository_import_blocks b
+              ON b.session_id = r.session_id AND b.cid = r.cid
+            WHERE r.session_id = ? AND r.kind = ? AND EXISTS (
+                SELECT 1 FROM public_repository_import_sessions
+                WHERE session_id = ? AND expires_at > ?
+            ) AND r.cid > ?
+            ORDER BY r.cid
+            LIMIT ?
+            """,
+            [
+                .text("session"), .text("record"),
+                .text("session"), .integer(100),
+                .text(""), .integer(256),
+            ]
+        )
+        let details = plan.compactMap {
+            $0.column("detail")?.string?.uppercased()
+        }
+        XCTAssertFalse(
+            details.contains { $0.contains("USE TEMP B-TREE") },
+            "reachable projection join pagination must not sort a full staging page: \(details)"
+        )
+        XCTAssertTrue(
+            details.contains { $0.contains("PUBLIC_REPOSITORY_IMPORT_REACHABLE") || $0.contains("PRIMARY KEY") || $0.contains("INDEX") },
+            "reachable projection join pagination must advance through the CID key: \(details)"
+        )
+    }
+
 
     func testRecordIndexPagesUseCompositePrimaryKeyWithoutTemporarySort() async throws {
         let root = FileManager.default.temporaryDirectory

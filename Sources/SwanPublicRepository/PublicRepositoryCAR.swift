@@ -30,6 +30,11 @@ public protocol PublicRepositoryCARFrameSink: Sendable {
         receivedByteCount: Int,
         frameCount: Int
     ) async throws
+    func flush() async throws
+}
+
+extension PublicRepositoryCARFrameSink {
+    public func flush() async throws {}
 }
 
 public struct PublicRepositoryCARParseResult: Sendable, Equatable {
@@ -450,6 +455,7 @@ public enum PublicRepositoryCAR {
                 frameCount: blockCount
             )
         }
+        try await sink.flush()
         return .init(
             rootCID: root,
             receivedByteCount: reader.receivedByteCount,

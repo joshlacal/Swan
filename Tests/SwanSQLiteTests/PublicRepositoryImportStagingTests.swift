@@ -949,6 +949,70 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
         }
     }
 
+    func testBatchedBlockStagingAcrossBatchBoundariesWithDuplicates() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            try? await fixture.database.close()
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
+        let binding = try binding(requestID: "batch-staging-dup", baseCID: fixture.initial.commitCID)
+
+        var frames = try await fixture.blocks()
+        // Duplicate existing blocks within the stream to test in-batch and cross-batch deduplication
+        if let first = frames.first {
+            frames.append(first)
+            frames.insert(first, at: frames.count / 2)
+        }
+        let car = try await encodeCAR(root: fixture.prepared.state.commitCID, frames: frames)
+        let source = InstrumentedCARSource(data: car, chunkBytes: 64 * 1024)
+
+        let result = try await testCoordinator(fixture.database).importRepository(
+            from: source,
+            binding: binding,
+            verifier: P256PublicRepositoryCommitVerifier(publicKey: fixture.key.publicKey),
+            createdAt: 100,
+            expiresAt: 200
+        )
+        XCTAssertEqual(result.state, fixture.prepared.state)
+    }
+
+    func testBatchBlockStagingDuplicateConflictFailsAtomically() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            try? await fixture.database.close()
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
+        let binding = try binding(requestID: "batch-dup-conflict", baseCID: fixture.initial.commitCID)
+
+        let sessionOutcome = try await fixture.database.createPublicRepositoryImportSession(
+            binding: binding,
+            createdAt: 100,
+            expiresAt: 200,
+            now: 100
+        )
+        guard case let .staged(session) = sessionOutcome else {
+            XCTFail("expected staged session")
+            return
+        }
+
+        let block1 = PublicRepositoryBlock(cid: fixture.initial.commitCID, bytes: Data([1, 2, 3, 4]))
+        let block2 = PublicRepositoryBlock(cid: fixture.initial.commitCID, bytes: Data([5, 6, 7, 8]))
+
+        // Staging a batch containing identical CID with conflicting bytes must throw duplicateBlockConflict
+        do {
+            try await fixture.database.stagePublicRepositoryCARBlocks(
+                sessionID: session.id,
+                blocks: [block1, block2],
+                receivedByteCount: 100,
+                frameCount: 2,
+                now: 100
+            )
+            XCTFail("expected duplicateBlockConflict")
+        } catch let error as PublicRepositoryImportStagingError {
+            XCTAssertEqual(error, .duplicateBlockConflict)
+        }
+    }
+
     func testOptIn256MiBStagedCAR() async throws {
         guard ProcessInfo.processInfo.environment["SWAN_RUN_256MIB_CAR_STAGING"] == "1" else {
             throw XCTSkip("set SWAN_RUN_256MIB_CAR_STAGING=1 for the 256 MiB acceptance run")
