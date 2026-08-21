@@ -75,9 +75,11 @@ private actor ControllableDocuments: SwanDIDDocumentFetching {
     }
 }
 
+private struct TestAcknowledgementTimeoutError: Error, Sendable {}
+
 private actor TestAcknowledgement {
     private var signaled = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [CheckedContinuation<Void, Error>] = []
 
     func signal() {
         signaled = true
@@ -88,14 +90,33 @@ private actor TestAcknowledgement {
         }
     }
 
-    func wait() async {
+    func wait(timeoutSeconds: TimeInterval = 3) async throws {
         if signaled { return }
-        await withCheckedContinuation { continuation in
-            waiters.append(continuation)
+        let timer = Task { [weak self] in
+            try await Task.sleep(for: .seconds(timeoutSeconds))
+            await self?.timeout()
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            if signaled {
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+            }
+        }
+        timer.cancel()
+    }
+
+    private func timeout() {
+        guard !signaled else { return }
+        let continuations = waiters
+        waiters.removeAll()
+        for cont in continuations {
+            cont.resume(throwing: TestAcknowledgementTimeoutError())
         }
     }
 }
 private struct TestTimeoutError: Error, Sendable {}
+private struct TestStateError: Error, Sendable {}
 
 private final class BoundedJoinState<R: Sendable>: @unchecked Sendable {
     private enum State {
@@ -140,7 +161,11 @@ private final class BoundedJoinState<R: Sendable>: @unchecked Sendable {
     }
 }
 
-private func boundedJoin<T: Sendable>(_ task: Task<T, Error>, timeoutSeconds: TimeInterval = 3) async throws -> T {
+private func boundedJoin<T: Sendable>(
+    _ task: Task<T, Error>,
+    timeoutSeconds: TimeInterval = 3,
+    onInstalled: (@Sendable () async -> Void)? = nil
+) async throws -> T {
     let state = BoundedJoinState<T>()
     return try await withTaskCancellationHandler(
         operation: {
@@ -161,6 +186,11 @@ private func boundedJoin<T: Sendable>(_ task: Task<T, Error>, timeoutSeconds: Ti
             }
             return try await withCheckedThrowingContinuation { cont in
                 state.install(cont)
+                if let onInstalled {
+                    Task {
+                        await onInstalled()
+                    }
+                }
             }
         },
         onCancel: {
@@ -623,7 +653,7 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
                 }
             }
         }
-        await installed.wait()
+        try await installed.wait()
         state.complete(with: .success(100))
         // Duplicate completion ignored
         state.complete(with: .success(200))
@@ -642,14 +672,14 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
                 }
             }
         }
-        await installed.wait()
-        state.complete(with: .failure(TestTimeoutError()))
+        try await installed.wait()
+        state.complete(with: .failure(TestStateError()))
         // Subsequent completion ignored
         state.complete(with: .success(42))
         do {
             _ = try await boundedJoin(task)
-            XCTFail("should have failed with TestTimeoutError")
-        } catch is TestTimeoutError {
+            XCTFail("should have failed with TestStateError")
+        } catch is TestStateError {
             // Expected
         } catch {
             XCTFail("unexpected error: \(error)")
@@ -667,7 +697,7 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
                 }
             }
         }
-        await installed.wait()
+        try await installed.wait()
         state.complete(with: .failure(CancellationError()))
         // Subsequent completion ignored
         state.complete(with: .success(42))
@@ -705,16 +735,17 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
     }
 
     func testBoundedJoinWhenTaskCancelled() async throws {
-        let started = TestAcknowledgement()
+        let installed = TestAcknowledgement()
         let callerTask = Task {
             let task: Task<Int, Error> = Task {
-                await started.signal()
                 try await Task.sleep(for: .seconds(10))
                 return 42
             }
-            return try await boundedJoin(task, timeoutSeconds: 3)
+            return try await boundedJoin(task, timeoutSeconds: 3, onInstalled: {
+                await installed.signal()
+            })
         }
-        await started.wait()
+        try await installed.wait()
         callerTask.cancel()
         do {
             _ = try await callerTask.value

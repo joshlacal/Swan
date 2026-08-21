@@ -143,7 +143,7 @@ public enum RepositoryMSTCodec {
         return try encodeUnchecked(node)
     }
 
-    package static func encodeUnchecked(_ node: RepositoryMSTNode) throws -> Data {
+    static func encodeUnchecked(_ node: RepositoryMSTNode) throws -> Data {
         let entries: [Any] = node.entries.map { entry in
             OrderedCBORMap(entries: [
                 (key: "p", value: UInt64(entry.prefixLength)),
