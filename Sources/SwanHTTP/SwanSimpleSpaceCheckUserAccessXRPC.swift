@@ -5,7 +5,6 @@ import Petrel
 import SwanCore
 import SwanOAuth
 import SwanSpaces
-import SwanSpacesWire
 
 /// The complete capability for the generic PDS managing-app endpoint.  Its
 /// construction deliberately makes storage access unrepresentable.

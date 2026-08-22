@@ -6,7 +6,6 @@ import Petrel
 import SwanCore
 import SwanOAuth
 import SwanSpaces
-import SwanSpacesWire
 import SwanStorage
 
 /// The request-only capability for an authority's delegation exchange. It is

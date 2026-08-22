@@ -5,13 +5,13 @@ import HummingbirdTesting
 import HTTPTypes
 import Logging
 import NIOCore
+import Petrel
+import SwanSQLite
+import SwanSpaces
 import XCTest
 @testable import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
-import SwanSQLite
-import SwanSpaces
-import SwanSpacesWire
 
 final class SimpleSpaceCheckUserAccessHTTPTests: XCTestCase, @unchecked Sendable {
     fileprivate static let authority = "did:plc:abcdefghijklmnopqrstuvwx"

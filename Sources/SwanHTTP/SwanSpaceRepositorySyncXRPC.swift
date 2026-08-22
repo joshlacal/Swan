@@ -6,7 +6,6 @@ import Petrel
 import SwanCore
 import SwanOAuth
 import SwanSpaces
-import SwanSpacesWire
 import SwanStorage
 
 /// The narrowly composed capability for the two read-only incremental-sync

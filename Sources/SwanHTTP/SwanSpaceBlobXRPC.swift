@@ -6,7 +6,6 @@ import Petrel
 import SwanCore
 import SwanOAuth
 import SwanSpaces
-import SwanSpacesWire
 import SwanStorage
 
 private let maximumPermissionedBlobTransferBytes = 256 * 1024 * 1024

@@ -4,7 +4,6 @@ import SwanCore
 import SwanOAuth
 import SwanSQLite
 import SwanSpaces
-import SwanSpacesWire
 import SwanStorage
 
 /// One operator-configured service destination. The endpoint is selected from

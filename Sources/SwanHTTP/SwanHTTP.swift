@@ -5,6 +5,7 @@ import HummingbirdWebSocket
 import HTTPTypes
 import Logging
 import NIOCore
+import Petrel
 import ServiceLifecycle
 import SwanAccounts
 import SwanCore

@@ -6,7 +6,6 @@ import Petrel
 import SwanCore
 import SwanOAuth
 import SwanSpaces
-import SwanSpacesWire
 import SwanStorage
 
 /// The one capability required to expose a user's PDS delegation endpoint.

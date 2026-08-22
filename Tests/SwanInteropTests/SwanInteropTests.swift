@@ -184,8 +184,8 @@ final class SwanInteropTests: XCTestCase {
 
         let text = try String(contentsOf: fixture.generatedWireManifestURL, encoding: .utf8)
         let mutated = text.replacingOccurrences(
-            of: "Sources/SwanSpacesWire/Generated/",
-            with: "Sources/SwanSpacesWire/Generated/../Generated/"
+            of: "Sources/SwanSpacesWire/",
+            with: "Sources/SwanSpacesWire/../SwanSpacesWire/"
         )
         try fixture.replaceGeneratedWireManifest(Data(mutated.utf8))
 
@@ -1596,7 +1596,7 @@ private final class ProfileFixture {
         try data.write(to: generatedWireManifestURL)
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         try replaceInProfile(
-            "a5428bd2edd32d2d2a605e41fb46816a14e3a9985ede60b56f3e50f6ca180387",
+            "7e7fe09868a7fcda0c6ab824ebe19e7f64ba147db63fd02a27762ed538e02704",
             with: digest
         )
     }

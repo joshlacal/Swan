@@ -4,7 +4,6 @@ import SwanCore
 import SwanOAuth
 import SwanSpaces
 import SwanStorage
-import SwanSpacesWire
 
 /// Deterministic laboratory-only mutation applied after a bounded recovery
 /// response has been spooled and before the normal streaming verifier sees it.

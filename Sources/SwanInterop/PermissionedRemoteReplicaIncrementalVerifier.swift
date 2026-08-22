@@ -3,7 +3,6 @@ import Petrel
 import SwanCore
 import SwanOAuth
 import SwanSpaces
-import SwanSpacesWire
 import SwanStorage
 
 public enum PermissionedRemoteReplicaIncrementalVerificationError:

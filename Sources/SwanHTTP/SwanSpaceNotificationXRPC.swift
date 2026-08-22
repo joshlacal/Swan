@@ -6,7 +6,6 @@ import Petrel
 import SwanCore
 import SwanOAuth
 import SwanSpaces
-import SwanSpacesWire
 import SwanStorage
 
 /// The narrow capability for the proposal-0016 writer-discovery and
