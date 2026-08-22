@@ -1,566 +1,80 @@
 # Swan
 
-Swan is a Swift-native AT Protocol permissioned-data interoperability laboratory.
-It intentionally starts with protocol fidelity, durable local semantics, and
-cross-implementation fixtures rather than attempting to be a public production
-PDS on day one.
+Swan is a Swift-native AT Protocol server and permissioned-data interoperability engine. It provides an AT Protocol Personal Data Server (PDS) implementation, an OAuth 2.1 authorization server with DPoP, multi-factor authentication (TOTP and WebAuthn passkeys), a SvelteKit account portal, multi-plane SQLite storage, an XRPC proxy, and protocol testing harnesses.
 
-The active profile is `permissioned-data-0016-2026-07-30`. Its upstream pins
-and security boundary live in `Profiles/`.
+The active protocol profile is `permissioned-data-0016-2026-08-15`. Its upstream pins and security definitions live in `Profiles/`.
+
+## Scope and trust boundaries
+
+Swan is developed for protocol interoperability testing and self-hosted environments; it does not claim to be a general-purpose public production PDS on the open federation today.
+
+Permissioned data in Swan is access-controlled rather than end-to-end encrypted. A hosting PDS remains inside the trust boundary and is responsible for enforcing read and write capabilities across spaces and repositories.
+
+## Architecture
+
+Swan is organized around the following subsystems:
+
+- **HTTP runtime:** Built on Hummingbird 2 with structured concurrency and non-blocking I/O.
+- **Multi-plane SQLite storage:**
+  - `control.sqlite`: Account records, identity bindings, MFA factors, web portal sessions, OAuth tokens, and write notification outboxes.
+  - `<did>.sqlite`: Per-account databases containing public records, Merkle Search Tree (MST) blocks, signed commits, and private space records.
+  - `firehose.sqlite`: Event sequencing, event frames, and diff CAR slices for WebSocket streaming.
+  - All SQLite databases operate in WAL mode with `PRAGMA foreign_keys = ON`.
+- **Blob and key storage:** Content-addressed public and private blobs are stored in `blobs/`. Encrypted key envelopes protected by a Key Encryption Key (KEK) reside in `keys/`.
+- **Authentication and identity:** OAuth 2.1 with DPoP, scoped app passwords, Argon2id password hashing, and second-factor authentication using TOTP and WebAuthn passkeys.
+- **Account portal:** SvelteKit frontend in `web/`, served at `/account` and styled with daisyUI.
+- **XRPC proxy:** Namespace-based proxy routing for `app.bsky.*`, `chat.bsky.*`, `tools.ozone.*`, and moderation endpoints, with destination dispatch via the `atproto-proxy` header.
+
+## Build and run
+
+### Prerequisites
+
+- Swift 6.0 or later (macOS 15+ or Linux)
+- SQLite 3.40+
+
+### Local instance setup
+
+1. Build the project:
+   ```sh
+   swift build
+   ```
+
+2. Verify the offline protocol profile:
+   ```sh
+   swift run swan verify
+   ```
+
+3. Install a local test account:
+   ```sh
+   echo "test-password-123" > /tmp/swan-test-password.txt
+   chmod 0600 /tmp/swan-test-password.txt
+
+   swift run swan account install-local \
+     --data-directory .swan-data \
+     --did did:plc:example1234567890123456 \
+     --handle user.test \
+     --revision 3jxyz00000000 \
+     --password-file /tmp/swan-test-password.txt
+   ```
+
+4. Start the server:
+   ```sh
+   swift run swan serve --data-directory .swan-data --port 3000 --host 127.0.0.1
+   ```
 
 ## Documentation
 
-- 🏛️ **[Modular Architecture & Components](docs/architecture.md):** Hummingbird 2 runtime, SQLite dual-plane storage, OAuth 2.1 / DPoP, public firehose, and MFA subsystem.
-- 🚀 **[Production Deployment & Configuration Guide](docs/deployment-guide.md):** Docker & systemd setups, secrets management (`0600` files), CLI flags (`swan serve`), and reverse proxy configurations (Caddy/Nginx).
-- 🛠️ **[Operational Runbook & Disaster Recovery](docs/operational-runbook.md):** Health monitoring, online encrypted account backup/restore, key rotation, and SQLite database maintenance.
-- 📖 **[API & Protocol Reference](docs/api-reference.md):** Complete AT Protocol XRPC endpoints, OAuth 2.1 endpoints, account portal REST APIs, and loopback management APIs.
-- 📚 **[Documentation Home](docs/README.md):** Complete index of all technical and protocol specifications.
-
-## Development
-
-```sh
-swift test
-swift run swan verify
-swift run swan serve --data-directory .swan-data
-swift run swan lab semantic --output /tmp/swan-semantic.json
-# A real host-to-host run (tokens stay in environment variables):
-swift run swan lab live --mode public --body-file ./fixtures/public-put.json \
-  --repository did:plc:... --collection app.bsky.feed.post --rkey fixture-1 \
-  --producer-auth bearer --consumer-auth bearer \
-  --output /tmp/swan-live-public.json
-```
-
-`lab semantic` is an offline local gate: it uses two independent durable
-SQLite roots to exercise replay, ordering, retention-gap recovery, CAR
-verification, permissioned credentials, and public/private blob reachability.
-Its summary artifact is explicitly labeled `swan-durable-to-swan-durable` and
-does not count as the pinned TypeScript PDS matrix.
-
-`lab live` is the stateful network-backed runner. In `public` mode it performs
-`repo.putRecord` on the producer and compares its returned CID with a
-subsequent `repo.getRecord` on the consumer. In `permissioned` mode the member
-writes its repository with member OAuth/DPoP, obtains a delegation, exchanges
-it at the authority for a space credential, and reads the member repository
-through the authority with that read-only credential. Space credentials are
-never used as write capabilities. The default read host is `authority`; pass
-`--permissioned-read-host member` when the member repository is hosted by a
-different implementation, so the credential is verified at the repository
-host rather than against a second authority-local copy. Add
-`--provision-space` for a disposable
-authority/member setup when running against the Compose Swan host. Use
-`--producer-auth oauth` for Swan account OAuth; the handle/password values are
-read from the environment and fresh DPoP proofs are minted per request.
-`bearer` mode reads only the named token environment variable and is useful for
-a pinned reference host. The output artifact keeps only statuses, CIDs,
-response digests, and sanitized endpoint events; request bodies, values,
-credentials, and proofs are never written.
-
-To verify the terminal incremental-sync page and its reader-bound commit, add
-`--permissioned-list-ops`. The verifier recomputes the LtHash commitment,
-content-binding MAC, and author context signature; provide the repository
-author's public key through `SWAN_LAB_PERMISSIONED_COMMIT_KEY` (base64url
-secp256k1 bytes). The pinned TypeScript revision currently returns HTTP 500
-when `listRepoOps` includes values because its joined SQLite query leaves
-`space` ambiguous. Its supported metadata-only form can be exercised with
-`--permissioned-list-ops-exclude-values`; the artifact records
-`syncValuesIncluded: false` so this limitation is visible rather than hidden.
-Swan's own endpoint remains value-capable and is covered by its HTTP tests.
-
-For the stateful permissioned alpha result, add
-`--permissioned-stateful-matrix` to `lab live --mode permissioned`. It runs
-the existing create/read flow and requires explicit write/read CID convergence,
-the matching `listRepoOps` operation CID and revision, a verified signed
-LtHash commitment that matches the verified full-CAR recovery commitment,
-and recovered CAR records before the artifact passes. It automatically enables
-both terminal verifiers and therefore requires a value-bearing incremental page.
-`--permissioned-list-ops-exclude-values` is a separate metadata-only
-compatibility smoke for the stock pinned TypeScript branch; it deliberately
-reports `syncValuesIncluded: false` and must not be combined with the stateful
-matrix. Use the checked-in recovery overlay when the stateful alpha gate needs
-value-bearing incremental and full-CAR endpoints.
-
-The default Compose service intentionally remains the byte-for-byte pinned
-TypeScript image. That image currently has no `getRepo` implementation and
-its value-bearing `listRepoOps` query is not usable, so it cannot by itself
-prove the recovery half of this stateful matrix. For that explicit lab gate,
-populate the pinned cache first and invoke `interop/compose-recovery.sh`; the
-wrapper applies the checksum-pinned recovery overlay to a disposable image
-without changing `.interop-cache` or the reference source checkout. Treat
-results from that overlay as qualified recovery evidence, not as evidence
-that the unmodified upstream image supports those endpoints.
-
-Add `--permissioned-get-repo` to stream and verify the full two-root recovery
-CAR from the selected permissioned repository host. It uses the same explicit
-repository-author key pin and records only the HTTP status, record count, and
-commitment in the artifact.
-
-Public live runs can include `--blob-file <path>`. Put the literal
-`{{BLOB_CID}}` wherever the uploaded blob CID belongs in the JSON record body;
-the runner replaces that placeholder only after the upload response is
-validated, then verifies the blob bytes through `sync.getBlob`. The live blob
-fixture is intentionally bounded to 2 MiB; production HTTP upload/download
-paths remain streamed. A disposable body may also use the literal
-`{{REPOSITORY_DID}}` for its `repo` field; the runner replaces it with the
-freshly bootstrapped account DID so clean Compose runs do not depend on a
-generated identity being checked into a fixture.
-
-For public repository handoff testing, `lab import-public` streams the pinned
-reference host's `com.atproto.sync.getRepo` response into durable per-account
-SQLite staging and publishes it only after signature, MST, CID, and revision
-CAS verification:
-
-```sh
-SWAN_LAB_PUBLIC_REPO_KEY="$PUBLIC_REPO_KEY" \
-swift run swan lab import-public --remote-url https://pds.test \
-  --data-directory .swan-data --did did:plc:... \
-  --commit-key-algorithm secp256k1 --output /tmp/swan-public-import.json
-```
-
-The public import command requires an operator-supplied verification key; it
-does not resolve remote DID/PLC keys implicitly. Its output is sanitized and
-contains no record values, tokens, passwords, or private key material.
-
-For the disposable Compose laboratory, `--resolve-commit-key` enables the
-explicit pinned PLC resolver. It is permitted only with the laboratory PLC
-origin and host allowlist; production runs must provide an operator-approved
-key resolver instead. Add `--promote-public-blobs` to fetch each raw-CID blob
-referenced by the imported public records through
-`com.atproto.sync.getBlob?did=<repo-did>&cid=<cid>`, verify its SHA-256 CID,
-and adopt it in the receiver's public blob namespace. Promotion runs after
-the CAR commit is durable and reports only `promotedBlobCount` in the
-sanitized artifact.
-
-The cross-host TypeScript permissioned smoke uses the pinned reference PDS as
-the member repository and Swan as the authority. It can use either an
-operator-supplied static delegation public-key pin or the bounded, explicitly
-allowlisted laboratory PLC resolver below. The static-pin run proves credential
-issuance and repository-host verification, but is not by itself evidence of
-dynamic DID/PLC discovery.
-
-An operator may instead configure delegation-key discovery explicitly in a
-notification configuration, without making the request path choose an
-authority:
-
-```json
-{
-  "delegationKeyPLC": {
-    "origin": "http://reference-plc:2582",
-    "laboratory": true,
-    "allowlistedHost": "reference-plc",
-    "allowedIssuers": ["did:plc:abcdefghijklmnopqrstuvwx"]
-  }
-}
-```
-
-The issuer list is required, duplicate-free, and DID-validated. Swan uses the
-same bounded PLC state/audit verification, durable key-continuity checkpoint,
-negative cache, and process-wide lookup admission as credential-key discovery;
-local account keys and explicit pins always win, and a failed remote lookup is
-opaque and fail-closed. The checked-in Compose notification file deliberately
-does not enable this optional field; production origins must be HTTPS and
-laboratory HTTP is restricted to the configured host allowlist.
-
-To exercise the dynamic path against an already-running disposable Compose
-project, use the acceptance harness. It creates a fresh reference-PDS account,
-rebuilds the project-scoped Swan image, temporarily replaces only Swan with an
-ephemeral resolver configuration, runs the permissioned write/credential/read
-flow, restores the original container, and retains only a sanitized artifact:
-
-```sh
-export SWAN_INTEROP_SECRETS_DIR=/absolute/path/to/owner-only-lab-secrets
-export SWAN_DYNAMIC_DELEGATION_PROJECT=disposable-compose-project
-export SWAN_DYNAMIC_DELEGATION_OUTPUT=/absolute/path/to/sanitized-result.json
-Scripts/run-reference-member-dynamic-delegation-acceptance.sh
-```
-
-Set `SWAN_DYNAMIC_DELEGATION_NO_BUILD=1` only when the project-scoped image is
-already known to represent the current checkout. The harness never changes the
-checked-in notification configuration and restores the Compose-managed Swan
-container on success, failure, or interruption.
-
-To include value-bearing incremental sync and two-root full-CAR recovery in
-that cross-host witness, first start the disposable project with the
-checksum-pinned recovery overlay, then set `SWAN_DYNAMIC_DELEGATION_STATEFUL=1`:
-
-```sh
-SWAN_INTEROP_SECRETS_DIR=/absolute/path/to/owner-only-lab-secrets \
-SWAN_DYNAMIC_DELEGATION_PROJECT=disposable-recovery-project \
-SWAN_DYNAMIC_DELEGATION_STATEFUL=1 \
-SWAN_DYNAMIC_DELEGATION_NO_BUILD=1 \
-Scripts/run-reference-member-dynamic-delegation-acceptance.sh
-```
-
-This derives only the reference account's public `did:key` verification
-material from the lab PLC audit and keeps the resulting artifact sanitized and
-owner-only. It is qualified evidence for the disposable overlay; the default
-stock TypeScript image remains immutable and its known value-bearing
-`listRepoOps`/`getRepo` limitations are not hidden.
-
-For the reverse-authority placement, set
-`SWAN_DYNAMIC_DELEGATION_DIRECTION=authority`. This makes the disposable
-TypeScript account the space authority, keeps the provisioned Swan account as
-the member, and requires Swan to resolve the authority credential key from the
-allowlisted PLC audit rather than a checked-in pin:
-
-```sh
-SWAN_INTEROP_SECRETS_DIR=/absolute/path/to/owner-only-lab-secrets \
-SWAN_DYNAMIC_DELEGATION_PROJECT=disposable-compose-project \
-SWAN_DYNAMIC_DELEGATION_DIRECTION=authority \
-SWAN_DYNAMIC_DELEGATION_NO_BUILD=1 \
-Scripts/run-reference-member-dynamic-delegation-acceptance.sh
-```
-
-## Server Operation and Exposed Surfaces
-
-### Foreign handle resolution
-
-By default, Swan's `com.atproto.identity.resolveHandle` route answers only for accounts provisioned locally in `control.sqlite`. A query for any handle this host does not hold fails immediately with `InvalidRequest`.
-
-Passing `--enable-foreign-handle-resolution` (default off) makes `com.atproto.identity.resolveHandle` answer for handles this host does not hold, using the pinned DNS TXT and `/.well-known/atproto-did` resolver that also verifies did:web claims. This flag is the only thing that makes that anonymous route reach the network. To prevent Server-Side Request Forgery (SSRF) and scanning of internal infrastructure, reserved TLDs and non-public addresses are refused before any lookup is performed. Results are cached in memory (5 minutes for hits, 30 seconds for misses, with single-flight deduplication across concurrent lookups for the same handle).
-
-With the flag off, a client asking about someone else's handle gets `InvalidRequest` — which is a divergence from a reference PDS, since bsky.social answers such a handle with 200 and its DID.
-
-### OAuth browser surfaces and stylesheet maintenance
-
-The interactive OAuth browser surfaces — login, consent, and the second-factor ceremony — are one shared daisyUI implementation in `Sources/SwanHTTP/SwanBrowserPages.swift` used by both the production authorization server and the localhost development bridge.
-
-The stylesheet is inlined directly into served HTML and admitted by a `style-src 'sha256-…'` CSP hash derived at run time from the inlined stylesheet bytes (`SwanBrowserPages.browserStyleCSPSource`), so `default-src 'none'` holds with no `'unsafe-inline'` and no external origin. Themes follow `prefers-color-scheme` automatically.
-
-The stylesheet is embedded in `Sources/SwanHTTP/SwanBrowserStyleSheet.swift` and is tree-shaken during compilation. `Scripts/build-browser-css.sh` regenerates the stylesheet and MUST be run after changing any class name in `SwanBrowserPages.swift` or `ScopeDescription.swift`, because unused classes are omitted from the build.
-
-### Account portal
-
-The account portal at `/account` is a SvelteKit app in `web/`, built by the Dockerfile's `account-web-build` stage and served from the runtime image (at `/usr/local/share/swan/account`, or configured via `--account-portal-directory`). It is also styled with daisyUI to match the browser login surfaces. The legacy standalone stylesheet `web/static/auth-tokens.css` and the `/account/auth-tokens.css` route were removed in favor of this unified static frontend build.
-
-### XRPC proxy routing and destination dispatch
-
-Swan transparently proxies unsupported XRPC requests to upstream AT Protocol services. The XRPC proxy admits methods by namespace (`app.bsky.`, `chat.bsky.`, `tools.ozone.`, plus `com.atproto.moderation.createReport` and `com.atproto.label.queryLabels`), NOT by membership in the generated method registry, because that registry's lexicon pin trails upstream. When proxying was gated on registry membership, newly added upstream methods like `chat.bsky.convo.getUnreadCounts` and `app.bsky.video.*` were rejected with 404 because the local lexicon pin had not yet incorporated them.
-
-Methods in `chat.bsky.*` and `tools.ozone.*` require the client to name a destination with `atproto-proxy` (formatted as `<did>#<service-id>`). With no header only the configured AppView's own namespace is admissible, forwarding directly to the configured AppView (`--appview-url` / `--appview-did`). Requests for any other namespace without an explicit `atproto-proxy` header fail closed with 404. Swan-owned namespaces (`com.atproto.space.`, `blue.catbird.`) and local state methods within proxyable namespaces (`app.bsky.actor.getPreferences`, `app.bsky.actor.putPreferences`) are denied and never leave this host.
-
-### Operator diagnostics and failure logs
-
-To provide operational traceability without logging credentials or altering constant-time failure paths, Swan emits structured log lines for operations that previously left no server-side trace:
-
-- `legacy createSession rejected`: Logged when legacy password or app-password authentication fails on `com.atproto.server.createSession`. The log carries a fixed-vocabulary `stage=` (`identifier_unresolved`, `no_credential_matched`, `auth_factor_token_required`, `rate_limited`, `malformed_request`, `token_rejected`, `unavailable`) plus `factorToken=absent|empty|present`, never a credential. A failed password login previously produced an opaque 401 with no server-side trace at all; this log allows operators to distinguish bad passwords from clients submitting empty or unexpected factor tokens.
-- `xrpc pipethrough upstream failed`: Logged when an outbound request to an upstream service (such as the AppView or an `atproto-proxy` target) fails. The log carries `nsid=` (the requested XRPC method), `host=` (the destination hostname), and the transport `reason=` (such as DNS failure, connection timeout, or TLS handshake error). An upstream proxy 502 previously left no server-side trace at all; minted service tokens are never logged.
-
-## Disposable Compose interoperability lab
-
-The lab accepts no secret values through Compose environment interpolation.
-Before invoking `interop/compose.sh`, create an owner-only directory **outside
-this repository**, set it to mode `0700`, and create these owner-only regular
-files at mode `0600`:
-
-- `oauth-server-key`
-- `account-kek`
-- `operator-secret`
-- `authority.did`
-- `authority.handle`
-- `authority.password`
-- `member.did`
-- `member.handle`
-- `member.password`
-- `public-repo-revision`
-- `pds-dpop-secret`
-- `pds-jwt-secret`
-- `pds-admin-password`
-- `pds-repo-signing-key`
-- `pds-plc-rotation-key`
-
-Both `oauth-server-key` and `account-kek` contain URL-safe Base64 encodings of
-32-byte keys. The account identity files normally contain canonical DIDs/handles.
-For a fresh disposable lab, either DID file may instead contain exactly
-`generate`: bootstrap then creates the PLC-backed identity, records the generated
-DID in the durable data volume, and requires that same DID on later starts. This
-mode is explicit and is not accepted for production provisioning. `public-repo-revision`
-must be a valid repository-v3 revision. PDS files
-use the formats required by the pinned reference PDS; all files must be
-nonempty even though this preflight intentionally never prints their values.
-
-Set `SWAN_INTEROP_SECRETS_DIR` to that directory's absolute path. The wrapper
-rejects in-repository paths, symlinks, non-owner files, and group/other
-permissions before Docker is invoked:
-
-```sh
-export SWAN_INTEROP_SECRETS_DIR=/absolute/path/outside/this/repository
-./interop/compose.sh up
-```
-
-Host file UIDs normally do not match the image's `swan` or `node` UIDs. The
-network-isolated `swan-secrets-init` service therefore copies the validated
-external files into named volumes with container ownership and mode `0400`.
-This root service runs only the dedicated copy wrapper; it never invokes the
-Swan executable. `swan-bootstrap` receives the bootstrap-only copy, while the
-long-running `swan` service receives exactly three files —
-`oauth-server-key`, `account-kek`, and `email-proof-key` — from the
-`swan-runtime-secrets` volume. `operator-secret` is prepared into a **separate**
-`swan-operator-secrets` volume that this base topology never mounts; only the
-reference-relay overlay, the one topology that passes `--management-port`,
-mounts it, at `/run/secrets/swan-operator`. The reference PDS loads its prepared
-files internally through an unprivileged wrapper, so secret values never appear
-in the Compose model.
-
-> **Upgrading an existing lab:** `operator-secret` used to be copied into
-> `swan-runtime-secrets`. Docker never re-initialises a named volume that
-> already has content, so an operator who merely restarts keeps the stale copy
-> and the runtime keeps reading it. Destroy the volumes first:
->
-> ```sh
-> ./interop/compose.sh down -v
-> ```
->
-> `down` without `-v` is not sufficient.
-
-Startup is ordered as follows:
-
-1. `swan-secrets-init` and `swan-data-init` prepare owner-correct secret/data
-   volumes without network access.
-2. Unprivileged `swan-bootstrap` creates disposable authority and member
-   accounts through the reference PLC's prepare/activate lifecycle. It uses a
-   static handle proof only for this local laboratory bootstrap; production
-   account activation continues to use network handle verification. The
-   generated PLC-backed identities and signed public genesis records are
-   durable under the Swan data volume.
-3. Unprivileged `swan` starts with local-space interop enabled behind Caddy;
-   its healthcheck performs a bounded HTTP request to `/health`, so an
-   executable that has not bound the listener cannot satisfy Compose readiness.
-4. The pinned reference PLC and PDS must answer their own `/_health` and
-   `/xrpc/_health` endpoints before the reference PDS or Toxiproxy setup is
-   considered ready.
-5. Caddy creates its local CA; its healthcheck gates `caddy-ca-ready`, which
-   copies the public root certificate into an unprivileged read-only trust
-   volume.
-
-Caddy on loopback port 443 is the sole host ingress and owns the in-network
-`swan.test` and `pds.test` aliases. Mailpit and Toxiproxy have no published
-ports. The Compose `scenario-runner` remains an inert trust-handoff service;
-stateful runs use an explicit one-shot `docker run` on the lab network so the
-runner's credentials and request bodies are never part of the Compose model.
-The same one-shot path runs the sanitized six-fault endpoint matrix.
-
-`Scripts/verify-interop-lab.sh` statically enforces this topology, and
-`Scripts/test-verify-interop-lab.sh` pressure-tests the verifier with unsafe
-privilege, dependency, interpolation, mount, runner, and readiness mutations.
-Normal Compose also loads the checked-in
-`interop/notification-config.json`, but **not** from the runtime image: it is
-carried by the lab-only `interop-notification-config` Dockerfile stage, and the
-network-isolated `swan-notification-config-init` service publishes it into the
-`swan-notification-config` named volume, which `swan` mounts read-only at
-`/etc/swan/interop`. A named volume rather than a host bind keeps the path
-portable and operator-unwritable, and keeps a laboratory PLC configuration out
-of every runtime image.
-The Swan container root filesystem is read-only; only its bounded
-`/tmp` tmpfs and named data volume are writable. Normal Compose explicitly
-enables durable notification delivery, so startup installs the outbox recovery
-service instead of merely loading receiver verification material.
-
-The checked-in notification file is strictly disposable lab routing plus public
-verification configuration. It has no secret, private-key, password, token,
-recipient binding, or static key fields. Its sole authority route binds the
-fixed restart-scenario DID and service-JWT audience to
-`http://localhost:3001`, with the final peer pinned to `127.0.0.1`; there is no
-wildcard or request-controlled destination. Its credential-key resolver uses
-the pinned laboratory PLC origin (`reference-plc`) with an explicit host
-allowlist. Production or cross-host notification pins remain an
-operator-supplied configuration outside this repository.
-
-The reference PLC uses the pinned `@did-plc/server` validator behind a small
-file-backed laboratory adapter. Accepted operation bodies are written to an
-owner-only, atomically replaced `reference-plc-data` volume and replayed
-through the pinned validator before the listener starts. A malformed or
-tampered state file fails closed instead of silently resetting the PLC registry.
-The focused persistence gate is:
-
-```sh
-interop/test-reference-plc-persistence.sh
-```
-
-### Notification crash/restart acceptance
-
-Run the durable outbox closure against a disposable Compose project:
-
-```sh
-export SWAN_INTEROP_SECRETS_DIR=/absolute/path/outside/this/repository
-Scripts/run-notification-restart-acceptance.sh
-```
-
-The scenario installs two disposable local accounts while Swan is stopped,
-commits one real permissioned write through OAuth under a delivery-disabled
-seed process, verifies one opaque pending outbox row, and kills that process.
-It starts and waits for a loopback proxy before launching a recovery-enabled
-Swan process with the normal Compose image, volumes, config, and delivery flag.
-The proxy forwards `notifyWrite`, discards the first successful
-acknowledgement, and returns the second. It must observe exactly two successful,
-byte-identical forwards; this is not a claim that the deleted sender row
-retains an exact attempt count. Read-only SQLite assertions require the sender
-outbox to converge to empty while the authority retains exactly one receipt
-and one writer-state effect. A final start of the normal Compose Swan service
-must preserve that state without the proxy.
-
-The private record value and OAuth artifact exist only in container tmpfs. The
-proxy retains only counts and SHA-256 request digests, and the script prints no
-credentials, service-auth headers, event IDs, request bodies, or permissioned
-values. It tears down its uniquely named project and volumes on exit. Static
-verification proves the configuration and scenario contract; this acceptance
-is live Compose evidence only after the command itself completes successfully.
-
-### Clean-cache acceptance
-
-Run the reproducibility gate from a clean SwiftPM scratch path on macOS:
-
-```sh
-Scripts/run-clean-cache-acceptance.sh --mode macos
-```
-
-On Linux, provide the same external owner-only secret directory used for the
-lab. The runner copies the source into a disposable scratch directory, fetches
-the pinned reference archive into that copy, runs the static and Swift suites
-there, then rebuilds the Compose images with `--no-cache` and waits for all
-required services. Its generated Compose project is torn down with volumes at
-the end; the scratch directory is retained for inspection.
-
-```sh
-export SWAN_INTEROP_SECRETS_DIR=/absolute/path/outside/this/repository
-Scripts/run-clean-cache-acceptance.sh --mode linux --wait-timeout 240
-```
-
-To qualify the value-bearing reference recovery overlay during the same
-disposable Compose build, add `--reference-variant recovery`. The default
-`pinned` variant remains the byte-for-byte upstream image, and both variants
-report build/health evidence only; run the live semantic harness separately.
-
-To retain the exact scratch location in CI, supply a path that does not yet
-exist:
-
-```sh
-Scripts/run-clean-cache-acceptance.sh --mode macos \
-  --scratch-path /tmp/swan-clean-cache-macos
-```
-
-Prior Linux Compose artifacts cover health checks, PLC-backed account bootstrap,
-Swan-to-Swan transport, public/private isolation, and endpoint-probe fault
-scenarios. They are not a clean-cache run of the current working copy and are
-not evidence of full Swan-to-TypeScript semantic convergence. The pinned
-TypeScript host also has disposable public-record and cross-host permissioned
-transport probes; those sanitized artifacts do not close the value-bearing sync,
-compaction-gap, reverse-authority, or cross-implementation OAuth gates.
-
-The current macOS clean-cache run completed the full Swift suite with zero
-failures. Its opt-in 256 MiB stress tests remain explicitly skipped unless
-`SWAN_CAR_256M_STRESS=1`, `SWAN_RUN_256MIB_CAR_STAGING=1`, and
-`SWAN_RUN_256MIB_PUBLIC_GET_REPO=1` are supplied.
-
-### Pinned wire generation
-
-Normal Swift builds use only the checked-in `Sources/SwanSpacesWire/Generated`
-sources; they do not download lexicons or invoke Petrel. Regeneration is an
-explicit, profile-pinned operation. Materialize the pinned reference archive
-first (so `.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354`
-exists), then select the reviewed Petrel generator workspace explicitly:
-
-```sh
-PETREL_GENERATOR_ROOT=/Users/joshlacalamito/Developer/Catbird+Petrel/Petrel-swan-generator \
-  ./Scripts/verify-wire-generation.sh
-
-# This is the intentional mutating form. It validates the profile, c2a1cdbe
-# generator parent, server-contract capability, and entrypoint before writing.
-PETREL_GENERATOR_ROOT=/Users/joshlacalamito/Developer/Catbird+Petrel/Petrel-swan-generator \
-  ./Scripts/regenerate-wire.sh
-```
-
-`verify-wire-generation.sh` regenerates into a disposable temporary directory
-and requires a byte-for-byte empty diff against the checked-in Swift output, so
-it is the CI gate. Neither command falls back to the ordinary `../Petrel`
-checkout. CI must materialize the pinned reference archive and the isolated
-Petrel generator source locally; the scripts perform no network access.
-Checksum validation goes through `Scripts/sha256.sh`, which uses `sha256sum`
-when available and otherwise macOS `shasum -a 256`.
-
-`Swan` never places permissioned records into a public repository, public blob
-namespace, log line, or fixture. Permissioned data is access-controlled, not
-end-to-end encrypted; a hosting PDS remains in the trust boundary.
-
-## Forum test vehicle
-
-`swan lab forum` is a deliberately minimal, deliberately ugly CLI test vehicle
-for the full permissioned-data social flow: a space authority, multiple
-per-user permissioned repositories on mixed hosts, and one syncer that merges
-them into a single thread. There is no UI, no branding, and no new lexicon: the
-forum space type is `blue.catbird.lab.forum`, records are plain
-`blue.catbird.lab.post` / `blue.catbird.lab.reply` collection names, and the
-space layer treats them as opaque values.
-
-### provision
-
-Create the space on an authority and add a member (reuses the
-`lab live --provision-space` mechanics):
-
-```sh
-export SWAN_LAB_AUTHORITY_HANDLE=...
-export SWAN_LAB_AUTHORITY_PASSWORD=...
-swift run swan lab forum provision \
-  --authority-url https://swan.test \
-  --space at://did:plc:.../space/blue.catbird.lab.forum/lab-1 \
-  --member-did did:plc:...
-```
-
-### post
-
-Write one record into the caller's own permissioned repository with OAuth
-space-create scope (the read-only space credential is never a write
-capability):
-
-```sh
-export SWAN_LAB_PRODUCER_HANDLE=...
-export SWAN_LAB_PRODUCER_PASSWORD=...
-swift run swan lab forum post \
-  --producer-url https://pds.test \
-  --space at://did:plc:.../space/blue.catbird.lab.forum/lab-1 \
-  --text "hello forum" \
-  --reply-to at://did:plc:.../space/blue.catbird.lab.forum/lab-1/did:plc:.../blue.catbird.lab.post/2222222222222
-```
-
-`--rkey` defaults to a fresh sortable TID; `--collection` defaults to
-`blue.catbird.lab.post`. A reply is stored as `reply: {root, parent}` like
-`app.bsky.feed.post`, with `--reply-root` defaulting to `--reply-to`. The
-written repository DID is the OAuth subject (or `--repo` with bearer auth).
-
-### thread (the syncer)
-
-Acting as a consumer (e.g. Carol), the syncer mints one delegation token at
-the consumer's PDS, exchanges it at the authority for ONE space credential
-(delegation tokens are short-lived and single-use), and discovers the writer
-set via `com.atproto.space.listRepos`. For each writer repo it fetches,
-verifies (signed commit + LtHash commitment), and durably applies the
-incremental ops with that same credential at the writer's own host, falling
-back to verified full-CAR recovery when incremental history is unavailable.
-Writer hosts are resolved from each writer DID's `#atproto_pds` PLC service
-endpoint (or an explicit `--writer-host did=url` override). The global
-`SWAN_LAB_PERMISSIONED_COMMIT_KEY` verifies every writer repo's signed commit;
-when writers use different repository signing keys, give each writer its own
-key as a `--writer-host did=url:did:key:z...` suffix (canonical PLC
-verification method), which overrides the global key for that writer. Finally
-it reads
-every record for the space from the durable receiver store, merges them into
-one thread, prints the thread as plain text, and writes a sanitized artifact
-(`--output`, mode 0600) containing counts, DIDs, CIDs, and post text only.
-
-```sh
-export SWAN_LAB_CONSUMER_HANDLE=...
-export SWAN_LAB_CONSUMER_PASSWORD=...
-export SWAN_LAB_PERMISSIONED_COMMIT_KEY=...   # base64url secp256k1 writer key
-swift run swan lab forum thread \
-  --consumer-url https://pds.test \
-  --authority-url https://swan.test \
-  --space at://did:plc:.../space/blue.catbird.lab.forum/lab-1 \
-  --receiver-did did:plc:... \
-  --data-directory .swan-data
-```
-
-Thread-merge semantics (pure `ForumThreadMerger`): a record whose `reply.root`
-is nil or points to itself is a root; every other record attaches under its
-`reply.parent`; a reply whose parent record is absent lands in the `unlinked`
-section (the orphaned-reply rule); roots and siblings are ordered by record
-time (`createdAt`, else the rkey TID timestamp), then revision, then URI;
-records from different writer DIDs merge into the same tree.
+- [Documentation index](docs/README.md): Complete index of all technical documentation and specifications.
+- [Modular architecture](docs/architecture.md): Runtime model, multi-plane storage architecture, MST repository engine, and event sequencing.
+- [Deployment guide](docs/deployment-guide.md): Production deployment with Docker and systemd, secrets management, and reverse proxy configuration.
+- [Operational runbook](docs/operational-runbook.md): Service health checks, encrypted backup and restore, key rotation, and SQLite maintenance.
+- [API reference](docs/api-reference.md): XRPC method catalog, OAuth 2.1 discovery and token endpoints, and account portal REST APIs.
+- [Server surfaces](docs/server-surfaces.md): Foreign handle resolution, OAuth browser styling, account portal configuration, and XRPC proxy routing.
+- [Interoperability laboratory](docs/interop-lab.md): Offline semantic testing, live network harnesses, Docker Compose testbed, and wire generation.
+- [Forum test vehicle](docs/forum-lab.md): Minimal multi-writer forum vehicle, subcommands, and thread merge ordering rules.
+- [Threat boundaries](docs/threat-boundaries.md): Security model, cryptographic accumulators, and PLC resolution caching.
+- [OAuth scope limits](docs/oauth-scope-limits.md): Input budgets, grant limits, and protocol admission rules.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).

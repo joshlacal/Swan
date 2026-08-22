@@ -1,32 +1,24 @@
-# Swan Documentation Index
+# Documentation index
 
-Welcome to the documentation suite for **Swan**, a Swift-native AT Protocol Personal Data Server (PDS) and permissioned-data interoperability engine.
+This directory contains technical documentation for Swan, a Swift-native AT Protocol Personal Data Server (PDS) and permissioned-data server running profile `permissioned-data-0016-2026-08-15`.
 
----
+## Core documentation
 
-## 📚 Core Documentation Library
+- [Swan architecture](architecture.md): Overview of the Hummingbird 2 server runtime, the three SQLite storage planes, the OAuth 2.1 and DPoP subsystem, the public firehose, the spaces engine, and the MFA subsystem.
+- [Server surfaces](server-surfaces.md): Technical specification for foreign handle resolution, interactive OAuth browser pages, the SvelteKit Account Management Portal, and XRPC proxy routing.
+- [Interoperability lab](interop-lab.md): Test harness and conformance matrix for validating Swan against reference AT Protocol implementations across public and permissioned-data profiles.
+- [Forum lab](forum-lab.md): Test environment and verification fixtures for multi-party permissioned-data spaces and threaded forum workloads.
+- [API reference](api-reference.md): Endpoint specifications for AT Protocol XRPC methods, OAuth 2.1 authorization endpoints, account portal REST APIs, and loopback management operations.
+- [Deployment guide](deployment-guide.md): Production deployment instructions covering Docker, native systemd service configuration, secrets management, CLI flags, and reverse proxy setup.
+- [Operational runbook](operational-runbook.md): Procedures for health monitoring, encrypted account backups, disaster recovery, key rotation, and database maintenance.
 
-| Document | Description | Target Audience |
-|---|---|---|
-| 🏛️ **[Modular Architecture & Component Overview](architecture.md)** | Deep dive into Hummingbird 2 runtime, SQLite dual-plane storage, OAuth 2.1 / DPoP subsystem, public firehose sequencer, MST repository engine, and MFA/Passkey infrastructure. | Engineers, Architects, Security Auditors |
-| 🚀 **[Production Deployment & Configuration Guide](deployment-guide.md)** | Production deployment guide covering Docker, native systemd service configuration, secrets management (`0600` owner-only files), CLI flags (`swan serve`), and reverse proxy setups (Caddy / Nginx). | DevOps, SREs, System Administrators |
-| 🛠️ **[Operational Runbook & Disaster Recovery](operational-runbook.md)** | Operational guide for health monitoring, online encrypted account backups (`swan backup`), disaster restore (`swan restore`), key rotation, database maintenance, and offline recovery. | SREs, On-Call Operators |
-| 📖 **[API & Protocol Reference](api-reference.md)** | Complete reference for all AT Protocol XRPC methods, OAuth 2.1 / DPoP discovery and token endpoints, Account Portal REST APIs (`/account/api/*`), and Loopback Management APIs. | Integrators, Frontend Developers, App Developers |
+## Security and protocol specifications
 
----
+- [Threat boundaries](threat-boundaries.md): Formal definitions of access control boundaries, cryptographic accumulators (LtHash), author commitments, and PLC key resolution caching.
+- [OAuth scope limits](oauth-scope-limits.md): Input budgets, grant limits, and protocol admission rules compared to upstream TypeScript reference implementations.
 
-## 🛡️ Security & Protocol Specifications
+## Research notes
 
-- **[Threat Boundaries & Security Model](threat-boundaries.md):** Formal definitions of access control boundaries, cryptographic accumulators (LtHash), author commitments, and PLC key resolution caching.
-- **[OAuth Scope Limits & Divergences](oauth-scope-limits.md):** Documentation of input budgets, expanded grant limits, and deliberate protocol admission rules compared to `@atproto` TypeScript references.
-- **[Permissioned Data Repin Scope](permissioned-data-repin-scope.md):** Pinned protocol profile specifications and upstream compatibility matrices.
+- [Permissioned data repin scope](notes/permissioned-data-repin-scope.md): Engineering analysis examining lexicon differences, scope grammars, and type requirements for re-pinning against upstream permissioned-data branches.
 
----
-
-## ⚡ Quick Start for Operators
-
-1. **Review System Prerequisites:** See [System Requirements in Deployment Guide](deployment-guide.md#1-prerequisites--system-requirements).
-2. **Generate Cryptographic Secrets:** Follow the [Zero-Secret Generation Script](deployment-guide.md#2-secrets-management--key-generation).
-3. **Deploy via Docker Compose:** Deploy using our [Hardened Production Compose File](deployment-guide.md#4-production-docker-deployment).
-4. **Configure Reverse Proxy:** Setup TLS and WebSocket streaming with [Caddy or Nginx Configurations](deployment-guide.md#6-reverse-proxy-configuration).
-5. **Verify Service Health:** Validate your installation using [Health Probes](operational-runbook.md#1-health-monitoring--metrics).
+The directories `docs/superpowers/` and `docs/security/` contain internal engineering logs and audit records; they are retained for development provenance rather than user-facing documentation.

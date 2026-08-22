@@ -1,174 +1,594 @@
-# Swan API & Protocol Reference
+# Swan API and protocol reference
 
-This document provides an exhaustive reference of all XRPC endpoints, OAuth 2.1 authorization server endpoints, account portal REST APIs, and loopback management interfaces implemented by Swan.
+Swan exposes four distinct HTTP surfaces across two network listeners:
 
----
-
-## 1. AT Protocol XRPC Surface
-
-All XRPC endpoints are mounted under the `/xrpc/` path prefix.
-
-### Server & Account Discovery
-| NSID | Method | Auth | Description |
-|---|---|---|---|
-| `com.atproto.server.describeServer` | `GET` | None | Returns server DID, available domain suffixes, invite code requirements, and active protocol profile ID. |
-| `community.lexicon.service.describe` | `GET` | None | Lists all supported XRPC method NSIDs served by this instance. |
-| `com.atproto.server.createAccount` | `POST` | Optional Invite / Proof | Provisions a new AT Protocol account, registers DID with PLC, and initializes an empty repository. |
-| `com.atproto.server.deleteAccount` | `POST` | Bearer Token / Password | Deletes an account and associated repository data. |
-| `com.atproto.server.requestPasswordReset` | `POST` | None | Generates an email password-reset token via the transactional email outbox. |
-| `com.atproto.server.resetPassword` | `POST` | Reset Token | Consumes reset token to establish a new account password. |
-| `com.atproto.server.createInviteCode` | `POST` | Admin / Authorized | Generates single-use or multi-use registration invite codes. |
-| `com.atproto.server.getAccountInviteCodes` | `GET` | Account Auth | Retrieves invite codes created by or allocated to the caller. |
-| `com.atproto.server.reserveSigningKey` | `POST` | Pre-auth | Reserves a public key for PLC identity preparation. |
-
-### Legacy Session Management (App Passwords)
-| NSID | Method | Auth | Description |
-|---|---|---|---|
-| `com.atproto.server.createSession` | `POST` | Password / App Password | Authenticates an account and mints legacy access and refresh JWTs. |
-| `com.atproto.server.getSession` | `GET` | Bearer Access JWT | Returns metadata for the currently active legacy session. |
-| `com.atproto.server.refreshSession` | `POST` | Bearer Refresh JWT | Rotates legacy access JWT and refresh JWT. |
-| `com.atproto.server.deleteSession` | `POST` | Bearer Refresh JWT | Revokes the active legacy session. |
-
-### Public Repository Reads & Mutations
-| NSID | Method | Auth | Description |
-|---|---|---|---|
-| `com.atproto.repo.describeRepo` | `GET` | None | Returns repo DID, handle, signing DID key, and collection list. |
-| `com.atproto.repo.getRecord` | `GET` | None | Fetches a single CBOR record by `repo`, `collection`, and `rkey`. |
-| `com.atproto.repo.listRecords` | `GET` | None | Lists records within a collection with pagination (`cursor`, `limit`). |
-| `com.atproto.repo.createRecord` | `POST` | OAuth / DPoP | Creates a new record in a collection with an auto-generated or specified TID. |
-| `com.atproto.repo.putRecord` | `POST` | OAuth / DPoP | Writes or replaces a record with CAS validation (`swapCommit`, `swapRecord`). |
-| `com.atproto.repo.deleteRecord` | `POST` | OAuth / DPoP | Deletes a record with CAS validation. |
-| `com.atproto.repo.applyWrites` | `POST` | OAuth / DPoP | Atomic batch of create, update, and delete operations. |
-| `com.atproto.repo.uploadBlob` | `POST` | OAuth / DPoP | Streams and stores a content-addressed binary blob (up to 2 MiB default). |
-| `com.atproto.repo.listMissingBlobs` | `GET` | OAuth / DPoP | Lists blob references present in records that have not been uploaded. |
-
-### Synchronization & Public Firehose
-| NSID | Method | Auth | Description |
-|---|---|---|---|
-| `com.atproto.sync.subscribeRepos` | `GET (WebSocket)` | None | Real-time firehose stream of sequential commits, syncs, identity updates, and tombstones. |
-| `com.atproto.sync.getRepo` | `GET` | None | Exports a repository's full state as a verified CAR v1 stream. |
-| `com.atproto.sync.getRepoStatus` | `GET` | None | Returns repo status, active state, and latest commit CID. |
-| `com.atproto.sync.getLatestCommit` | `GET` | None | Returns the latest signed commit CID and revision. |
-| `com.atproto.sync.getRecord` | `GET` | None | Returns record data and Merkle Search Tree proof. |
-| `com.atproto.sync.getBlocks` | `GET` | None | Fetches raw CAR blocks for specified CIDs. |
-| `com.atproto.sync.getBlob` | `GET` | None | Downloads public content-addressed blob bytes by `did` and `cid`. |
-| `com.atproto.sync.listBlobs` | `GET` | None | Lists public blob CIDs associated with an account repository. |
-| `com.atproto.sync.listRepoOps` | `GET` | None | Returns an incremental log of repository operations since a given revision. |
-| `com.atproto.sync.getHostStatus` | `GET` | None | Returns PDS host operational status. |
-| `com.atproto.sync.getBlobLimit` | `GET` | None | Returns upload and storage size limits for blobs. |
-
-### Identity & Preferences
-| NSID | Method | Auth | Description |
-|---|---|---|---|
-| `com.atproto.identity.resolveHandle` | `GET` | None | Resolves a handle to its corresponding DID. |
-| `com.atproto.identity.updateHandle` | `POST` | OAuth / DPoP | Updates the canonical handle associated with an account. |
-| `com.atproto.actor.getPreferences` | `GET` | OAuth / DPoP | Returns user-defined client preferences. |
-| `com.atproto.actor.putPreferences` | `POST` | OAuth / DPoP | Updates user-defined client preferences. |
-
-### Permissioned Spaces Plane
-| NSID | Method | Auth | Description |
-|---|---|---|---|
-| `com.atproto.space.getSpace` | `GET` | Space Credential | Retrieves metadata and member lists for a permissioned space. |
-| `com.atproto.space.listSpaces` | `GET` | Account Auth | Lists all permissioned spaces an account participates in. |
-| `com.atproto.space.listRepos` | `GET` | Space Credential | Lists writer repository DIDs participating in a space. |
-| `com.atproto.space.getDelegationToken` | `GET` | Account Auth | Mints a short-lived delegation token for authority exchange. |
-| `com.atproto.space.getSpaceCredential` | `POST` | Delegation Token | Exchanges delegation token at space authority for a read-only space credential. |
-| `com.atproto.space.getRecord` | `GET` | Space Credential | Reads a permissioned record within a space. |
-| `com.atproto.space.listRecords` | `GET` | Space Credential | Lists permissioned records within a space collection. |
-| `com.atproto.space.createRecord` | `POST` | Space OAuth | Writes a permissioned record into the caller's space repo. |
-| `com.atproto.space.putRecord` | `POST` | Space OAuth | Updates a permissioned record within a space. |
-| `com.atproto.space.deleteRecord` | `POST` | Space OAuth | Removes a permissioned record from a space. |
-| `com.atproto.space.applyWrites` | `POST` | Space OAuth | Executes batch mutations within a permissioned space. |
-| `com.atproto.space.getLatestCommit` | `GET` | Space Credential | Returns latest reader-bound signed commit CID and LtHash accumulator. |
-| `com.atproto.space.listRepoOps` | `GET` | Space Credential | Incremental sync log for space repository operations. |
-| `com.atproto.space.getRepo` | `GET` | Space Credential | Exports space repository CAR with dual-root recovery commitments. |
-| `com.atproto.space.getBlob` | `GET` | Space Credential | Downloads private blob bytes attached to a space record. |
-| `com.atproto.space.listBlobs` | `GET` | Space Credential | Lists private blob CIDs within a space. |
-| `com.atproto.space.registerNotify` | `POST` | Space Credential | Subscribes an endpoint to space write notifications. |
-| `com.atproto.space.unregisterNotify` | `POST` | Space Credential | Unsubscribes an endpoint from space write notifications. |
-| `com.atproto.space.notifyWrite` | `POST` | Outbox Auth | Ingests peer-pinned write notification from space writer. |
-| `com.atproto.space.notifySpaceDeleted`| `POST` | Outbox Auth | Ingests space deletion notification. |
-| `com.atproto.simplespace.checkUserAccess`| `GET` | Service JWT | Verifies user membership and permissions in a space. |
+1. **Public XRPC Surface**: Mounted under `/xrpc/` on the public listener (default port `3000`). Serves standard AT Protocol XRPC methods, local permissioned space extensions, and transparent AppView proxying.
+2. **OAuth 2.1 Authorization Server**: Mounted under `/.well-known/` and `/oauth/` on the public listener (default port `3000`). Implements RFC 8414 discovery, RFC 9126 Pushed Authorization Requests (PAR), interactive authorization, DPoP-constrained token exchange, and RFC 7009 token revocation.
+3. **Account Portal REST API**: Mounted under `/account/api/` on the public listener (default port `3000`). Drives the self-service web portal for credential management, multi-factor authentication (MFA/WebAuthn), scoped app passwords, `did:web` bindings, and data export.
+4. **Loopback Management REST API**: Mounted under `/v1/` on a dedicated loopback-only listener (default `127.0.0.1:3001`). Provides administrative controls for account lifecycle state, PLC genesis provisioning, and manual firehose synchronisation.
 
 ---
 
-## 2. OAuth 2.1 & DPoP Endpoints
+## Public XRPC surface
 
-| Endpoint | Method | RFC / Standard | Description |
+All XRPC endpoints are mounted under `/xrpc/`. Responses use JSON encoding with `Cache-Control: no-store` unless explicitly noted as binary CAR or blob streams.
+
+### Server discovery and metadata
+
+#### `com.atproto.server.describeServer`
+- **Method**: `GET`
+- **Authentication**: None
+- **Parameters**: None
+- **Returns**: JSON object containing `did` (service DID, e.g. `did:web:example.com`), `availableUserDomains` (array of supported domain suffixes), `inviteCodeRequired` (boolean, always `false` in standard Swan builds), and `swanProfile` (active permissioned profile ID, e.g. `permissioned-data-0016-2026-08-15`).
+
+#### `community.lexicon.service.describe`
+- **Method**: `GET`
+- **Authentication**: None
+- **Parameters**: None
+- **Returns**: JSON object containing `roles: ["pds"]` and `methods: [ { "$type": "community.lexicon.service.describe#nsid", "value": "<nsid>" } ]`. Enumerates all XRPC method NSIDs served locally by the active configuration.
+
+#### `com.atproto.identity.resolveHandle`
+- **Method**: `GET`
+- **Authentication**: None
+- **Parameters**: Query parameter `handle` (string, required).
+- **Returns**: JSON object `{ "did": "did:..." }`. Resolves local account handles against `control.sqlite`.
+
+---
+
+### Public repository reads
+
+Public read endpoints enforce bounded concurrency and memory admission via `SwanRequestBodyAdmissionConfiguration`.
+
+#### `com.atproto.repo.describeRepo`
+- **Method**: `GET`
+- **Authentication**: None
+- **Parameters**: Query parameter `repo` (DID or handle, required).
+- **Returns**: JSON object containing `handle`, `did`, `didDoc`, `collections` (array of NSIDs present in repository), and `handleIsCorrect` (boolean).
+
+#### `com.atproto.repo.getRecord`
+- **Method**: `GET`
+- **Authentication**: None
+- **Parameters**: Query parameters `repo` (DID or handle, required), `collection` (NSID, required), `rkey` (record key string, required), `cid` (CID string, optional).
+- **Returns**: JSON object `{ "uri": "at://...", "cid": "...", "value": { ... } }`.
+
+#### `com.atproto.repo.listRecords`
+- **Method**: `GET`
+- **Authentication**: None
+- **Parameters**: Query parameters `repo` (DID or handle, required), `collection` (NSID, required), `limit` (integer 1–100, default 50), `cursor` (string, optional), `reverse` (boolean, default `false`).
+- **Returns**: JSON object `{ "records": [ { "uri": "...", "cid": "...", "value": { ... } } ], "cursor": "..." }`.
+
+---
+
+### Public repository mutations
+
+All mutation endpoints require authentication and enforce granular scope authorization matching AT Protocol repository action semantics.
+
+#### `com.atproto.repo.createRecord`
+- **Method**: `POST`
+- **Authentication**: OAuth 2.1 DPoP token or Legacy Bearer JWT (requires scope for `create` action on target collection).
+- **Request Body**: JSON object `{ "repo": "did:...", "collection": "nsid", "record": { ... }, "rkey": "...", "validate": true, "swapCommit": "cid" }`.
+- **Returns**: JSON object `{ "uri": "at://...", "cid": "...", "commit": { "cid": "...", "rev": "..." }, "validationStatus": "valid" }`.
+
+#### `com.atproto.repo.putRecord`
+- **Method**: `POST`
+- **Authentication**: OAuth 2.1 DPoP token or Legacy Bearer JWT (requires scope for both `create` and `update` actions on target collection).
+- **Request Body**: JSON object `{ "repo": "did:...", "collection": "nsid", "rkey": "...", "record": { ... }, "validate": true, "swapRecord": "cid", "swapCommit": "cid" }`.
+- **Returns**: JSON object `{ "uri": "at://...", "cid": "...", "commit": { "cid": "...", "rev": "..." }, "validationStatus": "valid" }`.
+
+#### `com.atproto.repo.deleteRecord`
+- **Method**: `POST`
+- **Authentication**: OAuth 2.1 DPoP token or Legacy Bearer JWT (requires scope for `delete` action on target collection).
+- **Request Body**: JSON object `{ "repo": "did:...", "collection": "nsid", "rkey": "...", "swapRecord": "cid", "swapCommit": "cid" }`.
+- **Returns**: JSON object `{ "commit": { "cid": "...", "rev": "..." } }`.
+
+#### `com.atproto.repo.applyWrites`
+- **Method**: `POST`
+- **Authentication**: OAuth 2.1 DPoP token or Legacy Bearer JWT (requires matching scopes for each create, update, or delete operation in the batch).
+- **Request Body**: JSON object `{ "repo": "did:...", "writes": [ ... ], "validate": true, "swapCommit": "cid" }`.
+- **Returns**: JSON object `{ "commit": { "cid": "...", "rev": "..." }, "results": [ ... ] }`.
+
+#### `com.atproto.repo.uploadBlob`
+- **Method**: `POST`
+- **Authentication**: OAuth 2.1 DPoP token or Legacy Bearer JWT (requires blob upload permission).
+- **Request Body**: Raw binary octets (`*/*`) with `Content-Type` header (max default size 2 MiB, admitted through streaming spool).
+- **Returns**: JSON object `{ "blob": { "$type": "blob", "ref": { "$link": "<cid>" }, "mimeType": "...", "size": 12345 } }`.
+
+---
+
+### Synchronization and firehose
+
+#### `com.atproto.sync.subscribeRepos`
+- **Method**: `GET` (HTTP/1.1 WebSocket Upgrade)
+- **Authentication**: None
+- **Parameters**: Query parameter `cursor` (integer sequence number, optional).
+- **Returns**: WebSocket binary stream of CBOR-encoded frame objects (`#commit`, `#identity`, `#account`, `#sync`, `#tombstone`). Uses auto-ping liveness with a 4 KiB inbound frame limit.
+
+#### `com.atproto.sync.getLatestCommit`
+- **Method**: `GET`
+- **Authentication**: None
+- **Parameters**: Query parameter `did` (DID string, required).
+- **Returns**: JSON object `{ "cid": "...", "rev": "..." }`.
+
+#### `com.atproto.sync.getRepoStatus`
+- **Method**: `GET`
+- **Authentication**: None
+- **Parameters**: Query parameter `did` (DID string, required).
+- **Returns**: JSON object `{ "did": "did:...", "active": true, "status": "active", "rev": "..." }`.
+
+#### `com.atproto.sync.getRepo`
+- **Method**: `GET`
+- **Authentication**: None
+- **Parameters**: Query parameter `did` (DID string, required). Parameter `since` is not supported and is rejected with `400 InvalidRequest`.
+- **Returns**: Complete repository export as a verified CAR v1 binary stream (`application/vnd.ipld.car`).
+
+#### `com.atproto.sync.getBlob`
+- **Method**: `GET`
+- **Authentication**: None
+- **Parameters**: Query parameters `did` (DID string, required), `cid` (CID string, required).
+- **Returns**: Raw content-addressed binary bytes with original MIME `Content-Type`.
+
+---
+
+### Legacy session and app password management
+
+Legacy session management implements password and app password authentication for clients that do not support OAuth 2.1.
+
+#### `com.atproto.server.createSession`
+- **Method**: `POST`
+- **Authentication**: Password or App Password in request body.
+- **Request Body**: JSON object `{ "identifier": "<handle-or-email>", "password": "<password>", "authFactorToken": "<totp-code-optional>" }`.
+- **Returns**: JSON object containing `did`, `handle`, `email`, `emailConfirmed`, `accessJwt`, `refreshJwt`, `active`, and `status`.
+
+#### `com.atproto.server.refreshSession`
+- **Method**: `POST`
+- **Authentication**: `Authorization: Bearer <refreshJwt>`.
+- **Request Body**: Empty.
+- **Returns**: JSON object with rotated `accessJwt` and `refreshJwt`.
+
+#### `com.atproto.server.getSession`
+- **Method**: `GET`
+- **Authentication**: `Authorization: Bearer <accessJwt>`.
+- **Parameters**: None.
+- **Returns**: JSON object containing account status and metadata (`did`, `handle`, `email`, `emailConfirmed`, `active`).
+
+#### `com.atproto.server.getServiceAuth`
+- **Method**: `GET`
+- **Authentication**: `Authorization: Bearer <accessJwt>`.
+- **Parameters**: Query parameters `aud` (service DID, required), `exp` (integer timestamp, optional), `lxm` (lexicon method NSID, optional).
+- **Returns**: JSON object `{ "token": "<signed-inter-service-jwt>" }`.
+
+#### `com.atproto.server.deleteSession`
+- **Method**: `POST`
+- **Authentication**: `Authorization: Bearer <refreshJwt>`.
+- **Request Body**: Empty.
+- **Returns**: 200 OK empty response. Revokes the session.
+
+App password management is deliberately **not** available over XRPC. All three
+methods below are registered so that they fail closed with a stable
+`403 request_not_allowed` for both `GET` and `POST`, rather than falling
+through to a bare bearer check or to the upstream proxy.
+
+Each method requires an authenticated management session cookie plus a fresh
+step-up receipt. XRPC never carries management cookies, so no XRPC request can
+satisfy that requirement. Manage app passwords through the account portal
+instead; see the account portal REST API section.
+
+#### `com.atproto.server.createAppPassword`
+- **Method**: `POST`, `GET`
+- **Authentication**: Not satisfiable over XRPC.
+- **Returns**: `403` with body `{ "error": "request_not_allowed" }`.
+
+#### `com.atproto.server.listAppPasswords`
+- **Method**: `POST`, `GET`
+- **Authentication**: Not satisfiable over XRPC.
+- **Returns**: `403` with body `{ "error": "request_not_allowed" }`.
+
+#### `com.atproto.server.revokeAppPassword`
+- **Method**: `POST`, `GET`
+- **Authentication**: Not satisfiable over XRPC.
+- **Returns**: `403` with body `{ "error": "request_not_allowed" }`.
+
+---
+
+### Account email and password management
+
+#### `com.atproto.server.createAccount`
+- **Method**: `POST`
+- **Authentication**: None (governed by signup policy: open, invite, or closed; admits optional Turnstile token, invite code, or email proof).
+- **Request Body**: JSON object `{ "handle": "...", "password": "...", "email": "...", "inviteCode": "...", "turnstileToken": "..." }`.
+- **Returns**: JSON object `{ "did": "did:...", "handle": "...", "accessJwt": "", "refreshJwt": "" }`.
+
+#### `com.atproto.server.requestPasswordReset`
+- **Method**: `POST`
+- **Authentication**: None
+- **Request Body**: JSON object `{ "email": "user@example.com" }`.
+- **Returns**: 200 OK empty response (timing-equalized to prevent email enumeration). Emits recovery email token to transactional outbox.
+
+#### `com.atproto.server.resetPassword`
+- **Method**: `POST`
+- **Authentication**: Reset token from email.
+- **Request Body**: JSON object `{ "token": "<recovery-token>", "password": "<new-password>" }`.
+- **Returns**: 200 OK empty response.
+
+#### `com.atproto.server.requestEmailConfirmation`
+- **Method**: `POST`
+- **Authentication**: OAuth 2.1 DPoP token or Legacy Bearer JWT.
+- **Request Body**: Empty.
+- **Returns**: 200 OK empty response. Dispatches confirmation email token.
+
+#### `com.atproto.server.confirmEmail`
+- **Method**: `POST`
+- **Authentication**: OAuth 2.1 DPoP token or Legacy Bearer JWT.
+- **Request Body**: JSON object `{ "email": "user@example.com", "token": "<confirmation-token>" }`.
+- **Returns**: 200 OK empty response.
+
+#### `com.atproto.server.requestEmailUpdate` and `com.atproto.server.updateEmail`
+- **Method**: `POST`
+- **Authentication**: OAuth 2.1 DPoP token or Legacy Bearer JWT.
+- **Returns**: `403 Forbidden` (`accountEmailError(.forbidden)`).
+- **Operational Note**: Swan intentionally refuses email mutation over public XRPC. All email modifications must be performed via the authenticated Account Portal with step-up verification.
+
+---
+
+### Actor preferences
+
+Actor preferences are managed as local PDS state and are explicitly denied from AppView proxy forwarding.
+
+#### `app.bsky.actor.getPreferences`
+- **Method**: `GET`
+- **Authentication**: OAuth 2.1 DPoP token or Legacy Bearer JWT.
+- **Parameters**: None.
+- **Returns**: JSON object `{ "preferences": [ { "$type": "...", ... } ] }`.
+
+#### `app.bsky.actor.putPreferences`
+- **Method**: `POST`
+- **Authentication**: OAuth 2.1 DPoP token or Legacy Bearer JWT.
+- **Request Body**: JSON object `{ "preferences": [ ... ] }`.
+- **Returns**: 200 OK empty response.
+
+---
+
+### Deliberately unserved or divergent XRPC endpoints
+
+Swan intentionally closes or does not implement several reference PDS XRPC endpoints. Requests to these endpoints return structured `404 Not Found` (`public_endpoint_unavailable`) or `400 Bad Request`:
+
+| NSID | Expected method | Public status | Canonical alternative in Swan |
 |---|---|---|---|
-| `/.well-known/oauth-protected-resource` | `GET` | RFC 8414 / ATProto | Resource server metadata declaring issuer and supported scopes. |
-| `/.well-known/oauth-authorization-server` | `GET` | RFC 8414 / OAuth 2.1 | Authorization server metadata (endpoints, grant types, DPoP algs). |
-| `/.well-known/did.json` | `GET` | W3C DID Core | Service DID document containing verification keys and service endpoints. |
-| `/oauth/par` | `POST` | RFC 9126 (PAR) | Pushed Authorization Request endpoint. Returns `request_uri`. Requires DPoP proof. |
-| `/oauth/authorize` | `GET` | OAuth 2.1 | Interactive browser endpoint for authentication, MFA verification, and consent. |
-| `/oauth/authorize` | `POST` | OAuth 2.1 | Handles user credential submission and begins session. |
-| `/oauth/authorize/mfa` | `POST` | FIDO2 / TOTP | Consumes MFA challenge/response during OAuth flow. |
-| `/oauth/authorize/consent` | `POST` | OAuth 2.1 | Records user authorization decision (`approve` or `deny`). |
-| `/oauth/token` | `POST` | OAuth 2.1 / DPoP | Exchanges authorization code or refresh token for sender-constrained access tokens. |
+| `com.atproto.server.deleteAccount` | `POST` | `404 Not Found` | Loopback management API (`POST /v1/accounts/delete`) or Account Portal (`POST /account/api/lifecycle/delete`). |
+| `com.atproto.server.createInviteCode` | `POST` | `404 Not Found` | Not implemented. Swan does not issue runtime invite codes. |
+| `com.atproto.server.getAccountInviteCodes` | `GET` | `404 Not Found` | Not implemented. |
+| `com.atproto.server.reserveSigningKey` | `POST` | `404 Not Found` | Loopback management API (`POST /v1/accounts/plc/prepare`) or Account Portal. |
+| `com.atproto.identity.updateHandle` | `POST` | `404 Not Found` | Account Portal (`POST /account/api/identity/*`) or Loopback management API. |
+| `com.atproto.repo.listMissingBlobs` | `GET` | `404 Not Found` | Not implemented. |
+| `com.atproto.sync.getRecord` | `GET` | `404 Not Found` | Use `com.atproto.repo.getRecord`. |
+| `com.atproto.sync.getBlocks` | `GET` | `404 Not Found` | Use `com.atproto.sync.getRepo` for complete CAR exports. |
+| `com.atproto.sync.listBlobs` | `GET` | `404 Not Found` | Public sync listBlobs is not served; permissioned space sync provides `com.atproto.space.listBlobs`. |
+| `com.atproto.sync.listRepoOps` | `GET` | `404 Not Found` | Public sync listRepoOps is not served; permissioned space sync provides `com.atproto.space.listRepoOps`. |
+| `com.atproto.sync.getHostStatus` | `GET` | `404 Not Found` | Use `/health` or `describeServer`. |
+| `com.atproto.sync.getBlobLimit` | `GET` | `404 Not Found` | Not implemented. |
+| `com.atproto.space.getSpace` | `GET` | `404 Not Found` | Use `com.atproto.simplespace.getSpace`. |
+
+---
+
+## XRPC proxy routing and admission rules
+
+When an inbound request under `/xrpc/**` matches no exact local route, Swan evaluates it through `SwanXRPCProxyRouter` (`Sources/SwanHTTP/SwanXRPCProxyRouting.swift`).
+
+### Routing admission logic
+
+1. **Deny-list check**: Prefixes `com.atproto.space.` and `blue.catbird.` and exact NSIDs `app.bsky.actor.getPreferences` and `app.bsky.actor.putPreferences` are always denied with `403/404` and never leave the host.
+2. **Proxy header presence (`atproto-proxy`)**:
+   - If an `atproto-proxy: <did>#<service-id>` header is present, the NSID must match the proxyable namespace allow-list:
+     - Namespaces: `app.bsky.*`, `chat.bsky.*`, `tools.ozone.*`
+     - Exact NSIDs: `com.atproto.moderation.createReport`, `com.atproto.label.queryLabels`
+   - If the header targets the configured AppView DID and fragment, the request is forwarded directly to the configured endpoint. Otherwise, the destination DID document is resolved via HTTPS.
+3. **No proxy header (default route)**:
+   - Only requests with the `app.bsky.*` prefix are forwarded to the configured AppView (`appViewDID`). All other namespaces return `404 Not Found`.
+
+---
+
+## Permissioned spaces plane
+
+Swan implements the `permissioned-data-0016-2026-08-15` profile for access-controlled collaborative data spaces. All endpoints are mounted under `/xrpc/`.
+
+### Space lifecycle and membership (`com.atproto.simplespace.*`)
+
+#### `com.atproto.simplespace.createSpace`
+- **Method**: `POST`
+- **Authentication**: Account Auth (OAuth DPoP or Session).
+- **Request Body**: JSON object `{ "name": "<name>", "policy": "<policy-type>", "appAccess": "<access-mode>" }`.
+- **Returns**: JSON object containing created space DID and descriptor metadata.
+
+#### `com.atproto.simplespace.getSpace`
+- **Method**: `GET`
+- **Authentication**: Space Credential.
+- **Parameters**: Query parameter `space` (space DID string, required).
+- **Returns**: JSON object containing space declaration, member list, and policy attributes.
+
+#### `com.atproto.simplespace.updateSpace`
+- **Method**: `POST`
+- **Authentication**: Space Owner.
+- **Request Body**: JSON object `{ "space": "did:...", "name": "...", "policy": "...", "appAccess": "..." }`.
+- **Returns**: 200 OK empty response.
+
+#### `com.atproto.simplespace.deleteSpace`
+- **Method**: `POST`
+- **Authentication**: Space Owner.
+- **Request Body**: JSON object `{ "space": "did:..." }`.
+- **Returns**: 200 OK empty response.
+
+#### `com.atproto.simplespace.addMember`
+- **Method**: `POST`
+- **Authentication**: Space Owner.
+- **Request Body**: JSON object `{ "space": "did:...", "member": "did:...", "role": "admin" | "writer" | "reader" }`.
+- **Returns**: 200 OK empty response.
+
+#### `com.atproto.simplespace.removeMember`
+- **Method**: `POST`
+- **Authentication**: Space Owner.
+- **Request Body**: JSON object `{ "space": "did:...", "member": "did:..." }`.
+- **Returns**: 200 OK empty response.
+
+#### `com.atproto.simplespace.listMembers`
+- **Method**: `GET`
+- **Authentication**: Space Credential.
+- **Parameters**: Query parameters `space` (space DID string, required), `cursor` (optional), `limit` (integer, optional).
+- **Returns**: JSON object `{ "members": [ { "did": "...", "role": "..." } ], "cursor": "..." }`.
+
+#### `com.atproto.simplespace.checkUserAccess`
+- **Method**: `GET`
+- **Authentication**: Service JWT.
+- **Parameters**: Query parameters `space` (space DID, required), `user` (user DID, required).
+- **Returns**: JSON object `{ "hasAccess": true, "role": "writer" }`.
+
+---
+
+### Space delegation and credentials (`com.atproto.space.*`)
+
+#### `com.atproto.space.listSpaces`
+- **Method**: `GET`
+- **Authentication**: Account Auth.
+- **Parameters**: None.
+- **Returns**: JSON object `{ "spaces": [ { "space": "did:...", "name": "...", "role": "..." } ] }`.
+
+#### `com.atproto.space.getDelegationToken`
+- **Method**: `GET`
+- **Authentication**: Account Auth.
+- **Parameters**: Query parameters `space` (space DID, required), `targetDID` (service DID, required).
+- **Returns**: JSON object `{ "token": "<delegation-token-jwt>" }`.
+
+#### `com.atproto.space.getSpaceCredential`
+- **Method**: `POST`
+- **Authentication**: Delegation token or client attestation.
+- **Request Body**: JSON object `{ "delegationToken": "<delegation-jwt>" }`.
+- **Returns**: JSON object `{ "credential": "<space-read-credential>" }`.
+
+---
+
+### Space records and repository operations (`com.atproto.space.*`)
+
+#### `com.atproto.space.getRecord`
+- **Method**: `GET`
+- **Authentication**: Space Credential.
+- **Parameters**: Query parameters `space` (required), `repo` (required), `collection` (required), `rkey` (required), `cid` (optional).
+- **Returns**: JSON object `{ "uri": "at://...", "cid": "...", "value": { ... } }`.
+
+#### `com.atproto.space.listRecords`
+- **Method**: `GET`
+- **Authentication**: Space Credential.
+- **Parameters**: Query parameters `space` (required), `repo` (required), `collection` (required), `limit` (optional), `cursor` (optional), `reverse` (optional).
+- **Returns**: JSON object `{ "records": [ ... ], "cursor": "..." }`.
+
+#### `com.atproto.space.createRecord`
+- **Method**: `POST`
+- **Authentication**: Space OAuth or Writer Credential.
+- **Request Body**: JSON object `{ "space": "did:...", "repo": "did:...", "collection": "nsid", "record": { ... } }`.
+- **Returns**: JSON object `{ "uri": "at://...", "cid": "...", "commit": { ... } }`.
+
+#### `com.atproto.space.putRecord`
+- **Method**: `POST`
+- **Authentication**: Space OAuth or Writer Credential.
+- **Request Body**: JSON object `{ "space": "did:...", "repo": "did:...", "collection": "nsid", "rkey": "...", "record": { ... } }`.
+- **Returns**: JSON object `{ "uri": "at://...", "cid": "...", "commit": { ... } }`.
+
+#### `com.atproto.space.deleteRecord`
+- **Method**: `POST`
+- **Authentication**: Space OAuth or Writer Credential.
+- **Request Body**: JSON object `{ "space": "did:...", "repo": "did:...", "collection": "nsid", "rkey": "..." }`.
+- **Returns**: JSON object `{ "commit": { ... } }`.
+
+#### `com.atproto.space.applyWrites`
+- **Method**: `POST`
+- **Authentication**: Space OAuth or Writer Credential.
+- **Request Body**: JSON object `{ "space": "did:...", "repo": "did:...", "writes": [ ... ] }`.
+- **Returns**: JSON object `{ "commit": { ... }, "results": [ ... ] }`.
+
+---
+
+### Space blobs, sync, and notifications (`com.atproto.space.*`)
+
+#### `com.atproto.space.getBlob`
+- **Method**: `GET`
+- **Authentication**: Space Credential.
+- **Parameters**: Query parameters `space` (required), `did` (required), `cid` (required).
+- **Returns**: Private blob binary bytes.
+
+#### `com.atproto.space.listBlobs`
+- **Method**: `GET`
+- **Authentication**: Space Credential.
+- **Parameters**: Query parameters `space` (required), `did` (required), `cursor` (optional), `limit` (optional).
+- **Returns**: JSON object `{ "blobs": [ "<cid>" ], "cursor": "..." }`.
+
+#### `com.atproto.space.getLatestCommit`
+- **Method**: `GET` (also served under alias `com.atproto.space.getRepoState`)
+- **Authentication**: Space Credential.
+- **Parameters**: Query parameters `space` (required), `did` (required).
+- **Returns**: JSON object `{ "cid": "...", "rev": "...", "lthash": "..." }`.
+
+#### `com.atproto.space.listRepoOps`
+- **Method**: `GET`
+- **Authentication**: Space Credential.
+- **Parameters**: Query parameters `space` (required), `did` (required), `since` (optional rev string).
+- **Returns**: JSON object `{ "ops": [ ... ] }`.
+
+#### `com.atproto.space.getRepo`
+- **Method**: `GET`
+- **Authentication**: Space Credential.
+- **Parameters**: Query parameters `space` (required), `did` (required), `since` (optional).
+- **Returns**: CAR v1 binary stream of private space repository.
+
+#### `com.atproto.space.listRepos`
+- **Method**: `GET`
+- **Authentication**: Space Credential.
+- **Parameters**: Query parameter `space` (required).
+- **Returns**: JSON object `{ "repos": [ "did:..." ] }`.
+
+#### `com.atproto.space.registerNotify`
+- **Method**: `POST`
+- **Authentication**: Space Credential.
+- **Request Body**: JSON object `{ "space": "did:...", "endpoint": "https://..." }`.
+- **Returns**: 200 OK empty response.
+
+#### `com.atproto.space.unregisterNotify`
+- **Method**: `POST`
+- **Authentication**: Space Credential.
+- **Request Body**: JSON object `{ "space": "did:...", "endpoint": "https://..." }`.
+- **Returns**: 200 OK empty response.
+
+#### `com.atproto.space.notifyWrite`
+- **Method**: `POST`
+- **Authentication**: Outbox authorization / writer proof.
+- **Request Body**: JSON object `{ "space": "did:...", "repo": "did:...", "commit": "..." }`.
+- **Returns**: 200 OK empty response.
+
+#### `com.atproto.space.notifySpaceDeleted`
+- **Method**: `POST`
+- **Authentication**: Outbox authorization / space owner proof.
+- **Request Body**: JSON object `{ "space": "did:..." }`.
+- **Returns**: 200 OK empty response.
+
+---
+
+## OAuth 2.1 and authorization server endpoints
+
+Swan acts as an OAuth 2.1 Authorization Server and Protected Resource Server.
+
+| Path | Method | Standard | Description |
+|---|---|---|---|
+| `/.well-known/did.json` | `GET` | W3C DID Core | Publishes service DID document (`did:web:<host>`, service entry `#atproto_pds`). |
+| `/.well-known/oauth-protected-resource` | `GET` | RFC 8414 | Resource server metadata declaring issuer, resource URI, and supported scopes. |
+| `/.well-known/oauth-authorization-server` | `GET` | RFC 8414 | Authorization server metadata (endpoints, response types, DPoP signing algorithms). |
+| `/oauth/par` | `POST` | RFC 9126 (PAR) | Pushed Authorization Request endpoint. Requires `DPoP` header. Returns `{"request_uri": "urn:ietf:params:oauth:request_uri:...", "expires_in": 300}`. |
+| `/oauth/authorize` | `GET` | OAuth 2.1 | Renders the browser authentication and authorization challenge UI. |
+| `/oauth/authorize` | `POST` | OAuth 2.1 | Consumes primary account credentials submitted via browser. |
+| `/oauth/authorize/mfa` | `POST` | FIDO2 / TOTP | Consumes MFA response (TOTP or WebAuthn assertion) during OAuth flow. |
+| `/oauth/authorize/consent` | `POST` | OAuth 2.1 | Submits user consent decision (`approve` or `deny`) for requested scopes. |
+| `/oauth/token` | `POST` | OAuth 2.1 / DPoP | Exchanges authorization code or refresh token for sender-constrained DPoP access tokens. |
 | `/oauth/revoke` | `POST` | RFC 7009 | Revokes an access token or refresh token. |
+| `/health` | `GET` | Health Check | Returns plain text `OK` when the HTTP listener is operational. |
 
 ---
 
-## 3. Account Portal REST APIs
+## Account portal REST API
 
-All portal endpoints are mounted under `/account/api/` and require valid session cookies (`__Host-swan-session`) and anti-CSRF headers (`X-Swan-CSRF`).
+The account portal backend is mounted under `/account/api/`. Browser clients must maintain an authenticated cookie (`__Host-swan-session` or pre-auth session) and transmit the corresponding anti-CSRF token in the `X-Swan-CSRF` header on all mutating requests (`POST`, `DELETE`).
 
-### Authentication & Bootstrap
-| Path | Method | Description |
-|---|---|---|
-| `/account/api/signup/policy` | `GET` | Returns current registration policy (`closed`, `inviteRequired`, `openProtected`). |
-| `/account/api/bootstrap` | `GET` | Issues a pre-auth session and anti-CSRF token for unauthenticated pages. |
-| `/account/api/login` | `POST` | Submits handle and password; issues session or returns required MFA challenge. |
-| `/account/api/login/factor-challenge` | `POST` | Generates WebAuthn or TOTP challenge during login. |
-| `/account/api/login/factor` | `POST` | Submits WebAuthn assertion or TOTP code to complete login. |
-| `/account/api/logout` | `POST` | Revokes current browser session and clears session cookies. |
+### Bootstrap and authentication
 
-### Account Snapshot & Sessions
-| Path | Method | Description |
-|---|---|---|
-| `/account/api/portal` | `GET` | Returns full account snapshot (DID, handle, email, active sessions, MFA factors, app passwords). |
-| `/account/api/sessions` | `GET` | Lists all active web and OAuth browser sessions. |
-| `/account/api/sessions/:id` | `DELETE` | Revokes a specific session. |
-| `/account/api/sessions/revoke-others` | `POST` | Revokes all sessions except the caller's current session. |
+- `GET /account/api/signup/policy`: Returns current registration mode (`{"policy": "closed" | "inviteRequired" | "openProtected"}`).
+- `GET /account/api/bootstrap`: Issues a pre-auth session cookie and CSRF token for unauthenticated portal pages.
+- `POST /account/api/login`: Submits `handle` and `password`. Returns authenticated session or factor challenge.
+- `POST /account/api/login/factor-challenge`: Requests WebAuthn or TOTP challenge options.
+- `POST /account/api/login/factor`: Completes login using WebAuthn assertion or TOTP code.
+- `POST /account/api/signup/email/request`: Requests email confirmation code during portal registration.
+- `POST /account/api/signup/authorize`: Validates registration tokens and challenge solutions.
+- `POST /account/api/signup`: Creates account, provisions repository, and issues session cookie.
+- `POST /account/api/logout`: Revokes active browser session and clears session cookies.
 
-### Credentials & Security Factors
-| Path | Method | Description |
-|---|---|---|
-| `/account/api/factors/totp` | `POST` | Initializes TOTP enrollment; returns secret key and QR code URI. |
-| `/account/api/factors/totp/verify` | `POST` | Confirms TOTP code and activates factor on account. |
-| `/account/api/factors/passkeys/options` | `POST` | Generates WebAuthn registration options (relying party ID, user entity, challenge). |
-| `/account/api/factors/passkeys` | `POST` | Completes WebAuthn passkey enrollment with signed attestation. |
-| `/account/api/factors/passkeys/:id` | `DELETE` | Removes an enrolled passkey. |
-| `/account/api/factors/recovery-codes/rotate` | `POST` | Rotates backup recovery codes (requires step-up receipt). |
-| `/account/api/step-up` | `POST` | Initiates biometric or password re-authentication for high-risk operations. |
+### Account snapshots and projections
 
-### App Passwords & Third-Party Apps
-| Path | Method | Description |
-|---|---|---|
-| `/account/api/app-passwords` | `GET` | Lists all active scoped app passwords. |
-| `/account/api/app-passwords` | `POST` | Generates a new scoped app password. Plaintext returned **only once**. |
-| `/account/api/app-passwords/:name` | `DELETE` | Revokes an app password. |
-| `/account/api/connected-apps` | `GET` | Lists authorized OAuth client applications and granted scopes. |
-| `/account/api/connected-apps/:client_id` | `DELETE` | Revokes authorization for a third-party OAuth app. |
+- `GET /account/api/portal`: Returns full sanitized account snapshot (DID, handle, email, sessions, MFA factors, app passwords, connected apps).
+- `GET /account/api/session`, `/sessions`, `/profile`, `/identity`, `/app-passwords`, `/scope-presets`, `/factors`, `/connected-apps`, `/export`, `/migration`: Section-specific projections of account state.
 
-### Export & Deletion
-| Path | Method | Description |
-|---|---|---|
-| `/account/api/export/request` | `POST` | Requests a downloadable portable archive of user records and blobs. |
-| `/account/api/lifecycle/delete` | `POST` | Submits GDPR account erasure request with permanent PLC tombstoning. |
+### Multi-factor authentication and security factors
+
+- `POST /account/api/factors/totp`: Generates TOTP secret key and QR code URI for enrollment.
+- `POST /account/api/factors/totp/verify`: Submits TOTP code to confirm enrollment.
+- `DELETE /account/api/factors/totp`: Removes enrolled TOTP factor.
+- `POST /account/api/factors/passkeys/options`: Generates WebAuthn registration options.
+- `POST /account/api/factors/passkeys`: Completes WebAuthn passkey enrollment with signed attestation.
+- `DELETE /account/api/factors/passkeys` and `DELETE /account/api/factors/passkeys/*`: Deletes an enrolled passkey.
+- `POST /account/api/factors/recovery-codes/rotate`: Rotates emergency backup recovery codes (requires step-up receipt).
+- `POST /account/api/step-up` and `POST /account/api/step-up/password`: Initiates re-authentication step-up for high-risk actions.
+
+### App passwords and connected apps
+
+- `POST /account/api/app-passwords`: Creates a scoped app password (returns plaintext once).
+- `DELETE /account/api/app-passwords` and `DELETE /account/api/app-passwords/*`: Revokes app passwords.
+- `DELETE /account/api/connected-apps`: Revokes authorized third-party OAuth client grants.
+- `DELETE /account/api/sessions` and `DELETE /account/api/sessions/*`: Revokes specific browser sessions.
+- `POST /account/api/sessions/revoke-others`: Revokes all sessions except the caller's current session.
+
+### `did:web` identity binding endpoints
+
+- `GET /.well-known/swan/did-web-claim/*`: Public endpoint serving the unauthenticated cryptographic claim nonce for external domain verification.
+- `POST /account/api/identity/reserve`: Reserves a `did:web` signing key and claim nonce.
+- `POST /account/api/identity/claim`: Validates claim nonce on external domain and binds `did:web`.
+- `POST /account/api/identity/rotate`: Rotates `did:web` signing key.
+- `POST /account/api/identity/remove`: Removes `did:web` binding.
+- `POST /account/api/identity/reverify`: Re-validates DID document against the external host.
+- `POST /account/api/identity/admission`: Configures write and token admission policy for the identity.
+
+### Data export and erasure
+
+- `POST /account/api/export/request`: Requests generation of a portable CAR and blob archive.
+- `POST /account/api/migration/request`: Initiates account migration export package.
+- `POST /account/api/lifecycle/delete`: Submits permanent account deletion and erasure request.
 
 ---
 
-## 4. Loopback Management REST APIs
+## Loopback management REST API
 
-The loopback management listener (default port 3001) is strictly bound to `127.0.0.1` and requires an `Authorization: Bearer <operator-secret>` header.
+The management server runs on a dedicated HTTP listener bound strictly to `127.0.0.1` (default port `3001`). All requests require the `Authorization: Bearer <operator-secret>` header.
 
-| Path | Method | Request Body | Description |
-|---|---|---|---|
-| `/v1/accounts` | `GET` | `?did=<did>` or `?handle=<handle>` | Returns comprehensive account metadata, lifecycle status, and key IDs. |
-| `/v1/accounts/deactivate` | `POST` | `{"did": "..."}` | Suspends account login, firehose output, and mutations. |
-| `/v1/accounts/reactivate` | `POST` | `{"did": "..."}` | Restores a deactivated account to active status. |
-| `/v1/accounts/delete` | `POST` | `{"did": "...", "tombstoneReason": "..."}` | Executes permanent account deletion and publishes PLC tombstone. |
-| `/v1/accounts/plc/prepare` | `POST` | `{"handle": "...", "signingKey": "..."}` | Prepares a new PLC genesis operation. |
-| `/v1/accounts/plc/activate` | `POST` | `{"did": "...", "handleProof": "..."}` | Completes PLC activation and publishes identity. |
-| `/v1/firehose/sync` | `POST` | `{"did": "..."}` | Manually triggers in-process firehose emission for an account. |
+### `GET /v1/accounts`
+- **Method**: `GET`
+- **Authentication**: Operator secret bearer token.
+- **Parameters**: Query parameter `did` (DID string) or `handle` (handle string).
+- **Returns**: JSON object containing account record metadata: `did`, `handle`, `email`, `lifecycleStatus` (`active`, `deactivated`, `tombstoned`), `factorsCount`, `activeSessionsCount`, `keyIDs`, and creation timestamp.
+
+### `POST /v1/accounts/deactivate`
+- **Method**: `POST`
+- **Authentication**: Operator secret bearer token.
+- **Request Body**: JSON object `{ "did": "did:..." }`.
+- **Returns**: JSON object with updated account view showing `lifecycleStatus: "deactivated"`. Suspends login, firehose emission, and write mutations.
+
+### `POST /v1/accounts/reactivate`
+- **Method**: `POST`
+- **Authentication**: Operator secret bearer token.
+- **Request Body**: JSON object `{ "did": "did:..." }`.
+- **Returns**: JSON object with updated account view showing `lifecycleStatus: "active"`. Restores full account operations.
+
+### `POST /v1/accounts/delete`
+- **Method**: `POST`
+- **Authentication**: Operator secret bearer token.
+- **Request Body**: JSON object `{ "did": "did:...", "tombstoneReason": "<reason>", "exportReference": "<ref-optional>" }`.
+- **Returns**: JSON object with tombstone confirmation. Executes irreversible erasure of account database `<did>.sqlite`, purges control records, and emits PLC tombstone operation.
+
+### `POST /v1/accounts/plc/prepare`
+- **Method**: `POST`
+- **Authentication**: Operator secret bearer token.
+- **Request Body**: JSON object `{ "handle": "user.example.com", "signingKey": "did:key:..." }`.
+- **Returns**: JSON object containing unsigned PLC genesis operation and generated rotation credentials.
+
+### `POST /v1/accounts/plc/activate`
+- **Method**: `POST`
+- **Authentication**: Operator secret bearer token.
+- **Request Body**: JSON object `{ "did": "did:plc:...", "handleProof": "<proof>" }`.
+- **Returns**: JSON object confirming PLC activation and directory publication.
+
+### `POST /v1/firehose/sync`
+- **Method**: `POST`
+- **Authentication**: Operator secret bearer token.
+- **Request Body**: JSON object `{ "did": "did:..." }`.
+- **Returns**: JSON object confirming immediate firehose sequencer synchronization for the account.

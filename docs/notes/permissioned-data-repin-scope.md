@@ -297,7 +297,3 @@ Local read-only clone for this investigation:
    third-party sign-in. Worth its own design pass; the `include:` family in
    particular introduces a fetch-and-resolve step Swan has no equivalent of.
 6. **`getSpaceCredential` DPoP binding.**
-
-Steps 2-4 are mechanical and verifiable. Step 5 is a protocol feature, not a
-port, and it is the one to schedule deliberately — especially against a branch
-that moved yesterday.

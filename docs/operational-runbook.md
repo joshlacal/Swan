@@ -1,232 +1,281 @@
-# Swan Operational Runbook & Disaster Recovery
+# Operational runbook
 
-This operational runbook provides procedures for maintaining health, executing backups and restores, rotating cryptographic secrets, performing database maintenance, and handling disaster recovery scenarios on a production Swan PDS.
+This operational runbook provides step-by-step procedures for health checking, taking and restoring account backups, rotating cryptographic keys, executing account lifecycle operations, performing database maintenance, and diagnosing operational incidents on a production Swan server.
 
----
+## Health checking and diagnostic probing
 
-## 1. Health Monitoring & Metrics
+### Liveness and readiness endpoints
 
-### Health & Readiness Endpoints
-Swan exposes multiple health check endpoints for load balancers, orchestrators, and external monitors:
+Swan exposes the following HTTP endpoints for monitoring and health verification:
 
-| Endpoint | Method | Success | Response | Purpose |
+| Endpoint | Method | Success | Content type | Purpose |
 |---|---|---|---|---|
-| `/health` | `GET` | `200 OK` | `OK` (text/plain) | Liveness probe. Verifies Hummingbird event loop and HTTP listener are responding. |
-| `/.well-known/did.json` | `GET` | `200 OK` | JSON DID Document | Service identity probe. Validates server identity resolution. |
-| `/xrpc/com.atproto.server.describeServer` | `GET` | `200 OK` | JSON Description | Capability probe. Validates profile and route surface loading. |
-| `/xrpc/community.lexicon.service.describe` | `GET` | `200 OK` | JSON Description | Lexicon method discovery probe. Returns all supported XRPC NSIDs. |
+| `/health` | `GET` | `200 OK` | `text/plain` | Liveness probe. Verifies HTTP listener and Hummingbird event loop responsiveness. |
+| `/.well-known/did.json` | `GET` | `200 OK` | `application/json` | Identity probe. Verifies server DID document resolution. |
+| `/xrpc/com.atproto.server.describeServer` | `GET` | `200 OK` | `application/json` | Capability probe. Returns supported user domains, contact email, and features. |
+| `/xrpc/community.lexicon.service.describe` | `GET` | `200 OK` | `application/json` | Lexicon method discovery probe. Returns supported XRPC NSID methods. |
 
-### Monitoring Health Probes via curl
+### Running health probes
+
+To check server health and descriptors:
+
 ```bash
-# Basic Liveness Check
+# 1. Check liveness
 curl -sS -f http://127.0.0.1:3000/health
 
-# Verify Server Description & Protocol Profile
+# 2. Check DID document
+curl -sS -f http://127.0.0.1:3000/.well-known/did.json | jq .
+
+# 3. Check server description and active capabilities
 curl -sS -f http://127.0.0.1:3000/xrpc/com.atproto.server.describeServer | jq .
-
-# Verify Supported Lexicons
-curl -sS -f http://127.0.0.1:3000/xrpc/community.lexicon.service.describe | jq .methods
 ```
 
-### Key Performance Indicators (KPIs) & Alerting Rules
+**Verification:** `/health` must return `OK` with exit code `0`.
 
-```mermaid
-graph TD
-    subgraph CoreMetrics ["Swan Operational Metrics"]
-        M1["HTTP 5xx Error Rate > 0.5%"]
-        M2["Firehose Subscriber Quota > 90%"]
-        M3["Outbox Pending Rows > 1,000"]
-        M4["SQLite WAL Size > 256 MB"]
-        M5["Disk Space Utilization > 80%"]
-    end
-    
-    M1 --> Alert["PagerDuty / Slack Alert"]
-    M2 --> Alert
-    M3 --> Alert
-    M4 --> Alert
-    M5 --> Alert
-```
+### Key operational metrics and thresholds
 
-1. **HTTP 5xx Error Rate:** Any sustained rate of HTTP 500 or 503 errors indicates database locks, unhandled runtime faults, or missing signing keys. Alert if 5xx exceeds 0.5% over 5 minutes.
-2. **Firehose Connection Saturation:** Swan reserves 25% of `--max-connections` for anonymous firehose subscribers. If firehose subscribers reach 100% of their allocation (64 connections on default 256 budget), new subscribers will receive `429 Too Many Requests` or `503 Service Unavailable`.
-3. **Outbox Stalling:** The `outbox_deliveries` table in `control.sqlite` should drain rapidly. If pending rows exceed 1,000 or oldest pending item is > 15 minutes old, alert on outbound network or SMTP blockage.
-4. **SQLite WAL Bloat:** WAL files (`control.sqlite-wal`, `<did>.sqlite-wal`) should rarely exceed 64 MiB under normal checkpointing. A WAL file growing beyond 256 MiB indicates long-running read transactions or failed checkpoints.
+Monitor the following indicators on your production host:
 
----
+1. **HTTP 5xx error rate**: Sustained HTTP 500 or 503 errors indicate unhandled exceptions, database locks, or missing key files. Alert if 5xx responses exceed 0.5% over a 5-minute rolling window.
+2. **Firehose subscriber quota**: Swan reserves 25% of `--max-connections` (64 out of 256 connections by default) for anonymous WebSocket firehose subscribers. Alert if active firehose subscribers reach 90% of the reserved capacity.
+3. **Outbox queue depth**: The `outbox_deliveries` table in `control.sqlite` records outbound emails and notifications. Alert if pending rows exceed 1,000 or if the oldest pending item is older than 15 minutes.
+4. **SQLite WAL size**: `control.sqlite-wal`, `firehose.sqlite-wal`, and `<did>.sqlite-wal` files should not exceed 64 MiB under normal checkpointing. Alert if any WAL file exceeds 256 MiB.
+5. **Disk space**: Alert if filesystem utilization on the data directory mount exceeds 80%.
 
-## 2. Backup & Restore Procedures
+## Taking and restoring backups
 
-Swan supports two complementary backup workflows:
-1. **Operator Encrypted Account Backup (`swan backup`):** Cryptographically authenticated, sealed snapshot of an individual account's data, private key envelopes, and public repository state.
-2. **Full System Snapshot:** Atomic filesystem or SQLite snapshot for host-level disaster recovery.
+Swan supports two backup workflows:
+- **Encrypted operator backup (`swan backup` / `swan restore`)**: Creates an authenticated, encrypted snapshot of an individual account's state, metadata, and key envelopes.
+- **Portable logical export (`swan export` / `swan restore`)**: Generates a checksummed, unencrypted CAR and JSON archive for cross-implementation migration.
+- **Full SQLite hot-backup**: Uses SQLite `VACUUM INTO` for zero-downtime node-level snapshots.
 
-```mermaid
-flowchart LR
-    subgraph BackupProcess ["Online Encrypted Backup (swan backup)"]
-        LiveDB[("Live SQLite WAL Databases\ncontrol.sqlite + <did>.sqlite")]
-        KeyDir["/keys (KEK Envelopes)"]
-        Operator["Operator Auth\n(operator-secret)"]
-        BackupKey["Backup Key\n(32-byte AES-GCM)"]
-        
-        LiveDB --> BackupCmd["swan backup"]
-        KeyDir --> BackupCmd
-        Operator --> BackupCmd
-        BackupKey --> BackupCmd
-        BackupCmd --> OutputDir["/backups/<did>-<timestamp>\n(Encrypted Blobs & Metadata)"]
-    end
-```
+### Procedure 1: Create an encrypted account backup (`swan backup`)
 
-### Procedure A: Encrypted Account Backup (`swan backup`)
+#### Prerequisites
+- Active account DID to back up.
+- Owner-only operator secret file (`mode 0600`).
+- Owner-only active account KEK file (`mode 0600`).
+- Dedicated 32-byte operator backup key file (`mode 0600`).
 
-Execute an online, non-blocking backup for an active account DID:
+#### Steps
+1. If an operator backup key file does not exist, generate one:
+   ```bash
+   openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | sudo tee /etc/swan/secrets/operator-backup-key > /dev/null
+   sudo chmod 0600 /etc/swan/secrets/operator-backup-key
+   sudo chown 10001:10001 /etc/swan/secrets/operator-backup-key
+   ```
+
+2. Run `swan backup` targeting a new, nonexistent output directory:
+   ```bash
+   swan backup \
+     --data-directory /var/lib/swan/data \
+     --did "did:plc:12345678abcdefgh" \
+     --output-directory "/var/backups/swan/did:plc:12345678abcdefgh_$(date +%Y%m%d_%H%M%S)" \
+     --operator-secret-file /etc/swan/secrets/operator-secret \
+     --account-kek-file /etc/swan/secrets/account-kek \
+     --backup-key-file /etc/swan/secrets/operator-backup-key \
+     --account-kek-id "primary"
+   ```
+
+#### Verification
+Check the command output. It returns a JSON object containing the backed-up account DID, repository commit CID, and manifest checksum. Verify the target directory exists and contains encrypted artifact files.
+
+### Procedure 2: Restore an encrypted account backup (`swan restore`)
+
+#### Prerequisites
+- Target backup directory produced by `swan backup`.
+- Owner-only operator secret file (`mode 0600`).
+- Owner-only operator backup key file (`mode 0600`).
+- Owner-only target account KEK file (`mode 0600`).
+- Clean or recovery data directory.
+
+#### Steps
+Run `swan restore` with backup options:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-DATA_DIR="/var/lib/swan/data"
-SECRETS_DIR="/etc/swan/secrets"
-BACKUP_ROOT="/var/backups/swan"
-ACCOUNT_DID="did:plc:12345678abcdefgh"
-TIMESTAMP="$(date -u +%Y%m%d_%H%M%SZ)"
-TARGET_DIR="${BACKUP_ROOT}/${ACCOUNT_DID}_${TIMESTAMP}"
-
-# Ensure backup key exists (32-byte base64url)
-BACKUP_KEY_FILE="${SECRETS_DIR}/operator-backup-key"
-if [ ! -f "${BACKUP_KEY_FILE}" ]; then
-  echo "Generating new operator backup key..."
-  openssl rand -base64 32 | tr '+/' '-_' | tr -d '=' | tr -d '\n' > "${BACKUP_KEY_FILE}"
-  chmod 0600 "${BACKUP_KEY_FILE}"
-fi
-
-mkdir -p "${BACKUP_ROOT}"
-
-echo "Running backup for ${ACCOUNT_DID} into ${TARGET_DIR}..."
-
-swan backup \
-  --data-directory "${DATA_DIR}" \
-  --did "${ACCOUNT_DID}" \
-  --output-directory "${TARGET_DIR}" \
-  --operator-secret-file "${SECRETS_DIR}/operator-secret" \
-  --account-kek-file "${SECRETS_DIR}/account-kek" \
-  --backup-key-file "${BACKUP_KEY_FILE}" \
-  --account-kek-id "primary"
-
-echo "Backup complete and verified."
-```
-
-### Procedure B: Encrypted Account Restore (`swan restore`)
-
-To restore an account from an operator backup into a new or recovered data directory:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-DATA_DIR="/var/lib/swan/data"
-SECRETS_DIR="/etc/swan/secrets"
-BACKUP_INPUT_DIR="/var/backups/swan/did:plc:12345678abcdefgh_20260817_140000Z"
-BACKUP_KEY_FILE="${SECRETS_DIR}/operator-backup-key"
-
-echo "Restoring account from ${BACKUP_INPUT_DIR} into ${DATA_DIR}..."
-
 swan restore \
-  --data-directory "${DATA_DIR}" \
-  --input-directory "${BACKUP_INPUT_DIR}" \
-  --operator-secret-file "${SECRETS_DIR}/operator-secret" \
-  --backup-key-file "${BACKUP_KEY_FILE}" \
-  --account-kek-file "${SECRETS_DIR}/account-kek" \
+  --data-directory /var/lib/swan/data \
+  --input-directory /var/backups/swan/did:plc:12345678abcdefgh_20260822_120000 \
+  --operator-secret-file /etc/swan/secrets/operator-secret \
+  --backup-key-file /etc/swan/secrets/operator-backup-key \
+  --account-kek-file /etc/swan/secrets/account-kek \
   --account-kek-id "primary"
-
-echo "Account restoration succeeded."
 ```
 
-### Procedure C: Full SQLite Hot-Backup via `VACUUM INTO`
+#### Verification
+Verify the restored account metadata using `swan account show`:
+```bash
+swan account show \
+  --data-directory /var/lib/swan/data \
+  --did "did:plc:12345678abcdefgh"
+```
+The account status must be `active`.
 
-For automated whole-node disaster recovery backups while Swan is running:
+### Procedure 3: Create a portable logical export (`swan export`)
 
+To create an unencrypted portable account archive suitable for migration to another AT Protocol PDS:
+
+#### Prerequisites
+- Active account DID.
+- Owner-only operator secret file (`mode 0600`).
+- Owner-only account KEK file (`mode 0600`).
+
+#### Steps
+Run `swan export`:
+
+```bash
+swan export \
+  --data-directory /var/lib/swan/data \
+  --did "did:plc:12345678abcdefgh" \
+  --output-directory "/var/backups/swan/export_did:plc:12345678abcdefgh_$(date +%Y%m%d_%H%M%S)" \
+  --operator-secret-file /etc/swan/secrets/operator-secret \
+  --account-kek-file /etc/swan/secrets/account-kek \
+  --account-kek-id "primary"
+```
+
+#### Verification
+The command outputs JSON containing `manifestSHA256` and the list of exported files (repository CAR, blob index, account metadata). The manifest reference is automatically recorded in `control.sqlite`.
+
+### Procedure 4: Stage a portable logical archive (`swan restore`)
+
+To stage an unencrypted portable archive into Swan storage:
+
+#### Prerequisites
+- Directory containing the unencrypted portable export files.
+- Owner-only operator secret file (`mode 0600`).
+
+#### Steps
+Run `swan restore` without backup key options:
+
+```bash
+swan restore \
+  --data-directory /var/lib/swan/data \
+  --input-directory /var/backups/swan/export_did:plc:12345678abcdefgh_20260822_120000 \
+  --operator-secret-file /etc/swan/secrets/operator-secret
+```
+
+#### Verification
+Confirm the staged account state using `swan account show`.
+
+### Procedure 5: Hot SQLite backup using `VACUUM INTO`
+
+To create atomic, zero-downtime filesystem copies of all databases while Swan is actively running:
+
+#### Prerequisites
+- `sqlite3` CLI utility installed.
+- Sufficient disk space on the backup destination mount.
+
+#### Steps
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
 DATA_DIR="/var/lib/swan/data"
-BACKUP_DEST="/var/backups/swan_full_$(date +%Y%m%d_%H%M%S)"
+BACKUP_DEST="/var/backups/swan_node_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${BACKUP_DEST}"
 
-# 1. Backup control plane database safely
+# 1. Safely backup control plane database
 sqlite3 "${DATA_DIR}/control.sqlite" "VACUUM INTO '${BACKUP_DEST}/control.sqlite';"
 
-# 2. Backup firehose database safely
+# 2. Safely backup firehose database if present
 if [ -f "${DATA_DIR}/firehose.sqlite" ]; then
   sqlite3 "${DATA_DIR}/firehose.sqlite" "VACUUM INTO '${BACKUP_DEST}/firehose.sqlite';"
 fi
 
-# 3. Backup all per-account databases
+# 3. Safely backup all per-account databases
 for db in "${DATA_DIR}"/did:*.sqlite; do
   [ -f "$db" ] || continue
   filename="$(basename "$db")"
   sqlite3 "$db" "VACUUM INTO '${BACKUP_DEST}/${filename}';"
 done
 
-# 4. Copy key envelopes and blobs (hardlinks or copy)
-cp -a "${DATA_DIR}/keys" "${BACKUP_DEST}/keys"
-cp -a "${DATA_DIR}/blobs" "${BACKUP_DEST}/blobs" 2>/dev/null || true
+# 4. Copy key envelopes and blobs
+if [ -d "${DATA_DIR}/keys" ]; then
+  cp -a "${DATA_DIR}/keys" "${BACKUP_DEST}/keys"
+fi
+if [ -d "${DATA_DIR}/blobs" ]; then
+  cp -a "${DATA_DIR}/blobs" "${BACKUP_DEST}/blobs"
+fi
 
-echo "Full node backup created at ${BACKUP_DEST}"
+echo "Full node hot-backup completed at ${BACKUP_DEST}."
 ```
 
----
+#### Verification
+Verify the backup databases with `sqlite3 "${BACKUP_DEST}/control.sqlite" "PRAGMA integrity_check;"`. The command must return `ok`.
 
-## 3. Cryptographic Key Rotation Procedures
+## Rotating cryptographic keys
 
-### Procedure A: Account Key Encryption Key (KEK) Rotation
-The Account KEK protects per-account private key envelopes stored in `<data-directory>/keys/`. To rotate the KEK:
+### Procedure 1: Account Key Encryption Key (KEK) rotation
 
-1. **Generate New KEK:**
+The Account KEK protects per-account private key envelopes stored in `<data-directory>/keys/`. Each envelope records the active KEK identifier under which it was encrypted.
+
+#### Prerequisites
+- Root or administrative access to the secrets directory.
+
+#### Steps
+1. Generate the new Account KEK file:
    ```bash
-   gen_b64url() { openssl rand -base64 32 | tr '+/' '-_' | tr -d '='; }
-   gen_b64url > /etc/swan/secrets/account-kek-v2
-   chmod 0600 /etc/swan/secrets/account-kek-v2
+   openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | sudo tee /etc/swan/secrets/account-kek-v2 > /dev/null
+   sudo chmod 0600 /etc/swan/secrets/account-kek-v2
+   sudo chown 10001:10001 /etc/swan/secrets/account-kek-v2
    ```
-2. **Re-encrypt Key Envelopes:**
-   Run the offline envelope migration utility to decrypt envelopes with `primary` and re-encrypt under `v2`:
-   ```bash
-   swan account re-encrypt-keys \
-     --data-directory /var/lib/swan/data \
-     --old-kek-file /etc/swan/secrets/account-kek \
-     --old-kek-id primary \
-     --new-kek-file /etc/swan/secrets/account-kek-v2 \
-     --new-kek-id v2 \
-     --operator-secret-file /etc/swan/secrets/operator-secret
-   ```
-3. **Update Daemon Configuration:**
-   Point `--public-account-kek-file` and other KEK flags to `/etc/swan/secrets/account-kek-v2` with ID `v2`, then restart Swan:
+
+2. Update the server startup configuration to point to the new key file and pass the new identifier `v2`:
+   - Set `--public-account-kek-file /etc/swan/secrets/account-kek-v2` and `--public-account-kek-id v2`.
+   - Set `--signup-account-kek-file /etc/swan/secrets/account-kek-v2` and `--signup-account-kek-id v2`.
+   - Update `--legacy-session-account-kek-file` and `--appview-proxy-account-kek-file` if enabled.
+
+3. Restart Swan:
    ```bash
    sudo systemctl restart swan
    ```
 
-### Procedure B: OAuth Server Key Rotation
-The `oauth-server-key` encrypts user browser sessions and DPoP-bound refresh tokens.
+> Existing key envelopes created under earlier KEK identifiers remain readable as long as their corresponding key files remain accessible, while all newly provisioned accounts or rotated keys use the active `v2` identifier.
 
-> [!WARNING]
-> Rotating the `oauth-server-key` will invalidate existing active browser portal sessions and active OAuth refresh tokens, requiring users and third-party apps to re-authenticate.
+#### Verification
+Provision a test account or rotate an existing account's PLC keys to confirm envelopes are created under `v2`.
 
-1. Generate the new key:
+### Procedure 2: OAuth server master key rotation
+
+The `oauth-server-key` is the master key for encrypting browser sessions, CSRF receipts, and refresh tokens.
+
+> Rotating `oauth-server-key` invalidates existing active browser portal sessions and OAuth refresh tokens. Users and client applications will need to re-authenticate.
+
+#### Prerequisites
+- Root access to `/etc/swan/secrets`.
+
+#### Steps
+1. Generate the new OAuth server key:
    ```bash
-   openssl rand -base64 32 | tr '+/' '-_' | tr -d '=' | tr -d '\n' > /etc/swan/secrets/oauth-server-key.new
-   chmod 0600 /etc/swan/secrets/oauth-server-key.new
+   openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | sudo tee /etc/swan/secrets/oauth-server-key.new > /dev/null
+   sudo chmod 0600 /etc/swan/secrets/oauth-server-key.new
+   sudo chown 10001:10001 /etc/swan/secrets/oauth-server-key.new
    ```
+
 2. Atomically swap the secret file:
    ```bash
-   mv /etc/swan/secrets/oauth-server-key.new /etc/swan/secrets/oauth-server-key
+   sudo mv /etc/swan/secrets/oauth-server-key.new /etc/swan/secrets/oauth-server-key
    ```
-3. Gracefully reload Swan:
+
+3. Restart Swan:
    ```bash
    sudo systemctl restart swan
    ```
 
-### Procedure C: PLC Account Key Rotation (`rotate-plc`)
-When rotating an account's PLC signing or recovery key:
+#### Verification
+Authenticate via the account portal or an OAuth client to confirm token issuance succeeds.
+
+### Procedure 3: Account PLC identity key rotation (`swan account rotate-plc`)
+
+To rotate an account's PLC signing and rotation key pair and publish the signed operation to the PLC directory:
+
+#### Prerequisites
+- Active account DID.
+- Owner-only operator secret file (`mode 0600`).
+- Owner-only account KEK file (`mode 0600`).
+
+#### Steps
+Run `swan account rotate-plc`:
 
 ```bash
 swan account rotate-plc \
@@ -238,16 +287,154 @@ swan account rotate-plc \
   --account-kek-id "primary"
 ```
 
----
+#### Verification
+Check the command output. It returns JSON containing the new signing key CID and updated PLC operation CID. Query the PLC directory to confirm the updated genesis:
+```bash
+curl -sS "https://plc.directory/did:plc:12345678abcdefgh/log" | jq .
+```
 
-## 4. Database Maintenance & Tuning
+## Account lifecycle operations
 
-### WAL Maintenance & Checkpointing
-SQLite WAL files should be periodically checkpointed and truncated to reclaim disk space:
+### Installing a local account (`swan account install-local`)
+
+To install the durable, local half of an account offline (generating key envelopes, control records, and an empty public repository):
+
+1. Write the initial password to an owner-only file:
+   ```bash
+   echo -n "SecretPassword123" > /tmp/account-password.txt
+   chmod 0600 /tmp/account-password.txt
+   ```
+
+2. Run `install-local`:
+   ```bash
+   swan account install-local \
+     --data-directory /var/lib/swan/data \
+     --did "did:plc:12345678abcdefgh" \
+     --handle "alice.example.com" \
+     --revision "3k2aaaaaaae22" \
+     --password-file /tmp/account-password.txt \
+     --operator-secret-file /etc/swan/secrets/operator-secret \
+     --account-kek-file /etc/swan/secrets/account-kek \
+     --account-kek-id "primary"
+   ```
+
+3. Securely remove the temporary password file:
+   ```bash
+   rm -f /tmp/account-password.txt
+   ```
+
+**Verification:** Run `swan account show --data-directory /var/lib/swan/data --did did:plc:12345678abcdefgh`.
+
+### Preparing a PLC identity (`swan account prepare-plc`)
+
+To prepare and submit a recoverable PLC identity without activating it:
+
+```bash
+swan account prepare-plc \
+  --data-directory /var/lib/swan/data \
+  --request-id "req-$(uuidgen | tr '[:upper:]' '[:lower:]')" \
+  --handle "bob.example.com" \
+  --pds-origin "https://pds.example.com" \
+  --repository-revision "3k2aaaaaaae22" \
+  --plc-origin "https://plc.directory" \
+  --operator-secret-file /etc/swan/secrets/operator-secret \
+  --account-kek-file /etc/swan/secrets/account-kek \
+  --account-kek-id "primary"
+```
+
+### Activating a prepared PLC identity (`swan account activate-plc`)
+
+To activate a submitted PLC identity after handle and directory verification:
+
+```bash
+swan account activate-plc \
+  --data-directory /var/lib/swan/data \
+  --request-id "req-12345678-abcd-1234-abcd-1234567890ab" \
+  --password-file /tmp/account-password.txt \
+  --plc-origin "https://plc.directory" \
+  --operator-secret-file /etc/swan/secrets/operator-secret \
+  --account-kek-file /etc/swan/secrets/account-kek \
+  --account-kek-id "primary"
+```
+
+### Deactivating and reactivating accounts
+
+To temporarily suspend an account:
+```bash
+swan account deactivate \
+  --data-directory /var/lib/swan/data \
+  --did "did:plc:12345678abcdefgh" \
+  --operator-secret-file /etc/swan/secrets/operator-secret
+```
+
+To reactivate a deactivated account:
+```bash
+swan account reactivate \
+  --data-directory /var/lib/swan/data \
+  --did "did:plc:12345678abcdefgh" \
+  --operator-secret-file /etc/swan/secrets/operator-secret
+```
+
+### Permanently deleting an account (`swan account delete`)
+
+To permanently deactivate an account, remove its keys and private data, and record a tombstone in the PLC directory:
+
+```bash
+swan account delete \
+  --data-directory /var/lib/swan/data \
+  --did "did:plc:12345678abcdefgh" \
+  --tombstone-reason "User requested GDPR erasure" \
+  --plc-origin "https://plc.directory" \
+  --operator-secret-file /etc/swan/secrets/operator-secret \
+  --account-kek-file /etc/swan/secrets/account-kek \
+  --account-kek-id "primary"
+```
+
+**Verification:** Run `swan account show --data-directory /var/lib/swan/data --did did:plc:12345678abcdefgh`. The status must show `deleted` with the declared tombstone.
+
+## Firehose operations and sync announcement
+
+### Forcing a firehose `#sync` announcement (`swan firehose force-sync`)
+
+If downstream relays or AppViews miss public repository commits (for example, following network partition recovery or repository import), use `force-sync` to enqueue a manual `#sync` event:
+
+```bash
+swan firehose force-sync \
+  --data-directory /var/lib/swan/data \
+  --did "did:plc:12345678abcdefgh"
+```
+
+**Verification:** The command outputs `enqueued forced #sync for <did> (request <uuid>)`.
+
+### Inspecting a relay CAR archive (`swan firehose inspect-relay-car`)
+
+To inspect an exported relay repository CAR file:
+
+```bash
+swan firehose inspect-relay-car \
+  --car /tmp/repo-snapshot.car
+```
+
+### Verifying relay capture against PLC (`swan firehose verify-relay-capture`)
+
+To verify relay event captures and Swan repository state against authenticated PLC keys:
+
+```bash
+swan firehose verify-relay-capture \
+  --manifest /path/to/relay-verifier-manifest.json \
+  --plc-origin "https://plc.directory"
+```
+
+## Database maintenance and storage tuning
+
+### WAL checkpointing and truncation
+
+To prevent SQLite WAL files from expanding indefinitely and to reclaim disk space, run regular checkpoints across all databases:
 
 ```bash
 #!/usr/bin/env bash
-# Run nightly via cron or systemd timer
+set -euo pipefail
+
 DATA_DIR="/var/lib/swan/data"
 
 for db in "${DATA_DIR}"/*.sqlite; do
@@ -255,68 +442,141 @@ for db in "${DATA_DIR}"/*.sqlite; do
   echo "Checkpointing $db..."
   sqlite3 "$db" "PRAGMA wal_checkpoint(TRUNCATE);"
 done
+
+echo "All SQLite WAL files checkpointed and truncated."
 ```
 
-### Database Integrity Verification
-Run periodic integrity checks across all control and account databases:
+### Database integrity checks
+
+To run full integrity checks across all control and account databases:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
+
 DATA_DIR="/var/lib/swan/data"
 
-echo "Checking SQLite database integrity..."
 for db in "${DATA_DIR}"/*.sqlite; do
   [ -f "$db" ] || continue
-  echo "Checking $db..."
-  result=$(sqlite3 "$db" "PRAGMA integrity_check; PRAGMA foreign_key_check;")
-  if [ "$result" != "ok" ]; then
-    echo "ERROR: Integrity check failed on $db: $result" >&2
+  echo "Checking integrity of $db..."
+  integrity=$(sqlite3 "$db" "PRAGMA integrity_check;")
+  fk=$(sqlite3 "$db" "PRAGMA foreign_key_check;")
+  
+  if [ "$integrity" != "ok" ]; then
+    echo "ERROR: Integrity check failed on $db: $integrity" >&2
+    exit 1
+  fi
+  if [ -n "$fk" ]; then
+    echo "ERROR: Foreign key violations on $db: $fk" >&2
     exit 1
   fi
 done
-echo "All databases passed integrity checks."
+
+echo "All databases passed integrity and foreign key checks."
 ```
 
-### Manual Firehose Sequence Compaction
-If `firehose.sqlite` grows excessively before the retention reaper runs:
+### Automatic firehose retention and compaction
 
+Swan manages `firehose.sqlite` automatically during runtime using the built-in background retention reaper. The reaper runs every `--public-firehose-retention-interval-seconds` (default: `60` seconds) and prunes event frames exceeding:
+- `--public-firehose-retention-age-hours` (default: `72` hours).
+- `--public-firehose-retention-max-rows` (default: `1000000` rows).
+- `--public-firehose-retention-max-bytes` (default: `1073741824` bytes / 1 GiB).
+
+To adjust retention parameters, update the `swan serve` flags in your systemd unit or `docker-compose.yml`. To reclaim freed space from `firehose.sqlite` after heavy pruning:
 ```bash
-swan firehose prune \
-  --data-directory /var/lib/swan/data \
-  --retention-age-hours 48 \
-  --retention-max-rows 500000 \
-  --operator-secret-file /etc/swan/secrets/operator-secret
+sqlite3 /var/lib/swan/data/firehose.sqlite "VACUUM;"
 ```
 
----
+## Diagnosing operational failures
 
-## 5. Offline Recovery & Account Migrations
+### Structured diagnostic log events
 
-### Rebuilding Merkle Search Trees (MST)
-If an account's local SQLite database suffers record corruption but has verified CAR commits or relay snapshots:
+Swan emits structured log events for authentication and outbound proxy events to give operators diagnostic visibility without logging sensitive credentials or tokens.
 
-```bash
-swan lab import-public \
-  --remote-url https://relay.example.com \
-  --data-directory /var/lib/swan/data \
-  --did did:plc:12345678abcdefgh \
-  --commit-key-algorithm secp256k1 \
-  --resolve-commit-key \
-  --promote-public-blobs \
-  --output /tmp/recovery-report.json
+#### 1. `legacy createSession rejected`
+
+Emitted when authentication fails on `com.atproto.server.createSession`. To protect against account enumeration, clients receive a constant-time opaque 401 error. The server log records the exact failure stage and factor token shape:
+
+```
+[INFO] legacy createSession rejected [stage: "identifier_unresolved", factorToken: "absent"]
 ```
 
-### Permanent Account Deletion & PLC Tombstoning
-To permanently destroy an account, delete its private SQLite database and key envelopes, and submit an authenticated tombstone operation to the PLC directory:
+Fixed vocabulary for `stage`:
+- `identifier_unresolved`: The handle or DID does not exist or does not belong to an active account on this server.
+- `no_credential_matched`: The identifier resolved, but neither the primary password nor any scoped app password matched.
+- `auth_factor_token_required`: The primary password verified, but the account has active MFA/email factors and no factor token was presented.
+- `rate_limited`: The client IP or account identifier exceeded login rate limits.
+- `malformed_request`: The JSON body exceeded byte bounds or contained invalid fields.
+- `token_rejected`: An invalid or expired token was presented.
+- `unavailable`: Internal storage or password hasher was temporarily unavailable.
 
-```bash
-swan account delete \
-  --data-directory /var/lib/swan/data \
-  --did did:plc:12345678abcdefgh \
-  --tombstone-reason "User requested GDPR erasure" \
-  --plc-origin "https://plc.directory" \
-  --operator-secret-file /etc/swan/secrets/operator-secret \
-  --account-kek-file /etc/swan/secrets/account-kek \
-  --account-kek-id "primary"
+Fixed vocabulary for `factorToken`:
+- `absent`: The `authFactorToken` field was not present in the request JSON.
+- `empty`: The `authFactorToken` field was present but empty.
+- `present`: An `authFactorToken` value was supplied in the request.
+
+#### 2. `xrpc pipethrough upstream failed`
+
+Emitted when an outbound HTTP request to an upstream service (such as the AppView or an `atproto-proxy` target) fails. The client receives an opaque HTTP 502 Bad Gateway; the server log records:
+
 ```
+[INFO] xrpc pipethrough upstream failed [nsid: "app.bsky.feed.getTimeline", host: "api.bsky.app", reason: "connection timed out"]
+```
+
+Key metadata fields:
+- `nsid`: The requested XRPC method.
+- `host`: Target destination hostname.
+- `reason`: Underlying transport or DNS failure (minted service tokens are never logged).
+
+### Common operational troubleshooting scenarios
+
+#### Scenario 1: SQLite database locked or WAL growing rapidly
+
+**Symptoms**: HTTP 500/503 responses; WAL files exceed 256 MiB; log messages mentioning `database is locked`.
+
+**Resolution**:
+1. Check for long-running read transactions or external backup processes holding locks:
+   ```bash
+   fuser -v /var/lib/swan/data/control.sqlite
+   ```
+2. Run manual checkpointing:
+   ```bash
+   sqlite3 /var/lib/swan/data/control.sqlite "PRAGMA wal_checkpoint(TRUNCATE);"
+   ```
+3. Ensure storage is backed by fast NVMe SSD storage and that `PRAGMA busy_timeout` has not been altered.
+
+#### Scenario 2: Upstream AppView returns 502 Bad Gateway
+
+**Symptoms**: Client requests to `app.bsky.*` endpoints fail with HTTP 502; `xrpc pipethrough upstream failed` appears in logs.
+
+**Resolution**:
+1. Inspect the `host` and `reason` metadata in the `xrpc pipethrough upstream failed` log entry.
+2. Verify DNS resolution and HTTPS connectivity to the configured AppView from the host:
+   ```bash
+   curl -sS -I https://api.bsky.app/xrpc/_health
+   ```
+3. Verify that `--appview-proxy-account-kek-file` is configured with a valid account KEK so service-auth tokens can be signed.
+
+#### Scenario 3: Anonymous firehose subscribers receive 429 Too Many Requests
+
+**Symptoms**: Relay or consumer connections to `/xrpc/com.atproto.sync.subscribeRepos` are rejected with HTTP 429 or 503.
+
+**Resolution**:
+1. Check current connection usage. By default, 25% of `--max-connections` (64 out of 256) is reserved for anonymous firehose subscribers.
+2. If legitimate traffic requires more subscriber capacity, increase `--max-connections` (for example, `--max-connections 512` allows 128 subscribers):
+   ```bash
+   # Update systemd or docker-compose with --max-connections 512
+   sudo systemctl restart swan
+   ```
+
+#### Scenario 4: Outbox deliveries or email verification stalled
+
+**Symptoms**: Users do not receive password reset or email verification emails; rows in `outbox_deliveries` accumulate.
+
+**Resolution**:
+1. Check the count of pending items in `control.sqlite`:
+   ```bash
+   sqlite3 /var/lib/swan/data/control.sqlite "SELECT COUNT(*) FROM outbox_deliveries WHERE status = 'pending';"
+   ```
+2. Verify SMTP credentials and connectivity to your SMTP provider (`--email-smtp-host` on port `587` or `465`).
+3. Check daemon logs for SMTP handshake failures or authentication refusals.

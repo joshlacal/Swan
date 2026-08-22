@@ -1,260 +1,155 @@
-# Swan Modular Architecture & Component Overview
+# Swan architecture
 
-Swan is a Swift-native AT Protocol Personal Data Server (PDS) and permissioned-data interoperability engine built for extreme protocol fidelity, cryptographic correctness, strict data isolation, and crash resilience. It is developed on Swift 6 with Swift Concurrency and runs on the Hummingbird 2 server framework.
+Swan is a Swift-native AT Protocol Personal Data Server (PDS) and permissioned-data server. It is built with Swift 6 and Swift Concurrency, running on the Hummingbird 2 server framework on top of SwiftNIO.
 
 ```mermaid
 flowchart TB
-    subgraph Ingress ["Public Ingress & Reverse Proxy"]
+    subgraph Ingress ["Network ingress"]
         Client["Client / AppView / Relay / Browser"]
-        Proxy["Reverse Proxy (Caddy / Nginx)"]
+        Proxy["Reverse proxy (Caddy / Nginx)"]
         Client -->|TLS 1.3 / HTTPS / WSS| Proxy
     end
 
-    subgraph SwanHTTPRuntime ["Swan Hummingbird 2 Runtime (Port 3000)"]
-        Router["Hummingbird 2 Router\n(Strict Phase Registration)"]
-        CORS["SwanCORSMiddleware\n(Origin, Headers, Methods)"]
-        Admission["Body Admission & Limiter\n(16KB JSON / 2MB Blob Stream)"]
+    subgraph SwanHTTPRuntime ["Swan runtime (Port 3000)"]
+        Router["Hummingbird 2 router"]
+        CORS["SwanCORSMiddleware"]
+        Admission["Body admission limiter"]
         
         Proxy -->|HTTP/1.1 / WS| Router
         Router --> CORS
         CORS --> Admission
         
-        subgraph Subsystems ["Core Service Subsystems"]
-            OAuthSubsys["OAuth 2.1 & DPoP Engine\n(RFC 9449, RFC 9126 PAR, JAR)"]
-            RepoSubsys["Public Repository Engine\n(MST, Signed Commits, CAR v1)"]
-            FirehoseSubsys["Public Firehose Sequencer\n(subscribeRepos, Diff CARs)"]
-            SpaceSubsys["Permissioned Spaces Engine\n(LtHash, Delegations, Outbox)"]
-            PortalSubsys["Account Portal & MFA Engine\n(WebAuthn, TOTP, SvelteKit SPA)"]
-            LegacySubsys["Legacy Auth & App Passwords\n(createSession, AppView Proxy)"]
+        subgraph Subsystems ["Service subsystems"]
+            OAuthSubsys["OAuth 2.1 and DPoP engine"]
+            RepoSubsys["Public repository engine"]
+            FirehoseSubsys["Public firehose sequencer"]
+            SpaceSubsys["Permissioned spaces engine"]
+            PortalSubsys["Account portal and MFA engine"]
+            ProxySubsys["AppView proxy router"]
         end
         
         Admission --> Subsystems
     end
 
-    subgraph StorageLayer ["Durable SQLite Dual-Plane Storage"]
-        ControlDB[("control.sqlite (WAL)\nControl Plane: Accounts, Identity,\nSessions, OAuth, MFA, Outbox")]
-        AccountDB[("<did>.sqlite (WAL)\nPer-Account Data Plane: Public Records,\nMST Blocks, Private Space Records")]
-        FirehoseDB[("firehose.sqlite (WAL)\nFirehose Sequence, Frames, Diff CARs")]
-        Blobs[("Blobs Directory\nContent-Addressed Public & Private Blobs")]
-        KeysDir[("Keys Directory (0700)\nEncrypted Key Envelopes (AES-GCM / KEK)")]
+    subgraph StorageLayer ["SQLite storage planes"]
+        ControlDB[("control.sqlite\nControl plane")]
+        AccountDB[("<did>.sqlite\nPer-account data plane")]
+        FirehoseDB[("firehose.sqlite\nFirehose sequencer plane")]
+        Blobs[("blobs/\nContent-addressed blobs")]
+        KeysDir[("keys/ (0700)\nEncrypted key envelopes")]
     end
 
     Subsystems --> StorageLayer
-
-    subgraph ManagementPlane ["Isolated Management Runtime (Loopback Port 3001)"]
-        MgmtRouter["Management HTTP Router\n(Bearer Operator-Secret)"]
-        MgmtOps["PLC Account Lifecycle\nPermanent Deletion & Tombstoning\nFirehose Sync Ingestion"]
-        MgmtRouter --> MgmtOps
-        MgmtOps --> StorageLayer
-    end
 ```
 
----
+## Library target structure
 
-## 1. Hummingbird 2 Server Runtime
+Swan's codebase is divided into modular Swift Package Manager library targets, each with a defined boundary and responsibility:
 
-Swan uses **Hummingbird 2** on top of **SwiftNIO** to achieve asynchronous, non-blocking HTTP and WebSocket processing with deterministic memory management and Swift 6 structured concurrency.
+- `SwanCore`: Core cryptographic primitives (SHA-256, BLAKE3, K-256, P-256), base data structures, error types, logging configuration, and fundamental domain protocols.
+- `SwanSpacesWire`: Typed wire models and lexicon definitions for permissioned spaces (`com.atproto.space.*` and `com.atproto.simplespace.*`), generated from AT Protocol lexicons via Petrel.
+- `SwanPublicWire`: Wire models, query parameter decoders, and response serializers for public AT Protocol repository endpoints and sync interfaces.
+- `SwanPublicRepository`: Merkle Search Tree (MST) implementation, CBOR-encoded records with CIDv1 addressing, signed commit trees, and CAR v1 archive packing and slicing.
+- `SwanPublicFirehose`: Firehose event sequencer, stream frame encoding (`#commit`, `#sync`, `#identity`, `#account`, `#info`), minimal diff CAR packaging, and subscriber connection budgeting.
+- `SwanPublicRelayVerifier`: Verification and ingestion logic for public relay events and synchronization streams.
+- `SwanSpaces`: Permissioned data and spaces engine, LtHash16 cryptographic accumulator, capability delegations, space oplogs, reader-bound commit verification, and durable outbox delivery.
+- `SwanStorage`: Abstract storage protocols and interfaces defining the contracts for repositories, spaces, credentials, replay guards, WebAuthn challenges, and audit logs.
+- `SwanSQLite`: SQLite backend implementation using SQLiteNIO, managing write-ahead logging (WAL), foreign keys, microsecond transactions, compare-and-swap (CAS) updates, and queries across the three database planes.
+- `SwanAccounts`: Account lifecycle management, Argon2id and bcrypt password hashing, `did:web` and `did:plc` identity resolution, and multi-factor authentication (TOTP RFC 6238, WebAuthn/FIDO2 passkeys, recovery codes, step-up tokens, and audit event emission).
+- `SwanAccountExport`: Account export bundle generation, CAR archive creation, and metadata packaging.
+- `SwanOAuth`: OAuth 2.1 authorization server implementing Pushed Authorization Requests (PAR, RFC 9126), Proof Key for Code Exchange (PKCE, RFC 7636), Demonstrating Proof-of-Possession (DPoP, RFC 9449), private_key_jwt client authentication (RFC 7523), token lifecycle, and scope resolution.
+- `SwanHTTP`: Hummingbird 2 HTTP and WebSocket server runtime, router assembly, CORS middleware, request body admission limiters, XRPC handlers, OAuth endpoints, Account Portal asset serving, and AppView proxying.
+- `SwanInterop`: Interoperability test matrix, conformance test runners, and multi-implementation verification harnesses.
+- `swan`: Command-line executable providing eight subcommands: `serve`, `account`, `export`, `backup`, `restore`, `verify`, `lab`, and `firehose`.
 
-### Key Architectural Invariants
-1. **Immutable Route Assembly:** Hummingbird 2 bakes middleware stacks and route handlers into the routing tree during startup. All routes must be registered before the `Application` instance is created (`SwanHTTP.buildRouter()`). Route additions after initialization are strictly forbidden and rejected.
-2. **CORS Middleware Precedence:** `SwanCORSMiddleware` is attached as the very first middleware on the router. This guarantees that `OPTIONS` preflight requests for any registered path or 404 fallback receive proper CORS headers without falling into unhandled route exceptions.
-3. **Bounded Request Body Admission:** All HTTP JSON write bodies are gated by `SwanRequestBodyAdmissionConfiguration` with strict size ceilings (16 KiB default for JSON payloads, 2 MiB for public blobs) to eliminate Denial of Service (DoS) attack vectors via unconstrained allocations.
-4. **Graceful Service Lifecycle:** Background tasks (such as firehose sequencers, retention reapers, did:web revalidation workers, and SMTP outbox dispatchers) conform to `Service` or `CustomStringConvertible` lifecycle actors. When `SIGTERM` or `SIGINT` is received, the server stops accepting new connections, allows in-flight SQLite transactions to drain, and gracefully closes network listeners.
+## Hummingbird 2 runtime
 
----
+Swan uses Hummingbird 2 on top of SwiftNIO to handle asynchronous, non-blocking HTTP and WebSocket traffic with Swift 6 structured concurrency.
 
-## 2. SQLite Dual-Plane Storage Architecture
+- **Immutable router assembly:** Routes and middleware stacks are assembled during startup in `SwanHTTP.buildRouter()`. Once the `Application` instance is created, route additions are disallowed.
+- **CORS middleware precedence:** `SwanCORSMiddleware` sits as the first middleware on the router, ensuring that `OPTIONS` preflight requests for any path receive correct CORS headers before reaching route handlers.
+- **Bounded request body admission:** `SwanRequestBodyAdmissionConfiguration` enforces strict size ceilings on incoming request bodies (16 KiB default for JSON payloads, 2 MiB for public blobs) to prevent denial-of-service attacks from unbounded memory allocation.
+- **Graceful service lifecycle:** Background services (including the firehose sequencer, retention reaper, and outbox dispatcher) integrate with Swift Service Lifecycle. On receiving `SIGTERM` or `SIGINT`, the runtime stops accepting new connections, allows in-flight database transactions to drain, and shuts down network listeners cleanly.
 
-Swan enforces a strict separation between the **control plane** and the **data plane** to isolate account metadata from repository data.
+## Storage planes
+
+Swan divides persistent storage across three distinct database planes, content-addressed blob storage, and an encrypted key directory:
 
 ```mermaid
 graph LR
-    subgraph ControlPlane ["Control Plane (Shared)"]
+    subgraph ControlPlane ["Control plane (Shared)"]
         CDB[("control.sqlite\n- accounts\n- identity_bindings\n- mfa_factors\n- portal_sessions\n- oauth_tokens\n- outbox_deliveries")]
     end
     
-    subgraph DataPlane ["Data Plane (Isolated Per-Account)"]
+    subgraph DataPlane ["Data plane (Per-account)"]
         ADB1[("did:plc:account1.sqlite\n- public_records\n- repo_mst_blocks\n- repo_commits\n- space_records\n- space_oplog")]
         ADB2[("did:plc:account2.sqlite\n- public_records\n- repo_mst_blocks\n- repo_commits\n- space_records\n- space_oplog")]
     end
     
-    subgraph FirehosePlane ["Firehose Plane"]
+    subgraph FirehosePlane ["Firehose plane"]
         FDB[("firehose.sqlite\n- public_firehose_events\n- public_firehose_frames\n- public_firehose_diff_cars")]
     end
 ```
 
-### Storage Principles
-- **`control.sqlite`:** Owns global state including account identities (DIDs, handles), password hashes (Argon2id/bcrypt), MFA credentials, active OAuth client registrations, browser sessions, and cross-account delivery outboxes.
-- **`<did>.sqlite`:** Every account has its own SQLite database file named after its canonical DID (e.g. `did:plc:12345678.sqlite`). It contains the user's public repository records, Merkle Search Tree (MST) nodes, signed commits, and private space operations.
-- **`firehose.sqlite`:** Dedicated sequencer database storing the continuous monotonic event stream, event frames, and diff CARs.
-- **Write-Ahead Logging (WAL):** All SQLite databases operate strictly in `WAL` mode with `PRAGMA synchronous = NORMAL` and `PRAGMA foreign_keys = ON`.
-- **No Network I/O Inside Transactions:** Database transactions are kept microsecond-short. Network requests (PLC resolution, SMTP sends, OAuth JWKS fetches) are **never** executed while a SQLite transaction lock is held.
-- **Compare-And-Swap (CAS) Correctness:** Mutations to repositories and sequences require explicit revision/CID compare-and-swap checks, preventing lost updates under concurrency.
+- **`control.sqlite` (Control plane):** Stores global server state, including account identities (DIDs, handles), password hashes (Argon2id/bcrypt), MFA factor records, active OAuth client metadata, portal sessions, and cross-account delivery outboxes.
+- **`<did>.sqlite` (Per-account data plane):** Each account has a dedicated SQLite database named after its canonical DID (for example, `did:plc:12345678.sqlite`). This file contains the account's public repository records, Merkle Search Tree (MST) nodes, signed commits, private space records, and space oplogs.
+- **`firehose.sqlite` (Firehose sequencer plane):** Stores the monotonic public event sequence, event frames, and diff CAR slices.
+- **`blobs/` (Content-addressed storage):** Stores repository and space blobs addressed by their cryptographic hashes.
+- **`keys/` (Key envelope directory):** Protected directory with `0700` filesystem permissions holding AES-GCM encrypted key envelopes (such as repository signing keys and TOTP secret encryption keys).
 
----
+All databases operate in SQLite Write-Ahead Logging (WAL) mode with `PRAGMA synchronous = NORMAL` and `PRAGMA foreign_keys = ON`. Transactions are kept short, and network I/O is prohibited while holding SQLite locks. Compare-and-swap (CAS) operations protect against lost updates during concurrent mutations.
 
-## 3. OAuth 2.1 & DPoP Sender-Constrained Subsystem
+## OAuth 2.1 and DPoP authorization model
 
-Swan implements an OAuth 2.1 authorization server with mandatory sender-constraining via **DPoP (Demonstrating Proof-of-Possession at the Application Layer, RFC 9449)**.
+Swan provides an OAuth 2.1 authorization server with mandatory sender-constrained tokens via DPoP (RFC 9449):
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor User as User / Browser
-    participant Client as AT Protocol Client / App
-    participant AS as Swan OAuth AS (/oauth/*)
-    participant RS as Swan Resource Server (/xrpc/*)
+- **Pushed Authorization Requests (PAR, RFC 9126):** Clients must submit authorization parameters to `/oauth/par` before directing the user agent to `/oauth/authorize`. Authorization parameters in query strings are rejected.
+- **Sender-constrained tokens (RFC 9449):** Access and refresh tokens are bound to the client's public key using ES256 DPoP proofs. Bearer tokens intercepted in transit cannot be replayed from other endpoints.
+- **Server nonce rotation:** Swan issues and rotates server nonces to guard against proof replay attacks.
+- **Private Key JWT client authentication (RFC 7523):** Confidential clients authenticate using signed client assertions.
+- **Dynamic client metadata discovery:** Client metadata is fetched over HTTPS from client ID URLs with strict SSRF defenses blocking private and loopback IP addresses.
+- **Scope resolution:** Swan parses and validates fine-grained scopes including `atproto`, `include:<nsid>`, `space:<type>`, and collection-scoped permissions against lexicon definitions.
 
-    Client->>AS: 1. POST /oauth/par (Signed Request, DPoP Proof)
-    AS-->>Client: 2. 201 Created (request_uri, expires_in)
-    
-    Client->>User: 3. Redirect to /oauth/authorize?client_id=...&request_uri=...
-    User->>AS: 4. GET /oauth/authorize (Interactive Login & Consent)
-    AS-->>User: 5. Redirect to client redirect_uri with ?code=...
-    
-    Client->>AS: 6. POST /oauth/token (grant_type=authorization_code, code, code_verifier, DPoP Proof)
-    AS-->>Client: 7. 200 OK (access_token, refresh_token, token_type=DPoP, sub=DID)
-    
-    Client->>RS: 8. POST /xrpc/com.atproto.repo.putRecord (Authorization: DPoP <token>, DPoP: <proof>)
-    RS-->>Client: 9. 200 OK (Verified & Executed)
-```
+For details on the interactive sign-in pages, authorization consent flows, inlined daisyUI stylesheets, and runtime CSP hash derivation, see [Server surfaces](server-surfaces.md).
 
-### Security & Protocol Features
-- **Mandatory PAR (RFC 9126):** Clients must push authorization parameters to `/oauth/par` before directing the user agent to `/oauth/authorize`. Authorization parameters in query strings are rejected.
-- **Sender-Constrained Tokens (RFC 9449):** Access and refresh tokens are bound to the client's ephemeral public key via DPoP proofs (using ES256). Intercepted bearer tokens cannot be replayed from other endpoints.
-- **Server Nonce Enforcement:** Swan issues and rotates high-entropy server nonces to protect against proof replay.
-- **Private Key JWT Client Authentication (RFC 7523):** Confidential clients authenticate using client assertions signed with their registered keys.
-- **Dynamic Client Metadata Discovery:** Client configurations are fetched securely over HTTPS from `client_id` URLs with strict loopback/private IP blocking to prevent Server-Side Request Forgery (SSRF).
-- **Fine-Grained Scope Resolution:** Supports `atproto`, `include:<nsid>`, `space:<type>`, and collection-scoped permissions with cryptographic lexicon validation.
-### OAuth Browser Pages & Inlined Style Security
-Swan's interactive OAuth browser surfaces—the sign-in page, client authorization consent, and second-factor MFA ceremony—are rendered by a unified HTML implementation in `Sources/SwanHTTP/SwanBrowserPages.swift` shared across both the production authorization server and localhost development endpoints.
-- **Inlined daisyUI Stylesheet:** The markup is styled with daisyUI 5 (built on Tailwind CSS v4). The compiled CSS is embedded directly into `Sources/SwanHTTP/SwanBrowserStyleSheet.swift` and inlined into `<style>` tags on served pages, eliminating static asset routes and remote stylesheet requests during authentication.
-- **Dynamic CSP Hash Derivation:** To enforce `default-src 'none'` without resorting to `'unsafe-inline'` or external style origins, `SwanBrowserPages.browserStyleCSPSource` derives a SHA-256 base64 digest of the exact inlined stylesheet string at runtime. Hummingbird injects this hash as `style-src 'sha256-…'` in the response `Content-Security-Policy` header. Per-response nonces (`script-src 'nonce-…'`) protect inline WebAuthn ceremony scripts.
-- **Stylesheet Build Process:** The stylesheet is tree-shaken against class names in `Sources/SwanHTTP/SwanBrowserPages.swift` and `Sources/SwanHTTP/ScopeDescription.swift`. Whenever class names in either file are modified, `Scripts/build-browser-css.sh` must be executed to regenerate `SwanBrowserStyleSheet.swift`.
-- **System Theme Adaptation:** Pages declare `<meta name="color-scheme" content="light dark">` and utilize semantic daisyUI theme variables (`bg-base-200`, `text-base-content`, `card bg-base-100`), automatically adapting to the user's `prefers-color-scheme` setting.
+## Public repository and firehose engine
 
----
+The public repository subsystem implements the AT Protocol data repository model with cryptographic verification and real-time streaming:
 
-## 4. Public Firehose & Repository Engine
+- **Deterministic Merkle Search Tree (MST):** Records are indexed in a deterministic binary key-path trie with CBOR encoding, enabling inclusion/exclusion proofs and compact CAR archive extraction.
+- **Secp256k1 commit signing:** Every repository commit is cryptographically signed by the account's repository key (K-256 / `ES256K`) and verified against the account's DID document or PLC directory history.
+- **Monotonic sequencer:** Events (`#commit`, `#sync`, `#identity`, `#account`, `#info`) receive continuous 64-bit integer sequence IDs stored in `firehose.sqlite`.
+- **Diff CAR packaging:** Firehose commit events deliver minimal diff CAR slices containing only newly added or modified blocks over `/xrpc/com.atproto.sync.subscribeRepos`.
+- **Subscriber admission budgeting:** Connection quotas allocate 75% of capacity for standard API traffic and reserve 25% for firehose WebSocket consumers (`PublicFirehoseSubscriberAdmission`).
+- **Retention reaper:** Background worker automatically removes expired firehose entries according to configured age, row count, or byte size limits.
 
-The public repository engine is a complete, native AT Protocol repository implementation featuring Merkle Search Trees (MST) and real-time streaming.
+For details on `com.atproto.identity.resolveHandle` and foreign handle resolution across external DNS and HTTPS endpoints, see [Server surfaces](server-surfaces.md).
 
-```mermaid
-graph TD
-    Commit["Repository Commit\n(Signed via K-256 / secp256k1)"]
-    MST["Merkle Search Tree (MST)\nDeterministic Binary Key-Path Trie"]
-    Records["Record Blocks (CBOR / CIDv1)"]
-    Outbox["Outbox Staging Table\n(Atomic with Commit)"]
-    Sequencer["Public Firehose Sequencer\n(Assigns Monotonic Sequence)"]
-    Streamer["WebSocket Streamer\n(/xrpc/com.atproto.sync.subscribeRepos)"]
-    Reaper["Firehose Retention Reaper\n(72h / 1M rows / 1GB cap)"]
+## Multi-factor authentication and step-up subsystem
 
-    Commit --> MST
-    MST --> Records
-    Commit -.->|Atomic Commit| Outbox
-    Outbox --> Sequencer
-    Sequencer --> FirehoseDB[("firehose.sqlite")]
-    FirehoseDB --> Streamer
-    FirehoseDB --> Reaper
-```
+Swan integrates multi-factor authentication into account management and OAuth authorization workflows:
 
-### Engine Components
-- **Deterministic MST:** Records are organized in deterministic CBOR-encoded Merkle Search Trees, enabling cryptographic proof of inclusion/exclusion and compact CAR generation.
-- **Secp256k1 Commit Signing:** Every commit is cryptographically signed by the account's repository signing key, verifiable against the account's DID document or PLC directory history.
-- **Monotonic Sequencer:** Events (`#commit`, `#sync`, `#identity`, `#account`, `#info`) receive contiguous, gap-free 64-bit integer sequence IDs stored in `firehose.sqlite`.
-- **Diff CAR Packaging:** Firehose commit events carry minimal diff CAR slices containing only newly created/modified blocks, minimizing network overhead.
-- **Subscriber Connection Budgeting:** Connection quotas reserve 75% of available capacity for standard API calls and assign a dedicated 25% quota for firehose WebSocket consumers (`PublicFirehoseSubscriberAdmission`).
-- **Configurable Retention Reaper:** Automatically reaps expired firehose entries based on age (default: 72h), row count (default: 1,000,000), or byte limits (default: 1 GiB).
+- **WebAuthn and FIDO2 passkeys:** Supports hardware security keys and platform biometrics via W3C WebAuthn Level 3. Registration and assertion verify ES256/P-256 COSE keys, exact HTTPS origin, RP ID hash, client data type, challenge binding, user presence (UP), user verification (UV), and monotonic signature counters in atomic SQLite transactions.
+- **TOTP (RFC 6238):** Standard time-based one-time passwords supporting SHA-1, SHA-256, and SHA-512 with 6 or 8 digits and single-step drift windows. Includes constant-time comparison, per-account replay CAS guards, and AES-GCM encrypted secret envelopes.
+- **Backup recovery codes:** High-entropy single-use recovery codes stored exclusively as salted Argon2id or SHA-256 digests.
+- **Step-up authentication:** Sensitive operations (such as credential updates, app password creation, data export, and account deletion) require fresh re-authentication, issuing short-lived, single-use `stepUpReceipt` tokens bound to the active session.
+- **Redacted audit logging:** All MFA operations emit structured `MFAAuditEvent` records. Plaintext passwords, TOTP codes, recovery codes, WebAuthn challenge bytes, and signature payloads are excluded from logs.
 
-### Public Identity & Foreign Handle Resolution
-The AT Protocol endpoint `com.atproto.identity.resolveHandle` resolves user handles to canonical DIDs. By default, Swan answers exclusively for accounts locally provisioned in `control.sqlite`. Queries for third-party handles return an immediate `InvalidRequest` error without contacting the network.
+## Permissioned spaces engine
 
-Passing `--enable-foreign-handle-resolution` (default off) enables Swan to resolve external handles across the network:
-- **Pinned Verification Engine:** External handles are resolved using the same verified DNS TXT record (`_atproto.<handle>`) and HTTPS `/.well-known/atproto-did` mechanisms that validate `did:web` identity documents.
-- **Network Boundary & SSRF Defense:** This flag is the sole mechanism that allows the anonymous `resolveHandle` endpoint to initiate outbound network traffic. Before any DNS query or HTTP connection is initiated, the resolver verifies the target domain against strict SSRF rules, immediately rejecting reserved TLDs and non-public IP address ranges.
-- **Deduplicated In-Memory Caching:** Resolved DIDs are cached in memory for 5 minutes (300 seconds), while failed resolutions are cached for 30 seconds to mitigate denial-of-service amplification. Concurrent requests for the same handle share a single in-flight resolution task.
-- **Reference PDS Divergence:** Reference PDS implementations (such as `bsky.social`) answer foreign handle queries with HTTP 200 and the resolved DID by default. Swan defaults to rejecting unhosted handles with `InvalidRequest` unless foreign handle resolution is explicitly enabled by the operator.
+Swan's permissioned-data plane provides structured, multi-party collaboration spaces without publishing sensitive records to the public firehose:
 
----
+- **LtHash cryptographic accumulator:** Uses additively homomorphic hashing (LtHash16) to maintain an incremental commitment over repository state.
+- **Reader-bound commit signatures:** Commit signatures bind the space author, space identifier, revision, and reader context, preventing unauthorized distribution.
+- **Capability delegations and space credentials:** Space authorities issue short-lived delegation tokens that are exchanged for read-only space credentials.
+- **Durable outbox delivery:** Peer-pinned notification workers ensure at-least-once notification delivery to remote space members across network disruptions and service restarts.
 
-## 5. MFA & WebAuthn / Passkey Subsystem
+## AppView proxying and external surfaces
 
-Swan provides enterprise-grade multi-factor authentication built directly into the account portal and OAuth authorization workflows.
+Swan handles legacy client compatibility and upstream AT Protocol proxying:
 
-```mermaid
-flowchart TD
-    LoginReq["User Enters Handle & Password"]
-    VerifyPassword{"Password Valid?"}
-    CheckMFA{"MFA Enrolled?"}
-    IssueSession["Issue Authenticated Session Cookie"]
-    PromptMFA["Issue Pre-Auth Challenge\nReturn Required Factor Kinds"]
-    
-    LoginReq --> VerifyPassword
-    VerifyPassword -- No --> Reject["401 Unauthorized"]
-    VerifyPassword -- Yes --> CheckMFA
-    CheckMFA -- No --> IssueSession
-    CheckMFA -- Yes --> PromptMFA
-    
-    PromptMFA --> SelectFactor{"Select MFA Factor"}
-    SelectFactor -->|FIDO2 Passkey| WebAuthn["WebAuthn Assertion\n(ES256/RS256 Challenge Verification)"]
-    SelectFactor -->|TOTP Code| TOTP["TOTP (RFC 6238)\n30s Time Window Verification"]
-    SelectFactor -->|Recovery Code| RecCode["Recovery Code\n(Argon2id Salted Hash Check)"]
-    
-    WebAuthn --> VerifyFactor{"Factor Valid?"}
-    TOTP --> VerifyFactor
-    RecCode --> VerifyFactor
-    
-    VerifyFactor -- Yes --> IssueSession
-    VerifyFactor -- No --> RejectMFA["403 Forbidden"]
-```
+- **Scoped app passwords:** Clients that do not support OAuth 2.1 can authenticate via `com.atproto.server.createSession` using scoped, revocable app passwords.
+- **Upstream AppView routing:** Read queries for AppView namespaces (`app.bsky.*`) are proxied upstream to the configured AppView using minted service-auth JWTs.
+- **Destination routing via `atproto-proxy`:** When the client provides an `atproto-proxy` header, the proxy resolves the target service endpoint and forwards requests in allowed namespaces (`app.bsky.*`, `chat.bsky.*`, `tools.ozone.*`).
 
-### Supported Factor Kinds
-1. **WebAuthn / FIDO2 Passkeys:** Hardware security keys (YubiKey, Apple Touch ID/Face ID, Windows Hello) using standard W3C WebAuthn Level 3 assertions.
-2. **TOTP (RFC 6238):** Standard time-based one-time passwords with SHA-1 HMAC and 30-second windows.
-3. **Backup Recovery Codes:** Salted and cryptographically hashed one-time recovery codes for account salvage.
-4. **Step-Up Authentication:** High-risk actions (modifying credentials, generating app passwords, account deletion) require interactive re-authentication or biometric step-up challenges resulting in single-use `stepUpReceipt` tokens.
-
----
-
-## 6. SvelteKit Static Portal & Management Service
-
-Swan includes an integrated account management interface built with SvelteKit.
-
-- **Static Pre-Rendering & Build:** The account portal is implemented as a SvelteKit single-page application under `web/`. It is compiled in container environments by the Dockerfile's `account-web-build` stage (`FROM node:22-bookworm-slim ... AS account-web-build`) and copied to `/usr/local/share/swan/account` in the runtime image (configurable via `--account-portal-directory`).
-- **Hummingbird Asset Handler:** Hummingbird serves `/account/**` SPA routes with secure headers (`Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`).
-- **daisyUI Component Styling:** The portal interface is built using daisyUI components, sharing visual tokens with the server-rendered OAuth browser pages. Standalone static CSS files such as `web/static/auth-tokens.css` and the `/account/auth-tokens.css` route have been removed in favor of the unified build.
-- **Session Security:**
-  - `__Host-swan-session`: `HTTPOnly`, `Secure`, `SameSite=Lax` cookie storing cryptographically signed session identifiers.
-  - `__Host-swan-csrf`: Anti-CSRF token validated via double-submit header checks (`X-Swan-CSRF`).
-  - Strict pre-auth isolation prevents unauthenticated users from accessing any account data before factor verification.
----
-
-## 7. Permissioned Data / Spaces Subsystem
-
-Swan's permissioned-data plane provides structured collaboration spaces with cryptographic auditability without placing sensitive data into the public AT Protocol firehose.
-
-- **LtHash Cryptographic Accumulator:** Uses additively homomorphic hashing (LtHash16) to maintain an incremental commitment over repository state.
-- **Reader-Bound Commits:** Commit signatures bind the space author, space identifier, revision, and reader context.
-- **Delegation & Space Credentials:** Space authorities issue short-lived, single-use delegation tokens that are exchanged for read-only space credentials.
-- **Durable Outbox Delivery:** Peer-pinned notification workers ensure at-least-once notification delivery to remote space members and authorities across network interruptions and daemon restarts.
-
----
-
-## 8. AppView Proxying & Scoped App Passwords
-
-- **Legacy App Passwords:** Enables third-party AT Protocol clients that do not yet support OAuth 2.1 to authenticate via `com.atproto.server.createSession` using scoped, revocable app passwords.
-- **Transparent AppView Proxying:** Unmatched `app.bsky.*` read queries are proxied upstream to the official Bluesky AppView (`https://api.bsky.app`) with minted service-auth JWTs, providing complete feed and social graph access out of the box.
-
-### XRPC Proxy Routing & Namespace Admission
-The XRPC proxy router (`SwanXRPCProxyRouter`) transparently routes unsupported XRPC endpoints to upstream AT Protocol services while safeguarding local state.
-
-- **Namespace-Based Admission:** Method admission is decided strictly by namespace prefix (`app.bsky.`, `chat.bsky.`, `tools.ozone.`) and exact moderation methods (`com.atproto.moderation.createReport`, `com.atproto.label.queryLabels`), rather than membership in the generated method registry. Because the generated method registry reflects a static lexicon pin that lags behind upstream releases, gating on registry membership previously caused published upstream methods (such as `chat.bsky.convo.getUnreadCounts` and `app.bsky.video.*`) to return unexpected 404 errors.
-- **Protected Local State:** Swan-owned namespaces (`com.atproto.space.`, `blue.catbird.`) and local state methods within proxyable namespaces (`app.bsky.actor.getPreferences`, `app.bsky.actor.putPreferences`) are denied and never forwarded upstream.
-- **Destination Routing via `atproto-proxy`:**
-  - When the client includes an `atproto-proxy` header (`did:web:...#service_id`), the proxy resolves the target service endpoint and admits any method within the allowable namespaces. Methods in `chat.bsky.*` and `tools.ozone.*` require this header.
-  - When no `atproto-proxy` header is present, the proxy admits only the configured AppView's own namespace (`app.bsky.*`) and forwards requests directly to the configured upstream AppView (`--appview-url` / `--appview-did`). Requests for other namespaces without an explicit destination header fail closed with HTTP 404 (unrouted).
-
-### Operator Diagnostics & Failure Observability
-To ensure diagnostic traceability for authentication and proxy failures without leaking credentials or violating timing invariants, Swan emits structured log events:
-- **`legacy createSession rejected`:** Emitted when legacy authentication on `com.atproto.server.createSession` fails. To prevent account enumeration, client responses remain constant-time opaque errors. The log entry includes a fixed-vocabulary `stage` parameter (`identifier_unresolved`, `no_credential_matched`, `auth_factor_token_required`, `rate_limited`, `malformed_request`, `token_rejected`, `unavailable`) and a `factorToken` descriptor (`absent`, `empty`, or `present`). No identifiers, passwords, or token strings are recorded. This allows operators to distinguish wrong-password attempts from clients sending empty or misconfigured second-factor tokens.
-- **`xrpc pipethrough upstream failed`:** Emitted when an outbound HTTP request to an upstream service (such as the AppView or an `atproto-proxy` target) fails. While clients receive a generic HTTP 502 Bad Gateway response, the log records `nsid` (the requested XRPC method), `host` (the target upstream host), and `reason` (the underlying transport failure, such as DNS lookup errors, connection timeouts, or TLS handshakes). Minted service authentication JWTs are never logged.
+For full details on the XRPC proxy router, namespace admission rules, the SvelteKit Account Management Portal, and operator diagnostics, see [Server surfaces](server-surfaces.md).
