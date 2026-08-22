@@ -35,11 +35,18 @@ Before deploying Swan, you must decide on the following operational parameters:
 
 ### Software prerequisites
 
-- **Linux host**: Ubuntu 24.04 LTS, Debian 12, or RHEL 9.
-- **Container engine** (for containerized deployments): Docker Engine 26+ and Docker Compose v2.27+.
-- **Native runtime** (for systemd deployments): Swift 6.0+ runtime libraries, SQLite 3.45+, and OpenSSL 3.0+.
+- **Container engine** (for containerized deployments): Docker Engine with Compose v2.
+- **Container base image**: the `Dockerfile` builds and runs on `swift:6.1-jammy`,
+  pinned by digest. Its build stage adds `libsodium-dev` and `pkg-config`; its
+  runtime stage adds `ca-certificates`, `curl`, `libsodium23`, and `libsecret-1-0`.
+- **Native runtime** (for systemd deployments): the Swift 6.1 runtime libraries
+  and the same runtime packages the image installs — libsodium and libsecret.
+  Swan builds against `swift-tools-version: 6.1`, so an older toolchain will not
+  resolve the manifest.
 - **DNS**: Public DNS A and AAAA records pointing your hostname (e.g. `pds.example.com`) to your reverse proxy ingress IP.
-- **Reverse proxy**: Caddy 2.8+ or NGINX 1.26+ configured for automated TLS termination, HTTP/2 or HTTP/3, and WebSocket connection upgrade.
+- **Reverse proxy**: Caddy or NGINX, configured for automated TLS termination,
+  HTTP/2 or HTTP/3, and WebSocket connection upgrade. The Compose laboratory
+  topology uses Caddy as its sole ingress.
 
 ### Secrets handling and file permissions
 

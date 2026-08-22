@@ -29,8 +29,9 @@ Swan is organized around the following subsystems:
 
 ### Prerequisites
 
-- Swift 6.0 or later (macOS 15+ or Linux)
-- SQLite 3.40+
+- Swift 6.1 or later, as declared by `Package.swift` (`swift-tools-version: 6.1`)
+- macOS 15 or later, or Linux
+- libsodium, discovered through `pkg-config`. Install it with `brew install libsodium` or `apt install libsodium-dev`.
 
 ### Local instance setup
 
