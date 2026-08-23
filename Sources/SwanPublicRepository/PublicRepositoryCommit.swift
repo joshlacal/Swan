@@ -330,7 +330,7 @@ public enum PublicRepositoryCommitCodec {
     ) throws {
         switch algorithm {
         case .p256:
-            guard P256WireSignature.isCanonicalLowS(signature) else {
+            guard SwanCore.P256WireSignature.isCanonicalLowS(signature) else {
                 throw PublicRepositoryCommitError.invalidSignature
             }
         case .secp256k1:

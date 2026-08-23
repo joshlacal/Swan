@@ -427,7 +427,7 @@ private actor RecordingSigner: PublicRepositoryCommitSigner {
 
     func sign(unsignedCommitBytes: Data) async throws -> Data {
         calls.append(unsignedCommitBytes)
-        return try P256WireSignature.sign(unsignedCommitBytes, using: key)
+        return try SwanCore.P256WireSignature.sign(unsignedCommitBytes, using: key)
     }
 }
 

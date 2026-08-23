@@ -228,7 +228,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
 
     private func getLatestCommit(
         target: PermissionedRemoteReplicaTarget,
-        verificationKey: PermissionedDataJWTVerificationKey
+        verificationKey: SwanOAuth.PermissionedDataJWTVerificationKey
     ) async throws -> PermissionedRemoteReplicaFreshnessWitness {
         let query = [
             "space": target.space.rawValue,

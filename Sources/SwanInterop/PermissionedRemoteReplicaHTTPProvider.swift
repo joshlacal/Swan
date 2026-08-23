@@ -223,7 +223,7 @@ public struct PermissionedRemoteReplicaHTTPSourceProvider:
     private func verifyLatestCommit(
         _ commit: ComAtprotoSpaceDefs.SignedCommit,
         target: PermissionedRemoteReplicaTarget,
-        verificationKey: PermissionedDataJWTVerificationKey
+        verificationKey: SwanOAuth.PermissionedDataJWTVerificationKey
     ) throws -> PermissionedRemoteReplicaFreshnessWitness {
         guard commit.ver == 1,
               commit.hash.data.count == 32,

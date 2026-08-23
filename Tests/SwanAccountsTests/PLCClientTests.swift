@@ -367,7 +367,7 @@ final class PLCClientTests: XCTestCase {
         let state = try await client.fetchState(did: fixture.did)
 
         XCTAssertEqual(state.did, fixture.did)
-        XCTAssertEqual(state.rotationKeys, [P256DIDKey(publicKey: rotationKey.publicKey).value])
+        XCTAssertEqual(state.rotationKeys, [SwanAccounts.P256DIDKey(publicKey: rotationKey.publicKey).value])
         let requests = await transport.requests
         XCTAssertEqual(requests.map(\.url.path), ["/\(fixture.did)/data", "/\(fixture.did)/log/audit"])
     }

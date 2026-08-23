@@ -1238,7 +1238,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             jti: jti
         )).base64URLEncodedString()
         let input = "\(header).\(claims)"
-        let signature = try P256WireSignature.sign(
+        let signature = try SwanCore.P256WireSignature.sign(
             Data(input.utf8),
             using: key
         ).base64URLEncodedString()
@@ -1455,7 +1455,7 @@ private func signedClientAttestation(
         options: [.sortedKeys, .withoutEscapingSlashes]
     ).base64URLEncodedString()
     let input = "\(header).\(claims)"
-    let signature = try P256WireSignature.sign(
+    let signature = try SwanCore.P256WireSignature.sign(
         Data(input.utf8),
         using: key
     ).base64URLEncodedString()

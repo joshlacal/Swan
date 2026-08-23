@@ -696,7 +696,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
         let header = try encoder.encode(Header(jwk: token.jwk)).base64URLEncodedString()
         let claims = try encoder.encode(Claims(jti: jti, iat: Int64(Date().timeIntervalSince1970), htm: method, htu: "\(Self.publicURL.absoluteString)\(path)", nonce: fixture.runtime.dpopNonceService.issue(), ath: Data(SHA256.hash(data: Data(token.token.utf8))).base64URLEncodedString())).base64URLEncodedString()
         let input = "\(header).\(claims)"
-        let signature = try P256WireSignature.sign(Data(input.utf8), using: token.key).base64URLEncodedString()
+        let signature = try SwanCore.P256WireSignature.sign(Data(input.utf8), using: token.key).base64URLEncodedString()
         var headers = HTTPFields()
         headers[.authorization] = "DPoP \(token.token)"
         headers[HTTPField.Name("DPoP")!] = "\(input).\(signature)"

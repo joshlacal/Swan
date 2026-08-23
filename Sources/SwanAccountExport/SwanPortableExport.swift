@@ -350,7 +350,7 @@ public enum SwanPortableExportVerifier {
             expectedHandle: manifest.canonicalHandle,
             expectedRepositoryRevision: verifiedPublicGenesis.revision,
             expectedPublicGenesisCID: verifiedPublicGenesis.commitCID.string,
-            expectedSigningDIDKey: P256DIDKey(publicKey: signingPublicKey).value
+            expectedSigningDIDKey: SwanAccounts.P256DIDKey(publicKey: signingPublicKey).value
         )
         return manifest
     }
@@ -524,7 +524,7 @@ public enum SwanPortableExportVerifier {
             expectedHandle: manifest.canonicalHandle,
             expectedRepositoryRevision: verifiedPublicGenesis.revision,
             expectedPublicGenesisCID: verifiedPublicGenesis.commitCID.string,
-            expectedSigningDIDKey: P256DIDKey(publicKey: signingPublicKey).value
+            expectedSigningDIDKey: SwanAccounts.P256DIDKey(publicKey: signingPublicKey).value
         )
         return manifest
     }
@@ -549,7 +549,7 @@ public enum SwanPortableExportVerifier {
               parsed.codec == .raw,
               parsed.multihash.algorithm == Multihash.sha256Code,
               parsed.multihash.length == Multihash.sha256Length,
-              Hex.encode(parsed.multihash.digest) == sha256 else {
+              SwanCore.Hex.encode(parsed.multihash.digest) == sha256 else {
             throw SwanPortableExportError.invalidArchive
         }
     }
@@ -788,7 +788,7 @@ public enum SwanPortableExportVerifier {
               let signingDIDKey = regular.verificationMethods["atproto"] else {
             throw SwanPortableExportError.invalidArchive
         }
-        let canonicalDIDKey = try P256DIDKey(signingDIDKey)
+        let canonicalDIDKey = try SwanAccounts.P256DIDKey(signingDIDKey)
         guard canonicalDIDKey.value == signingDIDKey else {
             throw SwanPortableExportError.invalidArchive
         }
@@ -1168,7 +1168,7 @@ public struct SwanPortableAccountExporter: Sendable {
         )
         try PLCOperationCodec.verifyGenesis(operation, expectedDID: did)
         guard operation.regular?.verificationMethods["atproto"]
-            == P256DIDKey(publicKey: signingPublicKey).value else {
+            == SwanAccounts.P256DIDKey(publicKey: signingPublicKey).value else {
             throw SwanPortableExportError.invalidAccount
         }
         let object: [String: Any] = [
@@ -1213,7 +1213,7 @@ public struct SwanPortableAccountExporter: Sendable {
               parsed.codec == .raw,
               parsed.multihash.algorithm == Multihash.sha256Code,
               parsed.multihash.length == Multihash.sha256Length,
-              Hex.encode(parsed.multihash.digest) == sha256 else {
+              SwanCore.Hex.encode(parsed.multihash.digest) == sha256 else {
             throw SwanPortableExportError.invalidArchive
         }
     }
@@ -1258,7 +1258,7 @@ public struct SwanPortableAccountExporter: Sendable {
             }
             try writer.finish()
             finished = true
-            return (count, Hex.encode(Data(hasher.finalize())))
+            return (count, SwanCore.Hex.encode(Data(hasher.finalize())))
         }
 
         func abort() {
@@ -1478,7 +1478,7 @@ actor SwanPortableExportFileByteSource:
         }
         let result = (
             byteCount,
-            Hex.encode(Data(digest.finalize()))
+            SwanCore.Hex.encode(Data(digest.finalize()))
         )
         close()
         return result

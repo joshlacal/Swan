@@ -87,7 +87,7 @@ public enum PublicRepositoryGenesisCodec {
 
         let (emptyMST, emptyMSTCID) = try emptyMSTBlock()
         let unsignedCommit = try encodeUnsignedCommit(did: did, revision: revision, dataCID: emptyMSTCID)
-        let signature = try P256WireSignature.sign(unsignedCommit, using: signingKey)
+        let signature = try SwanCore.P256WireSignature.sign(unsignedCommit, using: signingKey)
         let signedCommit = try encodeSignedCommit(
             did: did,
             revision: revision,
@@ -172,7 +172,7 @@ public enum PublicRepositoryGenesisCodec {
 
         let signature: P256.Signing.ECDSASignature
         do {
-            signature = try P256WireSignature.decodeCanonical(decoded.signature)
+            signature = try SwanCore.P256WireSignature.decodeCanonical(decoded.signature)
         } catch {
             throw PublicRepositoryGenesisError.invalidSignature
         }

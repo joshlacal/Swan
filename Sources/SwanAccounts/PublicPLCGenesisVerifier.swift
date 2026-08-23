@@ -86,9 +86,9 @@ extension SwanPublicPLCGenesisVerifier: PublicPLCIdentityVerifying {
             }
 
             guard regular.verificationMethods.count == 1,
-                  regular.verificationMethods["atproto"].map(PLCDIDKeyCodec.isCanonical) == true,
+                  regular.verificationMethods["atproto"].map(SwanAccounts.PLCDIDKeyCodec.isCanonical) == true,
                   regular.rotationKeys.count >= 1,
-                  regular.rotationKeys.allSatisfy({ PLCDIDKeyCodec.isCanonical($0) }) else {
+                  regular.rotationKeys.allSatisfy({ SwanAccounts.PLCDIDKeyCodec.isCanonical($0) }) else {
                 throw SwanError.unauthorized("PLC operation identity keys are invalid")
             }
             previousDate = entry.createdAt
@@ -137,7 +137,7 @@ extension SwanPublicPLCGenesisVerifier: PublicPLCRepositoryAuthenticating {
         signingDIDKey: String
     ) async throws -> PublicRepositoryCommitAuthentication {
         let verifier: any PublicRepositoryCommitVerifier
-        switch try PLCDIDKeyCodec.decode(signingDIDKey) {
+        switch try SwanAccounts.PLCDIDKeyCodec.decode(signingDIDKey) {
         case let .p256(publicKey):
             verifier = P256PublicRepositoryCommitVerifier(
                 publicKey: publicKey
@@ -179,7 +179,7 @@ private struct PLCSecp256k1RepositoryCommitVerifier:
             format: .compressed
         )
         verificationIdentity =
-            "secp256k1-sha256:\(Hex.encode(SHA256.hash(data: compressedPublicKey)))"
+            "secp256k1-sha256:\(SwanCore.Hex.encode(SHA256.hash(data: compressedPublicKey)))"
     }
 
     func verify(

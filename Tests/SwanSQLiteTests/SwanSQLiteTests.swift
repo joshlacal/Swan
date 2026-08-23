@@ -1935,9 +1935,9 @@ final class SwanSQLiteTests: XCTestCase {
         )
         .deletingLastPathComponent()
         .appending(path: "permissioned-blob-cas")
-        .appending(path: Hex.encode(SHA256.hash(data: Data(fixture.author.utf8))))
-        .appending(path: String(Hex.encode(canonical.multihash.digest).prefix(2)))
-        .appending(path: "\(Hex.encode(canonical.multihash.digest)).blob")
+        .appending(path: SwanCore.Hex.encode(SHA256.hash(data: Data(fixture.author.utf8))))
+        .appending(path: String(SwanCore.Hex.encode(canonical.multihash.digest).prefix(2)))
+        .appending(path: "\(SwanCore.Hex.encode(canonical.multihash.digest)).blob")
         XCTAssertTrue(FileManager.default.fileExists(atPath: privateCASPath.path))
         let privateAsPublic = try await database!.publicBlobData(
             cid: spaceReference.cid
@@ -2185,11 +2185,11 @@ final class SwanSQLiteTests: XCTestCase {
 
         func casPath(_ cid: String) throws -> URL {
             let parsed = try CID.parse(cid)
-            let digest = Hex.encode(parsed.multihash.digest)
+            let digest = SwanCore.Hex.encode(parsed.multihash.digest)
             return SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.author)
                 .deletingLastPathComponent()
                 .appending(path: "permissioned-blob-cas")
-                .appending(path: Hex.encode(SHA256.hash(data: Data(fixture.author.utf8))))
+                .appending(path: SwanCore.Hex.encode(SHA256.hash(data: Data(fixture.author.utf8))))
                 .appending(path: String(digest.prefix(2)))
                 .appending(path: "\(digest).blob")
         }
@@ -2256,7 +2256,7 @@ final class SwanSQLiteTests: XCTestCase {
         let fixture = try Fixture()
         var database: SQLiteAccountDatabase? = try await fixture.open()
         let payload = Data("legacy private blob".utf8)
-        let legacyCID = "sha256:\(Hex.encode(SHA256.hash(data: payload)))"
+        let legacyCID = "sha256:\(SwanCore.Hex.encode(SHA256.hash(data: payload)))"
         let reference = BlobReference(cid: legacyCID, namespace: .space(fixture.space))
         try await database!.close()
         database = nil
@@ -2311,7 +2311,7 @@ final class SwanSQLiteTests: XCTestCase {
             repeating: 0x5a,
             count: (64 * 1_024 * 3) + 17
         )
-        let legacyCID = "sha256:\(Hex.encode(SHA256.hash(data: payload)))"
+        let legacyCID = "sha256:\(SwanCore.Hex.encode(SHA256.hash(data: payload)))"
         let reference = BlobReference(
             cid: legacyCID,
             namespace: .space(fixture.space)
@@ -2356,7 +2356,7 @@ final class SwanSQLiteTests: XCTestCase {
         let fixture = try Fixture()
         var database: SQLiteAccountDatabase? = try await fixture.open()
         let payload = Data("legacy and raw CID physical alias".utf8)
-        let legacyCID = "sha256:\(Hex.encode(SHA256.hash(data: payload)))"
+        let legacyCID = "sha256:\(SwanCore.Hex.encode(SHA256.hash(data: payload)))"
         let legacyReference = BlobReference(
             cid: legacyCID,
             namespace: .space(fixture.space)
@@ -2506,7 +2506,7 @@ final class SwanSQLiteTests: XCTestCase {
         )
         let lifecycle = try await connection.query(
             "SELECT 1 FROM blob_cas_lifecycle WHERE digest_hex = ?",
-            [.text(Hex.encode(try CID.parse(reference.cid).multihash.digest))]
+            [.text(SwanCore.Hex.encode(try CID.parse(reference.cid).multihash.digest))]
         )
         XCTAssertTrue(lifecycle.isEmpty)
         try await connection.close()
@@ -2516,7 +2516,7 @@ final class SwanSQLiteTests: XCTestCase {
         let fixture = try Fixture()
         var seeded: SQLiteAccountDatabase? = try await fixture.open()
         let payload = Data("legacy lifecycle interleave".utf8)
-        let legacyCID = "sha256:\(Hex.encode(SHA256.hash(data: payload)))"
+        let legacyCID = "sha256:\(SwanCore.Hex.encode(SHA256.hash(data: payload)))"
         let reference = BlobReference(cid: legacyCID, namespace: .space(fixture.space))
         try await seeded!.close()
         seeded = nil
@@ -2560,7 +2560,7 @@ final class SwanSQLiteTests: XCTestCase {
             FileManager.default.fileExists(
                 atPath: try privateCASPath(
                     fixture: fixture,
-                    digestHex: Hex.encode(SHA256.hash(data: payload))
+                    digestHex: SwanCore.Hex.encode(SHA256.hash(data: payload))
                 ).path
             )
         )
@@ -2603,7 +2603,7 @@ final class SwanSQLiteTests: XCTestCase {
         seeded = nil
 
         let payload = Data(repeating: 0x61, count: 2 * 1_024 * 1_024)
-        let legacyCID = "sha256:\(Hex.encode(SHA256.hash(data: payload)))"
+        let legacyCID = "sha256:\(SwanCore.Hex.encode(SHA256.hash(data: payload)))"
         let reference = BlobReference(cid: legacyCID, namespace: .space(fixture.space))
         try await installPreV4BlobSchema(
             fixture: fixture,
@@ -2658,7 +2658,7 @@ final class SwanSQLiteTests: XCTestCase {
         let parsed = try CID.parse(cid)
         return try privateCASPath(
             fixture: fixture,
-            digestHex: Hex.encode(parsed.multihash.digest)
+            digestHex: SwanCore.Hex.encode(parsed.multihash.digest)
         )
     }
 
@@ -2670,7 +2670,7 @@ final class SwanSQLiteTests: XCTestCase {
         return SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.author)
             .deletingLastPathComponent()
             .appending(path: "permissioned-blob-cas")
-            .appending(path: Hex.encode(SHA256.hash(data: Data(fixture.author.utf8))))
+            .appending(path: SwanCore.Hex.encode(SHA256.hash(data: Data(fixture.author.utf8))))
             .appending(path: String(digestHex.prefix(2)))
             .appending(path: "\(digestHex).blob")
     }

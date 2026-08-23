@@ -284,7 +284,7 @@ final class AccountDataDeletionRuntimeTests: XCTestCase {
             .deletingLastPathComponent()
             .appending(path: "permissioned-blob-cas")
             .appending(
-                path: Hex.encode(SHA256.hash(data: Data(alice.utf8)))
+                path: SwanCore.Hex.encode(SHA256.hash(data: Data(alice.utf8)))
             )
             .appending(path: "aa")
         try FileManager.default.createDirectory(
@@ -330,7 +330,7 @@ final class AccountDataDeletionRuntimeTests: XCTestCase {
         cid: String
     ) throws -> URL {
         let parsed = try CID.parse(cid)
-        let digest = Hex.encode(parsed.multihash.digest)
+        let digest = SwanCore.Hex.encode(parsed.multihash.digest)
         let accountDatabase = SQLiteLayout.accountDatabase(
             in: root,
             did: did
@@ -339,7 +339,7 @@ final class AccountDataDeletionRuntimeTests: XCTestCase {
             .deletingLastPathComponent()
             .appending(path: "permissioned-blob-cas")
             .appending(
-                path: Hex.encode(SHA256.hash(data: Data(did.utf8)))
+                path: SwanCore.Hex.encode(SHA256.hash(data: Data(did.utf8)))
             )
             .appending(path: String(digest.prefix(2)))
             .appending(path: "\(digest).blob")
@@ -368,7 +368,7 @@ final class AccountDataDeletionRuntimeTests: XCTestCase {
                 if remainder == 0 { break }
             }
             let did = "did:plc:\(String(identifier))"
-            let digest = Hex.encode(
+            let digest = SwanCore.Hex.encode(
                 SHA256.hash(data: Data(did.utf8))
             )
             let prefix = String(digest.prefix(2))

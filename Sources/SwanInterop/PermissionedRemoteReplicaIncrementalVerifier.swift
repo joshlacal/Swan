@@ -48,7 +48,7 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
         commit: ComAtprotoSpaceDefs.SignedCommit,
         base: PermissionedRemoteReplicaIncrementalBaseState,
         target: PermissionedRemoteReplicaTarget,
-        verificationKey: PermissionedDataJWTVerificationKey
+        verificationKey: SwanOAuth.PermissionedDataJWTVerificationKey
     ) throws -> VerifiedPermissionedRemoteReplicaIncrementalPage {
         guard base.head.target == target else {
             throw PermissionedRemoteReplicaIncrementalVerificationError
@@ -173,7 +173,7 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
     public static func verifyCommit(
         _ commit: ComAtprotoSpaceDefs.SignedCommit,
         target: PermissionedRemoteReplicaTarget,
-        verificationKey: PermissionedDataJWTVerificationKey
+        verificationKey: SwanOAuth.PermissionedDataJWTVerificationKey
     ) throws -> PermissionedRemoteReplicaFreshnessWitness {
         guard commit.ver == 1,
               commit.hash.data.count == 32,

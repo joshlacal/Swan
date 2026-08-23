@@ -1725,7 +1725,7 @@ private func makePublicDIDDocument(
     signingDIDKey: String,
     serviceEndpoint: String
 ) throws -> DIDDocument {
-    let verificationType = switch try PLCDIDKeyCodec.decode(signingDIDKey) {
+    let verificationType = switch try SwanAccounts.PLCDIDKeyCodec.decode(signingDIDKey) {
     case .p256:
         "EcdsaSecp256r1VerificationKey2019"
     case .secp256k1:

@@ -509,7 +509,7 @@ private actor CountingEngineSigner: PublicRepositoryCommitSigner {
 
     func sign(unsignedCommitBytes: Data) async throws -> Data {
         callCount += 1
-        return try P256WireSignature.sign(unsignedCommitBytes, using: key)
+        return try SwanCore.P256WireSignature.sign(unsignedCommitBytes, using: key)
     }
 }
 

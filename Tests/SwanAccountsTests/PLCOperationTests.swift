@@ -11,17 +11,17 @@ final class PLCOperationTests: XCTestCase {
     private let rotationKey = try! P256.Signing.PrivateKey(rawRepresentation: Data(repeating: 9, count: 32))
 
     func testP256DIDKeyMatchesPinnedTypeScriptCompressedGoldenAndRoundTrips() throws {
-        let encoded = P256DIDKey(publicKey: privateKey.publicKey)
+        let encoded = SwanAccounts.P256DIDKey(publicKey: privateKey.publicKey)
         XCTAssertEqual(
             encoded.value,
             "did:key:zDnaejgmAHMLkBPMBWnkBxyGxpXx8LgE4WJAYDhwZzyoRAddF"
         )
-        XCTAssertEqual(try P256DIDKey(encoded.value).publicKey.x963Representation, privateKey.publicKey.x963Representation)
-        XCTAssertEqual(try P256DIDKey(encoded.value).value, encoded.value)
+        XCTAssertEqual(try SwanAccounts.P256DIDKey(encoded.value).publicKey.x963Representation, privateKey.publicKey.x963Representation)
+        XCTAssertEqual(try SwanAccounts.P256DIDKey(encoded.value).value, encoded.value)
     }
 
     func testP256DIDKeyRejectsWrongCodecUncompressedPointAndNonCanonicalBase58() throws {
-        let valid = P256DIDKey(publicKey: privateKey.publicKey).value
+        let valid = SwanAccounts.P256DIDKey(publicKey: privateKey.publicKey).value
         for malformed in [
             valid.replacingOccurrences(of: "did:key:z", with: "did:key:x"),
             "did:key:z\(String(valid.dropFirst("did:key:z".count)).uppercased())",
@@ -29,20 +29,20 @@ final class PLCOperationTests: XCTestCase {
             "did:key:z6MkiTBz1yXLP7QKgQDeq5DgxdBdXKvg8u3Yu1B7S5K6M2HTh",
             "did:key:z4oJ8aP4p91UJupm9qqYqdmqYucG7LvoPBydLL1FY5JhmF6gqCeLRyBYB7vM7GXKPyhujKbVUqZh9gQ5rvuz49hchqusY",
         ] {
-            XCTAssertThrowsError(try P256DIDKey(malformed), malformed)
+            XCTAssertThrowsError(try SwanAccounts.P256DIDKey(malformed), malformed)
         }
     }
 
     func testSecp256k1DIDKeyCodecAcceptsPinnedTypeScriptFormOnly() throws {
         let value = "did:key:zQ3shqwJEJyMBsBXCWyCBpUBMqxcon9oHB7mCvx4sSpMdLJwc"
-        let key = try PLCDIDKeyCodec.decode(value)
+        let key = try SwanAccounts.PLCDIDKeyCodec.decode(value)
         guard case let .secp256k1(bytes) = key else {
             return XCTFail("expected secp256k1 key")
         }
         XCTAssertEqual(bytes.count, 33)
         XCTAssertEqual(bytes.first, 0x03)
-        XCTAssertTrue(PLCDIDKeyCodec.isCanonical(value))
-        XCTAssertThrowsError(try PLCDIDKeyCodec.decode(
+        XCTAssertTrue(SwanAccounts.PLCDIDKeyCodec.isCanonical(value))
+        XCTAssertThrowsError(try SwanAccounts.PLCDIDKeyCodec.decode(
             value.replacingOccurrences(of: "zQ3s", with: "zDna")
         ))
     }
@@ -56,8 +56,8 @@ final class PLCOperationTests: XCTestCase {
             prev: nil
         )
         XCTAssertEqual(unsigned.alsoKnownAs, ["at://alice.example.com"])
-        XCTAssertEqual(unsigned.verificationMethods, ["atproto": P256DIDKey(publicKey: privateKey.publicKey).value])
-        XCTAssertEqual(unsigned.rotationKeys, [P256DIDKey(publicKey: rotationKey.publicKey).value])
+        XCTAssertEqual(unsigned.verificationMethods, ["atproto": SwanAccounts.P256DIDKey(publicKey: privateKey.publicKey).value])
+        XCTAssertEqual(unsigned.rotationKeys, [SwanAccounts.P256DIDKey(publicKey: rotationKey.publicKey).value])
         XCTAssertEqual(
             unsigned.services,
             ["atproto_pds": .init(type: "AtprotoPersonalDataServer", endpoint: "https://pds.example.com")]
@@ -201,7 +201,7 @@ final class PLCOperationTests: XCTestCase {
         XCTAssertEqual(state.keyGeneration, 2)
         XCTAssertEqual(
             state.signingDIDKey,
-            P256DIDKey(publicKey: nextSigningKey.publicKey).value
+            SwanAccounts.P256DIDKey(publicKey: nextSigningKey.publicKey).value
         )
 
         let wrongParent = try PublicPLCOperationHistoryEntry(
@@ -273,8 +273,8 @@ final class PLCOperationTests: XCTestCase {
         XCTAssertEqual(try PLCOperationCodec.verify(
             signedUpdate,
             authorizedRotationKeys: [
-                P256DIDKey(publicKey: privateKey.publicKey).value,
-                P256DIDKey(publicKey: rotationKey.publicKey).value,
+                SwanAccounts.P256DIDKey(publicKey: privateKey.publicKey).value,
+                SwanAccounts.P256DIDKey(publicKey: rotationKey.publicKey).value,
             ]
         ), 1)
         for invalid in [
@@ -303,7 +303,7 @@ final class PLCOperationTests: XCTestCase {
         XCTAssertEqual(try tombstone.cid, CID.fromDAGCBOR(try tombstone.canonicalDAGCBOR))
         XCTAssertNoThrow(try PLCOperationCodec.verify(
             tombstone,
-            authorizedRotationKeys: [P256DIDKey(publicKey: rotationKey.publicKey).value]
+            authorizedRotationKeys: [SwanAccounts.P256DIDKey(publicKey: rotationKey.publicKey).value]
         ))
         let json = String(decoding: try tombstone.canonicalJSON, as: UTF8.self)
         XCTAssertTrue(json.contains(#""type":"plc_tombstone""#))
@@ -314,10 +314,10 @@ final class PLCOperationTests: XCTestCase {
     }
 
     func testRejectsDuplicateRotationKeysHighSSignatureTamperingAndOversize() throws {
-        let didKey = P256DIDKey(publicKey: rotationKey.publicKey).value
+        let didKey = SwanAccounts.P256DIDKey(publicKey: rotationKey.publicKey).value
         XCTAssertThrowsError(try PLCUnsignedRegularOperation(
             rotationKeys: [didKey, didKey],
-            verificationMethods: ["atproto": P256DIDKey(publicKey: privateKey.publicKey).value],
+            verificationMethods: ["atproto": SwanAccounts.P256DIDKey(publicKey: privateKey.publicKey).value],
             alsoKnownAs: ["at://alice.example.com"],
             services: ["atproto_pds": .init(type: "AtprotoPersonalDataServer", endpoint: "https://pds.example.com")],
             prev: nil
@@ -342,7 +342,7 @@ final class PLCOperationTests: XCTestCase {
         let oversizedAKA = Array(repeating: "https://example.com/" + String(repeating: "x", count: 1_000), count: 8)
         XCTAssertThrowsError(try PLCUnsignedRegularOperation(
             rotationKeys: [didKey],
-            verificationMethods: ["atproto": P256DIDKey(publicKey: privateKey.publicKey).value],
+            verificationMethods: ["atproto": SwanAccounts.P256DIDKey(publicKey: privateKey.publicKey).value],
             alsoKnownAs: oversizedAKA,
             services: [:],
             prev: nil

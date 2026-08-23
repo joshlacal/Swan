@@ -1348,7 +1348,7 @@ final class SwanInteropTests: XCTestCase {
             key: .p256(signingKey.publicKey)
         )
         let unsigned = Data("repository-commit-bytes".utf8)
-        let signature = try P256WireSignature.sign(unsigned, using: signingKey)
+        let signature = try SwanCore.P256WireSignature.sign(unsigned, using: signingKey)
 
         try await verifier.verify(
             signature: signature,

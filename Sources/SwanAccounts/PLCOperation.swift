@@ -443,7 +443,7 @@ public enum PLCOperationCodec {
         using key: P256.Signing.PrivateKey
     ) throws -> PLCSignedOperation {
         let signingBytes = try encodeSigningBytes(operation)
-        let signature = try P256WireSignature.sign(signingBytes, using: key)
+        let signature = try SwanCore.P256WireSignature.sign(signingBytes, using: key)
         let encoded = signature.plcBase64URL
         let signed: PLCSignedOperation
         switch operation {
@@ -503,7 +503,7 @@ public enum PLCOperationCodec {
         for (index, keyText) in authorizedRotationKeys.enumerated() {
             switch try PLCDIDKeyCodec.decode(keyText) {
             case let .p256(key):
-                let signature = try P256WireSignature.decodeCanonical(signatureBytes)
+                let signature = try SwanCore.P256WireSignature.decodeCanonical(signatureBytes)
                 if key.isValidSignature(signature, for: signingBytes) {
                     return index
                 }
@@ -717,7 +717,7 @@ public enum PLCOperationCodec {
                 guard let key = try? PLCDIDKeyCodec.decode($0) else { return false }
                 switch key {
                 case .p256:
-                    return (try? P256WireSignature.decodeCanonical(signatureBytes)) != nil
+                    return (try? SwanCore.P256WireSignature.decodeCanonical(signatureBytes)) != nil
                 case .secp256k1:
                     return isCanonicalSecp256k1Signature(signatureBytes)
                 }
@@ -732,7 +732,7 @@ public enum PLCOperationCodec {
 
     private static func decodeCanonicalSignature(_ value: String) throws -> Data {
         guard let decoded = Data(plcBase64URL: value),
-              decoded.count == P256WireSignature.rawByteCount,
+              decoded.count == SwanCore.P256WireSignature.rawByteCount,
               decoded.plcBase64URL == value else {
             throw SwanError.malformed("PLC operation signature encoding is invalid")
         }

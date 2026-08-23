@@ -44,7 +44,7 @@ public struct P256PublicRepositoryCommitSigner: @unchecked Sendable, PublicRepos
     }
 
     public func sign(unsignedCommitBytes: Data) async throws -> Data {
-        try P256WireSignature.sign(unsignedCommitBytes, using: privateKey)
+        try SwanCore.P256WireSignature.sign(unsignedCommitBytes, using: privateKey)
     }
 }
 
@@ -66,7 +66,7 @@ public struct P256PublicRepositoryCommitVerifier: @unchecked Sendable, PublicRep
         unsignedCommitBytes: Data,
         did _: String
     ) async throws {
-        let decoded = try P256WireSignature.decodeCanonical(signature)
+        let decoded = try SwanCore.P256WireSignature.decodeCanonical(signature)
         guard publicKey.isValidSignature(decoded, for: unsignedCommitBytes) else {
             throw PublicRepositoryCommitError.invalidSignature
         }

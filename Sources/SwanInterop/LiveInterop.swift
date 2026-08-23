@@ -646,7 +646,7 @@ public actor InteropFixtureRecorder {
                 status: response.status,
                 requestBytes: requestBody?.count ?? 0,
                 responseBytes: response.body.count,
-                responseSHA256: Hex.encode(Data(SHA256.hash(data: response.body))),
+                responseSHA256: SwanCore.Hex.encode(Data(SHA256.hash(data: response.body))),
                 responseError: response.status >= 400 ? response.bodyErrorCode : nil
             )
         )
@@ -674,14 +674,14 @@ public struct LiveInteropHost: Sendable {
     /// Optional operator-pinned key for verifying permissioned repository
     /// commits returned by this host. A missing key is an intentional
     /// fail-closed condition when an incremental sync assertion is requested.
-    public let permissionedCommitVerificationKey: PermissionedDataJWTVerificationKey?
+    public let permissionedCommitVerificationKey: SwanOAuth.PermissionedDataJWTVerificationKey?
 
     public init(
         label: String,
         client: InteropXRPCClient,
         authorization: InteropAuthorization = .none,
         authorizationProvider: InteropAuthorizationProvider? = nil,
-        permissionedCommitVerificationKey: PermissionedDataJWTVerificationKey? = nil
+        permissionedCommitVerificationKey: SwanOAuth.PermissionedDataJWTVerificationKey? = nil
     ) {
         self.label = label
         self.client = client
@@ -839,7 +839,7 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
     /// incremental page an explicit state-transition witness, rather than an
     /// endpoint-success probe.
     public let syncOperationRevision: String?
-    /// Hex-encoded LtHash commitment reconstructed from the terminal page.
+    /// SwanCore.Hex-encoded LtHash commitment reconstructed from the terminal page.
     public let syncCommitment: String?
     /// Revision bound into the verified signed terminal commitment.
     public let syncCommitRevision: String?
@@ -1754,7 +1754,7 @@ public enum LiveInteropRunner {
                 )
             }
             let received = try fileDigest(url)
-            let expectedDigest = Hex.encode(SHA256.hash(data: expectedBody))
+            let expectedDigest = SwanCore.Hex.encode(SHA256.hash(data: expectedBody))
             let verified = received.bytes == expectedBody.count
                 && received.digest == expectedDigest
             return PermissionedBlobResult(
@@ -1828,7 +1828,7 @@ public enum LiveInteropRunner {
                 )
             }
             let received = try fileDigest(url)
-            let expectedDigest = Hex.encode(SHA256.hash(data: expectedBody))
+            let expectedDigest = SwanCore.Hex.encode(SHA256.hash(data: expectedBody))
             let verified = received.bytes == expectedBody.count
                 && received.digest == expectedDigest
             return PublicBlobResult(
@@ -1853,7 +1853,7 @@ public enum LiveInteropRunner {
             count += chunk.count
             digest.update(data: chunk)
         }
-        return (count, Hex.encode(Data(digest.finalize())))
+        return (count, SwanCore.Hex.encode(Data(digest.finalize())))
     }
 
     /// Advances a member repository using exactly the pinned applyWrites
@@ -2641,7 +2641,7 @@ public enum LiveInteropRunner {
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
                     operationRevision: operation.rev.toString(),
-                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
+                    commitment: SwanCore.Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "CommitmentMismatch"
                 )
@@ -2664,7 +2664,7 @@ public enum LiveInteropRunner {
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
                     operationRevision: operation.rev.toString(),
-                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
+                    commitment: SwanCore.Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "ContentBindingMismatch"
                 )
@@ -2674,7 +2674,7 @@ public enum LiveInteropRunner {
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
                     operationRevision: operation.rev.toString(),
-                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
+                    commitment: SwanCore.Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "MissingCommitKey"
                 )
@@ -2692,7 +2692,7 @@ public enum LiveInteropRunner {
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
                     operationRevision: operation.rev.toString(),
-                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
+                    commitment: SwanCore.Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "ContextSignatureMismatch"
                 )
@@ -2701,7 +2701,7 @@ public enum LiveInteropRunner {
                 status: response.status, opsCount: output.ops.count,
                 operationCID: operation.cid?.string,
                 operationRevision: operation.rev.toString(),
-                commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
+                commitment: SwanCore.Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                 commitVerified: true, valuesIncluded: includeValues, errorCode: nil
             )
         } catch {
@@ -2794,7 +2794,7 @@ public enum LiveInteropRunner {
             return PermissionedCARResult(
                 status: response.status,
                 recordCount: recovery.recordCount,
-                commitment: Hex.encode(recovery.commitment),
+                commitment: SwanCore.Hex.encode(recovery.commitment),
                 wireRevision: recovery.wireRevision.toString(),
                 expectedRecordVerified:
                     recovery.verifiedExpectedWitnessCount == 1,
@@ -2994,7 +2994,7 @@ public enum LiveInteropRunner {
 }
 
 private func responseDigest(_ response: InteropHTTPResponse) -> String {
-    Hex.encode(Data(SHA256.hash(data: response.body)))
+    SwanCore.Hex.encode(Data(SHA256.hash(data: response.body)))
 }
 
 private func canonicalInteropRecordValue(_ record: ATProtocolValueContainer) throws -> Data {
@@ -3355,7 +3355,7 @@ public struct SwanCARConsumer: Sendable {
         fileURL: URL,
         space: SpaceURI,
         author: String,
-        verificationKey: PermissionedDataJWTVerificationKey
+        verificationKey: SwanOAuth.PermissionedDataJWTVerificationKey
     ) throws -> VerifiedSpaceCARRecovery {
         let data = try boundedFileData(fileURL)
         let algorithm: String = switch verificationKey {
@@ -3401,7 +3401,7 @@ public struct SwanCARConsumer: Sendable {
         fileURL: URL,
         space: SpaceURI,
         author: String,
-        verificationKey: PermissionedDataJWTVerificationKey,
+        verificationKey: SwanOAuth.PermissionedDataJWTVerificationKey,
         expectedEntries: [SpaceCARRecoveryIndexEntry] = []
     ) async throws -> VerifiedStreamingSpaceCARRecovery {
         let algorithm: String = switch verificationKey {

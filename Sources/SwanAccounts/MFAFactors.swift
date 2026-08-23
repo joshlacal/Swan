@@ -572,7 +572,7 @@ public struct WebAuthnVerifier: Sendable {
     }
 
     private func decodeWebAuthnSignature(_ data: Data) throws -> P256.Signing.ECDSASignature {
-        if data.count == 64 { return try P256WireSignature.decodeMalleabilityTolerant(data) }
+        if data.count == 64 { return try SwanCore.P256WireSignature.decodeMalleabilityTolerant(data) }
         guard data.count >= 8 && data[0] == 0x30 else { throw MFAError.invalidSignature }
         var i = 1
         func length() throws -> Int { guard i < data.count else { throw MFAError.invalidSignature }; let b = data[i]; i += 1; guard b & 0x80 == 0 else { throw MFAError.invalidSignature }; return Int(b) }
@@ -580,7 +580,7 @@ public struct WebAuthnVerifier: Sendable {
         let total = try length(); guard total == data.count - i else { throw MFAError.invalidSignature }; let r = try integer(); let s = try integer(); guard i == data.count, r.count <= 33, s.count <= 33 else { throw MFAError.invalidSignature }
         let rawR = r.count == 33 ? Data(r.dropFirst()) : Data(repeating: 0, count: 32 - r.count) + r
         let rawS = s.count == 33 ? Data(s.dropFirst()) : Data(repeating: 0, count: 32 - s.count) + s
-        return try P256WireSignature.decodeMalleabilityTolerant(rawR + rawS)
+        return try SwanCore.P256WireSignature.decodeMalleabilityTolerant(rawR + rawS)
     }
     private struct ClientData: Decodable { let type: String; let challenge: String; let origin: String; let crossOrigin: Bool
         enum CodingKeys: String, CodingKey { case type, challenge, origin, crossOrigin }

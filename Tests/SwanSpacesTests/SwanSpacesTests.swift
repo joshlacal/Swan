@@ -16,7 +16,7 @@ final class SwanSpacesTests: XCTestCase {
         var state = LtHash()
         let original = state.serialized
         XCTAssertEqual(
-            Hex.encode(state.commitment),
+            SwanCore.Hex.encode(state.commitment),
             "e5a00aa9991ac8a5ee3109844d84a55583bd20572ad3ffcd42792f3c36b183ad"
         )
         state.add(element: "record-token")
@@ -245,7 +245,7 @@ final class SwanSpacesTests: XCTestCase {
             commitment: Data(repeating: 3, count: 32),
             key: key
         )
-        XCTAssertTrue(P256WireSignature.isCanonicalLowS(envelope.contextSignature))
+        XCTAssertTrue(SwanCore.P256WireSignature.isCanonicalLowS(envelope.contextSignature))
 
         let malleated = SpaceCommitEnvelope(
             context: context,

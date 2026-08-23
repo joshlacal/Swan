@@ -282,20 +282,20 @@ public struct PublicRepositoryBlobPromotionResult: Sendable, Equatable {
 public struct PermissionedDataPublicRepositoryCommitVerifier: @unchecked Sendable,
     PublicRepositoryCommitVerifier
 {
-    private let key: PermissionedDataJWTVerificationKey
+    private let key: SwanOAuth.PermissionedDataJWTVerificationKey
 
     public let signingAlgorithm: PublicRepositorySigningAlgorithm
     public let verificationIdentity: String
 
-    public init(key: PermissionedDataJWTVerificationKey) {
+    public init(key: SwanOAuth.PermissionedDataJWTVerificationKey) {
         self.key = key
         switch key {
         case let .p256(publicKey):
             signingAlgorithm = .p256
-            verificationIdentity = "p256-sha256:\(Hex.encode(SHA256.hash(data: publicKey.x963Representation)))"
+            verificationIdentity = "p256-sha256:\(SwanCore.Hex.encode(SHA256.hash(data: publicKey.x963Representation)))"
         case let .secp256k1PublicKey(bytes):
             signingAlgorithm = .secp256k1
-            verificationIdentity = "secp256k1-sha256:\(Hex.encode(SHA256.hash(data: bytes)))"
+            verificationIdentity = "secp256k1-sha256:\(SwanCore.Hex.encode(SHA256.hash(data: bytes)))"
         }
     }
 

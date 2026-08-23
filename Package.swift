@@ -33,7 +33,7 @@ let package = Package(
         // says why.
         .package(
             url: "https://github.com/joshlacal/Petrel.git",
-            revision: "bf1f27567e5d49b0a8ca5d7ead2c6ea0ef9a2575"
+            revision: "ac750478ac25288b9e409a41ddba593bd4e18053"
         ),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),

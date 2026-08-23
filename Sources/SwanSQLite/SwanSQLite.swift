@@ -26,7 +26,7 @@ public enum SQLiteLayout {
     }
 
     public static func accountDatabase(in dataDirectory: URL, did: String) -> URL {
-        let digest = Hex.encode(SHA256.hash(data: Data(did.utf8)))
+        let digest = SwanCore.Hex.encode(SHA256.hash(data: Data(did.utf8)))
         return dataDirectory
             .appending(path: "actors")
             .appending(path: String(digest.prefix(2)))
@@ -2310,7 +2310,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let databasePath: String
         var heldDatabaseDescriptor: Int32 = -1
         do {
-            let name = "\(Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite"
+            let name = "\(SwanCore.Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite"
             let path = SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
                 .standardizedFileURL.path
             switch openMode {
@@ -2445,7 +2445,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 if !descriptorBacked {
                     try SQLiteProtectedPaths.hardenSQLiteFiles(
                         parentDescriptor: accountDescriptor,
-                        databaseName: "\(Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite"
+                        databaseName: "\(SwanCore.Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite"
                     )
                 }
             } catch {
@@ -5477,7 +5477,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let computedRawCID = CID.fromBlob(data).string
         if expectedCID.hasPrefix("sha256:") {
             guard expectedCID
-                == "sha256:\(Hex.encode(SHA256.hash(data: data)))" else {
+                == "sha256:\(SwanCore.Hex.encode(SHA256.hash(data: data)))" else {
                 throw SQLiteRepositoryError.corruptDatabase(
                     "portable restore blob CID is invalid"
                 )
@@ -5556,7 +5556,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 "portable restore blob length is invalid"
             )
         }
-        let digestHex = Hex.encode(summary.digest)
+        let digestHex = SwanCore.Hex.encode(summary.digest)
         let rawCID = CID(
             codec: .raw,
             multihash: Multihash(
@@ -8488,7 +8488,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 digest: summary.digest
             )
         )
-        let digestHex = Hex.encode(summary.digest)
+        let digestHex = SwanCore.Hex.encode(summary.digest)
         let columns = blobNamespaceColumns(namespace)
         return try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
             try await putBlobLocked(
@@ -11433,11 +11433,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// accounts that happen to share a layout prefix could race on a payload
     /// file while SQLite tracks references only in their separate databases.
     private var accountBlobNamespace: String {
-        Hex.encode(SHA256.hash(data: Data(accountDID.utf8)))
+        SwanCore.Hex.encode(SHA256.hash(data: Data(accountDID.utf8)))
     }
 
     private func legacyBlobCID(_ payload: Data) -> String {
-        "sha256:\(Hex.encode(SHA256.hash(data: payload)))"
+        "sha256:\(SwanCore.Hex.encode(SHA256.hash(data: payload)))"
     }
 
     private func canonicalRawBlobCID(_ value: String) throws -> CID {
@@ -11655,7 +11655,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
     private func blobDigestHex(cid: String, allowLegacy: Bool) throws -> String {
         if let parsed = try? canonicalRawBlobCID(cid) {
-            return Hex.encode(parsed.multihash.digest)
+            return SwanCore.Hex.encode(parsed.multihash.digest)
         }
         guard allowLegacy,
               cid.utf8.count == 71,
@@ -11663,7 +11663,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
               let digest = legacyBlobDigest(cid) else {
             throw SwanError.malformed("blob CID is invalid")
         }
-        return Hex.encode(digest)
+        return SwanCore.Hex.encode(digest)
     }
 
     private func legacyBlobDigest(_ value: String) -> Data? {

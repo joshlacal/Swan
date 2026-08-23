@@ -1608,7 +1608,7 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
             ath: Data(SHA256.hash(data: Data(token.utf8))).base64URLEncodedString()
         )).base64URLEncodedString()
         let input = "\(header).\(claims)"
-        let signature = try P256WireSignature.sign(Data(input.utf8), using: key).base64URLEncodedString()
+        let signature = try SwanCore.P256WireSignature.sign(Data(input.utf8), using: key).base64URLEncodedString()
         return authorizationHeaders(token: token, proof: "\(input).\(signature)")
     }
 

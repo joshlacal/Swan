@@ -2168,7 +2168,7 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
                 ath: Data(SHA256.hash(data: Data(token.utf8))).base64URLEncodedString()
             )).base64URLEncodedString()
             let input = header + "." + claims
-            let signature = try P256WireSignature.sign(
+            let signature = try SwanCore.P256WireSignature.sign(
                 Data(input.utf8), using: key
             ).base64URLEncodedString()
             var fields = HTTPFields()

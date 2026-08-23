@@ -362,7 +362,7 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
         let carBytes = try XCTUnwrap(
             Data(base64Encoded: try XCTUnwrap(vector["carBase64"] as? String))
         )
-        let signingKey = try P256DIDKey(
+        let signingKey = try SwanAccounts.P256DIDKey(
             try XCTUnwrap(vector["signingKeyDID"] as? String)
         ).publicKey
         let expectedCommitCID = try XCTUnwrap(vector["commitCID"] as? String)

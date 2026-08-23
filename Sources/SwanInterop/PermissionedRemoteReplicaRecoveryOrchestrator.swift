@@ -29,7 +29,7 @@ private actor PermissionedRemoteReplicaSourceCloseGate {
 
 public struct PermissionedRemoteReplicaSourceSession: Sendable {
     public let identity: PermissionedRemoteReplicaSourceIdentity
-    public let verificationKey: PermissionedDataJWTVerificationKey
+    public let verificationKey: SwanOAuth.PermissionedDataJWTVerificationKey
     public let freshnessWitness: PermissionedRemoteReplicaFreshnessWitness
     public let source: any SpaceCARRecoveryByteSource
     /// Releases the source descriptor and any temporary transport spool. The
@@ -40,7 +40,7 @@ public struct PermissionedRemoteReplicaSourceSession: Sendable {
 
     public init(
         identity: PermissionedRemoteReplicaSourceIdentity,
-        verificationKey: PermissionedDataJWTVerificationKey,
+        verificationKey: SwanOAuth.PermissionedDataJWTVerificationKey,
         freshnessWitness: PermissionedRemoteReplicaFreshnessWitness,
         source: any SpaceCARRecoveryByteSource,
         closeSource: @escaping @Sendable () async -> Void
@@ -305,7 +305,7 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
             source.repositoryDID,
             source.verifierIdentity,
             freshness.wireRevision.toString(),
-            Hex.encode(freshness.commitment),
+            SwanCore.Hex.encode(freshness.commitment),
             profileID,
             String(limits.maximumCARBytes),
             String(limits.maximumRecordBytes),
@@ -322,9 +322,9 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
                 String(expectedBase.generation),
                 expectedBase.wireRevision.toString(),
                 expectedBase.historyFloorWireRevision.toString(),
-                Hex.encode(expectedBase.ltHash),
-                Hex.encode(expectedBase.commitment),
-                Hex.encode(expectedBase.stateMarker),
+                SwanCore.Hex.encode(expectedBase.ltHash),
+                SwanCore.Hex.encode(expectedBase.commitment),
+                SwanCore.Hex.encode(expectedBase.stateMarker),
             ] {
                 material.append(contentsOf: value.utf8)
                 material.append(0)

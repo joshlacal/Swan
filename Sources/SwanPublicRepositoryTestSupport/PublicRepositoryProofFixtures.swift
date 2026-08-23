@@ -478,7 +478,7 @@ public enum PublicRepositoryProofFixtureBuilder {
         }
         var tampered = signature
         tampered[tampered.startIndex + 31] ^= 0x01
-        guard P256WireSignature.isCanonicalLowS(tampered) else {
+        guard SwanCore.P256WireSignature.isCanonicalLowS(tampered) else {
             throw PublicRepositoryProofFixtureError.signatureTamperingChangedStructure
         }
         var result = commitBytes
