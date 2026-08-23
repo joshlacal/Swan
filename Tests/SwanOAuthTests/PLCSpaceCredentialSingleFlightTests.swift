@@ -475,7 +475,8 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         }
 
         try await waitForFetchCount(2, from: plc)
-        await plc.releaseAll(with: .success)
+        await plc.releaseNext(with: .success)
+        await plc.releaseNext(with: .success)
         var successes = 0
         for lookup in lookups {
             let succeeded = try await withinDeadline { await lookup.value }
@@ -495,49 +496,187 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         async throws
     {
         let issuers = Self.validIssuers
-        let plc = try controlledPLC(for: issuers)
+        let phaseRecorder = SingleFlightPhaseRecorder()
+        let checkpointStore = SingleFlightCheckpointStore(
+            phaseRecorder: phaseRecorder
+        )
+        let outcomeRecorder = SingleFlightLookupOutcomeRecorder()
+        let startBarrier = SingleFlightCompetitionBarrier(
+            participants: issuers.count
+        )
+        let plc = try controlledPLC(
+            for: issuers,
+            phaseRecorder: phaseRecorder
+        )
         let firstResolver = try PLCSpaceCredentialPublicKeyResolver(
             plc: plc,
-            continuityStore: SingleFlightCheckpointStore(),
+            continuityStore: checkpointStore,
             cacheConfiguration: .init(maximumConcurrentLookups: 8)
         )
         let secondResolver = try PLCSpaceCredentialPublicKeyResolver(
             plc: plc,
-            continuityStore: SingleFlightCheckpointStore(),
+            continuityStore: checkpointStore,
             cacheConfiguration: .init(maximumConcurrentLookups: 8)
         )
 
         let lookups = issuers.enumerated().map { index, issuer in
+            let lookupIndex = index + 1
             let resolver = index.isMultiple(of: 2)
                 ? firstResolver
                 : secondResolver
             return Task {
+                await phaseRecorder.record(.lookupStarted(
+                    index: lookupIndex,
+                    issuer: issuer
+                ))
+                await startBarrier.arriveAndWait()
+                let succeeded: Bool
                 do {
-                    return try await resolver.publicKey(
+                    succeeded = try await resolver.publicKey(
                         for: issuer,
                         keyID: PermissionedDataJWT.spaceCredentialKeyID
                     ) != nil
                 } catch {
-                    return false
+                    succeeded = false
                 }
+                await phaseRecorder.record(.lookupOutcomeReturned(
+                    index: lookupIndex,
+                    issuer: issuer,
+                    succeeded: succeeded
+                ))
+                await outcomeRecorder.record(
+                    lookupIndex: lookupIndex,
+                    succeeded: succeeded
+                )
+                return succeeded
             }
         }
 
-        try await waitForFetchCount(8, from: plc)
-        await plc.releaseAll(with: .success)
-        var successes = 0
-        for lookup in lookups {
-            let succeeded = try await withinDeadline { await lookup.value }
-            if succeeded {
-                successes += 1
+        do {
+            try await waitForFetchCount(8, from: plc)
+            // Eight withheld fetches hold the process permits. Waiting for
+            // the other two registered contenders to return before draining
+            // removes scheduler timing from the expected hard-ceiling result.
+            try await waitForLookupCompletionCount(
+                2,
+                from: outcomeRecorder
+            )
+            try await drainControlledFetches(
+                plc: plc,
+                untilCompletionCount: issuers.count,
+                from: outcomeRecorder
+            )
+        } catch {
+            let beforeCleanup = await singleFlightBatchDiagnostic(
+                issuers: issuers,
+                plc: plc,
+                checkpointStore: checkpointStore,
+                phaseRecorder: phaseRecorder,
+                outcomeRecorder: outcomeRecorder
+            )
+            // This actor transition covers both already-pending continuations
+            // and fetches that enter after the failure path starts.
+            await plc.enableAutomaticRelease(with: .success)
+            var acknowledged = [Bool]()
+            for lookup in lookups {
+                acknowledged.append(await lookup.value)
             }
+            let afterCleanup = await singleFlightBatchDiagnostic(
+                issuers: issuers,
+                plc: plc,
+                checkpointStore: checkpointStore,
+                phaseRecorder: phaseRecorder,
+                outcomeRecorder: outcomeRecorder
+            )
+            XCTFail(
+                "process-wide fixture failed: \(error)\n" +
+                    "before cleanup:\n\(beforeCleanup)\n" +
+                    "after cleanup:\n\(afterCleanup)\n" +
+                    "acknowledged outcomes=\(acknowledged)"
+            )
+            return
         }
+
+        var acknowledged = [Bool]()
+        for lookup in lookups {
+            acknowledged.append(await lookup.value)
+        }
+        let successes = acknowledged.filter { $0 }.count
 
         let fetchCount = await plc.fetchCount()
         let peakFetchCount = await plc.peakConcurrentFetchCount()
         XCTAssertEqual(successes, 8)
         XCTAssertEqual(fetchCount, 8)
         XCTAssertEqual(peakFetchCount, 8)
+    }
+
+    func testControlledPLCDrainReleasesLateContenderAfterFirstRelease()
+        async throws
+    {
+        let issuers = Array(Self.validIssuers.prefix(2))
+        let plc = try controlledPLC(for: issuers)
+        let resolver = try PLCSpaceCredentialPublicKeyResolver(
+            plc: plc,
+            continuityStore: SingleFlightCheckpointStore()
+        )
+        let lateStart = SingleFlightOneShotSignal()
+
+        let first = Task {
+            try await resolver.publicKey(
+                for: issuers[0],
+                keyID: PermissionedDataJWT.spaceCredentialKeyID
+            )
+        }
+        let late = Task {
+            await lateStart.wait()
+            return try await resolver.publicKey(
+                for: issuers[1],
+                keyID: PermissionedDataJWT.spaceCredentialKeyID
+            )
+        }
+
+        try await waitForFetchCount(1, from: plc)
+        await plc.enableAutomaticRelease(with: .success)
+        let firstKey = try await withinDeadline { try await first.value }
+        XCTAssertNotNil(firstKey)
+
+        await lateStart.signal()
+        try await waitForFetchCount(2, from: plc)
+        let losingBodyFinished = SingleFlightOneShotSignal()
+        do {
+            _ = try await withinDeadline(
+                0.05,
+                reportTimeout: false
+            ) {
+                do {
+                    let key = try await late.value
+                    await losingBodyFinished.signal()
+                    return key
+                } catch {
+                    await losingBodyFinished.signal()
+                    throw error
+                }
+            }
+        } catch SingleFlightTestTimeout.taskValue {
+            let fetchState = await plc.controlledFetchState(for: 2)
+            await plc.releaseNext(with: .success)
+            _ = try await late.value
+            await losingBodyFinished.wait()
+            XCTFail(
+                "late contender remained \(fetchState) after the first release"
+            )
+            return
+        }
+
+        let finalFetchState = await plc.controlledFetchState(for: 2)
+        let finalFetchCount = await plc.fetchCount()
+        let finalPeakFetchCount = await plc.peakConcurrentFetchCount()
+        let finalFixture = await plc.diagnosticDescription()
+        XCTAssertEqual(finalFetchState, .released)
+        XCTAssertEqual(finalFetchCount, 2)
+        XCTAssertEqual(finalPeakFetchCount, 1)
+        XCTAssertTrue(finalFixture.contains("pending=[]"), finalFixture)
+        XCTAssertTrue(finalFixture.contains("automatic=true"), finalFixture)
     }
 
     private func controlledPLC(
@@ -717,10 +856,34 @@ private actor SingleFlightPhaseRecorder {
         }
     }
 
+    func phases(for issuer: String) -> [SingleFlightPhase] {
+        recordedPhases.filter { $0.issuer == issuer }
+    }
+
     func latestLookupIndex(for issuer: String) -> Int? {
         recordedPhases.reversed().first(where: {
             $0.issuer == issuer
         })?.lookupIndex
+    }
+}
+
+private actor SingleFlightLookupOutcomeRecorder {
+    private var outcomes = [Int: Bool]()
+
+    func record(
+        lookupIndex: Int,
+        succeeded: Bool
+    ) {
+        precondition(outcomes[lookupIndex] == nil)
+        outcomes[lookupIndex] = succeeded
+    }
+
+    func completionCount() -> Int { outcomes.count }
+
+    func outcome(for lookupIndex: Int) -> SingleFlightLookupOutcomeState {
+        outcomes[lookupIndex].map {
+            .returned(success: $0)
+        } ?? .pending
     }
 }
 
@@ -773,6 +936,8 @@ private actor SingleFlightControlledPLC: PLCClient {
     private let phaseRecorder: SingleFlightPhaseRecorder?
     private var pending = [PendingFetch]()
     private var releasedFetches = Set<Int>()
+    private var fetchIssuers = [Int: String]()
+    private var automaticOutcome: Outcome?
     private var fetches = 0
     private var activeFetches = 0
     private var peakActiveFetches = 0
@@ -792,6 +957,7 @@ private actor SingleFlightControlledPLC: PLCClient {
     func fetchState(did: String) async throws -> PLCDocumentData {
         fetches += 1
         let lookupIndex = fetches
+        fetchIssuers[lookupIndex] = did
         activeFetches += 1
         peakActiveFetches = max(peakActiveFetches, activeFetches)
         if let phaseRecorder {
@@ -800,13 +966,29 @@ private actor SingleFlightControlledPLC: PLCClient {
                 issuer: did
             ))
         }
-        let outcome = await withCheckedContinuation {
-            (continuation: CheckedContinuation<Outcome, Never>) in
-            pending.append(PendingFetch(
-                continuation: continuation,
-                did: did,
-                index: lookupIndex
-            ))
+        let outcome: Outcome
+        if let automaticOutcome {
+            releasedFetches.insert(lookupIndex)
+            if let phaseRecorder {
+                await phaseRecorder.record(.stateFetchReleased(
+                    index: lookupIndex,
+                    issuer: did
+                ))
+            }
+            outcome = automaticOutcome
+        } else {
+            // Re-checking the actor-owned automatic outcome immediately
+            // before continuation installation is what makes the transition
+            // race-free: no await can interleave between this branch and the
+            // synchronous continuation closure below.
+            outcome = await withCheckedContinuation {
+                (continuation: CheckedContinuation<Outcome, Never>) in
+                pending.append(PendingFetch(
+                    continuation: continuation,
+                    did: did,
+                    index: lookupIndex
+                ))
+            }
         }
         activeFetches -= 1
         guard outcome == .success,
@@ -833,8 +1015,9 @@ private actor SingleFlightControlledPLC: PLCClient {
         snapshots[did]?.audit
     }
 
-    func releaseNext(with outcome: Outcome) async {
-        guard !pending.isEmpty else { return }
+    @discardableResult
+    func releaseNext(with outcome: Outcome) async -> Bool {
+        guard !pending.isEmpty else { return false }
         let fetch = pending.removeFirst()
         releasedFetches.insert(fetch.index)
         if let phaseRecorder {
@@ -844,12 +1027,14 @@ private actor SingleFlightControlledPLC: PLCClient {
             ))
         }
         fetch.continuation.resume(returning: outcome)
+        return true
     }
 
-    func releaseAll(with outcome: Outcome) async {
-        let fetches = pending
+    func enableAutomaticRelease(with outcome: Outcome) async {
+        automaticOutcome = outcome
+        let currentFetches = pending
         pending.removeAll(keepingCapacity: true)
-        for fetch in fetches {
+        for fetch in currentFetches {
             releasedFetches.insert(fetch.index)
             if let phaseRecorder {
                 await phaseRecorder.record(.stateFetchReleased(
@@ -874,6 +1059,29 @@ private actor SingleFlightControlledPLC: PLCClient {
             return .pending
         }
         return .notStarted
+    }
+
+    func controlledFetchState(
+        for issuer: String
+    ) -> SingleFlightControlledFetchState {
+        guard let lookupIndex = fetchIssuers.first(where: {
+            $0.value == issuer
+        })?.key else {
+            return .notStarted
+        }
+        return controlledFetchState(for: lookupIndex)
+    }
+
+    func diagnosticDescription() -> String {
+        let pendingDescription = pending.map {
+            "\($0.index):\($0.did)"
+        }.joined(separator: ",")
+        let releasedDescription = releasedFetches.sorted().map(String.init)
+            .joined(separator: ",")
+        return "fetches=\(fetches) active=\(activeFetches) " +
+            "peak=\(peakActiveFetches) pending=[\(pendingDescription)] " +
+            "released=[\(releasedDescription)] " +
+            "automatic=\(automaticOutcome != nil)"
     }
 }
 
@@ -1272,6 +1480,7 @@ private final class SingleFlightDeadlineRace<Value: Sendable>:
 
 private enum SingleFlightTestTimeout: Error {
     case fetchCount(Int)
+    case lookupCompletionCount(expected: Int, actual: Int)
     case taskValue
 }
 
@@ -1287,6 +1496,72 @@ private func waitForFetchCount(
         }
         await Task.yield()
     }
+}
+
+private func waitForLookupCompletionCount(
+    _ expected: Int,
+    from recorder: SingleFlightLookupOutcomeRecorder
+) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(2))
+    while await recorder.completionCount() < expected {
+        guard clock.now < deadline else {
+            throw SingleFlightTestTimeout.lookupCompletionCount(
+                expected: expected,
+                actual: await recorder.completionCount()
+            )
+        }
+        await Task.yield()
+    }
+}
+
+private func drainControlledFetches(
+    plc: SingleFlightControlledPLC,
+    untilCompletionCount expected: Int,
+    from recorder: SingleFlightLookupOutcomeRecorder
+) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(2))
+    while await recorder.completionCount() < expected {
+        if await plc.releaseNext(with: .success) {
+            continue
+        }
+        guard clock.now < deadline else {
+            throw SingleFlightTestTimeout.lookupCompletionCount(
+                expected: expected,
+                actual: await recorder.completionCount()
+            )
+        }
+        await Task.yield()
+    }
+}
+
+private func singleFlightBatchDiagnostic(
+    issuers: [String],
+    plc: SingleFlightControlledPLC,
+    checkpointStore: SingleFlightCheckpointStore,
+    phaseRecorder: SingleFlightPhaseRecorder,
+    outcomeRecorder: SingleFlightLookupOutcomeRecorder
+) async -> String {
+    var lines = [await plc.diagnosticDescription()]
+    for (index, issuer) in issuers.enumerated() {
+        let lookupIndex = index + 1
+        let phases = await phaseRecorder.phases(for: issuer)
+        let checkpoint = try? await checkpointStore
+            .plcCredentialKeyContinuityCheckpoint(for: issuer)
+        let checkpointDescription = checkpoint.map {
+            "present(terminalCID: \($0.terminalCID))"
+        } ?? "absent"
+        let fetchState = await plc.controlledFetchState(for: issuer)
+        let outcome = await outcomeRecorder.outcome(for: lookupIndex)
+        lines.append(
+            "lookup=\(lookupIndex) issuer=\(issuer) " +
+                "fetch=\(fetchState) checkpoint=\(checkpointDescription) " +
+                "outcome=\(outcome) lastPhase=\(String(describing: phases.last)) " +
+                "phases=\(phases)"
+        )
+    }
+    return lines.joined(separator: "\n")
 }
 
 private func XCTAssertThrowsSingleFlightError<T>(
