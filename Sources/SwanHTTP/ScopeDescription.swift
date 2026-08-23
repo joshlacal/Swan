@@ -1,22 +1,15 @@
 import Foundation
+import SwanCore
 
-/// A semantic scope classification, owned by this file and independent of
-/// Lane 1's grammar layer (`Sources/SwanCore/OAuthScopes`, spec §4/§5),
-/// which had not landed when this renderer was written.
+/// A semantic scope classification for consent rendering, shaped one-for-one
+/// against `AtprotoScope` (`Sources/SwanCore/OAuthScopes`, spec §4.7) but
+/// expressed in plain `String`/`[String]` rather than its typed sub-values.
+/// The renderer only prints these values; it never matches or canonicalises
+/// them, so carrying the richer types through this boundary adds no value.
 ///
-/// This is deliberately NOT a validator. `AtprotoScope` (§4.7) rejects a
-/// malformed scope before it is ever persisted; by the time a scope reaches
-/// a consent page it has already survived that gate (§4.8, §9-D5). `classify`
-/// therefore only has to pick the right card and its wording — a string it
-/// cannot confidently parse becomes `.unrecognized` and still gets a row
-/// (D19: "never drop an undescribable row", mirroring
-/// `scope-description.tsx:178`'s NSID fallback) rather than being rejected
-/// or silently dropped.
-///
-/// Once Lane 1's `AtprotoScope` ships, `classify(_:)` should become a thin
-/// adapter over `AtprotoScope.parse` — the cases below are shaped one-for-one
-/// against §4.7's `AtprotoScope` enum so that swap is mechanical, not a
-/// rewrite.
+/// `classify(_:)` is a thin adapter over the same `AtprotoScope.parse` grammar
+/// used by admission. `ConsentScope` keeps only the display model local to
+/// SwanHTTP; it does not re-derive scope syntax from raw prefixes.
 enum ConsentScope: Sendable, Hashable {
     case atproto
     case transitionEmail
@@ -29,8 +22,9 @@ enum ConsentScope: Sendable, Hashable {
     case repo(collection: [String], actions: [String])
     case rpc(aud: String, lxm: [String])
     case space(SpaceGrant)
-    /// A scope byte string this bridge parser could not confidently place
-    /// into a family. Renders as a fallback row rather than vanishing.
+    /// A scope rejected by today's parser. The complete original string is
+    /// retained for the fallback card and Advanced details rather than being
+    /// truncated, confidently misclassified, or silently dropped.
     case unrecognized(raw: String)
 
     /// Grant-side space fields (§5.6.2). Wildcards and the unresolved `self`
@@ -42,10 +36,7 @@ enum ConsentScope: Sendable, Hashable {
         /// A specific record key, or "*" (default — every record). D19 gap
         /// found in review: dropping this field made a single-record grant
         /// (`skey=abc123`) and an every-record grant (`skey=*`, the default)
-        /// render identically. That's not a validation gap or a bridge-parser
-        /// artifact — it's information the renderer must show regardless of
-        /// how the scope was parsed, so it survives the `AtprotoScope.parse`
-        /// swap unchanged.
+        /// render identically.
         let skey: String
         let actions: [String]   // subset of read_self/read/create/update/delete
         let manage: [String]    // subset of create/update/delete (space lifecycle)
@@ -55,145 +46,62 @@ enum ConsentScope: Sendable, Hashable {
         var isUniversal: Bool { type == "*" && authority == "*" }
     }
 
-    private static let knownPrefixes = ["account", "blob", "identity", "include", "repo", "rpc", "space"]
-
-    /// Best-effort classification for consent rendering. Handles both the
-    /// positional form (`prefix:value?k=v`) and the fully-named form
-    /// (`prefix?key=value...`) from §4.4, using simple `&`/`=` splitting and
-    /// percent-decoding rather than the full grammar of §4.1/§4.6 (NSID/DID
-    /// validation, canonical ordering, forbidden-combination checks) — none
-    /// of that changes which card a scope needs.
+    /// Maps the typed admission parser's cases and values into the renderer's
+    /// string-only display model. Parser failure is deliberately fail-closed:
+    /// it produces a raw fallback row instead of a known-family card.
+    ///
+    /// A valid `include:` loses its typed `aud` only when converted to the
+    /// fixed no-capability card. With a resolver configured, productive
+    /// includes are replaced by their concrete grants before rendering; an
+    /// unexpanded pass-through include grants nothing, so its card is fixed.
+    /// Parser-rejected legacy input takes `.unrecognized(raw:)`, which retains
+    /// the full original scope, including all query parameters.
     static func classify(_ raw: String) -> ConsentScope {
-        switch raw {
-        case "atproto": return .atproto
-        case "transition:email": return .transitionEmail
-        case "transition:generic": return .transitionGeneric
-        case "transition:chat.bsky": return .transitionChatBsky
-        default: break
-        }
-
-        for prefix in knownPrefixes {
-            guard raw == prefix || raw.hasPrefix(prefix + ":") || raw.hasPrefix(prefix + "?") else {
-                continue
-            }
-            let rest = raw.dropFirst(prefix.count)
-            let (positional, params) = parseScopeBody(rest)
-            return classifyFamily(prefix: prefix, positional: positional, params: params, raw: raw)
-        }
-        return .unrecognized(raw: raw)
-    }
-
-    /// A recognised prefix with a REQUIRED field genuinely absent (no
-    /// positional value and no named form of it either — `space:`, `repo:`,
-    /// an `rpc:` with no `aud`) is not "this family with an edge-case
-    /// value"; it is missing the one thing the family cannot be described
-    /// without. `.unrecognized` for those is a presence check, not a
-    /// grammar check — it costs nothing borrowed from Lane 1's validator.
-    ///
-    /// What this deliberately still does NOT check: NSID/DID/record-key
-    /// *shape* (`space:short`, `space:...?skey=a/b`), enum membership
-    /// (`account:*` — attr must be email/repo/status), MIME structure
-    /// (`blob:image`), forbidden parameter combinations (`rpc:*?aud=*`),
-    /// or unknown query keys (`space:...?unknown=1`). Catching those means
-    /// re-deriving §4/§5's grammar here — the exact second-implementation
-    /// risk this bridge exists to avoid, and worse than the gap it would
-    /// close: a byte string with one of those defects is rejected at PAR
-    /// and never reaches a consent page in production (§4.8, §9-D5), so a
-    /// half-built shadow validator would spend real complexity on strings
-    /// this renderer will never actually see, while still not matching
-    /// `AtprotoScope` exactly. `ScopeDescriptionTests` asserts this
-    /// boundary against the pinned golden corpus precisely so it stays a
-    /// stated, checked gap rather than a silent one, and closes for real
-    /// the moment `classify` becomes an `AtprotoScope.parse` adapter.
-    ///
-    /// Two further divergence classes the corpus's 16 invalid entries do
-    /// NOT exercise, found by Lane 1 reading this file against the real
-    /// grammar rather than against the fixture: (1) a positional value AND
-    /// the named form of the same key both present (`account:email?attr=repo`)
-    /// — the real grammar hard-rejects this as `.positionalAndNamedConflict`;
-    /// this classifier's `positional ?? params[...]?.first` silently prefers
-    /// the positional value instead. (2) A single-valued key repeated
-    /// (`space:x?authority=a&authority=b`) — the real grammar hard-rejects
-    /// this as `.repeatedSingleValuedParameter`; here `params[...]?.first`
-    /// silently takes the first. Both would render a confident card for a
-    /// scope `AtprotoScope.parse` refuses outright. Neither is worth a
-    /// bespoke check here for the same reason as the gaps above — they
-    /// vanish for free on the swap.
-    private static func classifyFamily(
-        prefix: String, positional: String?, params: [String: [String]], raw: String
-    ) -> ConsentScope {
-        // A present-but-empty positional (`space:`, `repo:`) means the same
-        // thing as an absent one for a REQUIRED field — treat both as nil so
-        // the guards below see "missing", not "empty string supplied".
-        let positional = positional.flatMap { $0.isEmpty ? nil : $0 }
-        switch prefix {
-        case "account":
-            guard let attr = positional ?? params["attr"]?.first else { return .unrecognized(raw: raw) }
-            return .account(attr: attr, actions: params["action"] ?? ["read"])
-        case "blob":
-            let accept = positional.map { [$0] } ?? (params["accept"] ?? [])
-            guard !accept.isEmpty else { return .unrecognized(raw: raw) }
-            return .blob(accept: accept)
-        case "identity":
-            guard let attr = positional ?? params["attr"]?.first else { return .unrecognized(raw: raw) }
-            return .identity(attr: attr)
-        case "include":
-            guard let nsid = positional ?? params["nsid"]?.first else { return .unrecognized(raw: raw) }
-            return .include(nsid: nsid)
-        case "repo":
-            let collection = positional.map { [$0] } ?? (params["collection"] ?? [])
-            guard !collection.isEmpty else { return .unrecognized(raw: raw) }
-            return .repo(collection: collection, actions: params["action"] ?? ["create", "update", "delete"])
-        case "rpc":
-            let lxm = positional.map { [$0] } ?? (params["lxm"] ?? [])
-            // `aud` has no default (rpc-permission.ts:67-70) — genuinely
-            // required, unlike `authority`/`skey`/`action` elsewhere.
-            guard !lxm.isEmpty, let aud = params["aud"]?.first, !aud.isEmpty else {
-                return .unrecognized(raw: raw)
-            }
-            return .rpc(aud: aud, lxm: lxm)
-        case "space":
-            guard let type = positional ?? params["type"]?.first else { return .unrecognized(raw: raw) }
-            return .space(
-                SpaceGrant(
-                    type: type,
-                    authority: params["authority"]?.first ?? "self",
-                    skey: params["skey"]?.first ?? "*",
-                    actions: params["action"] ?? ["read", "create", "update", "delete"],
-                    manage: params["manage"] ?? [],
-                    collection: params["collection"] ?? []
-                ))
-        default:
+        let scope: AtprotoScope
+        do {
+            scope = try AtprotoScope.parse(raw)
+        } catch {
             return .unrecognized(raw: raw)
         }
-    }
 
-    /// `rest` is everything after the matched prefix: empty, or starting
-    /// with `:` (positional form, optionally followed by `?params`) or `?`
-    /// (named-only form).
-    private static func parseScopeBody(_ rest: Substring) -> (positional: String?, params: [String: [String]]) {
-        guard !rest.isEmpty else { return (nil, [:]) }
-        var positional: String?
-        var queryPart: Substring = ""
-        if rest.hasPrefix(":") {
-            let afterColon = rest.dropFirst()
-            if let qIndex = afterColon.firstIndex(of: "?") {
-                positional = String(afterColon[afterColon.startIndex..<qIndex])
-                queryPart = afterColon[afterColon.index(after: qIndex)...]
-            } else {
-                positional = String(afterColon)
-            }
-        } else if rest.hasPrefix("?") {
-            queryPart = rest.dropFirst()
+        switch scope {
+        case .atproto:
+            return .atproto
+        case .transitionEmail:
+            return .transitionEmail
+        case .transitionGeneric:
+            return .transitionGeneric
+        case .transitionChatBsky:
+            return .transitionChatBsky
+        case let .account(permission):
+            return .account(
+                attr: permission.attr.rawValue,
+                actions: permission.action.map(\.rawValue))
+        case let .blob(permission):
+            return .blob(accept: permission.accept.map(\.stringValue))
+        case let .identity(permission):
+            return .identity(attr: permission.attr.rawValue)
+        case let .include(scope):
+            return .include(nsid: scope.nsid)
+        case let .repo(permission):
+            return .repo(
+                collection: permission.collection.map(\.stringValue),
+                actions: permission.action.map(\.rawValue))
+        case let .rpc(permission):
+            return .rpc(
+                aud: permission.aud.stringValue,
+                lxm: permission.lxm.map(\.stringValue))
+        case let .space(permission):
+            return .space(
+                SpaceGrant(
+                    type: permission.type.stringValue,
+                    authority: permission.authority.stringValue,
+                    skey: permission.skey.stringValue,
+                    actions: permission.action.map(\.rawValue),
+                    manage: permission.manage.map(\.rawValue),
+                    collection: permission.collection.map(\.stringValue)
+                ))
         }
-        var params: [String: [String]] = [:]
-        for pair in queryPart.split(separator: "&", omittingEmptySubsequences: true) {
-            guard let eqIndex = pair.firstIndex(of: "=") else { continue }
-            let key = String(pair[pair.startIndex..<eqIndex])
-            let rawValue = String(pair[pair.index(after: eqIndex)...])
-            params[key, default: []].append(rawValue.removingPercentEncoding ?? rawValue)
-        }
-        return (positional, params)
     }
 }
 
@@ -209,18 +117,15 @@ enum ConsentScope: Sendable, Hashable {
 /// the cards (S4.4). `atproto` alone never gets a card of its own (S4.1a);
 /// it still appears in the raw/advanced list, since that list is unconditional.
 enum ScopeDescription {
-    /// - Parameter emptyPermissionSets: NSIDs of `include:` scopes that Phase-2
-    ///   resolution proved and expanded to **zero** grants (§5.7.5). They render
-    ///   through the same `includeCard` as an unexpanded Phase-1 `include:`,
-    ///   because the wording §5.7.2 fixes — "Requested permission set `<nsid>`.
-    ///   Swan does not currently grant capabilities derived from this set." — is
-    ///   exactly true of both, and a second string saying the same thing is the
-    ///   defect §9-D19 exists to prevent.
+    /// Productive `include:` scopes are expanded into concrete grants before
+    /// this renderer runs. `emptyPermissionSets` carries the NSIDs whose
+    /// expansion yielded zero grants (§5.7.5); they use the same canonical
+    /// "grants nothing" wording as an unexpanded pass-through `include:`.
     ///
-    ///   They arrive as a separate parameter rather than inside `scopes` because
-    ///   by this point the `include:` string is gone: expansion replaced it, and
-    ///   an empty expansion replaced it with nothing. Only the caller that ran
-    ///   the resolver still knows the NSID was ever asked for.
+    /// They arrive as a separate parameter rather than inside `scopes` because
+    /// by this point the `include:` string is gone: expansion replaced it, and
+    /// an empty expansion replaced it with nothing. Only the caller that ran
+    /// the resolver still knows the NSID was ever asked for.
     static func render(
         scopes: some Sequence<String>,
         emptyPermissionSets: [String] = []
@@ -269,8 +174,8 @@ enum ScopeDescription {
         if !repoEntries.isEmpty { cards.append(repoCard(repoEntries)) }
         if !rpcEntries.isEmpty { cards.append(rpcCard(rpcEntries)) }
         if !spaceGrants.isEmpty { cards.append(spaceCard(spaceGrants)) }
-        // Deduplicated and sorted: a Phase-1 `include:` still in `scopes` and a
-        // Phase-2 empty expansion naming the same NSID must not print twice.
+        // Deduplicated and sorted: an unexpanded pass-through `include:` still
+        // in `scopes` and an empty expansion naming the same NSID print once.
         if !includeNsids.isEmpty {
             cards.append(includeCard(Array(Set(includeNsids)).sorted()))
         }
@@ -407,9 +312,9 @@ enum ScopeDescription {
         return "\(base), limited to one record (<code>\(escape(grant.skey))</code>)"
     }
 
-    /// S4.2 — the ONE canonical Phase-1 `include:` wording (§5.7.2, §9-D19),
-    /// verbatim: "Requested permission set `<nsid>`. Swan does not currently
-    /// grant capabilities derived from this set."
+    /// S4.2 — the one canonical wording for an unexpanded or empty `include:`
+    /// (§5.7.2, §9-D19). Productive includes have already been replaced by
+    /// their concrete grants before rendering.
     private static func includeCard(_ nsids: [String]) -> String {
         let rows = nsids.map { nsid in
             "<li><b>Requested permission set \(escape(nsid)).</b> "
@@ -420,7 +325,7 @@ enum ScopeDescription {
 
     /// D11 / §9-D19 — `transition:*` is recognised and parses, but grants
     /// nothing in Swan. Same "recognised, grants nothing here" treatment as
-    /// Phase-1 `include:`, so it must not render as raw bytes either.
+    /// an unexpanded or empty `include:`, so it must not render as raw bytes.
     private static func transitionCard(_ rawScopes: [String]) -> String {
         let rows = rawScopes.map { raw in
             "<li><b>Legacy compatibility scope <code>\(escape(raw))</code>.</b> "
@@ -429,9 +334,9 @@ enum ScopeDescription {
         return card(title: "Legacy compatibility", bodyHTML: "<ul class=\"list-disc pl-5 flex flex-col gap-1\">\(rows)</ul>")
     }
 
-    /// D19: "never drop an undescribable row." Anything this bridge parser
-    /// could not place into a known family still gets a row here rather than
-    /// vanishing from the semantic section.
+    /// D19: "never drop an undescribable row." Anything the typed parser
+    /// rejects still gets its full raw scope here rather than vanishing from
+    /// the semantic section.
     private static func unrecognizedCard(_ raws: [String]) -> String {
         let rows = raws.map { "<li><code>\(escape($0))</code></li>" }.joined()
         return card(title: "Other requested permissions", bodyHTML: "<ul class=\"list-disc pl-5 flex flex-col gap-1\">\(rows)</ul>")

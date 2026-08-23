@@ -1,15 +1,12 @@
 import Foundation
+import SwanCore
 import Testing
 
 @testable import SwanHTTP
 
-/// Lane 1's `AtprotoScope` / `SpacePermission` (Sources/SwanCore/OAuthScopes,
-/// spec §4.7) had not landed when this file was written, so these tests
-/// exercise `ConsentScope`/`ScopeDescription` directly — both the bridge
-/// parser (`ConsentScope.classify`, driven by raw scope strings, matching
-/// what the two consent call sites actually have today) and the renderer
-/// fed pre-built `ConsentScope` values (a stand-in for what
-/// `AtprotoScope.parse` will hand it once wired).
+/// Consent display classification must stay a thin, fail-closed adapter over
+/// the admission grammar in `AtprotoScope.parse`. The renderer still consumes
+/// `ConsentScope` so its presentation defaults remain local to SwanHTTP.
 @Suite("ScopeDescription")
 struct ScopeDescriptionTests {
 
@@ -140,33 +137,12 @@ struct ScopeDescriptionTests {
         #expect(ConsentScope.classify("repo:") == .unrecognized(raw: "repo:"))
     }
 
-    /// `ConsentScope` is a temporary stand-in for Lane 1's `AtprotoScope`,
-    /// not a reimplementation of §4/§5's grammar (`classifyFamily`'s doc
-    /// comment states exactly what it does and does not check, and why).
-    /// So this test does NOT assert full parity with upstream's parser —
-    /// that would require this file to duplicate the grammar it is
-    /// deliberately avoiding. It asserts the two narrower properties that
-    /// are true by design and checkable without a validator:
-    ///
-    /// 1. For every corpus entry upstream's own parser marks
-    ///    `isAtprotoOauthScope: true`, `classify` lands in the matching
-    ///    family — never `.unrecognized`. A valid scope silently swallowed
-    ///    into the fallback bucket is the failure this guards against.
-    /// 2. For every entry — valid OR invalid — the renderer still shows a
-    ///    row for it (D19: never drop one, `scope-description.tsx:178`'s
-    ///    fallback discipline). This does NOT assert a confident family
-    ///    for the invalid entries; several of them (`account:*`,
-    ///    `blob:image`, `rpc:*?aud=*`, `space:short`, six `skey=` variants,
-    ///    `space:...?unknown=1`) still land in a confident family card
-    ///    because their defect is a grammar-shape or enum-membership
-    ///    violation this classifier does not check — that gap is real,
-    ///    known, and closes when `classify` becomes an `AtprotoScope.parse`
-    ///    adapter, not before.
-    ///
-    /// Re-run after that swap: property 1 becomes the regression proof the
-    /// swap preserved behavior, and property 2's "still shows a row" should
-    /// continue to hold trivially since the raw list is unconditional.
-    @Test("classify() never silently drops a valid corpus scope, and render() never drops any corpus row")
+    /// The pinned 62-row corpus is exercised against Swan's admission parser,
+    /// not its upstream boolean field, so display and admission cannot drift:
+    /// every successful parse must map to the same semantic family, every
+    /// parser failure must retain the exact raw scope as `.unrecognized`, and
+    /// every original input must remain escaped in Advanced details.
+    @Test("all pinned corpus rows mirror admission parsing and keep escaped raw details")
     func classifyAndRenderAgreeWithPinnedGoldenCorpus() throws {
         let fixtureURL = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()  // SwanHTTPTests/
@@ -177,61 +153,76 @@ struct ScopeDescriptionTests {
         let values = try #require(root["values"] as? [[String: Any]])
         #expect(values.count == 62, "corpus shape changed — re-check this test against it")
 
-        let knownPrefixes = ["account", "blob", "identity", "include", "repo", "rpc", "space"]
-        var trueEntriesChecked = 0
+        var parsedEntriesChecked = 0
+        var rejectedEntriesChecked = 0
         var allEntriesChecked = 0
         for entry in values {
             let input = try #require(entry["input"] as? String)
-            // Upstream's own verdict — the independent oracle, not derived
-            // from this file's own prefix logic.
-            let isValid = try #require(entry["isAtprotoOauthScope"] as? Bool)
 
-            // Property 2, for every entry regardless of validity: never
-            // silently dropped from the page.
+            // Every input, accepted or rejected, remains escaped in the
+            // dedicated Advanced-details list below the semantic cards.
             let rendered = ScopeDescription.render(scopes: [input])
             #expect(
-                rendered.contains(">\(htmlEscapeForTest(input))</code>"),
+                rendered.contains(
+                    "<code class=\"font-mono\">\(htmlEscapeForTest(input))</code>"),
                 "corpus entry \(input.debugDescription) missing from the advanced raw-scope list")
             allEntriesChecked += 1
 
-            guard isValid else { continue }
-            // Property 1, only for entries upstream itself accepts:
-            // classify() must land in the matching family, never fall back.
-            // `atproto` and the three `transition:*` statics aren't one of
-            // the seven families and have their own exact-match cases.
             let classified = ConsentScope.classify(input)
-            switch input {
-            case "atproto":
-                #expect(classified == .atproto)
-            case "transition:email":
-                #expect(classified == .transitionEmail)
-            case "transition:generic":
-                #expect(classified == .transitionGeneric)
-            case "transition:chat.bsky":
-                #expect(classified == .transitionChatBsky)
-            default:
-                let expectedPrefix = try #require(
-                    knownPrefixes.first { input == $0 || input.hasPrefix($0 + ":") || input.hasPrefix($0 + "?") },
-                    "valid corpus entry \(input.debugDescription) matches no known family prefix")
-                switch (expectedPrefix, classified) {
-                case ("account", .account), ("blob", .blob), ("identity", .identity), ("include", .include),
-                    ("repo", .repo), ("rpc", .rpc), ("space", .space):
+            do {
+                let parsed = try AtprotoScope.parse(input)
+                switch (parsed, classified) {
+                case (.atproto, .atproto),
+                     (.transitionEmail, .transitionEmail),
+                     (.transitionGeneric, .transitionGeneric),
+                     (.transitionChatBsky, .transitionChatBsky),
+                     (.account, .account),
+                     (.blob, .blob),
+                     (.identity, .identity),
+                     (.include, .include),
+                     (.repo, .repo),
+                     (.rpc, .rpc),
+                     (.space, .space):
                     break
                 default:
                     Issue.record(
-                        "valid corpus entry \(input.debugDescription) expected family \(expectedPrefix), classify() returned \(classified)"
+                        "parsed corpus entry \(input.debugDescription) expected family \(parsed), classify() returned \(classified)"
                     )
                 }
+                parsedEntriesChecked += 1
+            } catch {
+                #expect(
+                    classified == .unrecognized(raw: input),
+                    "parser-rejected corpus entry \(input.debugDescription) classified confidently as \(classified)"
+                )
+                rejectedEntriesChecked += 1
             }
-            trueEntriesChecked += 1
         }
         #expect(allEntriesChecked == 62)
-        // 37, not 36: the corpus carries one valid entry — bare `atproto` —
-        // that matches none of `knownPrefixes`. It is still counted here,
-        // because the exact-match `switch` above covers it (and the three
-        // `transition:*` statics) before the prefix lookup is reached. An
-        // earlier 36 silently assumed every valid entry was prefix-matched.
-        #expect(trueEntriesChecked == 37, "expected 37 isAtprotoOauthScope:true entries in the pinned corpus")
+        #expect(parsedEntriesChecked == 37, "expected 37 parser-accepted entries in the pinned corpus")
+        #expect(rejectedEntriesChecked == 25, "expected 25 parser-rejected entries in the pinned corpus")
+    }
+
+    @Test("positional conflicts and repeated single-valued parameters fall back to their raw scopes")
+    func parserRejectedStructuralControlsFallBackToRaw() {
+        let conflict = "account:email?attr=repo"
+        #expect(throws: ScopeParseError.positionalAndNamedConflict(prefix: "account", key: "attr")) {
+            try AtprotoScope.parse(conflict)
+        }
+
+        let repeated = "space:com.example.type?authority=did:plc:aaa&authority=did:plc:bbb"
+        #expect(throws: ScopeParseError.repeatedSingleValuedParameter(prefix: "space", key: "authority")) {
+            try AtprotoScope.parse(repeated)
+        }
+
+        for raw in [conflict, repeated] {
+            #expect(ConsentScope.classify(raw) == .unrecognized(raw: raw))
+            #expect(
+                ScopeDescription.render(scopes: [raw]).contains(
+                    "<code class=\"font-mono\">\(htmlEscapeForTest(raw))</code>"),
+                "parser-rejected control \(raw.debugDescription) missing from Advanced details"
+            )
+        }
     }
 
     private func htmlEscapeForTest(_ value: String) -> String {
@@ -290,7 +281,7 @@ struct ScopeDescriptionTests {
 
     // MARK: - S4.2 — the one canonical include: string, verbatim
 
-    @Test("include: renders the exact canonical Phase-1 wording (§5.7.2, §9-D19)")
+    @Test("an unexpanded include: renders the canonical grants-nothing wording (§5.7.2, §9-D19)")
     func includeRendersCanonicalWording() {
         let html = ScopeDescription.render(scopes: ["include:com.example.bar"])
         let text = stripTags(html)
@@ -320,8 +311,9 @@ struct ScopeDescriptionTests {
         )
     }
 
-    /// One NSID, two routes to the same card — a Phase-1 `include:` still in the
-    /// scope set and a Phase-2 empty expansion naming it — must print once.
+    /// One NSID, two routes to the same card — an unexpanded pass-through
+    /// `include:` still in the scope set and an empty expansion naming it —
+    /// must print once.
     @Test("an NSID reaching the include card both ways is not printed twice")
     func includeNSIDIsNotDuplicatedAcrossBothChannels() {
         let html = ScopeDescription.render(
