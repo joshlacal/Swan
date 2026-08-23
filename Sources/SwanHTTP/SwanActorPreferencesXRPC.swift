@@ -402,6 +402,9 @@ private func actorPreferencesFailureResponse(
         }
     }
     if let storageError = error as? AccountControlStoreError {
+        if storageError == .invalidTransition {
+            return actorPreferencesError(.unauthorized, "Unauthorized")
+        }
         return actorPreferencesError(
             storageError == .unavailable
                 ? .serviceUnavailable

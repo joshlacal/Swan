@@ -49,7 +49,10 @@ public enum LegacySessionTokenKind: String, Sendable, Equatable {
 }
 
 public protocol LegacySessionStore: Sendable {
-    /// Opens a family and records its first token pair.
+    /// Opens a family and records its first token pair. Durable control-store
+    /// implementations must make family insertion conditional on the account
+    /// still being active in the same write transaction; a prior deactivation
+    /// is an invalid transition, never a family that can be revoked later.
     func createLegacySessionFamily(
         familyID: String,
         did: String,

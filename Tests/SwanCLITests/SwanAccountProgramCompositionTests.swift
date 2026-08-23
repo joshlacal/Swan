@@ -481,6 +481,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 sessions: try DurableLegacySessionService(
                     store: control,
                     appPasswords: control,
+                    accountControlStore: control,
                     credentials: credentials,
                     serviceDID: "did:web:swan.example",
                     serverKey: Data(repeating: 0x3C, count: 32)
@@ -975,6 +976,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     sessions: try DurableLegacySessionService(
                         store: control,
                         appPasswords: control,
+                        accountControlStore: control,
                         credentials: credentials,
                         serviceDID: SwanServiceIdentity(publicURL: publicURL).did,
                         serverKey: Data(repeating: 0x6E, count: 32)

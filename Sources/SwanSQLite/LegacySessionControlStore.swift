@@ -26,18 +26,11 @@ extension SQLiteControlDatabase: LegacySessionStore {
         let createdAt = try legacySessionTimestamp(now)
         try await withConnectionGate {
             try await transaction {
-                _ = try await connection.query(
-                    """
-                    INSERT INTO legacy_session_families
-                        (family_id, did, app_password_id, created_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    [
-                        .text(familyID),
-                        .text(did),
-                        appPasswordID.map(SQLiteData.text) ?? .null,
-                        .integer(createdAt),
-                    ]
+                try await insertActiveLegacySessionFamilyLocked(
+                    familyID: familyID,
+                    did: did,
+                    appPasswordID: appPasswordID,
+                    createdAt: createdAt
                 )
                 try await insertLegacyToken(
                     digest: accessDigest,
@@ -277,18 +270,11 @@ extension SQLiteControlDatabase: LegacySessionStore {
                     // transaction: no legacy session family is created.
                     throw AccountControlStoreError.invalidTransition
                 }
-                _ = try await connection.query(
-                    """
-                    INSERT INTO legacy_session_families
-                        (family_id, did, app_password_id, created_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    [
-                        .text(familyID),
-                        .text(did),
-                        appPasswordID.map(SQLiteData.text) ?? .null,
-                        .integer(createdAt),
-                    ]
+                try await insertActiveLegacySessionFamilyLocked(
+                    familyID: familyID,
+                    did: did,
+                    appPasswordID: appPasswordID,
+                    createdAt: createdAt
                 )
                 try await insertLegacyToken(
                     digest: accessDigest,
@@ -334,6 +320,43 @@ extension SQLiteControlDatabase: LegacySessionStore {
                 .integer(try legacySessionTimestamp(expiresAt)),
             ]
         )
+    }
+
+    /// Inserts a legacy family while the caller holds the control connection
+    /// gate and an IMMEDIATE transaction. The account predicate and insert are
+    /// one SQLite statement, so deactivation and every family-creation path
+    /// have a single durable order. This is internal so the retired
+    /// compatibility writer can preserve the same table-wide invariant without
+    /// becoming a second authority.
+    func insertActiveLegacySessionFamilyLocked(
+        familyID: String,
+        did: String,
+        appPasswordID: String?,
+        createdAt: Int
+    ) async throws {
+        let inserted = try await connection.query(
+            """
+            INSERT INTO legacy_session_families
+                (family_id, did, app_password_id, created_at)
+            SELECT ?, account.did, ?, ?
+            FROM accounts AS account
+            WHERE account.did = ? AND account.status = 'active'
+            RETURNING family_id
+            """,
+            [
+                .text(familyID),
+                appPasswordID.map(SQLiteData.text) ?? .null,
+                .integer(createdAt),
+                .text(did),
+            ]
+        )
+        guard let row = inserted.first else {
+            throw AccountControlStoreError.invalidTransition
+        }
+        guard inserted.count == 1,
+              row.column("family_id")?.string == familyID else {
+            throw AccountControlStoreError.malformedRecord
+        }
     }
 
     private func legacySessionFamily(_ row: SQLiteRow) throws -> LegacySessionFamily {

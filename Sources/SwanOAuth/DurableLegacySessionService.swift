@@ -30,13 +30,13 @@ public actor DurableLegacySessionService {
 
     private let store: any LegacySessionStore
     private let appPasswords: any AppPasswordStore
+    private let accountControlStore: any AccountControlStore
     private let credentials: AppPasswordCredentials
     private let serviceDID: String
     private let signingKey: SymmetricKey
     private let macKey: SymmetricKey
-    /// Narrow durable identity admission for new-token issuance. `nil` keeps
-    /// focused fixtures source-compatible; production composition always
-    /// supplies it and every issuance path denies (fails closed) when the
+    /// Narrow durable identity admission for new-token issuance. Production
+    /// composition supplies it and every issuance path denies (fails closed) when the
     /// identity is a suspended or failed-grace did:web account, or when the
     /// store/resolver is unavailable.
     private let identityAdmission: (any SwanIdentityAdmissionEvaluating)?
@@ -51,6 +51,7 @@ public actor DurableLegacySessionService {
     public init(
         store: any LegacySessionStore,
         appPasswords: any AppPasswordStore,
+        accountControlStore: any AccountControlStore,
         credentials: AppPasswordCredentials,
         serviceDID: String,
         serverKey: Data,
@@ -61,6 +62,7 @@ public actor DurableLegacySessionService {
         }
         self.store = store
         self.appPasswords = appPasswords
+        self.accountControlStore = accountControlStore
         self.credentials = credentials
         self.serviceDID = serviceDID
         self.identityAdmission = identityAdmission
@@ -78,6 +80,23 @@ public actor DurableLegacySessionService {
                 using: SymmetricKey(data: serverKey)
             ))
         )
+    }
+
+    /// The account row is an independent, mandatory authorization fact. A
+    /// valid JWT and a live legacy-family row cannot outlive deactivation.
+    /// Missing/inactive accounts are ordinary denial; storage failures remain
+    /// unavailable, but every error fails closed.
+    private func requireActiveAccount(did: String) async throws {
+        do {
+            guard let account = try await accountControlStore.account(did: did),
+                  account.status.authorizesAccount else {
+                throw SwanError.unauthorized("legacy session account is not active")
+            }
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("legacy session account lifecycle is unavailable")
+        }
     }
 
     /// Fails closed for new-token issuance: a suspended or failed-grace
@@ -195,6 +214,7 @@ public actor DurableLegacySessionService {
         ) else {
             throw SwanError.unauthorized("legacy session is not active")
         }
+        try await requireActiveAccount(did: family.did)
         let permissions = try await permissions(for: family)
         return .accountLegacySession(subject: family.did, permissions: permissions)
     }
@@ -225,6 +245,7 @@ public actor DurableLegacySessionService {
         ) else {
             throw SwanError.unauthorized("legacy session is not active")
         }
+        try await requireActiveAccount(did: family.did)
         guard family.appPasswordID == nil else {
             throw SwanError.unauthorized("app-password sessions cannot manage app passwords")
         }
@@ -252,6 +273,7 @@ public actor DurableLegacySessionService {
             try await store.revokeLegacySessionFamily(familyID: family.familyID, now: now)
             throw SwanError.unauthorized("legacy session is not active")
         case let .active(family):
+            try await requireActiveAccount(did: family.did)
             try await requireIdentityAdmission(did: family.did, now: now)
             // Re-derived HERE, from the app-password row, so an edited
             // credential narrows this session and a revoked one ends it. Never

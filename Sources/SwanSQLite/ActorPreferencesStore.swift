@@ -59,20 +59,30 @@ extension SQLiteControlDatabase: ActorPreferencesStore {
         }
         try await withConnectionGate {
             try await transaction {
-                _ = try await connection.query(
+                let written = try await connection.query(
                     """
                     INSERT INTO actor_preferences(did, preferences_json, updated_at)
-                    VALUES (?, ?, ?)
+                    SELECT account.did, ?, ?
+                    FROM accounts AS account
+                    WHERE account.did = ? AND account.status = 'active'
                     ON CONFLICT(did) DO UPDATE SET
                         preferences_json = excluded.preferences_json,
                         updated_at = excluded.updated_at
+                    RETURNING did
                     """,
                     [
-                        .text(did),
                         .blob(ByteBuffer(data: json)),
                         .integer(now),
+                        .text(did),
                     ]
                 )
+                guard let row = written.first else {
+                    throw AccountControlStoreError.invalidTransition
+                }
+                guard written.count == 1,
+                      row.column("did")?.string == did else {
+                    throw AccountControlStoreError.malformedRecord
+                }
             }
         }
     }

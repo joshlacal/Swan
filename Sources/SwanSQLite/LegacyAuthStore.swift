@@ -346,18 +346,11 @@ extension SQLiteControlDatabase: AccountLegacyAuthStore {
         refreshExpiresAt: Date,
         now: Date
     ) async throws {
-        _ = try await connection.query(
-            """
-            INSERT INTO legacy_session_families
-                (family_id, did, app_password_id, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            [
-                .text(family.familyID),
-                .text(family.accountDID),
-                family.appPasswordID.map(SQLiteData.text) ?? .null,
-                .integer(Self.microseconds(family.createdAt)),
-            ]
+        try await insertActiveLegacySessionFamilyLocked(
+            familyID: family.familyID,
+            did: family.accountDID,
+            appPasswordID: family.appPasswordID,
+            createdAt: Self.microseconds(family.createdAt)
         )
         _ = try await connection.query(
             """

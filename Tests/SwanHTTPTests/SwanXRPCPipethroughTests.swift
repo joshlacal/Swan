@@ -5,10 +5,12 @@ import Hummingbird
 import HummingbirdTesting
 import Logging
 import NIOCore
+import SwanAccounts
 import SwanCore
 import SwanOAuth
 import SwanSpaces
 import SwanSQLite
+import SwanStorage
 import XCTest
 
 @testable import SwanHTTP
@@ -1499,6 +1501,85 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(sender.recorded().count, 0)
     }
 
+    func testLegacyProxyAfterDeactivationInvokesNeitherSignerNorSender() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanLegacyProxyLifecycle-\(UUID().uuidString)")
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            _ = try await control.createAccount(
+                AccountControlRegistration(
+                    did: Self.did,
+                    canonicalHandle: "legacy-proxy.example.com",
+                    passwordVerifier:
+                        "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                    signingKey: .init(purpose: .signing, generation: 1),
+                    rotationKey: .init(purpose: .rotation, generation: 1),
+                    createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+                )
+            )
+            let credentials = try AppPasswordCredentials()
+            let legacySessions = try DurableLegacySessionService(
+                store: control,
+                appPasswords: control,
+                accountControlStore: control,
+                credentials: credentials,
+                serviceDID: "did:web:swan.test",
+                serverKey: Data(repeating: 0x48, count: 32)
+            )
+            let tokens = try await legacySessions.issue(
+                did: Self.did,
+                appPassword: nil
+            )
+            _ = try await control.transitionStatus(
+                did: Self.did,
+                to: .deactivated,
+                declaration: .init(),
+                now: Date()
+            )
+
+            let runtime = try SwanOAuthRuntime(
+                controlStore: control,
+                serverKey: Data(repeating: 0x49, count: 32)
+            )
+            let authorizer = try SwanOAuthResourceAuthorizer(
+                publicURL: URL(string: "https://swan.test")!,
+                runtime: runtime,
+                accountControlStore: control,
+                legacySessions: legacySessions
+            )
+            let signer = CountingProxyServiceTokenIssuer()
+            let sender = RecordingProxySender()
+            let capability = SwanXRPCPipethroughServer(
+                authorizer: authorizer,
+                tokens: signer,
+                sender: sender,
+                resolver: SwanServiceEndpointResolver(
+                    documents: StubDIDDocuments(documents: [:])
+                ),
+                appView: try SwanAppViewConfiguration()
+            )
+            let router = Router(context: SwanHTTPRequestContext.self)
+            capability.register(on: router)
+            try await makeApp(router).test(.live) { client in
+                try await client.execute(
+                    uri: "/xrpc/app.bsky.feed.getTimeline",
+                    method: .get,
+                    headers: [.authorization: "Bearer \(tokens.accessJWT)"]
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized, self.body(response))
+                }
+            }
+            let signingCalls = await signer.callCount()
+            XCTAssertEqual(signingCalls, 0)
+            XCTAssertEqual(sender.recorded().count, 0)
+            try await control.close()
+        } catch {
+            try? await control.close()
+            throw error
+        }
+    }
+
     /// The same reordering, measured through the real production router rather
     /// than through a router carrying only this capability.
     ///
@@ -1601,6 +1682,17 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         let control = try await SQLiteControlDatabase(dataDirectory: root)
         defer { try? FileManager.default.removeItem(at: root) }
         do {
+            _ = try await control.createAccount(
+                AccountControlRegistration(
+                    did: Self.did,
+                    canonicalHandle: "pipethrough-composition.example.com",
+                    passwordVerifier:
+                        "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                    signingKey: .init(purpose: .signing, generation: 1),
+                    rotationKey: .init(purpose: .rotation, generation: 1),
+                    createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+                )
+            )
             let runtime = try SwanOAuthRuntime(
                 controlStore: control,
                 serverKey: Data(repeating: 0x3D, count: 32)
@@ -1925,6 +2017,30 @@ private struct TestProxyServiceTokenIssuer: SwanProxyServiceTokenIssuing {
             now: now
         )
     }
+}
+
+private actor CountingProxyServiceTokenIssuer: SwanProxyServiceTokenIssuing {
+    private static let key = P256.Signing.PrivateKey()
+    private var calls = 0
+
+    func issueProxyServiceToken(
+        issuer: String,
+        audience: String,
+        method: String,
+        now: Date
+    ) async throws -> String {
+        calls += 1
+        return try ProxyServiceJWT.create(
+            issuer: issuer,
+            audience: audience,
+            method: method,
+            eventID: UUID().uuidString,
+            key: Self.key,
+            now: now
+        )
+    }
+
+    func callCount() -> Int { calls }
 }
 
 private struct StubDIDDocuments: SwanDIDDocumentFetching {

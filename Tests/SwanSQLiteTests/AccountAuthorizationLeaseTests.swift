@@ -84,6 +84,141 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         try await control.close()
     }
 
+    func testDeactivationQueuedBeforeLegacyIssuanceRejectsBothFamilyCreationPaths() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "SwanLegacyIssuanceLifecycle-\(UUID().uuidString)"
+            )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        addTeardownBlock { [control, root] in
+            await control.setConnectionGateWaiterEnqueuedForTesting(nil)
+            try? await control.close()
+            try? FileManager.default.removeItem(at: root)
+        }
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        _ = try await control.createAccount(
+            AccountControlRegistration(
+                did: did,
+                canonicalHandle: "legacy-issuance.example.com",
+                passwordVerifier:
+                    "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: .init(purpose: .signing, generation: 1),
+                rotationKey: .init(purpose: .rotation, generation: 1),
+                createdAt: now
+            )
+        )
+        let context = try AccountAuthorizationContext(
+            channel: .legacy,
+            sessionID: "queued-legacy-issuance",
+            purpose: "managementLogin"
+        )
+        let grant = try await control.createPasswordAuthorizationGrant(
+            grantDigest: Data(repeating: 0x61, count: 32),
+            accountDID: did,
+            context: context,
+            now: now
+        )
+
+        // Hold the FIFO connection gate, then enqueue deactivation ahead of
+        // both family-creation transactions. This chooses the ordering without
+        // wall-clock sleeps: once released, deactivation must win first.
+        let blocker = RotationCommitBarrier()
+        let accountDID = did
+        let heldAuthorization = Task {
+            try await control.withActiveAccountAuthorization(did: accountDID) {
+                await blocker.park()
+            }
+        }
+        await blocker.waitUntilParked()
+
+        let queue = ConnectionGateWaiterProbe()
+        await control.setConnectionGateWaiterEnqueuedForTesting {
+            Task { await queue.recordWaiter() }
+        }
+        let deactivation = Task {
+            try await control.transitionStatus(
+                did: accountDID,
+                to: .deactivated,
+                declaration: .init(),
+                now: now.addingTimeInterval(1)
+            )
+        }
+        await queue.waitUntilCount(1)
+
+        let directIssuance = Task {
+            try await control.createLegacySessionFamily(
+                familyID: "queued-direct-family",
+                did: accountDID,
+                appPasswordID: nil,
+                accessDigest: Data(repeating: 0x62, count: 32),
+                accessExpiresAt: now.addingTimeInterval(3_600),
+                refreshDigest: Data(repeating: 0x63, count: 32),
+                refreshExpiresAt: now.addingTimeInterval(90 * 86_400),
+                now: now.addingTimeInterval(2)
+            )
+        }
+        let grantIssuance = Task {
+            try await control.createLegacySessionFamilyConsumingGrant(
+                familyID: "queued-grant-family",
+                did: accountDID,
+                appPasswordID: nil,
+                accessDigest: Data(repeating: 0x64, count: 32),
+                accessExpiresAt: now.addingTimeInterval(3_600),
+                refreshDigest: Data(repeating: 0x65, count: 32),
+                refreshExpiresAt: now.addingTimeInterval(90 * 86_400),
+                authorizationGrantDigest: grant.grantDigest,
+                authorizationContext: context,
+                now: now.addingTimeInterval(2)
+            )
+        }
+        await queue.waitUntilCount(3)
+        await blocker.release()
+
+        _ = try await heldAuthorization.value
+        _ = try await deactivation.value
+        let directResult = await directIssuance.result
+        let grantResult = await grantIssuance.result
+        assertInvalidTransition(
+            directResult,
+            "deactivation-first must reject ordinary legacy family creation"
+        )
+        assertInvalidTransition(
+            grantResult,
+            "deactivation-first must reject grant-consuming legacy family creation"
+        )
+
+        if case .failure = grantResult {
+            // The active-account insert failure occurs after grant consumption
+            // in the same transaction. Reactivation and a second attempt with
+            // that exact grant proves the first consume rolled back.
+            _ = try await control.transitionStatus(
+                did: did,
+                to: .active,
+                declaration: .init(),
+                now: now.addingTimeInterval(3)
+            )
+            try await control.createLegacySessionFamilyConsumingGrant(
+                familyID: "grant-after-reactivation",
+                did: did,
+                appPasswordID: nil,
+                accessDigest: Data(repeating: 0x66, count: 32),
+                accessExpiresAt: now.addingTimeInterval(3_600),
+                refreshDigest: Data(repeating: 0x67, count: 32),
+                refreshExpiresAt: now.addingTimeInterval(90 * 86_400),
+                authorizationGrantDigest: grant.grantDigest,
+                authorizationContext: context,
+                now: now.addingTimeInterval(4)
+            )
+        }
+        await control.setConnectionGateWaiterEnqueuedForTesting(nil)
+        try await control.close()
+    }
+
     func testFirehoseAuthorizationFencePassesLiveGenerationAndRejectsInactive() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(
@@ -643,6 +778,26 @@ private extension AccountAuthorizationLeaseTests {
     }
 }
 
+private func assertInvalidTransition(
+    _ result: Result<Void, any Error>,
+    _ message: String,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) {
+    switch result {
+    case .success:
+        XCTFail(message, file: file, line: line)
+    case let .failure(error):
+        XCTAssertEqual(
+            error as? AccountControlStoreError,
+            .invalidTransition,
+            message,
+            file: file,
+            line: line
+        )
+    }
+}
+
 private actor LifecycleRaceProbe {
     enum Outcome: Sendable, Equatable {
         case deactivationQueuedAtControlGate
@@ -663,6 +818,25 @@ private actor LifecycleRaceProbe {
     func waitForFirstOutcome() async -> Outcome {
         if let firstOutcome { return firstOutcome }
         return await withCheckedContinuation { outcomeWaiters.append($0) }
+    }
+}
+
+private actor ConnectionGateWaiterProbe {
+    private var count = 0
+    private var waiters: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func recordWaiter() {
+        count += 1
+        let ready = waiters.filter { $0.target <= count }
+        waiters.removeAll { $0.target <= count }
+        ready.forEach { $0.continuation.resume() }
+    }
+
+    func waitUntilCount(_ target: Int) async {
+        if count >= target { return }
+        await withCheckedContinuation { continuation in
+            waiters.append((target, continuation))
+        }
     }
 }
 

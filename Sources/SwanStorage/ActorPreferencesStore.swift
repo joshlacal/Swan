@@ -19,8 +19,9 @@ public protocol ActorPreferencesStore: Sendable {
     func actorPreferences(did: String) async throws -> Data?
 
     /// Overwrites the durable preferences document for `did` with `json`.
-    /// Callers must pass only the authenticated subject's DID; this store
-    /// has no way to distinguish an authenticated write from a spoofed one
-    /// and trusts its caller completely on that point.
+    /// Callers must pass only the authenticated subject's DID. Durable control
+    /// stores additionally require that subject's account to remain active at
+    /// the write linearization point; authorization earlier in an HTTP request
+    /// does not permit a write that loses a race with deactivation.
     func setActorPreferences(did: String, json: Data) async throws
 }

@@ -3554,6 +3554,94 @@ final class SwanSQLiteTests: XCTestCase {
         XCTAssertFalse(controlText.contains("c2VlZC1waHJhc2U="))
     }
 
+    func testAccountDeactivationAtomicallyRevokesEveryLegacyFamily() async throws {
+        let root = try controlRoot()
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        addTeardownBlock { [database, root] in
+            try? await database.close()
+            try? FileManager.default.removeItem(at: root)
+        }
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        let createdAt = Date(timeIntervalSince1970: 1_750_000_000)
+        _ = try await database.createAccount(
+            controlRegistration(
+                did: did,
+                handle: "legacy-revocation.example.com",
+                createdAt: createdAt
+            )
+        )
+        for index in 0 ..< 2 {
+            try await database.createLegacySessionFamily(
+                familyID: "legacy-family-\(index)",
+                did: did,
+                appPasswordID: nil,
+                accessDigest: Data(repeating: UInt8(0x31 + index * 2), count: 32),
+                accessExpiresAt: createdAt.addingTimeInterval(3_600),
+                refreshDigest: Data(repeating: UInt8(0x32 + index * 2), count: 32),
+                refreshExpiresAt: createdAt.addingTimeInterval(90 * 86_400),
+                now: createdAt
+            )
+        }
+
+        // Force the last step of the lifecycle cleanup to fail. The account
+        // status and family timestamps must roll back with the token deletion.
+        _ = try await database.connection.query(
+            """
+            CREATE TEMP TRIGGER fail_legacy_token_delete
+            BEFORE DELETE ON legacy_session_tokens
+            BEGIN
+                SELECT RAISE(ABORT, 'forced legacy token delete failure');
+            END
+            """
+        )
+        let transitionTime = createdAt.addingTimeInterval(10)
+        do {
+            _ = try await database.transitionStatus(
+                did: did,
+                to: .deactivated,
+                declaration: .init(),
+                now: transitionTime
+            )
+            XCTFail("the injected delete failure must abort deactivation")
+        } catch {}
+
+        let rolledBackAccount = try await database.account(did: did)
+        XCTAssertEqual(rolledBackAccount?.status, .active)
+        let rolledBackFamilies = try await database.connection.query(
+            "SELECT revoked_at FROM legacy_session_families WHERE did = ? ORDER BY family_id",
+            [.text(did)]
+        )
+        XCTAssertEqual(rolledBackFamilies.count, 2)
+        XCTAssertTrue(rolledBackFamilies.allSatisfy { $0.column("revoked_at")?.isNull == true })
+        let rolledBackTokens = try await database.connection.query(
+            "SELECT COUNT(*) AS token_count FROM legacy_session_tokens"
+        )
+        XCTAssertEqual(rolledBackTokens.first?.column("token_count")?.integer, 4)
+
+        _ = try await database.connection.query("DROP TRIGGER fail_legacy_token_delete")
+        _ = try await database.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: .init(),
+            now: transitionTime
+        )
+
+        let revokedFamilies = try await database.connection.query(
+            "SELECT revoked_at FROM legacy_session_families WHERE did = ? ORDER BY family_id",
+            [.text(did)]
+        )
+        let expectedTimestamp = Int(transitionTime.timeIntervalSince1970 * 1_000_000)
+        XCTAssertEqual(revokedFamilies.count, 2)
+        XCTAssertEqual(
+            revokedFamilies.compactMap { $0.column("revoked_at")?.integer },
+            [expectedTimestamp, expectedTimestamp]
+        )
+        let remainingTokens = try await database.connection.query(
+            "SELECT COUNT(*) AS token_count FROM legacy_session_tokens"
+        )
+        XCTAssertEqual(remainingTokens.first?.column("token_count")?.integer, 0)
+    }
+
     func testTransitionWithEmissionEnqueuesAccountBatchAtomically() async throws {
         let root = try controlRoot()
         defer { try? FileManager.default.removeItem(at: root) }

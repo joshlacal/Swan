@@ -21,6 +21,23 @@ private func assertThrowsAsync(
     } catch {}
 }
 
+private func assertUnauthorizedAsync(
+    _ expression: @autoclosure () async throws -> some Any,
+    _ message: String = "expected an unauthorized error",
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        _ = try await expression()
+        XCTFail(message, file: file, line: line)
+    } catch SwanError.unauthorized {
+        // Expected lifecycle denial. A store outage or malformed token must
+        // not accidentally satisfy this security assertion.
+    } catch {
+        XCTFail("\(message); received \(error)", file: file, line: line)
+    }
+}
+
 /// App-password sessions: the token pair, its rotation, and the three
 /// properties the design turns on — reuse revokes the family, scope is
 /// re-derived from the app-password row rather than carried, and revoking a
@@ -60,6 +77,7 @@ final class DurableLegacySessionServiceTests: XCTestCase {
             service: try DurableLegacySessionService(
                 store: database,
                 appPasswords: database,
+                accountControlStore: database,
                 credentials: credentials,
                 serviceDID: serviceDID,
                 serverKey: Data(repeating: 0x2b, count: 32)
@@ -385,5 +403,143 @@ final class DurableLegacySessionServiceTests: XCTestCase {
             try await fixture.service.authorize(accessJWT: firstTokens.accessJWT)
         )
         _ = try await fixture.service.authorize(accessJWT: secondTokens.accessJWT)
+    }
+
+    // MARK: - Account lifecycle
+
+    /// Removing only OAuth authority on account deactivation leaves the bearer
+    /// access row live for the rest of its two-hour lifetime. The account
+    /// lifecycle is an independent authorization fact and must deny the token
+    /// immediately even though its JWT and legacy family are otherwise valid.
+    func testLegacyAccessIsRejectedImmediatelyAfterAccountDeactivation() async throws {
+        let fixture = try await makeFixture()
+        addTeardownBlock { [fixture] in
+            try? await fixture.database.close()
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
+        let now = Date()
+        let tokens = try await fixture.service.issue(
+            did: did,
+            appPassword: nil,
+            now: now
+        )
+        _ = try await fixture.service.authorize(
+            accessJWT: tokens.accessJWT,
+            now: now
+        )
+
+        _ = try await fixture.database.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: .init(),
+            now: now.addingTimeInterval(1)
+        )
+
+        await assertUnauthorizedAsync(
+            try await fixture.service.authorize(
+                accessJWT: tokens.accessJWT,
+                now: now.addingTimeInterval(2)
+            ),
+            "a deactivated account's legacy access token must be rejected"
+        )
+    }
+
+    /// Deactivation is a durable revocation boundary, not an in-memory check.
+    /// Closing and reopening control.sqlite must not make the old refresh row
+    /// usable again.
+    func testLegacyRefreshIsRejectedAfterDeactivationAndDatabaseReopen() async throws {
+        let fixture = try await makeFixture()
+        let now = Date()
+        let tokens = try await fixture.service.issue(
+            did: did,
+            appPassword: nil,
+            now: now
+        )
+        _ = try await fixture.database.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: .init(),
+            now: now.addingTimeInterval(1)
+        )
+        try await fixture.database.close()
+
+        let reopened = try await SQLiteControlDatabase(dataDirectory: fixture.root)
+        do {
+            let service = try DurableLegacySessionService(
+                store: reopened,
+                appPasswords: reopened,
+                accountControlStore: reopened,
+                credentials: fixture.credentials,
+                serviceDID: serviceDID,
+                serverKey: Data(repeating: 0x2b, count: 32)
+            )
+            await assertUnauthorizedAsync(
+                try await service.refresh(
+                    refreshJWT: tokens.refreshJWT,
+                    now: now.addingTimeInterval(2)
+                ),
+                "a deactivated account's refresh token must stay rejected after reopen"
+            )
+            try await reopened.close()
+            try FileManager.default.removeItem(at: fixture.root)
+        } catch {
+            try? await reopened.close()
+            try? FileManager.default.removeItem(at: fixture.root)
+            throw error
+        }
+    }
+
+    /// Reactivation restores authority for new credentials only. It must not
+    /// clear the durable revocation timestamp on a family that crossed an
+    /// inactive lifecycle boundary.
+    func testReactivationDoesNotRevivePreDeactivationLegacyTokens() async throws {
+        let fixture = try await makeFixture()
+        addTeardownBlock { [fixture] in
+            try? await fixture.database.close()
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
+        let now = Date()
+        let tokens = try await fixture.service.issue(
+            did: did,
+            appPassword: nil,
+            now: now
+        )
+        _ = try await fixture.database.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: .init(),
+            now: now.addingTimeInterval(1)
+        )
+        _ = try await fixture.database.transitionStatus(
+            did: did,
+            to: .active,
+            declaration: .init(),
+            now: now.addingTimeInterval(2)
+        )
+
+        await assertUnauthorizedAsync(
+            try await fixture.service.authorize(
+                accessJWT: tokens.accessJWT,
+                now: now.addingTimeInterval(3)
+            ),
+            "reactivation must not revive a pre-deactivation access token"
+        )
+        await assertUnauthorizedAsync(
+            try await fixture.service.refresh(
+                refreshJWT: tokens.refreshJWT,
+                now: now.addingTimeInterval(3)
+            ),
+            "reactivation must not revive a pre-deactivation refresh token"
+        )
+
+        let fresh = try await fixture.service.issue(
+            did: did,
+            appPassword: nil,
+            now: now.addingTimeInterval(4)
+        )
+        _ = try await fixture.service.authorize(
+            accessJWT: fresh.accessJWT,
+            now: now.addingTimeInterval(4)
+        )
     }
 }

@@ -4120,6 +4120,7 @@ extension SwanCommand {
                             sessions: try DurableLegacySessionService(
                                 store: controlDatabase,
                                 appPasswords: controlDatabase,
+                                accountControlStore: controlDatabase,
                                 credentials: credentials,
                                 // The same identity `/.well-known/did.json` and
                                 // `describeServer` publish, so a token's `aud`

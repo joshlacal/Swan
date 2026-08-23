@@ -77,6 +77,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             sessions: try DurableLegacySessionService(
                 store: database,
                 appPasswords: database,
+                accountControlStore: database,
                 credentials: credentials,
                 serviceDID: "did:web:swan.test",
                 serverKey: Data(repeating: 0x3c, count: 32)
@@ -746,6 +747,50 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
                 XCTAssertEqual(response.status, .unauthorized)
             }
         }
+    }
+
+    func testLegacyGetServiceAuthAfterDeactivationDoesNotInvokeIssuer() async throws {
+        let fixture = try await makeFixture()
+        addTeardownBlock { [fixture] in
+            try? await fixture.database.close()
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
+        let audience = "did:web:remote.example#pds"
+        let method = "com.atproto.repo.getRecord"
+        let password = try await issuePassword(
+            fixture,
+            scopes: "atproto rpc:\(method)?aud=did:web:remote.example%23pds"
+        )
+        try await app(fixture).test(.router) { client in
+            var access = ""
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createSession",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(
+                    string: "{\"identifier\":\"\(self.handle)\",\"password\":\"\(password)\"}"
+                )
+            ) { response in
+                access = try XCTUnwrap(try self.json(response)["accessJwt"] as? String)
+            }
+            _ = try await fixture.database.transitionStatus(
+                did: self.did,
+                to: .deactivated,
+                declaration: .init(),
+                now: Date()
+            )
+
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.getServiceAuth?aud=\(audience.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)!)&lxm=\(method)",
+                method: .get,
+                headers: [.authorization: "Bearer \(access)"]
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest, self.body(response))
+                XCTAssertEqual(try self.json(response)["error"] as? String, "ExpiredToken")
+            }
+        }
+        let calls = await fixture.serviceAuthIssuer.calls()
+        XCTAssertEqual(calls, [])
     }
 
     // MARK: - App-password management

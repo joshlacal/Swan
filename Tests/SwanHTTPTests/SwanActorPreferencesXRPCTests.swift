@@ -80,6 +80,94 @@ final class SwanActorPreferencesXRPCTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testLegacyActorPreferencesPutAfterDeactivationDoesNotWrite() async throws {
+        try await withPreferencesStore { store in
+            _ = try await store.transitionStatus(
+                did: Self.did,
+                to: .deactivated,
+                declaration: .init(),
+                now: Date()
+            )
+            let app = self.makeApp(
+                authorizer: PreferencesAuthorizer(
+                    result: .success(
+                        .accountLegacySession(
+                            subject: Self.did,
+                            permissions: SwanScopePermissions(
+                                rawScopes: ["atproto"],
+                                subject: Self.did
+                            )
+                        )
+                    )
+                ),
+                store: store
+            )
+            try await app.test(.live) { client in
+                try await client.execute(
+                    uri: "/xrpc/app.bsky.actor.putPreferences",
+                    method: .post,
+                    headers: self.jsonHeaders(),
+                    body: ByteBuffer(string: #"{"preferences":[]}"#)
+                ) { response in
+                    self.assertError(
+                        response,
+                        status: .unauthorized,
+                        code: "Unauthorized"
+                    )
+                }
+            }
+            let stored = try await store.actorPreferences(did: Self.did)
+            XCTAssertNil(stored)
+        }
+    }
+
+    func testAuthorizationThenDeactivationBeforeActorPreferencesWriteDoesNotCommit() async throws {
+        try await withPreferencesStore { store in
+            let parked = ParkingActorPreferencesStore(delegate: store)
+            let app = self.makeApp(
+                authorizer: PreferencesAuthorizer(
+                    result: .success(
+                        .accountLegacySession(
+                            subject: Self.did,
+                            permissions: SwanScopePermissions(
+                                rawScopes: ["atproto"],
+                                subject: Self.did
+                            )
+                        )
+                    )
+                ),
+                store: parked
+            )
+            try await app.test(.live) { client in
+                let request = Task {
+                    try await client.execute(
+                        uri: "/xrpc/app.bsky.actor.putPreferences",
+                        method: .post,
+                        headers: self.jsonHeaders(),
+                        body: ByteBuffer(string: #"{"preferences":[]}"#)
+                    ) { response in
+                        self.assertError(
+                            response,
+                            status: .unauthorized,
+                            code: "Unauthorized"
+                        )
+                    }
+                }
+                await parked.waitUntilWriteParked()
+                _ = try await store.transitionStatus(
+                    did: Self.did,
+                    to: .deactivated,
+                    declaration: .init(),
+                    now: Date()
+                )
+                await parked.releaseWrite()
+                try await request.value
+            }
+            let stored = try await store.actorPreferences(did: Self.did)
+            XCTAssertNil(stored)
+        }
+    }
+
     func testRejectsUnauthenticatedRequests() async throws {
         try await withPreferencesStore { store in
             let app = self.makeApp(
@@ -239,6 +327,7 @@ final class SwanActorPreferencesXRPCTests: XCTestCase, @unchecked Sendable {
         let control = try await SQLiteControlDatabase(dataDirectory: root)
         defer { try? FileManager.default.removeItem(at: root) }
         do {
+            try await seedAccount(Self.did, handle: "preferences-main.example.com", in: control)
             let runtime = try SwanOAuthRuntime(
                 controlStore: control,
                 serverKey: Data(repeating: 0x3D, count: 32)
@@ -352,12 +441,32 @@ final class SwanActorPreferencesXRPCTests: XCTestCase, @unchecked Sendable {
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try await SQLiteControlDatabase(dataDirectory: root)
         do {
+            try await seedAccount(Self.did, handle: "preferences-a.example.com", in: store)
+            try await seedAccount(Self.otherDID, handle: "preferences-b.example.com", in: store)
             try await body(store)
             try await store.close()
         } catch {
             try? await store.close()
             throw error
         }
+    }
+
+    private func seedAccount(
+        _ did: String,
+        handle: String,
+        in store: SQLiteControlDatabase
+    ) async throws {
+        _ = try await store.createAccount(
+            AccountControlRegistration(
+                did: did,
+                canonicalHandle: handle,
+                passwordVerifier:
+                    "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: .init(purpose: .signing, generation: 1),
+                rotationKey: .init(purpose: .rotation, generation: 1),
+                createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+            )
+        )
     }
 
     private func makeApp(
@@ -408,6 +517,40 @@ final class SwanActorPreferencesXRPCTests: XCTestCase, @unchecked Sendable {
         )
         XCTAssertEqual(Set(object.keys), ["error"])
         return try XCTUnwrap(object["error"] as? String)
+    }
+}
+
+private actor ParkingActorPreferencesStore: ActorPreferencesStore {
+    private let delegate: any ActorPreferencesStore
+    private var writeParked = false
+    private var parkedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    init(delegate: any ActorPreferencesStore) {
+        self.delegate = delegate
+    }
+
+    func actorPreferences(did: String) async throws -> Data? {
+        try await delegate.actorPreferences(did: did)
+    }
+
+    func setActorPreferences(did: String, json: Data) async throws {
+        writeParked = true
+        let waiters = parkedWaiters
+        parkedWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { releaseContinuation = $0 }
+        try await delegate.setActorPreferences(did: did, json: json)
+    }
+
+    func waitUntilWriteParked() async {
+        if writeParked { return }
+        await withCheckedContinuation { parkedWaiters.append($0) }
+    }
+
+    func releaseWrite() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }
 
