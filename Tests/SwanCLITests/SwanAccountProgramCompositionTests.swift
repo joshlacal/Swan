@@ -630,7 +630,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                         headers: steered,
                         body: ByteBuffer(string: #"{"name":"test"}"#)
                     ) { response in
-                        XCTAssertEqual(response.status, .badRequest, uri)
+                        XCTAssertEqual(response.status, .forbidden, uri)
                     }
                 }
             }

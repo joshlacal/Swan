@@ -115,7 +115,7 @@ public protocol SwanLegacySessionRateLimiting: Sendable {
 public struct SwanLegacySessionXRPCServer: Sendable {
     static let maximumJSONBytes = 8 * 1024
 
-    /// The eight methods this service owns.
+    /// The eight methods this service claims in the legacy hierarchy.
     public static let methodNSIDs: Set<String> = [
         ComAtprotoServerCreateSession.typeIdentifier,
         ComAtprotoServerRefreshSession.typeIdentifier,
@@ -125,6 +125,16 @@ public struct SwanLegacySessionXRPCServer: Sendable {
         ComAtprotoServerCreateAppPassword.typeIdentifier,
         ComAtprotoServerListAppPasswords.typeIdentifier,
         ComAtprotoServerRevokeAppPassword.typeIdentifier,
+    ]
+
+    /// The five methods served locally by this service. The three app-password
+    /// methods are portal-only and fail closed (403 request_not_allowed).
+    public static let servedMethodNSIDs: Set<String> = [
+        ComAtprotoServerCreateSession.typeIdentifier,
+        ComAtprotoServerRefreshSession.typeIdentifier,
+        ComAtprotoServerGetSession.typeIdentifier,
+        ComAtprotoServerDeleteSession.typeIdentifier,
+        ComAtprotoServerGetServiceAuth.typeIdentifier,
     ]
 
     /// Also handed to the resource authorizers, so a legacy bearer token is
@@ -209,17 +219,20 @@ public struct SwanLegacySessionXRPCServer: Sendable {
             request, context async -> Response in
             await handlers.deleteSession(request, context: context)
         }
-        router.post("/xrpc/\(ComAtprotoServerCreateAppPassword.typeIdentifier)") {
-            request, context async -> Response in
-            await handlers.createAppPassword(request, context: context)
-        }
-        router.get("/xrpc/\(ComAtprotoServerListAppPasswords.typeIdentifier)") {
-            request, context async -> Response in
-            await handlers.listAppPasswords(request, context: context)
-        }
-        router.post("/xrpc/\(ComAtprotoServerRevokeAppPassword.typeIdentifier)") {
-            request, context async -> Response in
-            await handlers.revokeAppPassword(request, context: context)
+        let allMethods: [HTTPRequest.Method] = [
+            .get, .head, .post, .put, .patch, .delete, .options, .connect, .trace,
+        ]
+        for path in [
+            "/xrpc/\(ComAtprotoServerCreateAppPassword.typeIdentifier)",
+            "/xrpc/\(ComAtprotoServerListAppPasswords.typeIdentifier)",
+            "/xrpc/\(ComAtprotoServerRevokeAppPassword.typeIdentifier)",
+        ] {
+            let routePath = RouterPath(path)
+            for method in allMethods {
+                router.on(routePath, method: method) { _, _ async -> Response in
+                    jsonResponseWithStatus(.forbidden, body: ["error": "request_not_allowed"])
+                }
+            }
         }
     }
 }
@@ -593,116 +606,6 @@ private struct Handlers: Sendable {
         }
     }
 
-    // MARK: - App-password management
-
-    /// Every one of these requires a FULL-ACCESS session — upstream's
-    /// `ACCESS_FULL` (`createAppPassword.ts:11`). The rule that matters is
-    /// anti-escalation: an app password must not mint further app passwords, nor
-    /// revoke the credential that would have contained it.
-    private func fullAccessSubject(_ request: Request) async throws -> String {
-        let presented = try bearerToken(request)
-        do {
-            return try await sessions.authorizeFullAccess(accessJWT: presented)
-        } catch {
-            throw SwanLegacySessionXRPCFailure.expiredToken
-        }
-    }
-
-    func createAppPassword(_ request: Request, context: SwanHTTPRequestContext) async -> Response {
-        do {
-            try await requireNoQuery(request, context: context)
-            let input: ComAtprotoServerCreateAppPassword.Input = try await decodeExactJSON(
-                request, context: context, required: ["name"], optional: ["privileged"]
-            )
-            let subject = try await fullAccessSubject(request)
-            guard !input.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  input.name.utf8.count <= 256 else {
-                throw SwanLegacySessionXRPCFailure.invalidRequest
-            }
-            // Petrel's generated Input carries `name` and `privileged` — the
-            // standard lexicon has no `scopes` field, so the design's proposed
-            // extension is not expressible without a lexicon change. The
-            // backward-compatible default IS the mapping the design specifies:
-            // `privileged` decides only whether DMs are reachable.
-            let scopes = AppPasswordScopes.defaultScopes(privileged: input.privileged ?? false)
-            let issued: AppPasswordIssuance
-            do {
-                issued = try await credentials.issue(
-                    did: subject, name: input.name, scopes: scopes, into: appPasswords
-                )
-            } catch let failure as AppPasswordStoreError {
-                switch failure {
-                case .duplicateName, .limitReached: throw SwanLegacySessionXRPCFailure.invalidRequest
-                case .unknownAccount: throw SwanLegacySessionXRPCFailure.expiredToken
-                }
-            } catch {
-                throw SwanLegacySessionXRPCFailure.unavailable
-            }
-            // The one and only time the secret is returned.
-            return try json(
-                .ok,
-                ComAtprotoServerCreateAppPassword.AppPassword(
-                    name: issued.record.name,
-                    password: issued.password,
-                    createdAt: ATProtocolDate(date: issued.record.createdAt),
-                    privileged: input.privileged ?? false
-                )
-            )
-        } catch {
-            return response(for: error)
-        }
-    }
-
-    func listAppPasswords(_ request: Request, context: SwanHTTPRequestContext) async -> Response {
-        do {
-            let subject = try await fullAccessSubject(request)
-            let rows: [AppPasswordRecord]
-            do {
-                rows = try await appPasswords.listAppPasswords(did: subject)
-            } catch {
-                throw SwanLegacySessionXRPCFailure.unavailable
-            }
-            return try json(
-                .ok,
-                ComAtprotoServerListAppPasswords.Output(
-                    passwords: rows.map { record in
-                        ComAtprotoServerListAppPasswords.AppPassword(
-                            name: record.name,
-                            createdAt: ATProtocolDate(date: record.createdAt),
-                            // Derived from the stored scopes rather than a
-                            // separate column, so the two can never disagree.
-                            privileged: record.scopes
-                                .split(separator: " ")
-                                .contains("transition:chat.bsky")
-                        )
-                    }
-                )
-            )
-        } catch {
-            return response(for: error)
-        }
-    }
-
-    func revokeAppPassword(_ request: Request, context: SwanHTTPRequestContext) async -> Response {
-        do {
-            try await requireNoQuery(request, context: context)
-            let input: ComAtprotoServerRevokeAppPassword.Input = try await decodeExactJSON(
-                request, context: context, required: ["name"], optional: []
-            )
-            let subject = try await fullAccessSubject(request)
-            do {
-                // Deleting the row cascades to its session families and their
-                // tokens, so revocation ends the credential's live sessions in
-                // the same statement.
-                try await appPasswords.revokeAppPassword(did: subject, name: input.name)
-            } catch {
-                throw SwanLegacySessionXRPCFailure.unavailable
-            }
-            return Response(status: .ok, headers: [:], body: .init())
-        } catch {
-            return response(for: error)
-        }
-    }
 
     // MARK: shared
 

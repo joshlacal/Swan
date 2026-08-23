@@ -51,21 +51,6 @@ public struct SwanLegacyAuthXRPCAdapter: Sendable {
         return ComAtprotoServerGetServiceAuth.Output(token: result.token)
     }
 
-    public func createAppPassword(context: LegacyXRPCAuthorizationContext, name: String, scopes: Set<String>, now: Date = Date()) async throws -> ComAtprotoServerCreateAppPassword.AppPassword {
-        guard let stepUp = context.freshStepUpReceipt else { throw SwanError.unauthorized("management step-up required") }
-        let result = try await service.createAppPassword(accountDID: context.accountDID, name: name, scopes: scopes, managementSessionToken: context.opaqueAuthorization, stepUpToken: stepUp, now: now)
-        return ComAtprotoServerCreateAppPassword.AppPassword(name: result.name, password: result.secret, createdAt: ATProtocolDate(date: now), privileged: nil)
-    }
-
-    public func listAppPasswords(context: LegacyXRPCAuthorizationContext, now: Date = Date()) async throws -> ComAtprotoServerListAppPasswords.Output {
-        let values = try await service.listAppPasswords(accountDID: context.accountDID, managementSessionToken: context.opaqueAuthorization, now: now)
-        return ComAtprotoServerListAppPasswords.Output(passwords: values.map { .init(name: $0.name, createdAt: ATProtocolDate(date: $0.createdAt), privileged: nil) })
-    }
-
-    public func revokeAppPassword(context: LegacyXRPCAuthorizationContext, input: ComAtprotoServerRevokeAppPassword.Input, now: Date = Date()) async throws {
-        guard let stepUp = context.freshStepUpReceipt else { throw SwanError.unauthorized("management step-up required") }
-        try await service.revokeAppPassword(accountDID: context.accountDID, name: input.name, managementSessionToken: context.opaqueAuthorization, stepUpToken: stepUp, now: now)
-    }
 
     private func createSessionOutput(_ tokens: LegacyCompatibilitySessionTokens) throws -> ComAtprotoServerCreateSession.Output {
         try ComAtprotoServerCreateSession.Output(
@@ -143,13 +128,3 @@ public struct SwanLegacyBearerAuthorizer: Sendable {
     }
 }
 
-/// Created only by the authenticated XRPC layer; it is deliberately opaque
-/// and is not a browser cookie or a caller-supplied account identifier.
-public struct LegacyXRPCAuthorizationContext: Sendable {
-    public let accountDID: String
-    public let opaqueAuthorization: String
-    public let freshStepUpReceipt: String?
-    internal init(accountDID: String, opaqueAuthorization: String, freshStepUpReceipt: String? = nil) {
-        self.accountDID = accountDID; self.opaqueAuthorization = opaqueAuthorization; self.freshStepUpReceipt = freshStepUpReceipt
-    }
-}

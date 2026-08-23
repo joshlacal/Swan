@@ -813,7 +813,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
         return token
     }
 
-    func testCreateListAndRevokeAnAppPassword() async throws {
+    func testAppPasswordMethodsFailClosedOverXRPC() async throws {
         let fixture = try await makeFixture()
         defer {
             Task {
@@ -822,84 +822,9 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             }
         }
         try await app(fixture).test(.router) { client in
-            let token = try await self.fullAccessToken(client, fixture: fixture)
-
-            var issued = ""
-            try await client.execute(
-                uri: "/xrpc/com.atproto.server.createAppPassword",
-                method: .post,
-                headers: [.contentType: "application/json", .authorization: "Bearer \(token)"],
-                body: ByteBuffer(string: "{\"name\":\"phone\"}")
-            ) { response in
-                XCTAssertEqual(response.status, .ok, self.body(response))
-                let payload = try self.json(response)
-                XCTAssertEqual(payload["name"] as? String, "phone")
-                issued = try XCTUnwrap(payload["password"] as? String)
-            }
-
-            // Listing shows it and never carries the secret.
-            try await client.execute(
-                uri: "/xrpc/com.atproto.server.listAppPasswords",
-                method: .get,
-                headers: [.authorization: "Bearer \(token)"]
-            ) { response in
-                XCTAssertEqual(response.status, .ok, self.body(response))
-                XCTAssertFalse(self.body(response).contains(issued))
-                let passwords = try XCTUnwrap(
-                    try self.json(response)["passwords"] as? [[String: Any]]
-                )
-                XCTAssertEqual(passwords.count, 1)
-                XCTAssertEqual(passwords[0]["name"] as? String, "phone")
-            }
-
-            // The issued secret signs in.
-            try await client.execute(
-                uri: "/xrpc/com.atproto.server.createSession",
-                method: .post,
-                headers: [.contentType: "application/json"],
-                body: ByteBuffer(string:
-                    "{\"identifier\":\"\(self.handle)\",\"password\":\"\(issued)\"}"
-                )
-            ) { response in
-                XCTAssertEqual(response.status, .ok, self.body(response))
-            }
-
-            // Revoking it stops that.
-            try await client.execute(
-                uri: "/xrpc/com.atproto.server.revokeAppPassword",
-                method: .post,
-                headers: [.contentType: "application/json", .authorization: "Bearer \(token)"],
-                body: ByteBuffer(string: "{\"name\":\"phone\"}")
-            ) { response in
-                XCTAssertEqual(response.status, .ok, self.body(response))
-            }
-            try await client.execute(
-                uri: "/xrpc/com.atproto.server.createSession",
-                method: .post,
-                headers: [.contentType: "application/json"],
-                body: ByteBuffer(string:
-                    "{\"identifier\":\"\(self.handle)\",\"password\":\"\(issued)\"}"
-                )
-            ) { response in
-                XCTAssertEqual(response.status, .unauthorized)
-            }
-        }
-    }
-
-    /// The anti-escalation rule, and the reason these endpoints require
-    /// `ACCESS_FULL`: an app password must not mint further app passwords, nor
-    /// revoke the credential that would have contained it.
-    func testAnAppPasswordSessionCannotManageAppPasswords() async throws {
-        let fixture = try await makeFixture()
-        defer {
-            Task {
-                try? await fixture.database.close()
-                try? FileManager.default.removeItem(at: fixture.root)
-            }
-        }
-        let scoped = try await issuePassword(fixture, name: "scoped")
-        try await app(fixture).test(.router) { client in
-            var token = ""
+            let fullToken = try await self.fullAccessToken(client, fixture: fixture)
+            let scoped = try await self.issuePassword(fixture, name: "scoped")
+            var scopedToken = ""
             try await client.execute(
                 uri: "/xrpc/com.atproto.server.createSession",
                 method: .post,
@@ -909,28 +834,34 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
                 )
             ) { response in
                 XCTAssertEqual(response.status, .ok, self.body(response))
-                token = try XCTUnwrap(try self.json(response)["accessJwt"] as? String)
+                scopedToken = try XCTUnwrap(try self.json(response)["accessJwt"] as? String)
             }
 
-            for (uri, method, payload) in [
-                ("/xrpc/com.atproto.server.createAppPassword", HTTPRequest.Method.post, "{\"name\":\"escalated\"}"),
-                ("/xrpc/com.atproto.server.revokeAppPassword", .post, "{\"name\":\"scoped\"}"),
-            ] {
-                try await client.execute(
-                    uri: uri,
-                    method: method,
-                    headers: [.contentType: "application/json", .authorization: "Bearer \(token)"],
-                    body: ByteBuffer(string: payload)
-                ) { response in
-                    XCTAssertNotEqual(response.status, .ok, "for \(uri)")
+            for token in ["", fullToken, scopedToken] {
+                var headers = HTTPFields()
+                headers[.contentType] = "application/json"
+                if !token.isEmpty {
+                    headers[.authorization] = "Bearer \(token)"
                 }
-            }
-            try await client.execute(
-                uri: "/xrpc/com.atproto.server.listAppPasswords",
-                method: .get,
-                headers: [.authorization: "Bearer \(token)"]
-            ) { response in
-                XCTAssertNotEqual(response.status, .ok)
+                for uri in [
+                    "/xrpc/com.atproto.server.createAppPassword",
+                    "/xrpc/com.atproto.server.listAppPasswords",
+                    "/xrpc/com.atproto.server.revokeAppPassword",
+                ] {
+                    for method in [HTTPRequest.Method.post, .get, .put, .delete] {
+                        try await client.execute(
+                            uri: uri,
+                            method: method,
+                            headers: headers,
+                            body: ByteBuffer(string: "{\"name\":\"phone\"}")
+                        ) { response in
+                            XCTAssertEqual(response.status, .forbidden, "for \(method.rawValue) \(uri)")
+                            XCTAssertEqual(response.headers[.cacheControl], "no-store")
+                            let payload = try? self.json(response)
+                            XCTAssertEqual(payload?["error"] as? String, "request_not_allowed")
+                        }
+                    }
+                }
             }
         }
     }

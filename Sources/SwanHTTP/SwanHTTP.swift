@@ -939,6 +939,20 @@ public struct SwanHTTPServer: Sendable {
             // one claim a caller could disprove from the response in hand.
             "community.lexicon.service.describe",
         ])
+        if legacySessionXRPC != nil {
+            describedMethodSet.formUnion(SwanLegacySessionXRPCServer.servedMethodNSIDs)
+        }
+        if actorPreferencesXRPC != nil {
+            describedMethodSet.formUnion([
+                AppBskyActorGetPreferences.typeIdentifier,
+                AppBskyActorPutPreferences.typeIdentifier,
+            ])
+        }
+        describedMethodSet.subtract([
+            ComAtprotoServerCreateAppPassword.typeIdentifier,
+            ComAtprotoServerListAppPasswords.typeIdentifier,
+            ComAtprotoServerRevokeAppPassword.typeIdentifier,
+        ])
         // The `getRepoState` alias is listed exactly when its route is live —
         // the sync capability exists and the profile declares the canonical
         // name (see `registerAuthenticatedGetLatestCommitEndpoint`). Listing
