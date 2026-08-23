@@ -142,15 +142,11 @@ private struct PublicDescribeRepoHandler:
         ) else {
             throw PublicReadHandlerFailure.unavailable(.pdsOriginMismatch)
         }
-        let document = try PublicDIDDocument(
+        let didDocument = try makePublicDIDDocument(
             id: description.did,
             handle: description.identity.canonicalHandle,
             signingDIDKey: description.identity.signingDIDKey,
             serviceEndpoint: description.identity.pdsOrigin
-        )
-        let didDocument = try JSONDecoder().decode(
-            DIDDocument.self,
-            from: JSONEncoder().encode(document)
         )
         return .init(
             handle: try Handle(handleString: description.canonicalHandle),
@@ -454,7 +450,7 @@ func registerPublicRepositoryReadEndpoints(
     ) { request, _ async -> Response in
         var selector: String?
         do {
-            let query = try publicReadQuery(request, required: ["repo"])
+            let query = try publicReadQuery(request, schema: describeRepoQuerySchema)
             guard let repo = query["repo"] else {
                 throw PublicReadHandlerFailure.invalidRequest
             }
@@ -515,8 +511,7 @@ func registerPublicRepositoryReadEndpoints(
         do {
             let query = try publicReadQuery(
                 request,
-                required: ["repo", "collection", "rkey"],
-                optional: ["cid"]
+                schema: getRecordQuerySchema
             )
             guard let repo = query["repo"],
                   let collectionQuery = query["collection"],
@@ -594,8 +589,7 @@ func registerPublicRepositoryReadEndpoints(
         do {
             let query = try publicReadQuery(
                 request,
-                required: ["repo", "collection"],
-                optional: ["limit", "cursor", "reverse"]
+                schema: listRecordsQuerySchema
             )
             guard let repo = query["repo"],
                   let collectionQuery = query["collection"] else {
@@ -673,7 +667,7 @@ func registerPublicRepositoryReadEndpoints(
     ) { request, _ async -> Response in
         var selector: String?
         do {
-            let query = try publicReadQuery(request, required: ["did"])
+            let query = try publicReadQuery(request, schema: getLatestCommitQuerySchema)
             guard let rawDID = query["did"] else {
                 throw PublicReadHandlerFailure.invalidRequest
             }
@@ -742,7 +736,7 @@ func registerPublicRepositoryReadEndpoints(
     ) { request, _ async -> Response in
         var selector: String?
         do {
-            let query = try publicReadQuery(request, required: ["did"])
+            let query = try publicReadQuery(request, schema: getRepoStatusQuerySchema)
             guard let rawDID = query["did"] else {
                 throw PublicReadHandlerFailure.invalidRequest
             }
@@ -809,7 +803,8 @@ func registerPublicRepositoryReadEndpoints(
         var selector: String?
         do {
             let query = try publicReadQuery(
-                request, required: ["did"], optional: ["since"]
+                request,
+                schema: getRepoQuerySchema
             )
             guard query["since"] == nil else {
                 return publicReadError(.badRequest, "InvalidRequest")
@@ -1065,7 +1060,7 @@ func registerPublicHandleResolutionEndpoint(
     router.get("/xrpc/\(resolveHandleNSID)") { request, _ async -> Response in
         var selector: String?
         do {
-            let query = try publicReadQuery(request, required: ["handle"])
+            let query = try publicReadQuery(request, schema: resolveHandleQuerySchema)
             guard let rawHandle = query["handle"] else {
                 throw PublicReadHandlerFailure.invalidRequest
             }
@@ -1191,8 +1186,7 @@ private struct PublicBlobParameters {
 private func publicBlobParameters(_ request: Request) throws -> PublicBlobParameters {
     let query = try strictAuthenticatedRecordQuery(
         request,
-        required: ["did", "cid"],
-        optional: []
+        schema: publicBlobQuerySchema
     )
     guard let rawDID = query["did"],
           rawDID.utf8.count <= 2_048,
@@ -1269,14 +1263,31 @@ private func publicBlobRequestBody(
     }
 }
 
+private let describeRepoQuerySchema = StrictQuerySchema(required: ["repo"])
+private let getRecordQuerySchema = StrictQuerySchema(
+    required: ["repo", "collection", "rkey"],
+    optional: ["cid"]
+)
+private let listRecordsQuerySchema = StrictQuerySchema(
+    required: ["repo", "collection"],
+    optional: ["limit", "cursor", "reverse"]
+)
+private let getLatestCommitQuerySchema = StrictQuerySchema(required: ["did"])
+private let getRepoStatusQuerySchema = StrictQuerySchema(required: ["did"])
+private let getRepoQuerySchema = StrictQuerySchema(
+    required: ["did"],
+    optional: ["since"]
+)
+private let resolveHandleQuerySchema = StrictQuerySchema(required: ["handle"])
+private let publicBlobQuerySchema = StrictQuerySchema(required: ["did", "cid"])
+
 private func publicReadQuery(
     _ request: Request,
-    required: Set<String>,
-    optional: Set<String> = []
+    schema: StrictQuerySchema
 ) throws -> [String: String] {
     do {
         return try strictAuthenticatedRecordQuery(
-            request, required: required, optional: optional
+            request, schema: schema
         )
     } catch {
         throw PublicRepositoryReadError.invalidSelector
@@ -1534,10 +1545,8 @@ func publicReadJSON(
     method: String = "unknown",
     selector: String? = nil
 ) -> Response {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
     guard maximumBytes > 0,
-          let data = try? encoder.encode(value),
+          let data = try? SwanJSONEncoders.sortedNoEscaping.encode(value),
           data.count <= maximumBytes else {
         lease?.release()
         return publicReadUnavailable(
@@ -1564,49 +1573,188 @@ func publicReadJSON(
     )
 }
 
-private struct PublicDIDDocument: Encodable {
-    let context = [
-        "https://www.w3.org/ns/did/v1",
-        "https://w3id.org/security/suites/ecdsa-2019/v1",
-    ]
-    let id: String
-    let alsoKnownAs: [String]
-    let verificationMethod: [PublicDIDVerificationMethod]
-    let service: [PublicDIDService]
+private enum DecodableValue {
+    case string(String)
+    case array([DecodableValue])
+    case dictionary([String: DecodableValue])
+}
 
-    init(
-        id: String,
-        handle: String,
-        signingDIDKey: String,
-        serviceEndpoint: String
-    ) throws {
-        self.id = id
-        alsoKnownAs = ["at://\(handle)"]
-        let verificationType = switch try PLCDIDKeyCodec.decode(
-            signingDIDKey
-        ) {
-        case .p256:
-            "EcdsaSecp256r1VerificationKey2019"
-        case .secp256k1:
-            "EcdsaSecp256k1VerificationKey2019"
+private struct DecodableValueDecoder: Decoder {
+    let value: DecodableValue
+    var codingPath: [any CodingKey] = []
+    var userInfo: [CodingUserInfoKey: Any] = [:]
+
+    func container<Key: CodingKey>(keyedBy type: Key.Type) throws -> KeyedDecodingContainer<Key> {
+        guard case let .dictionary(dict) = value else {
+            throw DecodingError.typeMismatch(
+                [String: DecodableValue].self,
+                .init(codingPath: codingPath, debugDescription: "Expected dictionary")
+            )
         }
-        verificationMethod = [.init(
-            id: "#atproto",
-            type: verificationType,
-            controller: id,
-            publicKeyMultibase: String(signingDIDKey.dropFirst("did:key:".count))
-        )]
-        service = [.init(
-            id: "#atproto_pds",
-            type: "AtprotoPersonalDataServer",
-            serviceEndpoint: serviceEndpoint
-        )]
+        return KeyedDecodingContainer(KeyedContainer<Key>(dict: dict, codingPath: codingPath))
     }
 
-    enum CodingKeys: String, CodingKey {
-        case context = "@context"
-        case id, alsoKnownAs, verificationMethod, service
+    func unkeyedContainer() throws -> UnkeyedDecodingContainer {
+        guard case let .array(arr) = value else {
+            throw DecodingError.typeMismatch(
+                [DecodableValue].self,
+                .init(codingPath: codingPath, debugDescription: "Expected array")
+            )
+        }
+        return UnkeyedContainer(array: arr, codingPath: codingPath)
     }
+
+    func singleValueContainer() throws -> SingleValueDecodingContainer {
+        SingleContainer(value: value, codingPath: codingPath)
+    }
+
+    private struct KeyedContainer<Key: CodingKey>: KeyedDecodingContainerProtocol {
+        let dict: [String: DecodableValue]
+        var codingPath: [any CodingKey]
+        var allKeys: [Key] { dict.keys.compactMap(Key.init(stringValue:)) }
+
+        func contains(_ key: Key) -> Bool {
+            dict[key.stringValue] != nil
+        }
+
+        func decodeNil(forKey key: Key) throws -> Bool {
+            dict[key.stringValue] == nil
+        }
+
+        func decode<T: Decodable>(_ type: T.Type, forKey key: Key) throws -> T {
+            guard let val = dict[key.stringValue] else {
+                throw DecodingError.keyNotFound(
+                    key,
+                    .init(codingPath: codingPath, debugDescription: "Missing key \(key.stringValue)")
+                )
+            }
+            if type == String.self, case let .string(str) = val {
+                return str as! T
+            }
+            return try T(from: DecodableValueDecoder(value: val, codingPath: codingPath + [key]))
+        }
+
+        func nestedContainer<NestedKey: CodingKey>(keyedBy type: NestedKey.Type, forKey key: Key) throws -> KeyedDecodingContainer<NestedKey> {
+            guard let val = dict[key.stringValue] else {
+                throw DecodingError.keyNotFound(key, .init(codingPath: codingPath, debugDescription: "Missing key"))
+            }
+            return try DecodableValueDecoder(value: val, codingPath: codingPath + [key]).container(keyedBy: type)
+        }
+
+        func nestedUnkeyedContainer(forKey key: Key) throws -> UnkeyedDecodingContainer {
+            guard let val = dict[key.stringValue] else {
+                throw DecodingError.keyNotFound(key, .init(codingPath: codingPath, debugDescription: "Missing key"))
+            }
+            return try DecodableValueDecoder(value: val, codingPath: codingPath + [key]).unkeyedContainer()
+        }
+
+        func superDecoder() throws -> any Decoder {
+            DecodableValueDecoder(value: .dictionary(dict), codingPath: codingPath)
+        }
+
+        func superDecoder(forKey key: Key) throws -> any Decoder {
+            guard let val = dict[key.stringValue] else {
+                throw DecodingError.keyNotFound(key, .init(codingPath: codingPath, debugDescription: "Missing key"))
+            }
+            return DecodableValueDecoder(value: val, codingPath: codingPath + [key])
+        }
+    }
+
+    private struct UnkeyedContainer: UnkeyedDecodingContainer {
+        let array: [DecodableValue]
+        var codingPath: [any CodingKey]
+        var count: Int? { array.count }
+        var isAtEnd: Bool { currentIndex >= array.count }
+        var currentIndex: Int = 0
+
+        mutating func decodeNil() throws -> Bool { false }
+
+        mutating func decode<T: Decodable>(_ type: T.Type) throws -> T {
+            guard !isAtEnd else {
+                throw DecodingError.valueNotFound(type, .init(codingPath: codingPath, debugDescription: "Unkeyed container is at end"))
+            }
+            let val = array[currentIndex]
+            currentIndex += 1
+            if type == String.self, case let .string(str) = val {
+                return str as! T
+            }
+            return try T(from: DecodableValueDecoder(value: val, codingPath: codingPath))
+        }
+
+        mutating func nestedContainer<NestedKey: CodingKey>(keyedBy type: NestedKey.Type) throws -> KeyedDecodingContainer<NestedKey> {
+            guard !isAtEnd else {
+                throw DecodingError.valueNotFound(Any.self, .init(codingPath: codingPath, debugDescription: "Unkeyed container is at end"))
+            }
+            let val = array[currentIndex]
+            currentIndex += 1
+            return try DecodableValueDecoder(value: val, codingPath: codingPath).container(keyedBy: type)
+        }
+
+        mutating func nestedUnkeyedContainer() throws -> UnkeyedDecodingContainer {
+            guard !isAtEnd else {
+                throw DecodingError.valueNotFound(Any.self, .init(codingPath: codingPath, debugDescription: "Unkeyed container is at end"))
+            }
+            let val = array[currentIndex]
+            currentIndex += 1
+            return try DecodableValueDecoder(value: val, codingPath: codingPath).unkeyedContainer()
+        }
+
+        mutating func superDecoder() throws -> any Decoder {
+            DecodableValueDecoder(value: .array(array), codingPath: codingPath)
+        }
+    }
+
+    private struct SingleContainer: SingleValueDecodingContainer {
+        let value: DecodableValue
+        var codingPath: [any CodingKey]
+
+        func decodeNil() -> Bool { false }
+
+        func decode<T: Decodable>(_ type: T.Type) throws -> T {
+            if type == String.self, case let .string(str) = value {
+                return str as! T
+            }
+            return try T(from: DecodableValueDecoder(value: value, codingPath: codingPath))
+        }
+    }
+}
+
+private func makePublicDIDDocument(
+    id: String,
+    handle: String,
+    signingDIDKey: String,
+    serviceEndpoint: String
+) throws -> DIDDocument {
+    let verificationType = switch try PLCDIDKeyCodec.decode(signingDIDKey) {
+    case .p256:
+        "EcdsaSecp256r1VerificationKey2019"
+    case .secp256k1:
+        "EcdsaSecp256k1VerificationKey2019"
+    }
+    let value: DecodableValue = .dictionary([
+        "@context": .array([
+            .string("https://www.w3.org/ns/did/v1"),
+            .string("https://w3id.org/security/suites/ecdsa-2019/v1"),
+        ]),
+        "id": .string(id),
+        "alsoKnownAs": .array([.string("at://\(handle)")]),
+        "verificationMethod": .array([
+            .dictionary([
+                "id": .string("#atproto"),
+                "type": .string(verificationType),
+                "controller": .string(id),
+                "publicKeyMultibase": .string(String(signingDIDKey.dropFirst("did:key:".count))),
+            ]),
+        ]),
+        "service": .array([
+            .dictionary([
+                "id": .string("#atproto_pds"),
+                "type": .string("AtprotoPersonalDataServer"),
+                "serviceEndpoint": .string(serviceEndpoint),
+            ]),
+        ]),
+    ])
+    return try DIDDocument(from: DecodableValueDecoder(value: value))
 }
 
 private func publicReadOriginsMatch(_ lhs: String, _ rhs: String) -> Bool {
@@ -1626,15 +1774,3 @@ private func publicReadOriginsMatch(_ lhs: String, _ rhs: String) -> Bool {
     return left == right
 }
 
-private struct PublicDIDVerificationMethod: Encodable {
-    let id: String
-    let type: String
-    let controller: String
-    let publicKeyMultibase: String
-}
-
-private struct PublicDIDService: Encodable {
-    let id: String
-    let type: String
-    let serviceEndpoint: String
-}

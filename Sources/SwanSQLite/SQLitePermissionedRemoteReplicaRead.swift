@@ -43,7 +43,7 @@ extension SQLiteAccountDatabase {
             )
         }
         return try await withConnectionGate {
-            try await readTransaction {
+            try await writerReadTransaction {
                 guard let head = try await loadPermissionedRemoteReplicaHead(
                     target: target
                 ) else { return [] }

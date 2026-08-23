@@ -45,23 +45,22 @@ public struct RepositoryMSTLeaf: Sendable, Equatable {
 
 public enum RepositoryMSTCodec {
     public static func keyDepth(for path: PublicRepositoryPath) -> Int {
-        keyDepth(forASCIIKey: path.mstKey)
+        path.keyDepth
+    }
+
+    public static func keyDepth(forASCIIKey key: String) -> Int {
+        keyDepth(forASCIIBytes: Data(key.utf8))
     }
 
     /// The repository MST is a fanout-4 search tree: each complete pair of
     /// leading zero digest bits contributes one layer.
-    public static func keyDepth(forASCIIKey key: String) -> Int {
-        let digest = SHA256.hash(data: Data(key.utf8))
+    public static func keyDepth(forASCIIBytes bytes: Data) -> Int {
+        let digest = SHA256.hash(data: bytes)
         var depth = 0
         for byte in digest {
-            if byte < 64 { depth += 1 }
-            if byte < 16 { depth += 1 }
-            if byte < 4 { depth += 1 }
-            if byte == 0 {
-                depth += 1
-            } else {
-                break
-            }
+            let zeros = byte.leadingZeroBitCount
+            depth += zeros / 2
+            if zeros < 8 { break }
         }
         return depth
     }
@@ -77,8 +76,8 @@ public enum RepositoryMSTCodec {
             if let right = leaf.rightTreeCID {
                 try PublicRepositoryCID.validate(right)
             }
-            let key = Data(leaf.path.mstKey.utf8)
-            if index > 0, !previous.lexicographicallyPrecedes(key) {
+            let key = leaf.path.mstKeyBytes
+            if index > 0, !lexicographicallyPrecedes(previous, key) {
                 throw RepositoryMSTValidationError.keysNotStrictlyIncreasing
             }
             let prefix = index == 0 ? 0 : commonPrefixLength(previous, key)
@@ -111,7 +110,7 @@ public enum RepositoryMSTCodec {
             guard entry.prefixLength == expectedPrefix else {
                 throw RepositoryMSTValidationError.invalidPrefixCompression
             }
-            guard index == 0 || previous.lexicographicallyPrecedes(key) else {
+            guard index == 0 || lexicographicallyPrecedes(previous, key) else {
                 throw RepositoryMSTValidationError.keysNotStrictlyIncreasing
             }
             guard let slash = key.firstIndex(of: 0x2f),
@@ -141,13 +140,12 @@ public enum RepositoryMSTCodec {
             try PublicRepositoryCID.validate(left)
         }
         _ = try reconstructedLeaves(from: node)
+        return try encodeUnchecked(node)
+    }
 
-        let entries: [Any] = try node.entries.map { entry in
-            try PublicRepositoryCID.validate(entry.valueCID)
-            if let right = entry.rightTreeCID {
-                try PublicRepositoryCID.validate(right)
-            }
-            return OrderedCBORMap(entries: [
+    static func encodeUnchecked(_ node: RepositoryMSTNode) throws -> Data {
+        let entries: [Any] = node.entries.map { entry in
+            OrderedCBORMap(entries: [
                 (key: "p", value: UInt64(entry.prefixLength)),
                 (key: "k", value: entry.keySuffix),
                 (key: "v", value: ATProtoLink(cid: entry.valueCID)),
@@ -169,20 +167,52 @@ public enum RepositoryMSTCodec {
         guard parser.isAtEnd else {
             throw RepositoryMSTValidationError.invalidNodeSchema
         }
-        let canonical = try encode(node)
+        _ = try reconstructedLeaves(from: node)
+        let canonical = try encodeUnchecked(node)
         guard canonical == bytes else {
             throw RepositoryMSTValidationError.nonCanonicalNode
         }
         return node
     }
 
-    private static func commonPrefixLength(_ lhs: Data, _ rhs: Data) -> Int {
-        var count = 0
-        for (left, right) in zip(lhs, rhs) {
-            guard left == right else { break }
-            count += 1
+    public static func lexicographicallyPrecedes(_ lhs: Data, _ rhs: Data) -> Bool {
+        let minCount = min(lhs.count, rhs.count)
+        if minCount > 0 {
+            let cmp: Int32 = lhs.withUnsafeBytes { lhsRaw in
+                rhs.withUnsafeBytes { rhsRaw in
+                    guard let lhsPtr = lhsRaw.baseAddress,
+                          let rhsPtr = rhsRaw.baseAddress else {
+                        return 0
+                    }
+                    return memcmp(lhsPtr, rhsPtr, minCount)
+                }
+            }
+            if cmp != 0 {
+                return cmp < 0
+            }
         }
-        return count
+        return lhs.count < rhs.count
+    }
+
+    public static func commonPrefixLength(_ lhs: Data, _ rhs: Data) -> Int {
+        let minCount = min(lhs.count, rhs.count)
+        guard minCount > 0 else { return 0 }
+        return lhs.withUnsafeBytes { lhsRaw in
+            rhs.withUnsafeBytes { rhsRaw in
+                guard let lhsPtr = lhsRaw.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let rhsPtr = rhsRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return 0
+                }
+                if memcmp(lhsPtr, rhsPtr, minCount) == 0 {
+                    return minCount
+                }
+                var count = 0
+                while count < minCount && lhsPtr[count] == rhsPtr[count] {
+                    count += 1
+                }
+                return count
+            }
+        }
     }
 }
 

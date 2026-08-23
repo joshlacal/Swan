@@ -1,7 +1,6 @@
 import Foundation
 import Crypto
 @testable import SwanInterop
-import SwanSpacesWire
 import SwanSpaces
 import SwanStorage
 import Petrel

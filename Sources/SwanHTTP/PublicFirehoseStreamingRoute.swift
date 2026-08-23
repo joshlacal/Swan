@@ -504,7 +504,7 @@ private func publicFirehoseRunTailer(
   let outboundWrite: @Sendable (Data) async throws -> Void = { frameBytes in
     try await outbound.write(.binary(ByteBuffer(data: frameBytes)))
   }
-  let wakeupRead: () async -> Int64? = {
+  let wakeupRead: @Sendable () async -> Int64? = {
     // Never blocks: consumes the newest pending bump or reports none, so the
     // tailer falls back to its own bounded idle poll (the recovery path for
     // a missed or pre-subscription wakeup, and for a lost retention signal).

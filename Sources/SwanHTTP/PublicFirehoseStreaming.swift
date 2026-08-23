@@ -175,109 +175,284 @@ public struct PublicFirehoseTailer: Sendable {
   public func run(
     lastSent: Int64,
     outbound: @escaping @Sendable (Data) async throws -> Void,
-    waitForWakeup: () async -> Int64?
+    waitForWakeup: @escaping @Sendable () async -> Int64?
   ) async throws {
-    var cursor = lastSent
-    var backfillElapsed = Duration.zero
-    do {
-      while !Task.isCancelled {
-        // Checked before every read so a retention advance is caught even
-        // when it does not change what `events(after:)` would return (e.g.
-        // the consumer is already caught up but the retained window moved
-        // past its delivered cursor).
-        if let retainedFromSeq = try await database.retainedFromSeq(),
-           cursor < retainedFromSeq - 1 {
-          throw PublicFirehoseTailerError.outdatedCursor(
-            retainedFromSeq: retainedFromSeq
-          )
-        }
-        let rows = try await database.events(after: cursor, limit: limits.pageSize)
-        if rows.isEmpty {
-          let wakeupSeq = await waitForWakeup()
-          if wakeupSeq != nil {
-            continue
-          }
-          try await Task.sleep(for: .seconds(limits.idlePollInterval))
-          continue
-        }
-        let maxSeq = try await database.maxSequencedSeq()
-        // Raw difference is an upper bound on deliverable rows (deletion
-        // gaps only shrink the real count), so the bounded count runs only
-        // when a drop is already plausible.
-        var seqLag = maxSeq - cursor
-        if seqLag > limits.maximumSequenceLag {
-          seqLag = try await database.deliverableEventCount(
-            after: cursor,
-            limit: limits.maximumSequenceLag + 1
-          )
-        }
-        if PublicFirehoseSlowConsumerPolicy.shouldDrop(
-          seqLag: seqLag,
-          backfillElapsed: backfillElapsed,
-          writeDuration: nil,
-          limits: limits
-        ) {
-          logger.warning("dropping slow public firehose consumer")
-          throw PublicFirehoseTailerError.consumerTooSlow(
-            seqLag: seqLag,
-            backfillElapsed: backfillElapsed
-          )
-        }
-        let pageClock = ContinuousClock()
-        let pageStarted = pageClock.now
-        for row in rows {
-          try await writeWithinDeadline(row.frameBytes, outbound: outbound)
-          cursor = row.seq
-        }
-        let pageElapsed = pageClock.now - pageStarted
-        if seqLag > 0 {
-          backfillElapsed += pageElapsed
-        } else {
-          backfillElapsed = .zero
-        }
-      }
-    } catch is CancellationError {
-      return
+    let watchdog = PublicFirehoseWriteWatchdog(
+      timeout: limits.maximumWriteDuration,
+      logger: logger
+    )
+    let writerTask = Task {
+      try await self.runDeliveryLoop(
+        lastSent: lastSent,
+        outbound: outbound,
+        waitForWakeup: waitForWakeup,
+        watchdog: watchdog
+      )
     }
-    logger.debug("public firehose tailer exited")
-  }
+    watchdog.registerWriterTask(writerTask)
+    let watchdogTask = Task {
+      await watchdog.runWatchdogLoop()
+    }
 
-  /// Delivers one stored frame under a hard
-  /// ``PublicFirehoseStreamingLimits/maximumWriteDuration`` deadline.
-  ///
-  /// The previous shape timed the write *after* it returned. That bounds
-  /// nothing: the case worth bounding is a peer that has stopped reading, so
-  /// the socket buffer fills and the write suspends inside the page and never
-  /// returns — at which point the comparison never runs and the connection,
-  /// its hub subscription and its listener slot are pinned for as long as the
-  /// peer likes. Racing the write against a sleeper makes the deadline the
-  /// control it was always documented to be; the peer is then dropped through
-  /// the same `ConsumerTooSlow` path a lagging peer takes.
-  ///
-  /// Cancellation of the enclosing tailer cancels both children, and the
-  /// resulting `CancellationError` is rethrown unchanged so ``run`` still
-  /// exits quietly rather than reporting a slow consumer.
-  private func writeWithinDeadline(
-    _ frameBytes: Data,
-    outbound: @escaping @Sendable (Data) async throws -> Void
-  ) async throws {
-    let deadline = limits.maximumWriteDuration
-    try await withThrowingTaskGroup(of: Void.self) { group in
-      group.addTask { try await outbound(frameBytes) }
-      group.addTask {
-        try await Task.sleep(for: deadline)
-        throw PublicFirehoseTailerError.writeTooSlow(duration: deadline)
+    return try await withTaskCancellationHandler {
+      defer {
+        writerTask.cancel()
+        watchdogTask.cancel()
+        watchdog.terminate()
       }
       do {
-        try await group.next()
+        try await writerTask.value
+        if let timeoutDuration = watchdog.checkTimedOutDuration() {
+          throw PublicFirehoseTailerError.writeTooSlow(duration: timeoutDuration)
+        }
+      } catch is CancellationError {
+        if let timeoutDuration = watchdog.checkTimedOutDuration() {
+          throw PublicFirehoseTailerError.writeTooSlow(duration: timeoutDuration)
+        }
+        return
       } catch {
-        group.cancelAll()
-        if error is PublicFirehoseTailerError {
-          logger.warning("dropping slow public firehose write")
+        if let timeoutDuration = watchdog.checkTimedOutDuration() {
+          throw PublicFirehoseTailerError.writeTooSlow(duration: timeoutDuration)
         }
         throw error
       }
-      group.cancelAll()
+    } onCancel: {
+      writerTask.cancel()
+      watchdogTask.cancel()
+      watchdog.terminate()
+    }
+  }
+
+  private func runDeliveryLoop(
+    lastSent: Int64,
+    outbound: @escaping @Sendable (Data) async throws -> Void,
+    waitForWakeup: () async -> Int64?,
+    watchdog: PublicFirehoseWriteWatchdog
+  ) async throws {
+    var cursor = lastSent
+    var backfillElapsed = Duration.zero
+    while !Task.isCancelled {
+      // Checked before every read so a retention advance is caught even
+      // when it does not change what `events(after:)` would return (e.g.
+      // the consumer is already caught up but the retained window moved
+      // past its delivered cursor).
+      if let retainedFromSeq = try await database.retainedFromSeq(),
+         cursor < retainedFromSeq - 1 {
+        throw PublicFirehoseTailerError.outdatedCursor(
+          retainedFromSeq: retainedFromSeq
+        )
+      }
+      let rows = try await database.events(after: cursor, limit: limits.pageSize)
+      if rows.isEmpty {
+        let wakeupSeq = await waitForWakeup()
+        if wakeupSeq != nil {
+          continue
+        }
+        try await Task.sleep(for: .seconds(limits.idlePollInterval))
+        continue
+      }
+      let maxSeq = try await database.maxSequencedSeq()
+      // Raw difference is an upper bound on deliverable rows (deletion
+      // gaps only shrink the real count), so the bounded count runs only
+      // when a drop is already plausible.
+      var seqLag = maxSeq - cursor
+      if seqLag > limits.maximumSequenceLag {
+        seqLag = try await database.deliverableEventCount(
+          after: cursor,
+          limit: limits.maximumSequenceLag + 1
+        )
+      }
+      if PublicFirehoseSlowConsumerPolicy.shouldDrop(
+        seqLag: seqLag,
+        backfillElapsed: backfillElapsed,
+        writeDuration: nil,
+        limits: limits
+      ) {
+        logger.warning("dropping slow public firehose consumer")
+        throw PublicFirehoseTailerError.consumerTooSlow(
+          seqLag: seqLag,
+          backfillElapsed: backfillElapsed
+        )
+      }
+      let pageClock = ContinuousClock()
+      let pageStarted = pageClock.now
+      for row in rows {
+        try watchdog.beginWrite()
+        do {
+          try await outbound(row.frameBytes)
+          try watchdog.endWrite()
+        } catch {
+          try? watchdog.endWrite()
+          throw error
+        }
+        cursor = row.seq
+      }
+      let pageElapsed = pageClock.now - pageStarted
+      if seqLag > 0 {
+        backfillElapsed += pageElapsed
+      } else {
+        backfillElapsed = .zero
+      }
+    }
+    logger.debug("public firehose tailer exited")
+  }
+}
+
+/// Per-subscriber watchdog enforcing write deadlines without per-frame task allocations.
+///
+/// Rather than creating a `withThrowingTaskGroup` and two child tasks per frame,
+/// a single long-lived watchdog task is spawned per subscriber `run` invocation.
+/// When a frame write begins, the watchdog is informed of the deadline. If the write
+/// completes before the deadline, the watchdog is returned to idle. If the write
+/// exceeds the deadline, the watchdog atomically transitions to timedOut, logs the
+/// drop, and cancels the writer task. `endWrite` and timeout arbitrate one atomic
+/// terminal decision under a single lock.
+private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
+  private let lock = NSLock()
+  private let timeout: Duration
+  private let logger: Logger
+
+  private enum State {
+    case idle
+    case writing(deadline: ContinuousClock.Instant)
+    case timedOut(duration: Duration)
+    case terminated
+  }
+
+  private var state: State = .idle
+  private var writerTask: Task<Void, any Error>?
+  private var idleContinuation: CheckedContinuation<Void, Never>?
+
+  init(timeout: Duration, logger: Logger) {
+    self.timeout = timeout
+    self.logger = logger
+  }
+
+  func registerWriterTask(_ task: Task<Void, any Error>) {
+    lock.withLock {
+      self.writerTask = task
+    }
+  }
+
+  func beginWrite() throws {
+    let continuation: CheckedContinuation<Void, Never>? = try lock.withLock {
+      switch self.state {
+      case .terminated:
+        throw CancellationError()
+      case .timedOut(let duration):
+        throw PublicFirehoseTailerError.writeTooSlow(duration: duration)
+      case .idle, .writing:
+        self.state = .writing(deadline: ContinuousClock.now + timeout)
+        let cont = self.idleContinuation
+        self.idleContinuation = nil
+        return cont
+      }
+    }
+    continuation?.resume()
+  }
+
+  func endWrite() throws {
+    try lock.withLock {
+      switch self.state {
+      case .timedOut(let duration):
+        throw PublicFirehoseTailerError.writeTooSlow(duration: duration)
+      case .terminated:
+        throw CancellationError()
+      case .writing, .idle:
+        self.state = .idle
+      }
+    }
+  }
+
+  func terminate() {
+    let continuation: CheckedContinuation<Void, Never>? = lock.withLock {
+      self.state = .terminated
+      let cont = self.idleContinuation
+      self.idleContinuation = nil
+      return cont
+    }
+    continuation?.resume()
+  }
+
+  func checkTimedOutDuration() -> Duration? {
+    lock.withLock {
+      if case .timedOut(let duration) = self.state {
+        return duration
+      }
+      return nil
+    }
+  }
+
+  func runWatchdogLoop() async {
+    let clock = ContinuousClock()
+    while !Task.isCancelled {
+      enum Action {
+        case waitForBegin
+        case sleep(until: ContinuousClock.Instant)
+        case terminate
+      }
+
+      let action: Action = lock.withLock {
+        switch self.state {
+        case .terminated, .timedOut:
+          return .terminate
+        case .idle:
+          return .waitForBegin
+        case .writing(let deadline):
+          return .sleep(until: deadline)
+        }
+      }
+
+      switch action {
+      case .terminate:
+        return
+
+      case .waitForBegin:
+        await withCheckedContinuation { continuation in
+          var shouldResumeImmediately = false
+          lock.withLock {
+            switch self.state {
+            case .terminated, .timedOut, .writing:
+              shouldResumeImmediately = true
+            case .idle:
+              assert(self.idleContinuation == nil)
+              self.idleContinuation = continuation
+            }
+          }
+          if shouldResumeImmediately {
+            continuation.resume()
+          }
+        }
+
+      case .sleep(let deadline):
+        let now = clock.now
+        if now < deadline {
+          do {
+            try await Task.sleep(until: deadline, clock: clock)
+          } catch {
+            return
+          }
+        }
+
+        let targetToCancel: Task<Void, any Error>? = lock.withLock {
+          switch self.state {
+          case .writing(let activeDeadline):
+            if clock.now >= activeDeadline {
+              self.state = .timedOut(duration: self.timeout)
+              return self.writerTask
+            }
+            return nil
+          case .idle, .terminated, .timedOut:
+            return nil
+          }
+        }
+
+        if let targetToCancel {
+          logger.warning("dropping slow public firehose write")
+          targetToCancel.cancel()
+          return
+        }
+      }
     }
   }
 }

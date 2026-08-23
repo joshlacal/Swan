@@ -556,6 +556,83 @@ final class PublicFirehoseStreamingTests: XCTestCase {
     let delivered = await recorder.snapshot()
     XCTAssertTrue(delivered.isEmpty, "cancellation mid-idle must deliver nothing")
   }
+  func testTailerDropsSlowWriteAtDeadline() async throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
+    defer { Task { try? await firehose.close() } }
+    _ = try await firehose.appendBatch([identityItem(sourceKey: "slow-write-test")], now: epoch)
+
+    let limits = try PublicFirehoseStreamingLimits(
+      maximumWriteDuration: .milliseconds(200),
+      idlePollInterval: 0.01
+    )
+    let tailer = PublicFirehoseTailer(database: firehose, limits: limits, logger: logger)
+
+    let (writeStartedStream, writeStartedContinuation) = AsyncStream<Void>.makeStream(
+      bufferingPolicy: .bufferingNewest(1)
+    )
+
+    let clock = ContinuousClock()
+    let tailerTask = Task {
+      try await tailer.run(
+        lastSent: 0,
+        outbound: { _ in
+          writeStartedContinuation.yield()
+          try await Task.sleep(for: .seconds(10))
+        },
+        waitForWakeup: { nil }
+      )
+    }
+
+    // Await explicit confirmation that outbound has actually started and is suspended in its sleep
+    var iterator = writeStartedStream.makeAsyncIterator()
+    _ = await iterator.next()
+    let writeStarted = clock.now
+
+    // Await tailerTask with a bounded timeout (2 seconds) so failures fail fast without hanging
+    let outcome: Result<Void, any Error> = await withThrowingTaskGroup(of: Void.self) { group in
+      group.addTask {
+        try await tailerTask.value
+      }
+      group.addTask {
+        try await Task.sleep(for: .seconds(2))
+        tailerTask.cancel()
+        throw SwanError.malformed("tailer did not drop slow write within bounded interval")
+      }
+      do {
+        try await group.next()
+        group.cancelAll()
+        return .success(())
+      } catch {
+        group.cancelAll()
+        return .failure(error)
+      }
+    }
+    switch outcome {
+    case .success:
+      XCTFail("expected tailer.run to throw writeTooSlow, but it returned normally")
+    case .failure(let error as PublicFirehoseTailerError):
+      guard case .writeTooSlow(let duration) = error else {
+        return XCTFail("expected writeTooSlow, got \(error)")
+      }
+      XCTAssertEqual(duration, .milliseconds(200))
+    case .failure(let error):
+      XCTFail("expected writeTooSlow, got \(error)")
+    }
+
+    let elapsed = clock.now - writeStarted
+    XCTAssertLessThan(
+      elapsed,
+      .seconds(1),
+      "the drop must happen at the deadline (~200ms), not after the 10s write completes"
+    )
+    XCTAssertGreaterThanOrEqual(
+      elapsed,
+      .milliseconds(150),
+      "the drop must not happen prematurely before the write was actually attempted"
+    )
+  }
 
   // MARK: - Wakeup hub
 

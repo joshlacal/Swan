@@ -170,19 +170,22 @@ extension SQLiteControlDatabase: AccountLoginAdmissionStore {
                 // the three requested rows first so a legitimate expired
                 // bucket can never survive behind more than 512 unrelated
                 // expired rows and be misclassified as corrupt.
+                let candidatePlaceholders = Array(repeating: "(?, ?)", count: prepared.count).joined(separator: ", ")
+                var candidateDeleteParams: [SQLiteData] = []
                 for candidate in prepared {
-                    _ = try await connection.query(
-                        """
-                        DELETE FROM account_login_rate_limits
-                        WHERE scope = ? AND key_digest = ? AND expires_at <= ?
-                        """,
-                        [
-                            .text(candidate.bucket.scope.rawValue),
-                            candidate.bucket.keyDigest.sqliteData!,
-                            .integer(timestamp),
-                        ]
-                    )
+                    candidateDeleteParams.append(.text(candidate.bucket.scope.rawValue))
+                    candidateDeleteParams.append(candidate.bucket.keyDigest.sqliteData!)
                 }
+                candidateDeleteParams.append(.integer(timestamp))
+
+                _ = try await connection.query(
+                    """
+                    DELETE FROM account_login_rate_limits
+                    WHERE (scope, key_digest) IN (\(candidatePlaceholders))
+                      AND expires_at <= ?
+                    """,
+                    candidateDeleteParams
+                )
 
                 // Cleanup is deliberately bounded. A table that is still full
                 // after this pass rejects new keys instead of turning one
@@ -201,40 +204,43 @@ extension SQLiteControlDatabase: AccountLoginAdmissionStore {
                     [.integer(timestamp)]
                 )
 
-                var existing: [AccountLoginRateLimitScope: StoredLoginBucket] = [:]
+                var candidateSelectParams: [SQLiteData] = []
                 for candidate in prepared {
-                    let rows = try await connection.query(
-                        """
-                        SELECT window_started_at, expires_at, attempts
-                        FROM account_login_rate_limits
-                        WHERE scope = ? AND key_digest = ?
-                        """,
-                        [
-                            .text(candidate.bucket.scope.rawValue),
-                            candidate.bucket.keyDigest.sqliteData!,
-                        ]
-                    )
-                    guard rows.count <= 1 else {
+                    candidateSelectParams.append(.text(candidate.bucket.scope.rawValue))
+                    candidateSelectParams.append(candidate.bucket.keyDigest.sqliteData!)
+                }
+
+                let rows = try await connection.query(
+                    """
+                    SELECT scope, key_digest, window_started_at, expires_at, attempts
+                    FROM account_login_rate_limits
+                    WHERE (scope, key_digest) IN (\(candidatePlaceholders))
+                    """,
+                    candidateSelectParams
+                )
+
+                let candidateMap = Dictionary(uniqueKeysWithValues: prepared.map { ($0.bucket.scope, $0.bucket.keyDigest) })
+                var existing: [AccountLoginRateLimitScope: StoredLoginBucket] = [:]
+                for row in rows {
+                    guard case let .text(scopeText) = row.column("scope"),
+                          let scope = AccountLoginRateLimitScope(rawValue: scopeText),
+                          let expectedDigest = candidateMap[scope],
+                          case let .blob(digestBuffer) = row.column("key_digest"),
+                          Data(buffer: digestBuffer) == expectedDigest,
+                          case let .integer(startedAt) = row.column("window_started_at"),
+                          case let .integer(expiresAt) = row.column("expires_at"),
+                          case let .integer(attempts) = row.column("attempts"),
+                          startedAt >= 0,
+                          expiresAt > startedAt,
+                          (1 ... 10_000).contains(attempts),
+                          existing[scope] == nil else {
                         throw AccountControlStoreError.malformedRecord
                     }
-                    if let row = rows.first {
-                        guard case let .integer(startedAt) =
-                                  row.column("window_started_at"),
-                              case let .integer(expiresAt) =
-                                  row.column("expires_at"),
-                              case let .integer(attempts) =
-                                  row.column("attempts"),
-                              startedAt >= 0,
-                              expiresAt > startedAt,
-                              (1 ... 10_000).contains(attempts) else {
-                            throw AccountControlStoreError.malformedRecord
-                        }
-                        existing[candidate.bucket.scope] = StoredLoginBucket(
-                            startedAt: startedAt,
-                            expiresAt: expiresAt,
-                            attempts: attempts
-                        )
-                    }
+                    existing[scope] = StoredLoginBucket(
+                        startedAt: startedAt,
+                        expiresAt: expiresAt,
+                        attempts: attempts
+                    )
                 }
 
                 // A denied request must not allocate missing handle/pair keys:

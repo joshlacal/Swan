@@ -4,7 +4,6 @@ import HTTPTypes
 import Petrel
 import SwanCore
 import SwanSpaces
-import SwanSpacesWire
 import SwanStorage
 
 /// The distinct authenticated capability for local `listSpaces`. It has no

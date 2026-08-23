@@ -45,6 +45,7 @@ public struct ValidatedPublicRepositoryMST: Sendable, Equatable {
     public let reachableMSTBlocks: [CID: Data]
     public let reachableRecordCIDs: Set<CID>
     public let reachableRepositoryByteCount: Int
+    let orderedBlockCIDs: [CID]
 }
 
 public enum PublicRepositoryReachableBlockKind: String, Sendable, Equatable {
@@ -54,13 +55,27 @@ public enum PublicRepositoryReachableBlockKind: String, Sendable, Equatable {
 
 /// Durable import validators use this sink to externalize the verified
 /// projection. Calls carry identifiers only; block bodies remain in the
-/// supplied block source and are released after each validation step.
 public protocol PublicRepositoryReachableProjectionSink: Sendable {
     func recordReachableBlock(
         cid: CID,
         kind: PublicRepositoryReachableBlockKind
     ) async throws
+    func recordReachableBlock(
+        cid: CID,
+        kind: PublicRepositoryReachableBlockKind,
+        bytes: Data?
+    ) async throws
     func recordRepositoryIndex(path: PublicRepositoryPath, recordCID: CID) async throws
+}
+
+extension PublicRepositoryReachableProjectionSink {
+    public func recordReachableBlock(
+        cid: CID,
+        kind: PublicRepositoryReachableBlockKind,
+        bytes: Data?
+    ) async throws {
+        try await recordReachableBlock(cid: cid, kind: kind)
+    }
 }
 
 public struct ValidatedPublicRepositoryProjection: Sendable, Equatable {
@@ -108,466 +123,165 @@ public enum RepositoryMSTValidation {
             maximumDepth: limits.maximumCBORNestingDepth
         )
     }
-
     public static func validate(
-        rootCID: CID,
-        blocks: any PublicRepositoryBlockSource,
+        rootCID: CID, blocks: any PublicRepositoryBlockSource,
         limits: PublicRepositoryLimits = .standard,
         maximumReachableRepositoryBytes: Int? = nil
     ) async throws -> ValidatedPublicRepositoryMST {
-        try await validate(
-            rootCID: rootCID,
-            blocks: blocks,
-            limits: limits,
-            maximumReachableRepositoryBytes: maximumReachableRepositoryBytes,
-            maximumMSTNodesOverride: nil,
-            maximumMSTEntriesPerNodeOverride: nil
-        )
+        let collector = ValidationCollector()
+        let projection = try await validateProjection(rootCID: rootCID, blocks: blocks, projection: collector,
+            limits: limits, maximumReachableRepositoryBytes: maximumReachableRepositoryBytes)
+        let snapshot = await collector.snapshot()
+        return .init(rootCID: projection.rootCID, rootLayer: projection.rootLayer,
+            leaves: snapshot.leaves, reachableMSTBlocks: snapshot.mstBlocks,
+            reachableRecordCIDs: snapshot.recordCIDs,
+            reachableRepositoryByteCount: projection.reachableRepositoryByteCount,
+            orderedBlockCIDs: snapshot.orderedCIDs)
     }
 
-    /// Internal overrides let boundary tests prove zero/exact budgets without
-    /// weakening the externally constructible production policy.
     static func validate(
-        rootCID: CID,
-        blocks: any PublicRepositoryBlockSource,
-        limits: PublicRepositoryLimits,
+        rootCID: CID, blocks: any PublicRepositoryBlockSource, limits: PublicRepositoryLimits,
         maximumReachableRepositoryBytes: Int? = nil,
         maximumMSTNodesOverride: Int? = nil,
         maximumMSTEntriesPerNodeOverride: Int? = nil
     ) async throws -> ValidatedPublicRepositoryMST {
-        do {
-            try PublicRepositoryCID.validate(rootCID)
-        } catch {
-            throw RepositoryMSTValidationError.unsupportedCID
-        }
-        guard limits.maximumCBORNestingDepth >= 3 else {
-            throw RepositoryMSTValidationError.cborDepthLimitExceeded
-        }
-
-        let maximumNodes = maximumMSTNodesOverride ?? limits.maximumMSTNodes
-        let maximumEntries = maximumMSTEntriesPerNodeOverride ?? limits.maximumMSTEntriesPerNode
-        let maximumReachableBytes = maximumReachableRepositoryBytes ?? limits.maximumCARBytes
-        guard maximumReachableBytes >= 0, maximumReachableBytes <= limits.maximumCARBytes else {
-            throw RepositoryMSTValidationError.invalidReachableRepositoryByteBudget
-        }
-
-        struct WorkItem {
-            let cid: CID
-            let lowerBound: Data?
-            let upperBound: Data?
-            let expectedLayer: Int?
-            let isRoot: Bool
-        }
-
-        var work = [WorkItem(
-            cid: rootCID,
-            lowerBound: nil,
-            upperBound: nil,
-            expectedLayer: nil,
-            isRoot: true
-        )]
-        var referencedNodes: Set<CID> = [rootCID]
-        var seenNodes = Set<CID>()
-        var mstBlocks: [CID: Data] = [:]
-        var leaves: [RepositoryMSTLeaf] = []
-        /// The UTF-8 MST key of `leaves[i]`, kept alongside so the final sort
-        /// does not re-encode every key on every comparison.
-        var leafKeys: [Data] = []
-        var recordCIDs = Set<CID>()
-        var reachableBytes = 0
-        var rootLayer: Int?
-
-        while let item = work.popLast() {
-            guard seenNodes.insert(item.cid).inserted else {
-                throw RepositoryMSTValidationError.repeatedNode
-            }
-            guard seenNodes.count <= maximumNodes else {
-                throw RepositoryMSTValidationError.nodeLimitExceeded
-            }
-            let bytes = try await requiredBlock(item.cid, from: blocks)
-            do {
-                try PublicRepositoryCID.validate(item.cid, blockBytes: bytes)
-            } catch PublicRepositoryDomainError.unsupportedCID {
-                throw RepositoryMSTValidationError.unsupportedCID
-            } catch {
-                throw RepositoryMSTValidationError.blockCIDMismatch
-            }
-            reachableBytes = try adding(bytes.count, to: reachableBytes, maximum: maximumReachableBytes)
-
-            let node = try RepositoryMSTCodec.decode(bytes)
-            guard node.entries.count <= maximumEntries else {
-                throw RepositoryMSTValidationError.entryLimitExceeded
-            }
-            let nodeLeaves = try RepositoryMSTCodec.reconstructedLeaves(from: node)
-            let layer: Int
-
-            if let first = nodeLeaves.first {
-                layer = RepositoryMSTCodec.keyDepth(for: first.path)
-                guard (0 ... 128).contains(layer) else {
-                    throw RepositoryMSTValidationError.invalidLayer
-                }
-                if let expected = item.expectedLayer, layer != expected {
-                    throw RepositoryMSTValidationError.invalidLayer
-                }
-                for leaf in nodeLeaves where RepositoryMSTCodec.keyDepth(for: leaf.path) != layer {
-                    throw RepositoryMSTValidationError.leafLayerMismatch
-                }
-            } else if item.isRoot {
-                guard node.leftTreeCID == nil,
-                      bytes == PublicRepositoryGenesisCodec.canonicalEmptyMST else {
-                    throw RepositoryMSTValidationError.invalidEmptyTopology
-                }
-                layer = 0
-            } else {
-                guard let expected = item.expectedLayer,
-                      expected > 0,
-                      node.leftTreeCID != nil else {
-                    throw RepositoryMSTValidationError.invalidEmptyTopology
-                }
-                layer = expected
-            }
-
-            if item.isRoot {
-                rootLayer = layer
-            }
-            mstBlocks[item.cid] = bytes
-
-            if nodeLeaves.isEmpty {
-                if let left = node.leftTreeCID {
-                    guard referencedNodes.insert(left).inserted else {
-                        throw RepositoryMSTValidationError.repeatedNode
-                    }
-                    work.append(.init(
-                        cid: left,
-                        lowerBound: item.lowerBound,
-                        upperBound: item.upperBound,
-                        expectedLayer: layer - 1,
-                        isRoot: false
-                    ))
-                }
-                continue
-            }
-
-            for leaf in nodeLeaves {
-                let key = Data(leaf.path.mstKey.utf8)
-                guard isInside(key, lower: item.lowerBound, upper: item.upperBound) else {
-                    throw RepositoryMSTValidationError.subtreeOutOfRange
-                }
-                // The node and entries-per-node caps each bound one block. The
-                // aggregate leaf set they permit is their product, which is far
-                // above what the public read surface will admit; refuse here so
-                // an import can never publish a repository whose own reads
-                // fail. Checked before the append so the array never grows past
-                // the ceiling.
-                guard leaves.count < limits.maximumRepositoryRecords else {
-                    throw RepositoryMSTValidationError.recordLimitExceeded
-                }
-                leafKeys.append(key)
-                leaves.append(leaf)
-                recordCIDs.insert(leaf.recordCID)
-            }
-
-            guard layer > 0 || (node.leftTreeCID == nil && nodeLeaves.allSatisfy { $0.rightTreeCID == nil }) else {
-                throw RepositoryMSTValidationError.invalidLayer
-            }
-            if let left = node.leftTreeCID {
-                guard referencedNodes.insert(left).inserted else {
-                    throw RepositoryMSTValidationError.repeatedNode
-                }
-                work.append(.init(
-                    cid: left,
-                    lowerBound: item.lowerBound,
-                    upperBound: Data(nodeLeaves[0].path.mstKey.utf8),
-                    expectedLayer: layer - 1,
-                    isRoot: false
-                ))
-            }
-            for index in nodeLeaves.indices {
-                guard let right = nodeLeaves[index].rightTreeCID else { continue }
-                guard referencedNodes.insert(right).inserted else {
-                    throw RepositoryMSTValidationError.repeatedNode
-                }
-                let lower = Data(nodeLeaves[index].path.mstKey.utf8)
-                let upper = index + 1 < nodeLeaves.count
-                    ? Data(nodeLeaves[index + 1].path.mstKey.utf8)
-                    : item.upperBound
-                work.append(.init(
-                    cid: right,
-                    lowerBound: lower,
-                    upperBound: upper,
-                    expectedLayer: layer - 1,
-                    isRoot: false
-                ))
-            }
-        }
-
-        var expectedCollectionsByRecordCID: [CID: Set<String>] = [:]
-        for leaf in leaves {
-            expectedCollectionsByRecordCID[leaf.recordCID, default: []].insert(leaf.path.collection)
-        }
-        for cid in recordCIDs {
-            guard let bytes = try await blocks.block(for: cid) else {
-                throw RepositoryMSTValidationError.missingRecordBlock
-            }
-            do {
-                try PublicRepositoryCID.validate(cid, blockBytes: bytes)
-            } catch PublicRepositoryDomainError.unsupportedCID {
-                throw RepositoryMSTValidationError.unsupportedCID
-            } catch {
-                throw RepositoryMSTValidationError.recordBlockCIDMismatch
-            }
-            guard bytes.count <= limits.maximumRecordBlockBytes else {
-                throw RepositoryMSTValidationError.recordBlockTooLarge
-            }
-            reachableBytes = try adding(bytes.count, to: reachableBytes, maximum: maximumReachableBytes)
-            guard let expectedCollections = expectedCollectionsByRecordCID[cid] else {
-                throw RepositoryMSTValidationError.missingRecordBlock
-            }
-            for expectedCollection in expectedCollections {
-                do {
-                    try RepositoryRecordBlockValidator.validate(
-                        bytes,
-                        expectedType: expectedCollection,
-                        maximumDepth: limits.maximumCBORNestingDepth
-                    )
-                } catch {
-                    throw RepositoryMSTValidationError.invalidRecordBlock
-                }
-            }
-        }
-
-        leaves = Self.sortedByMSTKey(leaves, keys: leafKeys)
-        for pair in zip(leaves, leaves.dropFirst()) {
-            guard pair.0.path.mstKey < pair.1.path.mstKey else {
-                throw RepositoryMSTValidationError.keysNotStrictlyIncreasing
-            }
-        }
-        guard let rootLayer else {
-            throw RepositoryMSTValidationError.missingBlock
-        }
-        return ValidatedPublicRepositoryMST(
-            rootCID: rootCID,
-            rootLayer: rootLayer,
-            leaves: leaves,
-            reachableMSTBlocks: mstBlocks,
-            reachableRecordCIDs: recordCIDs,
-            reachableRepositoryByteCount: reachableBytes
-        )
+        let collector = ValidationCollector()
+        let projection = try await run(rootCID: rootCID, blocks: blocks, projection: collector, limits: limits,
+            maximumReachableRepositoryBytes: maximumReachableRepositoryBytes,
+            maximumMSTNodes: maximumMSTNodesOverride ?? limits.maximumMSTNodes,
+            maximumMSTEntries: maximumMSTEntriesPerNodeOverride ?? limits.maximumMSTEntriesPerNode)
+        let snapshot = await collector.snapshot()
+        return .init(rootCID: projection.rootCID, rootLayer: projection.rootLayer,
+            leaves: snapshot.leaves, reachableMSTBlocks: snapshot.mstBlocks,
+            reachableRecordCIDs: snapshot.recordCIDs,
+            reachableRepositoryByteCount: projection.reachableRepositoryByteCount,
+            orderedBlockCIDs: snapshot.orderedCIDs)
     }
 
-    /// Performs the same strict validation as `validate`, but externalizes the
-    /// reachable projection instead of retaining every MST block body. The
-    /// in-memory working set is one fetched block plus topology metadata.
     public static func validateProjection(
-        rootCID: CID,
-        blocks: any PublicRepositoryBlockSource,
+        rootCID: CID, blocks: any PublicRepositoryBlockSource,
         projection: any PublicRepositoryReachableProjectionSink,
         limits: PublicRepositoryLimits = .standard,
         maximumReachableRepositoryBytes: Int? = nil
     ) async throws -> ValidatedPublicRepositoryProjection {
-        do {
-            try PublicRepositoryCID.validate(rootCID)
-        } catch {
-            throw RepositoryMSTValidationError.unsupportedCID
-        }
-        guard limits.maximumCBORNestingDepth >= 3 else {
-            throw RepositoryMSTValidationError.cborDepthLimitExceeded
-        }
-        let maximumReachableBytes = maximumReachableRepositoryBytes ?? limits.maximumCARBytes
-        guard maximumReachableBytes >= 0, maximumReachableBytes <= limits.maximumCARBytes else {
+        try await run(rootCID: rootCID, blocks: blocks, projection: projection, limits: limits,
+            maximumReachableRepositoryBytes: maximumReachableRepositoryBytes,
+            maximumMSTNodes: limits.maximumMSTNodes,
+            maximumMSTEntries: limits.maximumMSTEntriesPerNode)
+    }
+
+    private static func run(
+        rootCID: CID, blocks: any PublicRepositoryBlockSource,
+        projection: any PublicRepositoryReachableProjectionSink,
+        limits: PublicRepositoryLimits, maximumReachableRepositoryBytes: Int?,
+        maximumMSTNodes: Int, maximumMSTEntries: Int
+    ) async throws -> ValidatedPublicRepositoryProjection {
+        do { try PublicRepositoryCID.validate(rootCID) }
+        catch { throw RepositoryMSTValidationError.unsupportedCID }
+        guard limits.maximumCBORNestingDepth >= 3 else { throw RepositoryMSTValidationError.cborDepthLimitExceeded }
+        let maximumBytes = maximumReachableRepositoryBytes ?? limits.maximumCARBytes
+        guard maximumBytes >= 0, maximumBytes <= limits.maximumCARBytes else {
             throw RepositoryMSTValidationError.invalidReachableRepositoryByteBudget
         }
-
         struct WorkItem {
-            let cid: CID
-            let lowerBound: Data?
-            let upperBound: Data?
-            let expectedLayer: Int?
-            let isRoot: Bool
+            let cid: CID; let lower: Data?; let upper: Data?
+            let expectedLayer: Int?; let isRoot: Bool
         }
-        var work = [WorkItem(
-            cid: rootCID, lowerBound: nil, upperBound: nil,
-            expectedLayer: nil, isRoot: true
-        )]
-        var referencedNodes: Set<CID> = [rootCID]
-        var seenNodes = Set<CID>()
-        var leaves: [RepositoryMSTLeaf] = []
-        /// The UTF-8 MST key of `leaves[i]`, kept alongside so the final sort
-        /// does not re-encode every key on every comparison.
-        var leafKeys: [Data] = []
-        var recordCIDs = Set<CID>()
-        var reachableBytes = 0
-        var rootLayer: Int?
-
-        while let item = work.popLast() {
+        var work = [WorkItem(cid: rootCID, lower: nil, upper: nil, expectedLayer: nil, isRoot: true)]
+        var cursor = 0
+        var referenced: Set<CID> = [rootCID], seen = Set<CID>()
+        var leaves: [RepositoryMSTLeaf] = [], keys: [Data] = []
+        var records = Set<CID>(), recordOrder: [CID] = []
+        var bytesTotal = 0, rootLayer: Int?
+        while cursor < work.count {
             try Task.checkCancellation()
-            guard seenNodes.insert(item.cid).inserted else {
-                throw RepositoryMSTValidationError.repeatedNode
-            }
-            guard seenNodes.count <= limits.maximumMSTNodes else {
-                throw RepositoryMSTValidationError.nodeLimitExceeded
-            }
+            let item = work[cursor]; cursor += 1
+            guard seen.insert(item.cid).inserted else { throw RepositoryMSTValidationError.repeatedNode }
+            guard seen.count <= maximumMSTNodes else { throw RepositoryMSTValidationError.nodeLimitExceeded }
             let bytes = try await requiredBlock(item.cid, from: blocks)
-            do {
-                try PublicRepositoryCID.validate(item.cid, blockBytes: bytes)
-            } catch PublicRepositoryDomainError.unsupportedCID {
-                throw RepositoryMSTValidationError.unsupportedCID
-            } catch {
-                throw RepositoryMSTValidationError.blockCIDMismatch
-            }
-            reachableBytes = try adding(bytes.count, to: reachableBytes, maximum: maximumReachableBytes)
+            do { try PublicRepositoryCID.validate(item.cid, blockBytes: bytes) }
+            catch PublicRepositoryDomainError.unsupportedCID { throw RepositoryMSTValidationError.unsupportedCID }
+            catch { throw RepositoryMSTValidationError.blockCIDMismatch }
+            bytesTotal = try adding(bytes.count, to: bytesTotal, maximum: maximumBytes)
             let node = try RepositoryMSTCodec.decode(bytes)
-            guard node.entries.count <= limits.maximumMSTEntriesPerNode else {
-                throw RepositoryMSTValidationError.entryLimitExceeded
-            }
+            guard node.entries.count <= maximumMSTEntries else { throw RepositoryMSTValidationError.entryLimitExceeded }
             let nodeLeaves = try RepositoryMSTCodec.reconstructedLeaves(from: node)
             let layer: Int
             if let first = nodeLeaves.first {
-                layer = RepositoryMSTCodec.keyDepth(for: first.path)
-                guard (0 ... 128).contains(layer) else {
-                    throw RepositoryMSTValidationError.invalidLayer
-                }
-                if let expected = item.expectedLayer, layer != expected {
-                    throw RepositoryMSTValidationError.invalidLayer
-                }
-                guard nodeLeaves.allSatisfy({
-                    RepositoryMSTCodec.keyDepth(for: $0.path) == layer
-                }) else {
-                    throw RepositoryMSTValidationError.leafLayerMismatch
-                }
+                layer = first.path.keyDepth
+                guard (0 ... 128).contains(layer) else { throw RepositoryMSTValidationError.invalidLayer }
+                if let expected = item.expectedLayer, layer != expected { throw RepositoryMSTValidationError.invalidLayer }
+                guard nodeLeaves.allSatisfy({ $0.path.keyDepth == layer }) else { throw RepositoryMSTValidationError.leafLayerMismatch }
             } else if item.isRoot {
-                guard node.leftTreeCID == nil,
-                      bytes == PublicRepositoryGenesisCodec.canonicalEmptyMST else {
+                guard node.leftTreeCID == nil, bytes == PublicRepositoryGenesisCodec.canonicalEmptyMST else {
                     throw RepositoryMSTValidationError.invalidEmptyTopology
                 }
                 layer = 0
             } else {
-                guard let expected = item.expectedLayer,
-                      expected > 0, node.leftTreeCID != nil else {
+                guard let expected = item.expectedLayer, expected > 0, node.leftTreeCID != nil else {
                     throw RepositoryMSTValidationError.invalidEmptyTopology
                 }
                 layer = expected
             }
             if item.isRoot { rootLayer = layer }
-            try await projection.recordReachableBlock(cid: item.cid, kind: .mst)
-
+            try await projection.recordReachableBlock(cid: item.cid, kind: .mst, bytes: bytes)
             if nodeLeaves.isEmpty {
                 if let left = node.leftTreeCID {
-                    guard referencedNodes.insert(left).inserted else {
-                        throw RepositoryMSTValidationError.repeatedNode
-                    }
-                    work.append(.init(
-                        cid: left, lowerBound: item.lowerBound,
-                        upperBound: item.upperBound, expectedLayer: layer - 1,
-                        isRoot: false
-                    ))
+                    guard referenced.insert(left).inserted else { throw RepositoryMSTValidationError.repeatedNode }
+                    work.append(.init(cid: left, lower: item.lower, upper: item.upper, expectedLayer: layer - 1, isRoot: false))
                 }
                 continue
             }
             for leaf in nodeLeaves {
-                let key = Data(leaf.path.mstKey.utf8)
-                guard isInside(key, lower: item.lowerBound, upper: item.upperBound) else {
-                    throw RepositoryMSTValidationError.subtreeOutOfRange
-                }
-                // See `validate`: the per-block caps do not bound the aggregate
-                // leaf set, and the public read surface refuses a repository
-                // above this ceiling.
-                guard leaves.count < limits.maximumRepositoryRecords else {
-                    throw RepositoryMSTValidationError.recordLimitExceeded
-                }
-                leafKeys.append(key)
-                leaves.append(leaf)
-                recordCIDs.insert(leaf.recordCID)
+                let key = leaf.path.mstKeyBytes
+                guard isInside(key, lower: item.lower, upper: item.upper) else { throw RepositoryMSTValidationError.subtreeOutOfRange }
+                guard leaves.count < limits.maximumRepositoryRecords else { throw RepositoryMSTValidationError.recordLimitExceeded }
+                keys.append(key); leaves.append(leaf)
+                if records.insert(leaf.recordCID).inserted { recordOrder.append(leaf.recordCID) }
             }
-            guard layer > 0 ||
-                    (node.leftTreeCID == nil && nodeLeaves.allSatisfy { $0.rightTreeCID == nil })
-            else {
+            guard layer > 0 || (node.leftTreeCID == nil && nodeLeaves.allSatisfy { $0.rightTreeCID == nil }) else {
                 throw RepositoryMSTValidationError.invalidLayer
             }
             if let left = node.leftTreeCID {
-                guard referencedNodes.insert(left).inserted else {
-                    throw RepositoryMSTValidationError.repeatedNode
-                }
-                work.append(.init(
-                    cid: left, lowerBound: item.lowerBound,
-                    upperBound: Data(nodeLeaves[0].path.mstKey.utf8),
-                    expectedLayer: layer - 1, isRoot: false
-                ))
+                guard referenced.insert(left).inserted else { throw RepositoryMSTValidationError.repeatedNode }
+                work.append(.init(cid: left, lower: item.lower, upper: nodeLeaves[0].path.mstKeyBytes, expectedLayer: layer - 1, isRoot: false))
             }
             for index in nodeLeaves.indices {
                 guard let right = nodeLeaves[index].rightTreeCID else { continue }
-                guard referencedNodes.insert(right).inserted else {
-                    throw RepositoryMSTValidationError.repeatedNode
-                }
-                work.append(.init(
-                    cid: right,
-                    lowerBound: Data(nodeLeaves[index].path.mstKey.utf8),
-                    upperBound: index + 1 < nodeLeaves.count
-                        ? Data(nodeLeaves[index + 1].path.mstKey.utf8)
-                        : item.upperBound,
-                    expectedLayer: layer - 1,
-                    isRoot: false
-                ))
+                guard referenced.insert(right).inserted else { throw RepositoryMSTValidationError.repeatedNode }
+                work.append(.init(cid: right, lower: nodeLeaves[index].path.mstKeyBytes,
+                    upper: index + 1 < nodeLeaves.count ? nodeLeaves[index + 1].path.mstKeyBytes : item.upper,
+                    expectedLayer: layer - 1, isRoot: false))
             }
         }
-
-        var expectedCollectionsByRecordCID: [CID: Set<String>] = [:]
-        for leaf in leaves {
-            expectedCollectionsByRecordCID[leaf.recordCID, default: []].insert(leaf.path.collection)
-        }
-        for cid in recordCIDs {
+        var expected: [CID: Set<String>] = [:]
+        for leaf in leaves { expected[leaf.recordCID, default: []].insert(leaf.path.collection) }
+        for cid in recordOrder {
             try Task.checkCancellation()
-            guard let bytes = try await blocks.block(for: cid) else {
-                throw RepositoryMSTValidationError.missingRecordBlock
+            guard let data = try await blocks.block(for: cid) else { throw RepositoryMSTValidationError.missingRecordBlock }
+            do { try PublicRepositoryCID.validate(cid, blockBytes: data) }
+            catch PublicRepositoryDomainError.unsupportedCID { throw RepositoryMSTValidationError.unsupportedCID }
+            catch { throw RepositoryMSTValidationError.recordBlockCIDMismatch }
+            guard data.count <= limits.maximumRecordBlockBytes else { throw RepositoryMSTValidationError.recordBlockTooLarge }
+            bytesTotal = try adding(data.count, to: bytesTotal, maximum: maximumBytes)
+            guard let collections = expected[cid] else { throw RepositoryMSTValidationError.missingRecordBlock }
+            for collection in collections {
+                do { try RepositoryRecordBlockValidator.validate(data, expectedType: collection, maximumDepth: limits.maximumCBORNestingDepth) }
+                catch { throw RepositoryMSTValidationError.invalidRecordBlock }
             }
-            do {
-                try PublicRepositoryCID.validate(cid, blockBytes: bytes)
-            } catch PublicRepositoryDomainError.unsupportedCID {
-                throw RepositoryMSTValidationError.unsupportedCID
-            } catch {
-                throw RepositoryMSTValidationError.recordBlockCIDMismatch
-            }
-            guard bytes.count <= limits.maximumRecordBlockBytes else {
-                throw RepositoryMSTValidationError.recordBlockTooLarge
-            }
-            reachableBytes = try adding(bytes.count, to: reachableBytes, maximum: maximumReachableBytes)
-            guard let expectedCollections = expectedCollectionsByRecordCID[cid] else {
-                throw RepositoryMSTValidationError.missingRecordBlock
-            }
-            for collection in expectedCollections {
-                do {
-                    try RepositoryRecordBlockValidator.validate(
-                        bytes, expectedType: collection,
-                        maximumDepth: limits.maximumCBORNestingDepth
-                    )
-                } catch {
-                    throw RepositoryMSTValidationError.invalidRecordBlock
-                }
-            }
-            try await projection.recordReachableBlock(cid: cid, kind: .record)
+            try await projection.recordReachableBlock(cid: cid, kind: .record, bytes: data)
         }
-        leaves = Self.sortedByMSTKey(leaves, keys: leafKeys)
+        leaves = Self.sortedByMSTKey(leaves, keys: keys)
         for pair in zip(leaves, leaves.dropFirst()) {
-            guard pair.0.path.mstKey < pair.1.path.mstKey else {
+            guard RepositoryMSTCodec.lexicographicallyPrecedes(pair.0.path.mstKeyBytes, pair.1.path.mstKeyBytes) else {
                 throw RepositoryMSTValidationError.keysNotStrictlyIncreasing
             }
         }
-        for leaf in leaves {
-            try await projection.recordRepositoryIndex(
-                path: leaf.path, recordCID: leaf.recordCID
-            )
-        }
-        guard let rootLayer else {
-            throw RepositoryMSTValidationError.missingBlock
-        }
-        return .init(
-            rootCID: rootCID,
-            rootLayer: rootLayer,
-            mstBlockCount: seenNodes.count,
-            recordBlockCount: recordCIDs.count,
-            recordCount: leaves.count,
-            reachableRepositoryByteCount: reachableBytes
-        )
+        if let collector = projection as? ValidationCollector { await collector.setLeaves(leaves) }
+        for leaf in leaves { try await projection.recordRepositoryIndex(path: leaf.path, recordCID: leaf.recordCID) }
+        guard let rootLayer else { throw RepositoryMSTValidationError.missingBlock }
+        return .init(rootCID: rootCID, rootLayer: rootLayer, mstBlockCount: seen.count,
+            recordBlockCount: records.count, recordCount: leaves.count, reachableRepositoryByteCount: bytesTotal)
     }
 
     private static func requiredBlock(
@@ -593,13 +307,13 @@ public enum RepositoryMSTValidation {
     ) -> [RepositoryMSTLeaf] {
         precondition(leaves.count == keys.count)
         return zip(keys, leaves)
-            .sorted { $0.0.lexicographicallyPrecedes($1.0) }
+            .sorted { RepositoryMSTCodec.lexicographicallyPrecedes($0.0, $1.0) }
             .map(\.1)
     }
 
     private static func isInside(_ key: Data, lower: Data?, upper: Data?) -> Bool {
-        if let lower, !lower.lexicographicallyPrecedes(key) { return false }
-        if let upper, !key.lexicographicallyPrecedes(upper) { return false }
+        if let lower, !RepositoryMSTCodec.lexicographicallyPrecedes(lower, key) { return false }
+        if let upper, !RepositoryMSTCodec.lexicographicallyPrecedes(key, upper) { return false }
         return true
     }
 
@@ -610,6 +324,36 @@ public enum RepositoryMSTValidation {
         }
         return result
     }
+}
+
+private actor ValidationCollector: PublicRepositoryReachableProjectionSink {
+    struct Snapshot {
+        var mstBlocks: [CID: Data] = [:]
+        var recordCIDs = Set<CID>()
+        var leaves: [RepositoryMSTLeaf] = []
+        var orderedCIDs: [CID] = []
+        var rootLayer: Int?
+        var bytes = 0
+    }
+    private var state = Snapshot()
+
+    func recordReachableBlock(cid: CID, kind: PublicRepositoryReachableBlockKind) async throws {
+        state.orderedCIDs.append(cid)
+        if kind == .record {
+            state.recordCIDs.insert(cid)
+        }
+    }
+    func recordReachableBlock(cid: CID, kind: PublicRepositoryReachableBlockKind, bytes: Data?) async throws {
+        state.orderedCIDs.append(cid)
+        if kind == .mst, let bytes {
+            state.mstBlocks[cid] = bytes
+        } else if kind == .record {
+            state.recordCIDs.insert(cid)
+        }
+    }
+    func setLeaves(_ leaves: [RepositoryMSTLeaf]) { state.leaves = leaves }
+    func recordRepositoryIndex(path: PublicRepositoryPath, recordCID: CID) async throws {}
+    func snapshot() -> Snapshot { state }
 }
 
 /// Strict, allocation-bounded validation of the AT data-model subset used by

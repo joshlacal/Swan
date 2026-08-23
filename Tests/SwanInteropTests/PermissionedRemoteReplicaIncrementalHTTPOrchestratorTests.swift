@@ -4,7 +4,6 @@ import Petrel
 @testable import SwanInterop
 import SwanOAuth
 import SwanSpaces
-import SwanSpacesWire
 import SwanStorage
 import XCTest
 

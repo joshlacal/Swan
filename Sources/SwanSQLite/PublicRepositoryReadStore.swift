@@ -52,12 +52,12 @@ extension SQLiteAccountDatabase {
     /// while DAG-CBOR links remain repository blocks and are ignored by the
     /// codec projection.
     public func publicRepositoryBlobCIDs() async throws -> [CID] {
-        try await withConnectionGate {
+        try await withReadConnectionGate {
             try await readTransaction {
                 // Reject oversized or malformed index projections before the
                 // optional promoter decodes any record block. The preflight
                 // itself is a bounded keyset walk and never selects values.
-                try await preflightPublicReadProjectionWithoutGate()
+                try await preflightPublicReadProjectionWithoutGate(connection: readConnection)
                 var cidsByString: [String: CID] = [:]
                 var lastCollection: String?
                 var lastRecordKey: String?
@@ -66,7 +66,7 @@ extension SQLiteAccountDatabase {
                     try Task.checkCancellation()
                     let rows: [SQLiteRow]
                     if let lastCollection, let lastRecordKey {
-                        rows = try await connection.query(
+                        rows = try await readConnection.query(
                             """
                             SELECT collection, rkey, record_cid
                             FROM public_repository_record_index
@@ -86,7 +86,7 @@ extension SQLiteAccountDatabase {
                             ]
                         )
                     } else {
-                        rows = try await connection.query(
+                        rows = try await readConnection.query(
                             """
                             SELECT collection, rkey, record_cid
                             FROM public_repository_record_index
@@ -123,7 +123,7 @@ extension SQLiteAccountDatabase {
                             ),
                             reason: .recordIndexMalformed
                         )
-                        let bytes = try await blockBytesWithoutGate(recordCID)
+                        let bytes = try await blockBytesWithoutGate(recordCID, connection: readConnection)
                         let value = try RepositoryMSTValidation.decodeRecordBlock(
                             bytes, for: path
                         )
@@ -243,9 +243,9 @@ extension SQLiteAccountDatabase {
         identityVerifier: any PublicPLCGenesisVerifying
     ) async throws -> SQLiteVerifiedPublicRepositoryGeneration {
         try await withConnectionGate {
-            try await readTransaction {
+            try await writerReadTransaction {
                 let fileIdentity = try publicRepositoryFileIdentityWithoutGate()
-                let dataVersion = try await publicRepositoryDataVersionWithoutGate()
+                let dataVersion = try await publicRepositoryDataVersionWithoutGate(connection: connection)
                 guard let state = try await loadPublicRepositoryStateWithoutGate() else {
                     throw PublicRepositoryReadError.unavailable(
                         reason: .repositoryStateMissing
@@ -453,7 +453,7 @@ extension SQLiteAccountDatabase {
                 // transaction-scoped, so the account database file really can
                 // be swapped underneath an in-flight admission, and that is a
                 // genuine disagreement rather than a race.
-                guard try await publicRepositoryDataVersionWithoutGate()
+                guard try await publicRepositoryDataVersionWithoutGate(connection: connection)
                     == dataVersion else {
                     throw PublicRepositoryReadError.unavailable(
                         reason: .generationPinStale
@@ -478,7 +478,8 @@ extension SQLiteAccountDatabase {
         }
     }
 
-    func preflightPublicReadProjectionWithoutGate() async throws {
+    func preflightPublicReadProjectionWithoutGate(connection: SQLiteConnection? = nil) async throws {
+        let conn = connection ?? self.connection
         var recordCount = 0
         var collectionCount = 0
         var collectionBytes = 0
@@ -489,7 +490,7 @@ extension SQLiteAccountDatabase {
             try Task.checkCancellation()
             let rows: [SQLiteRow]
             if let lastCollection, let lastRecordKey {
-                rows = try await connection.query(
+                rows = try await conn.query(
                     """
                     SELECT collection, rkey
                     FROM public_repository_record_index
@@ -509,7 +510,7 @@ extension SQLiteAccountDatabase {
                     ]
                 )
             } else {
-                rows = try await connection.query(
+                rows = try await conn.query(
                     """
                     SELECT collection, rkey
                     FROM public_repository_record_index
@@ -585,9 +586,10 @@ extension SQLiteAccountDatabase {
         generation: SQLiteVerifiedPublicRepositoryGeneration
     ) async throws -> PublicRepositoryReadDescription {
         try await withConnectionGate {
-            try await readTransaction {
+            try await writerReadTransaction {
                 _ = try await requirePublicRepositoryGenerationWithoutGate(
-                    generation
+                    generation,
+                    connection: connection
                 )
                 return generation.description
             }
@@ -600,9 +602,10 @@ extension SQLiteAccountDatabase {
         generation: SQLiteVerifiedPublicRepositoryGeneration
     ) async throws -> SQLitePublicRepositoryRecordRead {
         try await withConnectionGate {
-            try await readTransaction {
+            try await writerReadTransaction {
                 let state = try await requirePublicRepositoryGenerationWithoutGate(
-                    generation
+                    generation,
+                    connection: connection
                 )
                 let tree = try RepositoryMST.load(
                     rootCID: state.dataCID,
@@ -620,7 +623,8 @@ extension SQLiteAccountDatabase {
                       expectedCID == nil || expectedCID == cid else {
                     try await recheckPublicRepositoryGenerationWithoutGate(
                         generation,
-                        expectedState: state
+                        expectedState: state,
+                        connection: connection
                     )
                     return SQLitePublicRepositoryRecordRead(
                         state: state,
@@ -633,7 +637,7 @@ extension SQLiteAccountDatabase {
                 // reject it in `PublicRepositoryReadRecord`.
                 let byteCount = try await
                     publicRepositoryRecordBlockByteCountWithoutGate(cid)
-                let bytes = try await blockBytesWithoutGate(cid)
+                let bytes = try await blockBytesWithoutGate(cid, connection: connection)
                 guard bytes.count == byteCount else {
                     throw PublicRepositoryReadError.unavailable(reason: .blockMaterializationFailed)
                 }
@@ -644,7 +648,8 @@ extension SQLiteAccountDatabase {
                 )
                 try await recheckPublicRepositoryGenerationWithoutGate(
                     generation,
-                    expectedState: state
+                    expectedState: state,
+                    connection: connection
                 )
                 return SQLitePublicRepositoryRecordRead(
                     state: state,
@@ -670,9 +675,10 @@ extension SQLiteAccountDatabase {
             )
         }
         return try await withConnectionGate {
-            try await readTransaction {
+            try await writerReadTransaction {
                 let state = try await requirePublicRepositoryGenerationWithoutGate(
-                    generation
+                    generation,
+                    connection: connection
                 )
                 let tree = try RepositoryMST.load(
                     rootCID: state.dataCID,
@@ -717,7 +723,8 @@ extension SQLiteAccountDatabase {
                         break
                     }
                     let bytes = try await blockBytesWithoutGate(
-                        leaf.recordCID
+                        leaf.recordCID,
+                        connection: connection
                     )
                     guard bytes.count == byteCount else {
                         throw PublicRepositoryReadError.unavailable(reason: .blockMaterializationFailed)
@@ -735,7 +742,8 @@ extension SQLiteAccountDatabase {
                 )
                 try await recheckPublicRepositoryGenerationWithoutGate(
                     generation,
-                    expectedState: state
+                    expectedState: state,
+                    connection: connection
                 )
                 return SQLitePublicRepositoryPageRead(
                     state: state,
@@ -777,11 +785,15 @@ extension SQLiteAccountDatabase {
         )
         do {
             let state = try await withConnectionGate {
-                try await readTransaction {
+                try await writerReadTransaction {
                     let state = try await
-                        requirePublicRepositoryGenerationWithoutGate(generation)
+                        requirePublicRepositoryGenerationWithoutGate(
+                            generation,
+                            connection: connection
+                        )
                     let commitBytes = try await blockBytesWithoutGate(
-                        state.commitCID
+                        state.commitCID,
+                        connection: connection
                     )
                     let commit = try structurallyValidatedCommit(
                         signedCommitBytes: commitBytes,
@@ -802,7 +814,8 @@ extension SQLiteAccountDatabase {
                     try handle.seek(toOffset: 0)
                     try await recheckPublicRepositoryGenerationWithoutGate(
                         generation,
-                        expectedState: state
+                        expectedState: state,
+                        connection: connection
                     )
                     return state
                 }
@@ -828,14 +841,15 @@ extension SQLiteAccountDatabase {
         )
         do {
             let state = try await withConnectionGate {
-                try await readTransaction {
+                try await writerReadTransaction {
                     guard let state =
-                            try await loadPublicRepositoryStateWithoutGate()
+                            try await loadPublicRepositoryStateWithoutGate(connection: connection)
                     else {
                         throw PublicRepositoryReadError.unavailable(reason: .repositoryStateMissing)
                     }
                     let commitBytes = try await blockBytesWithoutGate(
-                        state.commitCID
+                        state.commitCID,
+                        connection: connection
                     )
                     let commit = try structurallyValidatedCommit(
                         signedCommitBytes: commitBytes,
@@ -872,8 +886,10 @@ extension SQLiteAccountDatabase {
     }
 
     private func requirePublicRepositoryGenerationWithoutGate(
-        _ generation: SQLiteVerifiedPublicRepositoryGeneration
+        _ generation: SQLiteVerifiedPublicRepositoryGeneration,
+        connection: SQLiteConnection? = nil
     ) async throws -> PublicRepositoryState {
+        let conn = connection ?? self.connection
         // Three independent pins, reported independently. `data_version` is
         // the only one that moves on an unrelated commit from any other
         // connection to this database, so callers must be able to tell it
@@ -892,13 +908,13 @@ extension SQLiteAccountDatabase {
                 reason: .fileIdentityMismatch
             )
         }
-        guard try await publicRepositoryDataVersionWithoutGate()
+        guard try await publicRepositoryDataVersionWithoutGate(connection: conn)
             == generation.dataVersion else {
             throw PublicRepositoryReadError.unavailable(
                 reason: .generationPinStale
             )
         }
-        guard let state = try await loadPublicRepositoryStateWithoutGate() else {
+        guard let state = try await loadPublicRepositoryStateWithoutGate(connection: conn) else {
             throw PublicRepositoryReadError.unavailable(
                 reason: .repositoryStateMissing
             )
@@ -913,21 +929,23 @@ extension SQLiteAccountDatabase {
 
     private func recheckPublicRepositoryGenerationWithoutGate(
         _ generation: SQLiteVerifiedPublicRepositoryGeneration,
-        expectedState: PublicRepositoryState
+        expectedState: PublicRepositoryState,
+        connection: SQLiteConnection? = nil
     ) async throws {
+        let conn = connection ?? self.connection
         guard try publicRepositoryFileIdentityWithoutGate()
             == generation.fileIdentity else {
             throw PublicRepositoryReadError.unavailable(
                 reason: .fileIdentityMismatch
             )
         }
-        guard try await publicRepositoryDataVersionWithoutGate()
+        guard try await publicRepositoryDataVersionWithoutGate(connection: conn)
             == generation.dataVersion else {
             throw PublicRepositoryReadError.unavailable(
                 reason: .generationPinStale
             )
         }
-        guard let state = try await loadPublicRepositoryStateWithoutGate() else {
+        guard let state = try await loadPublicRepositoryStateWithoutGate(connection: conn) else {
             throw PublicRepositoryReadError.unavailable(
                 reason: .repositoryStateMissing
             )
@@ -940,8 +958,9 @@ extension SQLiteAccountDatabase {
         }
     }
 
-    private func publicRepositoryDataVersionWithoutGate() async throws -> Int64 {
-        let rows = try await connection.query("PRAGMA data_version")
+    private func publicRepositoryDataVersionWithoutGate(connection: SQLiteConnection? = nil) async throws -> Int64 {
+        let conn = connection ?? self.connection
+        let rows = try await conn.query("PRAGMA data_version")
         guard rows.count == 1,
               let value = rows[0].column("data_version")?.integer,
               let dataVersion = Int64(exactly: value) else {
@@ -949,7 +968,6 @@ extension SQLiteAccountDatabase {
         }
         return dataVersion
     }
-
     private func publicRepositoryFileIdentityWithoutGate() throws
         -> SQLitePublicRepositoryFileIdentity
     {

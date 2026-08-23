@@ -479,6 +479,87 @@ final class PublicRelayVerifierTests: XCTestCase {
     XCTAssertEqual(current.snapshot.dataCID, materialized.rootCID)
     XCTAssertEqual(current.snapshot.records, [path.mstKey: record.cid])
   }
+  func testIncrementalCommitAcceptsReusedRecordBlockOmittedFromDiff() async throws {
+    let key = try P256.Signing.PrivateKey(rawRepresentation: Data(repeating: 1, count: 32))
+    let verifier = P256PublicRepositoryCommitVerifier(publicKey: key.publicKey)
+    let genesis = try PublicRepositoryGenesisCodec.create(
+      did: did,
+      revision: rev0,
+      signingKey: key
+    )
+    var state = try await RelayRepositoryVerificationState.fullSnapshot(
+      car: genesis.car,
+      expected: .init(did: did, revision: rev0, commitCID: genesis.commitCID, dataCID: genesis.emptyMSTCID),
+      verifier: verifier,
+      maximumCARBytes: genesis.car.count
+    )
+
+    let pathA = try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "a")
+    let pathB = try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "b")
+    let recordA = try PublicRepositoryRecordCodec.prepare(
+      PublicRecord(["$type": .string(pathA.collection), "text": .string("shared")]),
+      for: pathA
+    )
+
+    // Commit 1: Create pathA with recordA
+    var tree = try await RepositoryMST.empty().adding(path: pathA, recordCID: recordA.cid)
+    var mat = try await tree.materialized()
+    var commit = try await PublicRepositoryCommitCodec.prepare(
+      did: did,
+      revision: "3jzfcijpj2z2b",
+      dataCID: mat.rootCID,
+      currentRevision: rev0,
+      signer: P256PublicRepositoryCommitSigner(privateKey: key)
+    )
+    var diffBlocks = [PublicRepositoryBlock(cid: commit.commitCID, bytes: commit.signedCommitBytes)]
+    for cid in mat.newBlocks.cids {
+      let blockBytes = try await mat.newBlocks.block(for: cid)
+      diffBlocks.append(.init(cid: cid, bytes: try XCTUnwrap(blockBytes)))
+    }
+    diffBlocks.append(.init(cid: recordA.cid, bytes: recordA.bytes))
+    var sink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(diffBlocks), to: sink)
+    var event = RelayCommitEvent(
+      seq: 4, repo: did, commitCID: commit.commitCID, rev: "3jzfcijpj2z2b", since: rev0,
+      blocks: await sink.data,
+      ops: [.init(action: .create, path: pathA.mstKey, cid: recordA.cid, prev: nil)],
+      prevDataCID: genesis.emptyMSTCID, time: time
+    )
+    state = try await state.applying(commit: event, verifier: verifier)
+    XCTAssertEqual(state.snapshot.records, [pathA.mstKey: recordA.cid])
+
+    // Commit 2: Create pathB pointing to same recordA.cid, but OMITS recordA.bytes from diffBlocks!
+    let prevDataCID1 = mat.rootCID
+    tree = try await tree.adding(path: pathB, recordCID: recordA.cid)
+    mat = try await tree.materialized()
+    commit = try await PublicRepositoryCommitCodec.prepare(
+      did: did,
+      revision: "3jzfcijpj2z2c",
+      dataCID: mat.rootCID,
+      currentRevision: "3jzfcijpj2z2b",
+      signer: P256PublicRepositoryCommitSigner(privateKey: key)
+    )
+    diffBlocks = [PublicRepositoryBlock(cid: commit.commitCID, bytes: commit.signedCommitBytes)]
+    for cid in mat.newBlocks.cids {
+      let blockBytes = try await mat.newBlocks.block(for: cid)
+      diffBlocks.append(.init(cid: cid, bytes: try XCTUnwrap(blockBytes)))
+    }
+    // NOTE: recordA.bytes is NOT in diffBlocks! It is reused from previous state.
+    sink = TestCARSink()
+    _ = try await PublicRepositoryCAR.write(rootCID: commit.commitCID, blocks: TestCARBlockStream(diffBlocks), to: sink)
+    event = RelayCommitEvent(
+      seq: 5, repo: did, commitCID: commit.commitCID, rev: "3jzfcijpj2z2c", since: "3jzfcijpj2z2b",
+      blocks: await sink.data,
+      ops: [.init(action: .create, path: pathB.mstKey, cid: recordA.cid, prev: nil)],
+      prevDataCID: prevDataCID1, time: time
+    )
+    state = try await state.applying(commit: event, verifier: verifier)
+    XCTAssertEqual(state.snapshot.records, [
+      pathA.mstKey: recordA.cid,
+      pathB.mstKey: recordA.cid,
+    ])
+  }
+
 
   func testSyncVerifierTreatsCommitOnlyCARAsAnnouncementNotDiffOrSnapshot() async throws {
     let key = try P256.Signing.PrivateKey(rawRepresentation: Data(repeating: 1, count: 32))

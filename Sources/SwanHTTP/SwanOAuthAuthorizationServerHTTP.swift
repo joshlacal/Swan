@@ -1688,9 +1688,7 @@ private func oauthServerBodyFailureToken(
 private func oauthServerJSON<Body: Encodable>(
   _ status: HTTPResponse.Status, _ body: Body, headers: HTTPFields? = nil
 ) -> Response {
-  let encoder = JSONEncoder()
-  encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-  let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
+  let data = (try? SwanJSONEncoders.sortedNoEscaping.encode(body)) ?? Data("{}".utf8)
   var responseHeaders = headers ?? [.contentType: "application/json", .cacheControl: "no-store"]
   if responseHeaders[.contentType] == nil { responseHeaders[.contentType] = "application/json" }
   if responseHeaders[.cacheControl] == nil { responseHeaders[.cacheControl] = "no-store" }

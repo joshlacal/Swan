@@ -99,18 +99,19 @@ extension SQLiteAccountDatabase: PublicPLCIdentityHistoryStore {
     public func publicPLCOperationHistory() async throws
         -> [PublicPLCOperationHistoryEntry]
     {
-        try await withConnectionGate {
-            try await publicPLCOperationHistoryWithoutGate()
+        try await withReadConnectionGate {
+            try await publicPLCOperationHistoryWithoutGate(connection: readConnection)
         }
     }
 
     /// Read helper for account-database transactions that already hold the
     /// connection gate. It is internal so public repository identity reads
     /// can authenticate the history in the same SQLite snapshot.
-    func publicPLCOperationHistoryWithoutGate()
+    func publicPLCOperationHistoryWithoutGate(connection: SQLiteConnection? = nil)
         async throws -> [PublicPLCOperationHistoryEntry]
     {
-        let rows = try await connection.query(
+        let conn = connection ?? self.connection
+        let rows = try await conn.query(
             """
             SELECT sequence, cid, previous_cid, canonical_json, created_at,
                    signing_key_generation, rotation_key_generation

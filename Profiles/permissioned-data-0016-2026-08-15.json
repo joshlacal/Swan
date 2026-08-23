@@ -19,7 +19,7 @@
   "lexiconManifest": "permissioned-data-0016-2026-08-15.lexicons.sha256",
   "lexiconManifestSHA256": "873fb88439cadd447ee6a90f9fadb262fa84bdb6689735b53e667db13d7219c3",
   "generatedWireManifest": "permissioned-data-0016-2026-08-15.generated-wire.sha256",
-  "generatedWireManifestSHA256": "a5428bd2edd32d2d2a605e41fb46816a14e3a9985ede60b56f3e50f6ca180387",
+  "generatedWireManifestSHA256": "7e7fe09868a7fcda0c6ab824ebe19e7f64ba147db63fd02a27762ed538e02704",
   "intentionalDivergences": [
     {
       "endpoint": "com.atproto.space.getRepo",

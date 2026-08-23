@@ -4,7 +4,6 @@ import SwanCore
 import SwanOAuth
 import SwanSQLite
 import SwanSpaces
-import SwanSpacesWire
 import SwanStorage
 
 /// One operator-configured service destination. The endpoint is selected from
@@ -347,18 +346,14 @@ private func notificationJSON(
         rev: revision,
         hash: Bytes(data: commitment)
     )
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    return try encoder.encode(input)
+    return try SwanJSONEncoders.sortedNoEscaping.encode(input)
 }
 
 private func deletionJSON(space: SpaceURI) throws -> Data {
     let input = try ComAtprotoSpaceNotifySpaceDeleted.Input(
         space: SpaceRef(uriString: space.rawValue)
     )
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    return try encoder.encode(input)
+    return try SwanJSONEncoders.sortedNoEscaping.encode(input)
 }
 
 private func notificationHeaders(_ token: String) -> [String: String] {

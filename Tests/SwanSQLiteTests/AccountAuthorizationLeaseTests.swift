@@ -42,7 +42,6 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let control = try await SQLiteControlDatabase(dataDirectory: root)
-        defer { Task { try? await control.close() } }
         _ = try await control.createAccount(
             AccountControlRegistration(
                 did: did,
@@ -82,6 +81,7 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         } catch let error as AccountControlStoreError {
             XCTAssertEqual(error, .invalidTransition)
         }
+        try await control.close()
     }
 
     func testFirehoseAuthorizationFencePassesLiveGenerationAndRejectsInactive() async throws {
@@ -97,7 +97,6 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let control = try await SQLiteControlDatabase(dataDirectory: root)
-        defer { Task { try? await control.close() } }
         _ = try await control.createAccount(
             AccountControlRegistration(
                 did: did,
@@ -137,6 +136,7 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         } catch let error as AccountControlStoreError {
             guard case .invalidTransition = error else { throw error }
         }
+        try await control.close()
     }
 
     func testRotationIdentityAndKeyPromotionHoldOneAuthorizationFence() async throws {
@@ -152,7 +152,6 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let control = try await SQLiteControlDatabase(dataDirectory: root)
-        defer { Task { try? await control.close() } }
         _ = try await control.createAccount(
             AccountControlRegistration(
                 did: did,
@@ -226,6 +225,7 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
 
         let finalLifecycleGeneration = try await control.currentLifecycleGeneration(did: did)
         XCTAssertEqual(finalLifecycleGeneration, 2)
+        try await control.close()
     }
 
     func testStaleSignerGenerationNeverFallsBackToNonEmittingMutation() async throws {
@@ -241,7 +241,6 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let control = try await SQLiteControlDatabase(dataDirectory: root)
-        defer { Task { try? await control.close() } }
         _ = try await control.createAccount(
             AccountControlRegistration(
                 did: did,
@@ -266,6 +265,7 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         }
         let entered = await callback.hasEntered
         XCTAssertFalse(entered, "stale signer rejection must not retry with nil firehose context")
+        try await control.close()
     }
 
     /// F18. The publication fence used to answer a non-authorizing account by
@@ -288,7 +288,6 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let control = try await SQLiteControlDatabase(dataDirectory: root)
-        defer { Task { try? await control.close() } }
         _ = try await control.createAccount(
             AccountControlRegistration(
                 did: did,
@@ -331,6 +330,7 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
             entered,
             "a refused account must not reach the mutation at all"
         )
+        try await control.close()
     }
 
     /// F46. `apply` used to commit the permissioned batch first and only then
@@ -367,7 +367,9 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
             collection: "app.bsky.bookmarks.bookmark",
             rkey: "raced"
         )
+        print("P1: before installSpaceAccountDatabase")
         try await installSpaceAccountDatabase(root: root, did: did, space: space)
+        print("P2: after installSpaceAccountDatabase")
 
         let control = try await SQLiteControlDatabase(dataDirectory: root)
         _ = try await control.createAccount(
@@ -412,7 +414,6 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
             )
         }
         await commitBarrier.waitUntilParked()
-
         // Either the deactivation commits while the batch is parked (the
         // defect), or it queues behind the batch's control lease (the fix).
         // Recording both makes the observed ordering an assertion input rather
@@ -442,8 +443,6 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         let reopened = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
         let durable = try await reopened.spaceRecord(record)
         try await reopened.close()
-
-        // The batch was already inside the account write transaction before
         // the deactivation task existed, so under the fence it necessarily
         // holds the control lease first and the deactivation necessarily
         // queues behind it. There is no admissible ordering in which this
@@ -477,7 +476,6 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
             )
         }
     }
-
     /// F46's residual. Closing the write-then-check race put the whole batch
     /// under the process-wide control-plane write gate, so the reads, the
     /// authorization checks, and CID computation over as much as 1 MiB across

@@ -5,10 +5,31 @@ import SQLiteNIO
 import SwanPublicRepository
 import SwanStorage
 
-private struct SQLiteStagedCARFrameSink: PublicRepositoryCARFrameSink {
+private actor SQLiteStagedCARFrameSink: PublicRepositoryCARFrameSink {
     let database: SQLiteAccountDatabase
     let sessionID: String
     let now: @Sendable () async -> Int64
+    let maxBatchBlocks: Int
+    let maxBatchBytes: Int
+
+    private var pendingBlocks: [PublicRepositoryBlock] = []
+    private var pendingBytes: Int = 0
+    private var lastReceivedByteCount: Int = 0
+    private var lastFrameCount: Int = 0
+
+    init(
+        database: SQLiteAccountDatabase,
+        sessionID: String,
+        now: @escaping @Sendable () async -> Int64,
+        maxBatchBlocks: Int = 500,
+        maxBatchBytes: Int = 2 * 1024 * 1024
+    ) {
+        self.database = database
+        self.sessionID = sessionID
+        self.now = now
+        self.maxBatchBlocks = maxBatchBlocks
+        self.maxBatchBytes = maxBatchBytes
+    }
 
     func receiveHeader(rootCID: CID, receivedByteCount: Int) async throws {
         try await database.stagePublicRepositoryCARHeader(
@@ -24,9 +45,32 @@ private struct SQLiteStagedCARFrameSink: PublicRepositoryCARFrameSink {
         receivedByteCount: Int,
         frameCount: Int
     ) async throws {
-        try await database.stagePublicRepositoryCARBlock(
+        if !pendingBlocks.isEmpty &&
+            (pendingBlocks.count >= maxBatchBlocks || pendingBytes + block.bytes.count > maxBatchBytes) {
+            try await flush()
+        }
+
+        pendingBlocks.append(block)
+        pendingBytes += block.bytes.count
+        lastReceivedByteCount = receivedByteCount
+        lastFrameCount = frameCount
+
+        if pendingBlocks.count >= maxBatchBlocks || pendingBytes >= maxBatchBytes {
+            try await flush()
+        }
+    }
+
+    func flush() async throws {
+        guard !pendingBlocks.isEmpty else { return }
+        let blocksToFlush = pendingBlocks
+        let receivedByteCount = lastReceivedByteCount
+        let frameCount = lastFrameCount
+        pendingBlocks.removeAll(keepingCapacity: true)
+        pendingBytes = 0
+
+        try await database.stagePublicRepositoryCARBlocks(
             sessionID: sessionID,
-            block: block,
+            blocks: blocksToFlush,
             receivedByteCount: receivedByteCount,
             frameCount: frameCount,
             now: await now()
@@ -513,35 +557,54 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
         }
     }
 
-    func stagePublicRepositoryCARBlock(
+    func stagePublicRepositoryCARBlocks(
         sessionID: String,
-        block: PublicRepositoryBlock,
+        blocks: [PublicRepositoryBlock],
         receivedByteCount: Int,
         frameCount: Int,
         now: Int64
     ) async throws {
+        guard !blocks.isEmpty else { return }
         try await withConnectionGate {
             try await transaction {
-                let existing = try await connection.query(
-                    """
-                    SELECT bytes FROM public_repository_import_blocks
-                    WHERE session_id = ? AND cid = ?
-                    """,
-                    [.text(sessionID), .text(block.cid.string)]
-                )
-                if let row = existing.first {
-                    guard let value = row.column("bytes"),
-                          Data(sqliteData: value) == block.bytes else {
-                        throw PublicRepositoryImportStagingError.duplicateBlockConflict
+                var batchSeen: [CID: Data] = [:]
+                for block in blocks {
+                    if let existingBytes = batchSeen[block.cid] {
+                        guard existingBytes == block.bytes else {
+                            throw PublicRepositoryImportStagingError.duplicateBlockConflict
+                        }
+                    } else {
+                        batchSeen[block.cid] = block.bytes
                     }
-                } else {
-                    _ = try await connection.query(
+                }
+
+                var batchInserted = Set<CID>()
+                for block in blocks {
+                    if batchInserted.contains(block.cid) {
+                        continue
+                    }
+                    let existing = try await connection.query(
                         """
-                        INSERT INTO public_repository_import_blocks(session_id, cid, bytes)
-                        VALUES (?, ?, ?)
+                        SELECT bytes FROM public_repository_import_blocks
+                        WHERE session_id = ? AND cid = ?
                         """,
-                        [.text(sessionID), .text(block.cid.string), block.bytes.sqliteData!]
+                        [.text(sessionID), .text(block.cid.string)]
                     )
+                    if let row = existing.first {
+                        guard let value = row.column("bytes"),
+                              Data(sqliteData: value) == block.bytes else {
+                            throw PublicRepositoryImportStagingError.duplicateBlockConflict
+                        }
+                    } else {
+                        _ = try await connection.query(
+                            """
+                            INSERT INTO public_repository_import_blocks(session_id, cid, bytes)
+                            VALUES (?, ?, ?)
+                            """,
+                            [.text(sessionID), .text(block.cid.string), block.bytes.sqliteData!]
+                        )
+                    }
+                    batchInserted.insert(block.cid)
                 }
                 let updated = try await connection.query(
                     """
@@ -564,6 +627,22 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                 }
             }
         }
+    }
+
+    func stagePublicRepositoryCARBlock(
+        sessionID: String,
+        block: PublicRepositoryBlock,
+        receivedByteCount: Int,
+        frameCount: Int,
+        now: Int64
+    ) async throws {
+        try await stagePublicRepositoryCARBlocks(
+            sessionID: sessionID,
+            blocks: [block],
+            receivedByteCount: receivedByteCount,
+            frameCount: frameCount,
+            now: now
+        )
     }
 
     func stagedPublicRepositoryBlock(
@@ -1080,6 +1159,8 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                 requestID: requestID,
                 expectedBinding: expectedBinding
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as PublicRepositoryImportStagingError {
             throw error
         } catch {
@@ -1158,6 +1239,8 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
             else {
                 throw PublicRepositoryImportStagingError.corruptRepository
             }
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as PublicRepositoryImportStagingError {
             throw error
         } catch {
@@ -1260,44 +1343,92 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
             var lastCID: String?
             while true {
                 let rows: [SQLiteRow]
-                if let lastCID {
-                    rows = try await connection.query(
-                        """
-                        SELECT cid, kind
-                        FROM public_repository_import_reachable
-                        WHERE session_id = ? AND kind = ? AND EXISTS (
-                            SELECT 1 FROM public_repository_import_sessions
-                            WHERE session_id = ? AND expires_at > ?
-                        ) AND cid > ?
-                        ORDER BY cid
-                        LIMIT ?
-                        """,
-                        [
-                            .text(sessionID), .text(expectedKind),
-                            .text(sessionID), .integer(timestamp),
-                            .text(lastCID), .integer(pageSize),
-                        ]
-                    )
-                } else {
-                    rows = try await connection.query(
-                        """
-                        SELECT cid, kind
-                        FROM public_repository_import_reachable
-                        WHERE session_id = ? AND kind = ? AND EXISTS (
-                            SELECT 1 FROM public_repository_import_sessions
-                            WHERE session_id = ? AND expires_at > ?
+                if validateBlocks {
+                    if let lastCID {
+                        rows = try await connection.query(
+                            """
+                            SELECT r.cid, r.kind, length(b.bytes) AS byte_count
+                            FROM public_repository_import_reachable r
+                            LEFT JOIN public_repository_import_blocks b
+                              ON b.session_id = r.session_id AND b.cid = r.cid
+                            WHERE r.session_id = ? AND r.kind = ? AND EXISTS (
+                                SELECT 1 FROM public_repository_import_sessions
+                                WHERE session_id = ? AND expires_at > ?
+                            ) AND r.cid > ?
+                            ORDER BY r.cid
+                            LIMIT ?
+                            """,
+                            [
+                                .text(sessionID), .text(expectedKind),
+                                .text(sessionID), .integer(timestamp),
+                                .text(lastCID), .integer(pageSize),
+                            ]
                         )
-                        ORDER BY cid
-                        LIMIT ?
-                        """,
-                        [
-                            .text(sessionID), .text(expectedKind),
-                            .text(sessionID), .integer(timestamp),
-                            .integer(pageSize),
-                        ]
-                    )
+                    } else {
+                        rows = try await connection.query(
+                            """
+                            SELECT r.cid, r.kind, length(b.bytes) AS byte_count
+                            FROM public_repository_import_reachable r
+                            LEFT JOIN public_repository_import_blocks b
+                              ON b.session_id = r.session_id AND b.cid = r.cid
+                            WHERE r.session_id = ? AND r.kind = ? AND EXISTS (
+                                SELECT 1 FROM public_repository_import_sessions
+                                WHERE session_id = ? AND expires_at > ?
+                            )
+                            ORDER BY r.cid
+                            LIMIT ?
+                            """,
+                            [
+                                .text(sessionID), .text(expectedKind),
+                                .text(sessionID), .integer(timestamp),
+                                .integer(pageSize),
+                            ]
+                        )
+                    }
+                } else {
+                    if let lastCID {
+                        rows = try await connection.query(
+                            """
+                            SELECT cid, kind
+                            FROM public_repository_import_reachable
+                            WHERE session_id = ? AND kind = ? AND EXISTS (
+                                SELECT 1 FROM public_repository_import_sessions
+                                WHERE session_id = ? AND expires_at > ?
+                            ) AND cid > ?
+                            ORDER BY cid
+                            LIMIT ?
+                            """,
+                            [
+                                .text(sessionID), .text(expectedKind),
+                                .text(sessionID), .integer(timestamp),
+                                .text(lastCID), .integer(pageSize),
+                            ]
+                        )
+                    } else {
+                        rows = try await connection.query(
+                            """
+                            SELECT cid, kind
+                            FROM public_repository_import_reachable
+                            WHERE session_id = ? AND kind = ? AND EXISTS (
+                                SELECT 1 FROM public_repository_import_sessions
+                                WHERE session_id = ? AND expires_at > ?
+                            )
+                            ORDER BY cid
+                            LIMIT ?
+                            """,
+                            [
+                                .text(sessionID), .text(expectedKind),
+                                .text(sessionID), .integer(timestamp),
+                                .integer(pageSize),
+                            ]
+                        )
+                    }
                 }
                 if rows.isEmpty { break }
+                var pageCIDsToValidate: [(cid: CID, byteCount: Int)] = []
+                if validateBlocks {
+                    pageCIDsToValidate.reserveCapacity(rows.count)
+                }
                 for row in rows {
                     let kind = requiredText(row, "kind")
                     guard kind == expectedKind else {
@@ -1322,22 +1453,61 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                     digest.append(cidString)
 
                     if validateBlocks {
-                        let bodyRows = try await connection.query(
-                            """
-                            SELECT bytes FROM public_repository_import_blocks
-                            WHERE session_id = ? AND cid = ?
-                            """,
-                            [.text(sessionID), .text(cid.string)]
-                        )
-                        guard bodyRows.count == 1,
-                              let bodyValue = bodyRows.first?.column("bytes"),
-                              let body = Data(sqliteData: bodyValue) else {
+                        guard let byteCount = row.column("byte_count")?.integer,
+                              byteCount > 0 else {
                             throw PublicRepositoryImportStagingError.corruptStaging
                         }
-                        do {
-                            try PublicRepositoryCID.validate(cid, blockBytes: body)
-                        } catch {
-                            throw PublicRepositoryImportStagingError.corruptStaging
+                        pageCIDsToValidate.append((cid: cid, byteCount: byteCount))
+                    }
+                }
+
+                if validateBlocks, !pageCIDsToValidate.isEmpty {
+                    let maxValidationBatchBytes = 2 * 1024 * 1024
+                    var sliceStart = 0
+                    while sliceStart < pageCIDsToValidate.count {
+                        var sliceEnd = sliceStart
+                        var sliceBytes = 0
+                        while sliceEnd < pageCIDsToValidate.count {
+                            let nextBytes = pageCIDsToValidate[sliceEnd].byteCount
+                            if sliceEnd > sliceStart && sliceBytes + nextBytes > maxValidationBatchBytes {
+                                break
+                            }
+                            sliceBytes += nextBytes
+                            sliceEnd += 1
+                        }
+                        let slice = pageCIDsToValidate[sliceStart ..< sliceEnd]
+                        sliceStart = sliceEnd
+
+                        let placeholders = Array(repeating: "?", count: slice.count).joined(separator: ", ")
+                        var params: [SQLiteData] = [.text(sessionID)]
+                        params.append(contentsOf: slice.map { .text($0.cid.string) })
+                        let blockRows = try await connection.query(
+                            """
+                            SELECT cid, bytes
+                            FROM public_repository_import_blocks
+                            WHERE session_id = ? AND cid IN (\(placeholders))
+                            """,
+                            params
+                        )
+                        var blockMap: [String: Data] = [:]
+                        blockMap.reserveCapacity(blockRows.count)
+                        for blockRow in blockRows {
+                            guard let cidText = blockRow.column("cid")?.string,
+                                  let value = blockRow.column("bytes"),
+                                  let bytes = Data(sqliteData: value) else {
+                                throw PublicRepositoryImportStagingError.corruptStaging
+                            }
+                            blockMap[cidText] = bytes
+                        }
+                        for item in slice {
+                            guard let body = blockMap[item.cid.string] else {
+                                throw PublicRepositoryImportStagingError.corruptStaging
+                            }
+                            do {
+                                try PublicRepositoryCID.validate(item.cid, blockBytes: body)
+                            } catch {
+                                throw PublicRepositoryImportStagingError.corruptStaging
+                            }
                         }
                     }
                 }

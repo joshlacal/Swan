@@ -7,9 +7,9 @@ readonly profile="${profile_root}/permissioned-data-0016-2026-08-15.json"
 readonly manifest="${profile_root}/permissioned-data-0016-2026-08-15.lexicons.sha256"
 readonly generated_manifest="${profile_root}/permissioned-data-0016-2026-08-15.generated-wire.sha256"
 readonly petrel_manifest="${root}/PetrelManifest.json"
-readonly expected_profile_sha256="7c4733fdfb19246de785e7090b420b5cdfd95e2c9129de69625b860c35c11977"
+readonly expected_profile_sha256="b3edfc13675d4273cf036f1f74391795b3f1307d4b1fd24ad021f26fa60e4023"
 readonly expected_manifest_sha256="873fb88439cadd447ee6a90f9fadb262fa84bdb6689735b53e667db13d7219c3"
-readonly expected_generated_manifest_sha256="a5428bd2edd32d2d2a605e41fb46816a14e3a9985ede60b56f3e50f6ca180387"
+readonly expected_generated_manifest_sha256="7e7fe09868a7fcda0c6ab824ebe19e7f64ba147db63fd02a27762ed538e02704"
 readonly expected_petrel_manifest_sha256="70fa60badb45cfd17a261d3395b6c4ef80d94bf2d951034359ed1df93adad9ca"
 readonly reference_root="${1:-${root}/.interop-cache/atproto-bddc99fb24c34b4078b9bf65837283f37b49ab66}"
 readonly sha256="${root}/Scripts/sha256.sh"
@@ -54,7 +54,7 @@ if profile.get("lexiconManifestSHA256") != "873fb88439cadd447ee6a90f9fadb262fa84
     raise SystemExit("successor profile lexicon manifest pin mismatch")
 if profile.get("generatedWireManifest") != "permissioned-data-0016-2026-08-15.generated-wire.sha256":
     raise SystemExit("successor profile generated-wire manifest name mismatch")
-if profile.get("generatedWireManifestSHA256") != "a5428bd2edd32d2d2a605e41fb46816a14e3a9985ede60b56f3e50f6ca180387":
+if profile.get("generatedWireManifestSHA256") != "7e7fe09868a7fcda0c6ab824ebe19e7f64ba147db63fd02a27762ed538e02704":
     raise SystemExit("successor profile generated-wire manifest pin mismatch")
 PY
 

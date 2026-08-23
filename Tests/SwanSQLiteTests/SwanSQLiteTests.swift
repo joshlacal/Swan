@@ -5,6 +5,7 @@ import SQLiteNIO
 import SwanCore
 @_spi(PortableRestore) @testable import SwanSQLite
 import SwanPublicFirehose
+import SwanPublicRepository
 import SwanSpaces
 import SwanStorage
 import XCTest
@@ -4087,6 +4088,382 @@ final class SwanSQLiteTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: SQLiteLayout.controlDatabase(in: target).path
         ))
+    }
+
+    func testReadInFlightAcrossCloseWaitsForReadGate() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        _ = try await fixture.commitFirst(on: database)
+
+        let readStarted = AsyncSignal()
+        let releaseRead = AsyncSignal()
+        let readFinished = AsyncSignal()
+
+        let readTask = Task {
+            try await database.withReadConnectionGate {
+                await readStarted.signal()
+                await releaseRead.wait()
+                let rows = try await database.readConnection.query(
+                    "SELECT COUNT(*) AS c FROM permissioned_repository_state"
+                )
+                await readFinished.signal()
+                return rows.first?.column("c")?.integer
+            }
+        }
+
+        await readStarted.wait()
+
+        let closeTask = Task {
+            try await database.close()
+        }
+
+        // Give closeTask a moment to arrive at the gates
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        // Release the read
+        await releaseRead.signal()
+        await readFinished.wait()
+
+        let count = try await readTask.value
+        XCTAssertEqual(count, 1)
+        try await closeTask.value
+    }
+
+    func testConcurrentCommitDuringPublicRepositoryRecordCIDDoesNotCauseFalseCorruption() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanPublicRecordCIDTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: 0o700)]
+        )
+
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        let key = P256.Signing.PrivateKey()
+        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        defer { Task { try? await database.close() } }
+
+        let genesis = try PublicRepositoryGenesisCodec.create(
+            did: did,
+            revision: "3jzfcijpj2z2a",
+            signingKey: key
+        )
+        _ = try await database.installPublicRepositoryGenesis(
+            genesis,
+            signingPublicKey: key.publicKey,
+            installedAt: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+
+        let path = try PublicRepositoryPath(
+            collection: "app.bsky.feed.post",
+            recordKey: "test-post"
+        )
+        let record = PublicRecord(["$type": .string("app.bsky.feed.post"), "text": .string("hello")])
+        let preparedRecord = try PublicRepositoryRecordCodec.prepare(record, for: path)
+        let recordCID = preparedRecord.cid
+        // Initial query when no record exists returns nil
+        let initial = try await database.publicRepositoryRecordCID(for: path)
+        XCTAssertNil(initial)
+
+        // Reserve and apply mutation on writer connection
+        let loadedInitial = try await database.loadPublicRepositoryState()
+        let initialPublicState = try XCTUnwrap(loadedInitial)
+        let request = try PublicRepositoryMutationRequest(
+            id: "req-1",
+            canonicalDigest: Data(repeating: 0x42, count: 32),
+            baseCommitCID: initialPublicState.commitCID
+        )
+        let outcome = try await database.reservePublicRepositoryRevision(
+            request,
+            wallClockMicroseconds: 1_750_000_000_000_000
+        )
+        guard case let .reserved(reservation) = outcome else {
+            return XCTFail("expected reserved outcome")
+        }
+        let prepared = try await PublicRepositoryEngine.apply(
+            repositoryDID: did,
+            currentState: initialPublicState,
+            blocks: database,
+            revision: reservation.nextRevision,
+            batch: try PublicRepositoryWriteBatch(
+                writes: [.create(
+                    path: path,
+                    record: record
+                )],
+                expectedCommitCID: initialPublicState.commitCID
+            ),
+            signer: P256PublicRepositoryCommitSigner(privateKey: key)
+        )
+        _ = try await database.applyPublicRepositoryMutation(
+            reservation: reservation,
+            prepared: prepared
+        )
+
+        // Verify record CID on readConnection inside readTransaction
+        let cid = try await database.publicRepositoryRecordCID(for: path)
+        XCTAssertEqual(cid, recordCID)
+    }
+
+    func testSimpleSpaceMemberPageReadsAtomicSnapshotDuringConcurrentMutation() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close(); try? FileManager.default.removeItem(at: fixture.root) } }
+
+        let space = try SpaceURI(
+            authority: fixture.author,
+            spaceType: "app.bsky.bookmarks",
+            skey: "members-snapshot"
+        )
+        let authority = try DurableSimpleSpaceAuthority(
+            database: database,
+            credentialSecret: Data(repeating: 0xB5, count: 32)
+        )
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        _ = try await authority.create(
+            space: space,
+            owner: fixture.author,
+            configuration: try SimpleSpaceConfiguration(
+                policy: .memberList,
+                appAccess: .open
+            ),
+            authorization: .accountOAuthForTesting(subject: fixture.author, scopes: ["atproto"]),
+            now: now
+        )
+
+        let memberAlice = "did:plc:alice00000000000000000001"
+        _ = try await database.addSimpleSpaceMember(
+            space: space,
+            member: memberAlice,
+            authorization: .accountOAuthForTesting(subject: fixture.author, scopes: ["atproto"]),
+            now: now.addingTimeInterval(1)
+        )
+
+        let barrier = SnapshotReadBarrier()
+        await database.installTestingHooks(
+            SQLiteTestingHooks(
+                afterSimpleSpaceMemberPageAuthorityRead: {
+                    await barrier.pause()
+                }
+            )
+        )
+
+        // Launch read task on readConnection in background
+        let readTask = Task {
+            try await database.simpleSpaceMemberPage(
+                space: space,
+                limit: 100,
+                cursor: nil,
+                authorization: .accountOAuthForTesting(subject: fixture.author, scopes: ["atproto"])
+            )
+        }
+
+        // Wait until readTask has opened its read transaction and read authority row
+        await barrier.waitUntilPaused()
+
+        // Concurrent mutation on writer connection adds memberBob and commits
+        let memberBob = "did:plc:bob00000000000000000000002"
+        _ = try await database.addSimpleSpaceMember(
+            space: space,
+            member: memberBob,
+            authorization: .accountOAuthForTesting(subject: fixture.author, scopes: ["atproto"]),
+            now: now.addingTimeInterval(2)
+        )
+
+        // Release readTask to continue reading members under readConnection's frozen snapshot
+        await barrier.release()
+
+        let page = try await readTask.value
+        // Atomic snapshot MUST see [owner, alice] and MUST NOT see [bob]
+        XCTAssertEqual(Set(page.members), Set([fixture.author, memberAlice]))
+
+        // Subsequent read (new transaction) sees all three
+        let updatedPage = try await database.simpleSpaceMemberPage(
+            space: space,
+            limit: 100,
+            cursor: nil,
+            authorization: .accountOAuthForTesting(subject: fixture.author, scopes: ["atproto"])
+        )
+        XCTAssertEqual(Set(updatedPage.members), Set([fixture.author, memberAlice, memberBob]))
+    }
+
+    func testValidatePortableRestoreStreamingReadsAtomicSnapshot() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close(); try? FileManager.default.removeItem(at: fixture.root) } }
+
+        var ltHash = LtHash()
+        ltHash.add(element: "\(fixture.first.collection)/\(fixture.first.rkey)/\(fixture.firstCID)")
+        let recovery = VerifiedSpaceCARRecovery(
+            wireRevision: try fixture.tid(0),
+            records: [
+                SpaceRecord(
+                    uri: fixture.first,
+                    value: fixture.firstValue,
+                    cid: fixture.firstCID,
+                    revision: 1
+                ),
+            ],
+            ltHash: ltHash.serialized,
+            commitment: ltHash.commitment
+        )
+        let repo = SQLitePortableRestoreRepository(
+            space: fixture.space,
+            author: fixture.author,
+            recovery: recovery
+        )
+        try await database.restorePortableRepositories([repo])
+
+        let metadata = SQLitePortableRestoreRepositoryMetadata(
+            space: fixture.space,
+            author: fixture.author,
+            wireRevision: try fixture.tid(0),
+            recordCount: 1,
+            logicalRestoredByteCount: fixture.firstValue.count,
+            ltHash: ltHash.serialized,
+            commitment: ltHash.commitment
+        )
+
+        actor InTransactionObservation {
+            var authorityRowCount: Int = -1
+            func record(count: Int) {
+                authorityRowCount = count
+            }
+            func count() -> Int { authorityRowCount }
+        }
+        let observation = InTransactionObservation()
+
+        let barrier = SnapshotReadBarrier()
+        await database.installTestingHooks(
+            SQLiteTestingHooks(
+                afterValidatePortableRestoreStateRead: {
+                    await barrier.pause()
+                },
+                onValidatePortableRestoreStreamingTransaction: { conn in
+                    let rows = try await conn.query(
+                        "SELECT COUNT(*) AS c FROM permissioned_simple_space_authorities"
+                    )
+                    let c = rows.first?.column("c")?.integer ?? -1
+                    await observation.record(count: Int(c))
+                }
+            )
+        )
+
+        // Launch streaming validation task on readConnection
+        let validationTask = Task {
+            try await database.validatePortableRestoreStreaming(repositories: [metadata])
+        }
+
+        // Wait until validationTask has read state on readConnection
+        await barrier.waitUntilPaused()
+
+        // Concurrent commit on writer connection (e.g. creating another simple space)
+        let space = try SpaceURI(
+            authority: fixture.author,
+            spaceType: "app.bsky.bookmarks",
+            skey: "concurrent-commit"
+        )
+        let authority = try DurableSimpleSpaceAuthority(
+            database: database,
+            credentialSecret: Data(repeating: 0xC3, count: 32)
+        )
+        _ = try await authority.create(
+            space: space,
+            owner: fixture.author,
+            configuration: try SimpleSpaceConfiguration(
+                policy: .memberList,
+                appAccess: .open
+            ),
+            authorization: .accountOAuthForTesting(subject: fixture.author, scopes: ["atproto"]),
+            now: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+
+        // Release validationTask to finish validating values and closures on readConnection
+        await barrier.release()
+
+        // Must succeed without error under readConnection snapshot
+        try await validationTask.value
+
+        // Assert on the in-transaction observation: inside the validation transaction
+        // on readConnection, permissioned_simple_space_authorities had 0 rows.
+        let inTransactionCount = await observation.count()
+        XCTAssertEqual(
+            inTransactionCount,
+            0,
+            "in-flight validation transaction on readConnection must observe 0 authorities from its frozen pre-commit snapshot"
+        )
+
+        // Subsequent read on readConnection sees the newly committed space
+        let hostedSpaces = try await database.hostedSpaceURIs(
+            spaceType: nil,
+            authority: nil,
+            cursor: nil,
+            limit: 100
+        )
+        XCTAssertTrue(
+            hostedSpaces.contains(space),
+            "subsequent read transaction must observe the newly committed space"
+        )
+    }
+
+    func testCloseSurfacesReaderCloseFailureAndTracksClosedState() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close(); try? FileManager.default.removeItem(at: fixture.root) } }
+
+        struct InjectedReaderCloseError: Error, Equatable {}
+
+        actor AttemptCounter {
+            var count = 0
+            func increment() -> Int {
+                count += 1
+                return count
+            }
+            func value() -> Int { count }
+        }
+        let counter = AttemptCounter()
+
+        // Install hook that injects a failure on the first reader-close attempt,
+        // and succeeds on the second attempt while recording attempt count.
+        await database.installTestingHooks(
+            SQLiteTestingHooks(
+                onReaderClose: {
+                    let attempt = await counter.increment()
+                    if attempt == 1 {
+                        throw InjectedReaderCloseError()
+                    }
+                }
+            )
+        )
+
+        // First close() must surface the injected reader error and not set isClosed = true
+        var threwInjectedError = false
+        do {
+            try await database.close()
+        } catch is InjectedReaderCloseError {
+            threwInjectedError = true
+        }
+        XCTAssertTrue(threwInjectedError, "close() must propagate reader close failure")
+        let firstAttempts = await counter.value()
+        XCTAssertEqual(firstAttempts, 1, "first close() must attempt reader close exactly once")
+
+        // Second close() must retry closing the live reader handle and increment the attempt count
+        try await database.close()
+        let secondAttempts = await counter.value()
+        XCTAssertEqual(
+            secondAttempts,
+            2,
+            "second close() must attempt closing the reader handle again instead of short-circuiting on isClosed"
+        )
+
+        // A third close() after successful closure is a harmless idempotent replay (isClosed is true)
+        try await database.close()
+        let thirdAttempts = await counter.value()
+        XCTAssertEqual(
+            thirdAttempts,
+            2,
+            "third close() after successful closure must be an idempotent no-op replay"
+        )
     }
 }
 

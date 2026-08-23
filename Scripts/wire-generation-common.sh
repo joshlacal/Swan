@@ -11,7 +11,7 @@ wire_generation_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 wire_generation_profile="${wire_generation_root}/Profiles/permissioned-data-0016-2026-08-15.json"
 readonly wire_generation_expected_petrel_generator_commit="710ecb0af23f07737c5c9b60eeed24092cb3aa3c"
 readonly wire_generation_sha256="${wire_generation_root}/Scripts/sha256.sh"
-readonly wire_generation_expected_profile_sha256="7c4733fdfb19246de785e7090b420b5cdfd95e2c9129de69625b860c35c11977"
+readonly wire_generation_expected_profile_sha256="b3edfc13675d4273cf036f1f74391795b3f1307d4b1fd24ad021f26fa60e4023"
 readonly wire_generation_expected_petrel_manifest_sha256="70fa60badb45cfd17a261d3395b6c4ef80d94bf2d951034359ed1df93adad9ca"
 
 wire_generation_profile_value() {

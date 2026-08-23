@@ -397,7 +397,7 @@ private func localhostPARNonceChallenge(runtime: SwanOAuthRuntime) -> Response {
     headers[.cacheControl] = "no-store"
     headers[SwanLocalhostPARHTTP.dpopNonceHeader] = runtime.dpopNonceService.issue()
     headers[.wwwAuthenticate] = "DPoP error=\"use_dpop_nonce\""
-    let data = (try? JSONEncoder().encode(LocalhostPARError(error: "use_dpop_nonce"))) ?? Data("{}".utf8)
+    let data = (try? SwanJSONEncoders.default.encode(LocalhostPARError(error: "use_dpop_nonce"))) ?? Data("{}".utf8)
     return Response(status: .badRequest, headers: headers, body: .init(byteBuffer: ByteBuffer(data: data)))
 }
 
@@ -409,9 +409,7 @@ private func localhostPARError(
 }
 
 private func localhostPARJSON(_ status: HTTPResponse.Status, _ body: some Encodable) -> Response {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
+    let data = (try? SwanJSONEncoders.sortedNoEscaping.encode(body)) ?? Data("{}".utf8)
     return Response(
         status: status,
         headers: [.contentType: "application/json", .cacheControl: "no-store"],

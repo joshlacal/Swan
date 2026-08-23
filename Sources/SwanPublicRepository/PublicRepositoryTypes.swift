@@ -29,6 +29,9 @@ public struct PublicRepositoryPath: Hashable, Sendable, CustomStringConvertible 
 
     public let collection: String
     public let recordKey: String
+    public let mstKey: String
+    public let mstKeyBytes: Data
+    public let keyDepth: Int
 
     public init(collection: String, recordKey: String) throws {
         guard Self.isValidCollection(collection) else {
@@ -38,15 +41,26 @@ public struct PublicRepositoryPath: Hashable, Sendable, CustomStringConvertible 
             throw PublicRepositoryDomainError.invalidRecordKey
         }
         let key = "\(collection)/\(recordKey)"
-        guard key.utf8.count <= Self.maximumMSTKeyBytes else {
+        let bytes = Data(key.utf8)
+        guard bytes.count <= Self.maximumMSTKeyBytes else {
             throw PublicRepositoryDomainError.pathTooLong
         }
         self.collection = collection
         self.recordKey = recordKey
+        self.mstKey = key
+        self.mstKeyBytes = bytes
+        self.keyDepth = RepositoryMSTCodec.keyDepth(forASCIIBytes: bytes)
     }
 
-    public var mstKey: String { "\(collection)/\(recordKey)" }
     public var description: String { mstKey }
+
+    public static func == (lhs: PublicRepositoryPath, rhs: PublicRepositoryPath) -> Bool {
+        lhs.mstKey == rhs.mstKey
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(mstKey)
+    }
 
     /// Mirrors the human-readable validator in pinned `@atproto/syntax`.
     private static func isValidCollection(_ value: String) -> Bool {

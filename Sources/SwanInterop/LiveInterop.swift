@@ -11,7 +11,6 @@ import SwanOAuth
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
-import SwanSpacesWire
 
 /// A bounded, redirect-free HTTP response used by the stateful interop
 /// harness.  The body is present only for small JSON/XRPC responses; CAR and

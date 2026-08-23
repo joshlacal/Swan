@@ -49,11 +49,20 @@ public enum SQLiteLayout {
 
     /// Connection-local configuration must run outside a migration write
     /// transaction (`foreign_keys` and `journal_mode` are not safely changed
-    /// inside one). Schema DDL below is serialized separately with
-    /// `BEGIN IMMEDIATE` by the owning SQLite database actor.
+    /// inside one). `synchronous=NORMAL` under WAL is the standard durability
+    /// point: it cannot corrupt the database; it can lose the tail of the most
+    /// recent transaction on host power loss or OS crash (not on process crash).
+    /// Swan's durability story for accepted writes is the firehose sequence
+    /// plus replication, not single-host fsync-per-commit. `cache_size`
+    /// (-64000 = ~64MB) and `mmap_size` (256MB) are connection-local performance
+    /// tunings. Schema DDL below is serialized separately with `BEGIN IMMEDIATE`
+    /// by the owning SQLite database actor.
     public static let controlConnectionPragmas = [
         "PRAGMA busy_timeout=5000",
         "PRAGMA journal_mode=WAL",
+        "PRAGMA synchronous=NORMAL",
+        "PRAGMA cache_size=-64000",
+        "PRAGMA mmap_size=268435456",
         "PRAGMA foreign_keys=ON",
     ]
 
@@ -652,9 +661,19 @@ public enum SQLiteLayout {
         """,
     ]
 
+    /// Connection-local configuration for account databases. `synchronous=NORMAL`
+    /// under WAL is the standard durability point: it cannot corrupt the database;
+    /// it can lose the tail of the most recent transaction on host power loss
+    /// or OS crash (not on process crash). Swan's durability story for accepted
+    /// writes is the firehose sequence plus replication, not single-host
+    /// fsync-per-commit. `cache_size` (-64000 = ~64MB) and `mmap_size` (256MB)
+    /// are connection-local performance tunings.
     public static let accountConnectionPragmas = [
         "PRAGMA busy_timeout=5000",
         "PRAGMA journal_mode=WAL",
+        "PRAGMA synchronous=NORMAL",
+        "PRAGMA cache_size=-64000",
+        "PRAGMA mmap_size=268435456",
         "PRAGMA foreign_keys=ON",
     ]
 
@@ -1324,6 +1343,8 @@ public enum SQLiteLayout {
             wire_revision TEXT NOT NULL,
             lthash BLOB NOT NULL CHECK(length(lthash) = 2048),
             current_commit BLOB NOT NULL,
+            oplog_entry_count INTEGER NOT NULL DEFAULT 0 CHECK(oplog_entry_count >= 0),
+            request_entry_count INTEGER NOT NULL DEFAULT 0 CHECK(request_entry_count >= 0),
             PRIMARY KEY(space_uri, author_did)
         )
         """,
@@ -1409,6 +1430,10 @@ public enum SQLiteLayout {
             -- are therefore evicted before any stamped row.
             created_at INTEGER NOT NULL DEFAULT 0 CHECK(created_at >= 0)
         )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS permissioned_space_requests_retention
+        ON permissioned_space_requests(space_uri, author_did, final_revision)
         """,
         """
         CREATE TABLE IF NOT EXISTS permissioned_space_outbox (
@@ -2056,8 +2081,11 @@ struct SQLiteTestingHooks: Sendable {
     var afterRemoteReplicaMutatingSQL: (@Sendable (Int) async throws -> Void)?
     var beforePermanentDeletionClose: (@Sendable () async throws -> Void)?
     var beforeWireOplogValueMaterialization: (@Sendable () async throws -> Void)?
+    var afterSimpleSpaceMemberPageAuthorityRead: (@Sendable () async -> Void)?
+    var afterValidatePortableRestoreStateRead: (@Sendable () async -> Void)?
+    var onValidatePortableRestoreStreamingTransaction: (@Sendable (SQLiteConnection) async throws -> Void)?
+    var onReaderClose: (@Sendable () async throws -> Void)?
     var incrementalReplayRetentionOperationLimit: Int?
-
     init(
         beforeApplyCommit: (@Sendable () async throws -> Void)? = nil,
         afterSnapshotStateRead: (@Sendable () async -> Void)? = nil,
@@ -2070,6 +2098,10 @@ struct SQLiteTestingHooks: Sendable {
         afterRemoteReplicaMutatingSQL: (@Sendable (Int) async throws -> Void)? = nil,
         beforePermanentDeletionClose: (@Sendable () async throws -> Void)? = nil,
         beforeWireOplogValueMaterialization: (@Sendable () async throws -> Void)? = nil,
+        afterSimpleSpaceMemberPageAuthorityRead: (@Sendable () async -> Void)? = nil,
+        afterValidatePortableRestoreStateRead: (@Sendable () async -> Void)? = nil,
+        onValidatePortableRestoreStreamingTransaction: (@Sendable (SQLiteConnection) async throws -> Void)? = nil,
+        onReaderClose: (@Sendable () async throws -> Void)? = nil,
         incrementalReplayRetentionOperationLimit: Int? = nil
     ) {
         self.beforeApplyCommit = beforeApplyCommit
@@ -2084,6 +2116,11 @@ struct SQLiteTestingHooks: Sendable {
         self.afterRemoteReplicaMutatingSQL = afterRemoteReplicaMutatingSQL
         self.beforePermanentDeletionClose = beforePermanentDeletionClose
         self.beforeWireOplogValueMaterialization = beforeWireOplogValueMaterialization
+        self.afterSimpleSpaceMemberPageAuthorityRead = afterSimpleSpaceMemberPageAuthorityRead
+        self.afterValidatePortableRestoreStateRead = afterValidatePortableRestoreStateRead
+        self.onValidatePortableRestoreStreamingTransaction =
+            onValidatePortableRestoreStreamingTransaction
+        self.onReaderClose = onReaderClose
         self.incrementalReplayRetentionOperationLimit =
             incrementalReplayRetentionOperationLimit
     }
@@ -2127,6 +2164,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let stagedBlobNamespaceMigrationVersion = 15
     private static let permissionedRequestReceiptRetentionMigrationVersion = 16
     private static let permissionedSpaceRecordBlobIndexMigrationVersion = 17
+    private static let permissionedOplogRetentionCutoffMigrationVersion = 18
 
     /// How long an uploaded blob no commit has claimed stays staged.
     ///
@@ -2185,7 +2223,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     public static let maximumPortableExportBlobs = 100_000
 
     let connection: SQLiteConnection
+    let readConnection: SQLiteConnection
     let connectionGate = SQLiteConnectionGate()
+    let readConnectionGate = SQLiteConnectionGate()
     let dataDirectory: URL
     let accountDID: String
     private let oplogRetention: Int
@@ -2199,8 +2239,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         SQLiteAccountExternalBodyLeaseGate()
     var testingHooks = SQLiteTestingHooks()
     private var activeWriteTransactions = 0
+    private var isReaderClosed = false
+    private var isWriterClosed = false
     private var isClosed = false
-
     public init(
         dataDirectory: URL,
         did: String,
@@ -2346,6 +2387,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         portableExportReadOnly = readOnly
         descriptorBackedRestore = descriptorBacked
         let openedConnection: SQLiteConnection
+        let openedReadConnection: SQLiteConnection
         do {
             let connectionPath = try readOnly
                 ? SQLiteLayout.readOnlyURI(for: databasePath)
@@ -2361,13 +2403,36 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             SQLiteProtectedPaths.closeDirectory(accountDescriptor)
             throw error
         }
+        do {
+            let readConnectionPath = try readOnly
+                ? SQLiteLayout.readOnlyURI(for: databasePath)
+                : databasePath
+            openedReadConnection = try await SQLiteConnection.open(
+                storage: .file(path: readConnectionPath)
+            )
+        } catch {
+            try? await openedConnection.close()
+            SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
+            SQLiteProtectedPaths.closeAccountLifecycleLock(
+                lifecycleLockDescriptor
+            )
+            SQLiteProtectedPaths.closeDirectory(accountDescriptor)
+            throw error
+        }
         connection = openedConnection
+        readConnection = openedReadConnection
         accountDirectoryDescriptor = accountDescriptor
         databaseFileDescriptor = heldDatabaseDescriptor
         accountLifecycleLockDescriptor = lifecycleLockDescriptor
         if !readOnly {
             do {
                 try await migrateWithoutGate()
+                let readPragmas = descriptorBackedRestore
+                    ? ["PRAGMA busy_timeout=5000", "PRAGMA journal_mode=MEMORY", "PRAGMA synchronous=NORMAL", "PRAGMA cache_size=-64000", "PRAGMA mmap_size=268435456", "PRAGMA foreign_keys=ON", "PRAGMA query_only=ON"]
+                    : SQLiteLayout.accountConnectionPragmas + ["PRAGMA query_only=ON"]
+                for statement in readPragmas {
+                    _ = try await openedReadConnection.query(statement)
+                }
                 _ = try await recoverExpiredPublicRepositoryImportSessionsWithoutGate(
                     now: Int(Date().timeIntervalSince1970)
                 )
@@ -2384,6 +2449,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     )
                 }
             } catch {
+                try? await openedReadConnection.close()
                 try? await openedConnection.close()
                 SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
                 SQLiteProtectedPaths.closeAccountLifecycleLock(
@@ -2393,6 +2459,23 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 throw error
             }
         } else {
+            do {
+                let readPragmas = descriptorBackedRestore
+                    ? ["PRAGMA busy_timeout=5000", "PRAGMA journal_mode=MEMORY", "PRAGMA synchronous=NORMAL", "PRAGMA cache_size=-64000", "PRAGMA mmap_size=268435456", "PRAGMA foreign_keys=ON", "PRAGMA query_only=ON"]
+                    : SQLiteLayout.accountConnectionPragmas + ["PRAGMA query_only=ON"]
+                for statement in readPragmas {
+                    _ = try await openedReadConnection.query(statement)
+                }
+            } catch {
+                try? await openedReadConnection.close()
+                try? await openedConnection.close()
+                SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
+                SQLiteProtectedPaths.closeAccountLifecycleLock(
+                    lifecycleLockDescriptor
+                )
+                SQLiteProtectedPaths.closeDirectory(accountDescriptor)
+                throw error
+            }
             // The mode=ro URI above makes the durable account database
             // immutable while still allowing CAR export to create/drop
             // connection-local TEMP index tables. SQLite's query_only pragma
@@ -2408,25 +2491,52 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         // all converge on the same actor. Closing twice must be a harmless
         // replay rather than invoking SQLiteNIO on an already-closed handle.
         guard !isClosed else { return }
-        isClosed = true
         try await withConnectionGate {
-            let descriptor = accountDirectoryDescriptor
-            let databaseDescriptor = databaseFileDescriptor
-            let lifecycleDescriptor = accountLifecycleLockDescriptor
-            accountDirectoryDescriptor = -1
-            databaseFileDescriptor = -1
-            accountLifecycleLockDescriptor = -1
-            defer {
-                SQLiteProtectedPaths.closeDirectory(databaseDescriptor)
-                SQLiteProtectedPaths.closeAccountLifecycleLock(
-                    lifecycleDescriptor
-                )
-                SQLiteProtectedPaths.closeDirectory(descriptor)
+            try await withReadConnectionGate {
+                var readerError: Error?
+                if !isReaderClosed {
+                    do {
+                        if let hook = testingHooks.onReaderClose {
+                            try await hook()
+                        }
+                        try await readConnection.close()
+                        isReaderClosed = true
+                    } catch {
+                        readerError = error
+                    }
+                }
+                var writerError: Error?
+                if !isWriterClosed {
+                    do {
+                        try await connection.close()
+                        isWriterClosed = true
+                    } catch {
+                        writerError = error
+                    }
+                }
+                if isReaderClosed && isWriterClosed {
+                    isClosed = true
+                    let descriptor = accountDirectoryDescriptor
+                    let databaseDescriptor = databaseFileDescriptor
+                    let lifecycleDescriptor = accountLifecycleLockDescriptor
+                    accountDirectoryDescriptor = -1
+                    databaseFileDescriptor = -1
+                    accountLifecycleLockDescriptor = -1
+                    SQLiteProtectedPaths.closeDirectory(databaseDescriptor)
+                    SQLiteProtectedPaths.closeAccountLifecycleLock(
+                        lifecycleDescriptor
+                    )
+                    SQLiteProtectedPaths.closeDirectory(descriptor)
+                }
+                if let readerError {
+                    throw readerError
+                }
+                if let writerError {
+                    throw writerError
+                }
             }
-            try await connection.close()
         }
     }
-
     /// Returns the identity of the exact database file descriptor retained
     /// for this connection. The descriptor is kept even for normal WAL
     /// databases (SQLite still uses the directory path for sidecars), so
@@ -2518,6 +2628,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePublicFirehoseOutboxIfNeeded()
             try await migratePublicFirehoseCompletionAnchorsIfNeeded()
             try await migratePermissionedRequestReceiptRetentionIfNeeded()
+            try await migratePermissionedOplogRetentionCutoffIfNeeded()
             try await migrateSpaceNotificationServiceIdentityIfNeeded()
             try await backfillPermissionedSpaceRecordBlobIndexIfNeeded()
         }
@@ -3058,6 +3169,55 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             ]
         )
     }
+    private func migratePermissionedOplogRetentionCutoffIfNeeded() async throws {
+        let version = Self.permissionedOplogRetentionCutoffMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        try await addAccountColumnIfMissing(
+            table: "permissioned_repository_state",
+            column: "oplog_entry_count",
+            definition: "INTEGER NOT NULL DEFAULT 0 CHECK(oplog_entry_count >= 0)"
+        )
+        try await addAccountColumnIfMissing(
+            table: "permissioned_repository_state",
+            column: "request_entry_count",
+            definition: "INTEGER NOT NULL DEFAULT 0 CHECK(request_entry_count >= 0)"
+        )
+        _ = try await connection.query(
+            """
+            UPDATE permissioned_repository_state AS s
+            SET oplog_entry_count = (
+                SELECT COUNT(*) FROM permissioned_space_oplog AS o
+                WHERE o.space_uri = s.space_uri AND o.author_did = s.author_did
+            ),
+            request_entry_count = (
+                SELECT COUNT(*) FROM permissioned_space_requests AS r
+                WHERE r.space_uri = s.space_uri AND r.author_did = s.author_did
+            )
+            """
+        )
+        _ = try await connection.query(
+            """
+            CREATE INDEX IF NOT EXISTS permissioned_space_requests_retention
+            ON permissioned_space_requests(space_uri, author_did, final_revision)
+            """
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
 
     /// Builds the record→blob edge index for databases whose permissioned
     /// records predate `permissioned_space_record_blobs`. New writes maintain
@@ -3928,8 +4088,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 "public record belongs to another account"
             )
         }
-        return try await withConnectionGate {
-            let rows = try await connection.query(
+        return try await withReadConnectionGate {
+            let rows = try await readConnection.query(
                 """
                 SELECT value, cid, revision
                 FROM public_repository_records
@@ -4107,8 +4267,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         } catch {
             throw PublicRepositoryGenesisStoreError.ownershipMismatch
         }
-        return try await withConnectionGate {
-            let rows = try await connection.query(
+        return try await withReadConnectionGate {
+            let rows = try await readConnection.query(
                 """
                 SELECT did, revision, commit_cid, car, installed_at
                 FROM public_repository_genesis
@@ -4206,8 +4366,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 throw SQLiteRepositoryError.duplicateRequest(requestID)
             }
 
-            let current = try await loadState(space: space, author: author)
+            let loaded = try await loadStateWithCounts(space: space, author: author)
+            let current = loaded?.state
             let actualRevision = current?.revision ?? 0
+            var newOplogCount = (loaded?.oplogEntryCount ?? 0) + writes.count
+            var newRequestCount = (loaded?.requestEntryCount ?? 0) + 1
             guard expectedRevision == actualRevision else {
                 throw SwanError.conflict(
                     expected: expectedRevision,
@@ -4367,25 +4530,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 wireRevision: wireRevision,
                 commitment: ltHash.commitment
             )
-            _ = try await connection.query(
-                """
-                INSERT INTO permissioned_repository_state(
-                    space_uri, author_did, revision, wire_revision,
-                    lthash, current_commit
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(space_uri, author_did) DO UPDATE SET
-                    revision = excluded.revision,
-                    wire_revision = excluded.wire_revision,
-                    lthash = excluded.lthash,
-                    current_commit = excluded.current_commit
-                """,
-                [
-                    .text(space.rawValue), .text(author),
-                    .integer(storedFinalRevision),
-                    .text(wireRevision.toString()), blob(ltHash.serialized),
-                    blob(marker),
-                ]
-            )
 
             let createdAt = Int(Date().timeIntervalSince1970 * 1_000_000)
             _ = try await connection.query(
@@ -4471,24 +4615,32 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
             try await testingHooks.beforeApplyCommit?()
 
-            let cutoffRows = try await connection.query(
-                """
-                SELECT revision
-                FROM permissioned_space_oplog
-                WHERE space_uri = ? AND author_did = ?
-                ORDER BY revision DESC, operation_index DESC
-                LIMIT 1 OFFSET ?
-                """,
-                [
-                    .text(space.rawValue), .text(author),
-                    .integer(oplogRetention - 1),
-                ]
-            )
-            if let cutoffRow = cutoffRows.first {
-                let oldestRetainedRevision = try requiredRevision(
-                    cutoffRow,
-                    "revision"
+            let minimumRetainedCommitRevision = max(1, storedFinalRevision - oplogRetention + 1)
+
+            // The receipt ledger is a replay reservation: every commit writes exactly
+            // one request keyed by monotonic final_revision. The retention cutoff is
+            // calculated directly in memory without any SELECT query or OFFSET scan.
+            if minimumRetainedCommitRevision > 1 {
+                _ = try await connection.query(
+                    """
+                    DELETE FROM permissioned_space_requests
+                    WHERE space_uri = ? AND author_did = ? AND final_revision < ?
+                    """,
+                    [
+                        .text(space.rawValue), .text(author),
+                        .integer(minimumRetainedCommitRevision),
+                    ]
                 )
+                let deletedRequests = try await connection.query(
+                    "SELECT changes() AS count"
+                )
+                if let first = deletedRequests.first {
+                    let deletedCount = try requiredNonnegativeInteger(first, "count")
+                    newRequestCount = max(0, newRequestCount - deletedCount)
+                }
+
+                // Revisions older than the retention depth window are guaranteed to
+                // have >= oplogRetention operations after them. Prune them directly.
                 _ = try await connection.query(
                     """
                     DELETE FROM permissioned_space_oplog
@@ -4496,56 +4648,87 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     """,
                     [
                         .text(space.rawValue), .text(author),
-                        .integer(try sqliteRevision(oldestRetainedRevision)),
+                        .integer(minimumRetainedCommitRevision),
                     ]
                 )
+                let deletedOplog = try await connection.query(
+                    "SELECT changes() AS count"
+                )
+                if let first = deletedOplog.first {
+                    let deletedCount = try requiredNonnegativeInteger(first, "count")
+                    newOplogCount = max(0, newOplogCount - deletedCount)
+                }
             }
 
-            // The receipt ledger is a replay reservation, not the state guard:
-            // the revision CAS above is what refuses a stale write, so a
-            // request older than this window is answered as a conflict instead
-            // of a duplicate. Retain it to the same depth as the oplog rather
-            // than by age, so one retention knob governs both and neither
-            // outlives the other. `created_at` orders the window; the final
-            // revision breaks ties and orders unstamped pre-upgrade rows.
-            let receiptCutoffRows = try await connection.query(
-                """
-                SELECT created_at, final_revision
-                FROM permissioned_space_requests
-                WHERE space_uri = ? AND author_did = ?
-                ORDER BY created_at DESC, final_revision DESC
-                LIMIT 1 OFFSET ?
-                """,
-                [
-                    .text(space.rawValue), .text(author),
-                    .integer(oplogRetention - 1),
-                ]
-            )
-            if let receiptCutoffRow = receiptCutoffRows.first {
-                let oldestRetainedStamp = try requiredNonnegativeInteger(
-                    receiptCutoffRow,
-                    "created_at"
-                )
-                let oldestRetainedReceipt = try requiredRevision(
-                    receiptCutoffRow,
-                    "final_revision"
-                )
-                _ = try await connection.query(
+            // If multi-operation commits in the retained window cause oplog entries to
+            // exceed oplogRetention, seek the exact cutoff revision from the oldest
+            // retained revision and delete the excess past that cutoff.
+            if newOplogCount > oplogRetention {
+                let excess = newOplogCount - oplogRetention
+                let cutoffRows = try await connection.query(
                     """
-                    DELETE FROM permissioned_space_requests
-                    WHERE space_uri = ? AND author_did = ?
-                      AND (created_at < ?
-                           OR (created_at = ? AND final_revision < ?))
+                    SELECT revision
+                    FROM permissioned_space_oplog
+                    WHERE space_uri = ? AND author_did = ? AND revision >= ?
+                    ORDER BY revision ASC, operation_index ASC
+                    LIMIT 1 OFFSET ?
                     """,
                     [
                         .text(space.rawValue), .text(author),
-                        .integer(oldestRetainedStamp),
-                        .integer(oldestRetainedStamp),
-                        .integer(try sqliteRevision(oldestRetainedReceipt)),
+                        .integer(minimumRetainedCommitRevision),
+                        .integer(excess),
                     ]
                 )
+                if let cutoffRow = cutoffRows.first {
+                    let oldestRetainedRevision = try requiredRevision(
+                        cutoffRow,
+                        "revision"
+                    )
+                    if oldestRetainedRevision > minimumRetainedCommitRevision {
+                        _ = try await connection.query(
+                            """
+                            DELETE FROM permissioned_space_oplog
+                            WHERE space_uri = ? AND author_did = ? AND revision < ?
+                            """,
+                            [
+                                .text(space.rawValue), .text(author),
+                                .integer(try sqliteRevision(oldestRetainedRevision)),
+                            ]
+                        )
+                        let deletedRows = try await connection.query(
+                            "SELECT changes() AS count"
+                        )
+                        if let first = deletedRows.first {
+                            let deletedCount = try requiredNonnegativeInteger(first, "count")
+                            newOplogCount = max(0, newOplogCount - deletedCount)
+                        }
+                    }
+                }
             }
 
+            _ = try await connection.query(
+                """
+                INSERT INTO permissioned_repository_state(
+                    space_uri, author_did, revision, wire_revision,
+                    lthash, current_commit, oplog_entry_count, request_entry_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(space_uri, author_did) DO UPDATE SET
+                    revision = excluded.revision,
+                    wire_revision = excluded.wire_revision,
+                    lthash = excluded.lthash,
+                    current_commit = excluded.current_commit,
+                    oplog_entry_count = excluded.oplog_entry_count,
+                    request_entry_count = excluded.request_entry_count
+                """,
+                [
+                    .text(space.rawValue), .text(author),
+                    .integer(storedFinalRevision),
+                    .text(wireRevision.toString()), blob(ltHash.serialized),
+                    blob(marker),
+                    .integer(newOplogCount),
+                    .integer(newRequestCount),
+                ]
+            )
             let state = PersistedRepositoryState(
                 space: space,
                 author: author,
@@ -4576,12 +4759,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         author: String
     ) async throws -> PersistedRepositorySnapshot? {
         try requireAccount(author)
-        return try await withConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space)
+                try await requireLocalRepositorySpaceOpen(space, connection: readConnection)
                 return try await repositorySnapshotWithoutTransaction(
                     space: space,
-                    author: author
+                    author: author,
+                    connection: readConnection
                 )
             }
         }
@@ -4591,9 +4775,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// SQLite read snapshot. Payload materialization and filesystem output are
     /// deliberately outside this transaction.
     public func portableExportInventory() async throws -> SQLitePortableExportInventory {
-        try await withConnectionGate {
+        try await withReadConnectionGate {
             try await readTransaction {
-                let repositoryCountRows = try await connection.query(
+                let repositoryCountRows = try await readConnection.query(
                     "SELECT COUNT(*) AS row_count FROM permissioned_repository_state"
                 )
                 guard repositoryCountRows.count == 1,
@@ -4605,7 +4789,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         "portable export repository inventory exceeds its bound"
                     )
                 }
-                let repositoryRows = try await connection.query(
+                let repositoryRows = try await readConnection.query(
                     """
                     SELECT space_uri, author_did
                     FROM permissioned_repository_state
@@ -4635,7 +4819,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     )
                 }
 
-                let blobCountRows = try await connection.query(
+                let blobCountRows = try await readConnection.query(
                     """
                     SELECT COUNT(*) AS row_count
                     FROM blob_namespace_references AS reference
@@ -4657,7 +4841,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         "portable export blob inventory exceeds its bound"
                     )
                 }
-                let blobRows = try await connection.query(
+                let blobRows = try await readConnection.query(
                     """
                     SELECT cid, namespace_kind, space_uri
                     FROM blob_namespace_references AS reference
@@ -4960,9 +5144,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         for repository in expected {
             try validatePortableRestoreRepository(repository)
         }
-        try await withConnectionGate {
+        try await withReadConnectionGate {
             try await readTransaction {
-                let states = try await connection.query(
+                let states = try await readConnection.query(
                     """
                     SELECT space_uri, author_did
                     FROM permissioned_repository_state
@@ -4984,7 +5168,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         )
                     }
                 }
-                let rows = try await connection.query(
+                let rows = try await readConnection.query(
                     """
                     SELECT space_uri, author_did, reason
                     FROM permissioned_restored_repository_closures
@@ -5002,7 +5186,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                           try requiredText(row, "reason") == "missing-authority-policy-v1",
                           let snapshot = try await repositorySnapshotWithoutTransaction(
                               space: repository.space,
-                              author: repository.author
+                              author: repository.author,
+                              connection: readConnection
                           ),
                           snapshot.state.revision == 1,
                           snapshot.state.wireRevision == repository.wireRevision,
@@ -5028,7 +5213,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     "permissioned_space_writers",
                     "permissioned_space_notification_registrations",
                 ] {
-                    let unexpected = try await connection.query(
+                    let unexpected = try await readConnection.query(
                         "SELECT 1 FROM \(table) LIMIT 1"
                     )
                     guard unexpected.isEmpty else {
@@ -5055,7 +5240,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 "portable restore repository inventory is invalid"
             )
         }
-        try await withConnectionGate {
+        try await withReadConnectionGate {
             try await readTransaction {
                 for repository in ordered {
                     try Task.checkCancellation()
@@ -5073,7 +5258,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     }
                     guard let state = try await loadState(
                         space: repository.space,
-                        author: repository.author
+                        author: repository.author,
+                        connection: readConnection
                     ),
                         state.revision == 1,
                         state.wireRevision == repository.wireRevision,
@@ -5084,6 +5270,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             "portable restore repository validation failed"
                         )
                     }
+                    await testingHooks.afterValidatePortableRestoreStateRead?()
                     var cursorCollection: String?
                     var cursorRKey: String?
                     var count = 0
@@ -5093,7 +5280,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         try Task.checkCancellation()
                         let rows: [SQLiteRow]
                         if let cursorCollection, let cursorRKey {
-                            rows = try await connection.query(
+                            rows = try await readConnection.query(
                                 """
                                 SELECT collection, rkey, cid,
                                        length(value) AS value_byte_count
@@ -5111,7 +5298,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                                 ]
                             )
                         } else {
-                            rows = try await connection.query(
+                            rows = try await readConnection.query(
                                 """
                                 SELECT collection, rkey, cid,
                                        length(value) AS value_byte_count
@@ -5150,7 +5337,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                                 collection: collection,
                                 rkey: rkey
                             )
-                            let valueRows = try await connection.query(
+                            let valueRows = try await readConnection.query(
                                 """
                                 SELECT value
                                 FROM permissioned_space_records
@@ -5227,7 +5414,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         )
                     }
                 }
-                let closures = try await connection.query(
+                let closures = try await readConnection.query(
                     """
                     SELECT space_uri, author_did, reason
                     FROM permissioned_restored_repository_closures
@@ -5263,7 +5450,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     "permissioned_space_writers",
                     "permissioned_space_notification_registrations",
                 ] {
-                    let unexpected = try await connection.query(
+                    let unexpected = try await readConnection.query(
                         "SELECT 1 FROM \(table) LIMIT 1"
                     )
                     guard unexpected.isEmpty else {
@@ -5271,6 +5458,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             "portable restore fabricated policy or delivery state"
                         )
                     }
+                }
+                if let hook = testingHooks.onValidatePortableRestoreStreamingTransaction {
+                    try await hook(readConnection)
                 }
             }
         }
@@ -5466,7 +5656,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
         let prepared = try await withConnectionGate {
             try await withRepositoryCARIndexTable {
-                try await readTransaction {
+                try await writerReadTransaction {
                     try Task.checkCancellation()
                     try await requireLocalRepositorySpaceOpen(space)
                     return try await prepareRepositoryCARSnapshotWithoutTransaction(
@@ -6103,10 +6293,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         author: String
     ) async throws -> PersistedRepositoryState? {
         try requireAccount(author)
-        let state = try await withConnectionGate {
+        let state = try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space)
-                return try await loadState(space: space, author: author)
+                try await requireLocalRepositorySpaceOpen(space, connection: readConnection)
+                return try await loadState(space: space, author: author, connection: readConnection)
             }
         }
         await testingHooks.afterRepositoryStateRead?()
@@ -6128,14 +6318,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         guard (1 ... 100).contains(limit) else {
             throw SwanError.malformed("invalid hosted-space page limit")
         }
-        return try await withConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
                 // `UNION` de-duplicates exact identity rows before Swift
                 // validates their canonical `SpaceURI` spelling and applies
                 // type/authority/cursor paging.  A local authority deletion,
                 // recipient tombstone, or v1 restored-policy closure always
                 // wins over a repository-state row.
-                let rows = try await connection.query(
+                let rows = try await readConnection.query(
                     """
                     SELECT space_uri, MAX(is_local_authority) AS is_local_authority
                     FROM (
@@ -6225,13 +6415,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
     private func repositorySnapshotWithoutTransaction(
         space: SpaceURI,
-        author: String
+        author: String,
+        connection: SQLiteConnection? = nil
     ) async throws -> PersistedRepositorySnapshot? {
-        guard let state = try await loadState(space: space, author: author) else {
+        let conn = connection ?? self.connection
+        guard let state = try await loadState(space: space, author: author, connection: conn) else {
             return nil
         }
         await testingHooks.afterSnapshotStateRead?()
-        let rows = try await connection.query(
+        let rows = try await conn.query(
             """
             SELECT collection, rkey, value, cid, revision
             FROM permissioned_space_records
@@ -6250,13 +6442,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         _ uri: SpaceRecordURI
     ) async throws -> PersistedSpaceRecord? {
         try requireAccount(uri.author)
-        return try await withConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(uri.space)
-                guard try await loadState(space: uri.space, author: uri.author) != nil else {
+                try await requireLocalRepositorySpaceOpen(uri.space, connection: readConnection)
+                guard try await loadState(space: uri.space, author: uri.author, connection: readConnection) != nil else {
                     return nil
                 }
-                return try await loadRecord(uri)
+                return try await loadRecord(uri, connection: readConnection)
             }
         }
     }
@@ -6282,13 +6474,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
             uniqueURIs.insert(uri)
         }
-        return try await withConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space)
+                try await requireLocalRepositorySpaceOpen(space, connection: readConnection)
                 var result: [SpaceRecordURI: PersistedSpaceRecordMetadata] = [:]
                 result.reserveCapacity(uniqueURIs.count)
                 for uri in uniqueURIs {
-                    if let metadata = try await loadRecordMetadata(uri) {
+                    if let metadata = try await loadRecordMetadata(uri, connection: readConnection) {
                         result[uri] = metadata
                     }
                 }
@@ -6376,10 +6568,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             )
         }
 
-        return try await withConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space)
-
+                try await requireLocalRepositorySpaceOpen(space, connection: readConnection)
                 var predicates = [
                     "space_uri = ?",
                     "author_did = ?",
@@ -6408,7 +6599,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 }
                 let order = reverse ? "ASC" : "DESC"
                 parameters.append(.integer(limit))
-                let rows = try await connection.query(
+                let rows = try await readConnection.query(
                     """
                     SELECT collection, rkey, cid, revision,
                            length(value) AS value_bytes
@@ -6460,7 +6651,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 var records: [PersistedSpaceRecord] = []
                 records.reserveCapacity(selected.count)
                 for item in selected {
-                    guard let record = try await loadRecord(item.uri),
+                    guard let record = try await loadRecord(item.uri, connection: readConnection),
                           record.value.count == item.valueBytes else {
                         throw SQLiteRepositoryError.corruptDatabase(
                             "permissioned record page changed during snapshot"
@@ -6479,14 +6670,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         since requestedRevision: UInt64
     ) async throws -> PersistedOplogRead {
         try requireAccount(author)
-        return try await withConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space)
+                try await requireLocalRepositorySpaceOpen(space, connection: readConnection)
                 return try await spaceOplogWithoutTransaction(
                     space: space,
                     author: author,
                     afterRevision: requestedRevision,
-                    afterIndex: nil
+                    afterIndex: nil,
+                    connection: readConnection
                 )
             }
         }
@@ -6515,16 +6707,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
               maximumAggregateValueBytes > 0 else {
             throw SwanError.malformed("permissioned oplog page limit is invalid")
         }
-        return try await withConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space)
+                try await requireLocalRepositorySpaceOpen(space, connection: readConnection)
                 return try await wireOplogWithoutTransaction(
                     space: space,
                     author: author,
                     since: since,
                     limit: limit,
                     includeValues: includeValues,
-                    maximumAggregateValueBytes: maximumAggregateValueBytes
+                    maximumAggregateValueBytes: maximumAggregateValueBytes,
+                    connection: readConnection
                 )
             }
         }
@@ -6536,14 +6729,16 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         since: TID?,
         limit: Int,
         includeValues: Bool,
-        maximumAggregateValueBytes: Int
+        maximumAggregateValueBytes: Int,
+        connection: SQLiteConnection? = nil
     ) async throws -> PersistedWireOplogRead {
-        guard let state = try await loadState(space: space, author: author) else {
+        let conn = connection ?? self.connection
+        guard let state = try await loadState(space: space, author: author, connection: conn) else {
             return .incremental(state: nil, entries: [])
         }
 
         if let since {
-            let oldestRows = try await connection.query(
+            let oldestRows = try await conn.query(
                 """
                 SELECT wire_revision
                 FROM permissioned_space_oplog
@@ -6575,7 +6770,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let valueBytesExpression = includeValues
             ? "COALESCE(SUM(COALESCE(length(live.value), 0)), 0)"
             : "0"
-        let groupRows = try await connection.query(
+        let groupRows = try await conn.query(
             """
             SELECT oplog.wire_revision,
                    MIN(oplog.revision) AS first_revision,
@@ -6656,7 +6851,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let rows: [SQLiteRow]
         if includeValues {
             try await testingHooks.beforeWireOplogValueMaterialization?()
-            rows = try await connection.query(
+            rows = try await conn.query(
                 """
                 SELECT oplog.wire_revision, oplog.action, oplog.collection,
                        oplog.rkey, oplog.cid, oplog.previous_cid,
@@ -6681,7 +6876,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 ]
             )
         } else {
-            rows = try await connection.query(
+            rows = try await conn.query(
                 """
                 SELECT wire_revision, action, collection, rkey, cid,
                        previous_cid, NULL AS current_value
@@ -6734,26 +6929,28 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         after cursor: PersistedOplogCursor?
     ) async throws -> PersistedOplogRead {
         try requireAccount(author)
-        return try await withConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space)
+                try await requireLocalRepositorySpaceOpen(space, connection: readConnection)
                 return try await spaceOplogWithoutTransaction(
                     space: space,
                     author: author,
                     afterRevision: cursor?.revision ?? 0,
-                    afterIndex: cursor?.index
+                    afterIndex: cursor?.index,
+                    connection: readConnection
                 )
             }
         }
     }
-
     private func spaceOplogWithoutTransaction(
         space: SpaceURI,
         author: String,
         afterRevision requestedRevision: UInt64,
-        afterIndex requestedIndex: UInt64?
+        afterIndex requestedIndex: UInt64?,
+        connection: SQLiteConnection? = nil
     ) async throws -> PersistedOplogRead {
-        guard let state = try await loadState(space: space, author: author) else {
+        let conn = connection ?? self.connection
+        guard let state = try await loadState(space: space, author: author, connection: conn) else {
             return .incremental([])
         }
         guard requestedRevision < state.revision
@@ -6761,7 +6958,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         else {
             return .incremental([])
         }
-        let oldestRows = try await connection.query(
+        let oldestRows = try await conn.query(
             """
             SELECT MIN(revision) AS oldest_revision
             FROM permissioned_space_oplog
@@ -6780,7 +6977,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         guard let oldest else {
             guard let snapshot = try await repositorySnapshotWithoutTransaction(
                 space: space,
-                author: author
+                author: author,
+                connection: conn
             ) else {
                 throw SQLiteRepositoryError.corruptDatabase(
                     "repository state has no snapshot"
@@ -6796,7 +6994,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         if cursorPredatesRetention {
             guard let snapshot = try await repositorySnapshotWithoutTransaction(
                 space: space,
-                author: author
+                author: author,
+                connection: conn
             ) else {
                 throw SQLiteRepositoryError.corruptDatabase(
                     "repository state has no snapshot"
@@ -6807,7 +7006,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
         let rows: [SQLiteRow]
         if let requestedIndex {
-            rows = try await connection.query(
+            rows = try await conn.query(
                 """
                 SELECT revision, operation_index, wire_revision, action,
                        collection, rkey, value, cid, previous_cid, commitment
@@ -6827,7 +7026,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 ]
             )
         } else {
-            rows = try await connection.query(
+            rows = try await conn.query(
                 """
                 SELECT revision, operation_index, wire_revision, action,
                        collection, rkey, value, cid, previous_cid, commitment
@@ -6970,7 +7169,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         authorization: AuthorizationContext
     ) async throws -> DurableSimpleSpaceState? {
         try requireAuthorityAccount(space: space)
-        return try await withConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
                 // The live `simplespace.getSpace` read contract: authority
                 // OAuth with read_self (ambient `atproto` bypass included) or
@@ -6980,7 +7179,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     space: space,
                     authorization: authorization
                 )
-                return try await loadSimpleSpace(space)?.state
+                return try await loadSimpleSpace(space, connection: readConnection)?.state
             }
         }
     }
@@ -7006,14 +7205,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
         }
         try requireAuthorityAccount(space: space)
-        return try await withConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
                 try requireAuthorityManagement(
                     space: space,
                     authorization: authorization,
                     operation: .update
                 )
-                let authorityRows = try await connection.query(
+                let authorityRows = try await readConnection.query(
                     """
                     SELECT owner_did, policy, app_access, managing_app, is_deleted
                     FROM permissioned_simple_space_authorities
@@ -7031,6 +7230,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         "invalid simple-space owner"
                     )
                 }
+                await testingHooks.afterSimpleSpaceMemberPageAuthorityRead?()
                 let policyRaw = try requiredText(authorityRow, "policy")
                 guard let policy = SimpleSpacePolicy(rawValue: policyRaw) else {
                     throw SQLiteRepositoryError.corruptDatabase(
@@ -7058,7 +7258,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     throw AuthorizedSimpleSpaceLifecycleError.notFound
                 }
 
-                let memberCountRows = try await connection.query(
+                let memberCountRows = try await readConnection.query(
                     """
                     SELECT COUNT(*) AS count
                     FROM permissioned_simple_space_members
@@ -7075,7 +7275,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         "simple-space members exceed their bound"
                     )
                 }
-                let ownerRows = try await connection.query(
+                let ownerRows = try await readConnection.query(
                     """
                     SELECT 1
                     FROM permissioned_simple_space_members
@@ -7090,7 +7290,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     )
                 }
 
-                let clientCountRows = try await connection.query(
+                let clientCountRows = try await readConnection.query(
                     """
                     SELECT COUNT(*) AS count
                     FROM permissioned_simple_space_clients
@@ -7114,7 +7314,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         )
                     }
                 }
-                let decisionCountRows = try await connection.query(
+                let decisionCountRows = try await readConnection.query(
                     """
                     SELECT COUNT(*) AS count
                     FROM permissioned_simple_space_managing_app_decisions
@@ -7141,7 +7341,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
                 let memberRows: [SQLiteRow]
                 if let cursor {
-                    memberRows = try await connection.query(
+                    memberRows = try await readConnection.query(
                         """
                         SELECT member_did
                         FROM permissioned_simple_space_members
@@ -7155,7 +7355,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         ]
                     )
                 } else {
-                    memberRows = try await connection.query(
+                    memberRows = try await readConnection.query(
                         """
                         SELECT member_did
                         FROM permissioned_simple_space_members
@@ -7595,9 +7795,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             throw SwanError.unauthorized("space credential is required")
         }
         try grant.allows(.read)
-        return try await withConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
-                let state = try await requiredSimpleSpace(space)
+                let state = try await requiredSimpleSpace(space, connection: readConnection)
                 try requireActiveSimpleSpace(state.state)
                 var values: [SQLiteData] = [.text(space.rawValue)]
                 var cursorClause = ""
@@ -7606,7 +7806,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     values.append(.text(cursor))
                 }
                 values.append(.integer(limit))
-                let rows = try await connection.query(
+                let rows = try await readConnection.query(
                     """
                     SELECT repo_did, wire_revision, commitment
                     FROM permissioned_space_writers
@@ -7847,9 +8047,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
         let timestamp = try simpleSpaceTimestamp(now)
         try requireAuthorityAccount(space: space)
-        return try await withConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
-                let rows = try await connection.query(
+                let rows = try await readConnection.query(
                     """
                     SELECT repo_did, expires_at
                     FROM permissioned_space_notification_registrations
@@ -8161,14 +8361,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
         if let clientID { try validateSimpleSpaceAppIdentifier(clientID) }
         try requireAuthorityAccount(space: space)
-        try await withConnectionGate {
+        try await withReadConnectionGate {
             try await readTransaction {
                 try requireSimpleSpaceCredentialRequester(
                     space: space,
                     user: user,
                     authorization: authorization
                 )
-                let stored = try await requiredSimpleSpace(space)
+                let stored = try await requiredSimpleSpace(space, connection: readConnection)
                 try requireActiveSimpleSpace(stored.state)
                 switch stored.state.space.configuration.appAccess {
                 case .open:
@@ -8324,6 +8524,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// through bounded SQLite substr() slices and remain subject to the
     /// caller's aggregate byte bound. Ordinary compatibility reads may still
     /// materialize a legacy row so they can migrate it to CAS.
+    // ponytail: streamBlobData trade-off notes:
+    // 1. Hazard A (race): metadata lookup via blobPayload runs on readConnection, but legacy
+    //    chunk streaming opens a new transaction on connection. A concurrent legacy-to-CAS
+    //    migration can commit in that window, causing a false corruption error on legacy blobs.
+    // 2. Hazard B (availability): holding the writer connection gate across the whole stream
+    //    blocks all writers during large (up to 512 MiB) transfers.
+    // Upgrade path: move CAS file descriptor verification outside the gated section with safe
+    // descriptor handoff, and keep legacy metadata + chunks in a single transaction.
     public func streamBlobData(
         for reference: BlobReference,
         maximumBytes: Int,
@@ -8638,13 +8846,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             throw SwanError.unauthorized("account database ownership mismatch")
         }
         _ = try canonicalRawBlobCID(cid)
-        let stored = try await withConnectionGate {
+        let stored = try await withReadConnectionGate {
             try await readTransaction {
-                try await requireReadablePermissionedBlobRepository(space)
+                try await requireReadablePermissionedBlobRepository(space, connection: readConnection)
                 return try await blobPayloadIfReachableWithoutGate(
                     cid: cid,
                     namespaceKind: "space",
-                    spaceURI: space.rawValue
+                    spaceURI: space.rawValue,
+                    connection: readConnection
                 )
             }
         }
@@ -8673,14 +8882,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             throw SwanError.unauthorized("account database ownership mismatch")
         }
         _ = try canonicalRawBlobCID(cid)
-        let stored = try await withConnectionGate {
+        let stored = try await withReadConnectionGate {
             try await readTransaction {
-                try await requireReadablePermissionedBlobRepository(space)
+                try await requireReadablePermissionedBlobRepository(space, connection: readConnection)
                 return try await blobPayloadIfReachableWithoutGate(
                     cid: cid,
                     namespaceKind: "space",
                     spaceURI: space.rawValue,
-                    includeLegacyPayload: false
+                    includeLegacyPayload: false,
+                    connection: readConnection
                 )
             }
         }
@@ -9229,12 +9439,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         spaceURI: String,
         includeLegacyPayload: Bool = true
     ) async throws -> StoredBlobPayload? {
-        try await withConnectionGate {
+        try await withReadConnectionGate {
             try await blobPayloadIfReachableWithoutGate(
                 cid: cid,
                 namespaceKind: namespaceKind,
                 spaceURI: spaceURI,
-                includeLegacyPayload: includeLegacyPayload
+                includeLegacyPayload: includeLegacyPayload,
+                connection: readConnection
             )
         }
     }
@@ -9250,8 +9461,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         namespaceKind: String,
         spaceURI: String
     ) async throws -> StoredBlobPayload? {
-        try await withConnectionGate {
-            let rows = try await connection.query(
+        try await withReadConnectionGate {
+            let rows = try await readConnection.query(
                 """
                 SELECT blob_payloads.cid, blob_payloads.storage_kind,
                        blob_payloads.cas_digest, blob_payloads.byte_count,
@@ -9304,8 +9515,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         cid: String,
         namespaceKind: String,
         spaceURI: String,
-        includeLegacyPayload: Bool = true
+        includeLegacyPayload: Bool = true,
+        connection: SQLiteConnection? = nil
     ) async throws -> StoredBlobPayload? {
+        let conn = connection ?? self.connection
         // The legacy payload is selected only by compatibility reads that
         // explicitly need a materialized value. Export streaming uses the
         // metadata-only form and reads bounded substr() slices below, so a
@@ -9313,7 +9526,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let payloadSelection = includeLegacyPayload
             ? "blob_payloads.payload"
             : "NULL AS payload"
-        let rows = try await connection.query(
+        let rows = try await conn.query(
             """
             SELECT blob_payloads.cid, \(payloadSelection),
                    blob_payloads.storage_kind, blob_payloads.cas_digest,
@@ -9797,8 +10010,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         guard limit >= 0 else {
             throw SwanError.malformed("outbox limit must not be negative")
         }
-        return try await withConnectionGate {
-            let rows = try await connection.query(
+        return try await withReadConnectionGate {
+            let rows = try await readConnection.query(
                 """
                 SELECT id, space_uri, author_did, revision, payload, attempts,
                        lease_token, lease_expires_at
@@ -9940,8 +10153,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         guard (0 ... 10_000).contains(limit) else {
             throw SwanError.malformed("notification fanout limit is invalid")
         }
-        return try await withConnectionGate {
-            let rows = try await connection.query(
+        return try await withReadConnectionGate {
+            let rows = try await readConnection.query(
                 """
                 SELECT id, source_issuer, source_event_id, kind, space_uri,
                        repo_did, wire_revision, commitment, endpoint, attempts,
@@ -10000,7 +10213,35 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
+    func withReadConnectionGate<T: Sendable>(
+        _ body: () async throws -> T
+    ) async throws -> T {
+        await readConnectionGate.acquire()
+        do {
+            let result = try await body()
+            await readConnectionGate.release()
+            return result
+        } catch {
+            await readConnectionGate.release()
+            throw error
+        }
+    }
+
     func readTransaction<T: Sendable>(
+        _ body: () async throws -> T
+    ) async throws -> T {
+        _ = try await readConnection.query("BEGIN")
+        do {
+            let result = try await body()
+            _ = try await readConnection.query("COMMIT")
+            return result
+        } catch {
+            _ = try? await readConnection.query("ROLLBACK")
+            throw error
+        }
+    }
+
+    func writerReadTransaction<T: Sendable>(
         _ body: () async throws -> T
     ) async throws -> T {
         _ = try await connection.query("BEGIN")
@@ -10254,18 +10495,22 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     }
 
     private func requiredSimpleSpace(
-        _ space: SpaceURI
+        _ space: SpaceURI,
+        connection: SQLiteConnection? = nil
     ) async throws -> LoadedSimpleSpaceAuthority {
-        guard let stored = try await loadSimpleSpace(space) else {
+        let conn = connection ?? self.connection
+        guard let stored = try await loadSimpleSpace(space, connection: conn) else {
             throw AuthorizedSimpleSpaceLifecycleError.notFound
         }
         return stored
     }
 
     private func loadSimpleSpace(
-        _ expectedSpace: SpaceURI
+        _ expectedSpace: SpaceURI,
+        connection: SQLiteConnection? = nil
     ) async throws -> LoadedSimpleSpaceAuthority? {
-        let rows = try await connection.query(
+        let conn = connection ?? self.connection
+        let rows = try await conn.query(
             """
             SELECT space_uri, owner_did, policy, app_access, managing_app,
                    is_deleted, revision, created_at, updated_at
@@ -10335,7 +10580,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             )
         }
 
-        let memberRows = try await connection.query(
+        let memberRows = try await conn.query(
             """
             SELECT member_did
             FROM permissioned_simple_space_members
@@ -10363,7 +10608,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
         }
 
-        let clientRows = try await connection.query(
+        let clientRows = try await conn.query(
             """
             SELECT client_id
             FROM permissioned_simple_space_clients
@@ -10421,7 +10666,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             )
         }
 
-        let managingDecisionRows = try await connection.query(
+        let managingDecisionRows = try await conn.query(
             """
             SELECT user_did
             FROM permissioned_simple_space_managing_app_decisions
@@ -10587,12 +10832,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// transaction is held, so it cannot race a deletion into a stale read or
     /// write. It intentionally does not reveal whether the receiver retained
     /// records before the closure.
-    private func requireLocalRepositorySpaceOpen(_ space: SpaceURI) async throws {
-        let rows = try await connection.query(
+    private func requireLocalRepositorySpaceOpen(_ space: SpaceURI, connection: SQLiteConnection? = nil) async throws {
+        let conn = connection ?? self.connection
+        let rows = try await conn.query(
             "SELECT 1 FROM permissioned_space_recipient_tombstones WHERE space_uri = ?",
             [.text(space.rawValue)]
         )
-        let restoredClosures = try await connection.query(
+        let restoredClosures = try await conn.query(
             """
             SELECT 1
             FROM permissioned_restored_repository_closures
@@ -10645,9 +10891,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// repository, tombstone/closure checks, and exact blob namespace
     /// reference are all read from the caller's one SQLite snapshot.
     private func requireReadablePermissionedBlobRepository(
-        _ space: SpaceURI
+        _ space: SpaceURI,
+        connection: SQLiteConnection? = nil
     ) async throws {
-        let rows = try await connection.query(
+        let conn = connection ?? self.connection
+        let rows = try await conn.query(
             """
             SELECT 1
             FROM permissioned_repository_state AS repository
@@ -10681,13 +10929,16 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    private func loadState(
+    private func loadStateWithCounts(
         space: SpaceURI,
-        author: String
-    ) async throws -> PersistedRepositoryState? {
-        let rows = try await connection.query(
+        author: String,
+        connection: SQLiteConnection? = nil
+    ) async throws -> (state: PersistedRepositoryState, oplogEntryCount: Int, requestEntryCount: Int)? {
+        let conn = connection ?? self.connection
+        let rows = try await conn.query(
             """
-            SELECT revision, wire_revision, lthash, current_commit
+            SELECT revision, wire_revision, lthash, current_commit,
+                   oplog_entry_count, request_entry_count
             FROM permissioned_repository_state
             WHERE space_uri = ? AND author_did = ?
             """,
@@ -10715,7 +10966,27 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 "invalid deterministic repository state marker"
             )
         }
-        return PersistedRepositoryState(
+        var oplogCount = (try? requiredNonnegativeInteger(row, "oplog_entry_count")) ?? 0
+        var requestCount = (try? requiredNonnegativeInteger(row, "request_entry_count")) ?? 0
+        if oplogCount == 0, revision > 0 {
+            let countRows = try await conn.query(
+                "SELECT COUNT(*) AS count FROM permissioned_space_oplog WHERE space_uri = ? AND author_did = ?",
+                [.text(space.rawValue), .text(author)]
+            )
+            if let first = countRows.first {
+                oplogCount = (try? requiredNonnegativeInteger(first, "count")) ?? 0
+            }
+        }
+        if requestCount == 0, revision > 0 {
+            let countRows = try await conn.query(
+                "SELECT COUNT(*) AS count FROM permissioned_space_requests WHERE space_uri = ? AND author_did = ?",
+                [.text(space.rawValue), .text(author)]
+            )
+            if let first = countRows.first {
+                requestCount = (try? requiredNonnegativeInteger(first, "count")) ?? 0
+            }
+        }
+        let state = PersistedRepositoryState(
             space: space,
             author: author,
             revision: revision,
@@ -10723,12 +10994,23 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             ltHash: ltHash,
             commit: marker
         )
+        return (state, oplogCount, requestCount)
+    }
+
+    private func loadState(
+        space: SpaceURI,
+        author: String,
+        connection: SQLiteConnection? = nil
+    ) async throws -> PersistedRepositoryState? {
+        try await loadStateWithCounts(space: space, author: author, connection: connection)?.state
     }
 
     private func loadRecord(
-        _ uri: SpaceRecordURI
+        _ uri: SpaceRecordURI,
+        connection: SQLiteConnection? = nil
     ) async throws -> PersistedSpaceRecord? {
-        let rows = try await connection.query(
+        let conn = connection ?? self.connection
+        let rows = try await conn.query(
             """
             SELECT collection, rkey, value, cid, revision
             FROM permissioned_space_records
@@ -10745,9 +11027,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     }
 
     private func loadRecordMetadata(
-        _ uri: SpaceRecordURI
+        _ uri: SpaceRecordURI,
+        connection: SQLiteConnection? = nil
     ) async throws -> PersistedSpaceRecordMetadata? {
-        let rows = try await connection.query(
+        let conn = connection ?? self.connection
+        let rows = try await conn.query(
             """
             SELECT collection, rkey, cid, revision
             FROM permissioned_space_records

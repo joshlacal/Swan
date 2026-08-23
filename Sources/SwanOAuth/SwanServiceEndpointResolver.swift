@@ -12,14 +12,62 @@ public enum SwanServiceResolutionFailure: Error, Sendable, Equatable {
     case unresolvableService
 }
 
-/// Resolves a `did#fragment` service reference to its https endpoint.
+private enum DIDDocumentFlightWaitOutcome: Sendable {
+    case completed(Result<SwanServiceEndpointResolver.Document, Error>)
+    case waiterCancelled
+}
+
+/// Bridges one caller to an independent shared task. Cancellation settles only
+/// this bridge; it never propagates to the task that other exact-DID callers
+/// are awaiting.
+private final class DIDDocumentFlightWait: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<DIDDocumentFlightWaitOutcome, Never>?
+    private var outcome: DIDDocumentFlightWaitOutcome?
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if case .waiterCancelled? = outcome {
+            return true
+        }
+        return false
+    }
+
+    func install(_ continuation: CheckedContinuation<DIDDocumentFlightWaitOutcome, Never>) {
+        lock.lock()
+        if let outcome {
+            lock.unlock()
+            continuation.resume(returning: outcome)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func complete(_ outcome: DIDDocumentFlightWaitOutcome) {
+        lock.lock()
+        guard self.outcome == nil else {
+            lock.unlock()
+            return
+        }
+        self.outcome = outcome
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: outcome)
+    }
+}
+
+/// Resolves a `did#fragment` service reference to its https endpoint with
+/// single-flight coalescing for concurrent lookups of the same DID.
 ///
 /// Every failure collapses to `.unresolvableService`: the caller turns that
 /// into a 400, and distinguishing "no such DID" from "no such fragment" would
 /// leak remote lookup detail without helping a legitimate client.
 public struct SwanServiceEndpointResolver: Sendable {
-    private struct Document: Decodable {
-        struct Service: Decodable {
+    fileprivate struct Document: Decodable, Sendable {
+        struct Service: Decodable, Sendable {
             let id: String
             let serviceEndpoint: String
         }
@@ -32,59 +80,166 @@ public struct SwanServiceEndpointResolver: Sendable {
         let service: [Service]?
     }
 
-    private let documents: any SwanDIDDocumentFetching
+    private actor ResolverActor {
+        private struct Flight: Sendable {
+            let identity: UUID
+            let task: Task<Document, Error>
+            var waiters: [DIDDocumentFlightWait]
+            var waiterCount: Int { waiters.count }
+        }
+
+        private let documents: any SwanDIDDocumentFetching
+        private var inFlight: [String: Flight] = [:]
+
+        init(documents: any SwanDIDDocumentFetching) {
+            self.documents = documents
+        }
+
+        func inFlightWaiterCount(for did: String) -> Int {
+            inFlight[did]?.waiterCount ?? 0
+        }
+
+        func document(forDID did: String) async throws -> Document {
+            try Task.checkCancellation()
+
+            let wait = DIDDocumentFlightWait()
+
+            if var flight = inFlight[did] {
+                flight.waiters.append(wait)
+                inFlight[did] = flight
+            } else {
+                let identity = UUID()
+                let documents = self.documents
+                let priority = Task.currentPriority
+                let task: Task<Document, Error> = Task.detached(priority: priority) {
+                    let data = try await documents.documentJSON(forDID: did)
+                    guard let document = try? JSONDecoder().decode(Document.self, from: data),
+                          document.service != nil,
+                          document.id == did
+                    else {
+                        throw SwanServiceResolutionFailure.unresolvableService
+                    }
+                    return document
+                }
+
+                let flight = Flight(
+                    identity: identity,
+                    task: task,
+                    waiters: [wait]
+                )
+                inFlight[did] = flight
+
+                Task.detached { [weak self] in
+                    let result = await task.result
+                    await self?.finishFlight(identity: identity, for: did, result: result)
+                }
+            }
+
+            let document = try await awaitFlight(wait)
+            return document
+        }
+
+        func endpoint(did: String, fragment: String) async throws -> URL {
+            let document = try await self.document(forDID: did)
+            guard let url = SwanServiceEndpointResolver.resolveEndpoint(
+                document: document,
+                did: did,
+                fragment: fragment
+            ) else {
+                throw SwanServiceResolutionFailure.unresolvableService
+            }
+            return url
+        }
+
+        func endpoint(serviceIdentifier: String) async throws -> URL {
+            guard !serviceIdentifier.isEmpty, serviceIdentifier.utf8.count <= 1_024 else {
+                throw SwanServiceResolutionFailure.unresolvableService
+            }
+            if let separator = serviceIdentifier.firstIndex(of: "#") {
+                let did = String(serviceIdentifier[..<separator])
+                let fragment = String(serviceIdentifier[serviceIdentifier.index(after: separator)...])
+                guard !did.isEmpty, !fragment.isEmpty, !fragment.contains("#") else {
+                    throw SwanServiceResolutionFailure.unresolvableService
+                }
+                return try await endpoint(did: did, fragment: fragment)
+            }
+            let did = serviceIdentifier
+            let document = try await self.document(forDID: did)
+            guard let services = document.service,
+                  services.count == 1,
+                  let only = services.first,
+                  let url = URL(string: only.serviceEndpoint),
+                  url.scheme?.lowercased() == "https",
+                  let host = url.host, !host.isEmpty,
+                  url.user == nil, url.password == nil
+            else { throw SwanServiceResolutionFailure.unresolvableService }
+            return url
+        }
+
+        private func awaitFlight(_ wait: DIDDocumentFlightWait) async throws -> Document {
+            let outcome = await withTaskCancellationHandler(
+                operation: {
+                    await withCheckedContinuation { continuation in
+                        wait.install(continuation)
+                        if Task.isCancelled {
+                            wait.complete(.waiterCancelled)
+                        }
+                    }
+                },
+                onCancel: {
+                    wait.complete(.waiterCancelled)
+                }
+            )
+            switch outcome {
+            case let .completed(result):
+                return try result.get()
+            case .waiterCancelled:
+                throw CancellationError()
+            }
+        }
+
+        private func finishFlight(
+            identity: UUID,
+            for did: String,
+            result: Result<Document, Error>
+        ) {
+            guard let flight = inFlight[did], flight.identity == identity else {
+                return
+            }
+            inFlight.removeValue(forKey: did)
+            for waiter in flight.waiters {
+                waiter.complete(.completed(result))
+            }
+        }
+    }
+
+    private let resolverActor: ResolverActor
 
     public init(documents: any SwanDIDDocumentFetching) {
-        self.documents = documents
+        self.resolverActor = ResolverActor(documents: documents)
+    }
+
+    internal func inFlightWaiterCount(for did: String) async -> Int {
+        await resolverActor.inFlightWaiterCount(for: did)
     }
 
     public func endpoint(did: String, fragment: String) async throws -> URL {
-        let data: Data
         do {
-            data = try await documents.documentJSON(forDID: did)
+            return try await resolverActor.endpoint(did: did, fragment: fragment)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw SwanServiceResolutionFailure.unresolvableService
         }
-        guard let document = try? JSONDecoder().decode(Document.self, from: data),
-              let services = document.service
-        else { throw SwanServiceResolutionFailure.unresolvableService }
-        // Bind the document to the DID that was asked for. Without this the
-        // fetch path's answer is trusted on its own: a `did:web` host that
-        // serves (or is made to serve) some other subject's document — via a
-        // shared host, a stale cache entry, or a path that is not the one the
-        // method-specific id names — silently selects that subject's endpoint.
-        //
-        // The comparison is byte-exact against the DID string as received,
-        // and no normalisation is applied: any normalisation here would be a
-        // second, weaker grammar than the one
-        // `SwanPeerPinnedDIDDocumentFetcher` already used to derive the fetch
-        // URL, which is exactly how a mismatch gets accepted.
-        //
-        // So this also refuses two spellings that name the same `did:web`
-        // subject but are not the same string: a differently percent-encoded
-        // port (`%3A` vs `:`) and a differently cased host. DNS is
-        // case-insensitive and the fetch would succeed either way, so a caller
-        // that spells the DID differently from the document it is asking about
-        // now gets `.unresolvableService` where it previously got the
-        // endpoint. That is deliberate — the caller controls the spelling
-        // (`SwanXRPCPipethrough` passes the `atproto-proxy` header through
-        // unfolded) and the remedy is to name the subject as its document
-        // does. `testDecodedPortSpellingDoesNotMatchEncodedDocumentID` and
-        // `testHostCaseDifferenceDoesNotMatchDocumentID` pin both, so a later
-        // "helpful" normalisation fails loudly instead of silently widening
-        // what may be bound.
-        //
-        // A document with no `id` at all is rejected: `id` is required by DID
-        // Core, and a document that will not name its own subject cannot be
-        // bound to one.
-        guard document.id == did else {
-            throw SwanServiceResolutionFailure.unresolvableService
+    }
+    fileprivate static func resolveEndpoint(
+        document: Document,
+        did: String,
+        fragment: String
+    ) -> URL? {
+        guard document.id == did, let services = document.service else {
+            return nil
         }
-        // A service id may be written "#frag" or "did:...#frag". Exactly one
-        // entry may match: a document that declares the same service id twice
-        // is malformed, and picking the first would let a later duplicate be
-        // appended to a document to shadow-or-be-shadowed depending only on
-        // ordering. Refuse the ambiguity instead of resolving it.
         let matches = services.filter {
             $0.id == "#\(fragment)" || $0.id == "\(did)#\(fragment)"
         }
@@ -95,7 +250,7 @@ public struct SwanServiceEndpointResolver: Sendable {
             url.scheme?.lowercased() == "https",
             let host = url.host, !host.isEmpty,
             url.user == nil, url.password == nil
-        else { throw SwanServiceResolutionFailure.unresolvableService }
+        else { return nil }
         return url
     }
 
@@ -113,35 +268,13 @@ public struct SwanServiceEndpointResolver: Sendable {
     /// The endpoint checks (https, host, no credentials) are identical to the
     /// fragment form — a DID document is not this server's to trust either.
     public func endpoint(serviceIdentifier: String) async throws -> URL {
-        guard !serviceIdentifier.isEmpty, serviceIdentifier.utf8.count <= 1_024 else {
-            throw SwanServiceResolutionFailure.unresolvableService
-        }
-        if let separator = serviceIdentifier.firstIndex(of: "#") {
-            let did = String(serviceIdentifier[..<separator])
-            let fragment = String(serviceIdentifier[serviceIdentifier.index(after: separator)...])
-            guard !did.isEmpty, !fragment.isEmpty, !fragment.contains("#") else {
-                throw SwanServiceResolutionFailure.unresolvableService
-            }
-            return try await endpoint(did: did, fragment: fragment)
-        }
-        let did = serviceIdentifier
-        let data: Data
         do {
-            data = try await documents.documentJSON(forDID: did)
+            return try await resolverActor.endpoint(serviceIdentifier: serviceIdentifier)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw SwanServiceResolutionFailure.unresolvableService
         }
-        guard let document = try? JSONDecoder().decode(Document.self, from: data),
-              document.id == did,
-              let services = document.service,
-              services.count == 1,
-              let only = services.first,
-              let url = URL(string: only.serviceEndpoint),
-              url.scheme?.lowercased() == "https",
-              let host = url.host, !host.isEmpty,
-              url.user == nil, url.password == nil
-        else { throw SwanServiceResolutionFailure.unresolvableService }
-        return url
     }
 }
 

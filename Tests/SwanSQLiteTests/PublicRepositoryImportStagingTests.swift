@@ -469,6 +469,55 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
         try await reopened.close()
     }
 
+    func testCancelledCommittedResultReplayRethrowsCancellation() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let binding = try binding(
+            requestID: "replay-cancellation",
+            baseCID: fixture.initial.commitCID
+        )
+        let car = try await encodeCAR(
+            root: fixture.prepared.state.commitCID,
+            frames: try await fixture.blocks()
+        )
+        _ = try await testCoordinator(fixture.database)
+            .importRepository(
+                from: InstrumentedCARSource(data: car, chunkBytes: 31),
+                binding: binding,
+                verifier: P256PublicRepositoryCommitVerifier(publicKey: fixture.key.publicKey),
+                createdAt: 100,
+                expiresAt: 200
+            )
+
+        let database = fixture.database
+        let key = fixture.key
+        let coordinator = SQLitePublicRepositoryImportCoordinator(
+            database: database,
+            beforePublish: nil,
+            now: { 201 }
+        )
+        let barrier = AsyncBarrier()
+        let task = Task {
+            await barrier.wait()
+            return try await coordinator.importRepository(
+                from: InstrumentedCARSource(data: Data(), chunkBytes: 1),
+                binding: binding,
+                verifier: P256PublicRepositoryCommitVerifier(publicKey: key.publicKey),
+                createdAt: 201,
+                expiresAt: 202
+            )
+        }
+        task.cancel()
+        await barrier.open()
+        do {
+            _ = try await task.value
+            XCTFail("cancelled replay succeeded")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        try await fixture.database.close()
+    }
+
     func testCancellationAcrossFramingVerificationAndPrePublishLeavesNoLiveChange() async throws {
         // Canonical header ends at byte 59. The first frame then has a
         // multi-byte length prefix, a 36-byte CID, and a commit body.
@@ -898,6 +947,129 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
                 try await fixture.database.close()
             }
         }
+    }
+
+    func testBatchedBlockStagingAcrossBatchBoundariesWithDuplicates() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            try? await fixture.database.close()
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
+        let binding = try binding(requestID: "batch-staging-dup", baseCID: fixture.initial.commitCID)
+
+        var frames = try await fixture.blocks()
+        // Add 520 valid distinct DAG-CBOR extra blocks so total frames exceed the 500-block batch threshold
+        for index in 0 ..< 520 {
+            let extraBytes = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+                (key: "extra", value: index),
+                (key: "comment", value: "bulk unlinked frame for batch boundary test"),
+            ]))
+            let extraCID = CID.fromDAGCBOR(extraBytes)
+            frames.append(.init(cid: extraCID, bytes: extraBytes))
+        }
+        XCTAssertGreaterThan(frames.count, 520, "must exceed 500 blocks to cross batch boundary")
+
+        // Duplicate an early block (index 1, processed in Batch 1 < 500) at the end (processed in Batch 2 > 500)
+        let earlyBlock = frames[1]
+        let inBatchDuplicate = frames[3]
+        // In-batch duplicate in Batch 1:
+        frames.insert(inBatchDuplicate, at: 10)
+        // Cross-batch duplicate in Batch 2:
+        frames.append(earlyBlock)
+
+        let car = try await encodeCAR(root: fixture.prepared.state.commitCID, frames: frames)
+        let source = InstrumentedCARSource(data: car, chunkBytes: 64 * 1024)
+
+        let result = try await testCoordinator(fixture.database).importRepository(
+            from: source,
+            binding: binding,
+            verifier: P256PublicRepositoryCommitVerifier(publicKey: fixture.key.publicKey),
+            createdAt: 100,
+            expiresAt: 200
+        )
+        XCTAssertEqual(result.state, fixture.prepared.state)
+    }
+
+    func testMidBatchRollbackPreservesPriorCommittedBatchAndRevertsUncommittedInserts() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            try? await fixture.database.close()
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
+        let binding = try binding(requestID: "mid-batch-rollback", baseCID: fixture.initial.commitCID)
+
+        let sessionOutcome = try await fixture.database.createPublicRepositoryImportSession(
+            binding: binding,
+            createdAt: 100,
+            expiresAt: 200,
+            now: 100
+        )
+        guard case let .staged(session) = sessionOutcome else {
+            XCTFail("expected staged session")
+            return
+        }
+
+        let blockABytes = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [(key: "name", value: "blockA")]))
+        let blockACID = CID.fromDAGCBOR(blockABytes)
+        let blockA = PublicRepositoryBlock(cid: blockACID, bytes: blockABytes)
+
+        let blockBBytes = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [(key: "name", value: "blockB")]))
+        let blockBCID = CID.fromDAGCBOR(blockBBytes)
+        let blockB = PublicRepositoryBlock(cid: blockBCID, bytes: blockBBytes)
+
+        // Stage Batch 1 (2 valid blocks) -> commits successfully
+        try await fixture.database.stagePublicRepositoryCARBlocks(
+            sessionID: session.id,
+            blocks: [blockA, blockB],
+            receivedByteCount: 100,
+            frameCount: 2,
+            now: 100
+        )
+
+        // Prepare Batch 2 with 2 new unique blocks + 1 conflicting duplicate of blockA
+        let blockCBytes = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [(key: "name", value: "blockC")]))
+        let blockCCID = CID.fromDAGCBOR(blockCBytes)
+        let blockC = PublicRepositoryBlock(cid: blockCCID, bytes: blockCBytes)
+
+        let blockDBytes = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [(key: "name", value: "blockD")]))
+        let blockDCID = CID.fromDAGCBOR(blockDBytes)
+        let blockD = PublicRepositoryBlock(cid: blockDCID, bytes: blockDBytes)
+
+        // blockA with conflicting/tampered bytes
+        let conflictBlockA = PublicRepositoryBlock(cid: blockACID, bytes: Data([9, 9, 9, 9]))
+
+        // Staging Batch 2 must execute inserts for C and D before failing on conflictBlockA and rolling back
+        do {
+            try await fixture.database.stagePublicRepositoryCARBlocks(
+                sessionID: session.id,
+                blocks: [blockC, blockD, conflictBlockA],
+                receivedByteCount: 250,
+                frameCount: 5,
+                now: 100
+            )
+            XCTFail("expected duplicateBlockConflict")
+        } catch let error as PublicRepositoryImportStagingError {
+            XCTAssertEqual(error, .duplicateBlockConflict)
+        }
+
+        // Verify SQLite state: Batch 1 blocks remain intact; Batch 2 inserts (C and D) and counters were rolled back
+        let raw = try await openRaw(fixture.root)
+        let stagedBlocks = try await raw.query(
+            "SELECT cid FROM public_repository_import_blocks WHERE session_id = ? ORDER BY cid",
+            [.text(session.id)]
+        )
+        let stagedCIDs = Set(stagedBlocks.compactMap { $0.column("cid")?.string })
+        XCTAssertEqual(stagedCIDs, Set([blockACID.string, blockBCID.string]))
+        XCTAssertFalse(stagedCIDs.contains(blockCCID.string), "block C must be rolled back")
+        XCTAssertFalse(stagedCIDs.contains(blockDCID.string), "block D must be rolled back")
+
+        let sessionRows = try await raw.query(
+            "SELECT received_byte_count, frame_count FROM public_repository_import_sessions WHERE session_id = ?",
+            [.text(session.id)]
+        )
+        XCTAssertEqual(sessionRows.first?.column("received_byte_count")?.integer, 100)
+        XCTAssertEqual(sessionRows.first?.column("frame_count")?.integer, 2)
+        try await raw.close()
     }
 
     func testOptIn256MiBStagedCAR() async throws {
@@ -1769,6 +1941,27 @@ private struct CancellingVerifier: PublicRepositoryCommitVerifier {
         did _: String
     ) async throws {
         throw CancellationError()
+    }
+}
+
+private actor AsyncBarrier {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        let list = waiters
+        waiters.removeAll()
+        for waiter in list {
+            waiter.resume()
+        }
     }
 }
 

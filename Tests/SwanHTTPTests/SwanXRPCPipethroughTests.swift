@@ -803,6 +803,48 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(sender.recorded().count, 0)
     }
 
+    func testResolverCancellationRethrowsCancellationErrorWithoutMappingToBadRequest() async throws {
+        struct CancellingDIDDocuments: SwanDIDDocumentFetching {
+            func documentJSON(forDID _: String) async throws -> Data {
+                throw CancellationError()
+            }
+        }
+        let sender = RecordingProxySender()
+        let headers: HTTPFields = {
+            var headers = HTTPFields()
+            headers[HTTPField.Name("atproto-proxy")!] = "did:web:cancelled.example#bsky_fg"
+            return headers
+        }()
+        let router = Router(context: SwanHTTPRequestContext.self)
+        let capability = try SwanXRPCPipethroughServer(
+            authorizer: PipethroughAuthorizer(
+                result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
+            ),
+            tokens: TestProxyServiceTokenIssuer(),
+            sender: sender,
+            resolver: SwanServiceEndpointResolver(documents: CancellingDIDDocuments()),
+            appView: try SwanAppViewConfiguration()
+        )
+        capability.register(on: router)
+
+        do {
+            try await makeApp(router).test(.live) { client in
+                try await client.execute(
+                    uri: "/xrpc/app.bsky.feed.getFeedSkeleton",
+                    method: .get,
+                    headers: headers
+                ) { response in
+                    XCTAssertNotEqual(response.status, .badRequest, "cancellation must not be mapped to 400 badRequest")
+                }
+            }
+        } catch is CancellationError {
+            // Expected propagation of CancellationError
+        } catch {
+            // Transport or framework propagation
+        }
+        XCTAssertEqual(sender.recorded().count, 0)
+    }
+
     func testProxiedPostForwardsBodyAndContentType() async throws {
         let sender = RecordingProxySender()
         let headers: HTTPFields = {

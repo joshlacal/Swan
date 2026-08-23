@@ -1,9 +1,9 @@
 import Crypto
 import Foundation
+import Petrel
 import SwanCore
 import SwanOAuth
 import SwanSpaces
-import SwanSpacesWire
 import SwanStorage
 
 public enum PermissionedRemoteReplicaIncrementalSyncOutcome:

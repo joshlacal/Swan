@@ -105,6 +105,38 @@ final class StrictWriteJSONTests: XCTestCase, @unchecked Sendable {
             "trailing whitespace is not garbage"
         )
     }
+    func testStringLiteralsValidationParity() throws {
+        // Unescaped ASCII and multi-byte UTF-8
+        XCTAssertNoThrow(try StrictPermissionedWriteJSON.validate(Data(#"{"text":"hello world"}"#.utf8)))
+        XCTAssertNoThrow(try StrictPermissionedWriteJSON.validate(Data(#"{"text":"こんにちは 🌍"}"#.utf8)))
+        
+        // Valid escapes
+        XCTAssertNoThrow(try StrictPermissionedWriteJSON.validate(Data(#"{"text":"line1\nline2\t\"quoted\"\\slash\/back\bform\f"}"#.utf8)))
+        XCTAssertNoThrow(try StrictPermissionedWriteJSON.validate(Data(#"{"text":"\u0041\u0042\u0043"}"#.utf8)))
+        XCTAssertNoThrow(try StrictPermissionedWriteJSON.validate(Data(#"{"text":"\uD83D\uDE00"}"#.utf8)))
+        
+        // Control characters in string must be refused
+        XCTAssertThrowsError(try StrictPermissionedWriteJSON.validate(Data([0x7b, 0x22, 0x61, 0x22, 0x3a, 0x22, 0x0a, 0x22, 0x7d])))
+        XCTAssertThrowsError(try StrictPermissionedWriteJSON.validate(Data([0x7b, 0x22, 0x61, 0x22, 0x3a, 0x22, 0x00, 0x22, 0x7d])))
+        XCTAssertThrowsError(try StrictPermissionedWriteJSON.validate(Data([0x7b, 0x22, 0x61, 0x22, 0x3a, 0x22, 0x1f, 0x22, 0x7d])))
+        
+        // Invalid escapes must be refused
+        XCTAssertThrowsError(try StrictPermissionedWriteJSON.validate(Data(#"{"text":"\x00"}"#.utf8)))
+        XCTAssertThrowsError(try StrictPermissionedWriteJSON.validate(Data(#"{"text":"\u12"}"#.utf8)))
+        XCTAssertThrowsError(try StrictPermissionedWriteJSON.validate(Data(#"{"text":"\u123"}"#.utf8)))
+        XCTAssertThrowsError(try StrictPermissionedWriteJSON.validate(Data(#"{"text":"\uD800"}"#.utf8)))
+        
+        // Invalid UTF-8 must be refused
+        XCTAssertThrowsError(try StrictPermissionedWriteJSON.validate(Data([0x7b, 0x22, 0x61, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d])))
+        XCTAssertThrowsError(try StrictPermissionedWriteJSON.validate(Data([0x7b, 0x22, 0x61, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d])))
+        
+        // Unterminated string must be refused
+        XCTAssertThrowsError(try StrictPermissionedWriteJSON.validate(Data(#"{"text":"unterminated"# .utf8)))
+        
+        // Escaped vs unescaped duplicate key detection
+        XCTAssertThrowsError(try StrictPermissionedWriteJSON.validate(Data(#"{"\u0061":1,"a":2}"#.utf8)))
+    }
+
 
     // MARK: - Route
 

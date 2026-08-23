@@ -981,8 +981,74 @@ final class SwanHTTPTests: XCTestCase {
 
     private static let aliceDID = "did:plc:abcdefghijklmnopqrstuvwx"
     private static let testVerifier = "$argon2id$v=19$m=65536,t=3,p=1$bcdefghijklmnopqrstuvw$BCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq"
-}
 
+    func testSharedJSONEncodersFormatting() throws {
+        struct Payload: Encodable {
+            let b: String
+            let a: String
+            let url: String
+        }
+        let payload = Payload(b: "second", a: "first", url: "https://example.com/a/b")
+        
+        // sortedNoEscaping
+        let sortedNoEscapingData = try SwanJSONEncoders.sortedNoEscaping.encode(payload)
+        let sortedNoEscapingString = String(decoding: sortedNoEscapingData, as: UTF8.self)
+        XCTAssertEqual(
+            sortedNoEscapingString,
+            #"{"a":"first","b":"second","url":"https://example.com/a/b"}"#
+        )
+        
+        // sortedKeys (slashes are escaped)
+        let sortedKeysData = try SwanJSONEncoders.sortedKeys.encode(payload)
+        let sortedKeysString = String(decoding: sortedKeysData, as: UTF8.self)
+        XCTAssertEqual(
+            sortedKeysString,
+            #"{"a":"first","b":"second","url":"https:\/\/example.com\/a\/b"}"#
+        )
+    }
+
+    func testStrictQuerySchemaValidation() throws {
+        let schema = StrictQuerySchema(required: ["repo", "collection"], optional: ["limit", "cursor"])
+        
+        // Valid request
+        let req1 = Request(
+            head: .init(method: .get, scheme: "http", authority: "localhost", path: "/xrpc/test?repo=alice&collection=app.bsky.feed.post&limit=50"),
+            body: .init(buffer: .init())
+        )
+        let res1 = try strictAuthenticatedRecordQuery(req1, schema: schema)
+        XCTAssertEqual(res1["repo"], "alice")
+        XCTAssertEqual(res1["collection"], "app.bsky.feed.post")
+        XCTAssertEqual(res1["limit"], "50")
+        
+        // Missing required parameter
+        let req2 = Request(
+            head: .init(method: .get, scheme: "http", authority: "localhost", path: "/xrpc/test?repo=alice"),
+            body: .init(buffer: .init())
+        )
+        XCTAssertThrowsError(try strictAuthenticatedRecordQuery(req2, schema: schema))
+        
+        // Unknown parameter
+        let req3 = Request(
+            head: .init(method: .get, scheme: "http", authority: "localhost", path: "/xrpc/test?repo=alice&collection=app.bsky.feed.post&unknown=1"),
+            body: .init(buffer: .init())
+        )
+        XCTAssertThrowsError(try strictAuthenticatedRecordQuery(req3, schema: schema))
+        
+        // Duplicate parameter
+        let req4 = Request(
+            head: .init(method: .get, scheme: "http", authority: "localhost", path: "/xrpc/test?repo=alice&collection=app.bsky.feed.post&repo=bob"),
+            body: .init(buffer: .init())
+        )
+        XCTAssertThrowsError(try strictAuthenticatedRecordQuery(req4, schema: schema))
+        
+        // Fragment present
+        let req5 = Request(
+            head: .init(method: .get, scheme: "http", authority: "localhost", path: "/xrpc/test?repo=alice&collection=app.bsky.feed.post#frag"),
+            body: .init(buffer: .init())
+        )
+        XCTAssertThrowsError(try strictAuthenticatedRecordQuery(req5, schema: schema))
+    }
+}
 private actor TestManagementFirehoseSync: SwanManagementFirehoseSyncing {
     private(set) var requests: [SwanManagementFirehoseSyncInput] = []
     private var failure: SwanManagementFirehoseSyncError?

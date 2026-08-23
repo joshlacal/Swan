@@ -33,7 +33,7 @@ public enum RelayFullRepositoryVerifier {
         to: sink
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     let blocks = await sink.blocks
     guard let commitBytes = blocks[parsed.rootCID] else {
@@ -46,7 +46,7 @@ public enum RelayFullRepositoryVerifier {
         expectedCommitCID: parsed.rootCID
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     let repository: ValidatedPublicRepositoryMST
     do {
@@ -55,7 +55,7 @@ public enum RelayFullRepositoryVerifier {
         blocks: RelayDictionaryBlockSource(storage: blocks)
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     let required = Set(repository.reachableMSTBlocks.keys)
       .union(repository.reachableRecordCIDs)
@@ -202,6 +202,13 @@ public struct RelayRepositoryVerificationState: Sendable {
     )
   }
 
+  // Note on diff-only verification:
+  // An incremental diff-only verification walk was attempted and reverted.
+  // The blocker is that repository-wide ceilings (maximumMSTNodes, maximumCARBytes)
+  // require persisted per-CID reference counts to maintain correctly under node splits,
+  // layer changes, deletions, and reused blocks without drifting or causing memory leaks.
+  // Any future attempt to narrow this path requires a dedicated parity harness that invokes
+  // both the full and incremental verifiers across complex mutation histories before landing.
   public func applying(
     commit event: RelayCommitEvent,
     verifier: any PublicRepositoryCommitVerifier
@@ -248,7 +255,7 @@ public struct RelayRepositoryVerificationState: Sendable {
         to: sink
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     if let expectedRoot, parsed.rootCID != expectedRoot {
       throw RelayVerifierError.commitCIDMismatch
@@ -273,7 +280,7 @@ public struct RelayRepositoryVerificationState: Sendable {
         verifier: verifier
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     let blockSource = RelayDictionaryBlockSource(storage: merged)
     let repository: ValidatedPublicRepositoryMST
@@ -283,7 +290,7 @@ public struct RelayRepositoryVerificationState: Sendable {
         blocks: blockSource
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     if requireSelfContainedRepository {
       let required = Set(repository.reachableMSTBlocks.keys)
@@ -330,7 +337,7 @@ public struct RelayRepositoryVerificationState: Sendable {
         to: sink
       )
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
     let blocks = await sink.blocks
     guard parsed.frameCount == 1,
@@ -346,7 +353,7 @@ public struct RelayRepositoryVerificationState: Sendable {
       )
       return (commit, bytes)
     } catch {
-      throw mapRepositoryError(error)
+      throw try mapRepositoryError(error)
     }
   }
 
@@ -388,7 +395,10 @@ public enum RelayRepositoryDigest {
   }
 }
 
-private func mapRepositoryError(_ error: Error) -> RelayVerifierError {
+private func mapRepositoryError(_ error: Error) throws -> RelayVerifierError {
+  if error is CancellationError {
+    throw CancellationError()
+  }
   if let error = error as? PublicRepositoryCommitError, error == .invalidSignature {
     return .invalidCommitSignature
   }
