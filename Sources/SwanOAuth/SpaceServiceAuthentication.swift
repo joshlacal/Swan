@@ -269,11 +269,10 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
             maximumLifetime: configuration.maximumLifetime
         )
         guard claims.lxm == expectedMethod,
+              validServiceMethod(expectedMethod),
               expectedAudience.map({ claims.aud == $0 }) ?? true,
               let eventID = claims.jti,
-              validServiceEventID(eventID),
-              let verifiedMethod = claims.lxm,
-              validServiceMethod(verifiedMethod) else {
+              validServiceEventID(eventID) else {
             throw SwanError.unauthorized("service authentication is invalid")
         }
         return VerifiedSpaceServiceAuthentication(
