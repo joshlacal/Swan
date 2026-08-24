@@ -1,6 +1,6 @@
 import Foundation
 import SQLiteNIO
-import SwanPublicFirehose
+import PetrelFirehose
 import SwanStorage
 
 extension SQLiteControlDatabase: AccountDeletionControlStore {

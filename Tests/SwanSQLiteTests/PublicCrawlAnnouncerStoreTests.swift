@@ -1,6 +1,6 @@
 import Foundation
 import SQLiteNIO
-import SwanPublicFirehose
+import PetrelFirehose
 @testable import SwanSQLite
 import XCTest
 

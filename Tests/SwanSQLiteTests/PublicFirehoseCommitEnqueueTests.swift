@@ -1,7 +1,7 @@
 import Crypto
 import Foundation
 import Petrel
-import SwanPublicFirehose
+import PetrelFirehose
 import PetrelRepo
 import SwanStorage
 import XCTest

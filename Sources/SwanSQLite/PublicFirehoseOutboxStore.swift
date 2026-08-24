@@ -2,7 +2,7 @@ import Foundation
 import Petrel
 import SQLiteNIO
 import SwanCore
-import SwanPublicFirehose
+import PetrelFirehose
 import PetrelRepo
 
 public struct PublicFirehoseOutboxRow: Sendable, Equatable {

@@ -2,7 +2,7 @@ import Crypto
 import Foundation
 import Petrel
 import SQLiteNIO
-import SwanPublicFirehose
+import PetrelFirehose
 import PetrelRepo
 import SwanStorage
 

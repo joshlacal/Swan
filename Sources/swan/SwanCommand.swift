@@ -9,8 +9,7 @@ import SwanHTTP
 import SwanInterop
 import SwanCore
 import SwanOAuth
-import SwanPublicFirehose
-import SwanPublicRelayVerifier
+import PetrelFirehose
 import PetrelRepo
 import SwanSQLite
 import SwanStorage

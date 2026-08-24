@@ -1,5 +1,5 @@
 import Foundation
-import SwanPublicFirehose
+import PetrelFirehose
 import PetrelRepo
 import SwanStorage
 

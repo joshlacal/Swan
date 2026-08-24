@@ -6,7 +6,7 @@ import SQLiteNIO
 import SwanAccounts
 import SwanCore
 import SwanHTTP
-import SwanPublicFirehose
+import PetrelFirehose
 import PetrelRepo
 @testable import SwanSQLite
 import SwanStorage

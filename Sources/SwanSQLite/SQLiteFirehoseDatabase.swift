@@ -1,7 +1,7 @@
 import Foundation
 import SQLiteNIO
 import SwanCore
-import SwanPublicFirehose
+import PetrelFirehose
 
 public struct FirehoseAppendItem: Sendable {
   public let sourceKey: String

@@ -4,7 +4,7 @@ import Logging
 import NIOCore
 import ServiceLifecycle
 import SwanCore
-import SwanPublicFirehose
+import PetrelFirehose
 import SwanSQLite
 
 /// One outbound `com.atproto.sync.requestCrawl` announcement.

@@ -1,7 +1,7 @@
 import Foundation
 import SQLiteNIO
 import SwanCore
-import SwanPublicFirehose
+import PetrelFirehose
 
 public struct LifecycleEventItem: Sendable, Equatable {
   public let sourceKey: String

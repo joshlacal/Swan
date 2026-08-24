@@ -6,7 +6,7 @@ import NIOConcurrencyHelpers
 import NIOCore
 import NIOWebSocket
 import Petrel
-import SwanPublicFirehose
+import PetrelFirehose
 import SwanSQLite
 import Synchronization
 

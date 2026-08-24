@@ -1,7 +1,7 @@
 import Crypto
 import Foundation
 import SwanCore
-import SwanPublicFirehose
+import PetrelFirehose
 import PetrelRepo
 @_spi(Testing) import SwanSQLite
 import SwanStorage

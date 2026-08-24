@@ -3,7 +3,7 @@ import Foundation
 import SQLiteNIO
 @testable import SwanAccounts
 import SwanCore
-import SwanPublicFirehose
+import PetrelFirehose
 import PetrelRepo
 @testable import SwanSQLite
 import SwanStorage

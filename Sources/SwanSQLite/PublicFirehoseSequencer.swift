@@ -1,6 +1,6 @@
 import Foundation
 import SwanCore
-import SwanPublicFirehose
+import PetrelFirehose
 
 public struct PublicFirehoseAccountDatabase: Sendable {
   public let did: String

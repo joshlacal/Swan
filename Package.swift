@@ -8,8 +8,6 @@ let package = Package(
         .library(name: "SwanCore", targets: ["SwanCore"]),
         .library(name: "SwanSpacesWire", targets: ["SwanSpacesWire"]),
         .library(name: "SwanPublicWire", targets: ["SwanPublicWire"]),
-        .library(name: "SwanPublicFirehose", targets: ["SwanPublicFirehose"]),
-        .library(name: "SwanPublicRelayVerifier", targets: ["SwanPublicRelayVerifier"]),
         .library(name: "SwanSpaces", targets: ["SwanSpaces"]),
         .library(name: "SwanStorage", targets: ["SwanStorage"]),
         .library(name: "SwanSQLite", targets: ["SwanSQLite"]),
@@ -99,22 +97,6 @@ let package = Package(
         .target(name: "SwanSpacesWire", dependencies: ["SwanCore"]),
         .target(name: "SwanPublicWire", dependencies: ["SwanCore", .product(name: "Petrel", package: "Petrel")]),
         .target(
-            name: "SwanPublicFirehose",
-            dependencies: [
-                .product(name: "PetrelRepo", package: "Petrel"),
-                .product(name: "Petrel", package: "Petrel"),
-            ]
-        ),
-        .target(
-            name: "SwanPublicRelayVerifier",
-            dependencies: [
-                "SwanPublicFirehose",
-                .product(name: "PetrelRepo", package: "Petrel"),
-                .product(name: "Crypto", package: "swift-crypto"),
-                .product(name: "Petrel", package: "Petrel"),
-            ]
-        ),
-        .target(
             name: "SwanSpaces",
             dependencies: [
                 "CBLAKE3", "SwanCore",
@@ -133,7 +115,8 @@ let package = Package(
         .target(
             name: "SwanSQLite",
             dependencies: [
-                "SwanAccounts", "SwanCore", "SwanStorage", "SwanPublicFirehose",
+                "SwanAccounts", "SwanCore", "SwanStorage",
+                .product(name: "PetrelFirehose", package: "Petrel"),
                 .product(name: "PetrelRepo", package: "Petrel"),
                 .product(name: "Petrel", package: "Petrel"),
                 .product(name: "SQLiteNIO", package: "sqlite-nio"),
@@ -182,7 +165,8 @@ let package = Package(
         .target(
             name: "SwanHTTP",
             dependencies: [
-                "SwanAccounts", "SwanCore", "SwanPublicFirehose", "SwanPublicWire", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth", "SwanSQLite",
+                "SwanAccounts", "SwanCore", "SwanPublicWire", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth", "SwanSQLite",
+                .product(name: "PetrelFirehose", package: "Petrel"),
                 .product(name: "PetrelRepo", package: "Petrel"),
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),
@@ -210,7 +194,8 @@ let package = Package(
             name: "swan",
             dependencies: [
                 "SwanAccountExport", "SwanAccounts", "SwanHTTP", "SwanInterop", "SwanOAuth",
-                "SwanPublicFirehose", "SwanPublicRelayVerifier", "SwanSQLite",
+                "SwanSQLite",
+                .product(name: "PetrelFirehose", package: "Petrel"),
                 .product(name: "PetrelRepo", package: "Petrel"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Crypto", package: "swift-crypto"),
@@ -230,7 +215,8 @@ let package = Package(
         .testTarget(
             name: "SwanSQLiteTests",
             dependencies: [
-                "SwanAccounts", "SwanCore", "SwanHTTP", "SwanPublicFirehose", "SwanSQLite", "SwanStorage",
+                "SwanAccounts", "SwanCore", "SwanHTTP", "SwanSQLite", "SwanStorage",
+                .product(name: "PetrelFirehose", package: "Petrel"),
                 .product(name: "PetrelRepo", package: "Petrel"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Hummingbird", package: "hummingbird"),
@@ -258,6 +244,7 @@ let package = Package(
             dependencies: [
                 "CATHandleDNS", "SwanAccounts", "SwanCore", "SwanStorage",
                 "SwanSQLite",
+                .product(name: "PetrelFirehose", package: "Petrel"),
                 .product(name: "PetrelRepo", package: "Petrel"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
@@ -288,7 +275,8 @@ let package = Package(
                 // the test target needs the server type, the CLI module it
                 // mirrors, and the direct module dependencies Swift requires
                 // (no transitive imports).
-                "swan", "SwanHTTP", "SwanCore", "SwanOAuth", "SwanPublicFirehose",
+                "swan", "SwanHTTP", "SwanCore", "SwanOAuth",
+                .product(name: "PetrelFirehose", package: "Petrel"),
                 .product(name: "PetrelRepo", package: "Petrel"),
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
@@ -304,7 +292,8 @@ let package = Package(
         .testTarget(
             name: "SwanHTTPTests",
             dependencies: [
-                "swan", "SwanAccounts", "SwanHTTP", "SwanInterop", "SwanOAuth", "SwanPublicFirehose", "SwanPublicWire", "SwanSQLite", "SwanSpacesWire", "SwanStorage",
+                "swan", "SwanAccounts", "SwanHTTP", "SwanInterop", "SwanOAuth", "SwanPublicWire", "SwanSQLite", "SwanSpacesWire", "SwanStorage",
+                .product(name: "PetrelFirehose", package: "Petrel"),
                 .product(name: "PetrelRepo", package: "Petrel"),
                 // `swan`'s startup refusals are ArgumentParser `ValidationError`s.
                 // Asserting the concrete type is the difference between "it
@@ -333,15 +322,6 @@ let package = Package(
                 .product(name: "PetrelCrypto", package: "Petrel"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
-                .product(name: "Petrel", package: "Petrel"),
-            ]
-        ),
-        .testTarget(
-            name: "SwanPublicFirehoseTests",
-            dependencies: [
-                "SwanPublicFirehose",
-                "SwanPublicRelayVerifier",
-                .product(name: "PetrelRepo", package: "Petrel"),
                 .product(name: "Petrel", package: "Petrel"),
             ]
         ),

@@ -1,6 +1,6 @@
 import Foundation
 @testable import SwanAccounts
-import SwanPublicFirehose
+import PetrelFirehose
 import SwanSQLite
 import SwanStorage
 import XCTest

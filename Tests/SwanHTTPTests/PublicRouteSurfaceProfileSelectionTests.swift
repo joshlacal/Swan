@@ -11,7 +11,7 @@ import SwanCore
 @testable import SwanHTTP
 import SwanInterop
 import SwanOAuth
-import SwanPublicFirehose
+import PetrelFirehose
 import PetrelRepo
 import SwanPublicWire
 import SwanSpaces

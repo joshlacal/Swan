@@ -1,6 +1,6 @@
 import Foundation
 import SwanCore
-import SwanPublicFirehose
+import PetrelFirehose
 
 /// Bounded retention for the public firehose log. All three bounds are
 /// enforced together inside a single prune transaction; the earliest violated

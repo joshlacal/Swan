@@ -1,7 +1,7 @@
 import Foundation
 
 /// Test-only canonical CBOR value mirroring the strict reader in
-/// `SwanPublicFirehoseTests.FirehoseFrameTestDecoder`. It validates shortest
+/// `PetrelFirehoseTests.FirehoseFrameTestDecoder`. It validates shortest
 /// integer encodings and canonical map-key order (length, then bytes) while
 /// parsing; tag-42 CID links are consumed without CID validation (the reader
 /// is for connection-control frames and stored-frame headers).

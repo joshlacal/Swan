@@ -1,7 +1,7 @@
 import Foundation
 import Petrel
 import SwanCore
-import SwanPublicFirehose
+import PetrelFirehose
 import SwanSpaces
 import SwanStorage
 import XCTest

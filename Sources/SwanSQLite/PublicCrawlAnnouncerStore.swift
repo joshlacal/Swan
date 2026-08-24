@@ -1,7 +1,7 @@
 import Foundation
 import SQLiteNIO
 import SwanCore
-import SwanPublicFirehose
+import PetrelFirehose
 
 /// One crawler origin's durable requestCrawl announcer state. All timestamps
 /// are whole microseconds since the Unix epoch; `nextAttemptAt == nil` means

@@ -2,7 +2,7 @@ import Crypto
 import Foundation
 import Petrel
 import SwanCore
-import SwanPublicFirehose
+import PetrelFirehose
 import PetrelRepo
 import SwanStorage
 import XCTest

@@ -9,7 +9,7 @@ import SwanAccounts
 import SwanCore
 @testable import SwanHTTP
 import SwanOAuth
-import SwanPublicFirehose
+import PetrelFirehose
 import SwanSQLite
 import SwanSpaces
 import SwanStorage

@@ -2,7 +2,7 @@ import Foundation
 import Logging
 import Petrel
 import SwanCore
-import SwanPublicFirehose
+import PetrelFirehose
 import XCTest
 @testable import SwanHTTP
 @testable import SwanSQLite

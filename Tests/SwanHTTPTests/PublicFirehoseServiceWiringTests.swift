@@ -8,7 +8,7 @@ import Logging
 import NIOCore
 import Petrel
 import SwanOAuth
-import SwanPublicFirehose
+import PetrelFirehose
 import PetrelRepo
 import SwanStorage
 import XCTest

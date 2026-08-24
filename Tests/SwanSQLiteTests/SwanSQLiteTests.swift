@@ -4,7 +4,7 @@ import Petrel
 import SQLiteNIO
 import SwanCore
 @_spi(PortableRestore) @testable import SwanSQLite
-import SwanPublicFirehose
+import PetrelFirehose
 import PetrelRepo
 import SwanSpaces
 import SwanStorage

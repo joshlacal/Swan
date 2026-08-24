@@ -1,7 +1,7 @@
 import Foundation
 import SQLiteNIO
 import SwanCore
-import SwanPublicFirehose
+import PetrelFirehose
 import SwanStorage
 
 extension SQLiteControlDatabase {
