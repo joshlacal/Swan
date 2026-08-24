@@ -20,9 +20,6 @@ Swan is organized into distinct Swift Package Manager targets defined in `Packag
 | `SwanCore` | `Sources/SwanCore` | Base models, identifiers (`DID`, `TID`, `NSID`, `ATProtocolDate`), core error types, and logging primitives. |
 | `SwanSpacesWire` | `Sources/SwanSpacesWire` | Space wire models and permissioned data method registry. |
 | `SwanPublicWire` | `Sources/SwanPublicWire` | Public AT Protocol lexicon wire models and request/response structures. |
-| `SwanPublicRepository` | `Sources/SwanPublicRepository` | Merkle Search Tree (MST), CAR format encoding/decoding, commit signing, and repository storage primitives. |
-| `SwanPublicFirehose` | `Sources/SwanPublicFirehose` | Event streaming, frame sequencing, commit event serialization, and diff CAR generation. |
-| `SwanPublicRelayVerifier` | `Sources/SwanPublicRelayVerifier` | Verification logic for public firehose event streams against relay expectations. |
 | `SwanSpaces` | `Sources/SwanSpaces` | Space semantics, authorization, space commit codec, content-binding MAC verification, space membership, and policies. |
 | `SwanStorage` | `Sources/SwanStorage` | Core storage abstractions, storage traits, and repository persistence interfaces. |
 | `SwanSQLite` | `Sources/SwanSQLite` | SQLite backend implementation managing the three distinct storage planes with strict permission checking and WAL mode. |

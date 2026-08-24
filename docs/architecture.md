@@ -49,9 +49,6 @@ Swan's codebase is divided into modular Swift Package Manager library targets, e
 - `SwanCore`: Core cryptographic primitives (SHA-256, BLAKE3, K-256, P-256), base data structures, error types, logging configuration, and fundamental domain protocols.
 - `SwanSpacesWire`: Typed wire models and lexicon definitions for permissioned spaces (`com.atproto.space.*` and `com.atproto.simplespace.*`), generated from AT Protocol lexicons via Petrel.
 - `SwanPublicWire`: Wire models, query parameter decoders, and response serializers for public AT Protocol repository endpoints and sync interfaces.
-- `SwanPublicRepository`: Merkle Search Tree (MST) implementation, CBOR-encoded records with CIDv1 addressing, signed commit trees, and CAR v1 archive packing and slicing.
-- `SwanPublicFirehose`: Firehose event sequencer, stream frame encoding (`#commit`, `#sync`, `#identity`, `#account`, `#info`), minimal diff CAR packaging, and subscriber connection budgeting.
-- `SwanPublicRelayVerifier`: Verification and ingestion logic for public relay events and synchronization streams.
 - `SwanSpaces`: Permissioned data and spaces engine, LtHash16 cryptographic accumulator, capability delegations, space oplogs, reader-bound commit verification, and durable outbox delivery.
 - `SwanStorage`: Abstract storage protocols and interfaces defining the contracts for repositories, spaces, credentials, replay guards, WebAuthn challenges, and audit logs.
 - `SwanSQLite`: SQLite backend implementation using SQLiteNIO, managing write-ahead logging (WAL), foreign keys, microsecond transactions, compare-and-swap (CAS) updates, and queries across the three database planes.
