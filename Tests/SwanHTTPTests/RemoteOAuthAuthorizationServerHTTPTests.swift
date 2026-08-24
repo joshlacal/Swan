@@ -980,6 +980,167 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
       throw error
     }
   }
+  func testPARRejectsRemoteClientMetadataWithDuplicateKeysAsInvalidRequest() async throws {
+    let duplicateKeyJSON = Data("""
+    {
+      "client_id": "\(clientID.absoluteString)",
+      "client_id": "\(clientID.absoluteString)",
+      "client_name": "Duplicate Key App",
+      "redirect_uris": ["\(redirectURI.absoluteString)"],
+      "grant_types": ["authorization_code", "refresh_token"],
+      "response_types": ["code"],
+      "scope": "atproto",
+      "token_endpoint_auth_method": "none",
+      "dpop_bound_access_tokens": true
+    }
+    """.utf8)
+    let fixture = try await makeFixture(rawMetadataBody: duplicateKeyJSON)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let key = P256.Signing.PrivateKey()
+    let publicJWK = try jwk(key)
+    let challenge = String(repeating: "a", count: 43)
+    let form = parForm(challenge: challenge, assertion: nil)
+    do {
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.duplicate-par"))
+      try await app.test(.live) { client in
+        var nonce: String?
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(), body: ByteBuffer(string: form)
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+          nonce = response.headers[dpopNonceHeader]
+        }
+        let proof = try self.dpop(
+          key, publicJWK, jti: "dup-par-jti", nonce: try XCTUnwrap(nonce),
+          target: try OAuthDPoPProofValidator.normalizedTarget(
+            self.issuer.appending(path: "oauth/par")))
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(dpop: proof),
+          body: ByteBuffer(string: form)
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+          XCTAssertNotEqual(response.status, .serviceUnavailable)
+          XCTAssertEqual(try self.error(response.body), "invalid_request")
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
+  func testTokenEndpointRejectsMalformedPrivateKeyJWTAssertionAsInvalidGrant() async throws {
+    let clientKey = P256.Signing.PrivateKey()
+    let clientJWK = try jwk(clientKey, keyID: "client-key")
+    let metadata = try OAuthClientMetadata(
+      clientID: clientID,
+      redirectURIs: [redirectURI],
+      grantTypes: ["authorization_code", "refresh_token"],
+      responseTypes: ["code"],
+      scopes: ["atproto"],
+      tokenEndpointAuthMethod: .privateKeyJWT,
+      tokenEndpointAuthSigningAlgorithm: "ES256",
+      dpopBoundAccessTokens: true,
+      jwks: try OAuthJSONWebKeySet(keys: [clientJWK])
+    )
+    let fixture = try await makeFixture(metadata: metadata)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let dpopKey = P256.Signing.PrivateKey()
+      let dpopJWK = try jwk(dpopKey)
+      let resolved = try await fixture.completeConfiguration.clientMetadataLoader.load(clientID: clientID)
+      let validAssertionString = try self.clientAssertion(
+        clientKey, keyID: "client-key", audience: issuer.absoluteString, jti: "valid-par-jti")
+      let validatedAssertion = try await OAuthClientAssertionValidator(runtime: fixture.runtime).validate(
+        validAssertionString,
+        assertionType: OAuthClientAssertionValidator.assertionType,
+        client: resolved,
+        authorizationServerIssuer: issuer.absoluteString
+      )
+      let session = try OAuthValidatedSession(
+        issuer: issuer.absoluteString,
+        client: resolved,
+        redirectURI: redirectURI,
+        scopes: ["atproto"],
+        dpopProof: .init(
+          keyThumbprint: dpopJWK.thumbprint(),
+          jwtID: "test-token-jwt-id",
+          issuedAt: Date()
+        ),
+        clientAssertion: validatedAssertion
+      )
+    let verifier = "remote-oauth-server-test-verifier-000000000000000000"
+    let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64URLEncodedString()
+    let code = try await fixture.runtime.tokenService.issueAuthorizationCode(
+      subject: did,
+      session: session,
+      codeChallengeS256: challenge
+    )
+    let now = Int64(Date().timeIntervalSince1970)
+    let duplicateKeyHeader = Data(#"{"alg":"ES256","kid":"client-key","kid":"client-key"}"#.utf8).base64URLEncodedString()
+    struct Claims: Encodable {
+      let iss: String
+      let sub: String
+      let aud: String
+      let iat: Int64
+      let exp: Int64
+      let jti: String
+    }
+    let claims = try JSONEncoder().encode(Claims(
+      iss: clientID.absoluteString,
+      sub: clientID.absoluteString,
+      aud: issuer.absoluteString,
+      iat: now,
+      exp: now + 120,
+      jti: "assertion-dup-key"
+    )).base64URLEncodedString()
+    let input = "\(duplicateKeyHeader).\(claims)"
+    let signature = try P256WireSignature.sign(Data(input.utf8), using: clientKey).base64URLEncodedString()
+    let malformedAssertion = "\(input).\(signature)"
+
+    let codeForm = self.form([
+      ("grant_type", "authorization_code"),
+      ("client_id", self.clientID.absoluteString),
+      ("redirect_uri", self.redirectURI.absoluteString),
+      ("code", code),
+      ("code_verifier", verifier),
+      ("client_assertion_type", OAuthClientAssertionValidator.assertionType),
+      ("client_assertion", malformedAssertion),
+    ])
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.malformed-token"))
+      try await app.test(.live) { client in
+        var tokenNonce: String?
+        try await client.execute(
+          uri: "/oauth/token", method: .post, headers: formHeaders(),
+          body: ByteBuffer(string: codeForm)
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+          tokenNonce = response.headers[dpopNonceHeader]
+        }
+        let tokenTarget = try OAuthDPoPProofValidator.normalizedTarget(
+          self.issuer.appending(path: "oauth/token"))
+        let tokenProof = try self.dpop(
+          dpopKey, dpopJWK, jti: "token-dup-proof", nonce: try XCTUnwrap(tokenNonce),
+          target: tokenTarget)
+        try await client.execute(
+          uri: "/oauth/token", method: .post, headers: formHeaders(dpop: tokenProof),
+          body: ByteBuffer(string: codeForm)
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+          XCTAssertNotEqual(response.status, .serviceUnavailable)
+          XCTAssertEqual(try self.error(response.body), "invalid_grant")
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
 
   func testUnsafeRemoteMetadataNeverActivatesAClientOrContactsTransport() async throws {
     let metadata = try publicMetadata()
@@ -1709,7 +1870,8 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
   }
 
   private func makeFixture(
-    metadata: OAuthClientMetadata,
+    metadata: OAuthClientMetadata? = nil,
+    rawMetadataBody: Data? = nil,
     resolverAnswers: [[OAuthIPAddress]]? = nil,
     loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
     includeEmailRecovery: Bool = false,
@@ -1746,7 +1908,14 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
       let publicIP = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
       let resolver = RemoteOAuthResolver(
         answers: resolverAnswers ?? Array(repeating: [publicIP], count: 64))
-      let body = try JSONEncoder().encode(metadata)
+      let body: Data
+      if let rawMetadataBody {
+        body = rawMetadataBody
+      } else if let metadata {
+        body = try JSONEncoder().encode(metadata)
+      } else {
+        body = try JSONEncoder().encode(publicMetadata())
+      }
       let transport = RemoteOAuthTransport(
         response: .init(
           status: 200, headers: ["content-type": ["application/json"]], body: body,

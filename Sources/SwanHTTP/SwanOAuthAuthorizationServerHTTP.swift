@@ -422,6 +422,15 @@ private func handleOAuthServerPAR(
       ]
     )
     return oauthServerPARJSON(.badRequest, OAuthServerPARError(error: "invalid_request"))
+  } catch let error as PetrelCryptoError {
+    context.logger.info(
+      "oauth par rejected",
+      metadata: [
+        "stage": .string("client_validation"),
+        "reason": .string(error.description),
+      ]
+    )
+    return oauthServerPARJSON(.badRequest, OAuthServerPARError(error: "invalid_request"))
   } catch {
     context.logger.info(
       "oauth par failed", metadata: ["stage": .string("unexpected")])
@@ -890,6 +899,8 @@ private func exchangeOAuthServerToken(
         .serviceUnavailable, OAuthServerTokenError(error: "temporarily_unavailable"))
     }
     return oauthServerTokenJSON(.badRequest, OAuthServerTokenError(error: "invalid_grant"))
+  } catch is PetrelCryptoError {
+    return oauthServerTokenJSON(.badRequest, OAuthServerTokenError(error: "invalid_grant"))
   } catch {
     return oauthServerTokenJSON(
       .serviceUnavailable, OAuthServerTokenError(error: "temporarily_unavailable"))
@@ -981,6 +992,11 @@ private func revokeOAuthServerToken(
       return oauthServerTokenJSON(
         .serviceUnavailable, OAuthServerTokenError(error: "temporarily_unavailable"))
     }
+    // RFC 7009 intentionally provides no token or family existence oracle.
+    var headers: HTTPFields = [.cacheControl: "no-store"]
+    oauthAPICORSHeaders(&headers)
+    return Response(status: .ok, headers: headers)
+  } catch is PetrelCryptoError {
     // RFC 7009 intentionally provides no token or family existence oracle.
     var headers: HTTPFields = [.cacheControl: "no-store"]
     oauthAPICORSHeaders(&headers)
