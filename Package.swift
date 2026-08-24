@@ -326,6 +326,7 @@ let package = Package(
             name: "SwanInteropTests",
             dependencies: [
                 "SwanAccounts", "SwanCore", "SwanInterop", "SwanOAuth",
+                "SwanSpaces", "SwanSQLite",
                 .product(name: "PetrelRepo", package: "Petrel"),
                 .product(name: "PetrelFirehose", package: "Petrel"),
                 .product(name: "PetrelPLC", package: "Petrel"),
