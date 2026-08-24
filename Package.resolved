@@ -1,5 +1,5 @@
 {
-  "originHash" : "3a24e0db8fb4b24b1ec1d83d0da21f79f917ae3742151fc5c62bc721b9c84e00",
+  "originHash" : "0d895bea8408ee73b3edb008de9e63db8d5959d6bd321a8950db6e40df3694a5",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -17,15 +17,6 @@
       "state" : {
         "revision" : "e1caa19077dda4b00441142ef57da3db02acd466",
         "version" : "1.4.2"
-      }
-    },
-    {
-      "identity" : "cryptoswift",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/krzyzanowskim/CryptoSwift.git",
-      "state" : {
-        "revision" : "e45a26384239e028ec87fbcc788f513b67e10d8f",
-        "version" : "1.9.0"
       }
     },
     {
@@ -47,20 +38,11 @@
       }
     },
     {
-      "identity" : "jose-swift",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/beatt83/jose-swift.git",
-      "state" : {
-        "revision" : "b7d3ef55660fefd045641293bc95d4cdc07a15d8",
-        "version" : "6.0.4"
-      }
-    },
-    {
       "identity" : "petrel",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/joshlacal/Petrel.git",
       "state" : {
-        "revision" : "7ae8fa143c467095f39ac9f792872fe0aab9122a"
+        "revision" : "8fee34e8686c52de8c88a163cb44e5ffc58a17ea"
       }
     },
     {
@@ -304,15 +286,6 @@
       "state" : {
         "revision" : "126df9655565068bd97838c072c1db11f9fd42ee",
         "version" : "1.6.1"
-      }
-    },
-    {
-      "identity" : "swift-zlib",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/beatt83/swift-zlib.git",
-      "state" : {
-        "revision" : "8cf51bfdf81c46702dac496d16397d92ac392532",
-        "version" : "1.0.2"
       }
     },
     {
