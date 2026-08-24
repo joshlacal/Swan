@@ -124,8 +124,8 @@ public actor DurableAccountDirectory {
         password: String,
         now: Date = Date()
     ) async throws -> AccountControlAccount {
-        let did = try AccountIdentifiers.validateDID(did)
-        let handle = try AccountIdentifiers.canonicalHandle(handle)
+        let did = try validateDID(did)
+        let handle = try canonicalizeHandle(handle)
         guard let keyProvisioner else {
             throw SwanError.unavailable("account key provisioner is not configured")
         }
@@ -154,8 +154,8 @@ public actor DurableAccountDirectory {
         publicGenesisCommitCID: String? = nil,
         now: Date = Date()
     ) async throws -> AccountControlAccount {
-        let did = try AccountIdentifiers.validateDID(did)
-        let handle = try AccountIdentifiers.canonicalHandle(canonicalHandle)
+        let did = try validateDID(did)
+        let handle = try canonicalizeHandle(canonicalHandle)
         guard signingReference.accountDID == did,
               rotationReference.accountDID == did,
               signingReference.purpose == .signing,
@@ -184,12 +184,12 @@ public actor DurableAccountDirectory {
     /// Normal account lookup returns control metadata only; a password
     /// verifier can never cross this API boundary.
     public func account(did: String) async throws -> AccountControlAccount? {
-        try await store.account(did: AccountIdentifiers.validateDID(did))
+        try await store.account(did: validateDID(did))
     }
 
     /// Resolves a canonicalized handle without exposing credential material.
     public func resolve(handle: String) async throws -> AccountControlAccount? {
-        try await store.account(canonicalHandle: AccountIdentifiers.canonicalHandle(handle))
+        try await store.account(canonicalHandle: canonicalizeHandle(handle))
     }
 
     /// Returns the external-key-store references reconstructed from durable
@@ -197,7 +197,7 @@ public actor DurableAccountDirectory {
     public func keyReferences(
         did: String
     ) async throws -> (signing: AccountKeyReference, rotation: AccountKeyReference)? {
-        let did = try AccountIdentifiers.validateDID(did)
+        let did = try validateDID(did)
         guard let account = try await store.account(did: did) else {
             return nil
         }
@@ -216,7 +216,7 @@ public actor DurableAccountDirectory {
     public func authorizingAccount(
         did: String
     ) async throws -> AuthorizingAccountSnapshot? {
-        let did = try AccountIdentifiers.validateDID(did)
+        let did = try validateDID(did)
         guard let account = try await store.account(did: did),
               account.status.authorizesAccount,
               let references = try keyReferences(of: account) else {
@@ -461,7 +461,7 @@ public actor DurableAccountDirectory {
         var candidate:
             (account: AccountControlAccount, credential: AccountControlCredential)?
         var storageUnavailable = false
-        if let canonicalHandle = try? AccountIdentifiers.canonicalHandle(handle) {
+        if let canonicalHandle = try? canonicalizeHandle(handle) {
             do {
                 if let account = try await store.account(
                     canonicalHandle: canonicalHandle
@@ -756,7 +756,7 @@ public actor DurableAccountDirectory {
         now: Date = Date()
     ) async throws -> AccountControlAccount {
         try await store.transitionStatus(
-            did: AccountIdentifiers.validateDID(did),
+            did: validateDID(did),
             to: status,
             declaration: declaration,
             emitting: emitting,
@@ -775,5 +775,40 @@ public actor DurableAccountDirectory {
             purpose: purpose,
             generation: reference.generation
         )
+    }
+}
+
+private func validateDID(_ did: String) throws -> String {
+    do {
+        return try AccountIdentifiers.validateDID(did)
+    } catch let error as PetrelPLCError {
+        throw translatePLCError(error)
+    }
+}
+
+private func canonicalizeHandle(_ handle: String) throws -> String {
+    do {
+        return try AccountIdentifiers.canonicalHandle(handle)
+    } catch let error as PetrelPLCError {
+        throw translatePLCError(error)
+    }
+}
+
+private func translatePLCError(_ error: PetrelPLCError) -> SwanError {
+    switch error {
+    case let .invalidIdentifier(message):
+        return .invalidIdentifier(message)
+    case let .invalidProfile(message):
+        return .invalidProfile(message)
+    case let .unauthorized(message):
+        return .unauthorized(message)
+    case let .conflict(expected, actual):
+        return .conflict(expected: expected, actual: actual)
+    case .expired:
+        return .expired
+    case let .malformed(message):
+        return .malformed(message)
+    case let .unavailable(message):
+        return .unavailable(message)
     }
 }

@@ -923,6 +923,9 @@ private func status(for error: any Error) -> HTTPResponse.Status {
     case let error as SwanError:
         if case .unavailable = error { return .serviceUnavailable }
         return .badRequest
+    case let error as PetrelPLCError:
+        if case .unavailable = error { return .serviceUnavailable }
+        return .badRequest
     case is AccountControlStoreError:
         return .badRequest
     default:

@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import PetrelPLC
 import SwanAccounts
 import SwanCore
 import SwanStorage
@@ -473,6 +474,25 @@ public struct SwanDidWebIdentityHTTP: Sendable {
                 return .serviceUnavailable
             case .unavailable:
                 // Storage, resolver, key-store, or provider outage.
+                return .serviceUnavailable
+            }
+        case let error as PetrelPLCError:
+            switch error {
+            case let .unauthorized(message):
+                if message.contains("replayed") { return .conflict }
+                if message.contains("step-up") { return .stepUpRequired }
+                return .unprocessable(message)
+            case .conflict:
+                return .conflict
+            case .expired:
+                return .unprocessable("expired")
+            case let .invalidIdentifier(message):
+                return .unprocessable(message)
+            case let .malformed(message):
+                return .unprocessable(message)
+            case .invalidProfile:
+                return .serviceUnavailable
+            case .unavailable:
                 return .serviceUnavailable
             }
         case let error as AccountControlStoreError:
