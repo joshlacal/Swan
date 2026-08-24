@@ -1,4 +1,5 @@
 import Foundation
+import PetrelPLC
 import SwanAccounts
 
 /// Repository admission consumes a verified method-specific provider. It does

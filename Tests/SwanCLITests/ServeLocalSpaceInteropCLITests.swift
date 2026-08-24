@@ -1,7 +1,14 @@
 import Crypto
 import Foundation
-import SwanAccounts
+import Petrel
+import PetrelCrypto
+import PetrelPLC
 import PetrelRepo
+import SwanAccounts
+import SwanCore
+import SwanHTTP
+import SwanInterop
+import SwanOAuth
 import SwanSQLite
 import SwanStorage
 import XCTest

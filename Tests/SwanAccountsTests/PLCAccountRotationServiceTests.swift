@@ -3,6 +3,8 @@ import Foundation
 import SwanCore
 import PetrelFirehose
 import PetrelRepo
+import PetrelCrypto
+import PetrelPLC
 @_spi(Testing) import SwanSQLite
 import SwanStorage
 import XCTest

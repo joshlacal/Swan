@@ -6,6 +6,9 @@ import HTTPTypes
 import Logging
 import NIOCore
 import Petrel
+import PetrelPLC
+import PetrelRepo
+import PetrelFirehose
 import ServiceLifecycle
 import SwanAccounts
 import SwanCore
@@ -1692,7 +1695,7 @@ private func lifecycleErrorResponse(for error: any Error) -> Response {
     case AccountControlStoreError.invalidInput:
         status = HTTPResponse.Status(code: 422)
         code = "invalid_input"
-    case SwanError.invalidIdentifier:
+    case SwanError.invalidIdentifier, PetrelPLCError.invalidIdentifier:
         status = HTTPResponse.Status(code: 422)
         code = "invalid_request"
     case SwanError.unauthorized:

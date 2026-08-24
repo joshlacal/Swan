@@ -6,6 +6,8 @@ import Darwin
 import Glibc
 #endif
 import Petrel
+import PetrelCrypto
+import PetrelPLC
 @testable import SwanAccountExport
 import SwanAccounts
 import PetrelRepo

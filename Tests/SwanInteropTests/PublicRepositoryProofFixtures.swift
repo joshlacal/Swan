@@ -111,7 +111,7 @@ public struct PublicRepositoryProofFixture: Sendable {
     public let decoyPaths: [PublicRepositoryPath]
 
     /// The key the REQUESTED DID's document names. Build a
-    /// `did:key` from it with `SwanAccounts.P256DIDKey(publicKey:)`.
+    /// `did:key` from it with `P256DIDKey(publicKey:)`.
     public let documentPublicKeyX963: Data
     /// The key that actually signed the commit in this CAR.
     public let commitPublicKeyX963: Data

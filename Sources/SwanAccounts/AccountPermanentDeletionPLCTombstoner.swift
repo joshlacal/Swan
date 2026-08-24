@@ -1,5 +1,7 @@
 import Crypto
 import Foundation
+import PetrelCrypto
+import PetrelPLC
 import SwanCore
 
 /// Authenticated, restart-idempotent PLC tombstoning for permanent account

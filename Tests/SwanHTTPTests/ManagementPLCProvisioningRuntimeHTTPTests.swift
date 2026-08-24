@@ -3,6 +3,7 @@ import Hummingbird
 import HummingbirdTesting
 import Logging
 import NIOCore
+import PetrelPLC
 @testable import SwanAccounts
 import SwanCore
 @testable import SwanHTTP
@@ -119,7 +120,7 @@ final class ManagementPLCProvisioningRuntimeHTTPTests: XCTestCase {
             XCTAssertEqual(remainingWaiters, 0)
             try await fixture.liveDirectory.requireActivePreopenedAccount(prepared.did)
             let active = try await fixture.control.account(did: prepared.did)
-            XCTAssertEqual(active?.status, .active)
+            XCTAssertEqual(active?.status, AccountControlStatus.active)
             let recoveryCount = try await fixture.liveDirectory
                 .notificationRecoveryDatabases().count
             XCTAssertEqual(recoveryCount, 1)
@@ -304,7 +305,7 @@ final class ManagementPLCProvisioningRuntimeHTTPTests: XCTestCase {
             // that the management retry path must close.
             try await fixture.liveDirectory.requireActivePreopenedAccount(prepared.did)
             let activeAccount = try await fixture.control.account(did: prepared.did)
-            XCTAssertEqual(activeAccount?.status, .active)
+            XCTAssertEqual(activeAccount?.status, AccountControlStatus.active)
             let generationBeforeRetry = try await fixture.control
                 .currentLifecycleGeneration(did: prepared.did)
             XCTAssertEqual(generationBeforeRetry, 0)

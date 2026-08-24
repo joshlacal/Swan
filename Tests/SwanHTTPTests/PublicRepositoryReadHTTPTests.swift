@@ -5,6 +5,8 @@ import HTTPTypes
 import Logging
 import NIOCore
 import Petrel
+import PetrelCrypto
+import PetrelPLC
 import SwanAccounts
 import SwanCore
 @testable import SwanHTTP
@@ -362,7 +364,7 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
         let carBytes = try XCTUnwrap(
             Data(base64Encoded: try XCTUnwrap(vector["carBase64"] as? String))
         )
-        let signingKey = try SwanAccounts.P256DIDKey(
+        let signingKey = try P256DIDKey(
             try XCTUnwrap(vector["signingKeyDID"] as? String)
         ).publicKey
         let expectedCommitCID = try XCTUnwrap(vector["commitCID"] as? String)

@@ -3,6 +3,7 @@ import HTTPTypes
 import Hummingbird
 import NIOCore
 import Petrel
+import PetrelPLC
 import SwanAccounts
 import SwanCore
 import SwanOAuth

@@ -1,11 +1,12 @@
 import Crypto
 import Foundation
 import Petrel
+import PetrelCrypto
+import PetrelPLC
+import PetrelRepo
 import secp256k1
 import SwanCore
-import PetrelRepo
 import SwanStorage
-
 public struct SwanPublicPLCGenesisVerifier: PublicPLCGenesisVerifying {
     public init() {}
 
@@ -33,7 +34,10 @@ extension SwanPublicPLCGenesisVerifier: PublicPLCIdentityVerifying {
         guard !history.isEmpty else {
             throw SwanError.unavailable("PLC identity history is empty")
         }
-        try PLCOperationCodec.validateCanonicalDID(expectedDID)
+        guard (try? AccountIdentifiers.validateDID(expectedDID)) != nil,
+              expectedDID.hasPrefix("did:plc:") else {
+            throw SwanError.invalidIdentifier("canonical did:plc")
+        }
 
         var previousDate: Date?
         var previousOperation: PLCSignedOperation?
@@ -86,9 +90,9 @@ extension SwanPublicPLCGenesisVerifier: PublicPLCIdentityVerifying {
             }
 
             guard regular.verificationMethods.count == 1,
-                  regular.verificationMethods["atproto"].map(SwanAccounts.PLCDIDKeyCodec.isCanonical) == true,
+                  regular.verificationMethods["atproto"].map(PLCDIDKeyCodec.isCanonical) == true,
                   regular.rotationKeys.count >= 1,
-                  regular.rotationKeys.allSatisfy({ SwanAccounts.PLCDIDKeyCodec.isCanonical($0) }) else {
+                  regular.rotationKeys.allSatisfy({ PLCDIDKeyCodec.isCanonical($0) }) else {
                 throw SwanError.unauthorized("PLC operation identity keys are invalid")
             }
             previousDate = entry.createdAt
@@ -137,7 +141,7 @@ extension SwanPublicPLCGenesisVerifier: PublicPLCRepositoryAuthenticating {
         signingDIDKey: String
     ) async throws -> PublicRepositoryCommitAuthentication {
         let verifier: any PublicRepositoryCommitVerifier
-        switch try SwanAccounts.PLCDIDKeyCodec.decode(signingDIDKey) {
+        switch try PLCDIDKeyCodec.decode(signingDIDKey) {
         case let .p256(publicKey):
             verifier = P256PublicRepositoryCommitVerifier(
                 publicKey: publicKey

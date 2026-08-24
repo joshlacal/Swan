@@ -3,6 +3,8 @@ import Dispatch
 import Foundation
 import SQLiteNIO
 import SwanCore
+import PetrelCrypto
+import PetrelPLC
 import SwanSQLite
 import SwanStorage
 import XCTest

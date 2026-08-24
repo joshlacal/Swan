@@ -23,7 +23,7 @@ public protocol PublicCrawlHTTPTransport: Sendable {
     func announce(_ request: PublicCrawlAnnounceRequest) async throws -> Bool
 }
 
-/// The production transport, mirroring `AsyncHTTPClientPLCTransport`:
+/// The production transport, mirroring `URLSessionPLCTransport`:
 /// redirects are disallowed, connect and read timeouts are the bounded
 /// maximum, and decompression is disabled so the status code is the only
 /// decision input.

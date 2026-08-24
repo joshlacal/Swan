@@ -6,9 +6,11 @@ import Glibc
 #endif
 import Foundation
 import Petrel
+import PetrelCrypto
+import PetrelPLC
+import PetrelRepo
 import SwanAccounts
 import SwanCore
-import PetrelRepo
 import SwanSQLite
 import SwanSpaces
 import SwanSpacesWire
@@ -350,7 +352,7 @@ public enum SwanPortableExportVerifier {
             expectedHandle: manifest.canonicalHandle,
             expectedRepositoryRevision: verifiedPublicGenesis.revision,
             expectedPublicGenesisCID: verifiedPublicGenesis.commitCID.string,
-            expectedSigningDIDKey: SwanAccounts.P256DIDKey(publicKey: signingPublicKey).value
+            expectedSigningDIDKey: P256DIDKey(publicKey: signingPublicKey).value
         )
         return manifest
     }
@@ -524,7 +526,7 @@ public enum SwanPortableExportVerifier {
             expectedHandle: manifest.canonicalHandle,
             expectedRepositoryRevision: verifiedPublicGenesis.revision,
             expectedPublicGenesisCID: verifiedPublicGenesis.commitCID.string,
-            expectedSigningDIDKey: SwanAccounts.P256DIDKey(publicKey: signingPublicKey).value
+            expectedSigningDIDKey: P256DIDKey(publicKey: signingPublicKey).value
         )
         return manifest
     }
@@ -788,7 +790,7 @@ public enum SwanPortableExportVerifier {
               let signingDIDKey = regular.verificationMethods["atproto"] else {
             throw SwanPortableExportError.invalidArchive
         }
-        let canonicalDIDKey = try SwanAccounts.P256DIDKey(signingDIDKey)
+        let canonicalDIDKey = try P256DIDKey(signingDIDKey)
         guard canonicalDIDKey.value == signingDIDKey else {
             throw SwanPortableExportError.invalidArchive
         }
@@ -1168,7 +1170,7 @@ public struct SwanPortableAccountExporter: Sendable {
         )
         try PLCOperationCodec.verifyGenesis(operation, expectedDID: did)
         guard operation.regular?.verificationMethods["atproto"]
-            == SwanAccounts.P256DIDKey(publicKey: signingPublicKey).value else {
+            == P256DIDKey(publicKey: signingPublicKey).value else {
             throw SwanPortableExportError.invalidAccount
         }
         let object: [String: Any] = [

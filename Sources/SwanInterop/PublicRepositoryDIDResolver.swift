@@ -1,4 +1,6 @@
 import Foundation
+import PetrelCrypto
+import PetrelPLC
 import SwanAccounts
 import SwanOAuth
 import SwanCore

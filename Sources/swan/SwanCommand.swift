@@ -3,6 +3,8 @@ import Crypto
 import Foundation
 import Logging
 import Petrel
+import PetrelCrypto
+import PetrelPLC
 import SwanAccountExport
 @_spi(ServeStartup) import SwanAccounts
 import SwanHTTP
@@ -5759,7 +5761,7 @@ extension SwanCommand {
                         history,
                         expectedDID: canonicalDID
                     )
-                    guard case let .p256(publicKey) = try SwanAccounts.PLCDIDKeyCodec.decode(
+                    guard case let .p256(publicKey) = try PLCDIDKeyCodec.decode(
                         identity.signingDIDKey
                     ) else {
                         throw ValidationError("verified atproto signing method is not ES256")
@@ -9375,7 +9377,7 @@ private enum LabLiveSupport {
         // published key rather than to an operator-supplied algorithm label.
         if configured.hasPrefix("did:key:z") {
             do {
-                switch try SwanAccounts.PLCDIDKeyCodec.decode(configured) {
+                switch try PLCDIDKeyCodec.decode(configured) {
                 case let .p256(publicKey):
                     return .p256(publicKey)
                 case let .secp256k1(publicKey):

@@ -1,5 +1,6 @@
 import CATHandleDNS
 import Foundation
+import PetrelPLC
 import SwanCore
 
 #if canImport(Darwin)

@@ -5,6 +5,8 @@ import Darwin
 import Glibc
 #endif
 import Foundation
+import PetrelCrypto
+import PetrelPLC
 import SwanAccounts
 import SwanCore
 import SwanSQLite

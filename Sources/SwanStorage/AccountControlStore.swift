@@ -1568,7 +1568,7 @@ public extension AccountControlStore {
 }
 
 /// Strict lexical account identifiers shared by durable adapters that cannot
-/// depend on the higher-level account service. `SwanAccounts.AccountIdentifiers`
+/// depend on the higher-level account service. `PetrelPLC.AccountIdentifiers`
 /// validates the same DID and handle forms before public service calls.
 public enum AccountControlIdentifiers {
     public static func isDID(_ value: String) -> Bool {

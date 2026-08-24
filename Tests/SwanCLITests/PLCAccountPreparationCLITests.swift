@@ -2,6 +2,8 @@ import Foundation
 import NIOCore
 import NIOHTTP1
 import NIOPosix
+import PetrelCrypto
+import PetrelPLC
 import SwanAccounts
 import SwanSQLite
 import XCTest
@@ -18,7 +20,7 @@ final class PLCAccountPreparationCLITests: XCTestCase {
         let url = URL(
             string: "http://127.0.0.1:\(server.port)/did:plc:abcdefghijklmnopqrstuvwx/log/audit"
         )!
-        let transport = try AsyncHTTPClientPLCTransport()
+        let transport = try URLSessionPLCTransport()
         let response = try await transport.execute(.init(
             method: .get,
             url: url,

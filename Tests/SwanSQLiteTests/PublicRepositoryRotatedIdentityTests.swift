@@ -1,5 +1,7 @@
 import Crypto
 import Foundation
+import PetrelCrypto
+import PetrelPLC
 import SwanAccounts
 import SwanCore
 @testable import SwanSQLite

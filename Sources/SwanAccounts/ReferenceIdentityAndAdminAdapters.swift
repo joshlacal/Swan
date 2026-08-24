@@ -1,4 +1,5 @@
 import Foundation
+import PetrelPLC
 import SwanCore
 
 public struct ReferencePLCIdentityUpdateRequest: Sendable, Equatable {

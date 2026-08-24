@@ -1,4 +1,5 @@
 import Foundation
+import PetrelPLC
 import SwanStorage
 
 #if os(Linux)

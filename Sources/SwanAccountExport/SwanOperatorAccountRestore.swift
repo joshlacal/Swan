@@ -5,6 +5,8 @@ import Darwin
 import Glibc
 #endif
 import Foundation
+import PetrelCrypto
+import PetrelPLC
 @_spi(OperatorRestore) import SwanAccounts
 import PetrelRepo
 @_spi(PortableRestore) import SwanSQLite

@@ -3,6 +3,7 @@ import Hummingbird
 import HummingbirdCore
 import Logging
 import NIOCore
+import PetrelPLC
 import SwanAccounts
 import SwanCore
 import SwanStorage

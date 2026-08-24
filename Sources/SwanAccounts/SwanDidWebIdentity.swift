@@ -3,6 +3,7 @@ import Foundation
 #if canImport(CoreFoundation)
 import CoreFoundation
 #endif
+import PetrelPLC
 import SwanCore
 import SwanStorage
 

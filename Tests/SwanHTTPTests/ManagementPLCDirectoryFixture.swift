@@ -2,6 +2,7 @@ import Foundation
 import NIOCore
 import NIOHTTP1
 import NIOPosix
+import PetrelPLC
 @testable import SwanAccounts
 
 final class ManagementPLCDirectoryFixture: @unchecked Sendable {

@@ -2,6 +2,8 @@ import Crypto
 import Foundation
 import Petrel
 import SQLiteNIO
+import PetrelCrypto
+import PetrelPLC
 import SwanAccounts
 import SwanCore
 import PetrelRepo
@@ -181,7 +183,7 @@ final class PublicRepositoryAdmissionIntegrityTests: XCTestCase {
             .describePublicRepository(selector: did)
         XCTAssertEqual(
             validDescription?.identity.signingDIDKey,
-            SwanAccounts.P256DIDKey(publicKey: accountKey.publicKey).value
+            P256DIDKey(publicKey: accountKey.publicKey).value
         )
         try await validDirectory.close()
 

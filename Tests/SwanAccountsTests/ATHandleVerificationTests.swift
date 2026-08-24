@@ -1,5 +1,6 @@
 import CATHandleDNS
 import Foundation
+import PetrelPLC
 @testable import SwanAccounts
 import XCTest
 
