@@ -71,7 +71,7 @@ Swan is organized around the following subsystems:
 - [Operational runbook](docs/operational-runbook.md): Service health checks, encrypted backup and restore, key rotation, and SQLite maintenance.
 - [API reference](docs/api-reference.md): XRPC method catalog, OAuth 2.1 discovery and token endpoints, and account portal REST APIs.
 - [Server surfaces](docs/server-surfaces.md): Foreign handle resolution, OAuth browser styling, account portal configuration, and XRPC proxy routing.
-- [Interoperability laboratory](docs/interop-lab.md): Offline semantic testing, live network harnesses, Docker Compose testbed, and wire generation.
+- [Interoperability laboratory](docs/interop-lab.md): Offline semantic testing, live network harnesses, and Docker Compose testbed.
 - [Forum test vehicle](docs/forum-lab.md): Minimal multi-writer forum vehicle, subcommands, and thread merge ordering rules.
 - [Threat boundaries](docs/threat-boundaries.md): Security model, cryptographic accumulators, and PLC resolution caching.
 - [OAuth scope limits](docs/oauth-scope-limits.md): Input budgets, grant limits, and protocol admission rules.

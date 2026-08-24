@@ -1,6 +1,6 @@
 # Interoperability laboratory
 
-This document describes Swan's interoperability laboratory, offline semantic test runner, live network-backed test harnesses, disposable Docker Compose environment, acceptance suites, and protocol wire generation.
+This document describes Swan's interoperability laboratory, offline semantic test runner, live network-backed test harnesses, disposable Docker Compose environment, and acceptance suites.
 
 ## Development and local verification
 
@@ -293,24 +293,8 @@ export SWAN_RUN_256MIB_CAR_STAGING=1
 export SWAN_RUN_256MIB_PUBLIC_GET_REPO=1
 ```
 
-## Pinned wire generation
+## Protocol wire models
 
-Swan compiles using pre-generated wire source files checked into `Sources/SwanSpacesWire/Generated`. Standard builds do not download lexicons or execute code generators.
-
-To verify that the checked-in wire sources match the pinned protocol profile:
-
-```sh
-PETREL_GENERATOR_ROOT=/path/to/Petrel-swan-generator \
-  ./Scripts/verify-wire-generation.sh
-```
-
-To regenerate the wire source files when updating protocol profiles:
-
-```sh
-PETREL_GENERATOR_ROOT=/path/to/Petrel-swan-generator \
-  ./Scripts/regenerate-wire.sh
-```
-
-Set `PETREL_GENERATOR_ROOT` to the path of an isolated, reviewed checkout of the Petrel generator source workspace. Wire generation scripts do not fall back to ambient sibling directories and perform no network requests; all reference lexicons are loaded from `.interop-cache/`. Checksum verification is handled by `Scripts/sha256.sh`.
+Swan compiles using AT Protocol wire models and generated lexicon types supplied by the pinned `Petrel` package dependency rather than executing local code generation scripts or checking in generated sources under `Sources/SwanSpacesWire/Generated`. Standard builds do not download lexicons or execute code generators.
 
 Swan ensures that permissioned records never enter public repositories, public blob storage, log output, or test fixtures. Permissioned data is access-controlled rather than end-to-end encrypted; a hosting PDS remains within the trust boundary.
