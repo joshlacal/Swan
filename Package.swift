@@ -219,6 +219,7 @@ let package = Package(
             name: "SwanSpacesTests",
             dependencies: [
                 "SwanSpaces", "SwanStorage", "SwanSQLite",
+                .product(name: "PetrelCrypto", package: "Petrel"),
                 .product(name: "Petrel", package: "Petrel"),
             ]
         ),

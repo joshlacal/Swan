@@ -252,7 +252,11 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
         now: Date = Date()
     ) async throws -> VerifiedSpaceServiceAuthentication {
         let inspected = try SpaceServiceJWT.inspect(compact)
-        guard inspected.claims.lxm == expectedMethod,
+        guard let method = inspected.claims.lxm,
+              validServiceMethod(method),
+              method == expectedMethod,
+              let eventID = inspected.claims.jti,
+              validServiceEventID(eventID),
               expectedAudience.map({ inspected.claims.aud == $0 }) ?? true,
               let key = try await publicKeys.publicKey(for: inspected.claims.iss) else {
             throw SwanError.unauthorized("service authentication is invalid")
@@ -266,7 +270,10 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
         )
         guard claims.lxm == expectedMethod,
               expectedAudience.map({ claims.aud == $0 }) ?? true,
-              let eventID = claims.jti else {
+              let eventID = claims.jti,
+              validServiceEventID(eventID),
+              let verifiedMethod = claims.lxm,
+              validServiceMethod(verifiedMethod) else {
             throw SwanError.unauthorized("service authentication is invalid")
         }
         return VerifiedSpaceServiceAuthentication(

@@ -502,7 +502,7 @@ final class SwanOAuthTests: XCTestCase {
         XCTAssertNil(try SpaceServiceJWT.inspect(distant).claims.iat)
         XCTAssertThrowsError(try verify(distant)) { error in
             XCTAssertEqual(
-                error as? SwanError,
+                error as? PetrelCryptoError,
                 .unauthorized("service authentication time claims are invalid")
             )
         }
@@ -535,6 +535,69 @@ final class SwanOAuthTests: XCTestCase {
             iat: nowSeconds - Int64(maximumLifetime)
         )
         XCTAssertThrowsError(try verify(backdated))
+    }
+
+    func testSpaceServiceAuthenticationVerifierRefusesEmptyJTIAndNonAtprotoMethod() async throws {
+        let key = P256.Signing.PrivateKey()
+        let issuer = "did:plc:abcdefghijklmnopqrstuvwx"
+        let audience = "did:plc:zyxwvutsrqponmlkjihgfedc"
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let verifier = DurableSpaceServiceAuthenticationVerifier(
+            publicKeys: try PinnedSpaceServicePublicKeyResolver(pins: [
+                try .init(issuer: issuer, generation: 1, publicKey: key.publicKey)
+            ])
+        )
+
+        // A correctly signed token with empty jti is refused
+        let emptyJTIToken = try testCompactJWT(
+            header: TestSpaceServiceHeader(),
+            claims: SpaceServiceJWT.Claims(
+                iss: issuer,
+                aud: audience,
+                iat: Int64(now.timeIntervalSince1970),
+                exp: Int64(now.timeIntervalSince1970) + 60,
+                lxm: "com.atproto.space.notifyWrite",
+                jti: ""
+            ),
+            key: key
+        )
+        do {
+            _ = try await verifier.authenticate(
+                emptyJTIToken,
+                expectedAudience: audience,
+                expectedMethod: "com.atproto.space.notifyWrite",
+                now: now
+            )
+            XCTFail("expected empty jti token to be rejected")
+        } catch let error as SwanError {
+            XCTAssertEqual(error, .unauthorized("service authentication is invalid"))
+        }
+
+        // A correctly signed token whose lxm is a syntactically valid non-com.atproto NSID is refused even if expectedMethod matches
+        let nonAtprotoMethod = "app.bsky.feed.getPost"
+        let nonAtprotoToken = try testCompactJWT(
+            header: TestSpaceServiceHeader(),
+            claims: SpaceServiceJWT.Claims(
+                iss: issuer,
+                aud: audience,
+                iat: Int64(now.timeIntervalSince1970),
+                exp: Int64(now.timeIntervalSince1970) + 60,
+                lxm: nonAtprotoMethod,
+                jti: "valid-event-id"
+            ),
+            key: key
+        )
+        do {
+            _ = try await verifier.authenticate(
+                nonAtprotoToken,
+                expectedAudience: audience,
+                expectedMethod: nonAtprotoMethod,
+                now: now
+            )
+            XCTFail("expected non-com.atproto method to be rejected")
+        } catch let error as SwanError {
+            XCTAssertEqual(error, .unauthorized("service authentication is invalid"))
+        }
     }
 
     func testRemoteMetadataPolicyRejectsAllPrivateLiteralRanges() throws {
