@@ -3,6 +3,7 @@ import Foundation
 import HTTPTypes
 import Hummingbird
 import NIOCore
+import PetrelCrypto
 import SwanAccounts
 @testable import SwanCore
 @testable import SwanHTTP

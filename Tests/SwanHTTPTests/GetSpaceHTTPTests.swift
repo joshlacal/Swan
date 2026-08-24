@@ -5,13 +5,14 @@ import HummingbirdTesting
 import HTTPTypes
 import Logging
 import NIOCore
-import XCTest
+import PetrelCrypto
 @testable import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
+import XCTest
 
 final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
     private static let authority = "did:plc:abcdefghijklmnopqrstuvwx"

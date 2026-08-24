@@ -6,13 +6,14 @@ import HTTPTypes
 import Logging
 import NIOCore
 import Petrel
-import XCTest
+import PetrelCrypto
 @testable import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
 @_spi(PortableRestore) import SwanSQLite
 import SwanSpaces
 import SwanStorage
+import XCTest
 
 final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
     private static let alice = "did:plc:abcdefghijklmnopqrstuvwx"
@@ -273,7 +274,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let header = try encoder.encode(Header(jwk: token.jwk)).base64URLEncodedString()
         let claims = try encoder.encode(Claims(jti: jti, iat: Int64(Date().timeIntervalSince1970), htm: method, htu: "\(Self.publicURL.absoluteString)\(path)", nonce: runtime.dpopNonceService.issue(), ath: Data(SHA256.hash(data: Data(token.access.utf8))).base64URLEncodedString())).base64URLEncodedString()
-        let input = "\(header).\(claims)"; let signature = try SwanCore.P256WireSignature.sign(Data(input.utf8), using: token.key).base64URLEncodedString()
+        let input = "\(header).\(claims)"; let signature = try P256WireSignature.sign(Data(input.utf8), using: token.key).base64URLEncodedString()
         var headers = HTTPFields(); headers[.authorization] = "DPoP \(token.access)"; headers[HTTPField.Name("DPoP")!] = "\(input).\(signature)"; return headers
     }
 

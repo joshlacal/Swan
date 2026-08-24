@@ -6,12 +6,13 @@ import HTTPTypes
 import Logging
 import NIOCore
 import Petrel
+import PetrelCrypto
+import SwanCore
+import SwanHTTP
+import SwanOAuth
 import SwanSQLite
 import SwanSpaces
 import XCTest
-@testable import SwanCore
-@testable import SwanHTTP
-@testable import SwanOAuth
 
 final class SimpleSpaceCheckUserAccessHTTPTests: XCTestCase, @unchecked Sendable {
     fileprivate static let authority = "did:plc:abcdefghijklmnopqrstuvwx"
@@ -202,9 +203,9 @@ private struct CheckUserAccessFixture {
         method: String = ComAtprotoSimplespaceCheckUserAccess.typeIdentifier,
         audience: String = SimpleSpaceCheckUserAccessHTTPTests.audience,
         now: Date = Date(),
-        lifetime: TimeInterval = SwanOAuth.SpaceServiceJWT.lifetime
+        lifetime: TimeInterval = SpaceServiceJWT.lifetime
     ) throws -> String {
-        try SwanOAuth.SpaceServiceJWT.create(
+        try SpaceServiceJWT.create(
             issuer: SimpleSpaceCheckUserAccessHTTPTests.authority,
             audience: audience,
             method: method,

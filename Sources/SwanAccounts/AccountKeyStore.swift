@@ -1095,7 +1095,7 @@ public actor FileAccountKeyStore:
             reference.purpose.rawValue,
             String(reference.generation),
         ].joined(separator: "\u{0}")
-        return "\(PetrelCrypto.Hex.encode(SHA256.hash(data: Data(identity.utf8)))).key"
+        return "\(Hex.encode(SHA256.hash(data: Data(identity.utf8)))).key"
     }
 
     private static func isCanonicalKeyFilename(_ filename: String) -> Bool {
@@ -1117,7 +1117,7 @@ public actor FileAccountKeyStore:
 
     private static func plcStagingFilename(requestID: String) throws -> String {
         try validatePLCStagingRequestID(requestID)
-        let digest = PetrelCrypto.Hex.encode(SHA256.hash(
+        let digest = Hex.encode(SHA256.hash(
             data: Data("\(plcStagingFormat)\u{0}\(requestID)".utf8)
         ))
         return "\(digest).plcstage"

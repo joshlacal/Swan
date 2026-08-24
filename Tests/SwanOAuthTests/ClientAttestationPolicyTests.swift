@@ -1,10 +1,11 @@
 import Crypto
 import Foundation
-import XCTest
-@testable import SwanOAuth
-@testable import SwanSQLite
+import PetrelCrypto
 import SwanCore
+import SwanOAuth
+import SwanSQLite
 import SwanStorage
+import XCTest
 
 final class ClientAttestationPolicyTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_738_368_000)

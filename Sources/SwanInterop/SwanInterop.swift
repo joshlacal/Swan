@@ -1,8 +1,8 @@
-import Foundation
 import Crypto
+import Foundation
+import PetrelCrypto
 import SwanCore
 import SwanSpaces
-
 /// A stable, offline-only diagnostic for a checked-in protocol artifact.
 ///
 /// Deliberately do not carry filesystem paths, file contents, or underlying

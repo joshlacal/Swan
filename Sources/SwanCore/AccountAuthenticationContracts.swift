@@ -1,4 +1,5 @@
 import Foundation
+import PetrelCrypto
 
 /// The only factors which can raise a password-authenticated account to MFA
 /// strength.  Cryptographic enrollment and assertion verification live in the

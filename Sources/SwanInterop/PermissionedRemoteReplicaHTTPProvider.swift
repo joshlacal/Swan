@@ -1,10 +1,11 @@
 import Foundation
 import Petrel
+import PetrelCrypto
+import SwanAccounts
 import SwanCore
 import SwanOAuth
 import SwanSpaces
 import SwanStorage
-import SwanAccounts
 
 /// Deterministic laboratory-only mutation applied after a bounded recovery
 /// response has been spooled and before the normal streaming verifier sees it.
@@ -133,7 +134,7 @@ public struct PermissionedRemoteReplicaHTTPSourceProvider:
               latest.header("content-type")?.lowercased().contains("json") == true else {
             throw InteropHTTPError.unexpectedStatus(latest.status)
         }
-        let output = try SwanOAuth.StrictJSON.decode(
+        let output = try StrictJSON.decode(
             ComAtprotoSpaceGetLatestCommit.Output.self,
             from: latest.body
         )
@@ -224,7 +225,7 @@ public struct PermissionedRemoteReplicaHTTPSourceProvider:
     private func verifyLatestCommit(
         _ commit: ComAtprotoSpaceDefs.SignedCommit,
         target: PermissionedRemoteReplicaTarget,
-        verificationKey: SwanOAuth.PermissionedDataJWTVerificationKey
+        verificationKey: PermissionedDataJWTVerificationKey
     ) throws -> PermissionedRemoteReplicaFreshnessWitness {
         guard commit.ver == 1,
               commit.hash.data.count == 32,

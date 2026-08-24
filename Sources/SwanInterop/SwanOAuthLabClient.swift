@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import PetrelCrypto
 import SwanCore
 import SwanOAuth
 
@@ -61,7 +62,7 @@ public struct InteropDPoPKey: @unchecked Sendable {
         let headerPart = try encoder.encode(header).base64URLEncodedString()
         let payloadPart = try encoder.encode(claims).base64URLEncodedString()
         let signingInput = Data("\(headerPart).\(payloadPart)".utf8)
-        let signature = try SwanCore.P256WireSignature.sign(signingInput, using: privateKey)
+        let signature = try P256WireSignature.sign(signingInput, using: privateKey)
         return "\(headerPart).\(payloadPart).\(signature.base64URLEncodedString())"
     }
 

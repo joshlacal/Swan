@@ -1,12 +1,13 @@
 import Crypto
 import Foundation
+import PetrelCrypto
 import SwanAccounts
 import SwanCore
-import SwanSpaces
+@testable import SwanOAuth
 import SwanSQLite
+import SwanSpaces
 import SwanStorage
 import XCTest
-@testable import SwanOAuth
 
 /// F15/F32/F44/F45 (signing fences) and F16 (service-key resolution).
 ///

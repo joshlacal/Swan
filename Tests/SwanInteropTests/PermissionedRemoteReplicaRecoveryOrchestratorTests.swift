@@ -1,12 +1,14 @@
 import Crypto
 import Foundation
 import Petrel
-import XCTest
-@testable import SwanInterop
+import PetrelCrypto
+import SwanCore
 import SwanOAuth
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
+import XCTest
+@testable import SwanInterop
 
 final class PermissionedRemoteReplicaRecoveryOrchestratorTests: XCTestCase {
     private let receiver = "did:plc:receiverabcdefghijklmnopqrstu"
@@ -25,7 +27,7 @@ final class PermissionedRemoteReplicaRecoveryOrchestratorTests: XCTestCase {
 
         let fixture = try makeCAR()
         let key = fixture.key
-        let verificationKey = SwanOAuth.PermissionedDataJWTVerificationKey.p256(
+        let verificationKey = PermissionedDataJWTVerificationKey.p256(
             key.publicKey
         )
         let sourceIdentity = try PermissionedRemoteReplicaSourceIdentity(
@@ -86,7 +88,7 @@ final class PermissionedRemoteReplicaRecoveryOrchestratorTests: XCTestCase {
         let identity = try PermissionedRemoteReplicaSourceIdentity(
             origin: URL(string: "https://writer.example/")!,
             repositoryDID: repository,
-            verifierIdentity: SwanOAuth.PermissionedDataJWTVerificationKey.p256(
+            verifierIdentity: PermissionedDataJWTVerificationKey.p256(
                 key.publicKey
             ).recoveryVerifierIdentity
         )
@@ -122,7 +124,7 @@ final class PermissionedRemoteReplicaRecoveryOrchestratorTests: XCTestCase {
         defer { Task { try? await database.close() } }
 
         let key = P256.Signing.PrivateKey()
-        let verificationKey = SwanOAuth.PermissionedDataJWTVerificationKey.p256(
+        let verificationKey = PermissionedDataJWTVerificationKey.p256(
             key.publicKey
         )
         let identity = try PermissionedRemoteReplicaSourceIdentity(
@@ -182,7 +184,7 @@ final class PermissionedRemoteReplicaRecoveryOrchestratorTests: XCTestCase {
         defer { Task { try? await database.close() } }
 
         let fixture = try makeCAR()
-        let verificationKey = SwanOAuth.PermissionedDataJWTVerificationKey.p256(
+        let verificationKey = PermissionedDataJWTVerificationKey.p256(
             fixture.key.publicKey
         )
         let identity = try PermissionedRemoteReplicaSourceIdentity(
@@ -247,7 +249,7 @@ final class PermissionedRemoteReplicaRecoveryOrchestratorTests: XCTestCase {
         defer { Task { try? await database.close() } }
 
         let fixture = try makeCAR()
-        let verificationKey = SwanOAuth.PermissionedDataJWTVerificationKey.p256(
+        let verificationKey = PermissionedDataJWTVerificationKey.p256(
             fixture.key.publicKey
         )
         let source = try PermissionedRemoteReplicaSourceSession(
@@ -336,7 +338,7 @@ final class PermissionedRemoteReplicaRecoveryOrchestratorTests: XCTestCase {
         let source = try PermissionedRemoteReplicaSourceIdentity(
             origin: URL(string: "https://writer.example")!,
             repositoryDID: repository,
-            verifierIdentity: SwanOAuth.PermissionedDataJWTVerificationKey.p256(
+            verifierIdentity: PermissionedDataJWTVerificationKey.p256(
                 key.publicKey
             ).recoveryVerifierIdentity
         )

@@ -6,9 +6,10 @@ import HTTPTypes
 import Logging
 import NIOCore
 import Petrel
+import PetrelCrypto
+import PetrelFirehose
 import PetrelPLC
 import PetrelRepo
-import PetrelFirehose
 import ServiceLifecycle
 import SwanAccounts
 import SwanCore
@@ -1746,7 +1747,7 @@ private func decodeCreateAccountBody(
     }
     let data = Data(bytes)
     do {
-        try SwanOAuth.StrictJSON.validate(data)
+        try StrictJSON.validate(data)
         guard let object = try JSONSerialization.jsonObject(
             with: data,
             options: []

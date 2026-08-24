@@ -1,12 +1,13 @@
 import Crypto
 import Foundation
+import PetrelCrypto
 import SwanAccounts
 import SwanCore
-import SwanSQLite
-import SwanStorage
-import SwanSpaces
-import XCTest
 @testable import SwanOAuth
+import SwanSQLite
+import SwanSpaces
+import SwanStorage
+import XCTest
 
 final class LocalCredentialAuthorityFailClosedTests: XCTestCase {
     private let managedDID = "did:plc:abcdefghijklmnopqrstuvwx"

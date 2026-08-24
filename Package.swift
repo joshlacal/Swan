@@ -51,11 +51,6 @@ let package = Package(
         // which requires `HTTPField.Name` from HTTPTypes. Pinned to the
         // version Hummingbird already resolves.
         .package(url: "https://github.com/apple/swift-http-types.git", exact: "1.6.0"),
-        // The pinned TypeScript PDS signs AT Protocol repository and space
-        // JWTs with secp256k1 (`ES256K`). Keep verification in SwanOAuth
-        // explicit rather than inheriting an unstable transitive product from
-        // Petrel/JOSESwift.
-        .package(url: "https://github.com/GigaBitcoin/secp256k1.swift.git", exact: "0.15.0"),
     ],
     targets: [
         .systemLibrary(
@@ -90,6 +85,7 @@ let package = Package(
         .target(
             name: "SwanCore",
             dependencies: [
+                .product(name: "PetrelCrypto", package: "Petrel"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Logging", package: "swift-log"),
             ]
@@ -100,6 +96,7 @@ let package = Package(
             name: "SwanSpaces",
             dependencies: [
                 "CBLAKE3", "SwanCore",
+                .product(name: "PetrelCrypto", package: "Petrel"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Petrel", package: "Petrel"),
             ]
@@ -108,6 +105,7 @@ let package = Package(
             name: "SwanStorage",
             dependencies: [
                 "SwanCore", "SwanSpaces",
+                .product(name: "PetrelCrypto", package: "Petrel"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "PetrelRepo", package: "Petrel"),
             ]
@@ -138,7 +136,6 @@ let package = Package(
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOSSL", package: "swift-nio-ssl"),
-                .product(name: "secp256k1", package: "secp256k1.swift"),
                 .product(name: "Petrel", package: "Petrel"),
             ]
         ),
@@ -154,7 +151,6 @@ let package = Package(
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOSSL", package: "swift-nio-ssl"),
-                .product(name: "secp256k1", package: "secp256k1.swift"),
             ]
         ),
         .target(

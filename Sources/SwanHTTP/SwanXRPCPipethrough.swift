@@ -2,6 +2,7 @@ import Foundation
 import HTTPTypes
 import Hummingbird
 import NIOCore
+import PetrelCrypto
 import SwanCore
 import SwanOAuth
 import SwanSpaces

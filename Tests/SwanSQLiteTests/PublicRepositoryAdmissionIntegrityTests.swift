@@ -195,12 +195,12 @@ final class PublicRepositoryAdmissionIntegrityTests: XCTestCase {
             revision: installed.state.revision,
             dataCID: installed.state.dataCID
         )
-        let fakeSignature = try SwanCore.P256WireSignature.sign(
+        let fakeSignature = try P256WireSignature.sign(
             unsignedCommit,
             using: attackerKey
         )
-        XCTAssertEqual(fakeSignature.count, SwanCore.P256WireSignature.rawByteCount)
-        XCTAssertTrue(SwanCore.P256WireSignature.isCanonicalLowS(fakeSignature))
+        XCTAssertEqual(fakeSignature.count, P256WireSignature.rawByteCount)
+        XCTAssertTrue(P256WireSignature.isCanonicalLowS(fakeSignature))
         let fakeCommit = try canonicalSignedCommit(
             state: installed.state,
             signature: fakeSignature

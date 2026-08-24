@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import PetrelCrypto
 @testable import SwanOAuth
 import XCTest
 

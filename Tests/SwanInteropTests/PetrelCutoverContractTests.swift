@@ -1,10 +1,11 @@
+import Crypto
 import Foundation
-import XCTest
-import PetrelRepo
+import Petrel
+import PetrelCrypto
 import PetrelFirehose
 import PetrelPLC
-import PetrelCrypto
-
+import PetrelRepo
+import XCTest
 final class PetrelCutoverContractTests: XCTestCase {
     func testPublicRepositoryTIDAcceptsAndPreservesRevision() throws {
         let rev = "3jzfcijpj2z2a"
@@ -33,5 +34,47 @@ final class PetrelCutoverContractTests: XCTestCase {
         XCTAssertEqual(encoded.lowercased(), "00abff")
         let decoded = Hex.decode(encoded)
         XCTAssertEqual(decoded, original)
+    }
+
+    func testP256WireSignatureProducesCanonicalLowS() throws {
+        let key = P256.Signing.PrivateKey()
+        let message = Data("contract-test-message".utf8)
+        let signature = try P256WireSignature.sign(message, using: key)
+        XCTAssertEqual(signature.count, 64)
+        XCTAssertTrue(P256WireSignature.isCanonicalLowS(signature))
+        let decoded = try P256WireSignature.decodeCanonical(signature)
+        XCTAssertTrue(key.publicKey.isValidSignature(decoded, for: message))
+    }
+
+    func testStrictJSONRejectsDuplicateKeys() throws {
+        let valid = Data(#"{"a": 1, "b": 2}"#.utf8)
+        XCTAssertNoThrow(try StrictJSON.validate(valid))
+        let duplicate = Data(#"{"a": 1, "a": 2}"#.utf8)
+        XCTAssertThrowsError(try StrictJSON.validate(duplicate))
+    }
+
+    func testServiceJWTMintAndVerify() throws {
+        let key = P256.Signing.PrivateKey()
+        let issuer = "did:plc:abcdefghijklmnopqrstuvwx"
+        let audience = "did:web:api.bsky.app"
+        let token = try ProxyServiceJWT.create(
+            issuer: issuer,
+            audience: audience,
+            method: "app.bsky.actor.getProfile",
+            eventID: "event-123",
+            key: key,
+            lifetime: 60
+        )
+        let verificationKey = ATProtoJWTVerificationKey.p256(key.publicKey)
+        let claims = try SpaceServiceJWT.verify(
+            token,
+            publicKey: verificationKey,
+            expectedAudience: audience,
+            expectedMethod: "app.bsky.actor.getProfile"
+        )
+        XCTAssertEqual(claims.iss, issuer)
+        XCTAssertEqual(claims.aud, audience)
+        XCTAssertEqual(claims.lxm, "app.bsky.actor.getProfile")
+        XCTAssertEqual(claims.jti, "event-123")
     }
 }

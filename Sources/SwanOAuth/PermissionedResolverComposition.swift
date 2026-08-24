@@ -1,4 +1,5 @@
 import Foundation
+import PetrelCrypto
 import SwanCore
 
 /// Offline-only composition of the local account projection with explicit

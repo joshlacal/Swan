@@ -5,13 +5,14 @@ import HummingbirdTesting
 import HTTPTypes
 import Logging
 import NIOCore
-import XCTest
+import PetrelCrypto
 import SwanAccounts
 @testable import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
 import SwanSQLite
 import SwanStorage
+import XCTest
 
 final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
     private let issuer = URL(string: "https://swan.example")!

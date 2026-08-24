@@ -42,10 +42,10 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
 
         XCTAssertEqual(
             dedicated.deterministicIdentity,
-            SwanOAuth.PermissionedDataJWTVerificationKey.p256(p256).deterministicIdentity
+            PermissionedDataJWTVerificationKey.p256(p256).deterministicIdentity
         )
         XCTAssertTrue(try dedicated.verify(
-            signature: PetrelCrypto.P256WireSignature.sign(
+            signature: P256WireSignature.sign(
                 Data("credential".utf8),
                 using: privateKey
             ),
@@ -419,7 +419,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         let first = try XCTUnwrap(maybeFirst)
         XCTAssertEqual(
             first.deterministicIdentity,
-            SwanOAuth.PermissionedDataJWTVerificationKey.p256(oldKey).deterministicIdentity
+            PermissionedDataJWTVerificationKey.p256(oldKey).deterministicIdentity
         )
 
         await plc.setSnapshot(rotated, for: issuer)
@@ -431,7 +431,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         let refreshed = try XCTUnwrap(maybeRefreshed)
         XCTAssertEqual(
             refreshed.deterministicIdentity,
-            SwanOAuth.PermissionedDataJWTVerificationKey.p256(newKey).deterministicIdentity
+            PermissionedDataJWTVerificationKey.p256(newKey).deterministicIdentity
         )
 
         // Request-selected churn cannot evict the authenticated terminal-CID

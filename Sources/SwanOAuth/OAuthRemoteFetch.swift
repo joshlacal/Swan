@@ -1,5 +1,6 @@
 import AsyncHTTPClient
 import Foundation
+import PetrelCrypto
 import SwanCore
 
 #if canImport(Darwin)

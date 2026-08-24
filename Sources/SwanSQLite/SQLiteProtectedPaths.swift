@@ -1,7 +1,7 @@
 import Crypto
 import Foundation
+import PetrelCrypto
 import SwanCore
-
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)

@@ -6,7 +6,7 @@ import HTTPTypes
 import Logging
 import NIOCore
 import Petrel
-import XCTest
+import PetrelCrypto
 @testable import SwanAccounts
 @testable import SwanCore
 @testable import SwanHTTP
@@ -15,6 +15,7 @@ import XCTest
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
+import XCTest
 
 private actor RuntimeTokenCapture {
     private var delegation = ""
@@ -1167,7 +1168,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             ath: Data(SHA256.hash(data: Data(token.utf8))).base64URLEncodedString()
         )).base64URLEncodedString()
         let input = "\(header).\(claims)"
-        let signature = try SwanCore.P256WireSignature.sign(Data(input.utf8), using: key).base64URLEncodedString()
+        let signature = try P256WireSignature.sign(Data(input.utf8), using: key).base64URLEncodedString()
         var fields = HTTPFields()
         fields[.authorization] = "DPoP \(token)"
         fields[HTTPField.Name("DPoP")!] = "\(input).\(signature)"

@@ -1,11 +1,12 @@
 import Crypto
 import Foundation
 import Petrel
+import PetrelCrypto
+import SwanAccounts
 import SwanCore
 import SwanOAuth
 import SwanSpaces
 import SwanStorage
-import SwanAccounts
 
 public enum PermissionedRemoteReplicaIncrementalSyncOutcome:
     Sendable, Equatable
@@ -207,7 +208,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
         if response.status == 409 {
             guard response.header("content-type")?.lowercased().contains("json")
                     == true,
-                  let error = try? SwanOAuth.StrictJSON.decode(
+                  let error = try? StrictJSON.decode(
                       ErrorBody.self,
                       from: response.body
                   ),
@@ -221,7 +222,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                 == true else {
             throw InteropHTTPError.unexpectedStatus(response.status)
         }
-        return .output(try SwanOAuth.StrictJSON.decode(
+        return .output(try StrictJSON.decode(
             ComAtprotoSpaceListRepoOps.Output.self,
             from: response.body
         ))
@@ -229,7 +230,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
 
     private func getLatestCommit(
         target: PermissionedRemoteReplicaTarget,
-        verificationKey: SwanOAuth.PermissionedDataJWTVerificationKey
+        verificationKey: PermissionedDataJWTVerificationKey
     ) async throws -> PermissionedRemoteReplicaFreshnessWitness {
         let query = [
             "space": target.space.rawValue,
@@ -248,7 +249,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                 == true else {
             throw InteropHTTPError.unexpectedStatus(response.status)
         }
-        let output = try SwanOAuth.StrictJSON.decode(
+        let output = try StrictJSON.decode(
             ComAtprotoSpaceGetLatestCommit.Output.self,
             from: response.body
         )

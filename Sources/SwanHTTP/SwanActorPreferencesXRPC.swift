@@ -3,11 +3,12 @@ import Hummingbird
 import HTTPTypes
 import NIOCore
 import Petrel
+import PetrelCrypto
+import SwanAccounts
 import SwanCore
 import SwanOAuth
 import SwanSpaces
 import SwanStorage
-import SwanAccounts
 
 /// The 1 MiB write cap mirrors the storage layer's CHECK constraint exactly.
 /// A body over this bound is rejected here with 413 (`PayloadTooLarge`,
@@ -350,7 +351,7 @@ private func collectValidatedActorPreferencesJSON(
     }
     let data = Data(bytes)
     do {
-        try SwanOAuth.StrictJSON.validate(data)
+        try StrictJSON.validate(data)
         guard let object = try JSONSerialization.jsonObject(
             with: data,
             options: []

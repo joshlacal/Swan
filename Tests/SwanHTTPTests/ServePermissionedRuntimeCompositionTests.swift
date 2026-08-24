@@ -6,17 +6,18 @@ import HTTPTypes
 import Logging
 import NIOCore
 import Petrel
+import PetrelCrypto
 import SQLiteNIO
 import XCTest
 @testable import SwanAccounts
 @testable import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
-@testable import swan
 import SwanSQLite
 import SwanSpaces
 import SwanSpacesWire
 import SwanStorage
+@testable import swan
 
 final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sendable {
     private let localDID = "did:plc:abcdefghijklmnopqrstuvwx"
@@ -875,7 +876,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 now: now
             )
 
-            let localService = try SwanOAuth.SpaceServiceJWT.create(
+            let localService = try SpaceServiceJWT.create(
                 issuer: local,
                 audience: localDID,
                 method: "com.atproto.space.notifyWrite",
@@ -1054,7 +1055,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             headers = [.authorization: "Bearer \(delegation)"]
         case .notifyWrite:
-            let notifyWrite = try SwanOAuth.SpaceServiceJWT.create(
+            let notifyWrite = try SpaceServiceJWT.create(
                 issuer: space.authority,
                 audience: localDID,
                 method: ComAtprotoSpaceNotifyWrite.typeIdentifier,
@@ -1063,7 +1064,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             headers = [.authorization: "Bearer \(notifyWrite)"]
         case .notifyDeleted:
-            let notifyDeleted = try SwanOAuth.SpaceServiceJWT.create(
+            let notifyDeleted = try SpaceServiceJWT.create(
                 issuer: space.authority,
                 audience: recipientService,
                 method: ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier,
@@ -1072,7 +1073,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             headers = [.authorization: "Bearer \(notifyDeleted)"]
         case .checkUserAccess:
-            let checkUserAccess = try SwanOAuth.SpaceServiceJWT.create(
+            let checkUserAccess = try SpaceServiceJWT.create(
                 issuer: space.authority,
                 audience: managingAudience,
                 method: ComAtprotoSimplespaceCheckUserAccess.typeIdentifier,
@@ -1119,7 +1120,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             ath: Data(SHA256.hash(data: Data(token.utf8))).base64URLEncodedString()
         )).base64URLEncodedString()
         let input = "\(header).\(claims)"
-        let signature = try SwanCore.P256WireSignature.sign(
+        let signature = try P256WireSignature.sign(
             Data(input.utf8),
             using: key
         ).base64URLEncodedString()

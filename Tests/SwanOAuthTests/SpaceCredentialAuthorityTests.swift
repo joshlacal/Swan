@@ -1,12 +1,13 @@
 import Crypto
 import Foundation
-import XCTest
-@testable import SwanAccounts
-@testable import SwanOAuth
-@testable import SwanSQLite
+import PetrelCrypto
+import SwanAccounts
 import SwanCore
+import SwanOAuth
+import SwanSQLite
 import SwanSpaces
 import SwanStorage
+import XCTest
 
 final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
     private let authority = "did:plc:abcdefghijklmnopqrstuvwx"

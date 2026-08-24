@@ -5,16 +5,17 @@ import Hummingbird
 import HummingbirdTesting
 import Logging
 import NIOCore
+import PetrelCrypto
+import PetrelFirehose
 import SwanAccounts
 import SwanCore
 @testable import SwanHTTP
 import SwanOAuth
-import PetrelFirehose
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
-@testable import swan
 import XCTest
+@testable import swan
 
 /// Task 1 of the Swan account-program runtime integration: freeze the
 /// production-composition contract in red tests.

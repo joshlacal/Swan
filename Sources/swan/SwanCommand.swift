@@ -6294,7 +6294,7 @@ extension SwanCommand {
                         applyAttempts: 2,
                         firstOutcome: "applied",
                         secondOutcome: "exact_duplicate",
-                        requestDigest: SwanCore.Hex.encode(result.requestDigest)
+                        requestDigest: Hex.encode(result.requestDigest)
                     )
                 } else {
                     replayWitness = nil
@@ -6304,7 +6304,7 @@ extension SwanCommand {
                     outcome: outcomeCode,
                     priorRevision: prior?.wireRevision.toString(),
                     finalRevision: final?.wireRevision.toString(),
-                    finalCommitment: final.map { SwanCore.Hex.encode($0.commitment) },
+                    finalCommitment: final.map { Hex.encode($0.commitment) },
                     exactDuplicateReplay: replayWitness,
                     status: passed ? "passed" : "failed"
                 )
@@ -6812,12 +6812,12 @@ extension SwanCommand {
                     priorHeadGeneration: priorHead?.generation,
                     priorHeadRevision: priorHead?.wireRevision.toString(),
                     priorCommitment: priorHead.map {
-                        SwanCore.Hex.encode($0.commitment)
+                        Hex.encode($0.commitment)
                     },
                     replacementHeadGeneration: valid?.head.generation,
                     replacementHeadRevision: valid?.head.wireRevision.toString(),
                     replacementCommitment: valid.map {
-                        SwanCore.Hex.encode($0.head.commitment)
+                        Hex.encode($0.head.commitment)
                     },
                     replacementRecordCount: valid?.recordCount,
                     replacementCASAdvanced: replacementCASAdvanced,
@@ -6826,7 +6826,7 @@ extension SwanCommand {
                     finalHeadGeneration: finalHead?.generation,
                     finalHeadRevision: finalHead?.wireRevision.toString(),
                     finalCommitment: finalHead.map {
-                        SwanCore.Hex.encode($0.commitment)
+                        Hex.encode($0.commitment)
                     },
                     lastValidHeadPreserved: preserved,
                     status: passed ? "passed" : "failed",
@@ -6890,7 +6890,7 @@ extension SwanCommand {
             private static func responseError(
                 _ response: InteropHTTPResponse
             ) -> String? {
-                (try? SwanOAuth.StrictJSON.decode(
+                (try? StrictJSON.decode(
                     ErrorBody.self,
                     from: response.body
                 ))?.error
@@ -7107,7 +7107,7 @@ extension SwanCommand {
                 )
                 let document: InputDocument
                 do {
-                    document = try SwanOAuth.StrictJSON.decode(InputDocument.self, from: raw)
+                    document = try StrictJSON.decode(InputDocument.self, from: raw)
                 } catch {
                     throw ValidationError("stateful fault witness input is invalid")
                 }
@@ -7253,7 +7253,7 @@ extension SwanCommand {
                     witness = StatefulReplicaHeadWitness(
                         generation: head.generation,
                         revision: head.wireRevision.toString(),
-                        commitment: SwanCore.Hex.encode(head.commitment)
+                        commitment: Hex.encode(head.commitment)
                     )
                     guard witness != nil else {
                         throw ValidationError("durable replica head is invalid")
@@ -7464,7 +7464,7 @@ extension SwanCommand {
                               keyBytes.base64URLEncodedString() == encodedKey else {
                             throw ValidationError("public repository commit key is not canonical base64url")
                         }
-                        let verificationKey: SwanOAuth.PermissionedDataJWTVerificationKey
+                        let verificationKey: PermissionedDataJWTVerificationKey
                         do {
                             switch normalizedAlgorithm {
                             case "p256":
@@ -7472,7 +7472,7 @@ extension SwanCommand {
                                     try P256.Signing.PublicKey(x963Representation: keyBytes)
                                 )
                             default:
-                                verificationKey = try SwanOAuth.PermissionedDataJWTVerificationKey(
+                                verificationKey = try PermissionedDataJWTVerificationKey(
                                     secp256k1PublicKey: keyBytes
                                 )
                             }
@@ -8196,7 +8196,7 @@ extension SwanCommand {
                                 "forum post failed (status=\(response.status), error=\(errorCode ?? "unknown"))"
                             )
                         }
-                        let output = try SwanOAuth.StrictJSON.decode(
+                        let output = try StrictJSON.decode(
                             ForumPutRecordResponse.self,
                             from: response.body
                         )
@@ -8476,7 +8476,7 @@ extension SwanCommand {
                                 ))
                                 continue
                             }
-                            let writerKey: SwanOAuth.PermissionedDataJWTVerificationKey
+                            let writerKey: PermissionedDataJWTVerificationKey
                             if let overrideKey = writerHosts[writer]?.commitVerificationKey {
                                 writerKey = try LabLiveSupport.decodeCommitVerificationKey(overrideKey)
                             } else if let globalKey {
@@ -8616,7 +8616,7 @@ extension SwanCommand {
                                 host: writerURL.host ?? writerURL.absoluteString,
                                 outcome: outcomeCode,
                                 revision: final?.wireRevision.toString(),
-                                commitment: final.map { SwanCore.Hex.encode($0.commitment) },
+                                commitment: final.map { Hex.encode($0.commitment) },
                                 recordCount: writerRecords.count
                             ))
                             Forum.log("forum thread: writer \(writer) synced (\(outcomeCode), \(writerRecords.count) records)")
@@ -8994,7 +8994,7 @@ extension SwanCommand {
                             .contains("json") == true else {
                         throw InteropHTTPError.unexpectedStatus(response.status)
                     }
-                    let output = try SwanOAuth.StrictJSON.decode(
+                    let output = try StrictJSON.decode(
                         ForumListReposResponse.self,
                         from: response.body
                     )
@@ -9277,7 +9277,7 @@ private enum LabLiveSupport {
         redirectURI: String,
         scopes: [String],
         timeout: Double,
-        permissionedCommitVerificationKey: SwanOAuth.PermissionedDataJWTVerificationKey? = nil
+        permissionedCommitVerificationKey: PermissionedDataJWTVerificationKey? = nil
     ) async throws -> LiveInteropHost {
         guard timeout > 0, timeout <= 120, timeout.isFinite else {
             throw ValidationError("--request-timeout-seconds is invalid")
@@ -9349,7 +9349,7 @@ private enum LabLiveSupport {
 
     static func permissionedCommitVerificationKey(
         environment: String
-    ) throws -> SwanOAuth.PermissionedDataJWTVerificationKey {
+    ) throws -> PermissionedDataJWTVerificationKey {
         try decodeCommitVerificationKey(
             environmentValue(environment, label: "permissioned commit public key")
         )
@@ -9360,7 +9360,7 @@ private enum LabLiveSupport {
     /// per-writer override keys can be the only configured keys.
     static func optionalPermissionedCommitVerificationKey(
         environment: String
-    ) throws -> SwanOAuth.PermissionedDataJWTVerificationKey? {
+    ) throws -> PermissionedDataJWTVerificationKey? {
         guard let configured = ProcessInfo.processInfo.environment[environment],
               !configured.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
@@ -9370,7 +9370,7 @@ private enum LabLiveSupport {
 
     static func decodeCommitVerificationKey(
         _ configured: String
-    ) throws -> SwanOAuth.PermissionedDataJWTVerificationKey {
+    ) throws -> PermissionedDataJWTVerificationKey {
         // Interop runners may supply the repository's canonical PLC
         // verification method directly.  Decode the multicodec before the
         // legacy base64 forms so curve selection remains bound to the
@@ -9381,7 +9381,7 @@ private enum LabLiveSupport {
                 case let .p256(publicKey):
                     return .p256(publicKey)
                 case let .secp256k1(publicKey):
-                    return try SwanOAuth.PermissionedDataJWTVerificationKey(
+                    return try PermissionedDataJWTVerificationKey(
                         secp256k1PublicKey: publicKey
                     )
                 }
@@ -9411,7 +9411,7 @@ private enum LabLiveSupport {
             if algorithm == "ES256" {
                 return .p256(try P256.Signing.PublicKey(x963Representation: data))
             }
-            return try SwanOAuth.PermissionedDataJWTVerificationKey(secp256k1PublicKey: data)
+            return try PermissionedDataJWTVerificationKey(secp256k1PublicKey: data)
         } catch {
             throw ValidationError("permissioned commit public key is invalid")
         }

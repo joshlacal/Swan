@@ -1,14 +1,15 @@
-import Foundation
-import XCTest
 import Crypto
+import Foundation
 import NIOCore
 import Petrel
-@testable import SwanInterop
-import SwanCore
-import SwanOAuth
+import PetrelCrypto
 import PetrelRepo
+import SwanCore
+@testable import SwanInterop
+import SwanOAuth
 import SwanSQLite
 import SwanSpaces
+import XCTest
 
 final class SwanInteropTests: XCTestCase {
     private static let artifactRecordCID =
@@ -1348,7 +1349,7 @@ final class SwanInteropTests: XCTestCase {
             key: .p256(signingKey.publicKey)
         )
         let unsigned = Data("repository-commit-bytes".utf8)
-        let signature = try SwanCore.P256WireSignature.sign(unsigned, using: signingKey)
+        let signature = try P256WireSignature.sign(unsigned, using: signingKey)
 
         try await verifier.verify(
             signature: signature,

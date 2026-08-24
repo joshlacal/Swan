@@ -5,10 +5,11 @@ import HummingbirdTesting
 import HTTPTypes
 import Logging
 import NIOCore
+import PetrelCrypto
 @testable import SwanAccounts
-@testable import SwanHTTP
 import SwanCore
-import SwanOAuth
+@testable import SwanHTTP
+@testable import SwanOAuth
 @testable import SwanSQLite
 import SwanSpaces
 import SwanStorage

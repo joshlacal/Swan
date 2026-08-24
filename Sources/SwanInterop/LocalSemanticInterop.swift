@@ -1,10 +1,11 @@
 import Crypto
 import Foundation
 import Petrel
+import PetrelCrypto
 import SwanCore
 import SwanSQLite
-import SwanStorage
 import SwanSpaces
+import SwanStorage
 
 /// A sanitized result from the local semantic interoperability laboratory.
 ///
@@ -208,7 +209,7 @@ public enum LocalSemanticInteropRunner {
             let sourceEntries = firstEntries + secondEntries
             operationCount = sourceEntries.count
             let sourceState = try await sourceRepository.currentState(authorization: authorized)
-            sourceCommitment = SwanCore.Hex.encode(sourceState.commitment)
+            sourceCommitment = Hex.encode(sourceState.commitment)
             try check("source_commitment_is_nonempty", !sourceState.commitment.isEmpty)
 
             guard case let .incremental(incrementalEntries) = try await sourceRepository.sync(
@@ -232,7 +233,7 @@ public enum LocalSemanticInteropRunner {
                 consumerRevision += 1
             }
             let consumerState = try await consumerRepository.currentState(authorization: authorized)
-            consumerCommitment = SwanCore.Hex.encode(consumerState.commitment)
+            consumerCommitment = Hex.encode(consumerState.commitment)
             try check("ordered_replica_converges_on_commitment", consumerState.commitment == sourceState.commitment)
             let consumerRecords = try await consumerRepository.snapshot(authorization: authorized)
             let sourceRecords = try await sourceStateRecords(
@@ -350,7 +351,7 @@ public enum LocalSemanticInteropRunner {
                 throw Failure()
             }
             let recoveryState = try await recoverySource.currentState(authorization: authorized)
-            fullRecoveryCommitment = SwanCore.Hex.encode(recoveryCommitment)
+            fullRecoveryCommitment = Hex.encode(recoveryCommitment)
             try check("retention_gap_selects_full_snapshot", recoveryRecords.count == 1 && recoveryCommitment == recoveryState.commitment)
 
             let signingKey = P256.Signing.PrivateKey()
@@ -359,7 +360,7 @@ public enum LocalSemanticInteropRunner {
                 signingKey: signingKey,
                 authorization: authorized
             )
-            carDigest = SwanCore.Hex.encode(SHA256.hash(data: car.data))
+            carDigest = Hex.encode(SHA256.hash(data: car.data))
             let verifiedRecovery = try SpaceCARCodec.verifyRecovery(
                 car.data,
                 space: space,

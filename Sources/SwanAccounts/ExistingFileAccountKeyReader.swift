@@ -5,6 +5,7 @@ import Darwin
 import Glibc
 #endif
 import Foundation
+import PetrelCrypto
 import SwanCore
 
 /// A fail-closed view of an existing account key store for logical export.

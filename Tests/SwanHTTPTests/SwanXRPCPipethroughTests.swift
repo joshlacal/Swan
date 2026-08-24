@@ -5,15 +5,15 @@ import Hummingbird
 import HummingbirdTesting
 import Logging
 import NIOCore
+import PetrelCrypto
 import SwanAccounts
 import SwanCore
+@testable import SwanHTTP
 import SwanOAuth
 import SwanSpaces
 import SwanSQLite
 import SwanStorage
 import XCTest
-
-@testable import SwanHTTP
 
 /// Step 1 probe, kept as a permanent regression guard: Hummingbird's trie must
 /// resolve an exact `/xrpc/<nsid>` route ahead of a `/xrpc/**` recursive

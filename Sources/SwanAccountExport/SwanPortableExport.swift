@@ -551,7 +551,7 @@ public enum SwanPortableExportVerifier {
               parsed.codec == .raw,
               parsed.multihash.algorithm == Multihash.sha256Code,
               parsed.multihash.length == Multihash.sha256Length,
-              SwanCore.Hex.encode(parsed.multihash.digest) == sha256 else {
+              Hex.encode(parsed.multihash.digest) == sha256 else {
             throw SwanPortableExportError.invalidArchive
         }
     }
@@ -1215,7 +1215,7 @@ public struct SwanPortableAccountExporter: Sendable {
               parsed.codec == .raw,
               parsed.multihash.algorithm == Multihash.sha256Code,
               parsed.multihash.length == Multihash.sha256Length,
-              SwanCore.Hex.encode(parsed.multihash.digest) == sha256 else {
+              Hex.encode(parsed.multihash.digest) == sha256 else {
             throw SwanPortableExportError.invalidArchive
         }
     }
@@ -1260,7 +1260,7 @@ public struct SwanPortableAccountExporter: Sendable {
             }
             try writer.finish()
             finished = true
-            return (count, SwanCore.Hex.encode(Data(hasher.finalize())))
+            return (count, Hex.encode(Data(hasher.finalize())))
         }
 
         func abort() {
@@ -1480,7 +1480,7 @@ actor SwanPortableExportFileByteSource:
         }
         let result = (
             byteCount,
-            SwanCore.Hex.encode(Data(digest.finalize()))
+            Hex.encode(Data(digest.finalize()))
         )
         close()
         return result

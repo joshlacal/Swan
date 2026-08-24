@@ -6,11 +6,12 @@ import HTTPTypes
 import Logging
 import NIOCore
 import Petrel
+import PetrelCrypto
+import PetrelRepo
 import SQLiteNIO
 import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
-import PetrelRepo
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
@@ -302,7 +303,7 @@ final class StrictWriteJSONTests: XCTestCase, @unchecked Sendable {
                 ath: Data(SHA256.hash(data: Data(token.utf8))).base64URLEncodedString()
             )).base64URLEncodedString()
             let input = header + "." + claims
-            let signature = try SwanCore.P256WireSignature.sign(
+            let signature = try P256WireSignature.sign(
                 Data(input.utf8), using: key
             ).base64URLEncodedString()
             var fields = HTTPFields()

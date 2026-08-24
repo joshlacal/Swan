@@ -5,13 +5,14 @@ import HummingbirdTesting
 import HTTPTypes
 import Logging
 import NIOCore
+import PetrelCrypto
 import SwanAccounts
 import SwanCore
-import SwanOAuth
+@testable import SwanHTTP
+@testable import SwanOAuth
 import SwanSQLite
 import SwanStorage
 import XCTest
-@testable import SwanHTTP
 
 /// The four session endpoints, end to end over HTTP.
 ///

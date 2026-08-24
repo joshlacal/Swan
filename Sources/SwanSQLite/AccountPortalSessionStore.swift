@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import PetrelCrypto
 import SQLiteNIO
 import SwanCore
 import SwanStorage

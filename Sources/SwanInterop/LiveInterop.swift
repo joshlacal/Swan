@@ -6,12 +6,13 @@ import NIOFoundationCompat
 import NIOHTTP1
 import NIOSSL
 import Petrel
+import PetrelCrypto
+import SwanAccounts
 import SwanCore
 import SwanOAuth
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
-import SwanAccounts
 
 /// A bounded, redirect-free HTTP response used by the stateful interop
 /// harness.  The body is present only for small JSON/XRPC responses; CAR and
@@ -455,7 +456,7 @@ public struct InteropXRPCClient: Sendable {
     ) async throws -> Output {
         let response = try await self.query(nsid, query: query, authorization: authorization)
         try requireJSONSuccess(response)
-        return try SwanOAuth.StrictJSON.decode(Output.self, from: response.body)
+        return try StrictJSON.decode(Output.self, from: response.body)
     }
 
     public func procedure<Input: Encodable, Output: Decodable>(
@@ -469,7 +470,7 @@ public struct InteropXRPCClient: Sendable {
         let body = try encoder.encode(input)
         let response = try await procedure(nsid, body: body, authorization: authorization)
         try requireJSONSuccess(response)
-        return try SwanOAuth.StrictJSON.decode(Output.self, from: response.body)
+        return try StrictJSON.decode(Output.self, from: response.body)
     }
 
     public func stream(
@@ -647,7 +648,7 @@ public actor InteropFixtureRecorder {
                 status: response.status,
                 requestBytes: requestBody?.count ?? 0,
                 responseBytes: response.body.count,
-                responseSHA256: SwanCore.Hex.encode(Data(SHA256.hash(data: response.body))),
+                responseSHA256: Hex.encode(Data(SHA256.hash(data: response.body))),
                 responseError: response.status >= 400 ? response.bodyErrorCode : nil
             )
         )
@@ -675,14 +676,14 @@ public struct LiveInteropHost: Sendable {
     /// Optional operator-pinned key for verifying permissioned repository
     /// commits returned by this host. A missing key is an intentional
     /// fail-closed condition when an incremental sync assertion is requested.
-    public let permissionedCommitVerificationKey: SwanOAuth.PermissionedDataJWTVerificationKey?
+    public let permissionedCommitVerificationKey: PermissionedDataJWTVerificationKey?
 
     public init(
         label: String,
         client: InteropXRPCClient,
         authorization: InteropAuthorization = .none,
         authorizationProvider: InteropAuthorizationProvider? = nil,
-        permissionedCommitVerificationKey: SwanOAuth.PermissionedDataJWTVerificationKey? = nil
+        permissionedCommitVerificationKey: PermissionedDataJWTVerificationKey? = nil
     ) {
         self.label = label
         self.client = client
@@ -840,7 +841,7 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
     /// incremental page an explicit state-transition witness, rather than an
     /// endpoint-success probe.
     public let syncOperationRevision: String?
-    /// SwanCore.Hex-encoded LtHash commitment reconstructed from the terminal page.
+    /// Hex-encoded LtHash commitment reconstructed from the terminal page.
     public let syncCommitment: String?
     /// Revision bound into the verified signed terminal commitment.
     public let syncCommitRevision: String?
@@ -1317,7 +1318,7 @@ public enum LiveInteropRunner {
     }
 
     static func canonicalRecordCID(from body: Data) -> String? {
-        guard let response = try? SwanOAuth.StrictJSON.decode(
+        guard let response = try? StrictJSON.decode(
             RecordResponse.self,
             from: body
         ) else {
@@ -1327,7 +1328,7 @@ public enum LiveInteropRunner {
     }
 
     static func canonicalBlobCID(from body: Data) -> String? {
-        guard let response = try? SwanOAuth.StrictJSON.decode(
+        guard let response = try? StrictJSON.decode(
             BlobResponse.self,
             from: body
         ) else {
@@ -1755,7 +1756,7 @@ public enum LiveInteropRunner {
                 )
             }
             let received = try fileDigest(url)
-            let expectedDigest = SwanCore.Hex.encode(SHA256.hash(data: expectedBody))
+            let expectedDigest = Hex.encode(SHA256.hash(data: expectedBody))
             let verified = received.bytes == expectedBody.count
                 && received.digest == expectedDigest
             return PermissionedBlobResult(
@@ -1829,7 +1830,7 @@ public enum LiveInteropRunner {
                 )
             }
             let received = try fileDigest(url)
-            let expectedDigest = SwanCore.Hex.encode(SHA256.hash(data: expectedBody))
+            let expectedDigest = Hex.encode(SHA256.hash(data: expectedBody))
             let verified = received.bytes == expectedBody.count
                 && received.digest == expectedDigest
             return PublicBlobResult(
@@ -1854,7 +1855,7 @@ public enum LiveInteropRunner {
             count += chunk.count
             digest.update(data: chunk)
         }
-        return (count, SwanCore.Hex.encode(Data(digest.finalize())))
+        return (count, Hex.encode(Data(digest.finalize())))
     }
 
     /// Advances a member repository using exactly the pinned applyWrites
@@ -1906,7 +1907,7 @@ public enum LiveInteropRunner {
                     errorCode: responseErrorCode(write) ?? "HTTP\(write.status)"
                 )
             }
-            let output = try SwanOAuth.StrictJSON.decode(
+            let output = try StrictJSON.decode(
                 ComAtprotoSpaceApplyWrites.Output.self,
                 from: write.body
             )
@@ -2320,7 +2321,7 @@ public enum LiveInteropRunner {
                     errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
                 )
             }
-            let output = try SwanOAuth.StrictJSON.decode(
+            let output = try StrictJSON.decode(
                 ComAtprotoSpaceListRepoOps.Output.self,
                 from: response.body
             )
@@ -2439,7 +2440,7 @@ public enum LiveInteropRunner {
         }
     }
 
-    /// Pure admission check shared by the CLI and live runner. SwanOAuth.StrictJSON
+    /// Pure admission check shared by the CLI and live runner. StrictJSON
     /// rejects duplicate keys and hostile nesting before any OAuth secret is
     /// read; generated Input decoding pins the wire contract.
     public static func pinnedApplyWritesOperationCount(
@@ -2449,7 +2450,7 @@ public enum LiveInteropRunner {
     ) -> Int? {
         guard (1 ... 2 * 1024 * 1024).contains(body.count),
               (try? DID(didString: repository)) != nil,
-              let decoded = try? SwanOAuth.StrictJSON.decode(
+              let decoded = try? StrictJSON.decode(
                   ComAtprotoSpaceApplyWrites.Input.self,
                   from: body
               ),
@@ -2528,7 +2529,7 @@ public enum LiveInteropRunner {
                     errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
                 )
             }
-            let output = try SwanOAuth.StrictJSON.decode(
+            let output = try StrictJSON.decode(
                 ComAtprotoSpaceListRepoOps.Output.self,
                 from: response.body
             )
@@ -2642,7 +2643,7 @@ public enum LiveInteropRunner {
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
                     operationRevision: operation.rev.toString(),
-                    commitment: SwanCore.Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
+                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "CommitmentMismatch"
                 )
@@ -2665,7 +2666,7 @@ public enum LiveInteropRunner {
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
                     operationRevision: operation.rev.toString(),
-                    commitment: SwanCore.Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
+                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "ContentBindingMismatch"
                 )
@@ -2675,7 +2676,7 @@ public enum LiveInteropRunner {
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
                     operationRevision: operation.rev.toString(),
-                    commitment: SwanCore.Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
+                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "MissingCommitKey"
                 )
@@ -2693,7 +2694,7 @@ public enum LiveInteropRunner {
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
                     operationRevision: operation.rev.toString(),
-                    commitment: SwanCore.Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
+                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "ContextSignatureMismatch"
                 )
@@ -2702,7 +2703,7 @@ public enum LiveInteropRunner {
                 status: response.status, opsCount: output.ops.count,
                 operationCID: operation.cid?.string,
                 operationRevision: operation.rev.toString(),
-                commitment: SwanCore.Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
+                commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                 commitVerified: true, valuesIncluded: includeValues, errorCode: nil
             )
         } catch {
@@ -2795,7 +2796,7 @@ public enum LiveInteropRunner {
             return PermissionedCARResult(
                 status: response.status,
                 recordCount: recovery.recordCount,
-                commitment: SwanCore.Hex.encode(recovery.commitment),
+                commitment: Hex.encode(recovery.commitment),
                 wireRevision: recovery.wireRevision.toString(),
                 expectedRecordVerified:
                     recovery.verifiedExpectedWitnessCount == 1,
@@ -2995,7 +2996,7 @@ public enum LiveInteropRunner {
 }
 
 private func responseDigest(_ response: InteropHTTPResponse) -> String {
-    SwanCore.Hex.encode(Data(SHA256.hash(data: response.body)))
+    Hex.encode(Data(SHA256.hash(data: response.body)))
 }
 
 private func canonicalInteropRecordValue(_ record: ATProtocolValueContainer) throws -> Data {
@@ -3356,7 +3357,7 @@ public struct SwanCARConsumer: Sendable {
         fileURL: URL,
         space: SpaceURI,
         author: String,
-        verificationKey: SwanOAuth.PermissionedDataJWTVerificationKey
+        verificationKey: PermissionedDataJWTVerificationKey
     ) throws -> VerifiedSpaceCARRecovery {
         let data = try boundedFileData(fileURL)
         let algorithm: String = switch verificationKey {
@@ -3402,7 +3403,7 @@ public struct SwanCARConsumer: Sendable {
         fileURL: URL,
         space: SpaceURI,
         author: String,
-        verificationKey: SwanOAuth.PermissionedDataJWTVerificationKey,
+        verificationKey: PermissionedDataJWTVerificationKey,
         expectedEntries: [SpaceCARRecoveryIndexEntry] = []
     ) async throws -> VerifiedStreamingSpaceCARRecovery {
         let algorithm: String = switch verificationKey {
@@ -3603,7 +3604,7 @@ public struct SpaceCredentialBroker: Sendable {
             response: delegation
         )
         try requireJSONSuccess(delegation)
-        let delegationObject = try SwanOAuth.StrictJSON.decode(TokenResponse.self, from: delegation.body)
+        let delegationObject = try StrictJSON.decode(TokenResponse.self, from: delegation.body)
         let credentialAuthorization = delegationAuthorization ?? .bearer(token: delegationObject.token)
         let input = CredentialRequest(space: space.rawValue, clientAttestation: clientAttestation)
         let inputBody = try encode(input)
@@ -3620,7 +3621,7 @@ public struct SpaceCredentialBroker: Sendable {
             response: credential
         )
         try requireJSONSuccess(credential)
-        return try SwanOAuth.StrictJSON.decode(TokenResponse.self, from: credential.body).token
+        return try StrictJSON.decode(TokenResponse.self, from: credential.body).token
     }
 
     private struct TokenResponse: Decodable {

@@ -3,13 +3,14 @@ import Foundation
 import Hummingbird
 import HTTPTypes
 import NIOCore
-import XCTest
+import PetrelCrypto
 @testable import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
+import XCTest
 
 final class OAuthResourceAuthorizationTests: XCTestCase {
     private static let subject = "did:plc:abcdefghijklmnopqrstuvwx"

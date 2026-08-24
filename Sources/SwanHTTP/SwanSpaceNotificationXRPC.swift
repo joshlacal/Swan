@@ -3,6 +3,7 @@ import Hummingbird
 import HTTPTypes
 import NIOCore
 import Petrel
+import PetrelCrypto
 import SwanCore
 import SwanOAuth
 import SwanSpaces
@@ -770,7 +771,7 @@ func exactSpaceServiceBearerToken(from headers: HTTPFields) throws -> String {
     }
     let token = String(raw.dropFirst(prefix.count))
     guard !token.isEmpty,
-          token.utf8.count <= SwanOAuth.SpaceServiceJWT.maximumCompactBytes,
+          token.utf8.count <= SpaceServiceJWT.maximumCompactBytes,
           token.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
         throw SwanError.unauthorized("service authentication is invalid")
     }

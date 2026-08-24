@@ -1,8 +1,9 @@
 import Crypto
 import Foundation
-import XCTest
-@testable import SwanOAuth
+import PetrelCrypto
 import SwanCore
+import SwanOAuth
+import XCTest
 
 final class TypeScriptSpaceNotificationContractTests: XCTestCase {
     func testPinnedTypeScriptES256KNotifyWriteGoldenAndDirectWriterContract() async throws {

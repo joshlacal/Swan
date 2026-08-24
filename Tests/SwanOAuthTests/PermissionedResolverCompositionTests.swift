@@ -1,9 +1,10 @@
 import Crypto
 import Foundation
+import PetrelCrypto
 import SwanCore
+@testable import SwanOAuth
 import SwanSpaces
 import XCTest
-@testable import SwanOAuth
 
 final class PermissionedResolverCompositionTests: XCTestCase {
     private let localDID = "did:plc:cdefghijklmnopqrstuvwxyz"

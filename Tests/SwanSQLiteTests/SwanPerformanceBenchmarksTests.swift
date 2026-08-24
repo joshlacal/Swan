@@ -2,12 +2,13 @@ import Crypto
 import Foundation
 import Hummingbird
 import Petrel
+import PetrelCrypto
+import PetrelFirehose
+import PetrelRepo
 import SQLiteNIO
 import SwanAccounts
 import SwanCore
 import SwanHTTP
-import PetrelFirehose
-import PetrelRepo
 @testable import SwanSQLite
 import SwanStorage
 import XCTest
@@ -204,13 +205,13 @@ final class SwanPerformanceBenchmarksTests: XCTestCase {
             iterations: 2_000,
             bytesPerOp: message.count
         ) {
-            _ = try SwanCore.P256WireSignature.sign(message, using: privateKey)
+            _ = try P256WireSignature.sign(message, using: privateKey)
         }
         printResult(signResult)
         expectThroughput(signResult, atLeast: 500)
 
-        let signatureData = try SwanCore.P256WireSignature.sign(message, using: privateKey)
-        let signature = try SwanCore.P256WireSignature.decodeCanonical(signatureData)
+        let signatureData = try P256WireSignature.sign(message, using: privateKey)
+        let signature = try P256WireSignature.decodeCanonical(signatureData)
 
         let verifyResult = try measureSyncBenchmark(
             name: "Crypto: P-256 ECDSA Signature Verification",
@@ -231,7 +232,7 @@ final class SwanPerformanceBenchmarksTests: XCTestCase {
             iterations: 50_000,
             bytesPerOp: signatureData.count
         ) {
-            _ = SwanCore.P256WireSignature.isCanonicalLowS(signatureData)
+            _ = P256WireSignature.isCanonicalLowS(signatureData)
         }
         printResult(canonCheckResult)
         expectThroughput(canonCheckResult, atLeast: 50_000)

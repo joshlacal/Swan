@@ -1,4 +1,5 @@
 import Foundation
+import PetrelCrypto
 import SwanCore
 
 /// The two application environments the AT Protocol OAuth profile permits.

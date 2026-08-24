@@ -1,12 +1,12 @@
 import Crypto
 import Foundation
+import PetrelCrypto
+import SwanCore
+import SwanStorage
 import XCTest
-@testable import SwanCore
 @testable import SwanOAuth
 @testable import SwanSQLite
 @testable import SwanSpaces
-import SwanCore
-import SwanStorage
 
 final class SwanOAuthTests: XCTestCase {
     /// Re-aimed for §9-D21. The envelope (`localhostRequestedScopes`) used to
@@ -450,7 +450,7 @@ final class SwanOAuthTests: XCTestCase {
         XCTAssertThrowsError(
             try SpaceServiceJWT.verify(
                 serviceToken,
-                publicKey: .p256(key.publicKey),
+                publicKey: ATProtoJWTVerificationKey.p256(key.publicKey),
                 now: now
             )
         )
@@ -490,7 +490,7 @@ final class SwanOAuthTests: XCTestCase {
         func verify(_ compact: String) throws -> SpaceServiceJWT.Claims {
             try SpaceServiceJWT.verify(
                 compact,
-                publicKey: .p256(key.publicKey),
+                publicKey: ATProtoJWTVerificationKey.p256(key.publicKey),
                 now: now,
                 clockSkew: skew,
                 maximumLifetime: maximumLifetime
@@ -1272,7 +1272,7 @@ final class SwanOAuthTests: XCTestCase {
             try StrictJSON.validate(Data(deeplyNestedObject.utf8))
         ) { error in
             XCTAssertEqual(
-                error as? SwanError,
+                error as? PetrelCryptoError,
                 .malformed("JSON exceeds maximum nesting depth")
             )
         }
@@ -1285,7 +1285,7 @@ final class SwanOAuthTests: XCTestCase {
             try StrictJSON.validate(Data(deeplyNestedArray.utf8))
         ) { error in
             XCTAssertEqual(
-                error as? SwanError,
+                error as? PetrelCryptoError,
                 .malformed("JSON exceeds maximum nesting depth")
             )
         }
@@ -1307,7 +1307,7 @@ final class SwanOAuthTests: XCTestCase {
             try OAuthCompactJWT.unverifiedHeader(compactJWT)
         ) { error in
             XCTAssertEqual(
-                error as? SwanError,
+                error as? PetrelCryptoError,
                 .malformed("JSON exceeds maximum nesting depth")
             )
         }

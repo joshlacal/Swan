@@ -4,7 +4,6 @@ import Petrel
 import PetrelCrypto
 import PetrelPLC
 import PetrelRepo
-import secp256k1
 import SwanCore
 import SwanStorage
 public struct SwanPublicPLCGenesisVerifier: PublicPLCGenesisVerifying {
@@ -175,15 +174,12 @@ private struct PLCSecp256k1RepositoryCommitVerifier:
 {
     let signingAlgorithm: PublicRepositorySigningAlgorithm = .secp256k1
     let verificationIdentity: String
-    private let publicKey: secp256k1.Signing.PublicKey
+    private let key: ATProtoJWTVerificationKey
 
     init(compressedPublicKey: Data) throws {
-        publicKey = try secp256k1.Signing.PublicKey(
-            dataRepresentation: compressedPublicKey,
-            format: .compressed
-        )
+        key = try ATProtoJWTVerificationKey(secp256k1PublicKey: compressedPublicKey)
         verificationIdentity =
-            "secp256k1-sha256:\(SwanCore.Hex.encode(SHA256.hash(data: compressedPublicKey)))"
+            "secp256k1-sha256:\(Hex.encode(SHA256.hash(data: compressedPublicKey)))"
     }
 
     func verify(
@@ -191,12 +187,10 @@ private struct PLCSecp256k1RepositoryCommitVerifier:
         unsignedCommitBytes: Data,
         did _: String
     ) async throws {
-        let decoded = try secp256k1.Signing.ECDSASignature(
-            compactRepresentation: signature
-        )
-        guard publicKey.isValidSignature(
-            decoded,
-            for: unsignedCommitBytes
+        guard try key.verify(
+            signature: signature,
+            signingInput: unsignedCommitBytes,
+            algorithm: "ES256K"
         ) else {
             throw PublicRepositoryCommitError.invalidSignature
         }

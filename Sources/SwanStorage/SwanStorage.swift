@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import PetrelCrypto
 import SwanCore
 import SwanSpaces
 

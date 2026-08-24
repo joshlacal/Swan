@@ -6,14 +6,14 @@ import HummingbirdTesting
 import Logging
 import NIOCore
 import NIOPosix
+import PetrelCrypto
 import SwanAccounts
-import SwanSQLite
-import SwanStorage
-import XCTest
-
 @testable import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
+import SwanSQLite
+import SwanStorage
+import XCTest
 
 /// HTTP-level coverage for the complete (non-localhost) server assembly. The
 /// resolver and transport are deliberately in-process fixtures: no test can

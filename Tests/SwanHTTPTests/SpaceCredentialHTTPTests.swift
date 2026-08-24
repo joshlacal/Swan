@@ -6,13 +6,14 @@ import HTTPTypes
 import Logging
 import NIOCore
 import Petrel
-import XCTest
+import PetrelCrypto
 @testable import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
+import XCTest
 
 final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
     static let authority = "did:plc:abcdefghijklmnopqrstuvwx"
@@ -1238,7 +1239,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             jti: jti
         )).base64URLEncodedString()
         let input = "\(header).\(claims)"
-        let signature = try SwanCore.P256WireSignature.sign(
+        let signature = try P256WireSignature.sign(
             Data(input.utf8),
             using: key
         ).base64URLEncodedString()
@@ -1455,7 +1456,7 @@ private func signedClientAttestation(
         options: [.sortedKeys, .withoutEscapingSlashes]
     ).base64URLEncodedString()
     let input = "\(header).\(claims)"
-    let signature = try SwanCore.P256WireSignature.sign(
+    let signature = try P256WireSignature.sign(
         Data(input.utf8),
         using: key
     ).base64URLEncodedString()

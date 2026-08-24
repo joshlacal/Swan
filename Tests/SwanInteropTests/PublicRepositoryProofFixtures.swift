@@ -7,6 +7,7 @@
 import Crypto
 import Foundation
 import Petrel
+import PetrelCrypto
 import PetrelRepo
 import SwanCore
 
@@ -476,7 +477,7 @@ public enum PublicRepositoryProofFixtureBuilder {
         }
         var tampered = signature
         tampered[tampered.startIndex + 31] ^= 0x01
-        guard SwanCore.P256WireSignature.isCanonicalLowS(tampered) else {
+        guard P256WireSignature.isCanonicalLowS(tampered) else {
             throw PublicRepositoryProofFixtureError.signatureTamperingChangedStructure
         }
         var result = commitBytes

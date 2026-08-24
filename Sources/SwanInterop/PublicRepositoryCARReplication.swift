@@ -1,9 +1,10 @@
 import Crypto
 import Foundation
 import Petrel
-import SwanOAuth
-import SwanCore
+import PetrelCrypto
 import PetrelRepo
+import SwanCore
+import SwanOAuth
 import SwanSQLite
 import SwanStorage
 
@@ -282,20 +283,20 @@ public struct PublicRepositoryBlobPromotionResult: Sendable, Equatable {
 public struct PermissionedDataPublicRepositoryCommitVerifier: @unchecked Sendable,
     PublicRepositoryCommitVerifier
 {
-    private let key: SwanOAuth.PermissionedDataJWTVerificationKey
+    private let key: PermissionedDataJWTVerificationKey
 
     public let signingAlgorithm: PublicRepositorySigningAlgorithm
     public let verificationIdentity: String
 
-    public init(key: SwanOAuth.PermissionedDataJWTVerificationKey) {
+    public init(key: PermissionedDataJWTVerificationKey) {
         self.key = key
         switch key {
         case let .p256(publicKey):
             signingAlgorithm = .p256
-            verificationIdentity = "p256-sha256:\(SwanCore.Hex.encode(SHA256.hash(data: publicKey.x963Representation)))"
+            verificationIdentity = "p256-sha256:\(Hex.encode(SHA256.hash(data: publicKey.x963Representation)))"
         case let .secp256k1PublicKey(bytes):
             signingAlgorithm = .secp256k1
-            verificationIdentity = "secp256k1-sha256:\(SwanCore.Hex.encode(SHA256.hash(data: bytes)))"
+            verificationIdentity = "secp256k1-sha256:\(Hex.encode(SHA256.hash(data: bytes)))"
         }
     }
 

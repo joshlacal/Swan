@@ -1,6 +1,7 @@
 import Crypto
 import CLibsodium
 import Foundation
+import PetrelCrypto
 import SwanCore
 import SwanStorage
 

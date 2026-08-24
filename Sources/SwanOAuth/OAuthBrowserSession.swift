@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import PetrelCrypto
 import SwanCore
 
 /// Signed, short-lived state carried only in Swan's secure authorization

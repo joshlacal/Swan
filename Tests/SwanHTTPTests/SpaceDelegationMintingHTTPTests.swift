@@ -5,7 +5,7 @@ import HummingbirdTesting
 import HTTPTypes
 import Logging
 import NIOCore
-import XCTest
+import PetrelCrypto
 @testable import SwanAccounts
 @testable import SwanCore
 @testable import SwanHTTP
@@ -13,6 +13,7 @@ import XCTest
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
+import XCTest
 
 final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
     fileprivate static let user = "did:plc:abcdefghijklmnopqrstuvwx"

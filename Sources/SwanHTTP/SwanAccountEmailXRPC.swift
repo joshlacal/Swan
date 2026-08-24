@@ -3,6 +3,7 @@ import Hummingbird
 import HTTPTypes
 import Logging
 import NIOCore
+import PetrelCrypto
 import SwanAccounts
 import SwanOAuth
 import SwanPublicWire
