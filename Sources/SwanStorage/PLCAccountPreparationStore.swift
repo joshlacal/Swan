@@ -1,5 +1,5 @@
 import Foundation
-import SwanPublicRepository
+import PetrelRepo
 
 public enum PLCAccountPreparationStage: Int, Codable, Sendable, CaseIterable, Comparable {
     case keysStored = 1

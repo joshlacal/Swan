@@ -1,7 +1,7 @@
 import Crypto
 import Foundation
 import SwanCore
-import SwanPublicRepository
+import PetrelRepo
 import SwanStorage
 
 /// Successful local installation binds one active control-plane account to a

@@ -1,7 +1,7 @@
 import Foundation
 import Petrel
 import SwanPublicFirehose
-import SwanPublicRepository
+import PetrelRepo
 
 public enum RelayFrameDecoder {
   public static func decode(_ frame: Data) throws -> RelayEvent {

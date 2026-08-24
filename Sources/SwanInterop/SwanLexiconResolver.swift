@@ -3,7 +3,7 @@ import Petrel
 import SwanAccounts
 import SwanCore
 import SwanOAuth
-import SwanPublicRepository
+import PetrelRepo
 import SwanSQLite
 
 /// The production `SwanLexiconResolving`: all fifteen steps of §5.7.4,

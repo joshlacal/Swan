@@ -3,7 +3,7 @@ import Foundation
 import SwanAccounts
 import SwanCore
 @testable import SwanSQLite
-import SwanPublicRepository
+import PetrelRepo
 import SwanStorage
 import XCTest
 

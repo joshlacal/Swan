@@ -8,7 +8,7 @@ import Foundation
 import Petrel
 import SwanAccounts
 import SwanCore
-import SwanPublicRepository
+import PetrelRepo
 import SwanSQLite
 import SwanSpaces
 import SwanSpacesWire

@@ -3,7 +3,7 @@ import Foundation
 import Petrel
 import secp256k1
 import SwanCore
-import SwanPublicRepository
+import PetrelRepo
 import SwanStorage
 
 public struct SwanPublicPLCGenesisVerifier: PublicPLCGenesisVerifying {

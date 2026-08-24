@@ -3,7 +3,7 @@ import Petrel
 import SQLiteNIO
 import SwanCore
 import SwanPublicFirehose
-import SwanPublicRepository
+import PetrelRepo
 
 public struct PublicFirehoseOutboxRow: Sendable, Equatable {
   public let id: Int64

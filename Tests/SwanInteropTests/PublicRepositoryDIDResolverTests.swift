@@ -2,7 +2,7 @@ import Foundation
 import SwanAccounts
 import SwanCore
 import SwanInterop
-import SwanPublicRepository
+import PetrelRepo
 import XCTest
 
 final class PublicRepositoryDIDResolverTests: XCTestCase {

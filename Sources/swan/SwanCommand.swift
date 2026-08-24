@@ -11,7 +11,7 @@ import SwanCore
 import SwanOAuth
 import SwanPublicFirehose
 import SwanPublicRelayVerifier
-import SwanPublicRepository
+import PetrelRepo
 import SwanSQLite
 import SwanStorage
 import SwanSpaces

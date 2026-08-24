@@ -3,7 +3,7 @@ import Foundation
 import Petrel
 import SwanOAuth
 import SwanCore
-import SwanPublicRepository
+import PetrelRepo
 import SwanSQLite
 import SwanStorage
 

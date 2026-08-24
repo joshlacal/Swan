@@ -5,8 +5,7 @@ import SwanAccounts
 import SwanCore
 import SwanInterop
 import SwanOAuth
-import SwanPublicRepository
-import SwanPublicRepositoryTestSupport
+import PetrelRepo
 import SwanSQLite
 import XCTest
 

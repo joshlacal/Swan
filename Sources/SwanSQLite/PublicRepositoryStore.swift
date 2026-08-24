@@ -3,7 +3,7 @@ import Foundation
 import Petrel
 import SQLiteNIO
 import SwanPublicFirehose
-import SwanPublicRepository
+import PetrelRepo
 import SwanStorage
 
 struct SQLitePublicRepositoryBlockSource: PublicRepositoryBlockSource {

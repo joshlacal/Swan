@@ -11,7 +11,7 @@ import SQLiteNIO
 import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
-import SwanPublicRepository
+import PetrelRepo
 import SwanPublicWire
 import SwanSQLite
 import SwanSpaces
@@ -1753,7 +1753,7 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         scopes: Set<String> = PublicRepositoryMutationHTTPTests.realisticClientScopes
     ) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
-            .appending(path: "SwanPublicRepositoryMutationHTTPTests-" + UUID().uuidString)
+            .appending(path: "PublicRepositoryMutationHTTPTests-" + UUID().uuidString)
         let control = try await SQLiteControlDatabase(dataDirectory: root)
         let signingKey = P256.Signing.PrivateKey()
         let genesis = try PublicRepositoryGenesisCodec.create(

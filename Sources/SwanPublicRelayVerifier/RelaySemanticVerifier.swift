@@ -1,7 +1,7 @@
 import Foundation
 import Petrel
 import SwanPublicFirehose
-import SwanPublicRepository
+import PetrelRepo
 
 public enum RelaySequenceVerifier {
   public static func verify(

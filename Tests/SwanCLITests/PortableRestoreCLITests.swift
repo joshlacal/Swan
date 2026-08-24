@@ -3,7 +3,7 @@ import Foundation
 import Petrel
 import SwanAccountExport
 import SwanAccounts
-import SwanPublicRepository
+import PetrelRepo
 import SwanSpaces
 import SwanSpacesWire
 import XCTest

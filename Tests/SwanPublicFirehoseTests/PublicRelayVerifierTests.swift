@@ -3,7 +3,7 @@ import Foundation
 import Petrel
 @testable import SwanPublicRelayVerifier
 import SwanPublicFirehose
-import SwanPublicRepository
+import PetrelRepo
 import XCTest
 
 final class PublicRelayVerifierTests: XCTestCase {

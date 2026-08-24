@@ -1,7 +1,7 @@
 import Crypto
 import Foundation
 import SwanCore
-import SwanPublicRepository
+import PetrelRepo
 import SwanStorage
 
 public enum PLCAccountActivationError: Error, Sendable, Equatable {

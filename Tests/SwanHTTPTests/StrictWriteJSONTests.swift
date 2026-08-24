@@ -10,7 +10,7 @@ import SQLiteNIO
 import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
-import SwanPublicRepository
+import PetrelRepo
 import SwanSQLite
 import SwanSpaces
 import SwanStorage

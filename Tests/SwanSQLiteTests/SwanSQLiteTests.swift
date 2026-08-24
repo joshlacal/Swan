@@ -5,7 +5,7 @@ import SQLiteNIO
 import SwanCore
 @_spi(PortableRestore) @testable import SwanSQLite
 import SwanPublicFirehose
-import SwanPublicRepository
+import PetrelRepo
 import SwanSpaces
 import SwanStorage
 import XCTest

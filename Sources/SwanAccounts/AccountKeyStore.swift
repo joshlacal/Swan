@@ -6,7 +6,7 @@ import Glibc
 #endif
 import Foundation
 import SwanCore
-import SwanPublicRepository
+import PetrelRepo
 import SwanStorage
 
 public enum AccountKeyPurpose: String, Codable, Sendable, CaseIterable {

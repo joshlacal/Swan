@@ -5,7 +5,7 @@ import HTTPTypes
 import NIOCore
 import Petrel
 import SwanOAuth
-import SwanPublicRepository
+import PetrelRepo
 import SwanPublicWire
 import SwanCore
 import SwanStorage

@@ -1,6 +1,6 @@
 import Foundation
 import Petrel
-import SwanPublicRepository
+import PetrelRepo
 
 public enum PublicFirehoseDiffCARError: Error, Sendable, Equatable {
   case missingBlock(CID)

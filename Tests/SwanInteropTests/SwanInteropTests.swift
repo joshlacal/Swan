@@ -6,7 +6,7 @@ import Petrel
 @testable import SwanInterop
 import SwanCore
 import SwanOAuth
-import SwanPublicRepository
+import PetrelRepo
 import SwanSQLite
 import SwanSpaces
 

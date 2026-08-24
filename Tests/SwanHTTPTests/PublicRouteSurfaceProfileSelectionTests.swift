@@ -12,7 +12,7 @@ import SwanCore
 import SwanInterop
 import SwanOAuth
 import SwanPublicFirehose
-import SwanPublicRepository
+import PetrelRepo
 import SwanPublicWire
 import SwanSpaces
 import SwanSQLite

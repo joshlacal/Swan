@@ -1,6 +1,6 @@
 import Foundation
 import Petrel
-import SwanPublicRepository
+import PetrelRepo
 
 #if canImport(Darwin)
 import Darwin

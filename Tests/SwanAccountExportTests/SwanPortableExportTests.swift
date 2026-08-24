@@ -8,7 +8,7 @@ import Glibc
 import Petrel
 @testable import SwanAccountExport
 import SwanAccounts
-import SwanPublicRepository
+import PetrelRepo
 import SwanSQLite
 import SwanSpaces
 import SwanSpacesWire

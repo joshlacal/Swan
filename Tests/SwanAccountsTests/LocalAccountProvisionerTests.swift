@@ -1,7 +1,7 @@
 import Crypto
 import Foundation
 import SQLiteNIO
-import SwanPublicRepository
+import PetrelRepo
 import SwanSQLite
 import SwanStorage
 import XCTest

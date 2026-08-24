@@ -2,7 +2,7 @@ import Foundation
 import NIOCore
 import Petrel
 import SQLiteNIO
-import SwanPublicRepository
+import PetrelRepo
 import SwanStorage
 
 extension SQLiteAccountDatabase {

@@ -9,7 +9,7 @@ import SwanAccounts
 import SwanCore
 @testable import SwanHTTP
 import SwanOAuth
-import SwanPublicRepository
+import PetrelRepo
 import SwanSQLite
 import SwanStorage
 import XCTest
@@ -848,7 +848,7 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
         records: [PublicRepositoryReadRecord]
     ) {
         let root = FileManager.default.temporaryDirectory
-            .appending(path: "SwanPublicRepositoryReadHTTPTests-\(UUID().uuidString)")
+            .appending(path: "PublicRepositoryReadHTTPTests-\(UUID().uuidString)")
         let control = try await SQLiteControlDatabase(dataDirectory: root)
         let state = try PublicRepositoryState(
             did: did,

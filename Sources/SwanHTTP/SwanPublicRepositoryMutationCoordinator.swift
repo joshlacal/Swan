@@ -1,6 +1,6 @@
 import Foundation
 import Petrel
-import SwanPublicRepository
+import PetrelRepo
 import SwanStorage
 
 public enum PublicRepositoryMutationCoordinatorError: Error, Sendable, Equatable {

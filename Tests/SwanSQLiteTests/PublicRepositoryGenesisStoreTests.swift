@@ -1,7 +1,7 @@
 import Crypto
 import Foundation
 import SQLiteNIO
-import SwanPublicRepository
+import PetrelRepo
 @testable import SwanSQLite
 import XCTest
 
@@ -100,7 +100,7 @@ final class PublicRepositoryGenesisStoreTests: XCTestCase {
 
     private func temporaryDirectory() throws -> URL {
         let root = FileManager.default.temporaryDirectory
-            .appending(path: "SwanPublicRepositoryGenesisStoreTests-\(UUID().uuidString)")
+            .appending(path: "PublicRepositoryGenesisStoreTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
         return root

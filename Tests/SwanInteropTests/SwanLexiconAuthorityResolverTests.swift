@@ -4,7 +4,7 @@ import SwanAccounts
 import SwanCore
 import SwanInterop
 import SwanOAuth
-import SwanPublicRepository
+import PetrelRepo
 import XCTest
 
 /// P2-C — §5.7.4 steps 5-6. The lane's premise is that a lexicon authority may

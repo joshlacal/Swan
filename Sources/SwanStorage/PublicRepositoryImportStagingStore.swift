@@ -1,6 +1,6 @@
 import Foundation
 import Petrel
-import SwanPublicRepository
+import PetrelRepo
 
 public enum PublicRepositoryImportStagingError: Error, Sendable, Equatable {
     case invalidBinding

@@ -1,6 +1,4 @@
-// Test-support only. This target is not a package product and is never linked
-// into `swan`: it deliberately constructs artifacts that production code must
-// refuse, and nothing here belongs on a serving path.
+// Test-support only.
 //
 // CAR framing follows bluesky-social/atproto@3f6c96d5d2d25438bd40fa89d6ecc37865f8e354
 // packages/repo/src/car.ts, used under the repository's MIT OR Apache-2.0
@@ -9,8 +7,8 @@
 import Crypto
 import Foundation
 import Petrel
+import PetrelRepo
 import SwanCore
-import SwanPublicRepository
 
 public enum PublicRepositoryProofFixtureError: Error, Sendable, Equatable {
     /// The generated tree put the target key in the root node, so the proof CAR

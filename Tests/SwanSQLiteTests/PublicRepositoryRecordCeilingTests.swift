@@ -2,7 +2,7 @@ import Crypto
 import Foundation
 import Petrel
 import SQLiteNIO
-import SwanPublicRepository
+import PetrelRepo
 import SwanStorage
 @testable import SwanSQLite
 import XCTest
@@ -215,7 +215,7 @@ final class PublicRepositoryRecordCeilingTests: XCTestCase {
 
     private func makeRepository() async throws -> Repository {
         let root = FileManager.default.temporaryDirectory.appending(
-            path: "SwanPublicRepositoryRecordCeilingTests-" + UUID().uuidString
+            path: "PublicRepositoryRecordCeilingTests-" + UUID().uuidString
         )
         let key = P256.Signing.PrivateKey()
         let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)

@@ -1,6 +1,6 @@
 import Petrel
 import SwanCore
-import SwanPublicRepository
+import PetrelRepo
 
 /// The durable trust anchor retained after Swan authenticates a PLC document
 /// and its complete audit. Only the issuer and terminal operation CID are

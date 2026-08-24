@@ -6,7 +6,7 @@ import Glibc
 #endif
 import Foundation
 @_spi(OperatorRestore) import SwanAccounts
-import SwanPublicRepository
+import PetrelRepo
 @_spi(PortableRestore) import SwanSQLite
 import SwanSpaces
 import SwanStorage

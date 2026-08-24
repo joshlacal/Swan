@@ -5,7 +5,7 @@ import NIOCore
 import Petrel
 import SwanAccounts
 import SwanCore
-import SwanPublicRepository
+import PetrelRepo
 import SwanPublicWire
 import SwanStorage
 import Synchronization

@@ -2,7 +2,7 @@ import Crypto
 import Foundation
 import Petrel
 import SwanPublicFirehose
-import SwanPublicRepository
+import PetrelRepo
 
 public struct RelayVerifiedFullRepository: Sendable, Equatable {
   public let snapshot: RelayRepositorySnapshot

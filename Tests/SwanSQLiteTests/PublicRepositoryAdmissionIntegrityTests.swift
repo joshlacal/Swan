@@ -4,7 +4,7 @@ import Petrel
 import SQLiteNIO
 import SwanAccounts
 import SwanCore
-import SwanPublicRepository
+import PetrelRepo
 @testable import SwanSQLite
 import SwanStorage
 import XCTest

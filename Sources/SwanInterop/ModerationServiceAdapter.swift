@@ -2,7 +2,7 @@ import Foundation
 import SwanCore
 import SwanAccounts
 import Petrel
-import SwanPublicRepository
+import PetrelRepo
 
 public struct ModerationTransportRequest: Sendable, Equatable {
     public let host: String

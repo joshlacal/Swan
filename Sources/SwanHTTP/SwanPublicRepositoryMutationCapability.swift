@@ -2,7 +2,7 @@ import Foundation
 import Petrel
 import SwanAccounts
 import SwanOAuth
-import SwanPublicRepository
+import PetrelRepo
 import SwanStorage
 
 /// Startup-preopened projection used by public repository mutations. The

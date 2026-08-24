@@ -9,7 +9,7 @@ import NIOCore
 import Petrel
 import SwanOAuth
 import SwanPublicFirehose
-import SwanPublicRepository
+import PetrelRepo
 import SwanStorage
 import XCTest
 @testable import SwanCore

@@ -1606,7 +1606,7 @@ enum AccountControlMetadata {
 
     /// A public repository commit CID is Swan's canonical CIDv1 dag-cbor
     /// SHA-256 base32 representation. Full CAR/CID verification is owned by
-    /// SwanPublicRepository; this control-plane boundary prevents arbitrary
+    /// PetrelRepo; this control-plane boundary prevents arbitrary
     /// text from becoming a provenance marker.
     static func isPublicGenesisCommitCID(_ value: String) -> Bool {
         let bytes = Array(value.utf8)

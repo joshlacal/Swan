@@ -1,6 +1,6 @@
 import Foundation
 import SwanPublicFirehose
-import SwanPublicRepository
+import PetrelRepo
 import SwanStorage
 
 public enum PublicLifecycleEmitterError: Error, Equatable {
