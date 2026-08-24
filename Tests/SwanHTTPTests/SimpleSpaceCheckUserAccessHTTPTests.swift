@@ -202,9 +202,9 @@ private struct CheckUserAccessFixture {
         method: String = ComAtprotoSimplespaceCheckUserAccess.typeIdentifier,
         audience: String = SimpleSpaceCheckUserAccessHTTPTests.audience,
         now: Date = Date(),
-        lifetime: TimeInterval = SpaceServiceJWT.lifetime
+        lifetime: TimeInterval = SwanOAuth.SpaceServiceJWT.lifetime
     ) throws -> String {
-        try SpaceServiceJWT.create(
+        try SwanOAuth.SpaceServiceJWT.create(
             issuer: SimpleSpaceCheckUserAccessHTTPTests.authority,
             audience: audience,
             method: method,

@@ -11,6 +11,7 @@ import SwanOAuth
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
+import SwanAccounts
 
 /// A bounded, redirect-free HTTP response used by the stateful interop
 /// harness.  The body is present only for small JSON/XRPC responses; CAR and
@@ -454,7 +455,7 @@ public struct InteropXRPCClient: Sendable {
     ) async throws -> Output {
         let response = try await self.query(nsid, query: query, authorization: authorization)
         try requireJSONSuccess(response)
-        return try StrictJSON.decode(Output.self, from: response.body)
+        return try SwanOAuth.StrictJSON.decode(Output.self, from: response.body)
     }
 
     public func procedure<Input: Encodable, Output: Decodable>(
@@ -468,7 +469,7 @@ public struct InteropXRPCClient: Sendable {
         let body = try encoder.encode(input)
         let response = try await procedure(nsid, body: body, authorization: authorization)
         try requireJSONSuccess(response)
-        return try StrictJSON.decode(Output.self, from: response.body)
+        return try SwanOAuth.StrictJSON.decode(Output.self, from: response.body)
     }
 
     public func stream(
@@ -1316,7 +1317,7 @@ public enum LiveInteropRunner {
     }
 
     static func canonicalRecordCID(from body: Data) -> String? {
-        guard let response = try? StrictJSON.decode(
+        guard let response = try? SwanOAuth.StrictJSON.decode(
             RecordResponse.self,
             from: body
         ) else {
@@ -1326,7 +1327,7 @@ public enum LiveInteropRunner {
     }
 
     static func canonicalBlobCID(from body: Data) -> String? {
-        guard let response = try? StrictJSON.decode(
+        guard let response = try? SwanOAuth.StrictJSON.decode(
             BlobResponse.self,
             from: body
         ) else {
@@ -1905,7 +1906,7 @@ public enum LiveInteropRunner {
                     errorCode: responseErrorCode(write) ?? "HTTP\(write.status)"
                 )
             }
-            let output = try StrictJSON.decode(
+            let output = try SwanOAuth.StrictJSON.decode(
                 ComAtprotoSpaceApplyWrites.Output.self,
                 from: write.body
             )
@@ -2319,7 +2320,7 @@ public enum LiveInteropRunner {
                     errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
                 )
             }
-            let output = try StrictJSON.decode(
+            let output = try SwanOAuth.StrictJSON.decode(
                 ComAtprotoSpaceListRepoOps.Output.self,
                 from: response.body
             )
@@ -2438,7 +2439,7 @@ public enum LiveInteropRunner {
         }
     }
 
-    /// Pure admission check shared by the CLI and live runner. StrictJSON
+    /// Pure admission check shared by the CLI and live runner. SwanOAuth.StrictJSON
     /// rejects duplicate keys and hostile nesting before any OAuth secret is
     /// read; generated Input decoding pins the wire contract.
     public static func pinnedApplyWritesOperationCount(
@@ -2448,7 +2449,7 @@ public enum LiveInteropRunner {
     ) -> Int? {
         guard (1 ... 2 * 1024 * 1024).contains(body.count),
               (try? DID(didString: repository)) != nil,
-              let decoded = try? StrictJSON.decode(
+              let decoded = try? SwanOAuth.StrictJSON.decode(
                   ComAtprotoSpaceApplyWrites.Input.self,
                   from: body
               ),
@@ -2527,7 +2528,7 @@ public enum LiveInteropRunner {
                     errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
                 )
             }
-            let output = try StrictJSON.decode(
+            let output = try SwanOAuth.StrictJSON.decode(
                 ComAtprotoSpaceListRepoOps.Output.self,
                 from: response.body
             )
@@ -3602,7 +3603,7 @@ public struct SpaceCredentialBroker: Sendable {
             response: delegation
         )
         try requireJSONSuccess(delegation)
-        let delegationObject = try StrictJSON.decode(TokenResponse.self, from: delegation.body)
+        let delegationObject = try SwanOAuth.StrictJSON.decode(TokenResponse.self, from: delegation.body)
         let credentialAuthorization = delegationAuthorization ?? .bearer(token: delegationObject.token)
         let input = CredentialRequest(space: space.rawValue, clientAttestation: clientAttestation)
         let inputBody = try encode(input)
@@ -3619,7 +3620,7 @@ public struct SpaceCredentialBroker: Sendable {
             response: credential
         )
         try requireJSONSuccess(credential)
-        return try StrictJSON.decode(TokenResponse.self, from: credential.body).token
+        return try SwanOAuth.StrictJSON.decode(TokenResponse.self, from: credential.body).token
     }
 
     private struct TokenResponse: Decodable {

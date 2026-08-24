@@ -2,6 +2,7 @@ import Crypto
 import Foundation
 import Petrel
 import XCTest
+import SwanAccounts
 @testable import SwanAccounts
 
 final class PLCClientTests: XCTestCase {

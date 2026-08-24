@@ -4,6 +4,7 @@ import SwanCore
 import SwanOAuth
 import SwanSpaces
 import SwanStorage
+import SwanAccounts
 
 /// Deterministic laboratory-only mutation applied after a bounded recovery
 /// response has been spooled and before the normal streaming verifier sees it.
@@ -132,7 +133,7 @@ public struct PermissionedRemoteReplicaHTTPSourceProvider:
               latest.header("content-type")?.lowercased().contains("json") == true else {
             throw InteropHTTPError.unexpectedStatus(latest.status)
         }
-        let output = try StrictJSON.decode(
+        let output = try SwanOAuth.StrictJSON.decode(
             ComAtprotoSpaceGetLatestCommit.Output.self,
             from: latest.body
         )

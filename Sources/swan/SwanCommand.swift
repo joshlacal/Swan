@@ -43,6 +43,7 @@ private extension PermissionedRemoteReplicaIncrementalSyncOutcome {
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+import SwanAccounts
 #endif
 
 /// Offline operator configuration for the notification laboratory. All key
@@ -6890,7 +6891,7 @@ extension SwanCommand {
             private static func responseError(
                 _ response: InteropHTTPResponse
             ) -> String? {
-                (try? StrictJSON.decode(
+                (try? SwanOAuth.StrictJSON.decode(
                     ErrorBody.self,
                     from: response.body
                 ))?.error
@@ -7107,7 +7108,7 @@ extension SwanCommand {
                 )
                 let document: InputDocument
                 do {
-                    document = try StrictJSON.decode(InputDocument.self, from: raw)
+                    document = try SwanOAuth.StrictJSON.decode(InputDocument.self, from: raw)
                 } catch {
                     throw ValidationError("stateful fault witness input is invalid")
                 }
@@ -8196,7 +8197,7 @@ extension SwanCommand {
                                 "forum post failed (status=\(response.status), error=\(errorCode ?? "unknown"))"
                             )
                         }
-                        let output = try StrictJSON.decode(
+                        let output = try SwanOAuth.StrictJSON.decode(
                             ForumPutRecordResponse.self,
                             from: response.body
                         )
@@ -8994,7 +8995,7 @@ extension SwanCommand {
                             .contains("json") == true else {
                         throw InteropHTTPError.unexpectedStatus(response.status)
                     }
-                    let output = try StrictJSON.decode(
+                    let output = try SwanOAuth.StrictJSON.decode(
                         ForumListReposResponse.self,
                         from: response.body
                     )

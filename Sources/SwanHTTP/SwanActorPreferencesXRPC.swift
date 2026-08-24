@@ -7,6 +7,7 @@ import SwanCore
 import SwanOAuth
 import SwanSpaces
 import SwanStorage
+import SwanAccounts
 
 /// The 1 MiB write cap mirrors the storage layer's CHECK constraint exactly.
 /// A body over this bound is rejected here with 413 (`PayloadTooLarge`,
@@ -349,7 +350,7 @@ private func collectValidatedActorPreferencesJSON(
     }
     let data = Data(bytes)
     do {
-        try StrictJSON.validate(data)
+        try SwanOAuth.StrictJSON.validate(data)
         guard let object = try JSONSerialization.jsonObject(
             with: data,
             options: []

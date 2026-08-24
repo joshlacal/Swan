@@ -1748,7 +1748,7 @@ private func decodeCreateAccountBody(
     }
     let data = Data(bytes)
     do {
-        try StrictJSON.validate(data)
+        try SwanOAuth.StrictJSON.validate(data)
         guard let object = try JSONSerialization.jsonObject(
             with: data,
             options: []

@@ -4,6 +4,7 @@ import Petrel
 import SwanCore
 import SwanStorage
 import XCTest
+import SwanAccounts
 @testable import SwanAccounts
 
 final class PLCOperationTests: XCTestCase {

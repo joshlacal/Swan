@@ -875,7 +875,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 now: now
             )
 
-            let localService = try SpaceServiceJWT.create(
+            let localService = try SwanOAuth.SpaceServiceJWT.create(
                 issuer: local,
                 audience: localDID,
                 method: "com.atproto.space.notifyWrite",
@@ -1054,7 +1054,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             headers = [.authorization: "Bearer \(delegation)"]
         case .notifyWrite:
-            let notifyWrite = try SpaceServiceJWT.create(
+            let notifyWrite = try SwanOAuth.SpaceServiceJWT.create(
                 issuer: space.authority,
                 audience: localDID,
                 method: ComAtprotoSpaceNotifyWrite.typeIdentifier,
@@ -1063,7 +1063,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             headers = [.authorization: "Bearer \(notifyWrite)"]
         case .notifyDeleted:
-            let notifyDeleted = try SpaceServiceJWT.create(
+            let notifyDeleted = try SwanOAuth.SpaceServiceJWT.create(
                 issuer: space.authority,
                 audience: recipientService,
                 method: ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier,
@@ -1072,7 +1072,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             headers = [.authorization: "Bearer \(notifyDeleted)"]
         case .checkUserAccess:
-            let checkUserAccess = try SpaceServiceJWT.create(
+            let checkUserAccess = try SwanOAuth.SpaceServiceJWT.create(
                 issuer: space.authority,
                 audience: managingAudience,
                 method: ComAtprotoSimplespaceCheckUserAccess.typeIdentifier,

@@ -2,6 +2,7 @@ import Foundation
 import SQLiteNIO
 import SwanCore
 import SwanStorage
+import SwanAccounts
 
 /// App-password rows, in the control database beside `accounts`.
 ///

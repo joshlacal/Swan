@@ -499,7 +499,7 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
               .lowercased() == "application/json" else {
             throw SwanError.malformed("PLC directory response is not JSON")
         }
-        try StrictJSON.validate(response.body)
+        try SwanAccounts.StrictJSON.validate(response.body)
     }
 
     /// Whether a submit response authenticated itself, or whether the submit
@@ -569,12 +569,12 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
               .lowercased() == "application/json" else {
             throw SwanError.malformed("PLC directory response is not JSON")
         }
-        try StrictJSON.validate(response.body)
+        try SwanAccounts.StrictJSON.validate(response.body)
         return .verified
     }
 
     private func decodeState(_ data: Data, expectedDID: String) throws -> PLCDocumentData {
-        try StrictJSON.validate(data)
+        try SwanAccounts.StrictJSON.validate(data)
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               Set(object.keys) == [
                   "did", "rotationKeys", "verificationMethods", "alsoKnownAs", "services",
@@ -615,7 +615,7 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
     }
 
     private func decodeAndVerifyAudit(_ data: Data, expectedDID: String) throws -> [PLCAuditEntry] {
-        try StrictJSON.validate(data)
+        try SwanAccounts.StrictJSON.validate(data)
         guard let rawEntries = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
               !rawEntries.isEmpty,
               rawEntries.count <= 10_000 else {

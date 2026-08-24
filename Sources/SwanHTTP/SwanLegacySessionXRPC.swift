@@ -566,7 +566,7 @@ private struct Handlers: Sendable {
             if let requestedExpiry = parameters.exp {
                 let nowEpoch = Int64(now.timeIntervalSince1970.rounded(.towardZero))
                 guard requestedExpiry > nowEpoch,
-                      requestedExpiry <= nowEpoch + Int64(ProxyServiceJWT.maximumLifetime) else {
+                      requestedExpiry <= nowEpoch + Int64(SwanOAuth.ProxyServiceJWT.maximumLifetime) else {
                     throw SwanLegacySessionXRPCFailure.invalidRequest
                 }
             }
@@ -764,7 +764,7 @@ private struct Handlers: Sendable {
         }
         let data = Data(bytes)
         do {
-            try StrictJSON.validate(data)
+            try SwanOAuth.StrictJSON.validate(data)
             guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 throw SwanLegacySessionXRPCFailure.invalidRequest
             }

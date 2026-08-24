@@ -5,6 +5,7 @@ import SwanCore
 import SwanOAuth
 import SwanSpaces
 import SwanStorage
+import SwanAccounts
 
 public enum PermissionedRemoteReplicaIncrementalSyncOutcome:
     Sendable, Equatable
@@ -206,7 +207,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
         if response.status == 409 {
             guard response.header("content-type")?.lowercased().contains("json")
                     == true,
-                  let error = try? StrictJSON.decode(
+                  let error = try? SwanOAuth.StrictJSON.decode(
                       ErrorBody.self,
                       from: response.body
                   ),
@@ -220,7 +221,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                 == true else {
             throw InteropHTTPError.unexpectedStatus(response.status)
         }
-        return .output(try StrictJSON.decode(
+        return .output(try SwanOAuth.StrictJSON.decode(
             ComAtprotoSpaceListRepoOps.Output.self,
             from: response.body
         ))
@@ -247,7 +248,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                 == true else {
             throw InteropHTTPError.unexpectedStatus(response.status)
         }
-        let output = try StrictJSON.decode(
+        let output = try SwanOAuth.StrictJSON.decode(
             ComAtprotoSpaceGetLatestCommit.Output.self,
             from: response.body
         )
