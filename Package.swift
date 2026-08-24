@@ -97,7 +97,7 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
             ]
         ),
-        .target(name: "SwanSpacesWire", dependencies: ["SwanCore", .product(name: "Petrel", package: "Petrel")]),
+        .target(name: "SwanSpacesWire", dependencies: ["SwanCore"]),
         .target(name: "SwanPublicWire", dependencies: ["SwanCore", .product(name: "Petrel", package: "Petrel")]),
         .target(
             name: "SwanPublicRepository",

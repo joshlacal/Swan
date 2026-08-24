@@ -510,10 +510,6 @@ public struct SwanHTTPServer: Sendable {
         accountPortalHTTP: SwanAccountPortalHTTP? = nil,
         accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter? = nil,
         didWebIdentityHTTP: SwanDidWebIdentityHTTP? = nil,
-        // Kept as a source-compatible, inert parameter for callers compiled
-        // against the account-program merge. Legacy XRPC is owned solely by
-        // `SwanLegacySessionXRPCServer`; this adapter is never registered.
-        legacyAuthXRPC: SwanLegacyAuthXRPCAdapter? = nil,
         actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
         xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
@@ -544,7 +540,6 @@ public struct SwanHTTPServer: Sendable {
         self.accountPortalHTTP = accountPortalHTTP
         self.accountLifecycleXRPC = accountLifecycleXRPC
         self.didWebIdentityHTTP = didWebIdentityHTTP
-        _ = legacyAuthXRPC
         self.actorPreferencesXRPC = actorPreferencesXRPC
         self.xrpcPipethrough = xrpcPipethrough
         self.publicFirehoseStreaming = publicFirehoseStreaming

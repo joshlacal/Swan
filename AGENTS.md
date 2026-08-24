@@ -18,7 +18,7 @@ Swan is organized into distinct Swift Package Manager targets defined in `Packag
 | `CATHandleDNS` | `Sources/CATHandleDNS` | C library providing DNS resolution via `resolv` for AT Protocol handle verification. |
 | `CBLAKE3` | `Sources/CBLAKE3` | C implementation of the BLAKE3 cryptographic hash function. |
 | `SwanCore` | `Sources/SwanCore` | Base models, identifiers (`DID`, `TID`, `NSID`, `ATProtocolDate`), core error types, and logging primitives. |
-| `SwanSpacesWire` | `Sources/SwanSpacesWire` | Pinned space wire models, CBOR/IPLD structures, and generated lexicon data types (`Sources/SwanSpacesWire/Generated`). |
+| `SwanSpacesWire` | `Sources/SwanSpacesWire` | Space wire models and permissioned data method registry. |
 | `SwanPublicWire` | `Sources/SwanPublicWire` | Public AT Protocol lexicon wire models and request/response structures. |
 | `SwanPublicRepository` | `Sources/SwanPublicRepository` | Merkle Search Tree (MST), CAR format encoding/decoding, commit signing, and repository storage primitives. |
 | `SwanPublicFirehose` | `Sources/SwanPublicFirehose` | Event streaming, frame sequencing, commit event serialization, and diff CAR generation. |
@@ -108,17 +108,16 @@ Swan uses protocol profile pins under `Profiles/*.json` to fix protocol versions
 
 ## Generated-code boundary
 
-The directory `Sources/SwanSpacesWire/Generated` contains Swift code generated from pinned lexicon schemas by an external Petrel generator workspace.
+The directory `Sources/SwanPublicWire/Generated` contains Swift code generated from pinned lexicon schemas by an external Petrel generator workspace.
 
-- Never manually edit files in `Sources/SwanSpacesWire/Generated`.
-- The CI gate `Scripts/verify-wire-generation.sh` ensures generated sources match the pinned profile byte-for-byte.
-- To run wire generation verification locally, provide the generator path via environment variables:
+- Never manually edit files in `Sources/SwanPublicWire/Generated`.
+- The CI gate `Scripts/verify-public-wire-generation.sh` ensures generated sources match the pinned profile byte-for-byte.
+- To run public wire generation verification locally, provide the generator path via environment variables:
 ```bash
 export PETREL_GENERATOR_ROOT="/path/to/petrel-generator"
 export PETREL_GENERATOR_ENTRYPOINT="run.py"
-./Scripts/verify-wire-generation.sh
+./Scripts/verify-public-wire-generation.sh
 ```
-
 ## Security invariants
 
 When modifying Swan code, you must preserve these security boundaries:

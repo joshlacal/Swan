@@ -944,9 +944,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 service: PortalMemoryService()
             )
             // The legacy XRPC surface is installed through the canonical
-            // production session service. The retired LegacyAuthService and
-            // SwanLegacyAuthXRPCAdapter remain source-compatibility shims but
-            // are intentionally inert in SwanHTTPServer composition.
+            // production session service (SwanLegacySessionXRPCServer).
             let legacySessionXRPC: SwanLegacySessionXRPCServer?
             if installLegacy {
                 // The legacy session family row has an FK to `accounts(did)`;
