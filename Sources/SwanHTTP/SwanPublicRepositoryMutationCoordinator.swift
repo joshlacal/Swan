@@ -8,6 +8,7 @@ public enum PublicRepositoryMutationCoordinatorError: Error, Sendable, Equatable
     case inactiveAccount
     case invalidSwap
     case invalidBlobReference
+    case quotaExceeded
     case unavailable
 }
 
@@ -264,13 +265,17 @@ public enum SwanPublicRepositoryMutationCoordinator {
     }
 
     private static func map(_ error: Error) -> PublicRepositoryMutationCoordinatorError {
-        if let error = error as? PublicRepositoryMutationStoreError,
-           error == .commitCASConflict {
-            return .unavailable
-        }
-        if let error = error as? PublicRepositoryMutationStoreError,
-           error == .publicBlobNotReachable {
-            return .invalidBlobReference
+        if let error = error as? PublicRepositoryMutationStoreError {
+            switch error {
+            case .commitCASConflict:
+                return .unavailable
+            case .publicBlobNotReachable:
+                return .invalidBlobReference
+            case .blockQuotaExceeded:
+                return .quotaExceeded
+            default:
+                break
+            }
         }
         if let error = error as? PublicRepositoryEngineError {
             switch error {

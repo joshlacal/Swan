@@ -871,6 +871,7 @@ public enum SQLiteLayout {
                 OR length(committed_projection_digest) = 32
             ),
             integrity_digest BLOB NOT NULL CHECK(length(integrity_digest) = 32),
+            created_at INTEGER NOT NULL DEFAULT 0 CHECK(created_at >= 0),
             CHECK(
                     (status IN ('reserved', 'abandoned') AND committed_commit_cid IS NULL
                     AND committed_data_cid IS NULL AND committed_projection IS NULL
@@ -2167,6 +2168,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let permissionedSpaceRecordBlobIndexMigrationVersion = 17
     private static let permissionedOplogRetentionCutoffMigrationVersion = 18
     private static let publicFirehoseOutboxCompactionMigrationVersion = 19
+    private static let publicRepositoryRequestReceiptRetentionMigrationVersion = 20
 
     /// How long an uploaded blob no commit has claimed stays staged.
     ///
@@ -2240,6 +2242,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private let externalBodyLeases =
         SQLiteAccountExternalBodyLeaseGate()
     var testingHooks = SQLiteTestingHooks()
+    public var publicRepositoryBlockQuota: PublicRepositoryBlockQuota = .standard
     private var activeWriteTransactions = 0
     private var isReaderClosed = false
     private var isWriterClosed = false
@@ -2634,6 +2637,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePermissionedOplogRetentionCutoffIfNeeded()
             try await migrateSpaceNotificationServiceIdentityIfNeeded()
             try await backfillPermissionedSpaceRecordBlobIndexIfNeeded()
+            try await migratePublicRepositoryRequestReceiptRetentionIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -2651,8 +2655,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
         try await migrateSpaceNotificationReceiptScopeIfNeeded()
         try await compactSpaceNotificationReceiptsIfNeeded()
+        _ = try? await pruneTerminalPublicRepositoryMutationRequestsWithoutGate(
+            nowMicroseconds: 0
+        )
+        if let state = try? await loadPublicRepositoryStateWithoutGate() {
+            _ = try? await garbageCollectPublicRepositoryBlocksWithoutGate(state: state)
+        }
     }
-
     /// The first notification schema keyed receipts only by issuer and JTI.
     /// A service JTI is consumed in the context of one space, so retaining that
     /// key globally could suppress a valid announcement for a second space if
@@ -2793,6 +2802,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     OR length(committed_projection_digest) = 32
                 ),
                 integrity_digest BLOB NOT NULL CHECK(length(integrity_digest) = 32),
+                created_at INTEGER NOT NULL DEFAULT 0 CHECK(created_at >= 0),
                 CHECK(
                     (status IN ('reserved', 'abandoned') AND committed_commit_cid IS NULL
                         AND committed_data_cid IS NULL AND committed_projection IS NULL
@@ -2806,9 +2816,26 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             """
         )
         if hasIntegrity {
-            _ = try await connection.query(
-                "INSERT INTO public_repository_mutation_requests SELECT * FROM public_repository_mutation_requests_pre_integrity"
-            )
+            let hasCreatedAt = columns.contains { $0.column("name")?.string == "created_at" }
+            if hasCreatedAt {
+                _ = try await connection.query(
+                    "INSERT INTO public_repository_mutation_requests SELECT * FROM public_repository_mutation_requests_pre_integrity"
+                )
+            } else {
+                _ = try await connection.query(
+                    """
+                    INSERT INTO public_repository_mutation_requests(
+                        request_id, request_digest, base_commit_cid, base_revision,
+                        next_revision, status, committed_commit_cid, committed_data_cid,
+                        committed_projection, committed_projection_digest, integrity_digest, created_at
+                    )
+                    SELECT request_id, request_digest, base_commit_cid, base_revision,
+                           next_revision, status, committed_commit_cid, committed_data_cid,
+                           committed_projection, committed_projection_digest, integrity_digest, 0
+                    FROM public_repository_mutation_requests_pre_integrity
+                    """
+                )
+            }
         }
         _ = try await connection.query("DROP TABLE public_repository_mutation_requests_pre_integrity")
     }
@@ -3269,6 +3296,32 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
 
         guard applied.isEmpty else { return }
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
+    /// Finding 3: bounds receipt retention for public repository mutations.
+    private func migratePublicRepositoryRequestReceiptRetentionIfNeeded() async throws {
+        let version = Self.publicRepositoryRequestReceiptRetentionMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        try await addAccountColumnIfMissing(
+            table: "public_repository_mutation_requests",
+            column: "created_at",
+            definition: "INTEGER NOT NULL DEFAULT 0 CHECK(created_at >= 0)"
+        )
         _ = try await connection.query(
             """
             INSERT INTO permissioned_repository_migrations(version, applied_at)

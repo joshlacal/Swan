@@ -904,6 +904,7 @@ private func publicMutationResponse(
     switch failure {
     case .invalidSwap: return publicMutationError(.badRequest, "InvalidSwap")
     case .invalidBlobReference: return publicMutationError(.badRequest, "BlobNotFound")
+    case .quotaExceeded: return publicMutationError(.badRequest, "QuotaExceeded")
     case .repositoryNotFound: return publicMutationError(.notFound, "RepoNotFound")
     case .inactiveAccount: return publicMutationError(.forbidden, "AccountInactive")
     case .unavailable: return publicMutationError(.serviceUnavailable, "temporarily_unavailable")

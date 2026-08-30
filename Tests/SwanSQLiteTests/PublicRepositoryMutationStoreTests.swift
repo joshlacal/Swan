@@ -16,7 +16,6 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let key = P256.Signing.PrivateKey()
         let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
-        defer { Task { try? await database.close() } }
         let genesis = try PublicRepositoryGenesisCodec.create(
             did: did,
             revision: genesisRevision,
@@ -88,6 +87,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
         )
         let indexed = try await database.publicRepositoryRecordCID(for: path)
         XCTAssertNil(indexed)
+        try await database.close()
     }
 
     func testGenesisBecomesRepositoryTruthAndPreparedCreateSurvivesReopen() async throws {
@@ -964,6 +964,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
             request,
             wallClockMicroseconds: 1
         ) else {
+            try await upgraded.close()
             return XCTFail("empty legacy request table did not upgrade")
         }
         try await upgraded.close()

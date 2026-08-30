@@ -14,6 +14,22 @@ public enum PublicRepositoryMutationStoreError: Error, Sendable, Equatable {
     case publicBlobNotReachable
     case revisionExhausted
     case corruptRepository
+    case blockQuotaExceeded
+}
+
+public struct PublicRepositoryBlockQuota: Sendable, Equatable {
+    public let maximumTotalBytes: Int
+    public let maximumTotalBlocks: Int
+
+    public static let standard = PublicRepositoryBlockQuota(
+        maximumTotalBytes: PublicRepositoryLimits.standard.maximumCARBytes * 2,
+        maximumTotalBlocks: PublicRepositoryLimits.standard.maximumCARBlocks * 2
+    )
+
+    public init(maximumTotalBytes: Int, maximumTotalBlocks: Int) {
+        self.maximumTotalBytes = maximumTotalBytes
+        self.maximumTotalBlocks = maximumTotalBlocks
+    }
 }
 
 /// Retryable failure from the final control-plane publication fence. This is
