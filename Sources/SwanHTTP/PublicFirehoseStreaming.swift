@@ -15,6 +15,7 @@ public struct PublicFirehoseStreamingLimits: Sendable, Equatable {
   public let maximumBackfillCatchUp: Duration
   public let maximumWriteDuration: Duration
   public let maximumPageHold: Duration
+  public let maximumAdmissionWait: Duration
   public let idlePollInterval: TimeInterval
 
   public static let standard = try! PublicFirehoseStreamingLimits()
@@ -25,6 +26,7 @@ public struct PublicFirehoseStreamingLimits: Sendable, Equatable {
     maximumBackfillCatchUp: Duration = .seconds(120),
     maximumWriteDuration: Duration = .seconds(30),
     maximumPageHold: Duration? = nil,
+    maximumAdmissionWait: Duration? = nil,
     idlePollInterval: TimeInterval = 0.25
   ) throws {
     guard pageSize > 0, pageSize <= 1_000 else {
@@ -45,6 +47,10 @@ public struct PublicFirehoseStreamingLimits: Sendable, Equatable {
     guard resolvedPageHold > .zero else {
       throw SwanError.malformed("firehose maximum page hold must be positive")
     }
+    let resolvedAdmissionWait = maximumAdmissionWait ?? (resolvedPageHold * 16)
+    guard resolvedAdmissionWait > .zero else {
+      throw SwanError.malformed("firehose maximum admission wait must be positive")
+    }
     guard idlePollInterval.isFinite, idlePollInterval > 0 else {
       throw SwanError.malformed("firehose idle poll interval must be positive")
     }
@@ -53,6 +59,7 @@ public struct PublicFirehoseStreamingLimits: Sendable, Equatable {
     self.maximumBackfillCatchUp = maximumBackfillCatchUp
     self.maximumWriteDuration = maximumWriteDuration
     self.maximumPageHold = resolvedPageHold
+    self.maximumAdmissionWait = resolvedAdmissionWait
     self.idlePollInterval = idlePollInterval
   }
 }
@@ -72,7 +79,7 @@ public final class PublicFirehosePageAdmission: @unchecked Sendable {
     let continuation: CheckedContinuation<PublicFirehosePageLease, any Error>
   }
 
-  public init(maximumConcurrentPages: Int = 16) {
+  public init(maximumConcurrentPages: Int = 4) {
     self.maximumConcurrentPages = maximumConcurrentPages
   }
 
@@ -458,7 +465,7 @@ public struct PublicFirehoseTailer: Sendable {
       let pageLease: PublicFirehosePageLease
       do {
         pageLease = try await pageAdmission.reserve(
-          timeout: limits.maximumBackfillCatchUp
+          timeout: limits.maximumAdmissionWait
         )
       } catch is CancellationError {
         throw CancellationError()
@@ -492,8 +499,8 @@ public struct PublicFirehoseTailer: Sendable {
       let maximumPageHold = limits.maximumPageHold
       for row in rows {
         let currentHold = clock.now - pageStarted
-        if currentHold > maximumPageHold
-          || (seqLag > 0 && backfillElapsed + currentHold > limits.maximumBackfillCatchUp) {
+        if currentHold >= maximumPageHold
+          || (seqLag > 0 && backfillElapsed + currentHold >= limits.maximumBackfillCatchUp) {
           pageLease.release()
           logger.warning("dropping slow public firehose consumer exceeding backfill catch-up budget")
           throw PublicFirehoseTailerError.consumerTooSlow(
@@ -501,7 +508,21 @@ public struct PublicFirehoseTailer: Sendable {
             backfillElapsed: backfillElapsed + currentHold
           )
         }
-        try watchdog.beginWrite()
+        let remainingHold = maximumPageHold - currentHold
+        var writeBudget = min(limits.maximumWriteDuration, remainingHold)
+        if seqLag > 0 {
+          let remainingCatchUp = limits.maximumBackfillCatchUp - (backfillElapsed + currentHold)
+          writeBudget = min(writeBudget, remainingCatchUp)
+        }
+        guard writeBudget > .zero else {
+          pageLease.release()
+          logger.warning("dropping slow public firehose consumer exceeding backfill catch-up budget")
+          throw PublicFirehoseTailerError.consumerTooSlow(
+            seqLag: seqLag,
+            backfillElapsed: backfillElapsed + currentHold
+          )
+        }
+        try watchdog.beginWrite(timeout: writeBudget)
         do {
           try await outbound(row.frameBytes)
           try watchdog.endWrite()
@@ -535,12 +556,12 @@ public struct PublicFirehoseTailer: Sendable {
 /// terminal decision under a single lock.
 private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
   private let lock = NSLock()
-  private let timeout: Duration
+  private let defaultTimeout: Duration
   private let logger: Logger
 
   private enum State {
     case idle
-    case writing(deadline: ContinuousClock.Instant)
+    case writing(deadline: ContinuousClock.Instant, timeout: Duration)
     case timedOut(duration: Duration)
     case terminated
   }
@@ -550,7 +571,7 @@ private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
   private var idleContinuation: CheckedContinuation<Void, Never>?
 
   init(timeout: Duration, logger: Logger) {
-    self.timeout = timeout
+    self.defaultTimeout = timeout
     self.logger = logger
   }
 
@@ -560,7 +581,8 @@ private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
     }
   }
 
-  func beginWrite() throws {
+  func beginWrite(timeout: Duration? = nil) throws {
+    let effectiveTimeout = timeout ?? defaultTimeout
     let continuation: CheckedContinuation<Void, Never>? = try lock.withLock {
       switch self.state {
       case .terminated:
@@ -568,7 +590,10 @@ private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
       case .timedOut(let duration):
         throw PublicFirehoseTailerError.writeTooSlow(duration: duration)
       case .idle, .writing:
-        self.state = .writing(deadline: ContinuousClock.now + timeout)
+        self.state = .writing(
+          deadline: ContinuousClock.now + effectiveTimeout,
+          timeout: effectiveTimeout
+        )
         let cont = self.idleContinuation
         self.idleContinuation = nil
         return cont
@@ -624,7 +649,7 @@ private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
           return .terminate
         case .idle:
           return .waitForBegin
-        case .writing(let deadline):
+        case .writing(let deadline, _):
           return .sleep(until: deadline)
         }
       }
@@ -662,9 +687,9 @@ private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
 
         let targetToCancel: Task<Void, any Error>? = lock.withLock {
           switch self.state {
-          case .writing(let activeDeadline):
+          case .writing(let activeDeadline, let activeTimeout):
             if clock.now >= activeDeadline {
-              self.state = .timedOut(duration: self.timeout)
+              self.state = .timedOut(duration: activeTimeout)
               return self.writerTask
             }
             return nil
@@ -672,7 +697,6 @@ private final class PublicFirehoseWriteWatchdog: @unchecked Sendable {
             return nil
           }
         }
-
         if let targetToCancel {
           logger.warning("dropping slow public firehose write")
           targetToCancel.cancel()
