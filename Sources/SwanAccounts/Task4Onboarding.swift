@@ -752,20 +752,21 @@ public struct SignupService: Sendable {
     public func authorize(_ input: SignupAuthorizationInput, verificationCode: String? = nil, turnstileToken: String? = nil, remoteIP: String? = nil, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupAuthorization {
         // 1. Cheap structural checks
         guard policy.policy.permitsPublicSignup, input.isTrustedBucket else { throw SignupServiceError.closed }
+        // 2. Rate admission
+        guard let rateAdmission else {
+            if policy.policy == .inviteRequired { throw SignupServiceError.inviteRequired }
+            throw SwanError.unavailable("signup admission")
+        }
+        guard try await rateAdmission.permits(bucket: input.clientIPBucketDigest, now: now) else { throw SignupServiceError.rateLimited }
+
         guard lifetime.isFinite, (1 ... 900).contains(lifetime) else { throw SwanError.invalidIdentifier("signup authorization lifetime") }
+
         guard input.email != nil, input.emailProofDigest != nil else { throw SignupServiceError.emailProofRequired }
         guard AccountControlIdentifiers.isDID(input.identityDID) else { throw SignupServiceError.invalidIdentity }
         guard policy.permits(handle: input.handle, inviteCode: input.inviteDigest == nil ? nil : "present") else { throw SignupServiceError.inviteRequired }
         if policy.policy == .openProtected {
             guard proofVerifier != nil, proofService != nil, verificationCode != nil else { throw SignupServiceError.emailProofRequired }
             guard turnstile != nil, let turnstileToken, !turnstileToken.isEmpty else { throw SignupServiceError.turnstileRequired }
-        }
-
-        // 2. Rate admission
-        if let rateAdmission {
-            guard try await rateAdmission.permits(bucket: input.clientIPBucketDigest, now: now) else { throw SignupServiceError.rateLimited }
-        } else if policy.policy == .inviteRequired {
-            throw SignupServiceError.inviteRequired
         }
 
         // 3. Local email-proof verification

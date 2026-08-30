@@ -259,7 +259,7 @@ private struct Handlers: Sendable {
                 required: ["identifier", "password"],
                 optional: ["authFactorToken", "allowTakendown"]
             )
-            let rawPeer = context.remoteAddress?.ipAddress ?? "127.0.0.1"
+            let rawPeer = context.remoteAddress?.ipAddress
             guard let clientIP = try? loginClientIdentityPolicy.clientIPAddress(
                 directPeer: rawPeer,
                 headers: request.headers

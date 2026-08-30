@@ -215,7 +215,7 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
                     now: now.addingTimeInterval(4)
                 )
                 XCTFail("stale grant must not be usable after reactivation")
-            } catch {}
+            } catch AccountControlStoreError.notFound {}
         }
         await control.setConnectionGateWaiterEnqueuedForTesting(nil)
         try await control.close()
@@ -783,6 +783,19 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
             accountDID: did,
             context: context,
             now: now
+        )
+        let positiveDigest = Data(repeating: 0x78, count: 32)
+        _ = try await control.createPasswordAuthorizationGrant(
+            grantDigest: positiveDigest,
+            accountDID: did,
+            context: context,
+            now: now
+        )
+        _ = try await control.consumeAuthorizationGrant(
+            grantDigest: positiveDigest,
+            accountDID: did,
+            context: context,
+            now: now.addingTimeInterval(1)
         )
         // Status change updates accounts.updated_at
         _ = try await control.transitionStatus(did: did, to: .deactivated, declaration: .init(), emitting: nil, now: now.addingTimeInterval(5))

@@ -293,7 +293,7 @@ final class SwanLegacySessionXRPCTests: XCTestCase {
         }
     }
     func testLegacySessionLoginClientIdentityPolicyAndTrustedProxy() async throws {
-        let trustedPolicy = try SwanLoginClientIdentityPolicy(trustedProxyPeerLiterals: ["127.0.0.1"])
+        let trustedPolicy = try SwanLoginClientIdentityPolicy(trustedProxyPeerLiterals: ["127.0.0.1", "::1"])
         let fixture = try await makeFixture(loginClientIdentityPolicy: trustedPolicy)
         defer {
             Task {
@@ -308,7 +308,7 @@ final class SwanLegacySessionXRPCTests: XCTestCase {
             scopes: "atproto",
             into: fixture.database
         ).password
-        try await app.test(.router) { client in
+        try await app.test(.live) { client in
             // 1. Trusted proxy forwards valid client IP
             try await client.execute(
                 uri: "/xrpc/\(ComAtprotoServerCreateSession.typeIdentifier)",
@@ -329,6 +329,21 @@ final class SwanLegacySessionXRPCTests: XCTestCase {
                 headers: [
                     .contentType: "application/json",
                     HTTPField.Name("X-Swan-Client-IP")!: "invalid,ip,header",
+                ],
+                body: ByteBuffer(string: "{\"identifier\":\"alice.example.com\",\"password\":\"\(password)\"}")
+            ) { response in
+                XCTAssertEqual(response.status, .serviceUnavailable)
+            }
+        }
+
+        // Router tests have no socket peer; forwarding must not be trusted.
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/xrpc/\(ComAtprotoServerCreateSession.typeIdentifier)",
+                method: .post,
+                headers: [
+                    .contentType: "application/json",
+                    HTTPField.Name("X-Swan-Client-IP")!: "203.0.113.195",
                 ],
                 body: ByteBuffer(string: "{\"identifier\":\"alice.example.com\",\"password\":\"\(password)\"}")
             ) { response in

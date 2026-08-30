@@ -475,7 +475,6 @@ public protocol ManagementSessionStore: Sendable {
     func createManagementSession(_ session: ManagementSessionMetadata, sessionDigest: Data, csrfDigest: Data, now: Date) async throws
     func managementSession(digest: Data, now: Date) async throws -> ManagementSessionMetadata?
     func revokeManagementSession(digest: Data, now: Date) async throws
-    func revokeManagementSessions(accountDID: String, now: Date) async throws
     func revokeOtherManagementSessions(accountDID: String, except sessionID: ManagementSessionID, now: Date) async throws
     func purgeExpiredManagementSessions(now: Date) async throws
 

@@ -956,9 +956,6 @@ private actor PortalMemorySessionStore: ManagementSessionStore {
         guard let session = values[digest], session.accountDID == accountDID else { return }
         values.removeValue(forKey: digest)
     }
-    func revokeManagementSessions(accountDID: String, now _: Date) async throws {
-        values = values.filter { $0.value.accountDID != accountDID }
-    }
     func managementSessions(accountDID: String, now _: Date) async throws -> [ManagementSessionMetadata] {
         values.values.filter { $0.accountDID == accountDID }
     }

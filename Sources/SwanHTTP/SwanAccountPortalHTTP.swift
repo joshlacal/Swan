@@ -633,7 +633,7 @@ private func resolvePortalClientIP(
     context: SwanHTTPRequestContext,
     policy: SwanLoginClientIdentityPolicy
 ) -> String? {
-    let rawPeer = context.remoteAddress?.ipAddress ?? "127.0.0.1"
+    let rawPeer = context.remoteAddress?.ipAddress
     return try? policy.clientIPAddress(
         directPeer: rawPeer,
         headers: request.headers

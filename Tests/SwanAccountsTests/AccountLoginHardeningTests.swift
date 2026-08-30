@@ -479,37 +479,21 @@ final class AccountLoginHardeningTests: XCTestCase {
     }
 
     func testOAuthPeerAdmissionEnforcesAggregateGlobalBudgetAcrossDistinctPeers() async throws {
-        let policy = try OAuthPeerAdmissionPolicy(
-            attempts: 2,
-            globalAttempts: 5,
-            window: 10
-        )
+        let policy = try OAuthPeerAdmissionPolicy(attempts: 2, globalAttempts: 6, window: 10)
         let service = OAuthPeerAdmissionService(policy: policy)
         let start = Date(timeIntervalSince1970: 1_800_000_000)
-
-        // 5 distinct peers make 1 request each (all under their individual attempt budget of 2)
         for i in 1 ... 5 {
-            let decision = await service.admit(peer: "203.0.113.\(i)", now: start)
-            XCTAssertEqual(decision, .allowed, "peer \(i) within global budget")
+            let decision = await service.admit(peer: "203.0.113.\(i)", now: start.addingTimeInterval(-9))
+            XCTAssertEqual(decision, .allowed)
         }
-
-        // 6th distinct peer is rejected by global ceiling even though peer 6 has 0 prior attempts
-        let globalExhausted = await service.admit(peer: "203.0.113.6", now: start)
-        XCTAssertEqual(
-            globalExhausted,
-            .rateLimited,
-            "distinct peers must hit the aggregate global ceiling"
-        )
-
-        // Global refusal must not consume peer 6's own bucket
-        // Advance past window to verify window reopens and peer 6 has full budget
-        let reopenedStart = start.addingTimeInterval(policy.window)
-        let peer6First = await service.admit(peer: "203.0.113.6", now: reopenedStart)
-        XCTAssertEqual(peer6First, .allowed, "window reopens after expiration")
-        let peer6Second = await service.admit(peer: "203.0.113.6", now: reopenedStart.addingTimeInterval(1))
-        XCTAssertEqual(peer6Second, .allowed, "peer 6 has full individual budget")
-        let peer6Third = await service.admit(peer: "203.0.113.6", now: reopenedStart.addingTimeInterval(2))
-        XCTAssertEqual(peer6Third, .rateLimited, "peer 6 hits individual budget")
+        let seeded = await service.admit(peer: "203.0.113.6", now: start.addingTimeInterval(-1))
+        XCTAssertEqual(seeded, .allowed)
+        let refused = await service.admit(peer: "203.0.113.6", now: start)
+        XCTAssertEqual(refused, .rateLimited)
+        let afterGlobalWindow = await service.admit(peer: "203.0.113.6", now: start.addingTimeInterval(1))
+        XCTAssertEqual(afterGlobalWindow, .allowed, "global refusal must not consume peer 6's existing bucket")
+        let peerExhausted = await service.admit(peer: "203.0.113.6", now: start.addingTimeInterval(2))
+        XCTAssertEqual(peerExhausted, .rateLimited)
     }
 
     func testOAuthPeerAdmissionUnidentifiedPeersChargeGlobalBudget() async throws {

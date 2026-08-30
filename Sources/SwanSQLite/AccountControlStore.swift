@@ -2570,42 +2570,6 @@ extension SQLiteControlDatabase {
                         did: did,
                         timestamp: timestamp
                     )
-                    if account.status.authorizesAccount {
-                        // Families are created before authorization-code
-                        // redemption, so this permanently revokes every
-                        // pre-deactivation code, access token, and refresh
-                        // token without deleting their audit rows. Legacy
-                        // bearer families use the same lifecycle boundary;
-                        // their family rows remain as revocation evidence but
-                        // no credential-bearing token row survives it.
-                        _ = try await connection.query(
-                            """
-                            UPDATE oauth_control_token_families
-                            SET revoked_at = COALESCE(revoked_at, ?)
-                            WHERE subject = ?
-                            """,
-                            [.integer(timestamp), .text(did)]
-                        )
-                        _ = try await connection.query(
-                            """
-                            UPDATE legacy_session_families
-                            SET revoked_at = COALESCE(revoked_at, ?)
-                            WHERE did = ?
-                            """,
-                            [.integer(timestamp), .text(did)]
-                        )
-                        _ = try await connection.query(
-                            """
-                            DELETE FROM legacy_session_tokens
-                            WHERE family_id IN (
-                                SELECT family_id
-                                FROM legacy_session_families
-                                WHERE did = ?
-                            )
-                            """,
-                            [.text(did)]
-                        )
-                    }
                 }
                 if let emitting,
                    account.status != status,

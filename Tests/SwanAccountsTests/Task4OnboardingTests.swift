@@ -340,6 +340,28 @@ final class Task4OnboardingTests: XCTestCase {
         let auth = try await service.authorize(inputWithInvite)
         XCTAssertEqual(auth.handle, "dave.example.com")
     }
+    func testOpenProtectedSignupRequiresAdmission() async throws {
+        let store = InMemorySignupAuthorizationStore()
+        let service = try SignupService(policy: SignupPolicyService(policy: .openProtected), store: store)
+        let peer = try SocketAddressSignupPeerExtractor(serverSecret: Data(repeating: 9, count: 32))
+            .bucket(forCanonicalPeerIP: "192.0.2.9")
+        let input = try SignupAuthorizationInput.make(
+            requestID: "req-no-admission",
+            authorizationID: SignupAuthorizationID(rawValue: "auth-no-admission"),
+            handle: "no-admission.example.com",
+            email: try AccountEmailAddress("nobody@example.com"),
+            identityDID: "did:plc:abcdefghijklmnopqrstuvwx",
+            emailProofDigest: Data(repeating: 1, count: 32),
+            inviteDigest: nil,
+            peer: peer
+        )
+        do {
+            _ = try await service.authorize(input)
+            XCTFail("open-protected signup without admission must fail closed")
+        } catch SwanError.unavailable(let reason) {
+            XCTAssertEqual(reason, "signup admission")
+        }
+    }
 }
 
 private struct LocalTestEmailProofVerifier: SignupEmailProofVerifier {
@@ -375,6 +397,7 @@ private struct StubTurnstileTransport: TurnstileHTTPTransport {
     }
 }
 
+
 private actor InMemorySignupAuthorizationStore: SignupAuthorizationStore {
     private var values: [SignupAuthorizationID: SignupAuthorization] = [:]
     func reserve(_ authorization: SignupAuthorization, now _: Date) async throws {
@@ -392,4 +415,6 @@ private actor InMemorySignupAuthorizationStore: SignupAuthorizationStore {
     }
 
     func purgeExpiredSignupState(now _: Date) async throws {}
+
+
 }
