@@ -2087,6 +2087,7 @@ struct SQLiteTestingHooks: Sendable {
     var afterValidatePortableRestoreStateRead: (@Sendable () async -> Void)?
     var onValidatePortableRestoreStreamingTransaction: (@Sendable (SQLiteConnection) async throws -> Void)?
     var onReaderClose: (@Sendable () async throws -> Void)?
+    var afterPublicBlobPurgeCandidateSelection: (@Sendable () async throws -> Void)?
     var incrementalReplayRetentionOperationLimit: Int?
     init(
         beforeApplyCommit: (@Sendable () async throws -> Void)? = nil,
@@ -2104,6 +2105,7 @@ struct SQLiteTestingHooks: Sendable {
         afterValidatePortableRestoreStateRead: (@Sendable () async -> Void)? = nil,
         onValidatePortableRestoreStreamingTransaction: (@Sendable (SQLiteConnection) async throws -> Void)? = nil,
         onReaderClose: (@Sendable () async throws -> Void)? = nil,
+        afterPublicBlobPurgeCandidateSelection: (@Sendable () async throws -> Void)? = nil,
         incrementalReplayRetentionOperationLimit: Int? = nil
     ) {
         self.beforeApplyCommit = beforeApplyCommit
@@ -2123,6 +2125,7 @@ struct SQLiteTestingHooks: Sendable {
         self.onValidatePortableRestoreStreamingTransaction =
             onValidatePortableRestoreStreamingTransaction
         self.onReaderClose = onReaderClose
+        self.afterPublicBlobPurgeCandidateSelection = afterPublicBlobPurgeCandidateSelection
         self.incrementalReplayRetentionOperationLimit =
             incrementalReplayRetentionOperationLimit
     }
@@ -8949,7 +8952,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             // edge. Collecting on a partial answer would delete live blobs.
             return 0
         }
-
+        if let hook = testingHooks.afterPublicBlobPurgeCandidateSelection {
+            try await hook()
+        }
         var purged = 0
         for row in candidates {
             guard let cid = row.column("cid")?.string,
@@ -8970,6 +8975,21 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
             let needsReclamation = try await withConnectionGate {
                 try await transaction {
+                    if reference.namespace == .public {
+                        let isStillReachable: Bool
+                        if let override = testingHooks.permissionedBlobPublicReachabilityOverride?(reference.cid) {
+                            isStillReachable = override
+                        } else {
+                            do {
+                                isStillReachable = try await publicRepositoryContainsBlobCIDWithoutGate(reference.cid)
+                            } catch {
+                                isStillReachable = true
+                            }
+                        }
+                        if isStillReachable {
+                            return false
+                        }
+                    }
                     let metadata = try await blobPayloadIfReachableWithoutGate(
                         cid: reference.cid,
                         namespaceKind: columns.kind,

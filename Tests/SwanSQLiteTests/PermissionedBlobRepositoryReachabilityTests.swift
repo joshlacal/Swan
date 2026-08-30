@@ -388,7 +388,14 @@ final class PermissionedBlobRepositoryReachabilityTests: XCTestCase {
                     uri: fixture.record, value: privateValue, cid: privateCID
                 )]
             )
-            try await database.removeBlobReference(uploaded)
+            let rawDel = try await SQLiteConnection.open(
+                storage: .file(path: SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.author).path)
+            )
+            _ = try await rawDel.query(
+                "DELETE FROM blob_namespace_references WHERE cid = ? AND namespace_kind = 'public'",
+                [.text(uploaded.cid)]
+            )
+            try await rawDel.close()
             await database.installTestingHooks(SQLiteTestingHooks(
                 permissionedBlobPublicReachabilityOverride: { cid in
                     cid == uploaded.cid ? true : nil
