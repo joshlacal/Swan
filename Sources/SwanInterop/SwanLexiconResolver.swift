@@ -169,17 +169,25 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
             // its CID, preserve `last_succeeded_at`, and bump `updated_at` so
             // `isStale` governs the next attempt — explicitly "to avoid
             // hammering the resolver" (`lexicon-getter.ts:19-40`).
-            try await store.storeLexicon(
-                OAuthLexiconDocumentRow(
-                    nsid: nsid,
-                    document: cached?.document,
-                    sourceURI: cached?.sourceURI,
-                    verifiedCID: cached?.verifiedCID,
-                    createdAt: cached?.createdAt ?? instant,
-                    updatedAt: instant,
-                    lastSucceededAt: cached?.lastSucceededAt
+            do {
+                try await store.storeLexicon(
+                    OAuthLexiconDocumentRow(
+                        nsid: nsid,
+                        document: cached?.document,
+                        sourceURI: cached?.sourceURI,
+                        verifiedCID: cached?.verifiedCID,
+                        createdAt: cached?.createdAt ?? instant,
+                        updatedAt: instant,
+                        lastSucceededAt: cached?.lastSucceededAt
+                    )
                 )
-            )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                if Task.isCancelled {
+                    throw CancellationError()
+                }
+            }
             if let cached, let served = try Self.serve(cached, now: instant) {
                 return served
             }

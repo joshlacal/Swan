@@ -473,7 +473,8 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
 
         // 3. Fill until all 4,096 are fresh (non-expired)
         var nextIndex = 5000
-        while true {
+        var fillAttempts = 0
+        while fillAttempts < 1000 {
             let row = OAuthLexiconDocumentRow(
                 nsid: "com.example.fresh\(nextIndex)",
                 document: nil,
@@ -486,10 +487,16 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
             do {
                 try await store.storeLexicon(row)
                 nextIndex += 1
-            } catch {
+                fillAttempts += 1
+            } catch let error as SwanError {
+                guard case .unavailable = error else {
+                    XCTFail("unexpected error during negative cache fill: \(error)")
+                    break
+                }
                 break
             }
         }
+        XCTAssertLessThan(fillAttempts, 1000, "negative cache fill must stop at negative capacity ceiling")
 
         // Now that 4,096 non-expired negative rows exist, a new negative row must be rejected
         let overCapNegative = OAuthLexiconDocumentRow(
@@ -504,10 +511,12 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
         do {
             try await store.storeLexicon(overCapNegative)
             XCTFail("expected 4,096 negative row capacity exhaustion")
-        } catch {
-            // Expected capacity rejection
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                XCTFail("expected SwanError.unavailable, got: \(error)")
+                return
+            }
         }
-
         // 4. Converting an existing negative NSID to positive frees a negative slot
         let positiveDoc = Data("valid-doc".utf8)
         let convertedPositive = OAuthLexiconDocumentRow(
@@ -554,6 +563,77 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
 
         let preservedPositive = try await store.findLexicon(nsid: "com.example.pos.old")
         XCTAssertNotNil(preservedPositive, "positive rows must never be deleted by negative eviction")
+    }
+
+    func testSaturatedNegativeCacheDoesNotFailUnresolvableLexicon() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("lexicon-store-sat-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let store = try await SQLiteControlDatabase(dataDirectory: tempDir)
+        defer {
+            Task { try? await store.close() }
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+        let now = Date()
+
+        // 1. Fill negative cache to exactly 4,096 rows
+        for i in 0 ..< 4_096 {
+            let row = OAuthLexiconDocumentRow(
+                nsid: "com.example.sat\(i)",
+                document: nil,
+                sourceURI: nil,
+                verifiedCID: nil,
+                createdAt: now,
+                updatedAt: now,
+                lastSucceededAt: nil
+            )
+            try await store.storeLexicon(row)
+        }
+
+        // Verify negative cache is full
+        let overCapRow = OAuthLexiconDocumentRow(
+            nsid: "com.example.sat.overflow",
+            document: nil,
+            sourceURI: nil,
+            verifiedCID: nil,
+            createdAt: now,
+            updatedAt: now,
+            lastSucceededAt: nil
+        )
+        do {
+            try await store.storeLexicon(overCapRow)
+            XCTFail("expected negative cache capacity exhaustion")
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                XCTFail("expected unavailable error, got \(error)")
+                return
+            }
+        }
+
+        // 2. Instantiate a SwanLexiconResolver using this saturated store and a failing transport/DNS
+        let dns = AdversarialDNSResolver(records: []) // No did= records -> .noAuthorityDIDInTXT
+        let validKey = try await P256.Signing.PublicKey(x963Representation: PublicRepositoryProofFixtureBuilder.build(.valid).documentPublicKeyX963)
+        let resolver = try SwanLexiconResolver(
+            dns: dns,
+            authorities: AdversarialAuthorityResolver(
+                authority: SwanLexiconAuthority(
+                    pdsEndpoint: URL(string: "https://pds.example.net")!,
+                    commitVerifier: PermissionedDataPublicRepositoryCommitVerifier(
+                        key: .p256(validKey)
+                    )
+                )
+            ),
+            fetcher: OAuthRemoteDocumentFetcher(
+                policy: try OAuthRemoteFetchPolicy(),
+                resolver: AdversarialHostnameResolver(),
+                transport: AdversarialTransport(body: Data(), error: nil, blocksUntilCancelled: false)
+            ),
+            store: store,
+            now: { now }
+        )
+
+        // 3. Resolving an unresolvable NSID must return .unresolvable, NOT throw SwanError.unavailable
+        let resolution = try await resolver.resolve("com.example.unresolvable")
+        XCTAssertEqual(resolution, SwanLexiconResolution.unresolvable)
     }
 }
 

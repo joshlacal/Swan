@@ -628,6 +628,31 @@ final class ATHandleVerificationTests: XCTestCase {
         gate.release()
         XCTAssertEqual(gate.activeCount, 0)
     }
+
+    func testSystemATHandleDNSResolverRejectsWhenGateIsSaturated() async throws {
+        let gate = HandleDNSAdmissionGate(maxActive: 1, maxQueued: 0)
+        let resolver = SystemATHandleDNSResolver(gate: gate)
+
+        // Saturate gate with 1 active permit
+        try await gate.acquire()
+
+        // Next txtRecords and addresses calls via SystemATHandleDNSResolver must fail with .unavailable
+        do {
+            _ = try await resolver.txtRecords(name: "_atproto.example.com")
+            XCTFail("expected unavailable error when gate is saturated")
+        } catch {
+            XCTAssertEqual(error as? ATHandleVerificationError, .unavailable)
+        }
+
+        do {
+            _ = try await resolver.addresses(host: "example.com")
+            XCTFail("expected unavailable error when gate is saturated")
+        } catch {
+            XCTAssertEqual(error as? ATHandleVerificationError, .unavailable)
+        }
+
+        gate.release()
+    }
 }
 
 private enum FakeDNSResult<Value: Sendable>: Sendable {

@@ -154,36 +154,48 @@ final class HandleDNSAdmissionGate: @unchecked Sendable {
 
     private func cancel(id: UUID) {
         lock.lock()
-        defer { lock.unlock() }
+        let waiter: (id: UUID, continuation: CheckedContinuation<Void, Error>)?
         if let index = queued.firstIndex(where: { $0.id == id }) {
-            let item = queued.remove(at: index)
-            item.continuation.resume(throwing: CancellationError())
+            waiter = queued.remove(at: index)
+        } else {
+            waiter = nil
         }
+        lock.unlock()
+        waiter?.continuation.resume(throwing: CancellationError())
     }
 
     func release() {
         lock.lock()
-        defer { lock.unlock() }
         precondition(active > 0, "HandleDNSAdmissionGate released with active count 0")
+        let next: (id: UUID, continuation: CheckedContinuation<Void, Error>)?
         if !queued.isEmpty {
-            let next = queued.removeFirst()
-            next.continuation.resume()
+            next = queued.removeFirst()
         } else {
             active -= 1
+            next = nil
         }
+        lock.unlock()
+        next?.continuation.resume()
     }
 }
 
 public struct SystemATHandleDNSResolver: ATHandleDNSResolving {
-    static let gate = HandleDNSAdmissionGate(maxActive: 8, maxQueued: 128)
+    static let defaultGate = HandleDNSAdmissionGate(maxActive: 8, maxQueued: 128)
+    let gate: HandleDNSAdmissionGate
 
-    public init() {}
+    public init() {
+        self.gate = Self.defaultGate
+    }
+
+    init(gate: HandleDNSAdmissionGate) {
+        self.gate = gate
+    }
 
     public func txtRecords(name: String) async throws -> [ATHandleTXTRecord] {
-        try await Self.gate.acquire()
+        try await gate.acquire()
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
-                defer { Self.gate.release() }
+                defer { self.gate.release() }
                 var output = [UInt8](repeating: 0, count: 64 * 1_024)
                 let count = swan_at_handle_query_txt(
                     name,
@@ -223,10 +235,10 @@ public struct SystemATHandleDNSResolver: ATHandleDNSResolving {
 
     public func addresses(host: String) async throws -> [ATHandleIPAddress] {
         if let literal = ATHandleIPAddress(literal: host) { return [literal] }
-        try await Self.gate.acquire()
+        try await gate.acquire()
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
-                defer { Self.gate.release() }
+                defer { self.gate.release() }
                 var hints = addrinfo()
                 hints.ai_flags = AI_ADDRCONFIG
                 hints.ai_family = AF_UNSPEC
