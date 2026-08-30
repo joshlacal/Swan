@@ -176,7 +176,7 @@ final class PLCAccountRotationServiceTests: XCTestCase {
             now: Date(timeIntervalSince1970: 2_000_000_000)
         )
         XCTAssertEqual(drained, 4)
-        let events = try await firehose.events(after: 0, limit: 10)
+        let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
         XCTAssertEqual(events.map(\.kind), [.identity, .commit, .identity, .commit])
         XCTAssertEqual(
             events.map(\.sourceKey),

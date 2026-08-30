@@ -104,7 +104,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     XCTAssertEqual(seqs, [1, 2, 3])
     let maxSeq = try await firehose.maxSequencedSeq()
     XCTAssertEqual(maxSeq, 3)
-    let stored = try await firehose.events(after: 0, limit: 10)
+    let stored = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(stored.map(\.seq), [1, 2, 3])
     XCTAssertEqual(stored.map(\.batchOrdinal), [0, 1, 2])
     for event in stored {
@@ -148,7 +148,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     XCTAssertEqual(replayed, first)
     let maxSeq = try await firehose.maxSequencedSeq()
     XCTAssertEqual(maxSeq, 1)
-    let stored = try await firehose.events(after: 0, limit: 10)
+    let stored = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(stored.count, 1)
   }
 
@@ -190,7 +190,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
       try await firehose.appendBatch([differentMaterial], now: epoch),
       { if case .conflictingSourceKey = $0 { return true }; return false }
     )
-    let eventCount = try await firehose.events(after: 0, limit: 10).count
+    let eventCount = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes).count
     XCTAssertEqual(eventCount, 1)
   }
 
@@ -305,7 +305,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
       ),
       { $0 == .sequenceExhausted }
     )
-    let eventCount = try await firehose.events(after: 0, limit: 10).count
+    let eventCount = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes).count
     XCTAssertEqual(eventCount, 0)
   }
 
@@ -327,7 +327,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
       ),
       { $0 == .sequenceExhausted }
     )
-    let eventCount = try await firehose.events(after: 0, limit: 10).count
+    let eventCount = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes).count
     XCTAssertEqual(eventCount, 0)
   }
 
@@ -344,7 +344,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
       try await firehose.appendBatch([failing], now: epoch),
       { if case .corruptDatabase = $0 { return true }; return false }
     )
-    let eventCount = try await firehose.events(after: 0, limit: 10).count
+    let eventCount = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes).count
     XCTAssertEqual(eventCount, 0)
     let seqs = try await firehose.appendBatch(
       [identityItem(sourceKey: "k2", batchID: "batch-1")],
@@ -366,7 +366,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
       try await firehose.appendBatch([oversized], now: epoch),
       { if case .invalidRequest = $0 { return true }; return false }
     )
-    let eventCount = try await firehose.events(after: 0, limit: 10).count
+    let eventCount = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes).count
     XCTAssertEqual(eventCount, 0)
   }
 
@@ -379,24 +379,24 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
       ],
       now: epoch
     )
-    let afterOne = try await firehose.events(after: 1, limit: 10)
+    let afterOne = try await firehose.events(after: 1, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(afterOne.map(\.seq), [2, 3])
-    let afterTwo = try await firehose.events(after: 2, limit: 1)
+    let afterTwo = try await firehose.events(after: 2, limit: 1, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(afterTwo.map(\.seq), [3])
-    let fromZero = try await firehose.events(after: 0, limit: 10)
+    let fromZero = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(fromZero.map(\.seq), [1, 2, 3])
   }
 
   func testInvalidCursorsAndLimitsRejected() async throws {
     for cursor in [-1, FirehoseFrameLimits.maximumSequence + 1] {
       await expectThrows(
-        try await firehose.events(after: cursor, limit: 10),
+        try await firehose.events(after: cursor, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes),
         { if case .invalidRequest = $0 { return true }; return false }
       )
     }
     for limit in [0, -1, 1_001] {
       await expectThrows(
-        try await firehose.events(after: 0, limit: limit),
+        try await firehose.events(after: 0, limit: limit, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes),
         { if case .invalidRequest = $0 { return true }; return false }
       )
     }
@@ -523,7 +523,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     XCTAssertEqual(result.retainedFromSeq, 2)
     XCTAssertTrue(result.didAdvanceRetention)
     let retained = try await firehose.retainedFromSeq()
-    let stored = try await firehose.events(after: 0, limit: 10)
+    let stored = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     let maxSeq = try await firehose.maxSequencedSeq()
     XCTAssertEqual(retained, 2)
     XCTAssertEqual(stored.map(\.seq), [2])
@@ -549,7 +549,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
 
     XCTAssertEqual(result.deletedRows, 1)
     XCTAssertEqual(result.retainedFromSeq, 2)
-    let stored = try await firehose.events(after: 0, limit: 10)
+    let stored = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(stored.map(\.seq), [2, 3])
   }
 
@@ -583,7 +583,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
 
     XCTAssertEqual(result.deletedRows, 1)
     XCTAssertEqual(result.deletedBytes, 3_000_000)
-    let stored = try await firehose.events(after: 0, limit: 10)
+    let stored = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(stored.map(\.seq), [2])
   }
 
@@ -611,7 +611,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
       "the boundary is one past the last deleted sequence (2), not the "
         + "deleted sequence itself, since seq 2 no longer exists"
     )
-    let stored = try await firehose.events(after: 0, limit: 10)
+    let stored = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertTrue(stored.isEmpty)
     let maxSeq = try await firehose.maxSequencedSeq()
     XCTAssertEqual(
@@ -648,7 +648,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
         + "deleted sequence itself, since the whole log was pruned"
     )
     XCTAssertTrue(result.didAdvanceRetention)
-    let stored = try await firehose.events(after: 0, limit: 10)
+    let stored = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertTrue(stored.isEmpty)
     let maxSeq = try await firehose.maxSequencedSeq()
     XCTAssertEqual(
@@ -693,7 +693,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     XCTAssertEqual(result.deletedRows, 1850)
     XCTAssertEqual(result.retainedFromSeq, 1851)
     XCTAssertTrue(result.didAdvanceRetention)
-    let stored = try await firehose.events(after: 0, limit: 1_000)
+    let stored = try await firehose.events(after: 0, limit: 1_000, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(stored.count, 650)
     XCTAssertEqual(stored.map(\.seq), Array(Int64(1_851) ... Int64(2_500)))
     let maxSeq = try await firehose.maxSequencedSeq()
@@ -754,7 +754,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     )
     let retained = try await firehose.retainedFromSeq()
     XCTAssertEqual(retained, 3)
-    let stored = try await firehose.events(after: 0, limit: 10)
+    let stored = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertTrue(stored.isEmpty)
   }
 
@@ -802,7 +802,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     )
     XCTAssertEqual(seqs, [4])
 
-    let stored = try await firehose.events(after: 0, limit: 10)
+    let stored = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(stored.map(\.seq), [3, 4])
     XCTAssertEqual(stored.map(\.did), [otherDID, did])
     XCTAssertEqual(stored.last?.kind, .account)
@@ -840,7 +840,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
       deletingPriorEvents: marker
     )
     XCTAssertEqual(first, [2])
-    let afterFirst = try await firehose.events(after: 0, limit: 10)
+    let afterFirst = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(afterFirst.map(\.seq), [2])
 
     let replayed = try await firehose.appendBatch(
@@ -853,7 +853,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
       first,
       "exact source replay must not allocate a new sequence or duplicate the delete"
     )
-    let stored = try await firehose.events(after: 0, limit: 10)
+    let stored = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(stored.map(\.seq), [2])
   }
 
@@ -949,7 +949,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     )
     XCTAssertEqual(seqs, [4, 5])
 
-    let stored = try await firehose.events(after: 0, limit: 10)
+    let stored = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(
       stored.map(\.sourceKey),
       ["other-1", "sibling-1", "delete-1"],
@@ -980,7 +980,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
       deletingPriorEvents: marker
     )
     XCTAssertEqual(first, [2, 3])
-    let afterFirst = try await firehose.events(after: 0, limit: 10)
+    let afterFirst = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(
       afterFirst.map(\.seq),
       [2, 3],
@@ -993,7 +993,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
       deletingPriorEvents: marker
     )
     XCTAssertEqual(replayed, first, "exact replay reproduces the same sequences")
-    let afterReplay = try await firehose.events(after: 0, limit: 10)
+    let afterReplay = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(
       afterReplay.map(\.seq),
       [2, 3],

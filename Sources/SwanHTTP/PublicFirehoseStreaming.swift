@@ -1,5 +1,6 @@
 import Foundation
 import Logging
+import Synchronization
 import SwanCore
 import SwanSQLite
 import PetrelFirehose
@@ -50,11 +51,10 @@ public struct PublicFirehoseStreamingLimits: Sendable, Equatable {
 }
 
 /// Process-wide page admission bounding concurrent firehose event page materialization.
-public final class PublicFirehosePageAdmission: @unchecked Sendable {
+public final class PublicFirehosePageAdmission: Sendable {
   public static let shared = PublicFirehosePageAdmission()
 
-  private let lock = NSLock()
-  private var activeLeases: Int = 0
+  private let activeLeases = Mutex<Int>(0)
   public let maximumConcurrentPages: Int
 
   public init(maximumConcurrentPages: Int = 4) {
@@ -62,48 +62,48 @@ public final class PublicFirehosePageAdmission: @unchecked Sendable {
   }
 
   public func reserve() -> PublicFirehosePageLease? {
-    lock.lock()
-    defer { lock.unlock() }
-    guard activeLeases < maximumConcurrentPages else { return nil }
-    activeLeases += 1
+    let reserved = activeLeases.withLock { count -> Bool in
+      guard count < maximumConcurrentPages else { return false }
+      count += 1
+      return true
+    }
+    guard reserved else { return nil }
     return PublicFirehosePageLease(admission: self)
   }
 
   fileprivate func release() {
-    lock.lock()
-    defer { lock.unlock() }
-    guard activeLeases > 0 else { return }
-    activeLeases -= 1
+    activeLeases.withLock { count in
+      guard count > 0 else { return }
+      count -= 1
+    }
   }
 
   public var currentActiveLeases: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return activeLeases
+    activeLeases.withLock { $0 }
   }
 }
 
-public final class PublicFirehosePageLease: @unchecked Sendable {
-  private let lock = NSLock()
-  private var admission: PublicFirehosePageAdmission?
+public final class PublicFirehosePageLease: Sendable {
+  private let admission: PublicFirehosePageAdmission
+  private let released = Mutex(false)
 
   fileprivate init(admission: PublicFirehosePageAdmission) {
     self.admission = admission
   }
 
-  public func release() {
-    lock.lock()
-    guard let admission = self.admission else {
-      lock.unlock()
-      return
-    }
-    self.admission = nil
-    lock.unlock()
-    admission.release()
-  }
-
   deinit {
     release()
+  }
+
+  public func release() {
+    let shouldRelease = released.withLock { isReleased -> Bool in
+      guard !isReleased else { return false }
+      isReleased = true
+      return true
+    }
+    if shouldRelease {
+      admission.release()
+    }
   }
 }
 
@@ -177,6 +177,7 @@ public enum PublicFirehoseSlowConsumerPolicy: Sendable {
 public enum PublicFirehoseTailerError: Error, Sendable, Equatable {
   case consumerTooSlow(seqLag: Int64, backfillElapsed: Duration)
   case writeTooSlow(duration: Duration)
+  case admissionStarved
   /// The delivered cursor has fallen behind the retained window (a prune
   /// advanced `retained_from_seq` past what this connection has consumed).
   /// Carries the new retained boundary so the caller can resume there.
@@ -293,9 +294,11 @@ public struct PublicFirehoseTailer: Sendable {
   ) async throws {
     var cursor = lastSent
     var backfillElapsed = Duration.zero
+    var starvedStarted: ContinuousClock.Instant?
+    let clock = ContinuousClock()
     while !Task.isCancelled {
       // Checked before every read so a retention advance is caught even
-      // when it does not change what `events(after:)` would return (e.g.
+      // when it does not change what `events(after:, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)` would return (e.g.
       // the consumer is already caught up but the retained window moved
       // past its delivered cursor).
       if let retainedFromSeq = try await database.retainedFromSeq(),
@@ -304,10 +307,24 @@ public struct PublicFirehoseTailer: Sendable {
           retainedFromSeq: retainedFromSeq
         )
       }
+
+      // Admission is checked before lag accounting: server-side saturation
+      // must never be charged as consumer lag.
+      if let starvedStarted,
+         clock.now - starvedStarted > limits.maximumBackfillCatchUp {
+        logger.warning("dropping public firehose subscriber due to page admission saturation")
+        throw PublicFirehoseTailerError.admissionStarved
+      }
+      guard let pageLease = pageAdmission.reserve() else {
+        if starvedStarted == nil {
+          starvedStarted = clock.now
+        }
+        try await Task.sleep(for: .seconds(limits.idlePollInterval))
+        continue
+      }
+      starvedStarted = nil
+
       let maxSeq = try await database.maxSequencedSeq()
-      // Raw difference is an upper bound on deliverable rows (deletion
-      // gaps only shrink the real count), so the bounded count runs only
-      // when a drop is already plausible.
       var seqLag: Int64 = 0
       if maxSeq > cursor {
         seqLag = maxSeq - cursor
@@ -324,16 +341,14 @@ public struct PublicFirehoseTailer: Sendable {
         writeDuration: nil,
         limits: limits
       ) {
+        pageLease.release()
         logger.warning("dropping slow public firehose consumer")
         throw PublicFirehoseTailerError.consumerTooSlow(
           seqLag: seqLag,
           backfillElapsed: backfillElapsed
         )
       }
-      guard let pageLease = pageAdmission.reserve() else {
-        try await Task.sleep(for: .seconds(limits.idlePollInterval))
-        continue
-      }
+
       let rows: [FirehoseStoredEvent]
       do {
         rows = try await database.events(
@@ -354,9 +369,18 @@ public struct PublicFirehoseTailer: Sendable {
         try await Task.sleep(for: .seconds(limits.idlePollInterval))
         continue
       }
-      let pageClock = ContinuousClock()
-      let pageStarted = pageClock.now
+      let pageStarted = clock.now
       for row in rows {
+        let currentHold = clock.now - pageStarted
+        if currentHold > limits.maximumBackfillCatchUp
+          || (seqLag > 0 && backfillElapsed + currentHold > limits.maximumBackfillCatchUp) {
+          pageLease.release()
+          logger.warning("dropping slow public firehose consumer exceeding backfill catch-up budget")
+          throw PublicFirehoseTailerError.consumerTooSlow(
+            seqLag: seqLag,
+            backfillElapsed: backfillElapsed + currentHold
+          )
+        }
         try watchdog.beginWrite()
         do {
           try await outbound(row.frameBytes)
@@ -369,7 +393,7 @@ public struct PublicFirehoseTailer: Sendable {
         cursor = row.seq
       }
       pageLease.release()
-      let pageElapsed = pageClock.now - pageStarted
+      let pageElapsed = clock.now - pageStarted
       if seqLag > 0 {
         backfillElapsed += pageElapsed
       } else {

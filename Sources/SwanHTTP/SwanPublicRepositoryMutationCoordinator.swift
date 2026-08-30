@@ -51,7 +51,8 @@ public enum SwanPublicRepositoryMutationCoordinator {
         while true {
             attempts += 1
             guard let current = try await store.loadPublicRepositoryState() else { throw PublicRepositoryMutationCoordinatorError.repositoryNotFound }
-            let request = try PublicRepositoryMutationRequest(id: requestID, canonicalDigest: bodyDigest, baseCommitCID: current.commitCID)
+            let attemptRequestID = attempts == 1 ? requestID : "\(requestID):retry-\(attempts)"
+            let request = try PublicRepositoryMutationRequest(id: attemptRequestID, canonicalDigest: bodyDigest, baseCommitCID: current.commitCID)
             switch try await store.reservePublicRepositoryRevision(request, wallClockMicroseconds: now()) {
             case let .committed(committed): return committed
             case let .reserved(reservation):
@@ -208,8 +209,9 @@ public enum SwanPublicRepositoryMutationCoordinator {
             guard let current = try await store.loadPublicRepositoryState() else {
                 throw PublicRepositoryMutationCoordinatorError.repositoryNotFound
             }
+            let attemptRequestID = attempts == 1 ? requestID : "\(requestID):retry-\(attempts)"
             let request = try PublicRepositoryMutationRequest(
-                id: requestID,
+                id: attemptRequestID,
                 canonicalDigest: bodyDigest,
                 baseCommitCID: current.commitCID
             )

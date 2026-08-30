@@ -1749,7 +1749,10 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
             let rawCIDBefore = try await fixture.database.publicRepositoryRecordCID(for: path)
             let recordCIDBefore = try XCTUnwrap(rawCIDBefore)
             let outboxBefore = try await fixture.database.pendingPublicFirehoseOutbox()
-
+            let commitBlockBefore = try await fixture.database.block(for: stateBefore.commitCID)
+            XCTAssertNotNil(commitBlockBefore)
+            let recordBlockBefore = try await fixture.database.block(for: recordCIDBefore)
+            XCTAssertNotNil(recordBlockBefore)
             let duplicate = try await client.execute(
                 uri: Self.mutationPath,
                 method: .post,
@@ -1769,12 +1772,90 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
             let rawCIDAfter = try await fixture.database.publicRepositoryRecordCID(for: path)
             let recordCIDAfter = try XCTUnwrap(rawCIDAfter)
             let outboxAfter = try await fixture.database.pendingPublicFirehoseOutbox()
+            let commitBlockAfter = try await fixture.database.block(for: stateAfter.commitCID)
+            let recordBlockAfter = try await fixture.database.block(for: recordCIDAfter)
 
             XCTAssertEqual(stateAfter.commitCID, stateBefore.commitCID)
             XCTAssertEqual(stateAfter.revision, stateBefore.revision)
             XCTAssertEqual(recordCIDAfter, recordCIDBefore)
             XCTAssertEqual(outboxAfter.count, outboxBefore.count)
+            XCTAssertEqual(commitBlockAfter, commitBlockBefore)
+            XCTAssertEqual(recordBlockAfter, recordBlockBefore)
+
+            // Assert no receipt was committed for the rejected duplicate request.
+            let duplicateRequest = try PublicRepositoryMutationRequest(
+                id: "create-duplicate",
+                canonicalDigest: Data(repeating: 0xdd, count: 32),
+                baseCommitCID: stateAfter.commitCID
+            )
+            let duplicateReservationOutcome = try await fixture.database.reservePublicRepositoryRevision(
+                duplicateRequest,
+                wallClockMicroseconds: 1_750_000_000_000_000
+            )
+            guard case .reserved(let unusedReservation) = duplicateReservationOutcome else {
+                return XCTFail("rejected create request must not have committed a receipt")
+            }
+            try await fixture.database.abandonPublicRepositoryReservation(unusedReservation)
         }
+    }
+
+    func testCreateRecordConcurrentCASConflictRetriesAndFailsWithRecordAlreadyExists() async throws {
+        let fixture = try await makeFixture(
+            scopes: ["atproto", "repo:\(Self.collection)?action=create"]
+        )
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let signingKey = P256.Signing.PrivateKey()
+        let path = try PublicRepositoryPath(
+            collection: Self.collection,
+            recordKey: "raced-rkey"
+        )
+        let conflictingRecord = PublicRecord([
+            "$type": .string(Self.collection),
+            "text": .string("concurrently created"),
+        ])
+        let store = CreateRaceMutationStore(
+            database: fixture.database,
+            conflictingPath: path,
+            conflictingRecord: conflictingRecord,
+            signingKey: signingKey
+        )
+        let provider = SequencedGenerationSignerProvider(
+            generations: [1, 2],
+            signer: P256PublicRepositoryCommitSigner(privateKey: signingKey)
+        )
+
+        do {
+            _ = try await SwanPublicRepositoryMutationCoordinator.create(
+                store: store,
+                did: Self.did,
+                path: path,
+                record: PublicRecord([
+                    "$type": .string(Self.collection),
+                    "text": .string("second create attempting same key"),
+                ]),
+                swapCommit: nil,
+                requestID: "raced-create-request",
+                bodyDigest: Data(repeating: 0xee, count: 32),
+                signerProvider: provider,
+                now: { 1_750_000_000_000_000 }
+            )
+            XCTFail("expected recordAlreadyExists after retry")
+        } catch let error as PublicRepositoryMutationCoordinatorError {
+            XCTAssertEqual(error, .recordAlreadyExists)
+        }
+
+        let abandonedCount = await store.abandonedCount()
+        XCTAssertEqual(abandonedCount, 2, "both the conflict reservation and the engine rejection reservation must be abandoned")
+
+        // The concurrently committed record is intact and the repository state is valid.
+        let finalRecordCID = try await fixture.database.publicRepositoryRecordCID(for: path)
+        XCTAssertNotNil(finalRecordCID)
     }
 
     /// `uploadBlob` asserts from the Content-Type HEADER. `transition:generic`
@@ -2712,4 +2793,95 @@ private actor GenerationCheckingMutationStore: PublicRepositoryMutationStore {
     }
 
     func attemptedGenerations() -> [UInt64] { generations }
+}
+
+private actor CreateRaceMutationStore: PublicRepositoryMutationStore {
+    private let database: SQLiteAccountDatabase
+    private let conflictingPath: PublicRepositoryPath
+    private let conflictingRecord: PublicRecord
+    private let signingKey: P256.Signing.PrivateKey
+    private var attempts: Int = 0
+    private var abandonedReservations: [PublicRepositoryMutationReservation] = []
+
+    init(
+        database: SQLiteAccountDatabase,
+        conflictingPath: PublicRepositoryPath,
+        conflictingRecord: PublicRecord,
+        signingKey: P256.Signing.PrivateKey
+    ) {
+        self.database = database
+        self.conflictingPath = conflictingPath
+        self.conflictingRecord = conflictingRecord
+        self.signingKey = signingKey
+    }
+
+    func loadPublicRepositoryState() async throws -> PublicRepositoryState? {
+        try await database.loadPublicRepositoryState()
+    }
+
+    func verifyPublicRepositoryProjection() async throws {
+        try await database.verifyPublicRepositoryProjection()
+    }
+
+    func block(for cid: CID) async throws -> Data? {
+        try await database.block(for: cid)
+    }
+
+    func publicRepositoryRecordCID(for path: PublicRepositoryPath) async throws -> CID? {
+        if attempts == 0 {
+            return nil
+        }
+        return try await database.publicRepositoryRecordCID(for: path)
+    }
+
+    func reservePublicRepositoryRevision(
+        _ request: PublicRepositoryMutationRequest,
+        wallClockMicroseconds: UInt64
+    ) async throws -> PublicRepositoryMutationReservationOutcome {
+        try await database.reservePublicRepositoryRevision(
+            request,
+            wallClockMicroseconds: wallClockMicroseconds
+        )
+    }
+
+    func applyPublicRepositoryMutation(
+        reservation: PublicRepositoryMutationReservation,
+        prepared: PreparedPublicRepositoryMutation
+    ) async throws -> CommittedPublicRepositoryMutation {
+        attempts += 1
+        if attempts == 1 {
+            _ = try await SwanPublicRepositoryMutationCoordinator.put(
+                store: database,
+                did: "did:plc:abcdefghijklmnopqrstuvwx",
+                path: conflictingPath,
+                record: conflictingRecord,
+                swapRecord: nil,
+                swapCommit: nil,
+                requestID: "concurrent-occupying-commit",
+                bodyDigest: Data(repeating: 0xcc, count: 32),
+                signerProvider: SequencedGenerationSignerProvider(
+                    generations: [1],
+                    signer: P256PublicRepositoryCommitSigner(privateKey: signingKey)
+                ),
+                now: { 1_750_000_000_000_000 }
+            )
+            throw PublicRepositoryMutationStoreError.commitCASConflict
+        }
+        return try await database.applyPublicRepositoryMutation(
+            reservation: reservation,
+            prepared: prepared,
+            firehose: .init(lifecycleGeneration: 1)
+        )
+    }
+
+    func abandonPublicRepositoryReservation(
+        _ reservation: PublicRepositoryMutationReservation
+    ) async throws {
+        abandonedReservations.append(reservation)
+        try await database.abandonPublicRepositoryReservation(reservation)
+    }
+
+    func abandonedCount() -> Int {
+        abandonedReservations.count
+    }
 }

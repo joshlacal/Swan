@@ -128,7 +128,7 @@ final class PublicFirehoseServiceWiringTests: XCTestCase, @unchecked Sendable {
       XCTFail("service must exit cleanly on cancellation")
     }
 
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(events.count, 1)
     let event = try XCTUnwrap(events.first)
     XCTAssertEqual(event.seq, 1)
@@ -289,7 +289,7 @@ final class PublicFirehoseServiceWiringTests: XCTestCase, @unchecked Sendable {
         let header = try self.decodeFrameHeader(frame)
         XCTAssertEqual(header.op, 1)
         XCTAssertEqual(header.type, "#commit")
-        let stored = try await firehose.events(after: 0, limit: 10)
+        let stored = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
         XCTAssertEqual(stored.map(\.seq), [1])
         XCTAssertEqual(
           Data(buffer: frame.data),
@@ -519,7 +519,7 @@ final class PublicFirehoseServiceWiringTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(frames.count, 2)
         try self.assertInfoFrame(frames[0], name: "OutdatedCursor")
 
-        let stored = try await firehose.events(after: 0, limit: 10)
+        let stored = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
         XCTAssertEqual(Data(buffer: frames[1].data), stored.last?.frameBytes)
       }
       sequencerTask.cancel()

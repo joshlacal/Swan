@@ -496,7 +496,7 @@ public actor SQLiteFirehoseDatabase {
   public func events(
     after seq: Int64,
     limit: Int,
-    maximumBytes: Int = 4 * FirehoseFrameLimits.maximumFrameBytes
+    maximumBytes: Int
   ) async throws -> [FirehoseStoredEvent] {
     try checkOpen()
     guard seq >= 0, seq <= FirehoseFrameLimits.maximumSequence else {
