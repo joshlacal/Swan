@@ -636,12 +636,11 @@ const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
  * Generates a cryptographically secure random Base32 secret for TOTP (default 20 bytes = 32 Base32 chars / 160 bits).
  */
 export function generateBase32Secret(byteLength = 20): string {
-  const bytes = new Uint8Array(byteLength);
-  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-    crypto.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < byteLength; i++) bytes[i] = Math.floor(Math.random() * 256);
+  if (typeof crypto === 'undefined' || typeof crypto.getRandomValues !== 'function') {
+    throw new Error('Web Crypto (crypto.getRandomValues) is required for secure TOTP generation.');
   }
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
   let bits = 0;
   let value = 0;
   let output = '';

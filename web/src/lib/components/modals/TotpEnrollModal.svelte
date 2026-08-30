@@ -116,7 +116,15 @@
   preventClose={stage === 'verifying'}
   onClose={handleDone}
 >
-  {#if stage === 'init'}
+  {#if error && stage === 'init'}
+    <div class="flex flex-col gap-4 py-2">
+      <div class="alert alert-error text-sm" role="alert">{error}</div>
+      <div class="modal-action">
+        <button type="button" class="btn btn-primary" onclick={setupTotp}>Retry</button>
+        <button type="button" class="btn btn-ghost" onclick={handleDone}>Cancel</button>
+      </div>
+    </div>
+  {:else if stage === 'init'}
     <div class="flex flex-col items-center justify-center py-8 gap-3 text-base-content/60">
       <span class="loading loading-spinner loading-md"></span>
       <span class="text-xs font-mono">Generating key…</span>
