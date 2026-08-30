@@ -581,11 +581,29 @@ final class UpstreamScopeCorpusIntegrityTests: XCTestCase, @unchecked Sendable {
         try commitProc.run()
         commitProc.waitUntilExit()
 
+        let fakeBinDir = FileManager.default.temporaryDirectory.appending(path: "test-fake-tools-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: fakeBinDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fakeBinDir) }
+
+        let fakeNodeScript = """
+        #!/usr/bin/env bash
+        if [ "$1" = "-p" ]; then echo "22"; exit 0; fi
+        if [ "$1" = "-e" ]; then exit 0; fi
+        exit 0
+        """
+        for (name, contents) in [("node", fakeNodeScript), ("npm", "#!/usr/bin/env bash\nexit 0\n")] {
+            let url = fakeBinDir.appending(path: name)
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         proc.arguments = [script.path]
         var env = ProcessInfo.processInfo.environment
         env["SWAN_UPSTREAM_ATPROTO"] = tempRepo.path
+        let originalPath = env["PATH"] ?? "/usr/bin:/bin"
+        env["PATH"] = "\(fakeBinDir.path):\(originalPath)"
         proc.environment = env
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -596,7 +614,10 @@ final class UpstreamScopeCorpusIntegrityTests: XCTestCase, @unchecked Sendable {
 
         XCTAssertNotEqual(proc.terminationStatus, 0, "verify-corpus-zero-diff.sh must reject non-pinned git commit")
         let outputStr = String(decoding: data, as: UTF8.self)
-        XCTAssertTrue(outputStr.contains("bddc99fb") || outputStr.contains("commit") || outputStr.contains("HEAD"), "output must describe commit mismatch: \(outputStr)")
+        XCTAssertFalse(outputStr.contains("not on PATH"), "must not exit on toolchain dependency probe: \(outputStr)")
+        XCTAssertFalse(outputStr.contains("working tree is not clean"), "must not exit on working tree check: \(outputStr)")
+        XCTAssertTrue(outputStr.contains("does not match reference commit"), "output must describe commit mismatch: \(outputStr)")
+        XCTAssertTrue(outputStr.contains("bddc99fb"), "output must name reference commit: \(outputStr)")
     }
 
     func testRegenerationGateRejectsDirtyWorkingTree() throws {
@@ -630,11 +651,29 @@ final class UpstreamScopeCorpusIntegrityTests: XCTestCase, @unchecked Sendable {
 
         try "untracked\n".write(to: tempRepo.appending(path: "untracked.txt"), atomically: true, encoding: .utf8)
 
+        let fakeBinDir = FileManager.default.temporaryDirectory.appending(path: "test-fake-tools-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: fakeBinDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fakeBinDir) }
+
+        let fakeNodeScript = """
+        #!/usr/bin/env bash
+        if [ "$1" = "-p" ]; then echo "22"; exit 0; fi
+        if [ "$1" = "-e" ]; then exit 0; fi
+        exit 0
+        """
+        for (name, contents) in [("node", fakeNodeScript), ("npm", "#!/usr/bin/env bash\nexit 0\n")] {
+            let url = fakeBinDir.appending(path: name)
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         proc.arguments = [script.path]
         var env = ProcessInfo.processInfo.environment
         env["SWAN_UPSTREAM_ATPROTO"] = tempRepo.path
+        let originalPath = env["PATH"] ?? "/usr/bin:/bin"
+        env["PATH"] = "\(fakeBinDir.path):\(originalPath)"
         proc.environment = env
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -645,6 +684,7 @@ final class UpstreamScopeCorpusIntegrityTests: XCTestCase, @unchecked Sendable {
 
         let outputStr = String(decoding: data, as: UTF8.self)
         XCTAssertNotEqual(proc.terminationStatus, 0, "verify-corpus-zero-diff.sh must reject dirty git repository")
+        XCTAssertFalse(outputStr.contains("not on PATH"), "must not exit on toolchain dependency probe: \(outputStr)")
         XCTAssertTrue(outputStr.contains("working tree is not clean"), "output must describe dirty working tree: \(outputStr)")
     }
 
@@ -712,6 +752,7 @@ final class UpstreamScopeCorpusIntegrityTests: XCTestCase, @unchecked Sendable {
 
         let outputStr = String(decoding: data, as: UTF8.self)
         XCTAssertNotEqual(proc.terminationStatus, 0, "verify-corpus-zero-diff.sh must reject symlinks in package trees")
+        XCTAssertFalse(outputStr.contains("not on PATH"), "must not exit on toolchain dependency probe: \(outputStr)")
         XCTAssertTrue(outputStr.contains("symlinks found in copied upstream package trees"), "output must describe symlink rejection: \(outputStr)")
     }
 
