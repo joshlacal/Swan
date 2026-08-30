@@ -425,7 +425,8 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
 
     func unregisterSpaceNotification(
         space: SpaceURI,
-        serviceDID: String,
+        ownerServiceDID: String,
+        deliveryServiceDID: String?,
         authorization: AuthorizationContext
     ) async throws
 
@@ -455,6 +456,20 @@ public extension AuthorizedSpaceNotificationDirectory {
         authorization: AuthorizationContext
     ) async throws {
         try await registerSpaceNotification(registration, serviceDID: registration.serviceDID, authorization: authorization)
+    }
+
+    func unregisterSpaceNotification(
+        space: SpaceURI,
+        serviceDID: String,
+        authorization: AuthorizationContext
+    ) async throws {
+        let baseDID = serviceIssuerDID(serviceDID) ?? serviceDID
+        try await unregisterSpaceNotification(
+            space: space,
+            ownerServiceDID: baseDID,
+            deliveryServiceDID: serviceDID,
+            authorization: authorization
+        )
     }
 
     func unregisterSpaceNotification(

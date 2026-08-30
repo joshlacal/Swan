@@ -263,7 +263,8 @@ private struct AuthenticatedUnregisterSpaceNotifyHandler {
         do {
             try await capability.directory.unregisterSpaceNotification(
                 space: space,
-                serviceDID: input.service,
+                ownerServiceDID: ownerDID,
+                deliveryServiceDID: input.service,
                 authorization: authorization
             )
         } catch {

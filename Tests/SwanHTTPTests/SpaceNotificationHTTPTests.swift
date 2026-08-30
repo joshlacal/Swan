@@ -1347,16 +1347,49 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
     }
     func unregisterSpaceNotification(
         space: SpaceURI,
-        serviceDID: String,
+        ownerServiceDID: String,
+        deliveryServiceDID: String?,
         authorization _: AuthorizationContext
     ) async throws {
         guard space.authority == authority else {
             throw AuthorizedSimpleSpaceLifecycleError.notFound
         }
-        let baseDID = serviceIssuerDID(serviceDID) ?? serviceDID
-        registrationsValue.removeAll {
-            $0.space == space && ($0.service == serviceDID || $0.serviceDID == serviceDID || $0.service == baseDID || ($0.service == nil && $0.serviceDID == baseDID))
+        let baseOwner = serviceIssuerDID(ownerServiceDID) ?? ownerServiceDID
+        if let requested = deliveryServiceDID {
+            if !requested.contains("#") && (requested == ownerServiceDID || requested == baseOwner) {
+                registrationsValue.removeAll {
+                    $0.space == space &&
+                    ($0.ownerServiceDID == ownerServiceDID || $0.ownerServiceDID == baseOwner || $0.serviceDID == baseOwner) &&
+                    ($0.deliveryServiceDID == requested || $0.service == requested || ($0.deliveryServiceDID == nil && $0.service == nil))
+                }
+            } else {
+                registrationsValue.removeAll {
+                    $0.space == space &&
+                    ($0.ownerServiceDID == ownerServiceDID || $0.ownerServiceDID == baseOwner || $0.serviceDID == baseOwner) &&
+                    ($0.deliveryServiceDID == requested || $0.service == requested)
+                }
+            }
+        } else {
+            registrationsValue.removeAll {
+                $0.space == space &&
+                ($0.ownerServiceDID == ownerServiceDID || $0.ownerServiceDID == baseOwner || $0.serviceDID == baseOwner) &&
+                ($0.deliveryServiceDID == nil && $0.service == nil)
+            }
         }
+    }
+
+    func unregisterSpaceNotification(
+        space: SpaceURI,
+        serviceDID: String,
+        authorization: AuthorizationContext
+    ) async throws {
+        let baseDID = serviceIssuerDID(serviceDID) ?? serviceDID
+        try await unregisterSpaceNotification(
+            space: space,
+            ownerServiceDID: baseDID,
+            deliveryServiceDID: serviceDID,
+            authorization: authorization
+        )
     }
 
 

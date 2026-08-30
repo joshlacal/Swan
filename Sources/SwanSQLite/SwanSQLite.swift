@@ -8387,11 +8387,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// exact space and on the space still being active.
     public func unregisterSpaceNotification(
         space: SpaceURI,
+        ownerServiceDID: String? = nil,
+        deliveryServiceDID: String? = nil,
         service: String? = nil,
         serviceDID: String? = nil,
         authorization: AuthorizationContext
     ) async throws {
-        let ownerCandidate = serviceDID ?? (service != nil && !service!.isEmpty ? service : nil)
+        let ownerCandidate = ownerServiceDID ?? serviceDID ?? (service != nil && !service!.isEmpty ? service : nil)
         guard let owner = ownerCandidate,
               Self.isValidNotificationServiceIdentity(owner) else {
             throw SwanError.unauthorized("service authentication is required")
@@ -8407,13 +8409,44 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 let state = try await requiredSimpleSpace(space)
                 try requireActiveSimpleSpace(state.state)
                 let baseDID = serviceIssuerDID(owner) ?? owner
-                _ = try await connection.query(
-                    """
-                    DELETE FROM permissioned_space_notification_registrations
-                    WHERE space_uri = ? AND (owner_service_did = ? OR owner_service_did = ? OR owner_service_did LIKE ? || '#%')
-                    """,
-                    [.text(space.rawValue), .text(owner), .text(baseDID), .text(baseDID)]
-                )
+                let requested = deliveryServiceDID ?? (ownerServiceDID != nil ? nil : (service ?? serviceDID))
+                if let requested {
+                    guard Self.isValidNotificationServiceIdentity(requested) else {
+                        throw SwanError.invalidIdentifier("notification service identity")
+                    }
+                    let isOwnerWithoutFragment = (requested == owner || requested == baseDID) && !requested.contains("#")
+                    if isOwnerWithoutFragment {
+                        _ = try await connection.query(
+                            """
+                            DELETE FROM permissioned_space_notification_registrations
+                            WHERE space_uri = ?
+                              AND (owner_service_did = ? OR owner_service_did = ?)
+                              AND (delivery_service_did = ? OR delivery_service_did IS NULL)
+                            """,
+                            [.text(space.rawValue), .text(owner), .text(baseDID), .text(requested)]
+                        )
+                    } else {
+                        _ = try await connection.query(
+                            """
+                            DELETE FROM permissioned_space_notification_registrations
+                            WHERE space_uri = ?
+                              AND (owner_service_did = ? OR owner_service_did = ?)
+                              AND delivery_service_did = ?
+                            """,
+                            [.text(space.rawValue), .text(owner), .text(baseDID), .text(requested)]
+                        )
+                    }
+                } else {
+                    _ = try await connection.query(
+                        """
+                        DELETE FROM permissioned_space_notification_registrations
+                        WHERE space_uri = ?
+                          AND (owner_service_did = ? OR owner_service_did = ?)
+                          AND delivery_service_did IS NULL
+                        """,
+                        [.text(space.rawValue), .text(owner), .text(baseDID)]
+                    )
+                }
             }
         }
     }

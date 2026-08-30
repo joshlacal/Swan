@@ -1508,7 +1508,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         // Service A unregisters
         try await database.unregisterSpaceNotification(
             space: fixture.space,
-            service: "did:web:service-a.example",
+            service: "did:web:service-a.example#srv",
             authorization: credential
         )
         let activeAfter = try await database.isSpaceNotificationRegistrationActive(
@@ -1519,6 +1519,113 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         )
         XCTAssertFalse(activeAfter, "own unregister must remove registration")
     }
+    func testExactNotificationServiceUnregisterLeavesSiblingFragmentsAndEndpointOnly() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+
+        let now = Date()
+        let credential = fixture.readCredential()
+        let owner = "did:web:subscriber.example"
+        let serviceA = "did:web:subscriber.example#a"
+        let serviceB = "did:web:subscriber.example#b"
+        let endpointA = "https://a.example/notify"
+        let endpointB = "https://b.example/notify"
+        let endpointOnly = "https://endpoint-only.example/notify"
+
+        // Register #a for owner
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpointA,
+                repository: fixture.writer,
+                expiresAt: now.addingTimeInterval(3600),
+                service: serviceA,
+                serviceDID: owner
+            ),
+            authorization: credential,
+            now: now
+        )
+
+        // Register #b for same owner
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpointB,
+                repository: fixture.writer,
+                expiresAt: now.addingTimeInterval(3600),
+                service: serviceB,
+                serviceDID: owner
+            ),
+            authorization: credential,
+            now: now
+        )
+
+        // Register endpoint-only for same owner
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpointOnly,
+                repository: fixture.writer,
+                expiresAt: now.addingTimeInterval(3600),
+                service: nil,
+                serviceDID: owner
+            ),
+            authorization: credential,
+            now: now
+        )
+
+        // Verify all three are active
+        let activeA0 = try await database.isSpaceNotificationRegistrationActive(space: fixture.space, endpoint: endpointA, repository: fixture.writer, now: now)
+        let activeB0 = try await database.isSpaceNotificationRegistrationActive(space: fixture.space, endpoint: endpointB, repository: fixture.writer, now: now)
+        let activeOnly0 = try await database.isSpaceNotificationRegistrationActive(space: fixture.space, endpoint: endpointOnly, repository: fixture.writer, now: now)
+        XCTAssertTrue(activeA0)
+        XCTAssertTrue(activeB0)
+        XCTAssertTrue(activeOnly0)
+
+        // Unregister #a only
+        try await database.unregisterSpaceNotification(
+            space: fixture.space,
+            ownerServiceDID: owner,
+            deliveryServiceDID: serviceA,
+            authorization: credential
+        )
+
+        // #a is removed; #b and endpoint-only remain
+        let activeA1 = try await database.isSpaceNotificationRegistrationActive(space: fixture.space, endpoint: endpointA, repository: fixture.writer, now: now)
+        let activeB1 = try await database.isSpaceNotificationRegistrationActive(space: fixture.space, endpoint: endpointB, repository: fixture.writer, now: now)
+        let activeOnly1 = try await database.isSpaceNotificationRegistrationActive(space: fixture.space, endpoint: endpointOnly, repository: fixture.writer, now: now)
+        XCTAssertFalse(activeA1)
+        XCTAssertTrue(activeB1)
+        XCTAssertTrue(activeOnly1)
+
+        // Unregister endpoint-only using authenticated owner identity
+        try await database.unregisterSpaceNotification(
+            space: fixture.space,
+            ownerServiceDID: owner,
+            deliveryServiceDID: owner,
+            authorization: credential
+        )
+
+        // endpoint-only is removed; #b still remains
+        let activeOnly2 = try await database.isSpaceNotificationRegistrationActive(space: fixture.space, endpoint: endpointOnly, repository: fixture.writer, now: now)
+        let activeB2 = try await database.isSpaceNotificationRegistrationActive(space: fixture.space, endpoint: endpointB, repository: fixture.writer, now: now)
+        XCTAssertFalse(activeOnly2)
+        XCTAssertTrue(activeB2)
+
+        // Finally unregister #b
+        try await database.unregisterSpaceNotification(
+            space: fixture.space,
+            ownerServiceDID: owner,
+            deliveryServiceDID: serviceB,
+            authorization: credential
+        )
+        let activeB3 = try await database.isSpaceNotificationRegistrationActive(space: fixture.space, endpoint: endpointB, repository: fixture.writer, now: now)
+        XCTAssertFalse(activeB3)
+    }
+
+
 
     func testSpaceNotificationOwnershipMigrationClearsLegacyRowsAndRebuildsTable() async throws {
         let fixture = try NotificationFixture()
