@@ -236,6 +236,40 @@ final class AccountLoginHardeningTests: XCTestCase {
         try await database.close()
     }
 
+    func testHandleAndDIDAliasesShareOneAdmissionBucket() async throws {
+        let root = try temporaryLoginDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        let service = AccountLoginAdmissionService(
+            store: database,
+            key: try AccountLoginAdmissionKey(Data(repeating: 0xB9, count: 32)),
+            policy: try AccountLoginAdmissionPolicy(
+                handleAttempts: 2,
+                directPeerAttempts: 100,
+                pairAttempts: 100,
+                window: 300,
+                maximumProcessEntries: 64,
+                maximumDurableEntries: 64
+            )
+        )
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let first = try await service.admit(handle: "alice.example", directPeer: "203.0.113.71", now: now)
+        XCTAssertEqual(first, .allowed)
+        let second = try await service.admit(handle: " Alice.Example ", directPeer: "203.0.113.71", now: now.addingTimeInterval(1))
+        XCTAssertEqual(second, .allowed)
+        let third = try await service.admit(handle: "ALICE.EXAMPLE", directPeer: "203.0.113.71", now: now.addingTimeInterval(2))
+        XCTAssertEqual(third, .rateLimited, "whitespace and case variations of handle must share one admission bucket")
+
+        // DID aliases
+        let didFirst = try await service.admit(handle: "did:plc:abcdefghijklmnopqrstuvwx", directPeer: "203.0.113.72", now: now)
+        XCTAssertEqual(didFirst, .allowed)
+        let didSecond = try await service.admit(handle: " did:plc:abcdefghijklmnopqrstuvwx ", directPeer: "203.0.113.72", now: now.addingTimeInterval(1))
+        XCTAssertEqual(didSecond, .allowed)
+        let didThird = try await service.admit(handle: "did:plc:abcdefghijklmnopqrstuvwx", directPeer: "203.0.113.72", now: now.addingTimeInterval(2))
+        XCTAssertEqual(didThird, .rateLimited, "DID aliases must share one admission bucket")
+        try await database.close()
+    }
+
     func testLegacyWindowDurationAdmissionSchemaMigratesWithoutResettingAttempts() async throws {
         let root = try temporaryLoginDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

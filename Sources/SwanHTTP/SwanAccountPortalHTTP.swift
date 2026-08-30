@@ -197,7 +197,14 @@ public struct SwanAccountPortalConfiguration: Sendable, Equatable {
     public let publicOrigin: URL
     public let staticDirectory: URL
     public let signupPolicy: SignupPolicy
-    public init(publicOrigin: URL, staticDirectory: URL, signupPolicy: SignupPolicy = .closed) throws {
+    public let loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
+
+    public init(
+        publicOrigin: URL,
+        staticDirectory: URL,
+        signupPolicy: SignupPolicy = .closed,
+        loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct
+    ) throws {
         guard let components = URLComponents(url: publicOrigin, resolvingAgainstBaseURL: false),
               components.scheme?.lowercased() == "https", components.host != nil,
               components.user == nil, components.password == nil,
@@ -208,6 +215,7 @@ public struct SwanAccountPortalConfiguration: Sendable, Equatable {
         self.publicOrigin = publicOrigin
         self.staticDirectory = staticDirectory
         self.signupPolicy = signupPolicy
+        self.loginClientIdentityPolicy = loginClientIdentityPolicy
     }
 }
 
@@ -288,7 +296,9 @@ public struct SwanAccountPortalHTTP: Sendable {
                 if let admissionStatus = await accountLoginAdmissionStatus(
                     service: service,
                     handle: credentials.handle,
-                    context: context
+                    request: request,
+                    context: context,
+                    policy: configuration.loginClientIdentityPolicy
                 ) {
                     return accountError(admissionStatus)
                 }
@@ -345,7 +355,9 @@ public struct SwanAccountPortalHTTP: Sendable {
                     if let admissionStatus = await accountLoginAdmissionStatus(
                         service: service,
                         handle: credentials.handle,
-                        context: context
+                        request: request,
+                        context: context,
+                        policy: configuration.loginClientIdentityPolicy
                     ) {
                         return accountError(admissionStatus)
                     }
@@ -405,7 +417,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                     let admitted = try await collectAdmittedRequestBody(request, mediaType: .json, admission: .managementProcessShared, policy: .productionDefault, maximumBytes: 16 * 1024, termination: context.jsonWriteBodyTermination)
                     defer { admitted.release() }
                     let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
-                    let mutation = try await service.mutate(path: path, context: .init(sessionID: session, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress), payload: payload, now: Date())
+                    let mutation = try await service.mutate(path: path, context: .init(sessionID: session, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: resolvePortalClientIP(request: request, context: context, policy: configuration.loginClientIdentityPolicy)), payload: payload, now: Date())
                     if path == "logout" { try await sessions.revoke(sessionValue: session) }
                     return accountJSON(.ok, mutation, cookies: path == "logout" ? [expiredManagementCookie(), expiredCSRFToken()] : [])
                 } catch { return portalErrorResponse(error) }
@@ -439,7 +451,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                 let mutationPath = String(request.uri.path.dropFirst("/account/api/".count))
                 let mutation = try await service.mutate(
                     path: mutationPath,
-                    context: .init(sessionID: session, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress),
+                    context: .init(sessionID: session, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: resolvePortalClientIP(request: request, context: context, policy: configuration.loginClientIdentityPolicy)),
                     payload: payload,
                     now: Date()
                 )
@@ -456,12 +468,12 @@ public struct SwanAccountPortalHTTP: Sendable {
                       (try? await sessions.acceptsCSRF(sessionValue: session, csrfValue: csrf)) == true else { return accountError(.forbidden) }
                 do {
                     let metadata = try await sessions.authenticate(sessionValue: session)
-                    return accountJSON(.ok, try await service.mutate(path: path, context: .init(sessionID: session, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress), payload: nil, now: Date()))
+                    return accountJSON(.ok, try await service.mutate(path: path, context: .init(sessionID: session, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: resolvePortalClientIP(request: request, context: context, policy: configuration.loginClientIdentityPolicy)), payload: nil, now: Date()))
                 } catch { return portalErrorResponse(error) }
             }
         }
 
-        for prefix in ["sessions", "app-passwords", "factors/passkeys"] {
+        for prefix in ["sessions", "app-passwords", "factors/passkeys", "connected-apps"] {
             router.on("/account/api/\(prefix)/*", method: .delete) { [configuration, sessions, service] request, context async -> Response in
                 guard mutationHeadersAllow(request, expectedOrigin: configuration.publicOrigin),
                       let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),
@@ -475,7 +487,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                     defer { admitted.release() }
                     let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
                     let mutationPath = String(request.uri.path.dropFirst("/account/api/".count))
-                    return accountJSON(.ok, try await service.mutate(path: mutationPath, context: .init(sessionID: session, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: context.remoteAddress?.ipAddress), payload: payload, now: Date()))
+                    return accountJSON(.ok, try await service.mutate(path: mutationPath, context: .init(sessionID: session, accountDID: metadata.accountDID, strength: metadata.strength, stepUpToken: stepUpReceipt(from: request), directPeer: resolvePortalClientIP(request: request, context: context, policy: configuration.loginClientIdentityPolicy)), payload: payload, now: Date()))
                 } catch { return portalErrorResponse(error) }
             }
         }
@@ -616,15 +628,29 @@ private func stepUpReceipt(from request: Request) -> String? {
 /// capability so they can exercise HTTP policy without constructing SQLite
 /// rate-limit state; production ``SwanAccountPortalService`` always exposes it
 /// and fails closed when the accepted socket peer is unavailable.
+private func resolvePortalClientIP(
+    request: Request,
+    context: SwanHTTPRequestContext,
+    policy: SwanLoginClientIdentityPolicy
+) -> String? {
+    let rawPeer = context.remoteAddress?.ipAddress ?? "127.0.0.1"
+    return try? policy.clientIPAddress(
+        directPeer: rawPeer,
+        headers: request.headers
+    )
+}
+
 private func accountLoginAdmissionStatus(
     service: any SwanAccountPortalServing,
     handle: String,
-    context: SwanHTTPRequestContext
+    request: Request,
+    context: SwanHTTPRequestContext,
+    policy: SwanLoginClientIdentityPolicy
 ) async -> AccountStatus? {
     guard let admission = service as? any SwanAccountPortalLoginAdmissionServing else {
         return nil
     }
-    guard let directPeer = context.remoteAddress?.ipAddress else {
+    guard let directPeer = resolvePortalClientIP(request: request, context: context, policy: policy) else {
         return .serviceUnavailable
     }
     do {

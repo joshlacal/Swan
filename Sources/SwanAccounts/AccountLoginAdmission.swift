@@ -271,7 +271,8 @@ public actor AccountLoginAdmissionService {
         now: Date = Date()
     ) async throws -> AccountLoginAdmissionDecision {
         try Task.checkCancellation()
-        let handleBytes = Array(handle.utf8)
+        let trimmed = handle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let handleBytes = Array(trimmed.utf8)
         let peerBytes = Array(directPeer.utf8)
         guard (1 ... 253).contains(handleBytes.count),
               !handleBytes.contains(0),
@@ -283,7 +284,9 @@ public actor AccountLoginAdmissionService {
         }
 
         let normalizedHandle: Data
-        if let canonicalHandle = try? AccountIdentifiers.canonicalHandle(handle) {
+        if let canonicalDID = try? AccountIdentifiers.validateDID(trimmed) {
+            normalizedHandle = Data(canonicalDID.utf8)
+        } else if let canonicalHandle = try? AccountIdentifiers.canonicalHandle(trimmed) {
             normalizedHandle = Data(canonicalHandle.utf8)
         } else {
             normalizedHandle = Self.invalidHandleSentinel

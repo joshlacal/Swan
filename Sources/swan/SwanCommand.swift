@@ -4138,7 +4138,7 @@ extension SwanCommand {
                             // lifecycle snapshot than login.
                             accounts: accountProgramAccounts,
                             directory: SwanDurableLegacySessionDirectory(store: controlDatabase),
-                            rateLimiter: SwanInProcessLegacySessionRateLimiter(),
+                            loginClientIdentityPolicy: loginClientIdentityPolicy,
                             serviceAuthIssuer: legacySessionServiceAuthIssuer
                         )
                     } catch let error as ValidationError {
@@ -4752,7 +4752,8 @@ extension SwanCommand {
                             configuration: try SwanAccountPortalConfiguration(
                                 publicOrigin: baseURL,
                                 staticDirectory: accountPortalDirectoryURL,
-                                signupPolicy: resolvedSignupPolicy
+                                signupPolicy: resolvedSignupPolicy,
+                                loginClientIdentityPolicy: loginClientIdentityPolicy
                             ),
                             sessions: managementSessions,
                             service: portalService

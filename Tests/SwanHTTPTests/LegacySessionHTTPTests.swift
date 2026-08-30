@@ -27,13 +27,6 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
     /// so a placeholder verifier would not do.
     private static let accountPassword = "correct-horse-battery-staple"
 
-    private struct AlwaysAdmits: SwanLegacySessionRateLimiting {
-        func admitSessionCreation(identifier: String, now: Date) async -> Bool { true }
-    }
-
-    private struct NeverAdmits: SwanLegacySessionRateLimiting {
-        func admitSessionCreation(identifier: String, now: Date) async -> Bool { false }
-    }
 
     /// `Router` is not `Sendable`; the fixture is only ever used from the
     /// test's own task, so the escape hatch is accurate rather than a paper-over.
@@ -46,7 +39,8 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
     }
 
     private func makeFixture(
-        rateLimiter: any SwanLegacySessionRateLimiting = AlwaysAdmits(),
+        admissionPolicy: AccountLoginAdmissionPolicy = try! .init(),
+        loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         serviceAuthIssuer: TestServiceAuthIssuer? = nil
     ) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
@@ -58,6 +52,11 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             store: database,
             passwordHasher: hasher,
             verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher),
+            loginAdmissionService: AccountLoginAdmissionService(
+                store: database,
+                key: try AccountLoginAdmissionKey(Data(repeating: 0x9A, count: 32)),
+                policy: admissionPolicy
+            ),
             loginFactorTokenVerifier: factorTokens,
             authenticationFactors: database
         )
@@ -87,7 +86,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             appPasswords: database,
             accounts: accounts,
             directory: SwanDurableLegacySessionDirectory(store: database),
-            rateLimiter: rateLimiter,
+            loginClientIdentityPolicy: loginClientIdentityPolicy,
             serviceAuthIssuer: serviceAuthIssuer,
             // These tests assert behaviour, not timing. The production floor is
             // 350ms and would add seconds across the suite.
@@ -561,7 +560,14 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
     }
 
     func testRateLimitedLoginIsRefused() async throws {
-        let fixture = try await makeFixture(rateLimiter: NeverAdmits())
+        let fixture = try await makeFixture(
+            admissionPolicy: try AccountLoginAdmissionPolicy(
+                handleAttempts: 1,
+                directPeerAttempts: 1,
+                pairAttempts: 1,
+                window: 300
+            )
+        )
         defer {
             Task {
                 try? await fixture.database.close()
@@ -570,6 +576,19 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
         }
         let password = try await issuePassword(fixture)
         try await app(fixture).test(.router) { client in
+            // Attempt 1 consumes the single attempt
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createSession",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string:
+                    "{\"identifier\":\"\(self.handle)\",\"password\":\"\(password)\"}"
+                )
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+
+            // Attempt 2 is rate limited
             try await client.execute(
                 uri: "/xrpc/com.atproto.server.createSession",
                 method: .post,

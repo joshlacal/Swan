@@ -491,7 +491,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 appPasswords: control,
                 accounts: accounts,
                 directory: SwanDurableLegacySessionDirectory(store: control),
-                rateLimiter: SwanInProcessLegacySessionRateLimiter(),
+                loginClientIdentityPolicy: .direct,
                 serviceAuthIssuer: issuer,
                 minimumFailedLoginDuration: .milliseconds(1)
             )
@@ -984,7 +984,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     appPasswords: control,
                     accounts: accounts,
                     directory: SwanDurableLegacySessionDirectory(store: control),
-                    rateLimiter: SwanInProcessLegacySessionRateLimiter(),
+                    loginClientIdentityPolicy: .direct,
                     minimumFailedLoginDuration: .milliseconds(1)
                 )
             } else {
