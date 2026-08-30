@@ -744,7 +744,7 @@ public enum SQLiteLayout {
             repo_did TEXT,
             expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
             updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
-            service_did TEXT,
+            service_did TEXT NOT NULL,
             PRIMARY KEY(space_uri, endpoint),
             CHECK(length(endpoint) > 0)
         )
@@ -2849,16 +2849,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         _ = try await connection.query("DROP TABLE public_repository_mutation_requests_pre_integrity")
     }
 
-    /// Erratum 03's `registerNotify` service adoption: a registration may name
-    /// the subscriber's service identifier, which delivery uses as the JWT
-    /// audience. Pre-existing rows have no identifier — they stay legacy
-    /// endpoint-only registrations (never dynamic delivery destinations), so
-    /// the column is nullable and no row rewrite is needed.
+    /// Notification ownership is authenticated at registration time. Legacy
+    /// rows are discarded before rebuilding the table with a required owner.
     private func migrateSpaceNotificationServiceIdentityIfNeeded() async throws {
-        // An empty PRAGMA result means the table itself is absent — this
-        // database never carries space registrations (or creates the table
-        // with the column already in place later in setup); there is nothing
-        // to migrate.
         let columns = try await connection.query(
             "PRAGMA table_info(permissioned_space_notification_registrations)"
         )
@@ -2869,25 +2862,24 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             "ALTER TABLE permissioned_space_notification_registrations ADD COLUMN service_did TEXT"
         )
     }
+
     private func migrateSpaceNotificationOwnershipIfNeeded() async throws {
         let version = Self.spaceNotificationOwnershipMigrationVersion
-        try await transaction {
-            let applied = try await connection.query(
-                "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
-                [.integer(version)]
-            )
-            guard applied.isEmpty else { return }
-            _ = try await connection.query(
-                "DELETE FROM permissioned_space_notification_registrations"
-            )
-            _ = try await connection.query(
-                "INSERT INTO permissioned_repository_migrations(version, applied_at) VALUES (?, ?)",
-                [
-                    .integer(version),
-                    .integer(Int(Date().timeIntervalSince1970 * 1_000_000))
-                ]
-            )
-        }
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+        _ = try await connection.query(
+            "DELETE FROM permissioned_space_notification_registrations"
+        )
+        _ = try await connection.query(
+            "INSERT INTO permissioned_repository_migrations(version, applied_at) VALUES (?, ?)",
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000))
+            ]
+        )
     }
 
     /// Task 42 originally shipped staging tables before the exact projection
@@ -8227,8 +8219,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         serviceDID: String? = nil,
         authorization: AuthorizationContext
     ) async throws {
-        let owner = serviceDID ?? service
-        guard let owner else { throw SwanError.unauthorized("service authentication is required") }
+        guard let owner = serviceDID, service == nil else {
+            throw SwanError.unauthorized("service authentication is required")
+        }
         guard Self.isValidNotificationServiceIdentity(owner) else {
             throw SwanError.invalidIdentifier("notification service identity")
         }
@@ -8259,7 +8252,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         authorization: AuthorizationContext,
         now: Date = Date()
     ) async throws {
-        let owner = serviceDID ?? registration.service
+        guard let owner = serviceDID,
+              Self.isValidNotificationServiceIdentity(owner) else {
+            throw SwanError.unauthorized("service authentication is required")
+        }
         let endpoint = try validNotificationEndpoint(registration.endpoint)
         if let repository = registration.repository {
             guard isValidSimpleSpaceDID(repository) else {
@@ -8344,7 +8340,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         .text(registration.space.rawValue), .text(endpoint),
                         registration.repository.map(SQLiteData.text) ?? .null,
                         .integer(expiry), .integer(timestamp),
-                        owner.map(SQLiteData.text) ?? .null,
+                        .text(owner),
                     ]
                 )
             }

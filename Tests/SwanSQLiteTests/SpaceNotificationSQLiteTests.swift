@@ -65,6 +65,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                 repository: fixture.writer,
                 expiresAt: now.addingTimeInterval(3_600)
             ),
+            serviceDID: "did:plc:serviceabcdefghijklmnop",
             authorization: credential,
             now: now
         )
@@ -162,6 +163,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                 repository: nil,
                 expiresAt: now.addingTimeInterval(3_600)
             ),
+            serviceDID: "did:plc:serviceabcdefghijklmnop",
             authorization: credential,
             now: now
         )
@@ -173,6 +175,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                 expiresAt: now.addingTimeInterval(3_600),
                 service: serviceIdentity
             ),
+            serviceDID: "did:plc:serviceabcdefghijklmnop",
             authorization: credential,
             now: now
         )
@@ -387,6 +390,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                 repository: fixture.writer,
                 expiresAt: now.addingTimeInterval(600)
             ),
+            serviceDID: "did:plc:serviceabcdefghijklmnop",
             authorization: credential,
             now: now
         )
@@ -399,6 +403,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                 repository: nil,
                 expiresAt: now.addingTimeInterval(1_200)
             ),
+            serviceDID: "did:plc:serviceabcdefghijklmnop",
             authorization: credential,
             now: now
         )
@@ -448,6 +453,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                     repository: fixture.writer,
                     expiresAt: now.addingTimeInterval(60)
                 ),
+            serviceDID: "did:plc:serviceabcdefghijklmnop",
                 authorization: credential,
                 now: now
             )
@@ -461,6 +467,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                 repository: nil,
                 expiresAt: now.addingTimeInterval(120)
             ),
+            serviceDID: "did:plc:serviceabcdefghijklmnop",
             authorization: credential,
             now: now
         )
@@ -473,6 +480,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                     repository: fixture.writer,
                     expiresAt: now.addingTimeInterval(120)
                 ),
+            serviceDID: "did:plc:serviceabcdefghijklmnop",
                 authorization: credential,
                 now: now
             )
@@ -493,6 +501,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                 repository: fixture.writer,
                 expiresAt: now.addingTimeInterval(180)
             ),
+            serviceDID: "did:plc:serviceabcdefghijklmnop",
             authorization: credential,
             now: now.addingTimeInterval(61)
         )
@@ -1146,6 +1155,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                 repository: fixture.writer,
                 expiresAt: now.addingTimeInterval(600)
             ),
+            serviceDID: "did:plc:serviceabcdefghijklmnop",
             authorization: credential,
             now: now
         )

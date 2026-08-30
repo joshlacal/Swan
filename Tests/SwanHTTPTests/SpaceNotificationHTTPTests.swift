@@ -922,6 +922,7 @@ private struct NotificationHTTPFixture {
         let credential = try PermissionedDataJWT.createSpaceCredential(issuer: authority, space: space, key: key)
         var headers: HTTPFields = [.contentType: "application/json"]
         headers[.authorization] = "Bearer \(credential)"
+        headers[.init("Atproto-Service-Auth")!] = "Bearer writer-token"
         return headers
     }
 
@@ -1218,22 +1219,23 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
 
     func registerSpaceNotification(
         _ registration: AuthorizedSpaceNotificationRegistration,
+        serviceDID: String,
         authorization _: AuthorizationContext
     ) async throws {
         registrationsValue.removeAll { $0.endpoint == registration.endpoint }
         registrationsValue.append(registration)
     }
-
     func unregisterSpaceNotification(
         space: SpaceURI,
-        service: String,
+        serviceDID: String,
         authorization _: AuthorizationContext
     ) async throws {
         guard space.authority == authority else {
             throw AuthorizedSimpleSpaceLifecycleError.notFound
         }
-        registrationsValue.removeAll { $0.space == space && $0.service == service }
+        registrationsValue.removeAll { $0.space == space && $0.service == serviceDID }
     }
+
 
     func receiveSpaceWriteNotification(_ notification: AuthorizedSpaceWriteNotification) async throws {
         guard notification.space.authority == authority, notification.repository == writer else {
@@ -1248,7 +1250,8 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
         space: SpaceURI,
         issuer: String,
         audience: String,
-        eventID: String
+        eventID: String,
+        requestBodyDigest _: String?
     ) async throws {
         deletionsValue.append(
             .init(space: space, issuer: issuer, audience: audience, eventID: eventID)
@@ -1365,6 +1368,15 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
             throw SwanError.unauthorized("service authentication is invalid")
         }
         switch (compact, expectedMethod) {
+        case ("writer-token", "com.atproto.space.registerNotify"),
+             ("writer-token", "com.atproto.space.unregisterNotify"):
+            return .init(
+                issuer: writer,
+                audience: authority,
+                method: expectedMethod,
+                eventID: "service-event-registration",
+                expiresAt: Date(timeIntervalSinceNow: 60)
+            )
         case ("writer-token", "com.atproto.space.notifyWrite"):
             return .init(
                 issuer: writer,
