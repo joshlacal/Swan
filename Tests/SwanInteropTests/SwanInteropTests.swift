@@ -378,6 +378,69 @@ final class SwanInteropTests: XCTestCase {
         )
     }
 
+    func testXRPCClientRejectsPlaintextCredentialTransportForNonLoopback() async throws {
+        let insecureClient = try InteropXRPCClient(
+            baseURL: URL(string: "http://example.com")!,
+            timeout: 1
+        )
+        do {
+            _ = try await insecureClient.query(
+                "com.atproto.repo.getRecord",
+                query: ["repo": "did:plc:alice", "rkey": "3k"],
+                authorization: .bearer(token: "secret")
+            )
+            XCTFail("plain HTTP bearer unexpectedly succeeded")
+        } catch let error as InteropHTTPError {
+            XCTAssertEqual(error, .invalidURL)
+        }
+
+        do {
+            _ = try await insecureClient.procedure(
+                "com.atproto.repo.createRecord",
+                body: Data(),
+                authorization: .dpop(accessToken: "token", proof: "proof")
+            )
+            XCTFail("plain HTTP DPoP unexpectedly succeeded")
+        } catch let error as InteropHTTPError {
+            XCTAssertEqual(error, .invalidURL)
+        }
+
+        do {
+            _ = try await insecureClient.binaryProcedure(
+                "com.atproto.repo.uploadBlob",
+                body: Data([0x01]),
+                contentType: "application/octet-stream",
+                authorization: .service(token: "service-jwt")
+            )
+            XCTFail("plain HTTP service token unexpectedly succeeded")
+        } catch let error as InteropHTTPError {
+            XCTAssertEqual(error, .invalidURL)
+        }
+
+        // Loopback HTTP and HTTPS are permitted for credentials
+        for loopbackURL in [
+            URL(string: "http://127.0.0.1:8080")!,
+            URL(string: "http://localhost:8080")!,
+            URL(string: "https://example.com")!,
+        ] {
+            let client = try InteropXRPCClient(
+                baseURL: loopbackURL,
+                timeout: 0.1
+            )
+            do {
+                _ = try await client.query(
+                    "com.atproto.repo.getRecord",
+                    query: [:],
+                    authorization: .bearer(token: "secret")
+                )
+            } catch let error as InteropHTTPError {
+                XCTAssertNotEqual(error, .invalidURL)
+            } catch {
+                // Network connection error is fine, not invalidURL
+            }
+        }
+    }
+
     func testStreamingCARClientAllowsThePinned512MiBBoundSeparatelyFromJSON() throws {
         let http = try InteropHTTPClient(
             baseURL: URL(string: "https://pds.test")!,

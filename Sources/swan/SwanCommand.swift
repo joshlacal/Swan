@@ -139,7 +139,7 @@ struct ServeNotificationRuntime {
     /// decode answers `false`, which cannot widen anything: ``load(from:continuityStore:)``
     /// owns the diagnostics for an unusable file and refuses the same file a
     /// few lines later with a message that names the flag.
-    static func selectsLaboratoryPLC(from url: URL) -> Bool {
+    static func selectsLaboratoryPLC(from data: Data) -> Bool {
         struct LaboratorySelection: Decodable {
             struct PLC: Decodable {
                 let laboratory: Bool?
@@ -148,25 +148,39 @@ struct ServeNotificationRuntime {
             let credentialKeyPLC: PLC?
             let delegationKeyPLC: PLC?
         }
-        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
-              data.count > 0, data.count <= 256 * 1_024,
+        guard data.count > 0, data.count <= 256 * 1_024,
               let selection = try? JSONDecoder()
               .decode(LaboratorySelection.self, from: data)
         else { return false }
         return (selection.credentialKeyPLC?.laboratory ?? false)
             || (selection.delegationKeyPLC?.laboratory ?? false)
     }
-
+    static func selectsLaboratoryPLC(from url: URL) -> Bool {
+        guard let data = try? readBoundedRegularFileNoFollow(
+            url,
+            maximumBytes: 256 * 1_024,
+            validationMessage: "--notification-config is unavailable"
+        ) else { return false }
+        return selectsLaboratoryPLC(from: data)
+    }
     static func load(
         from url: URL,
         continuityStore: any PLCCredentialKeyContinuityStore
     ) throws -> ServeNotificationRuntime {
-        let data: Data
-        do {
-            data = try Data(contentsOf: url, options: [.mappedIfSafe])
-        } catch {
-            throw ValidationError("--notification-config is unavailable")
-        }
+        let data = try readBoundedRegularFileNoFollow(
+            url,
+            maximumBytes: 256 * 1_024,
+            validationMessage: "--notification-config is unavailable"
+        )
+        return try load(from: data, continuityStore: continuityStore)
+    }
+
+
+
+    static func load(
+        from data: Data,
+        continuityStore: any PLCCredentialKeyContinuityStore
+    ) throws -> ServeNotificationRuntime {
         guard data.count > 0, data.count <= 256 * 1_024 else {
             throw ValidationError("--notification-config has invalid size")
         }
@@ -3515,11 +3529,21 @@ extension SwanCommand {
             // known and before the control database, key stores, or any
             // listener exist, so a refused configuration leaves no state
             // behind.
+            let notificationConfigData: Data?
+            if let notificationConfig {
+                notificationConfigData = try readBoundedRegularFileNoFollow(
+                    URL(fileURLWithPath: notificationConfig),
+                    maximumBytes: 256 * 1_024,
+                    validationMessage: "--notification-config is unavailable"
+                )
+            } else {
+                notificationConfigData = nil
+            }
             try Self.requireLaboratoryPLCStaysOffPublicOrigins(
                 notificationConfigurationSelectsLaboratoryPLC:
-                notificationConfig.map {
+                notificationConfigData.map {
                     ServeNotificationRuntime.selectsLaboratoryPLC(
-                        from: URL(fileURLWithPath: $0)
+                        from: $0
                     )
                 } ?? false,
                 publicURL: baseURL
@@ -3859,9 +3883,9 @@ extension SwanCommand {
                         UnavailableSpaceCredentialClientAttestationPolicy()
                 }
                 let notificationRuntime: ServeNotificationRuntime?
-                if let notificationConfig {
+                if let notificationConfigData {
                     notificationRuntime = try ServeNotificationRuntime.load(
-                        from: URL(fileURLWithPath: notificationConfig),
+                        from: notificationConfigData,
                         continuityStore: controlDatabase
                     )
                 } else {
@@ -9484,22 +9508,11 @@ private enum LabLiveSupport {
     }
 
     static func body(at url: URL) throws -> Data {
-        let attributes: [FileAttributeKey: Any]
-        do {
-            attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        } catch {
-            throw ValidationError("live body file is unavailable")
-        }
-        guard (attributes[.type] as? FileAttributeType) == .typeRegular,
-              let size = attributes[.size] as? NSNumber,
-              size.intValue <= 2 * 1024 * 1024 else {
-            throw ValidationError("live body file must be a regular file no larger than 2 MiB")
-        }
-        do {
-            return try Data(contentsOf: url, options: [.mappedIfSafe])
-        } catch {
-            throw ValidationError("live body file is unavailable")
-        }
+        try readBoundedRegularFileNoFollow(
+            url,
+            maximumBytes: 2 * 1024 * 1024,
+            validationMessage: "live body file is unavailable"
+        )
     }
 
     static func query(_ rawValues: [String]) throws -> [String: String] {

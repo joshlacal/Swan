@@ -438,7 +438,7 @@ public struct InteropXRPCClient: Sendable {
             "Accept": "application/json",
             "Content-Type": contentType,
         ]
-        addAuthorization(authorization, to: &headers)
+        try addAuthorization(authorization, to: &headers)
         return try await http.execute(
             method: .post,
             path: path,
@@ -482,7 +482,7 @@ public struct InteropXRPCClient: Sendable {
     ) async throws -> InteropHTTPResponse {
         let path = try xrpcPath(nsid, query: query)
         var headers = ["Accept": "application/vnd.ipld.car, application/octet-stream, */*"]
-        addAuthorization(authorization, to: &headers)
+        try addAuthorization(authorization, to: &headers)
         return try await http.executeStreaming(
             method: .get,
             path: path,
@@ -510,7 +510,7 @@ public struct InteropXRPCClient: Sendable {
         let path = try makeXRPCPath(nsid, query: query)
         var headers = ["Accept": "application/json"]
         if body != nil { headers["Content-Type"] = "application/json" }
-        addAuthorization(authorization, to: &headers)
+        try addAuthorization(authorization, to: &headers)
         return try await http.execute(
             method: method,
             path: path,
@@ -540,16 +540,32 @@ public struct InteropXRPCClient: Sendable {
     private func addAuthorization(
         _ authorization: InteropAuthorization,
         to headers: inout [String: String]
-    ) {
+    ) throws {
         switch authorization {
         case .none:
             break
         case let .dpop(accessToken, proof):
+            try requireSecureTransportForCredentials()
             headers["Authorization"] = "DPoP " + accessToken
             headers["DPoP"] = proof
         case let .bearer(token), let .service(token):
+            try requireSecureTransportForCredentials()
             headers["Authorization"] = "Bearer " + token
         }
+    }
+
+    private func requireSecureTransportForCredentials() throws {
+        guard let scheme = http.baseURL.scheme?.lowercased() else {
+            throw InteropHTTPError.invalidURL
+        }
+        if scheme == "https" {
+            return
+        }
+        if scheme == "http", let host = http.baseURL.host?.lowercased(),
+           host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+            return
+        }
+        throw InteropHTTPError.invalidURL
     }
 
     private func requireJSONSuccess(_ response: InteropHTTPResponse) throws {
