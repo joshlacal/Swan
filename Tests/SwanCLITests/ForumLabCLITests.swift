@@ -34,7 +34,7 @@ final class ForumLabCLITests: XCTestCase {
         let output = String(decoding: result.stdout, as: UTF8.self)
         let errors = String(decoding: result.stderr, as: UTF8.self)
         XCTAssertTrue(
-            (output + errors).contains("environment variable is unavailable"),
+            (output + errors).contains("OAuth password file is unavailable") || (output + errors).contains("environment variable is unavailable"),
             output + errors
         )
     }
@@ -43,6 +43,9 @@ final class ForumLabCLITests: XCTestCase {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let output = directory.appending(path: "post.json")
+        let tokenFile = directory.appending(path: "producer-token")
+        try Data("test-token\n".utf8).write(to: tokenFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tokenFile.path)
 
         let result = try runCLI(
             command: [
@@ -52,11 +55,11 @@ final class ForumLabCLITests: XCTestCase {
                 "--text", "private fixture text",
                 "--repo", did,
                 "--producer-auth", "bearer",
+                "--producer-token-file", tokenFile.path,
                 "--request-timeout-seconds", "0.2",
                 "--output", output.path,
                 "--no-fail-on-failure",
-            ],
-            environment: ["SWAN_LAB_PRODUCER_TOKEN": "test-token"]
+            ]
         )
         XCTAssertEqual(result.status, 0, String(decoding: result.stderr, as: UTF8.self))
         let object = try XCTUnwrap(
@@ -115,6 +118,9 @@ final class ForumLabCLITests: XCTestCase {
         let materialized = try await SQLiteAccountDatabase(dataDirectory: data, did: did)
         try await materialized.close()
         let output = root.appending(path: "thread.json")
+        let tokenFile = root.appending(path: "consumer-token")
+        try Data("test-consumer-token\n".utf8).write(to: tokenFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tokenFile.path)
 
         let result = try runCLI(
             command: [
@@ -125,12 +131,12 @@ final class ForumLabCLITests: XCTestCase {
                 "--receiver-did", did,
                 "--data-directory", data.path,
                 "--consumer-auth", "bearer",
+                "--consumer-token-file", tokenFile.path,
                 "--request-timeout-seconds", "0.2",
                 "--output", output.path,
                 "--no-fail-on-failure",
             ],
             environment: [
-                "SWAN_LAB_CONSUMER_TOKEN": "test-consumer-token",
                 "SWAN_LAB_PERMISSIONED_COMMIT_KEY": secp256k1Key,
             ]
         )
@@ -227,6 +233,9 @@ final class ForumLabCLITests: XCTestCase {
         let materialized = try await SQLiteAccountDatabase(dataDirectory: data, did: did)
         try await materialized.close()
         let output = root.appending(path: "thread.json")
+        let tokenFile = root.appending(path: "consumer-token")
+        try Data("test-consumer-token\n".utf8).write(to: tokenFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tokenFile.path)
 
         let result = try runCLI(
             command: [
@@ -237,12 +246,12 @@ final class ForumLabCLITests: XCTestCase {
                 "--receiver-did", did,
                 "--data-directory", data.path,
                 "--consumer-auth", "bearer",
+                "--consumer-token-file", tokenFile.path,
                 "--request-timeout-seconds", "0.2",
                 "--writer-host", "\(did)=https://127.0.0.1:2:did:key:zQ3shqwJEJyMBsBXCWyCBpUBMqxcon9oHB7mCvx4sSpMdLJwc",
                 "--output", output.path,
                 "--no-fail-on-failure",
-            ],
-            environment: ["SWAN_LAB_CONSUMER_TOKEN": "test-consumer-token"]
+            ]
         )
         XCTAssertEqual(result.status, 0, String(decoding: result.stderr, as: UTF8.self))
         let object = try XCTUnwrap(

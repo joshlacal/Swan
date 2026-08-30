@@ -1079,7 +1079,7 @@ final class SwanAccountsTests: XCTestCase {
     private static let aliceDID = "did:plc:abcdefghijklmnopqrstuvwx"
     private static let bobDID = "did:plc:bcdefghijklmnopqrstuvwxy"
 
-    func testProvisioningSecretsRequireProtectedMatchingSources() throws {
+    func testProvisioningSecretsRequireOwnerOnlyFileAndRejectInvalidOrOversizedSources() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let key = Data(repeating: 0xAB, count: 32)
@@ -1088,34 +1088,63 @@ final class SwanAccountsTests: XCTestCase {
         try Data((encoded + "\n").utf8).write(to: keyFile)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyFile.path)
 
-        let fromBoth = try AccountProvisioningSecrets.accountKeyConfiguration(
-            environment: [AccountProvisioningSecrets.kekEnvironmentName: encoded],
+        let config = try AccountProvisioningSecrets.requiredMountedAccountKeyConfiguration(
             activeKeyID: "lab-primary",
             secretFile: keyFile
         )
-        XCTAssertEqual(fromBoth.activeKeyID, "lab-primary")
+        XCTAssertEqual(config.activeKeyID, "lab-primary")
 
-        XCTAssertThrowsError(
-            try AccountProvisioningSecrets.accountKeyConfiguration(
-                environment: [AccountProvisioningSecrets.kekEnvironmentName: base64URLEncoded(Data(repeating: 0xBC, count: 32))],
-                activeKeyID: "lab-primary",
-                secretFile: keyFile
-            )
-        )
+        let rawSecret = try AccountProvisioningSecrets.requiredMounted32ByteSecret(secretFile: keyFile)
+        XCTAssertEqual(rawSecret, key)
 
+        // Broad permissions are rejected
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: keyFile.path)
         XCTAssertThrowsError(
-            try AccountProvisioningSecrets.accountKeyConfiguration(
-                environment: [:],
+            try AccountProvisioningSecrets.requiredMountedAccountKeyConfiguration(
                 activeKeyID: "lab-primary",
                 secretFile: keyFile
             )
         )
+        XCTAssertThrowsError(
+            try AccountProvisioningSecrets.requiredMounted32ByteSecret(secretFile: keyFile)
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyFile.path)
 
+        // Symlinks are rejected
+        let linkFile = root.appending(path: "account-kek-link")
+        try FileManager.default.createSymbolicLink(at: linkFile, withDestinationURL: keyFile)
+        XCTAssertThrowsError(
+            try AccountProvisioningSecrets.requiredMountedAccountKeyConfiguration(
+                activeKeyID: "lab-primary",
+                secretFile: linkFile
+            )
+        )
+
+        // Non-canonical or malformed base64url is rejected
+        let malformedFile = root.appending(path: "malformed-kek")
+        try Data("not-valid-base64url!\n".utf8).write(to: malformedFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: malformedFile.path)
+        XCTAssertThrowsError(
+            try AccountProvisioningSecrets.requiredMountedAccountKeyConfiguration(
+                activeKeyID: "lab-primary",
+                secretFile: malformedFile
+            )
+        )
+
+        // Password file tests
         let passwordFile = root.appending(path: "password")
         try Data("correct horse 🦢\r\n".utf8).write(to: passwordFile)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: passwordFile.path)
         XCTAssertEqual(try AccountProvisioningSecrets.password(secretFile: passwordFile), "correct horse 🦢")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: passwordFile.path)
+        XCTAssertThrowsError(try AccountProvisioningSecrets.password(secretFile: passwordFile))
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: passwordFile.path)
+
+        let nullPasswordFile = root.appending(path: "null-password")
+        try Data([0x61, 0x00, 0x62]).write(to: nullPasswordFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: nullPasswordFile.path)
+        XCTAssertThrowsError(try AccountProvisioningSecrets.password(secretFile: nullPasswordFile))
     }
 
     private func keyConfiguration(activeKeyID: String, byte: UInt8) throws
