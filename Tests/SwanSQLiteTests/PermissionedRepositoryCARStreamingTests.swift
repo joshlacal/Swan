@@ -1220,6 +1220,116 @@ final class PermissionedRepositoryCARStreamingTests: XCTestCase {
         XCTAssertTrue(deletedRows.isEmpty, "delete must succeed and remove the record")
         try await rawCheck.close()
     }
+
+    func testDeleteThenCreateInSingleBatchMaintainsAccurateUsageAccountingAcrossCeilings() async throws {
+        let fixture = try PermissionedCARFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await database.close()
+
+        let databasePath = SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.author).path
+        let raw = try await SQLiteConnection.open(storage: .file(path: databasePath))
+
+        // Seed with 260 MB total to place space over the 256 MiB value bytes ceiling
+        let targetRkey = "target-record"
+        let oneHundredKBData = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "$type", value: "app.bsky.feed.post"),
+            (key: "text", value: String(repeating: "a", count: 100 * 1024))
+        ]))
+        let oneHundredKBCID = CID.fromDAGCBOR(oneHundredKBData).string
+
+        _ = try await raw.query(
+            """
+            INSERT INTO permissioned_space_records
+                (space_uri, author_did, collection, rkey, cid, value, revision)
+            VALUES (?, ?, 'app.bsky.feed.post', ?, ?, ?, 1)
+            """,
+            [
+                .text(fixture.space.rawValue), .text(fixture.author),
+                .text(targetRkey), .text(oneHundredKBCID), .blob(ByteBuffer(data: oneHundredKBData))
+            ]
+        )
+
+        let fillerChunk = ByteBuffer(data: Data(repeating: 0x22, count: 1024 * 1024))
+        let fillerCID = CID.fromDAGCBOR(Data(repeating: 0x22, count: 1024)).string
+        _ = try await raw.query(
+            """
+            INSERT INTO permissioned_space_records
+                (space_uri, author_did, collection, rkey, cid, value, revision)
+            WITH RECURSIVE filler(n) AS (
+                SELECT 1 UNION ALL SELECT n + 1 FROM filler WHERE n <= 260
+            )
+            SELECT ?, ?, 'app.bsky.feed.post', 'pad' || printf('%04d', n), ?, ?, 1
+            FROM filler
+            """,
+            [.text(fixture.space.rawValue), .text(fixture.author), .text(fillerCID), .blob(fillerChunk)]
+        )
+        try await raw.close()
+
+        let reopened = try await fixture.open()
+        defer { Task { try? await reopened.close() } }
+        let targetRecord = try fixture.record(rkey: targetRkey, value: oneHundredKBData)
+
+        // Batch 1: [delete(target), create(target, 200 KB)]
+        // Net change: +100 KB. Since the space is already over 256 MiB, this grows the space and MUST be rejected!
+        let twoHundredKBData = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "$type", value: "app.bsky.feed.post"),
+            (key: "text", value: String(repeating: "b", count: 200 * 1024))
+        ]))
+        let twoHundredKBCID = CID.fromDAGCBOR(twoHundredKBData).string
+
+        do {
+            _ = try await reopened.apply(
+                space: fixture.space,
+                author: fixture.author,
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try TID(tidString: "222222222222a"),
+                writes: [
+                    .delete(uri: targetRecord.uri),
+                    .create(uri: targetRecord.uri, value: twoHundredKBData, cid: twoHundredKBCID)
+                ]
+            )
+            XCTFail("delete then create with larger value when over ceiling must be rejected")
+        } catch let swanError as SwanError {
+            guard case .unavailable = swanError else {
+                return XCTFail("expected unavailable limit error, got \(swanError)")
+            }
+        }
+
+        // Batch 2: [delete(target), create(target, 50 KB)]
+        // Net change: -50 KB. Since this strictly reduces the over-limit space, it MUST be admitted!
+        let fiftyKBData = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "$type", value: "app.bsky.feed.post"),
+            (key: "text", value: String(repeating: "c", count: 50 * 1024))
+        ]))
+        let fiftyKBCID = CID.fromDAGCBOR(fiftyKBData).string
+
+        _ = try await reopened.apply(
+            space: fixture.space,
+            author: fixture.author,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try TID(tidString: "222222222222b"),
+            writes: [
+                .delete(uri: targetRecord.uri),
+                .create(uri: targetRecord.uri, value: fiftyKBData, cid: fiftyKBCID)
+            ]
+        )
+        try await reopened.close()
+
+        // Verify the record was updated to fiftyKBData in database
+        let rawCheck = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        let rows = try await rawCheck.query(
+            "SELECT length(value) AS len, cid FROM permissioned_space_records WHERE space_uri = ? AND author_did = ? AND rkey = ?",
+            [.text(fixture.space.rawValue), .text(fixture.author), .text(targetRkey)]
+        )
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows.first?.column("len")?.integer, fiftyKBData.count)
+        XCTAssertEqual(rows.first?.column("cid")?.string, fiftyKBCID)
+        try await rawCheck.close()
+    }
 }
 
 private struct PermissionedCARFixture {

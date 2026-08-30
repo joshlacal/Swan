@@ -312,10 +312,28 @@ extension SQLiteAccountDatabase {
 
     func measurePublicRepositoryBlocksInTransaction() async throws -> (count: Int, bytes: Int) {
         let rows = try await connection.query(
+            "SELECT block_count, total_bytes FROM public_repository_block_usage WHERE singleton = 1"
+        )
+        if let row = rows.first,
+           let count = row.column("block_count")?.integer,
+           let bytes = row.column("total_bytes")?.integer {
+            return (count, bytes)
+        }
+        let fallbackRows = try await connection.query(
             "SELECT COUNT(*) AS block_count, COALESCE(SUM(length(bytes)), 0) AS total_bytes FROM public_repository_blocks"
         )
-        let count = rows.first?.column("block_count")?.integer ?? 0
-        let bytes = rows.first?.column("total_bytes")?.integer ?? 0
+        let count = fallbackRows.first?.column("block_count")?.integer ?? 0
+        let bytes = fallbackRows.first?.column("total_bytes")?.integer ?? 0
+        _ = try await connection.query(
+            """
+            INSERT INTO public_repository_block_usage(singleton, block_count, total_bytes)
+            VALUES (1, ?, ?)
+            ON CONFLICT(singleton) DO UPDATE SET
+                block_count = excluded.block_count,
+                total_bytes = excluded.total_bytes
+            """,
+            [.integer(count), .integer(bytes)]
+        )
         return (count, bytes)
     }
 

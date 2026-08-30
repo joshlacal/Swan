@@ -655,6 +655,7 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 guard marked.count == 1 else {
                     throw PublicRepositoryMutationStoreError.reservationMismatch
                 }
+                try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
                 try await garbageCollectPublicRepositoryBlocksInTransaction(
                     state: prepared.state,
                     reductionOnly: prepared.recordResults.allSatisfy { $0.action == .delete }

@@ -237,6 +237,91 @@ final class PublicRepositoryBlockGarbageCollectionTests: XCTestCase {
         XCTAssertNil(indexed, "deleted item must be removed from record index")
     }
 
+    func testPublicRepositoryBlockQuotaCheckUsesMaintainedUsageWithoutScanningBlockTable() async throws {
+        let fixture = try await makeRepository()
+        defer { fixture.cleanUp() }
+
+        let path = try PublicRepositoryPath(collection: collection, recordKey: "item1")
+
+        // Initial create
+        _ = try await fixture.commit(
+            writes: [
+                .create(
+                    path: path,
+                    record: PublicRecord([
+                        "$type": .string(collection),
+                        "text": .string("initial text for maintained usage test"),
+                    ])
+                ),
+            ],
+            requestID: "usage-write-1"
+        )
+
+        let rawConn = try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.accountDatabase(in: fixture.root, did: did).path)
+        )
+        defer { Task { try? await rawConn.close() } }
+
+        // Check 1: Explain query plan on usage measurement uses primary key (O(1))
+        let eqpRows = try await rawConn.query(
+            "EXPLAIN QUERY PLAN SELECT block_count, total_bytes FROM public_repository_block_usage WHERE singleton = 1"
+        )
+        let eqpDetail = eqpRows.compactMap { $0.column("detail")?.string }.joined(separator: " ")
+        XCTAssertTrue(
+            eqpDetail.contains("USING PRIMARY KEY") || eqpDetail.contains("USING INDEX") || eqpDetail.contains("SEARCH"),
+            "measurement must be indexed O(1) query, got: \(eqpDetail)"
+        )
+
+        // Check 2: Maintained table matches exact scan after create
+        let scan1 = try await rawConn.query(
+            "SELECT COUNT(*) AS c, COALESCE(SUM(length(bytes)), 0) AS b FROM public_repository_blocks"
+        )
+        let usage1 = try await rawConn.query(
+            "SELECT block_count, total_bytes FROM public_repository_block_usage WHERE singleton = 1"
+        )
+        XCTAssertEqual(usage1.count, 1)
+        XCTAssertEqual(usage1.first?.column("block_count")?.integer, scan1.first?.column("c")?.integer)
+        XCTAssertEqual(usage1.first?.column("total_bytes")?.integer, scan1.first?.column("b")?.integer)
+
+        // Check 3: After updates, maintained usage stays in sync
+        for i in 2...5 {
+            _ = try await fixture.commit(
+                writes: [
+                    .update(
+                        path: path,
+                        record: PublicRecord([
+                            "$type": .string(collection),
+                            "text": .string("updated content \(i) to test block triggers"),
+                        ]),
+                        expectedRecordCID: nil
+                    ),
+                ],
+                requestID: "usage-write-\(i)"
+            )
+        }
+        let scan2 = try await rawConn.query(
+            "SELECT COUNT(*) AS c, COALESCE(SUM(length(bytes)), 0) AS b FROM public_repository_blocks"
+        )
+        let usage2 = try await rawConn.query(
+            "SELECT block_count, total_bytes FROM public_repository_block_usage WHERE singleton = 1"
+        )
+        XCTAssertEqual(usage2.first?.column("block_count")?.integer, scan2.first?.column("c")?.integer)
+        XCTAssertEqual(usage2.first?.column("total_bytes")?.integer, scan2.first?.column("b")?.integer)
+
+        // Check 4: After GC deletes blocks, maintained usage matches surviving blocks
+        let loadedState = try await fixture.database.loadPublicRepositoryState()
+        let state = try XCTUnwrap(loadedState)
+        try await fixture.database.garbageCollectPublicRepositoryBlocksWithoutGate(state: state)
+        let scan3 = try await rawConn.query(
+            "SELECT COUNT(*) AS c, COALESCE(SUM(length(bytes)), 0) AS b FROM public_repository_blocks"
+        )
+        let usage3 = try await rawConn.query(
+            "SELECT block_count, total_bytes FROM public_repository_block_usage WHERE singleton = 1"
+        )
+        XCTAssertEqual(usage3.first?.column("block_count")?.integer, scan3.first?.column("c")?.integer)
+        XCTAssertEqual(usage3.first?.column("total_bytes")?.integer, scan3.first?.column("b")?.integer)
+    }
+
     // MARK: - Helpers
 
     private struct Repository {

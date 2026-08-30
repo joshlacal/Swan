@@ -17,7 +17,11 @@ final class PublicBlobGarbageCollectionTests: XCTestCase {
         defer { fixture.cleanUp() }
 
         let blobBytes = Data("racing blob content".utf8)
-        let uploaded = try await fixture.database.putBlob(blobBytes, namespace: .public)
+        let uploaded = try await fixture.database.putBlob(
+            blobBytes,
+            namespace: .public,
+            mimeType: "application/octet-stream"
+        )
         let blobCID = uploaded.cid
 
         // Age the blob reference so it's older than cutoff
@@ -56,7 +60,7 @@ final class PublicBlobGarbageCollectionTests: XCTestCase {
 
         // Run purge with cutoff > 100
         let purged = try await fixture.database.purgeUnreferencedPublicBlobReferences(
-            now: Date(timeIntervalSince1970: 500)
+            now: Date(timeIntervalSince1970: 100 + 30 * 24 * 60 * 60)
         )
         XCTAssertEqual(purged, 0, "concurrently referenced blob must not be purged")
 
@@ -90,7 +94,7 @@ final class PublicBlobGarbageCollectionTests: XCTestCase {
         }
 
         let purged = try await fixture.database.purgeUnreferencedPublicBlobReferences(
-            now: Date(timeIntervalSince1970: 500)
+            now: Date(timeIntervalSince1970: 100 + 30 * 24 * 60 * 60)
         )
         XCTAssertEqual(purged, 1, "truly unreferenced blob must be purged")
 

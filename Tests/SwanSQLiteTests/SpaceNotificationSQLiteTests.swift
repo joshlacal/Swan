@@ -1540,6 +1540,76 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         XCTAssertEqual(rows.first?.column("endpoint")?.string, "https://valid.example/sink")
         XCTAssertEqual(rows.first?.column("service_did")?.string, "did:web:valid.example")
     }
+
+    func testSpaceDeleteAndRecreateRemovesWriterHighWaterAndAdmitsLiveNotificationAndRecovery() async throws {
+        let fixture = try NotificationFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+
+        let eventID1 = "writer-event-rev1"
+        let rev1 = try fixture.tid(1)
+        let notification1 = fixture.writeNotification(
+            eventID: eventID1,
+            revision: rev1,
+            commitmentByte: 0x42,
+            space: fixture.space
+        )
+        try await database.receiveSpaceWriteNotification(notification1)
+
+        // Verify permissioned_space_writers contains the writer high-water row
+        let writersBeforeDelete = try await database.connection.query(
+            "SELECT space_uri, repo_did, wire_revision FROM permissioned_space_writers WHERE space_uri = ?",
+            [.text(fixture.space.rawValue)]
+        )
+        XCTAssertEqual(writersBeforeDelete.count, 1)
+        XCTAssertEqual(writersBeforeDelete.first?.column("repo_did")?.string, fixture.writer)
+        XCTAssertEqual(writersBeforeDelete.first?.column("wire_revision")?.string, rev1.toString())
+
+        // Delete the space
+        let authContext = AuthorizationContext.accountOAuthForTesting(subject: fixture.authority, scopes: ["atproto"])
+        _ = try await database.deleteSimpleSpace(space: fixture.space, authorization: authContext)
+
+        // Verify permissioned_space_writers is empty immediately after delete
+        let writersAfterDelete = try await database.connection.query(
+            "SELECT space_uri, repo_did FROM permissioned_space_writers WHERE space_uri = ?",
+            [.text(fixture.space.rawValue)]
+        )
+        XCTAssertTrue(writersAfterDelete.isEmpty, "permissioned_space_writers must be empty immediately after delete")
+
+        // Recreate the space through createSimpleSpace
+        let authority = DurableSimpleSpaceAuthority(lifecycleDatabase: database)
+        _ = try await authority.create(
+            space: fixture.space,
+            owner: fixture.authority,
+            configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+            authorization: authContext
+        )
+        _ = try await authority.addMember(
+            space: fixture.space,
+            member: fixture.writer,
+            authorization: authContext
+        )
+
+        // Submit a notification at the same wire revision/commitment as before
+        let eventID2 = "writer-event-revived"
+        let notificationRecreate = fixture.writeNotification(
+            eventID: eventID2,
+            revision: rev1,
+            commitmentByte: 0x42,
+            space: fixture.space
+        )
+        try await database.receiveSpaceWriteNotification(notificationRecreate)
+
+        // Verify writer high-water row is recorded for the recreated space
+        let writersAfterRecreate = try await database.connection.query(
+            "SELECT space_uri, repo_did, wire_revision FROM permissioned_space_writers WHERE space_uri = ?",
+            [.text(fixture.space.rawValue)]
+        )
+        XCTAssertEqual(writersAfterRecreate.count, 1)
+        XCTAssertEqual(writersAfterRecreate.first?.column("wire_revision")?.string, rev1.toString())
+    }
 }
 
 private struct NotificationFixture {

@@ -849,6 +849,34 @@ public enum SQLiteLayout {
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS public_repository_block_usage (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            block_count INTEGER NOT NULL CHECK(block_count >= 0),
+            total_bytes INTEGER NOT NULL CHECK(total_bytes >= 0)
+        )
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS public_repository_blocks_ai
+        AFTER INSERT ON public_repository_blocks
+        BEGIN
+            INSERT INTO public_repository_block_usage(singleton, block_count, total_bytes)
+            VALUES (1, 1, length(NEW.bytes))
+            ON CONFLICT(singleton) DO UPDATE SET
+                block_count = block_count + 1,
+                total_bytes = total_bytes + length(NEW.bytes);
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS public_repository_blocks_ad
+        AFTER DELETE ON public_repository_blocks
+        BEGIN
+            UPDATE public_repository_block_usage
+            SET block_count = MAX(0, block_count - 1),
+                total_bytes = MAX(0, total_bytes - length(OLD.bytes))
+            WHERE singleton = 1;
+        END
+        """,
+        """
         CREATE TABLE IF NOT EXISTS public_repository_record_index (
             collection TEXT NOT NULL,
             rkey TEXT NOT NULL,
@@ -2649,6 +2677,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePermissionedRequestReceiptRetentionIfNeeded()
             try await backfillPermissionedSpaceRecordBlobIndexIfNeeded()
             try await migratePublicRepositoryRequestReceiptRetentionIfNeeded()
+            try await backfillPublicRepositoryBlockUsageIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -2820,6 +2849,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             "PRAGMA table_info(public_repository_mutation_requests)"
         )
         let hasIntegrity = columns.contains { $0.column("name")?.string == "integrity_digest" }
+
         let schemaRows = try await connection.query(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'public_repository_mutation_requests'"
         )
@@ -2893,6 +2923,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
         }
         _ = try await connection.query("DROP TABLE public_repository_mutation_requests_pre_integrity")
+    }
+
+
+    private func backfillPublicRepositoryBlockUsageIfNeeded() async throws {
+        _ = try await connection.query(
+            """
+            INSERT OR IGNORE INTO public_repository_block_usage(singleton, block_count, total_bytes)
+            SELECT 1, COUNT(*), COALESCE(SUM(length(bytes)), 0)
+            FROM public_repository_blocks
+            """
+        )
     }
 
     /// Notification ownership is authenticated at registration time. Legacy
@@ -4687,7 +4728,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
             let statsRow = try await connection.query(
                 """
-                SELECT COUNT(*) AS record_count, COALESCE(SUM(length(value)), 0) AS total_bytes
+                SELECT
+                  COUNT(*) AS record_count,
+                  COALESCE(SUM(length(value)), 0) AS total_bytes,
+                  COALESCE(
+                    SUM(
+                      2 * length(CAST(collection || '/' || rkey AS BLOB))
+                      + length(CAST(cid AS BLOB))
+                      + 64
+                    ),
+                    0
+                  ) AS logical_metadata_bytes
                 FROM permissioned_space_records
                 WHERE space_uri = ? AND author_did = ?
                 """,
@@ -4695,45 +4746,32 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             )
             let currentRecordCount = statsRow.first?.column("record_count")?.integer ?? 0
             let currentTotalBytes = statsRow.first?.column("total_bytes")?.integer ?? 0
+            let currentMetadataBytes = statsRow.first?.column("logical_metadata_bytes")?.integer ?? 0
 
             var simulatedRecordCount = currentRecordCount
             var simulatedTotalBytes = currentTotalBytes
+            var simulatedMetadataBytes = currentMetadataBytes
             var touchedRecordLengths: [SpaceRecordURI: Int?] = [:]
-            var simulatedMetadataBytes = 0
-            let metadataRows = try await connection.query(
-                """
-                SELECT collection, rkey, cid FROM permissioned_space_records
-                WHERE space_uri = ? AND author_did = ?
-                """,
-                [.text(space.rawValue), .text(author)]
-            )
-            for row in metadataRows {
-                guard let collection = row.column("collection")?.string,
-                      let rkey = row.column("rkey")?.string,
-                      let cid = row.column("cid")?.string else {
-                    throw SQLiteRepositoryError.corruptDatabase("invalid permissioned record metadata")
-                }
-                simulatedMetadataBytes += 2 * "\(collection)/\(rkey)".utf8.count
-                    + cid.utf8.count + 64
-            }
-            let currentMetadataBytes = simulatedMetadataBytes
             var touchedRecordMetadata: [SpaceRecordURI: Int?] = [:]
 
             for write in writes {
                 let uri = write.uri
                 let currentLength: Int?
-                if let known = touchedRecordLengths[uri] {
-                    currentLength = known
+                let currentMetadata: Int?
+                if let knownLength = touchedRecordLengths[uri] {
+                    currentLength = knownLength
+                    currentMetadata = touchedRecordMetadata[uri].flatMap { $0 }
                 } else {
                     let oldRecord = try await loadRecord(uri)
                     currentLength = oldRecord?.value.count
-                    touchedRecordLengths[uri] = currentLength
-                    let oldMetadata = try await connection.query(
-                        "SELECT cid FROM permissioned_space_records WHERE space_uri = ? AND author_did = ? AND collection = ? AND rkey = ?",
-                        [.text(space.rawValue), .text(author), .text(uri.collection), .text(uri.rkey)]
-                    )
-                    touchedRecordMetadata[uri] = oldMetadata.first?.column("cid")?.string.map {
-                        2 * "\(uri.collection)/\(uri.rkey)".utf8.count + $0.utf8.count + 64
+                    touchedRecordLengths.updateValue(currentLength, forKey: uri)
+                    if let oldCID = oldRecord?.cid {
+                        let meta = 2 * "\(uri.collection)/\(uri.rkey)".utf8.count + oldCID.utf8.count + 64
+                        currentMetadata = meta
+                        touchedRecordMetadata.updateValue(meta, forKey: uri)
+                    } else {
+                        currentMetadata = nil
+                        touchedRecordMetadata.updateValue(nil, forKey: uri)
                     }
                 }
                 let newMetadata: Int? = switch write {
@@ -4744,8 +4782,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     nil
                 }
                 simulatedMetadataBytes += (newMetadata ?? 0)
-                    - (touchedRecordMetadata[uri].flatMap { $0 } ?? 0)
-                touchedRecordMetadata[uri] = newMetadata
+                    - (currentMetadata ?? 0)
+                if let newMetadata {
+                    touchedRecordMetadata.updateValue(newMetadata, forKey: uri)
+                } else {
+                    touchedRecordMetadata.updateValue(nil, forKey: uri)
+                }
                 switch write {
                 case let .create(_, value, _):
                     if currentLength == nil {
@@ -4754,7 +4796,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     } else {
                         simulatedTotalBytes += value.count - (currentLength ?? 0)
                     }
-                    touchedRecordLengths[uri] = value.count
+                    touchedRecordLengths.updateValue(value.count, forKey: uri)
                 case let .put(_, value, _), let .update(_, value, _):
                     if currentLength == nil {
                         simulatedRecordCount += 1
@@ -4762,13 +4804,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     } else {
                         simulatedTotalBytes += value.count - (currentLength ?? 0)
                     }
-                    touchedRecordLengths[uri] = value.count
+                    touchedRecordLengths.updateValue(value.count, forKey: uri)
                 case .delete:
                     if let oldLen = currentLength {
                         simulatedRecordCount -= 1
                         simulatedTotalBytes -= oldLen
                     }
-                    touchedRecordLengths[uri] = nil
+                    touchedRecordLengths.updateValue(nil, forKey: uri)
                 }
             }
 
@@ -9243,18 +9285,21 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                   !referenced.contains(cid) else {
                 continue
             }
-            try await removeBlobReference(
+            if try await removeBlobReference(
                 BlobReference(cid: cid, namespace: .public)
-            )
-            purged += 1
+            ) {
+                purged += 1
+            }
         }
         return purged
     }
 
-    public func removeBlobReference(_ reference: BlobReference) async throws {
+    @discardableResult
+    public func removeBlobReference(_ reference: BlobReference) async throws -> Bool {
         let columns = blobNamespaceColumns(reference.namespace)
         let digestHex = try blobDigestHex(cid: reference.cid, allowLegacy: true)
-        try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
+        return try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
+            var referenceWasDeleted = false
             let needsReclamation = try await withConnectionGate {
                 try await transaction {
                     if reference.namespace == .public {
@@ -9289,6 +9334,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             .text(columns.spaceURI),
                         ]
                     )
+                    referenceWasDeleted = true
                     let remaining = try await connection.query(
                         "SELECT 1 FROM blob_namespace_references WHERE cid = ? LIMIT 1",
                         [.text(reference.cid)]
@@ -9328,6 +9374,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     digestHex: digestHex
                 )
             }
+            return referenceWasDeleted
         }
     }
 
