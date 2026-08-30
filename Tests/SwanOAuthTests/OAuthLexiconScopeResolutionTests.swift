@@ -553,6 +553,47 @@ final class OAuthLexiconScopeResolutionTests: XCTestCase {
             XCTFail("unexpected error: \(error)")
         }
     }
+
+    func testCancellationCooperativeOperationYieldsSpecifiedExpiryOnDeadlineRace() async throws {
+        struct TestExpiry: Error, Equatable {}
+        for _ in 0 ..< 20 {
+            do {
+                _ = try await SwanLexiconDeadline.run(seconds: 0.005, onExpiry: TestExpiry()) {
+                    // Cooperative operation: sleeps and throws CancellationError if cancelled
+                    try await Task.sleep(for: .seconds(5))
+                    return 42
+                }
+                XCTFail("expected deadline expiry")
+            } catch is TestExpiry {
+                // Expected: onExpiry error must be preserved
+            } catch is CancellationError {
+                XCTFail("race condition: cancellation laundered into CancellationError instead of specified expiry")
+            } catch {
+                XCTFail("unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testCallerCancellationYieldsCancellationErrorRatherThanExpiry() async throws {
+        struct TestExpiry: Error, Equatable {}
+        let task = Task {
+            try await SwanLexiconDeadline.run(seconds: 5.0, onExpiry: TestExpiry()) {
+                try await Task.sleep(for: .seconds(10))
+                return 42
+            }
+        }
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // Expected
+        } catch is TestExpiry {
+            XCTFail("caller cancellation must yield CancellationError, not onExpiry")
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
 }
 
 // MARK: - Async throwing assertion

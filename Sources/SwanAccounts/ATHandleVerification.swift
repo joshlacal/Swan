@@ -185,25 +185,45 @@ public final class HandleDNSAdmissionGate: @unchecked Sendable {
 public struct SystemATHandleDNSResolver: ATHandleDNSResolving {
     public static let defaultGate = HandleDNSAdmissionGate(maxActive: 8, maxQueued: 128)
     public let gate: HandleDNSAdmissionGate
+    private let queryTXT: (@Sendable (String, UnsafeMutablePointer<UInt8>, Int) -> Int)?
+    private let resolveAddresses: (@Sendable (String) throws -> [ATHandleIPAddress])?
 
     public init() {
-        self.gate = Self.defaultGate
+        self.init(gate: Self.defaultGate)
     }
 
     public init(gate: HandleDNSAdmissionGate) {
         self.gate = gate
+        self.queryTXT = nil
+        self.resolveAddresses = nil
     }
+
+    public init(
+        gate: HandleDNSAdmissionGate,
+        queryTXT: (@Sendable (String, UnsafeMutablePointer<UInt8>, Int) -> Int)? = nil,
+        resolveAddresses: (@Sendable (String) throws -> [ATHandleIPAddress])? = nil
+    ) {
+        self.gate = gate
+        self.queryTXT = queryTXT
+        self.resolveAddresses = resolveAddresses
+    }
+
     public func txtRecords(name: String) async throws -> [ATHandleTXTRecord] {
         try await gate.acquire()
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 defer { self.gate.release() }
                 var output = [UInt8](repeating: 0, count: 64 * 1_024)
-                let count = swan_at_handle_query_txt(
-                    name,
-                    &output,
-                    output.count
-                )
+                let count: Int32
+                if let queryTXT = self.queryTXT {
+                    count = Int32(queryTXT(name, &output, output.count))
+                } else {
+                    count = swan_at_handle_query_txt(
+                        name,
+                        &output,
+                        output.count
+                    )
+                }
                 guard count >= 0 else {
                     continuation.resume(
                         throwing: ATHandleVerificationError.unavailable
@@ -241,6 +261,15 @@ public struct SystemATHandleDNSResolver: ATHandleDNSResolving {
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 defer { self.gate.release() }
+                if let resolveAddresses = self.resolveAddresses {
+                    do {
+                        let result = try resolveAddresses(host)
+                        continuation.resume(returning: result)
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                    return
+                }
                 var hints = addrinfo()
                 hints.ai_flags = AI_ADDRCONFIG
                 hints.ai_family = AF_UNSPEC

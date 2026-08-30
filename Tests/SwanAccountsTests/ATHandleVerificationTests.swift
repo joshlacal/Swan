@@ -611,22 +611,78 @@ final class ATHandleVerificationTests: XCTestCase {
         gate.release()
     }
 
-    func testHandleDNSAdmissionGateFailurePathReleasesSlot() async throws {
+    func testSystemATHandleDNSResolverFailurePathReleasesSlotAndAdmitsSubsequentWork() async throws {
         let gate = HandleDNSAdmissionGate(maxActive: 1, maxQueued: 2)
 
-        // Acquire slot
-        try await gate.acquire()
-        XCTAssertEqual(gate.activeCount, 1)
+        // 1. TXT failure path releases slot
+        let failingTXTResolver = SystemATHandleDNSResolver(
+            gate: gate,
+            queryTXT: { _, _, _ in -1 }
+        )
+        do {
+            _ = try await failingTXTResolver.txtRecords(name: "_atproto.example.com")
+            XCTFail("expected unavailable error on failed TXT query")
+        } catch {
+            XCTAssertEqual(error as? ATHandleVerificationError, .unavailable)
+        }
+        let startTXT = ContinuousClock.now
+        while gate.activeCount > 0, ContinuousClock.now - startTXT < .seconds(1) {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(gate.activeCount, 0, "active permit must be released after TXT failure")
+        XCTAssertEqual(gate.queuedCount, 0)
 
-        // Simulate failure in operation -> release slot in defer
-        gate.release()
-        XCTAssertEqual(gate.activeCount, 0)
+        // Subsequent TXT acquire succeeds and admits work
+        let successTXTResolver = SystemATHandleDNSResolver(
+            gate: gate,
+            queryTXT: { _, output, _ in
+                let record = "did=did:plc:test".utf8
+                output[0] = UInt8((record.count >> 8) & 0xff)
+                output[1] = UInt8(record.count & 0xff)
+                for (i, byte) in record.enumerated() {
+                    output[2 + i] = byte
+                }
+                return 2 + record.count
+            }
+        )
+        let records = try await successTXTResolver.txtRecords(name: "_atproto.example.com")
+        XCTAssertEqual(records.count, 1)
+        let startTXTOk = ContinuousClock.now
+        while gate.activeCount > 0, ContinuousClock.now - startTXTOk < .seconds(1) {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(gate.activeCount, 0, "active permit must be released after successful TXT query")
 
-        // Next acquire succeeds
-        try await gate.acquire()
-        XCTAssertEqual(gate.activeCount, 1)
-        gate.release()
-        XCTAssertEqual(gate.activeCount, 0)
+        // 2. Address failure path releases slot
+        let failingAddressResolver = SystemATHandleDNSResolver(
+            gate: gate,
+            resolveAddresses: { _ in throw ATHandleVerificationError.unavailable }
+        )
+        do {
+            _ = try await failingAddressResolver.addresses(host: "example.com")
+            XCTFail("expected unavailable error on failed address lookup")
+        } catch {
+            XCTAssertEqual(error as? ATHandleVerificationError, .unavailable)
+        }
+        let startAddr = ContinuousClock.now
+        while gate.activeCount > 0, ContinuousClock.now - startAddr < .seconds(1) {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(gate.activeCount, 0, "active permit must be released after address lookup failure")
+        XCTAssertEqual(gate.queuedCount, 0)
+
+        // Subsequent address acquire succeeds and admits work
+        let successAddressResolver = SystemATHandleDNSResolver(
+            gate: gate,
+            resolveAddresses: { _ in [ATHandleIPAddress.ipv4(0x01020304)] }
+        )
+        let addresses = try await successAddressResolver.addresses(host: "example.com")
+        XCTAssertEqual(addresses.count, 1)
+        let startAddrOk = ContinuousClock.now
+        while gate.activeCount > 0, ContinuousClock.now - startAddrOk < .seconds(1) {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(gate.activeCount, 0, "active permit must be released after successful address lookup")
     }
 
     func testSystemATHandleDNSResolverRejectsWhenGateIsSaturated() async throws {

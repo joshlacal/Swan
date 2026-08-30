@@ -30,8 +30,8 @@ public func swanRaceWithDeadline<T: Sendable>(
         } catch {
             return
         }
-        operationTask.cancel()
         relay.complete(.failure(expiry))
+        operationTask.cancel()
     }
     defer {
         operationTask.cancel()
@@ -42,9 +42,9 @@ public func swanRaceWithDeadline<T: Sendable>(
             relay.install(continuation)
         }
     } onCancel: {
+        relay.complete(.failure(CancellationError()))
         operationTask.cancel()
         timeoutTask.cancel()
-        relay.complete(.failure(CancellationError()))
     }
 }
 

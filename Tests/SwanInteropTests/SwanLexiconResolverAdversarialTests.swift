@@ -6,7 +6,7 @@ import SwanCore
 import SwanInterop
 import SwanOAuth
 import PetrelRepo
-import SwanSQLite
+@testable import SwanSQLite
 import XCTest
 
 /// Lane P2-G. **Adversarial** vectors against `SwanLexiconResolver`, written
@@ -710,6 +710,74 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
         }
 
         gate.release()
+    }
+
+    func testUpgradedStoreWith8192NegativesNormalizesTo4096AndAdmitsPositives() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("lexicon-upgrade-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer {
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        let now = Date()
+        let nowMicros = Int(now.timeIntervalSince1970 * 1_000_000)
+
+        // 1. Pre-seed database with 8,192 fresh negative rows directly via raw SQL queries,
+        // simulating a legacy database upgraded to the new schema.
+        do {
+            let store = try await SQLiteControlDatabase(dataDirectory: tempDir)
+            for i in 0 ..< 8_192 {
+                let nsid = String(format: "com.example.legacy.%05d", i)
+                _ = try await store.connection.query(
+                    """
+                    INSERT INTO oauth_lexicon_documents(
+                        nsid, document, source_uri, verified_cid,
+                        created_at, updated_at, last_succeeded_at
+                    ) VALUES (?, NULL, NULL, NULL, ?, ?, NULL)
+                    """,
+                    [.text(nsid), .integer(nowMicros + i), .integer(nowMicros + i)]
+                )
+            }
+            let countRaw = try await store.countNegativeLexicons()
+            XCTAssertEqual(countRaw, 8_192)
+            try await store.close()
+        }
+
+        // 2. Reopen the database — migration / open normalization must transactionally trim
+        // negative rows above 4,096 (oldest by updated_at, nsid).
+        let reopenedStore = try await SQLiteControlDatabase(dataDirectory: tempDir)
+        defer {
+            Task { try? await reopenedStore.close() }
+        }
+
+        let countAfterReopen = try await reopenedStore.countNegativeLexicons()
+        XCTAssertEqual(countAfterReopen, 4_096)
+
+        // 3. Verify oldest rows (0 ..< 4096) were trimmed and newest (4096 ..< 8192) preserved
+        let oldestEvicted = try await reopenedStore.findLexicon(nsid: "com.example.legacy.00000")
+        XCTAssertNil(oldestEvicted, "oldest legacy negative rows must be trimmed on upgrade")
+        let newestPreserved = try await reopenedStore.findLexicon(nsid: "com.example.legacy.08191")
+        XCTAssertNotNil(newestPreserved, "newer legacy negative rows up to 4,096 must be preserved")
+
+        // 4. Storing a positive row must succeed and not hit total capacity error
+        let positiveDoc = Data([0x01, 0x02, 0x03, 0x04])
+        let positiveRow = OAuthLexiconDocumentRow(
+            nsid: "com.example.fresh.positive",
+            document: positiveDoc,
+            sourceURI: "at://did:plc:test/com.atproto.lexicon.schema/com.example.fresh.positive",
+            verifiedCID: "bafytestcid",
+            createdAt: now,
+            updatedAt: now,
+            lastSucceededAt: now
+        )
+        try await reopenedStore.storeLexicon(positiveRow)
+
+        let foundPositive = try await reopenedStore.findLexicon(nsid: "com.example.fresh.positive")
+        XCTAssertNotNil(foundPositive)
+        XCTAssertEqual(foundPositive?.document, positiveDoc)
+
+        let finalNegCount = try await reopenedStore.countNegativeLexicons()
+        XCTAssertEqual(finalNegCount, 4_096)
     }
 }
 

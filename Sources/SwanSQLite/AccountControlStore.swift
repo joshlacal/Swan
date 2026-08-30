@@ -475,6 +475,7 @@ extension SQLiteControlDatabase {
         try await migrateActorPreferencesSchema()
         try await migrateAccountControlHardeningV7()
         try await migrateAccountProgramIntegrationV8()
+        try await migrateOAuthLexiconDocumentsSchema()
     }
 
     /// Version 7 is a real in-place migration for databases created before
