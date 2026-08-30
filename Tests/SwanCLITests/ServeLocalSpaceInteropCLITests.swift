@@ -477,24 +477,32 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys])
             .write(to: notification)
 
-        let result = try runServeUntilStarted(data: data, arguments: [
-            "--host", "127.0.0.1",
-            "--port", "0",
-            "--public-url", "https://swan.example",
-            "--enable-local-space-interop",
-            "--enable-oauth-authorization-server",
-            "--space-account-kek-file", mountedKEK.path,
-            "--space-account-kek-id", "mixed",
-            "--space-account-key-directory", data.appending(path: "keys").path,
-            "--notification-config", notification.path,
-            "--enable-notification-delivery",
-            "--oauth-allow-metadata-ip", "127.0.0.1",
-        ])
+        let replacement = Data(
+            """
+            {"credentialKeyPLC":{"origin":"http://lab.invalid","laboratory":true}}
+            """.utf8
+        )
+        let result = try runServeUntilStarted(
+            data: data,
+            arguments: [
+                "--host", "127.0.0.1",
+                "--port", "0",
+                "--public-url", "https://swan.example",
+                "--enable-local-space-interop",
+                "--enable-oauth-authorization-server",
+                "--space-account-kek-file", mountedKEK.path,
+                "--space-account-kek-id", "mixed",
+                "--space-account-key-directory", data.appending(path: "keys").path,
+                "--notification-config", notification.path,
+                "--enable-notification-delivery",
+                "--oauth-allow-metadata-ip", "127.0.0.1",
+            ],
+            replaceFile: notification,
+            replacementData: replacement
+        )
 
         XCTAssertTrue(result.started, result.error)
-        // Overwrite notification file with laboratory-PLC / invalid content
-        try Data("{\"plcOrigin\":\"http://lab.invalid\"}".utf8).write(to: notification)
-        XCTAssertFalse(result.error.contains(root.path))
+        XCTAssertTrue(result.survivedReplacement, result.error)
     }
 
     func testServeNotificationConfigRejectsSymlinkFIFOAndOversize() throws {
@@ -822,7 +830,9 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
 
     private func runServeUntilStarted(
         data: URL,
-        arguments: [String]
+        arguments: [String],
+        replaceFile: URL? = nil,
+        replacementData: Data? = nil
     ) throws -> StartedProcessResult {
         let process = Process()
         process.executableURL = try XCTUnwrap(executableURL())
@@ -854,6 +864,15 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         process.standardOutput = output
         process.standardError = error
         try process.run()
+        if let replaceFile, let replacementData {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) {
+                let deadline = Date().addingTimeInterval(2)
+                while Date() < deadline && process.isRunning {
+                    try? replacementData.write(to: replaceFile, options: .atomic)
+                    usleep(1_000)
+                }
+            }
+        }
 
         let deadline = Date().addingTimeInterval(10)
         var started = false
@@ -864,11 +883,15 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
             )
             if rendered.contains("Server started and listening") {
                 started = true
+                if replaceFile != nil {
+                    Thread.sleep(forTimeInterval: 1)
+                }
                 break
             }
             if !process.isRunning { break }
             Thread.sleep(forTimeInterval: 0.05)
         }
+        let survivedReplacement = replaceFile == nil || process.isRunning
         if process.isRunning {
             // This test models the crash boundary required by the delivery
             // runtime. Recovery is proven separately after reopening the same
@@ -881,7 +904,8 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         return .init(
             started: started,
             output: String(decoding: try Data(contentsOf: outputURL), as: UTF8.self),
-            error: String(decoding: try Data(contentsOf: errorURL), as: UTF8.self)
+            error: String(decoding: try Data(contentsOf: errorURL), as: UTF8.self),
+            survivedReplacement: survivedReplacement
         )
     }
 
@@ -923,4 +947,5 @@ private struct StartedProcessResult {
     let started: Bool
     let output: String
     let error: String
+    let survivedReplacement: Bool
 }
