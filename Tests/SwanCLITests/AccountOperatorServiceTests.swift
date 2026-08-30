@@ -52,6 +52,19 @@ final class AccountOperatorServiceTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? AccountOperatorError, .operatorSecretFileUnavailable)
         }
+
+        let fifo = root.appending(path: "operator-secret-fifo")
+        mkfifo(fifo.path, 0o600)
+        XCTAssertThrowsError(
+            try OperatorSecretResolver.authorize(secretFile: fifo)
+        ) { error in
+            XCTAssertEqual(error as? AccountOperatorError, .operatorSecretFileUnavailable)
+        }
+        XCTAssertThrowsError(
+            try OperatorSecretResolver.loadVerifier(secretFile: fifo)
+        ) { error in
+            XCTAssertEqual(error as? AccountOperatorError, .operatorSecretFileUnavailable)
+        }
     }
 
     func testOperatorSecretVerifierRejectsWrongMalformedAndOversizedBearerValues() throws {

@@ -1,5 +1,6 @@
 import Foundation
 import PetrelPLC
+import SwanCore
 import SwanStorage
 
 #if os(Linux)
@@ -110,37 +111,21 @@ public enum OperatorSecretResolver {
     }
 
     private static func readSecretFile(_ url: URL) throws -> Data {
-        // Open the selected object once, without following links, then inspect
-        // that same descriptor. Checking path metadata followed by a separate
-        // path read would permit a link/rename race to swap in a different
-        // secret after validation.
-        let descriptor: Int32 = url.withUnsafeFileSystemRepresentation { path in
-            guard let path else { return -1 }
-            return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
-        }
-        guard descriptor >= 0 else { throw AccountOperatorError.operatorSecretFileUnavailable }
-        defer { _ = close(descriptor) }
-
-        var metadata = stat()
-        guard fstat(descriptor, &metadata) == 0,
-              (metadata.st_mode & S_IFMT) == S_IFREG,
-              metadata.st_uid == geteuid(),
-              (metadata.st_mode & (S_IRWXG | S_IRWXO)) == 0,
-              metadata.st_size > 0,
-              metadata.st_size <= off_t(OperatorSecretPolicy.maximumSecretBytes + 2) else {
-            throw AccountOperatorError.operatorSecretFileUnavailable
-        }
         do {
-            // Read one byte past the largest legal on-disk form so a file that
-            // grew after fstat still cannot evade the bounded input rule.
-            let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
-            let data = try handle.read(upToCount: OperatorSecretPolicy.maximumSecretBytes + 3) ?? Data()
-            guard data.count <= OperatorSecretPolicy.maximumSecretBytes + 2 else {
-                throw AccountOperatorError.operatorSecretRejected
-            }
+            let data = try AccountProvisioningSecrets.readOwnerOnlyRegularFile(
+                url,
+                maximumPayloadBytes: OperatorSecretPolicy.maximumSecretBytes
+            )
             return try validatedSecret(data)
         } catch let error as AccountOperatorError {
             throw error
+        } catch let error as SwanError {
+            switch error {
+            case .malformed:
+                throw AccountOperatorError.operatorSecretRejected
+            default:
+                throw AccountOperatorError.operatorSecretFileUnavailable
+            }
         } catch {
             throw AccountOperatorError.operatorSecretFileUnavailable
         }

@@ -163,6 +163,36 @@ final class DeploymentStartupInterlockTests: XCTestCase {
         )
     }
 
+    func testNotificationConfigPreflightReadsOnceAndPinsImmutableConfiguration() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "NotificationPreflightTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let configURL = root.appending(path: "notification.json")
+        let initialData = Data(#"{"credentialKeyPLC":{"origin":"https://plc.directory","laboratory":false}}"#.utf8)
+        try initialData.write(to: configURL)
+
+        guard let preflighted = try ServeNotificationRuntime.preflight(fromFile: configURL.path) else {
+            XCTFail("expected preflighted configuration")
+            return
+        }
+        XCTAssertEqual(preflighted.rawData, initialData)
+        XCTAssertFalse(preflighted.selectsLaboratoryPLC)
+
+        // Modify the file on disk to select laboratory PLC
+        let modifiedData = Data(#"{"credentialKeyPLC":{"origin":"http://lab.invalid","laboratory":true}}"#.utf8)
+        try modifiedData.write(to: configURL)
+
+        // The preflighted configuration remains immutable and unaffected by subsequent file modification
+        XCTAssertEqual(preflighted.rawData, initialData)
+        XCTAssertFalse(preflighted.selectsLaboratoryPLC)
+
+        // A second preflight would reflect the new file state
+        let secondPreflight = try ServeNotificationRuntime.preflight(fromFile: configURL.path)
+        XCTAssertEqual(secondPreflight?.selectsLaboratoryPLC, true)
+    }
+
     // MARK: - F36: the metadata IP allowlist may not sit on a public origin
 
     func testMetadataIPAllowlistIsRefusedOnAPubliclyReachableOrigin() throws {

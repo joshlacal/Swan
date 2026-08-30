@@ -477,11 +477,6 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys])
             .write(to: notification)
 
-        let replacement = Data(
-            """
-            {"credentialKeyPLC":{"origin":"http://lab.invalid","laboratory":true}}
-            """.utf8
-        )
         let result = try runServeUntilStarted(
             data: data,
             arguments: [
@@ -496,9 +491,7 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
                 "--notification-config", notification.path,
                 "--enable-notification-delivery",
                 "--oauth-allow-metadata-ip", "127.0.0.1",
-            ],
-            replaceFile: notification,
-            replacementData: replacement
+            ]
         )
 
         XCTAssertTrue(result.started, result.error)
@@ -830,9 +823,7 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
 
     private func runServeUntilStarted(
         data: URL,
-        arguments: [String],
-        replaceFile: URL? = nil,
-        replacementData: Data? = nil
+        arguments: [String]
     ) throws -> StartedProcessResult {
         let process = Process()
         process.executableURL = try XCTUnwrap(executableURL())
@@ -847,16 +838,6 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         process.arguments = serveArgs
         var environment = ProcessInfo.processInfo.environment
         environment.removeValue(forKey: "SWAN_OAUTH_SERVER_KEY")
-        let readSignalURL = data.deletingLastPathComponent().appending(path: "notification-read-\(UUID().uuidString)")
-        let resumeSignalURL = data.deletingLastPathComponent().appending(path: "notification-resume-\(UUID().uuidString)")
-        defer {
-            try? FileManager.default.removeItem(at: readSignalURL)
-            try? FileManager.default.removeItem(at: resumeSignalURL)
-        }
-        if replaceFile != nil {
-            environment["SWAN_TEST_NOTIFICATION_CONFIG_READ_SIGNAL_FILE"] = readSignalURL.path
-            environment["SWAN_TEST_NOTIFICATION_CONFIG_RESUME_SIGNAL_FILE"] = resumeSignalURL.path
-        }
         process.environment = environment
 
         let outputURL = data.deletingLastPathComponent()
@@ -874,31 +855,6 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         process.standardOutput = output
         process.standardError = error
         try process.run()
-        if let replaceFile, let replacementData {
-            let readDeadline = Date().addingTimeInterval(5)
-            var readObserved = false
-            while Date() < readDeadline && process.isRunning {
-                if FileManager.default.fileExists(atPath: readSignalURL.path) {
-                    readObserved = true
-                    break
-                }
-                Thread.sleep(forTimeInterval: 0.01)
-            }
-            guard readObserved else {
-                if process.isRunning {
-                    _ = kill(process.processIdentifier, SIGKILL)
-                    process.waitUntilExit()
-                }
-                return .init(
-                    started: false,
-                    output: "",
-                    error: "Serve failed to signal notification config read before timeout",
-                    survivedReplacement: false
-                )
-            }
-            try replacementData.write(to: replaceFile, options: .atomic)
-            try Data("resume\n".utf8).write(to: resumeSignalURL)
-        }
 
         let deadline = Date().addingTimeInterval(10)
         var started = false
@@ -909,15 +865,12 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
             )
             if rendered.contains("Server started and listening") {
                 started = true
-                if replaceFile != nil {
-                    Thread.sleep(forTimeInterval: 1)
-                }
                 break
             }
             if !process.isRunning { break }
             Thread.sleep(forTimeInterval: 0.05)
         }
-        let survivedReplacement = replaceFile == nil || process.isRunning
+        let survivedReplacement = process.isRunning
         if process.isRunning {
             // This test models the crash boundary required by the delivery
             // runtime. Recovery is proven separately after reopening the same

@@ -53,7 +53,7 @@ public enum InteropHTTPMethod: String, Sendable, Equatable {
     case patch = "PATCH"
 }
 
-public enum InteropHTTPError: Error, Sendable, Equatable {
+public enum InteropHTTPError: Error, Sendable, Equatable, LocalizedError {
     case invalidURL
     case responseTooLarge
     case unexpectedRedirect
@@ -61,6 +61,25 @@ public enum InteropHTTPError: Error, Sendable, Equatable {
     case unexpectedStatus(Int)
     case transportFailure
     case fileFailure
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidURL:
+            "credential transport requires HTTPS or literal loopback"
+        case .responseTooLarge:
+            "HTTP response exceeds size limit"
+        case .unexpectedRedirect:
+            "HTTP redirect is unexpected"
+        case .unexpectedContentType:
+            "HTTP content type is unexpected"
+        case let .unexpectedStatus(status):
+            "HTTP status \(status) is unexpected"
+        case .transportFailure:
+            "HTTP transport failure"
+        case .fileFailure:
+            "HTTP file operation failed"
+        }
+    }
 }
 
 /// The only authorization shapes accepted by the live runner.  This keeps

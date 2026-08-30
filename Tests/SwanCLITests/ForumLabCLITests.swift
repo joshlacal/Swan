@@ -474,7 +474,42 @@ final class ForumLabCLITests: XCTestCase {
                 "SWAN_LAB_CONSUMER_HANDLE": "consumer.swan.test",
             ]
         )
+        let combined = String(decoding: result.stdout + result.stderr, as: UTF8.self)
         XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            combined.contains("credential transport requires HTTPS or literal loopback"),
+            "Expected fixed credential transport diagnostic, got: \(combined)"
+        )
+
+        let secureResult = try runCLI(
+            command: [
+                "live",
+                "--mode", "permissioned",
+                "--name", "secure-lab-live",
+                "--producer-url", "https://example.com",
+                "--consumer-url", "https://swan.test",
+                "--producer-auth", "oauth",
+                "--producer-password-file", passwordFile.path,
+                "--producer-client-id", "http://localhost/client-id",
+                "--producer-redirect-uri", "http://127.0.0.1/callback",
+                "--consumer-auth", "none",
+                "--scope", "atproto",
+                "--space", spaceURI,
+                "--permissioned-read-host", "authority",
+                "--read-query", "space=\(spaceURI)", "repo=\(did)", "collection=blue.catbird.lab.post", "rkey=debug-0001",
+                "--body-file", bodyFile.path,
+                "--request-timeout-seconds", "0.2",
+            ],
+            environment: [
+                "SWAN_LAB_PRODUCER_HANDLE": "producer.example.com",
+                "SWAN_LAB_CONSUMER_HANDLE": "consumer.swan.test",
+            ]
+        )
+        let secureCombined = String(decoding: secureResult.stdout + secureResult.stderr, as: UTF8.self)
+        XCTAssertFalse(
+            secureCombined.contains("credential transport requires HTTPS or literal loopback"),
+            "HTTPS URL must not be rejected with credential transport diagnostic: \(secureCombined)"
+        )
     }
 
 

@@ -97,7 +97,7 @@ public enum AccountProvisioningSecrets {
     /// Opens exactly one filesystem object without following a link, then
     /// validates and reads that same descriptor. Path metadata plus a later
     /// path read would permit a rename/link swap between the checks.
-    private static func readOwnerOnlyRegularFile(
+    static func readOwnerOnlyRegularFile(
         _ url: URL,
         maximumPayloadBytes: Int
     ) throws -> Data {

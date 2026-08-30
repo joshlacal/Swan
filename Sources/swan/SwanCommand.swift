@@ -174,8 +174,32 @@ struct ServeNotificationRuntime {
         )
         return try load(from: data, continuityStore: continuityStore)
     }
+    struct ValidatedStartupMaterial: Sendable {
+        let rawData: Data
+        let selectsLaboratoryPLC: Bool
+    }
 
-
+    /// Preflights and reads the notification configuration file once from disk
+    /// through a bounded descriptor read, returning immutable startup material
+    /// that cannot be mutated by later file swaps or link races.
+    static func preflight(
+        fromFile file: String?
+    ) throws -> ValidatedStartupMaterial? {
+        guard let file, !file.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        let url = URL(fileURLWithPath: file)
+        let data = try readBoundedRegularFileNoFollow(
+            url,
+            maximumBytes: 256 * 1_024,
+            validationMessage: "--notification-config is unavailable"
+        )
+        guard data.count > 0, data.count <= 256 * 1_024 else {
+            throw ValidationError("--notification-config has invalid size")
+        }
+        let lab = selectsLaboratoryPLC(from: data)
+        return ValidatedStartupMaterial(rawData: data, selectsLaboratoryPLC: lab)
+    }
 
     static func load(
         from data: Data,
@@ -3489,40 +3513,18 @@ extension SwanCommand {
             // known and before the control database, key stores, or any
             // listener exist, so a refused configuration leaves no state
             // behind.
-            let notificationConfigData: Data?
-            if let notificationConfig {
-                notificationConfigData = try readBoundedRegularFileNoFollow(
-                    URL(fileURLWithPath: notificationConfig),
-                    maximumBytes: 256 * 1_024,
-                    validationMessage: "--notification-config is unavailable"
-                )
-            } else {
-                notificationConfigData = nil
-            }
+            let notificationStartupMaterial = try ServeNotificationRuntime.preflight(
+                fromFile: notificationConfig
+            )
             try Self.requireLaboratoryPLCStaysOffPublicOrigins(
                 notificationConfigurationSelectsLaboratoryPLC:
-                notificationConfigData.map {
-                    ServeNotificationRuntime.selectsLaboratoryPLC(
-                        from: $0
-                    )
-                } ?? false,
+                notificationStartupMaterial?.selectsLaboratoryPLC ?? false,
                 publicURL: baseURL
             )
             try Self.requireMetadataIPAllowlistStaysOffPublicOrigins(
                 allowlistedMetadataIPLiterals: oauthMetadataAllowedIPs,
                 publicURL: baseURL
             )
-            #if DEBUG
-            if let signalPath = ProcessInfo.processInfo.environment["SWAN_TEST_NOTIFICATION_CONFIG_READ_SIGNAL_FILE"] {
-                try? Data("read\n".utf8).write(to: URL(fileURLWithPath: signalPath))
-                if let resumePath = ProcessInfo.processInfo.environment["SWAN_TEST_NOTIFICATION_CONFIG_RESUME_SIGNAL_FILE"] {
-                    let resumeURL = URL(fileURLWithPath: resumePath)
-                    while !FileManager.default.fileExists(atPath: resumeURL.path) {
-                        try await Task.sleep(nanoseconds: 10_000_000)
-                    }
-                }
-            }
-            #endif
             let dataURL = URL(fileURLWithPath: dataDirectory)
             // Legacy bearer credentials are the one serve surface whose
             // mounted secrets must be validated as a single authority before
@@ -3854,9 +3856,9 @@ extension SwanCommand {
                         UnavailableSpaceCredentialClientAttestationPolicy()
                 }
                 let notificationRuntime: ServeNotificationRuntime?
-                if let notificationConfigData {
+                if let notificationStartupMaterial {
                     notificationRuntime = try ServeNotificationRuntime.load(
-                        from: notificationConfigData,
+                        from: notificationStartupMaterial.rawData,
                         continuityStore: controlDatabase
                     )
                 } else {
