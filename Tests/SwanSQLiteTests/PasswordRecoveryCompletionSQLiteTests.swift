@@ -215,6 +215,34 @@ final class PasswordRecoveryCompletionSQLiteTests: XCTestCase {
                 marker: 0x61,
                 now: now
             )
+            let legacyAccess = Data(repeating: 0x81, count: 32)
+            let legacyRefresh = Data(repeating: 0x82, count: 32)
+            try await database.createLegacySessionFamily(
+                familyID: "legacy-fam-1",
+                did: did,
+                appPasswordID: nil,
+                accessDigest: legacyAccess,
+                accessExpiresAt: now.addingTimeInterval(3600),
+                refreshDigest: legacyRefresh,
+                refreshExpiresAt: now.addingTimeInterval(86400),
+                now: now
+            )
+            let mgmtSessionDigest = Data(repeating: 0x91, count: 32)
+            let mgmtCSRF = Data(repeating: 0x92, count: 32)
+            let mgmtMetadata = try ManagementSessionMetadata(
+                sessionID: try ManagementSessionID(digest: mgmtSessionDigest),
+                accountDID: did,
+                issuedAt: now,
+                idleExpiresAt: now.addingTimeInterval(3600),
+                absoluteExpiresAt: now.addingTimeInterval(86400),
+                strength: .password
+            )
+            try await database.createManagementSession(
+                mgmtMetadata,
+                sessionDigest: mgmtSessionDigest,
+                csrfDigest: mgmtCSRF,
+                now: now
+            )
 
             let completed = try await database.completePasswordRecovery(
                 request,
@@ -259,6 +287,18 @@ final class PasswordRecoveryCompletionSQLiteTests: XCTestCase {
                 digest: secondFamily.accessDigest,
                 now: now.addingTimeInterval(6)
             )
+            let legacyAccessPost = try await database.legacyAccessSession(digest: legacyAccess, now: now.addingTimeInterval(6))
+            XCTAssertNil(legacyAccessPost, "legacy access session should be revoked after password recovery")
+            let legacyRefreshPost = try await database.legacyRefreshSession(digest: legacyRefresh, now: now.addingTimeInterval(6))
+            if case .rejected = legacyRefreshPost {} else {
+                XCTFail("legacy refresh session should be rejected after password recovery")
+            }
+            let legacyFamiliesPost = try await database.legacySessionFamilies(did: did, now: now.addingTimeInterval(6))
+            XCTAssertTrue(legacyFamiliesPost.isEmpty, "legacy families should be revoked after password recovery")
+            let mgmtPost = try await database.managementSession(digest: mgmtSessionDigest, now: now.addingTimeInterval(6))
+            XCTAssertNotNil(mgmtPost?.revokedAt, "management session should be revoked after password recovery")
+            let activeMgmtPost = try await database.managementSessions(accountDID: did, now: now.addingTimeInterval(6))
+            XCTAssertTrue(activeMgmtPost.isEmpty, "management sessions should be empty after password recovery")
             let unrelatedFamily = try await database.validatedAccessToken(
                 accessTokenDigest: otherFamily.accessDigest,
                 requireActiveSubject: false,

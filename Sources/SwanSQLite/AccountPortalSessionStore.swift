@@ -144,6 +144,21 @@ extension SQLiteControlDatabase: ManagementSessionStore,
         }
     }
 
+    public func revokeManagementSessions(accountDID: String, now: Date) async throws {
+        guard !accountDID.isEmpty else {
+            throw AccountControlStoreError.invalidInput
+        }
+        let current = try portalTimestampOrThrow(now)
+        try await withConnectionGate {
+            try await transaction {
+                _ = try await connection.query(
+                    "UPDATE management_sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE account_did = ?",
+                    [.integer(current), .text(accountDID)]
+                )
+            }
+        }
+    }
+
     public func managementSessions(accountDID: String, now: Date) async throws -> [ManagementSessionMetadata] {
         guard !accountDID.isEmpty else { throw AccountControlStoreError.invalidInput }
         let current = try portalTimestampOrThrow(now)

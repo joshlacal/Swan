@@ -81,6 +81,44 @@ final class AccountPortalSessionStoreTests: XCTestCase {
         XCTAssertTrue(retained)
     }
 
+    func testDeactivationAndReactivationRevokesManagementSessions() async throws {
+        let root = try portalTestRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
+        try await database.migrateAccountPortalSessionSchema()
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        _ = try await database.createAccount(try portalRegistration(did: did, handle: "portal.example.com", now: now))
+
+        let sessionDigest = Data(repeating: 0x04, count: 32)
+        let csrfDigest = Data(repeating: 0x05, count: 32)
+        let metadata = try ManagementSessionMetadata(
+            sessionID: try ManagementSessionID(digest: sessionDigest),
+            accountDID: did,
+            issuedAt: now,
+            idleExpiresAt: now.addingTimeInterval(3600),
+            absoluteExpiresAt: now.addingTimeInterval(86400),
+            strength: .password
+        )
+        try await database.createManagementSession(
+            metadata,
+            sessionDigest: sessionDigest,
+            csrfDigest: csrfDigest,
+            now: now
+        )
+        let activeBefore = try await database.managementSessions(accountDID: did, now: now)
+        XCTAssertEqual(activeBefore.count, 1)
+
+        _ = try await database.transitionStatus(did: did, to: .deactivated, declaration: .init(), emitting: nil, now: now.addingTimeInterval(10))
+        _ = try await database.transitionStatus(did: did, to: .active, declaration: .init(), emitting: nil, now: now.addingTimeInterval(20))
+
+        let sessionAfter = try await database.managementSession(digest: sessionDigest, now: now.addingTimeInterval(25))
+        XCTAssertNotNil(sessionAfter?.revokedAt, "management session should remain revoked after deactivation and reactivation")
+        let activeAfter = try await database.managementSessions(accountDID: did, now: now.addingTimeInterval(25))
+        XCTAssertTrue(activeAfter.isEmpty, "active management sessions should be empty after deactivation and reactivation")
+    }
+
     private func portalTestRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("swan-portal-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

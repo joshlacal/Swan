@@ -2324,14 +2324,7 @@ extension SQLiteControlDatabase {
                 // Families are created before authorization-code redemption,
                 // so revoking all of them also prevents a pre-recovery code
                 // from minting a fresh token pair afterwards.
-                _ = try await connection.query(
-                    """
-                    UPDATE oauth_control_token_families
-                    SET revoked_at = COALESCE(revoked_at, ?)
-                    WHERE subject = ?
-                    """,
-                    [.integer(timestamp), .text(request.did)]
-                )
+                try await revokeAllAccountSessionsLocked(did: request.did, timestamp: timestamp)
                 return .completed
             }
         }
@@ -2564,6 +2557,9 @@ extension SQLiteControlDatabase {
                     throw AccountControlStoreError.malformedRecord
                 }
                 if !status.authorizesAccount {
+                    try await revokeAllAccountSessionsLocked(did: did, timestamp: timestamp)
+                }
+                if !status.authorizesAccount {
                     // Suspension/deactivation is also a recovery-proof
                     // revocation boundary. Account status rejects the proof
                     // immediately; cleanup is page-limited so one account
@@ -2640,6 +2636,25 @@ extension SQLiteControlDatabase {
                 return try await requiredAccount(did: did)
             }
         }
+    }
+
+    private func revokeAllAccountSessionsLocked(did: String, timestamp: Int) async throws {
+        _ = try await connection.query(
+            "UPDATE oauth_control_token_families SET revoked_at = COALESCE(revoked_at, ?) WHERE subject = ?",
+            [.integer(timestamp), .text(did)]
+        )
+        _ = try await connection.query(
+            "UPDATE legacy_session_families SET revoked_at = COALESCE(revoked_at, ?) WHERE did = ?",
+            [.integer(timestamp), .text(did)]
+        )
+        _ = try await connection.query(
+            "DELETE FROM legacy_session_tokens WHERE family_id IN (SELECT family_id FROM legacy_session_families WHERE did = ?)",
+            [.text(did)]
+        )
+        _ = try await connection.query(
+            "UPDATE management_sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE account_did = ?",
+            [.integer(timestamp), .text(did)]
+        )
     }
 
     /// Maps an account control status to its public firehose representation.

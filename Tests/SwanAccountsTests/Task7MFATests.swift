@@ -645,6 +645,67 @@ final class Task7MFATests: XCTestCase {
         )
         XCTAssertEqual(wrongPasswordOutcome, .rejected)
     }
+
+    func testPasswordRecoveryInvalidatesStalePasswordGrantAndPreventsLegacyFamilyCreation() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("swan-grant-recovery-\(UUID().uuidString)")
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer {
+            Task { try? await database.close() }
+            try? FileManager.default.removeItem(at: root)
+        }
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        let email = try AccountEmailAddress("person@example.com")
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        _ = try await database.createAccount(
+            AccountControlRegistration(
+                did: did,
+                canonicalHandle: "grant-recovery.example.com",
+                passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$initialsalt$initial-precomputed-verifier",
+                signingKey: .init(purpose: .signing, generation: 1),
+                rotationKey: .init(purpose: .rotation, generation: 1),
+                createdAt: now
+            )
+        )
+        try await database.associateEmail(did: did, email: email, now: now)
+        let verificationDigest = Data(repeating: 0x31, count: 32)
+        let recoveryDigest = Data(repeating: 0x32, count: 32)
+        try await database.issueEmailToken(did: did, email: email, purpose: .verifyEmail, digest: verificationDigest, expiresAt: now.addingTimeInterval(600), now: now)
+        try await database.issueEmailToken(did: did, email: email, purpose: .passwordRecovery, digest: recoveryDigest, expiresAt: now.addingTimeInterval(600), now: now)
+        _ = try await database.consumeEmailToken(digest: verificationDigest, purpose: .verifyEmail, now: now.addingTimeInterval(1))
+
+        let legacyContext = try AccountAuthorizationContext(channel: .legacy, sessionID: "legacy-sess", purpose: "managementLogin")
+        let grantDigest = Data(repeating: 0x44, count: 32)
+        _ = try await database.createPasswordAuthorizationGrant(grantDigest: grantDigest, accountDID: did, context: legacyContext, now: now)
+
+        let confirmationOpt = try await database.passwordRecoveryConfirmation(proofDigest: recoveryDigest, now: now.addingTimeInterval(2))
+        let confirmation = try XCTUnwrap(confirmationOpt)
+        let request = try AccountPasswordRecoveryRequest(
+            confirmation: confirmation,
+            expectedVerifier: "$argon2id$v=19$m=65536,t=2,p=1$initialsalt$initial-precomputed-verifier",
+            replacementVerifier: "$argon2id$v=19$m=65536,t=2,p=1$replacesalt$replacement-precomputed-verifier"
+        )
+        let recovered = try await database.completePasswordRecovery(request, now: now.addingTimeInterval(3))
+        XCTAssertEqual(recovered, .completed)
+
+        // Consuming grant must fail because accounts.updated_at changed
+        do {
+            try await database.createLegacySessionFamilyConsumingGrant(
+                familyID: "legacy-fam-post-recovery",
+                did: did,
+                appPasswordID: nil,
+                accessDigest: Data(repeating: 0x51, count: 32),
+                accessExpiresAt: now.addingTimeInterval(3600),
+                refreshDigest: Data(repeating: 0x52, count: 32),
+                refreshExpiresAt: now.addingTimeInterval(86400),
+                authorizationGrantDigest: grantDigest,
+                authorizationContext: legacyContext,
+                now: now.addingTimeInterval(4)
+            )
+            XCTFail("grant consumption must fail after password recovery")
+        } catch {}
+        let families = try await database.legacySessionFamilies(did: did, now: now.addingTimeInterval(5))
+        XCTAssertTrue(families.isEmpty)
+    }
 }
 
 private actor InMemoryRecoveryCodeStore: RecoveryCodeStore {
