@@ -71,7 +71,7 @@ final class Task4OnboardingTests: XCTestCase {
             identityDID: "did:key:z6Mk", emailProofDigest: Data(repeating: 4, count: 32), inviteDigest: nil,
             peer: peer
         )
-        let service = try SignupService(policy: SignupPolicyService(policy: .openProtected), store: store)
+        let service = try SignupService(policy: SignupPolicyService(policy: .openProtected), store: store, rateAdmission: try SignupInviteRateAdmission())
         do {
             _ = try await service.authorize(input, lifetime: 901)
             XCTFail("authorization lifetime must be bounded")
@@ -92,7 +92,7 @@ final class Task4OnboardingTests: XCTestCase {
             inviteDigest: nil,
             peer: peer
         )
-        let service = try SignupService(policy: SignupPolicyService(policy: .openProtected), store: store)
+        let service = try SignupService(policy: SignupPolicyService(policy: .openProtected), store: store, rateAdmission: try SignupInviteRateAdmission())
         do {
             _ = try await service.authorize(input)
             XCTFail("missing verified email proof must fail")

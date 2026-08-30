@@ -143,7 +143,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             }
         }
         let password = try await issuePassword(fixture)
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             try await client.execute(
                 uri: "/xrpc/com.atproto.server.createSession",
                 method: .post,
@@ -173,7 +173,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
                 try? FileManager.default.removeItem(at: fixture.root)
             }
         }
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             try await client.execute(
                 uri: "/xrpc/com.atproto.server.createSession",
                 method: .post,
@@ -212,7 +212,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             }
         }
         let password = try await issuePassword(fixture)
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             try await client.execute(
                 uri: "/xrpc/com.atproto.server.createSession",
                 method: .post,
@@ -246,7 +246,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             }
         }
         _ = try await issuePassword(fixture)
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             var observed: [String] = []
             var statuses: [HTTPResponse.Status] = []
             for identifier in [self.handle, "nobody.example.com"] {
@@ -279,7 +279,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             }
         }
         let password = try await issuePassword(fixture)
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             try await client.execute(
                 uri: "/xrpc/com.atproto.server.createSession",
                 method: .post,
@@ -314,7 +314,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             createdAt: Date(timeIntervalSince1970: 1_750_000_000)
         )
         try await fixture.database.saveFactor(factor, now: Date(timeIntervalSince1970: 1_750_000_000))
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             try await client.execute(
                 uri: "/xrpc/com.atproto.server.createSession",
                 method: .post,
@@ -350,7 +350,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             createdAt: Date(timeIntervalSince1970: 1_750_000_000)
         )
         try await fixture.database.saveFactor(factor, now: Date(timeIntervalSince1970: 1_750_000_000))
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             try await client.execute(
                 uri: "/xrpc/com.atproto.server.createSession",
                 method: .post,
@@ -386,7 +386,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             createdAt: Date(timeIntervalSince1970: 1_750_000_000)
         )
         try await fixture.database.saveFactor(factor, now: Date(timeIntervalSince1970: 1_750_000_000))
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             try await client.execute(
                 uri: "/xrpc/com.atproto.server.createSession",
                 method: .post,
@@ -422,7 +422,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
         )
         try await fixture.database.saveFactor(factor, now: Date(timeIntervalSince1970: 1_750_000_000))
         let appPassword = try await issuePassword(fixture)
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             try await client.execute(
                 uri: "/xrpc/com.atproto.server.createSession",
                 method: .post,
@@ -575,7 +575,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             }
         }
         let password = try await issuePassword(fixture)
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             // Attempt 1 consumes the single attempt
             try await client.execute(
                 uri: "/xrpc/com.atproto.server.createSession",
@@ -613,7 +613,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             }
         }
         let password = try await issuePassword(fixture)
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             var access = ""
             var refresh = ""
             try await client.execute(
@@ -714,7 +714,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             fixture,
             scopes: "atproto rpc:\(method)?aud=did:web:remote.example%23pds"
         )
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             var access = ""
             try await client.execute(
                 uri: "/xrpc/com.atproto.server.createSession",
@@ -781,7 +781,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             fixture,
             scopes: "atproto rpc:\(method)?aud=did:web:remote.example%23pds"
         )
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             var access = ""
             try await client.execute(
                 uri: "/xrpc/com.atproto.server.createSession",
@@ -841,7 +841,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
                 try? FileManager.default.removeItem(at: fixture.root)
             }
         }
-        try await app(fixture).test(.router) { client in
+        try await app(fixture).test(.live) { client in
             let fullToken = try await self.fullAccessToken(client, fixture: fixture)
             let scoped = try await self.issuePassword(fixture, name: "scoped")
             var scopedToken = ""

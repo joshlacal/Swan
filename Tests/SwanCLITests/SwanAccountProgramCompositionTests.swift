@@ -291,10 +291,11 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
         )
         defer { fixture.cleanup() }
         do {
-            let app = fixture.server.buildApplication(
+            let app = Application(
+                router: fixture.server.buildRouter(),
                 logger: Logger(label: "SwanAccountProgramCompositionTests.legacy")
             )
-            try await app.test(.router) { client in
+            try await app.test(.ahc()) { client in
                 var steered = HTTPFields()
                 steered[.contentType] = "application/json"
                 steered[HTTPField.Name("atproto-proxy")!] = "did:web:attacker.example#svc"
@@ -339,10 +340,11 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
         )
         defer { fixture.cleanup() }
         do {
-            let app = fixture.server.buildApplication(
+            let app = Application(
+                router: fixture.server.buildRouter(),
                 logger: Logger(label: "SwanAccountProgramCompositionTests.refresh")
             )
-            try await app.test(.router) { client in
+            try await app.test(.ahc()) { client in
                 // Establish a legacy session to obtain a real refresh JWT.
                 var refreshJwt: String?
                 try await client.execute(
@@ -517,10 +519,11 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 publicRepositoryReadDirectory: try XCTUnwrap(directory),
                 legacySessionXRPC: legacy
             )
-            let app = server.buildApplication(
+            let app = Application(
+                router: server.buildRouter(),
                 logger: Logger(label: "SwanAccountProgramCompositionTests.service-auth")
             )
-            try await app.test(.router) { client in
+            try await app.test(.ahc()) { client in
                 var accessJWT = ""
                 try await client.execute(
                     uri: "/xrpc/com.atproto.server.createSession",
@@ -1127,6 +1130,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     policy: policyService,
                     store: control,
                     turnstile: turnstile,
+                    rateAdmission: try SignupInviteRateAdmission(),
                     proofVerifier: BoundedSignupEmailProofVerifier(store: control),
                     proofService: proofService
                 )

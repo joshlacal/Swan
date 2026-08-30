@@ -367,6 +367,7 @@ final class SwanOnboardingHTTPTests: XCTestCase, @unchecked Sendable {
                     policy: policyService,
                     store: control,
                     turnstile: turnstile,
+                    rateAdmission: try SignupInviteRateAdmission(),
                     proofVerifier: BoundedSignupEmailProofVerifier(store: control),
                     proofService: proofService
                 )

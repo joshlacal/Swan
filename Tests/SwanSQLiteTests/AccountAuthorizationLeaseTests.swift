@@ -215,10 +215,51 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
                     now: now.addingTimeInterval(4)
                 )
                 XCTFail("stale grant must not be usable after reactivation")
-            } catch AccountControlStoreError.notFound {}
+            } catch AccountControlStoreError.invalidTransition {}
         }
         await control.setConnectionGateWaiterEnqueuedForTesting(nil)
         try await control.close()
+    }
+
+    
+    func testFailedGrantFamilyInsertRollsBackGrantConsumption() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("SwanGrantRollback-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        addTeardownBlock { [control, root] in
+            try? await control.close()
+            try? FileManager.default.removeItem(at: root)
+        }
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        _ = try await control.createAccount(AccountControlRegistration(
+            did: did, canonicalHandle: "grant-rollback.example.com",
+            passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+            signingKey: .init(purpose: .signing, generation: 1), rotationKey: .init(purpose: .rotation, generation: 1), createdAt: now
+        ))
+        let context = try AccountAuthorizationContext(channel: .legacy, sessionID: "grant-rollback", purpose: "managementLogin")
+        let grant = try await control.createPasswordAuthorizationGrant(
+            grantDigest: Data(repeating: 0x71, count: 32), accountDID: did, context: context, now: now
+        )
+        try await control.createLegacySessionFamily(
+            familyID: "occupied-family", did: did, appPasswordID: nil,
+            accessDigest: Data(repeating: 0x72, count: 32), accessExpiresAt: now.addingTimeInterval(3_600),
+            refreshDigest: Data(repeating: 0x73, count: 32), refreshExpiresAt: now.addingTimeInterval(90 * 86_400), now: now
+        )
+        do {
+            try await control.createLegacySessionFamilyConsumingGrant(
+                familyID: "occupied-family", did: did, appPasswordID: nil,
+                accessDigest: Data(repeating: 0x74, count: 32), accessExpiresAt: now.addingTimeInterval(3_600),
+                refreshDigest: Data(repeating: 0x75, count: 32), refreshExpiresAt: now.addingTimeInterval(90 * 86_400),
+                authorizationGrantDigest: grant.grantDigest, authorizationContext: context, now: now
+            )
+            XCTFail("duplicate family insertion must fail")
+        } catch {}
+        try await control.createLegacySessionFamilyConsumingGrant(
+            familyID: "after-rollback-family", did: did, appPasswordID: nil,
+            accessDigest: Data(repeating: 0x76, count: 32), accessExpiresAt: now.addingTimeInterval(3_600),
+            refreshDigest: Data(repeating: 0x77, count: 32), refreshExpiresAt: now.addingTimeInterval(90 * 86_400),
+            authorizationGrantDigest: grant.grantDigest, authorizationContext: context, now: now
+        )
     }
 
     func testFirehoseAuthorizationFencePassesLiveGenerationAndRejectsInactive() async throws {
