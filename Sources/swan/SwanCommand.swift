@@ -4241,10 +4241,12 @@ extension SwanCommand {
                             database: controlDatabase,
                             signupSecret: signupSecret
                         )
+                        let signupRateAdmission = try SignupInviteRateAdmission()
                         let service = SignupService(
                             policy: policyService,
                             store: controlDatabase,
                             turnstile: turnstile,
+                            rateAdmission: signupRateAdmission,
                             proofVerifier: BoundedSignupEmailProofVerifier(
                                 store: controlDatabase
                             ),
