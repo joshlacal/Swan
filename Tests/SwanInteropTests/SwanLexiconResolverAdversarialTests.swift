@@ -427,11 +427,11 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
         }
         let now = Date()
 
-        // 1. Insert 4,096 negative rows (some expired, some fresh)
+        // 1. Insert 4,096 negative rows (500 expired, 3,596 fresh) with distinct deterministic timestamps
         for i in 0 ..< 4_096 {
             let updatedAt = i < 500
-                ? now.addingTimeInterval(-7200)
-                : now.addingTimeInterval(Double(i - 500) * 0.001)
+                ? now.addingTimeInterval(-7200 + Double(i))
+                : now.addingTimeInterval(-1800 + Double(i - 500))
             let row = OAuthLexiconDocumentRow(
                 nsid: "com.example.neg\(i)",
                 document: nil,
@@ -441,22 +441,26 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
                 updatedAt: updatedAt,
                 lastSucceededAt: nil
             )
-            try await store.storeLexicon(row)
+            try await store.storeLexiconDirectly(row)
         }
+        let countAfterInitialFill = try await store.countNegativeLexicons()
+        XCTAssertEqual(countAfterInitialFill, 4_096)
 
-        // Updating an existing negative NSID remains allowed
+        // Updating an existing negative NSID remains allowed without changing row count
         let updatedExisting = OAuthLexiconDocumentRow(
-            nsid: "com.example.neg1000",
+            nsid: "com.example.neg0",
             document: nil,
             sourceURI: nil,
             verifiedCID: nil,
-            createdAt: now,
-            updatedAt: now,
+            createdAt: now.addingTimeInterval(-7200),
+            updatedAt: now.addingTimeInterval(-7200),
             lastSucceededAt: nil
         )
         try await store.storeLexicon(updatedExisting)
+        let countAfterExistingUpdate = try await store.countNegativeLexicons()
+        XCTAssertEqual(countAfterExistingUpdate, 4_096)
 
-        // 2. Insert 4,097th negative row when expired rows exist -> evicts up to 512 expired rows and succeeds!
+        // 2. Insert 4,097th negative row when expired rows exist -> evicts 512 expired rows and inserts 1 row!
         let row4097 = OAuthLexiconDocumentRow(
             nsid: "com.example.neg4096",
             document: nil,
@@ -468,11 +472,19 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
         )
         try await store.storeLexicon(row4097)
 
-        // Check that expired rows were evicted (e.g. com.example.neg0 is gone)
-        let evicted = try await store.findLexicon(nsid: "com.example.neg0")
-        XCTAssertNil(evicted, "expired negative row should be evicted")
+        // Check that expired rows were evicted (e.g. com.example.neg0 and neg499 are gone, neg500 remains)
+        let evicted0 = try await store.findLexicon(nsid: "com.example.neg0")
+        XCTAssertNil(evicted0, "expired negative row should be evicted")
+        let evicted499 = try await store.findLexicon(nsid: "com.example.neg499")
+        XCTAssertNil(evicted499, "expired negative row should be evicted")
+        let fresh500 = try await store.findLexicon(nsid: "com.example.neg500")
+        XCTAssertNotNil(fresh500, "fresh negative row should not be evicted by expiry")
+        // 4096 - 500 expired + 1 new = 3597
+        let countAfterExpiredEviction = try await store.countNegativeLexicons()
+        XCTAssertEqual(countAfterExpiredEviction, 3_597)
+        XCTAssertLessThanOrEqual(countAfterExpiredEviction, 4_096)
 
-        // 3. Fill the remaining slots with fresh negatives, then verify that
+        // 3. Fill the remaining slots with fresh negatives (3597 + 499 = 4096), then verify that
         // admission evicts the oldest negative row transactionally.
         for i in 0 ..< 499 {
             let timestamp = now.addingTimeInterval(Double(5000 + i) * 0.001)
@@ -488,6 +500,9 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
                 )
             )
         }
+        let countAfterFill = try await store.countNegativeLexicons()
+        XCTAssertEqual(countAfterFill, 4_096)
+
         let oldestRow = try await store.findLexicon(nsid: "com.example.neg500")
         XCTAssertNotNil(oldestRow)
         let overCapNegative = OAuthLexiconDocumentRow(
@@ -495,8 +510,8 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
             document: nil,
             sourceURI: nil,
             verifiedCID: nil,
-            createdAt: now,
-            updatedAt: now,
+            createdAt: now.addingTimeInterval(10),
+            updatedAt: now.addingTimeInterval(10),
             lastSucceededAt: nil
         )
         try await store.storeLexicon(overCapNegative)
@@ -504,7 +519,10 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
         let admitted = try await store.findLexicon(nsid: overCapNegative.nsid)
         XCTAssertNil(evictedOldest)
         XCTAssertNotNil(admitted)
-        // 4. Converting an existing negative NSID to positive frees a negative slot
+        let countAfterOverflow = try await store.countNegativeLexicons()
+        XCTAssertEqual(countAfterOverflow, 4_096)
+
+        // 4. Converting an actually-admitted negative NSID to positive frees a negative slot
         let positiveDoc = Data("valid-doc".utf8)
         let convertedPositive = OAuthLexiconDocumentRow(
             nsid: "com.example.neg1000",
@@ -518,9 +536,27 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
         try await store.storeLexicon(convertedPositive)
         let foundConverted = try await store.findLexicon(nsid: "com.example.neg1000")
         XCTAssertEqual(foundConverted?.document, positiveDoc)
+        // Negative count dropped by 1 because neg1000 is now positive!
+        let countAfterConversion = try await store.countNegativeLexicons()
+        XCTAssertEqual(countAfterConversion, 4_095)
 
-        // Now we can insert one more negative row because one negative slot was freed!
-        try await store.storeLexicon(overCapNegative)
+        // Now we can insert a fresh, distinct, never-before-stored negative NSID without evicting any negative row!
+        let freshNegative = OAuthLexiconDocumentRow(
+            nsid: "com.example.neg.fresh_after_conversion",
+            document: nil,
+            sourceURI: nil,
+            verifiedCID: nil,
+            createdAt: now.addingTimeInterval(20),
+            updatedAt: now.addingTimeInterval(20),
+            lastSucceededAt: nil
+        )
+        try await store.storeLexicon(freshNegative)
+        let foundFreshNegative = try await store.findLexicon(nsid: "com.example.neg.fresh_after_conversion")
+        XCTAssertNotNil(foundFreshNegative)
+        let countAfterFreshNegative = try await store.countNegativeLexicons()
+        XCTAssertEqual(countAfterFreshNegative, 4_096)
+
+        // And verify that com.example.neg.overflow was NOT evicted when inserting into the freed slot!
         let foundOverCap = try await store.findLexicon(nsid: "com.example.neg.overflow")
         XCTAssertNotNil(foundOverCap)
 
@@ -550,6 +586,8 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
 
         let preservedPositive = try await store.findLexicon(nsid: "com.example.pos.old")
         XCTAssertNotNil(preservedPositive, "positive rows must never be deleted by negative eviction")
+        let countFinal = try await store.countNegativeLexicons()
+        XCTAssertLessThanOrEqual(countFinal, 4_096)
     }
 
     func testSaturatedNegativeCacheDoesNotFailUnresolvableLexicon() async throws {
@@ -618,6 +656,56 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
         // 3. Resolving an unresolvable NSID must return .unresolvable, NOT throw SwanError.unavailable
         let resolution = try await resolver.resolve("com.example.unresolvable")
         XCTAssertEqual(resolution, SwanLexiconResolution.unresolvable)
+    }
+
+    func testSaturatedDNSGateDoesNotWriteNegativeLexiconCacheRow() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("lexicon-store-dns-sat-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let store = try await SQLiteControlDatabase(dataDirectory: tempDir)
+        defer {
+            Task { try? await store.close() }
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+        let now = Date()
+
+        // Create a DNS resolver with a saturated admission gate
+        let gate = HandleDNSAdmissionGate(maxActive: 1, maxQueued: 0)
+        try await gate.acquire()
+        let dns = SystemATHandleDNSResolver(gate: gate)
+
+        let validKey = try await P256.Signing.PublicKey(
+            x963Representation: PublicRepositoryProofFixtureBuilder.build(.valid).documentPublicKeyX963
+        )
+        let resolver = try SwanLexiconResolver(
+            dns: dns,
+            authorities: AdversarialAuthorityResolver(
+                authority: SwanLexiconAuthority(
+                    pdsEndpoint: URL(string: "https://pds.example.net")!,
+                    commitVerifier: PermissionedDataPublicRepositoryCommitVerifier(
+                        key: .p256(validKey)
+                    )
+                )
+            ),
+            fetcher: OAuthRemoteDocumentFetcher(
+                policy: try OAuthRemoteFetchPolicy(),
+                resolver: AdversarialHostnameResolver(),
+                transport: AdversarialTransport(body: Data(), error: nil, blocksUntilCancelled: false)
+            ),
+            store: store,
+            now: { now }
+        )
+
+        let testNSID = "com.example.transient.saturation"
+        do {
+            _ = try await resolver.resolve(testNSID)
+            XCTFail("expected resolution to throw transient admission saturation error")
+        } catch {
+            // Transient local admission saturation must NOT create a negative lexicon cache row!
+            let cached = try await store.findLexicon(nsid: testNSID)
+            XCTAssertNil(cached, "DNS admission saturation must never write a negative lexicon cache row")
+        }
+
+        gate.release()
     }
 }
 

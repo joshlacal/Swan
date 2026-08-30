@@ -559,7 +559,7 @@ final class ATHandleVerificationTests: XCTestCase {
             try await gate.acquire()
             XCTFail("expected admission failure when queue is full")
         } catch {
-            XCTAssertEqual(error as? ATHandleVerificationError, .unavailable)
+            XCTAssertEqual(error as? ATHandleDNSAdmissionError, .saturated)
         }
     }
 
@@ -588,7 +588,7 @@ final class ATHandleVerificationTests: XCTestCase {
             try await gate.acquire()
             XCTFail("expected unavailable")
         } catch {
-            XCTAssertEqual(error as? ATHandleVerificationError, .unavailable)
+            XCTAssertEqual(error as? ATHandleDNSAdmissionError, .saturated)
         }
 
         // Cancel waiter1 -> must leave queue
@@ -641,14 +641,14 @@ final class ATHandleVerificationTests: XCTestCase {
             _ = try await resolver.txtRecords(name: "_atproto.example.com")
             XCTFail("expected unavailable error when gate is saturated")
         } catch {
-            XCTAssertEqual(error as? ATHandleVerificationError, .unavailable)
+            XCTAssertEqual(error as? ATHandleDNSAdmissionError, .saturated)
         }
 
         do {
             _ = try await resolver.addresses(host: "example.com")
             XCTFail("expected unavailable error when gate is saturated")
         } catch {
-            XCTAssertEqual(error as? ATHandleVerificationError, .unavailable)
+            XCTAssertEqual(error as? ATHandleDNSAdmissionError, .saturated)
         }
 
         gate.release()

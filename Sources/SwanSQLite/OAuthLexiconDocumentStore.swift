@@ -73,6 +73,15 @@ public protocol OAuthLexiconDocumentStore: Sendable {
     func findLexicon(nsid: String) async throws -> OAuthLexiconDocumentRow?
     func storeLexicon(_ row: OAuthLexiconDocumentRow) async throws
     func deleteLexicon(nsid: String) async throws
+    func countNegativeLexicons() async throws -> Int
+    func storeLexiconDirectly(_ row: OAuthLexiconDocumentRow) async throws
+}
+
+extension OAuthLexiconDocumentStore {
+    public func countNegativeLexicons() async throws -> Int { 0 }
+    public func storeLexiconDirectly(_ row: OAuthLexiconDocumentRow) async throws {
+        try await storeLexicon(row)
+    }
 }
 
 /// Durable resolved-lexicon cache in `control.sqlite`.
@@ -148,7 +157,7 @@ extension SQLiteControlDatabase: OAuthLexiconDocumentStore {
                     WHERE nsid IN (
                         SELECT nsid FROM oauth_lexicon_documents
                         WHERE document IS NULL AND updated_at < ?
-                        ORDER BY updated_at ASC
+                        ORDER BY updated_at ASC, nsid ASC
                         LIMIT ?
                     )
                     """,
@@ -176,7 +185,7 @@ extension SQLiteControlDatabase: OAuthLexiconDocumentStore {
                                 WHERE nsid = (
                                     SELECT nsid FROM oauth_lexicon_documents
                                     WHERE document IS NULL
-                                    ORDER BY updated_at ASC
+                                    ORDER BY updated_at ASC, nsid ASC
                                     LIMIT 1
                                 )
                                 """
@@ -231,6 +240,55 @@ extension SQLiteControlDatabase: OAuthLexiconDocumentStore {
                     [.text(nsid)]
                 )
             }
+        }
+    }
+
+    public func countNegativeLexicons() async throws -> Int {
+        try await withConnectionGate {
+            let rows = try await connection.query(
+                "SELECT COUNT(*) AS count FROM oauth_lexicon_documents WHERE document IS NULL"
+            )
+            guard let row = rows.first,
+                  case let .integer(count) = row.column("count") else {
+                throw OAuthControlStoreError.malformedRecord
+            }
+            return count
+        }
+    }
+
+    public func storeLexiconDirectly(_ row: OAuthLexiconDocumentRow) async throws {
+        guard Self.validLexiconNSID(row.nsid) else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        let createdAt = try Self.lexiconTimestamp(row.createdAt)
+        let updatedAt = try Self.lexiconTimestamp(row.updatedAt)
+        let lastSucceededAt = try row.lastSucceededAt.map(Self.lexiconTimestamp)
+        let params: [SQLiteData] = [
+            .text(row.nsid),
+            row.document.map { $0.sqliteData! } ?? .null,
+            row.sourceURI.map(SQLiteData.text) ?? .null,
+            row.verifiedCID.map(SQLiteData.text) ?? .null,
+            .integer(createdAt),
+            .integer(updatedAt),
+            lastSucceededAt.map(SQLiteData.integer) ?? .null,
+        ]
+        try await withConnectionGate {
+            _ = try await connection.query(
+                """
+                INSERT INTO oauth_lexicon_documents(
+                    nsid, document, source_uri, verified_cid,
+                    created_at, updated_at, last_succeeded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(nsid) DO UPDATE SET
+                    document = excluded.document,
+                    source_uri = excluded.source_uri,
+                    verified_cid = excluded.verified_cid,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at,
+                    last_succeeded_at = excluded.last_succeeded_at
+                """,
+                params
+            )
         }
     }
 

@@ -14,6 +14,10 @@ public enum ATHandleVerificationError: Error, Sendable, Equatable {
     case unavailable
 }
 
+public enum ATHandleDNSAdmissionError: Error, Sendable, Equatable {
+    case saturated
+}
+
 public enum ATHandleIPAddress: Hashable, Sendable, Equatable, CustomStringConvertible {
     case ipv4(UInt32)
     case ipv6(Data)
@@ -101,31 +105,30 @@ public protocol ATHandleDNSResolving: Sendable {
     func addresses(host: String) async throws -> [ATHandleIPAddress]
 }
 
-final class HandleDNSAdmissionGate: @unchecked Sendable {
+public final class HandleDNSAdmissionGate: @unchecked Sendable {
     private let lock = NSLock()
     private var active: Int = 0
     private var queued: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
-    let maxActive: Int
-    let maxQueued: Int
+    public let maxActive: Int
+    public let maxQueued: Int
 
-    init(maxActive: Int = 8, maxQueued: Int = 128) {
+    public init(maxActive: Int = 8, maxQueued: Int = 128) {
         self.maxActive = maxActive
         self.maxQueued = maxQueued
     }
 
-    var activeCount: Int {
+    public var activeCount: Int {
         lock.lock()
         defer { lock.unlock() }
         return active
     }
 
-    var queuedCount: Int {
+    public var queuedCount: Int {
         lock.lock()
         defer { lock.unlock() }
         return queued.count
     }
-
-    func acquire() async throws {
+    public func acquire() async throws {
         let id = UUID()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -144,7 +147,7 @@ final class HandleDNSAdmissionGate: @unchecked Sendable {
                     }
                 } else {
                     lock.unlock()
-                    continuation.resume(throwing: ATHandleVerificationError.unavailable)
+                    continuation.resume(throwing: ATHandleDNSAdmissionError.saturated)
                 }
             }
         } onCancel: {
@@ -164,7 +167,7 @@ final class HandleDNSAdmissionGate: @unchecked Sendable {
         waiter?.continuation.resume(throwing: CancellationError())
     }
 
-    func release() {
+    public func release() {
         lock.lock()
         precondition(active > 0, "HandleDNSAdmissionGate released with active count 0")
         let next: (id: UUID, continuation: CheckedContinuation<Void, Error>)?
@@ -180,17 +183,16 @@ final class HandleDNSAdmissionGate: @unchecked Sendable {
 }
 
 public struct SystemATHandleDNSResolver: ATHandleDNSResolving {
-    static let defaultGate = HandleDNSAdmissionGate(maxActive: 8, maxQueued: 128)
-    let gate: HandleDNSAdmissionGate
+    public static let defaultGate = HandleDNSAdmissionGate(maxActive: 8, maxQueued: 128)
+    public let gate: HandleDNSAdmissionGate
 
     public init() {
         self.gate = Self.defaultGate
     }
 
-    init(gate: HandleDNSAdmissionGate) {
+    public init(gate: HandleDNSAdmissionGate) {
         self.gate = gate
     }
-
     public func txtRecords(name: String) async throws -> [ATHandleTXTRecord] {
         try await gate.acquire()
         return try await withCheckedThrowingContinuation { continuation in
