@@ -74,14 +74,6 @@ public protocol OAuthLexiconDocumentStore: Sendable {
     func storeLexicon(_ row: OAuthLexiconDocumentRow) async throws
     func deleteLexicon(nsid: String) async throws
     func countNegativeLexicons() async throws -> Int
-    func storeLexiconDirectly(_ row: OAuthLexiconDocumentRow) async throws
-}
-
-extension OAuthLexiconDocumentStore {
-    public func countNegativeLexicons() async throws -> Int { 0 }
-    public func storeLexiconDirectly(_ row: OAuthLexiconDocumentRow) async throws {
-        try await storeLexicon(row)
-    }
 }
 
 /// Durable resolved-lexicon cache in `control.sqlite`.
@@ -256,41 +248,6 @@ extension SQLiteControlDatabase: OAuthLexiconDocumentStore {
         }
     }
 
-    public func storeLexiconDirectly(_ row: OAuthLexiconDocumentRow) async throws {
-        guard Self.validLexiconNSID(row.nsid) else {
-            throw OAuthControlStoreError.invalidInput
-        }
-        let createdAt = try Self.lexiconTimestamp(row.createdAt)
-        let updatedAt = try Self.lexiconTimestamp(row.updatedAt)
-        let lastSucceededAt = try row.lastSucceededAt.map(Self.lexiconTimestamp)
-        let params: [SQLiteData] = [
-            .text(row.nsid),
-            row.document.map { $0.sqliteData! } ?? .null,
-            row.sourceURI.map(SQLiteData.text) ?? .null,
-            row.verifiedCID.map(SQLiteData.text) ?? .null,
-            .integer(createdAt),
-            .integer(updatedAt),
-            lastSucceededAt.map(SQLiteData.integer) ?? .null,
-        ]
-        try await withConnectionGate {
-            _ = try await connection.query(
-                """
-                INSERT INTO oauth_lexicon_documents(
-                    nsid, document, source_uri, verified_cid,
-                    created_at, updated_at, last_succeeded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(nsid) DO UPDATE SET
-                    document = excluded.document,
-                    source_uri = excluded.source_uri,
-                    verified_cid = excluded.verified_cid,
-                    created_at = excluded.created_at,
-                    updated_at = excluded.updated_at,
-                    last_succeeded_at = excluded.last_succeeded_at
-                """,
-                params
-            )
-        }
-    }
 
     // MARK: - Row coding
 

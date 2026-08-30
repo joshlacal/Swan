@@ -427,11 +427,57 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
         }
         let now = Date()
 
-        // 1. Insert 4,096 negative rows (500 expired, 3,596 fresh) with distinct deterministic timestamps
+        // 1. Expired negative eviction with 512 batch limit
+        for i in 0 ..< 1_000 {
+            let updatedAt = now.addingTimeInterval(-7200 + Double(i) * 0.1)
+            let row = OAuthLexiconDocumentRow(
+                nsid: "com.example.expired\(i)",
+                document: nil,
+                sourceURI: nil,
+                verifiedCID: nil,
+                createdAt: updatedAt,
+                updatedAt: updatedAt,
+                lastSucceededAt: nil
+            )
+            try await store.storeLexicon(row)
+        }
+        let countAfterExpiredFill = try await store.countNegativeLexicons()
+        XCTAssertEqual(countAfterExpiredFill, 1_000)
+
+        // Inserting a row at `now` triggers eviction of up to 512 rows older than 1 hour
+        let triggerRow = OAuthLexiconDocumentRow(
+            nsid: "com.example.trigger",
+            document: nil,
+            sourceURI: nil,
+            verifiedCID: nil,
+            createdAt: now,
+            updatedAt: now,
+            lastSucceededAt: nil
+        )
+        try await store.storeLexicon(triggerRow)
+
+        // Exactly 512 oldest rows are evicted (expired0..expired511), expired512..expired999 remain
+        let evicted0 = try await store.findLexicon(nsid: "com.example.expired0")
+        XCTAssertNil(evicted0, "expired negative row should be evicted")
+        let evicted511 = try await store.findLexicon(nsid: "com.example.expired511")
+        XCTAssertNil(evicted511, "expired negative row within batch bound should be evicted")
+        let fresh512 = try await store.findLexicon(nsid: "com.example.expired512")
+        XCTAssertNotNil(fresh512, "expired negative row beyond batch bound should remain until next batch")
+        // 1000 - 512 expired + 1 trigger = 489
+        let countAfterExpiredEviction = try await store.countNegativeLexicons()
+        XCTAssertEqual(countAfterExpiredEviction, 489)
+
+        // Clean up remaining expired rows to test full 4,096 fresh capacity
+        for i in 512 ..< 1_000 {
+            try await store.deleteLexicon(nsid: "com.example.expired\(i)")
+        }
+        try await store.deleteLexicon(nsid: "com.example.trigger")
+        let countReset = try await store.countNegativeLexicons()
+        XCTAssertEqual(countReset, 0)
+
+        // 2. Fill negative cache to exactly 4,096 fresh rows (none expired)
         for i in 0 ..< 4_096 {
-            let updatedAt = i < 500
-                ? now.addingTimeInterval(-7200 + Double(i))
-                : now.addingTimeInterval(-1800 + Double(i - 500))
+            let updatedAt = now.addingTimeInterval(-1800 + Double(i) * 0.1)
             let row = OAuthLexiconDocumentRow(
                 nsid: "com.example.neg\(i)",
                 document: nil,
@@ -441,10 +487,10 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
                 updatedAt: updatedAt,
                 lastSucceededAt: nil
             )
-            try await store.storeLexiconDirectly(row)
+            try await store.storeLexicon(row)
         }
-        let countAfterInitialFill = try await store.countNegativeLexicons()
-        XCTAssertEqual(countAfterInitialFill, 4_096)
+        let countAfterFill = try await store.countNegativeLexicons()
+        XCTAssertEqual(countAfterFill, 4_096)
 
         // Updating an existing negative NSID remains allowed without changing row count
         let updatedExisting = OAuthLexiconDocumentRow(
@@ -452,59 +498,15 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
             document: nil,
             sourceURI: nil,
             verifiedCID: nil,
-            createdAt: now.addingTimeInterval(-7200),
-            updatedAt: now.addingTimeInterval(-7200),
+            createdAt: now.addingTimeInterval(-1800),
+            updatedAt: now.addingTimeInterval(-1800),
             lastSucceededAt: nil
         )
         try await store.storeLexicon(updatedExisting)
         let countAfterExistingUpdate = try await store.countNegativeLexicons()
         XCTAssertEqual(countAfterExistingUpdate, 4_096)
 
-        // 2. Insert 4,097th negative row when expired rows exist -> evicts 512 expired rows and inserts 1 row!
-        let row4097 = OAuthLexiconDocumentRow(
-            nsid: "com.example.neg4096",
-            document: nil,
-            sourceURI: nil,
-            verifiedCID: nil,
-            createdAt: now,
-            updatedAt: now,
-            lastSucceededAt: nil
-        )
-        try await store.storeLexicon(row4097)
-
-        // Check that expired rows were evicted (e.g. com.example.neg0 and neg499 are gone, neg500 remains)
-        let evicted0 = try await store.findLexicon(nsid: "com.example.neg0")
-        XCTAssertNil(evicted0, "expired negative row should be evicted")
-        let evicted499 = try await store.findLexicon(nsid: "com.example.neg499")
-        XCTAssertNil(evicted499, "expired negative row should be evicted")
-        let fresh500 = try await store.findLexicon(nsid: "com.example.neg500")
-        XCTAssertNotNil(fresh500, "fresh negative row should not be evicted by expiry")
-        // 4096 - 500 expired + 1 new = 3597
-        let countAfterExpiredEviction = try await store.countNegativeLexicons()
-        XCTAssertEqual(countAfterExpiredEviction, 3_597)
-        XCTAssertLessThanOrEqual(countAfterExpiredEviction, 4_096)
-
-        // 3. Fill the remaining slots with fresh negatives (3597 + 499 = 4096), then verify that
-        // admission evicts the oldest negative row transactionally.
-        for i in 0 ..< 499 {
-            let timestamp = now.addingTimeInterval(Double(5000 + i) * 0.001)
-            try await store.storeLexicon(
-                OAuthLexiconDocumentRow(
-                    nsid: "com.example.fill\(i)",
-                    document: nil,
-                    sourceURI: nil,
-                    verifiedCID: nil,
-                    createdAt: timestamp,
-                    updatedAt: timestamp,
-                    lastSucceededAt: nil
-                )
-            )
-        }
-        let countAfterFill = try await store.countNegativeLexicons()
-        XCTAssertEqual(countAfterFill, 4_096)
-
-        let oldestRow = try await store.findLexicon(nsid: "com.example.neg500")
-        XCTAssertNotNil(oldestRow)
+        // 3. Insert 4,097th negative row when no expired rows exist -> turns over oldest negative row
         let overCapNegative = OAuthLexiconDocumentRow(
             nsid: "com.example.neg.overflow",
             document: nil,
@@ -515,9 +517,11 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
             lastSucceededAt: nil
         )
         try await store.storeLexicon(overCapNegative)
-        let evictedOldest = try await store.findLexicon(nsid: "com.example.neg500")
+        let evictedOldest = try await store.findLexicon(nsid: "com.example.neg0")
+        let preserved1 = try await store.findLexicon(nsid: "com.example.neg1")
         let admitted = try await store.findLexicon(nsid: overCapNegative.nsid)
         XCTAssertNil(evictedOldest)
+        XCTAssertNotNil(preserved1)
         XCTAssertNotNil(admitted)
         let countAfterOverflow = try await store.countNegativeLexicons()
         XCTAssertEqual(countAfterOverflow, 4_096)
@@ -573,16 +577,16 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
         try await store.storeLexicon(oldPositive)
 
         // Trigger negative cleanup by storing another row
-        let triggerRow = OAuthLexiconDocumentRow(
-            nsid: "com.example.trigger",
+        let triggerPositiveRow = OAuthLexiconDocumentRow(
+            nsid: "com.example.trigger.pos",
             document: positiveDoc,
-            sourceURI: "at://did:plc:test/com.atproto.lexicon.schema/com.example.trigger",
+            sourceURI: "at://did:plc:test/com.atproto.lexicon.schema/com.example.trigger.pos",
             verifiedCID: "bafytestcid",
             createdAt: now,
             updatedAt: now,
             lastSucceededAt: now
         )
-        try await store.storeLexicon(triggerRow)
+        try await store.storeLexicon(triggerPositiveRow)
 
         let preservedPositive = try await store.findLexicon(nsid: "com.example.pos.old")
         XCTAssertNotNil(preservedPositive, "positive rows must never be deleted by negative eviction")
@@ -949,5 +953,9 @@ private actor AdversarialLexiconStore: OAuthLexiconDocumentStore {
 
     func deleteLexicon(nsid: String) async throws {
         rows[nsid] = nil
+    }
+
+    func countNegativeLexicons() async throws -> Int {
+        rows.values.filter { $0.document == nil }.count
     }
 }

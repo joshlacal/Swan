@@ -907,6 +907,10 @@ private actor InMemoryLexiconStore: OAuthLexiconDocumentStore {
     func deleteLexicon(nsid: String) async throws {
         rows[nsid] = nil
     }
+
+    func countNegativeLexicons() async throws -> Int {
+        rows.values.filter { $0.document == nil }.count
+    }
 }
 private actor ThrowingLexiconStore: OAuthLexiconDocumentStore {
     func findLexicon(nsid: String) async throws -> OAuthLexiconDocumentRow? { nil }
@@ -916,4 +920,5 @@ private actor ThrowingLexiconStore: OAuthLexiconDocumentStore {
     }
 
     func deleteLexicon(nsid: String) async throws {}
+    func countNegativeLexicons() async throws -> Int { 0 }
 }

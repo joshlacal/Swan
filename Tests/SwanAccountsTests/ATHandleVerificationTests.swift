@@ -653,6 +653,41 @@ final class ATHandleVerificationTests: XCTestCase {
 
         gate.release()
     }
+
+    func testHandleVerifierMapsSaturatedDNSToUnavailableRatherThanVerificationFailed() async throws {
+        let gate = HandleDNSAdmissionGate(maxActive: 1, maxQueued: 0)
+        let dns = SystemATHandleDNSResolver(gate: gate)
+        let verifier = ATProtocolHandleVerifier(
+            policy: try .production(),
+            dns: dns,
+            http: FakeHandleHTTP([])
+        )
+        try await gate.acquire()
+        defer { gate.release() }
+
+        do {
+            _ = try await verifier.verify(
+                plcState: state(handle: "alice.example.org"),
+                expectedDID: did,
+                handle: "alice.example.org",
+                pdsOrigin: "https://pds.example.org"
+            )
+            XCTFail("expected unavailable error")
+        } catch let error as ATHandleVerificationError {
+            XCTAssertEqual(error, .unavailable, "saturated DNS must yield .unavailable, never .verificationFailed")
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        do {
+            _ = try await verifier.resolve(handle: "alice.example.org")
+            XCTFail("expected unavailable error")
+        } catch let error as ATHandleVerificationError {
+            XCTAssertEqual(error, .unavailable, "saturated DNS must yield .unavailable, never .verificationFailed")
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
 }
 
 private enum FakeDNSResult<Value: Sendable>: Sendable {

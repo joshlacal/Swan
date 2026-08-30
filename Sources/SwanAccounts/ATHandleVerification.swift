@@ -519,6 +519,8 @@ public struct ATProtocolHandleVerifier: PLCHandleVerifying, Sendable {
             )
         } catch let error as ATHandleVerificationError {
             throw error
+        } catch is ATHandleDNSAdmissionError {
+            throw ATHandleVerificationError.unavailable
         } catch {
             throw ATHandleVerificationError.verificationFailed
         }
@@ -559,6 +561,8 @@ public struct ATProtocolHandleVerifier: PLCHandleVerifying, Sendable {
             return try await resolveHTTP(handle: handle)
         } catch let error as ATHandleVerificationError {
             throw error
+        } catch is ATHandleDNSAdmissionError {
+            throw ATHandleVerificationError.unavailable
         } catch {
             throw ATHandleVerificationError.verificationFailed
         }
@@ -761,10 +765,14 @@ public struct ATProtocolHandleVerifier: PLCHandleVerifying, Sendable {
     private func withDeadline<T: Sendable>(
         _ operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        try await swanRaceWithDeadline(
-            seconds: policy.timeout,
-            onExpiry: ATHandleVerificationError.unavailable,
-            operation: operation
-        )
+        do {
+            return try await swanRaceWithDeadline(
+                seconds: policy.timeout,
+                onExpiry: ATHandleVerificationError.unavailable,
+                operation: operation
+            )
+        } catch is ATHandleDNSAdmissionError {
+            throw ATHandleVerificationError.unavailable
+        }
     }
 }
