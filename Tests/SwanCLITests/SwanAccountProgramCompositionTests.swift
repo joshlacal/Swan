@@ -131,7 +131,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
             let app = fixture.server.buildApplication(
                 logger: Logger(label: "SwanAccountProgramCompositionTests.credentials")
             )
-            try await app.test(.router) { client in
+            try await app.test(.live) { client in
                 var steered = HTTPFields()
                 steered[.contentType] = "application/json"
                 steered[HTTPField.Name("atproto-proxy")!] = "did:web:attacker.example#svc"
@@ -178,7 +178,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
             let app = fixture.server.buildApplication(
                 logger: Logger(label: "SwanAccountProgramCompositionTests.assembled")
             )
-            try await app.test(.router) { client in
+            try await app.test(.live) { client in
                 try await client.execute(
                     uri: "/xrpc/com.atproto.server.createSession",
                     method: .post,

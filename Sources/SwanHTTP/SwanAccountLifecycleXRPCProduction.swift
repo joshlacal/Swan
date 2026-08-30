@@ -51,11 +51,8 @@ public struct SwanCreateAccountAuthorizationPipelineProduction: SwanCreateAccoun
         let inviteDigest = try input.inviteCode.map {
             try SignupInviteService(secret: signupSecret).digest(code: $0)
         }
-        let resolvedPeerAddress: SocketAddress
-        if let peerAddress {
-            resolvedPeerAddress = peerAddress
-        } else {
-            resolvedPeerAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 0)
+        guard let peerAddress else {
+            throw SwanError.unavailable("signup peer")
         }
         _ = try await service.authorize(
             requestID: requestID,
@@ -67,7 +64,7 @@ public struct SwanCreateAccountAuthorizationPipelineProduction: SwanCreateAccoun
             inviteDigest: inviteDigest,
             verificationCode: verificationCode,
             turnstileToken: input.turnstileToken,
-            peerAddress: resolvedPeerAddress,
+            peerAddress: peerAddress,
             extractor: extractor,
             now: now
         )
