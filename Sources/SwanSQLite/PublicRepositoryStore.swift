@@ -1437,7 +1437,6 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                     WHERE request_id IN (
                         SELECT request_id FROM public_repository_mutation_requests
                         WHERE status IN ('committed', 'abandoned')
-                          AND created_at > 0
                           AND created_at < ?
                         LIMIT 1000
                     )

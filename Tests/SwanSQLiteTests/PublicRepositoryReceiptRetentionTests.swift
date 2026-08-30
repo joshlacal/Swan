@@ -136,6 +136,75 @@ final class PublicRepositoryReceiptRetentionTests: XCTestCase {
         }
         try await reopened.close()
     }
+    func testPreUpgradeTerminalReceiptsArePrunedOnOpenWhileReservedRemain() async throws {
+        let fixture = try await makeRepository()
+        defer { fixture.cleanUp() }
+        try await fixture.database.close()
+
+        try await withRawConnection(root: fixture.root) { conn in
+            _ = try? await conn.query("DROP INDEX IF EXISTS public_repository_mutation_requests_retention")
+            _ = try await conn.query("DROP TABLE public_repository_mutation_requests")
+            _ = try await conn.query(
+                """
+                CREATE TABLE public_repository_mutation_requests (
+                    request_id TEXT PRIMARY KEY,
+                    request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
+                    base_commit_cid TEXT NOT NULL,
+                    base_revision TEXT NOT NULL,
+                    next_revision TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL CHECK(status IN ('reserved', 'committed', 'abandoned')),
+                    committed_commit_cid TEXT,
+                    committed_data_cid TEXT,
+                    committed_projection BLOB,
+                    committed_projection_digest BLOB CHECK(
+                        committed_projection_digest IS NULL
+                        OR length(committed_projection_digest) = 32
+                    ),
+                    integrity_digest BLOB NOT NULL CHECK(length(integrity_digest) = 32),
+                    CHECK(
+                        (status IN ('reserved', 'abandoned') AND committed_commit_cid IS NULL
+                            AND committed_data_cid IS NULL AND committed_projection IS NULL
+                            AND committed_projection_digest IS NULL)
+                        OR
+                        (status = 'committed' AND committed_commit_cid IS NOT NULL
+                            AND committed_data_cid IS NOT NULL AND committed_projection IS NOT NULL
+                            AND committed_projection_digest IS NOT NULL)
+                    )
+                )
+                """
+            )
+            _ = try await conn.query(
+                "DELETE FROM permissioned_repository_migrations WHERE version = 20"
+            )
+            // Seed pre-upgrade terminal abandoned receipt
+            _ = try await conn.query(
+                """
+                INSERT INTO public_repository_mutation_requests
+                    (request_id, request_digest, base_commit_cid, base_revision, next_revision, status, integrity_digest)
+                VALUES ('pre-upgrade-abandoned', x'0101010101010101010101010101010101010101010101010101010101010101', 'bafybase1', 'rev1', 'next1', 'abandoned', x'0101010101010101010101010101010101010101010101010101010101010101')
+                """
+            )
+            // Seed pre-upgrade reserved receipt
+            _ = try await conn.query(
+                """
+                INSERT INTO public_repository_mutation_requests
+                    (request_id, request_digest, base_commit_cid, base_revision, next_revision, status, integrity_digest)
+                VALUES ('pre-upgrade-reserved', x'0202020202020202020202020202020202020202020202020202020202020202', 'bafybase2', 'rev2', 'next2', 'reserved', x'0202020202020202020202020202020202020202020202020202020202020202')
+                """
+            )
+        }
+
+        let upgraded = try await SQLiteAccountDatabase(dataDirectory: fixture.root, did: did)
+
+        try await withRawConnection(root: fixture.root) { conn in
+            let rows = try await conn.query(
+                "SELECT request_id, status FROM public_repository_mutation_requests ORDER BY request_id"
+            )
+            let ids = rows.compactMap { $0.column("request_id")?.string }
+            XCTAssertEqual(ids, ["pre-upgrade-reserved"], "pre-upgrade terminal receipt must be pruned on database open while reserved receipt is retained")
+        }
+        try await upgraded.close()
+    }
 
     func testRetentionIndexCoversStatusAndCreatedAtQueryPlan() async throws {
         let fixture = try await makeRepository()

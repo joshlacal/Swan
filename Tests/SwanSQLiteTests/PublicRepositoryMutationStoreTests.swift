@@ -122,9 +122,10 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
             baseCommitCID: initial.commitCID
         )
         let reservation: PublicRepositoryMutationReservation
+        let nowMicros = UInt64(Date().timeIntervalSince1970 * 1_000_000)
         switch try await database.reservePublicRepositoryRevision(
             request,
-            wallClockMicroseconds: 1_750_000_000_000_000
+            wallClockMicroseconds: nowMicros
         ) {
         case let .reserved(value):
             reservation = value
@@ -184,7 +185,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
         XCTAssertEqual(reopenedIndexed, prepared.recordResults[0].recordCID)
         switch try await reopened.reservePublicRepositoryRevision(
             request,
-            wallClockMicroseconds: 1
+            wallClockMicroseconds: nowMicros
         ) {
         case .reserved:
             XCTFail("committed request was reserved again")
@@ -211,7 +212,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
         await XCTAssertThrowsAsync(
             try await corruptedReplay.reservePublicRepositoryRevision(
                 request,
-                wallClockMicroseconds: 1
+                wallClockMicroseconds: nowMicros
             )
         ) {
             XCTAssertEqual(
@@ -881,6 +882,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
             let root = try temporaryDirectory()
             defer { try? FileManager.default.removeItem(at: root) }
             let key = P256.Signing.PrivateKey()
+            let nowMicros = UInt64(Date().timeIntervalSince1970 * 1_000_000)
             let database = try await installedDatabase(root: root, key: key)
             let maybeState = try await database.loadPublicRepositoryState()
             let state = try XCTUnwrap(maybeState)
@@ -891,7 +893,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
                 requestID: "replay-\(column)",
                 digestByte: 0x93,
                 rkey: "replay-\(column)",
-                clock: 1_750_000_000_000_000
+                clock: nowMicros
             )
             _ = try await database.applyPublicRepositoryMutation(
                 reservation: candidate.reservation,
@@ -930,7 +932,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
             await XCTAssertThrowsAsync(
                 try await corrupted.reservePublicRepositoryRevision(
                     candidate.reservation.request,
-                    wallClockMicroseconds: 1
+                    wallClockMicroseconds: nowMicros
                 )
             ) {
                 XCTAssertEqual(
