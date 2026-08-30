@@ -8,6 +8,7 @@ public enum PublicRepositoryMutationCoordinatorError: Error, Sendable, Equatable
     case inactiveAccount
     case invalidSwap
     case invalidBlobReference
+    case recordAlreadyExists
     case unavailable
 }
 
@@ -72,6 +73,40 @@ public enum SwanPublicRepositoryMutationCoordinator {
                 }
             }
         }
+    }
+
+    public static func create(
+        store: any PublicRepositoryMutationStore,
+        did: String,
+        path: PublicRepositoryPath,
+        record: PublicRecord,
+        swapCommit: CID?,
+        requestID: String,
+        bodyDigest: Data,
+        signerProvider: any PublicRepositoryMutationSignerProvider,
+        now: @Sendable () -> UInt64 = currentWallClockMicroseconds
+    ) async throws -> PublicRepositoryMutationResult {
+        guard try await store.loadPublicRepositoryState() != nil else {
+            throw PublicRepositoryMutationCoordinatorError.repositoryNotFound
+        }
+        let current = try await store.publicRepositoryRecordCID(for: path)
+        if current != nil {
+            throw PublicRepositoryMutationCoordinatorError.recordAlreadyExists
+        }
+        return try await applyWithRetry(
+            store: store,
+            did: did,
+            path: path,
+            batch: .init(
+                writes: [.create(path: path, record: record)],
+                expectedCommitCID: swapCommit
+            ),
+            requestID: requestID,
+            bodyDigest: bodyDigest,
+            signerProvider: signerProvider,
+            now: now,
+            action: .create
+        )
     }
 
     public static func put(
@@ -276,6 +311,8 @@ public enum SwanPublicRepositoryMutationCoordinator {
             switch error {
             case .commitCIDMismatch, .recordCIDMismatch:
                 return .invalidSwap
+            case .recordAlreadyExists:
+                return .recordAlreadyExists
             default:
                 return .unavailable
             }

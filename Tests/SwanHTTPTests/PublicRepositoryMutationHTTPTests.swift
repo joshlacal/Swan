@@ -1714,6 +1714,69 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testCreateRecordOnOccupiedRKeyFailsWithoutMutatingRepositoryState() async throws {
+        let fixture = try await makeFixture(
+            scopes: ["atproto", "repo:\(Self.collection)?action=create"]
+        )
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let path = try PublicRepositoryPath(
+            collection: Self.collection,
+            recordKey: "occupied-rkey"
+        )
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.create-occupied")
+        ).test(.live) { client in
+            let first = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "create-first",
+                    method: "POST",
+                    path: Self.mutationPath
+                ),
+                body: ByteBuffer(string: self.putBody(rkey: "occupied-rkey", text: "initial"))
+            )
+            XCTAssertEqual(first.status, .ok)
+
+            let rawStateBefore = try await fixture.database.loadPublicRepositoryState()
+            let stateBefore = try XCTUnwrap(rawStateBefore)
+            let rawCIDBefore = try await fixture.database.publicRepositoryRecordCID(for: path)
+            let recordCIDBefore = try XCTUnwrap(rawCIDBefore)
+            let outboxBefore = try await fixture.database.pendingPublicFirehoseOutbox()
+
+            let duplicate = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "create-duplicate",
+                    method: "POST",
+                    path: Self.mutationPath
+                ),
+                body: ByteBuffer(string: self.putBody(rkey: "occupied-rkey", text: "overwriting"))
+            )
+            XCTAssertEqual(duplicate.status, .badRequest)
+            let bodyString = String(decoding: duplicate.body.readableBytesView, as: UTF8.self)
+            XCTAssertTrue(bodyString.contains("InvalidRequest"), "body: \(bodyString)")
+
+            let rawStateAfter = try await fixture.database.loadPublicRepositoryState()
+            let stateAfter = try XCTUnwrap(rawStateAfter)
+            let rawCIDAfter = try await fixture.database.publicRepositoryRecordCID(for: path)
+            let recordCIDAfter = try XCTUnwrap(rawCIDAfter)
+            let outboxAfter = try await fixture.database.pendingPublicFirehoseOutbox()
+
+            XCTAssertEqual(stateAfter.commitCID, stateBefore.commitCID)
+            XCTAssertEqual(stateAfter.revision, stateBefore.revision)
+            XCTAssertEqual(recordCIDAfter, recordCIDBefore)
+            XCTAssertEqual(outboxAfter.count, outboxBefore.count)
+        }
+    }
+
     /// `uploadBlob` asserts from the Content-Type HEADER. `transition:generic`
     /// covers any mime; the identity scope alone covers none.
     func testBlobUploadDeniedWithoutBlobOrTransitionScope() async throws {

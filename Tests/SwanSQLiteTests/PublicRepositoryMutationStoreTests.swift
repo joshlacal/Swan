@@ -1178,6 +1178,100 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
         return root
     }
+
+    func testEngineCreateFailsWhenRecordAlreadyExists() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let key = P256.Signing.PrivateKey()
+        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        defer { Task { try? await database.close() } }
+        let genesis = try PublicRepositoryGenesisCodec.create(
+            did: did,
+            revision: genesisRevision,
+            signingKey: key
+        )
+        _ = try await database.installPublicRepositoryGenesis(
+            genesis,
+            signingPublicKey: key.publicKey,
+            installedAt: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        let rawInitial = try await database.loadPublicRepositoryState()
+        let initial = try XCTUnwrap(rawInitial)
+        let path = try PublicRepositoryPath(
+            collection: "app.bsky.feed.post",
+            recordKey: "occupied-record"
+        )
+        let request1 = try PublicRepositoryMutationRequest(
+            id: "create-initial",
+            canonicalDigest: Data(repeating: 0x11, count: 32),
+            baseCommitCID: initial.commitCID
+        )
+        let reservation1: PublicRepositoryMutationReservation
+        switch try await database.reservePublicRepositoryRevision(
+            request1,
+            wallClockMicroseconds: 1_750_000_000_000_000
+        ) {
+        case let .reserved(value): reservation1 = value
+        case .committed: return XCTFail("unexpected replay")
+        }
+        let prepared1 = try await PublicRepositoryEngine.apply(
+            repositoryDID: did,
+            currentState: initial,
+            blocks: database,
+            revision: reservation1.nextRevision,
+            batch: try PublicRepositoryWriteBatch(
+                writes: [.create(
+                    path: path,
+                    record: PublicRecord([
+                        "$type": .string("app.bsky.feed.post"),
+                        "text": .string("first"),
+                    ])
+                )],
+                expectedCommitCID: initial.commitCID
+            ),
+            signer: P256PublicRepositoryCommitSigner(privateKey: key)
+        )
+        let committed1 = try await database.applyPublicRepositoryMutation(
+            reservation: reservation1,
+            prepared: prepared1
+        )
+
+        let request2 = try PublicRepositoryMutationRequest(
+            id: "create-duplicate",
+            canonicalDigest: Data(repeating: 0x22, count: 32),
+            baseCommitCID: committed1.state.commitCID
+        )
+        let reservation2: PublicRepositoryMutationReservation
+        switch try await database.reservePublicRepositoryRevision(
+            request2,
+            wallClockMicroseconds: 1_750_000_001_000_000
+        ) {
+        case let .reserved(value): reservation2 = value
+        case .committed: return XCTFail("unexpected replay")
+        }
+        do {
+            _ = try await PublicRepositoryEngine.apply(
+                repositoryDID: did,
+                currentState: committed1.state,
+                blocks: database,
+                revision: reservation2.nextRevision,
+                batch: try PublicRepositoryWriteBatch(
+                    writes: [.create(
+                        path: path,
+                        record: PublicRecord([
+                            "$type": .string("app.bsky.feed.post"),
+                            "text": .string("second"),
+                        ])
+                    )],
+                    expectedCommitCID: committed1.state.commitCID
+                ),
+                signer: P256PublicRepositoryCommitSigner(privateKey: key)
+            )
+            XCTFail("expected PublicRepositoryEngineError.recordAlreadyExists")
+        } catch let error as PublicRepositoryEngineError {
+            XCTAssertEqual(error, .recordAlreadyExists)
+        }
+    }
 }
 
 private enum InjectedFailure: Error, Equatable {
