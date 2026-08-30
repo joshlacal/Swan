@@ -973,7 +973,6 @@ extension SQLiteAccountDatabase:
                 }
                 try await testingHooks.afterRemoteReplicaMutatingSQL?(0)
             }
-
             do {
                 try await prepareRemoteReplicaGenerationBatched(
                     sessionID: sessionID,
@@ -1617,6 +1616,13 @@ extension SQLiteAccountDatabase:
                     .targetCASConflict
             }
         }
+        try await advanceWriterHighWaterWithoutGate(
+            space: head.target.space,
+            repository: head.target.repositoryDID,
+            wireRevision: head.wireRevision.toString(),
+            commitment: head.commitment,
+            updatedAt: installedAt
+        )
     }
 
     private func finalizeRemoteReplicaResult(

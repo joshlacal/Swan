@@ -2238,6 +2238,133 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
     XCTAssertEqual(missingOutcome, .fullCARRecoveryRequired)
     XCTAssertEqual(retainedHead, base)
   }
+
+  func testIncrementalRevisionNRejectsFullRecoveryNMinusOneAndConflictingN() async throws {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "incremental-highwater")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    defer { Task { try? await database.close() } }
+    let initial = try fixture.archive(
+      revision: "222222222222a",
+      values: ["initial value"],
+      ikmByte: 0x51
+    )
+    _ = try await fixture.install(
+      database: database,
+      archive: initial,
+      expectedBase: nil,
+      requestID: "incremental-highwater-bootstrap",
+      publicationAuthorization: fixture.publicationAuthorization
+    )
+    let head = try await database.permissionedRemoteReplicaHead(target: fixture.target)
+    let base = try XCTUnwrap(head)
+
+    let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+      (key: "text", value: "incremental update"),
+    ]))
+    let cid = CID.fromDAGCBOR(value)
+    let uri = try SpaceRecordURI(
+      space: fixture.space,
+      author: fixture.repositoryDID,
+      collection: initial.records[0].collection,
+      rkey: "new-record"
+    )
+    let revisionB = try TID(tidString: "222222222222b")
+    let op = VerifiedPermissionedRemoteReplicaOperation(
+      operationIndex: 0, wireRevision: revisionB, action: .create,
+      uri: uri, cid: cid, previousCID: nil, value: value
+    )
+    var terminalHash = try LtHash(serialized: base.ltHash)
+    terminalHash.add(element: "\(uri.collection)/\(uri.rkey)/\(cid.string)")
+    let batch = try makeIncrementalBatch(
+      target: fixture.target, expectedHead: base,
+      terminalRevision: revisionB, terminalHash: terminalHash,
+      recordCount: 2, operations: [op],
+      requestID: "incremental-batch-rev-b"
+    )
+    guard case .applied = try await database.applyVerifiedPermissionedRemoteReplicaBatch(
+      batch, appliedAt: 200
+    ) else {
+      return XCTFail("incremental batch failed to apply")
+    }
+    let currentHead = try await database.permissionedRemoteReplicaHead(target: fixture.target)
+
+    // Now try full recovery at wire revision 222222222222a (N-1). It must reject as stale recovery.
+    let staleArchive = try fixture.archive(
+      revision: "222222222222a",
+      values: ["stale full recovery"],
+      ikmByte: 0x52
+    )
+    await assertRemoteReplicaError(.staleRecovery) {
+      _ = try await fixture.install(
+        database: database,
+        archive: staleArchive,
+        expectedBase: currentHead,
+        requestID: "incremental-highwater-stale",
+        publicationAuthorization: fixture.publicationAuthorization
+      )
+    }
+
+    // Now test conflicting full recovery on a separate fixture with same state
+    let fixture2 = try RemoteReplicaSQLiteFixture(name: "incremental-highwater-equivocation")
+    defer { try? FileManager.default.removeItem(at: fixture2.root) }
+    let database2 = try await fixture2.open()
+    defer { Task { try? await database2.close() } }
+    let initial2 = try fixture2.archive(
+      revision: "222222222222a",
+      values: ["initial value"],
+      ikmByte: 0x51
+    )
+    _ = try await fixture2.install(
+      database: database2,
+      archive: initial2,
+      expectedBase: nil,
+      requestID: "incremental-highwater-bootstrap-2",
+      publicationAuthorization: fixture2.publicationAuthorization
+    )
+    let head2 = try await database2.permissionedRemoteReplicaHead(target: fixture2.target)
+    let base2 = try XCTUnwrap(head2)
+    let uri2 = try SpaceRecordURI(
+      space: fixture2.space,
+      author: fixture2.repositoryDID,
+      collection: initial.records[0].collection,
+      rkey: "new-record"
+    )
+    let op2 = VerifiedPermissionedRemoteReplicaOperation(
+      operationIndex: 0, wireRevision: revisionB, action: .create,
+      uri: uri2, cid: cid, previousCID: nil, value: value
+    )
+    var terminalHash2 = try LtHash(serialized: base2.ltHash)
+    terminalHash2.add(element: "\(uri2.collection)/\(uri2.rkey)/\(cid.string)")
+    let batch2 = try makeIncrementalBatch(
+      target: fixture2.target, expectedHead: base2,
+      terminalRevision: revisionB, terminalHash: terminalHash2,
+      recordCount: 2, operations: [op2],
+      requestID: "incremental-batch-rev-b-2"
+    )
+    guard case .applied = try await database2.applyVerifiedPermissionedRemoteReplicaBatch(
+      batch2, appliedAt: 200
+    ) else {
+      return XCTFail("incremental batch 2 failed to apply")
+    }
+    let currentHead2 = try await database2.permissionedRemoteReplicaHead(target: fixture2.target)
+
+    // Full recovery at wire revision 222222222222b (same N) but different commitment. Must reject as equivocation.
+    let conflictingArchive = try fixture2.archive(
+      revision: "222222222222b",
+      values: ["conflicting commitment"],
+      ikmByte: 0x53
+    )
+    await assertRemoteReplicaError(.equivocation) {
+      _ = try await fixture2.install(
+        database: database2,
+        archive: conflictingArchive,
+        expectedBase: currentHead2,
+        requestID: "incremental-highwater-conflicting",
+        publicationAuthorization: fixture2.publicationAuthorization
+      )
+    }
+  }
 }
 
 private struct IncrementalReplicaWitness: Equatable {

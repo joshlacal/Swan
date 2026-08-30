@@ -729,7 +729,7 @@ public enum SQLiteLayout {
     static let spaceNotificationSchemaStatements = [
         """
         CREATE TABLE IF NOT EXISTS permissioned_space_writers (
-            space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+            space_uri TEXT NOT NULL,
             repo_did TEXT NOT NULL,
             wire_revision TEXT NOT NULL,
             commitment BLOB NOT NULL CHECK(length(commitment) = 32),
@@ -2088,6 +2088,7 @@ struct SQLiteTestingHooks: Sendable {
     var onValidatePortableRestoreStreamingTransaction: (@Sendable (SQLiteConnection) async throws -> Void)?
     var onReaderClose: (@Sendable () async throws -> Void)?
     var afterPublicBlobPurgeCandidateSelection: (@Sendable () async throws -> Void)?
+    var permissionedCARSpoolAdmission: SpaceCARSpoolAdmission?
     var incrementalReplayRetentionOperationLimit: Int?
     init(
         beforeApplyCommit: (@Sendable () async throws -> Void)? = nil,
@@ -2106,6 +2107,7 @@ struct SQLiteTestingHooks: Sendable {
         onValidatePortableRestoreStreamingTransaction: (@Sendable (SQLiteConnection) async throws -> Void)? = nil,
         onReaderClose: (@Sendable () async throws -> Void)? = nil,
         afterPublicBlobPurgeCandidateSelection: (@Sendable () async throws -> Void)? = nil,
+        permissionedCARSpoolAdmission: SpaceCARSpoolAdmission? = nil,
         incrementalReplayRetentionOperationLimit: Int? = nil
     ) {
         self.beforeApplyCommit = beforeApplyCommit
@@ -2126,6 +2128,7 @@ struct SQLiteTestingHooks: Sendable {
             onValidatePortableRestoreStreamingTransaction
         self.onReaderClose = onReaderClose
         self.afterPublicBlobPurgeCandidateSelection = afterPublicBlobPurgeCandidateSelection
+        self.permissionedCARSpoolAdmission = permissionedCARSpoolAdmission
         self.incrementalReplayRetentionOperationLimit =
             incrementalReplayRetentionOperationLimit
     }
@@ -4590,6 +4593,83 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             guard actualRevision < UInt64(Int.max) else {
                 throw SQLiteRepositoryError.revisionOutOfRange(actualRevision)
             }
+            let statsRow = try await connection.query(
+                """
+                SELECT COUNT(*) AS record_count, COALESCE(SUM(length(value)), 0) AS total_bytes
+                FROM permissioned_space_records
+                WHERE space_uri = ? AND author_did = ?
+                """,
+                [.text(space.rawValue), .text(author)]
+            )
+            let currentRecordCount = statsRow.first?.column("record_count")?.integer ?? 0
+            let currentTotalBytes = statsRow.first?.column("total_bytes")?.integer ?? 0
+
+            var simulatedRecordCount = currentRecordCount
+            var simulatedTotalBytes = currentTotalBytes
+            var touchedRecordLengths: [SpaceRecordURI: Int?] = [:]
+
+            for write in writes {
+                let uri = write.uri
+                let currentLength: Int?
+                if let known = touchedRecordLengths[uri] {
+                    currentLength = known
+                } else {
+                    let oldRecord = try await loadRecord(uri)
+                    currentLength = oldRecord?.value.count
+                    touchedRecordLengths[uri] = currentLength
+                }
+                switch write {
+                case let .create(_, value, _):
+                    if currentLength == nil {
+                        simulatedRecordCount += 1
+                        simulatedTotalBytes += value.count
+                    } else {
+                        simulatedTotalBytes += value.count - (currentLength ?? 0)
+                    }
+                    touchedRecordLengths[uri] = value.count
+                case let .put(_, value, _), let .update(_, value, _):
+                    if currentLength == nil {
+                        simulatedRecordCount += 1
+                        simulatedTotalBytes += value.count
+                    } else {
+                        simulatedTotalBytes += value.count - (currentLength ?? 0)
+                    }
+                    touchedRecordLengths[uri] = value.count
+                case .delete:
+                    if let oldLen = currentLength {
+                        simulatedRecordCount -= 1
+                        simulatedTotalBytes -= oldLen
+                    }
+                    touchedRecordLengths[uri] = nil
+                }
+            }
+
+            let maxCount = SpaceCARProductionLimits.maximumRecordCount
+            let maxBytes = SpaceCARRecoveryLimits.absoluteMaximumLogicalRestoredBytes
+
+            let countOverLimit = currentRecordCount > maxCount
+            let bytesOverLimit = currentTotalBytes > maxBytes
+
+            if countOverLimit {
+                guard simulatedRecordCount < currentRecordCount else {
+                    throw SpaceCARProductionLimits.limitExceeded()
+                }
+            } else {
+                guard simulatedRecordCount <= maxCount else {
+                    throw SpaceCARProductionLimits.limitExceeded()
+                }
+            }
+
+            if bytesOverLimit {
+                guard simulatedTotalBytes < currentTotalBytes else {
+                    throw SpaceCARProductionLimits.limitExceeded()
+                }
+            } else {
+                guard simulatedTotalBytes <= maxBytes else {
+                    throw SpaceCARProductionLimits.limitExceeded()
+                }
+            }
+
             let revision = actualRevision + 1
             let storedRevision = try sqliteRevision(revision)
             var entries: [PersistedSpaceOplogEntry] = []
@@ -5840,50 +5920,57 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         author: String
     ) async throws -> AuthorizedSpaceRepositoryCARSnapshot? {
         try requireAccount(author)
-        guard let lease = sqlitePermissionedCARSpoolAdmission?.reserve(
-            accountDID: author,
-            maximumBytes: SpaceCARProductionLimits.maximumWorkingSpoolBytes
-        ) else {
-            throw SpaceCARProductionLimits.limitExceeded()
-        }
-        var transferredLease = false
-        defer {
-            if !transferredLease {
-                lease.release()
-            }
-        }
-        let prepared = try await withConnectionGate {
+        let admission = testingHooks.permissionedCARSpoolAdmission ?? sqlitePermissionedCARSpoolAdmission
+        return try await withConnectionGate {
             try await withRepositoryCARIndexTable {
                 try await writerReadTransaction {
                     try Task.checkCancellation()
                     try await requireLocalRepositorySpaceOpen(space)
-                    return try await prepareRepositoryCARSnapshotWithoutTransaction(
+                    guard let state = try await loadState(space: space, author: author) else {
+                        return nil
+                    }
+                    try Task.checkCancellation()
+                    let metrics = try await requireRepositoryCARProductionAdmission(
+                        space: space,
+                        author: author
+                    )
+                    let recoveryPrefixBytes = 64 * 1024
+                    let measuredBytes = metrics.totalValueBytes + 2 * metrics.logicalMetadataBytes + recoveryPrefixBytes
+                    guard let lease = admission?.reserve(
+                        accountDID: author,
+                        maximumBytes: measuredBytes
+                    ) else {
+                        throw SpaceCARProductionLimits.limitExceeded()
+                    }
+                    var transferredLease = false
+                    defer {
+                        if !transferredLease {
+                            lease.release()
+                        }
+                    }
+                    let prepared = try await prepareRepositoryCARSnapshotWithoutTransaction(
                         space: space,
                         author: author,
+                        state: state,
+                        recordCount: metrics.recordCount,
                         lease: lease
                     )
+                    if prepared != nil {
+                        transferredLease = true
+                    }
+                    return prepared
                 }
             }
         }
-        if prepared != nil {
-            transferredLease = true
-        }
-        return prepared
     }
 
     private func prepareRepositoryCARSnapshotWithoutTransaction(
         space: SpaceURI,
         author: String,
+        state: PersistedRepositoryState,
+        recordCount: Int,
         lease: SpaceCARSpoolLease
     ) async throws -> AuthorizedSpaceRepositoryCARSnapshot? {
-        guard let state = try await loadState(space: space, author: author) else {
-            return nil
-        }
-        try Task.checkCancellation()
-        let recordCount = try await requireRepositoryCARProductionAdmission(
-            space: space,
-            author: author
-        )
         try Task.checkCancellation()
         let bodyHandle = try SQLiteProtectedPaths.makeUnlinkedPermissionedCARSpool(
             in: dataDirectory
@@ -6079,6 +6166,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         transferredBodyHandle = true
         return prepared
     }
+    private struct CARAdmissionMetrics {
+        let recordCount: Int
+        let logicalMetadataBytes: Int
+        let totalValueBytes: Int
+    }
 
     /// Rejects adversarial path cardinality, TEMP projection amplification,
     /// and incompatible record bodies before creating either CAR payload
@@ -6086,7 +6178,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private func requireRepositoryCARProductionAdmission(
         space: SpaceURI,
         author: String
-    ) async throws -> Int {
+    ) async throws -> CARAdmissionMetrics {
         let countRows = try await connection.query(
             """
             SELECT COUNT(*) AS record_count
@@ -6116,7 +6208,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 ),
                 0
               ) AS logical_metadata_bytes,
-              COALESCE(MAX(length(value)), 0) AS maximum_record_bytes
+              COALESCE(MAX(length(value)), 0) AS maximum_record_bytes,
+              COALESCE(SUM(length(value)), 0) AS total_value_bytes
             FROM permissioned_space_records
             WHERE space_uri = ? AND author_did = ?
             """,
@@ -6127,16 +6220,25 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 .column("logical_metadata_bytes")?.integer,
               let maximumRecordBytes = admission
                 .column("maximum_record_bytes")?.integer,
+              let totalValueBytes = admission
+                .column("total_value_bytes")?.integer,
               logicalMetadataBytes >= 0,
               maximumRecordBytes >= 0,
+              totalValueBytes >= 0,
               logicalMetadataBytes
                 <= SpaceCARProductionLimits.maximumLogicalMetadataBytes,
               maximumRecordBytes
-                <= SpaceCARProductionLimits.maximumRecordBytes
+                <= SpaceCARProductionLimits.maximumRecordBytes,
+              totalValueBytes
+                <= SpaceCARRecoveryLimits.absoluteMaximumLogicalRestoredBytes
         else {
             throw SpaceCARProductionLimits.limitExceeded()
         }
-        return Int(count)
+        return CARAdmissionMetrics(
+            recordCount: Int(count),
+            logicalMetadataBytes: logicalMetadataBytes,
+            totalValueBytes: totalValueBytes
+        )
     }
 
     /// Materializes only canonical path metadata. Record values stay in the
@@ -8035,6 +8137,59 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
+    @discardableResult
+    func advanceWriterHighWaterWithoutGate(
+        space: SpaceURI,
+        repository: String,
+        wireRevision: String,
+        commitment: Data,
+        updatedAt: Int64
+    ) async throws -> Bool {
+        guard commitment.count == 32 else {
+            throw SQLiteRepositoryError.corruptDatabase("invalid writer commitment")
+        }
+        let existing = try await connection.query(
+            """
+            SELECT wire_revision, commitment
+            FROM permissioned_space_writers
+            WHERE space_uri = ? AND repo_did = ?
+            """,
+            [.text(space.rawValue), .text(repository)]
+        )
+        if let row = existing.first {
+            let currentRevision = try requiredTID(row, "wire_revision").toString()
+            let currentCommitment = try requiredBlob(row, "commitment")
+            guard currentCommitment.count == 32 else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid writer commitment")
+            }
+            if wireRevision < currentRevision {
+                return false
+            } else if wireRevision == currentRevision {
+                guard currentCommitment == commitment else {
+                    throw SwanError.conflict(expected: 0, actual: 1)
+                }
+                return false
+            }
+        }
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_space_writers(
+                space_uri, repo_did, wire_revision, commitment, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(space_uri, repo_did) DO UPDATE SET
+                wire_revision = excluded.wire_revision,
+                commitment = excluded.commitment,
+                updated_at = excluded.updated_at
+            """,
+            [
+                .text(space.rawValue), .text(repository),
+                .text(wireRevision), blob(commitment),
+                .integer(Int(updatedAt)),
+            ]
+        )
+        return true
+    }
+
     /// Replaces one endpoint's subscription atomically. A registration is
     /// keyed by the delivery endpoint, matching the pinned PDS. Re-registering
     /// with a different optional repo replaces it; expiry cleanup below acts
@@ -8308,34 +8463,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 )
                 guard receipt.isEmpty else { return }
 
-                let existing = try await connection.query(
-                    """
-                    SELECT wire_revision, commitment
-                    FROM permissioned_space_writers
-                    WHERE space_uri = ? AND repo_did = ?
-                    """,
-                    [.text(notification.space.rawValue), .text(notification.repository)]
+                let advancesWriter = try await advanceWriterHighWaterWithoutGate(
+                    space: notification.space,
+                    repository: notification.repository,
+                    wireRevision: notification.wireRevision,
+                    commitment: notification.commitment,
+                    updatedAt: Int64(timestamp)
                 )
-                var advancesWriter = true
-                if let row = existing.first {
-                    let currentRevision = try requiredTID(row, "wire_revision").toString()
-                    let currentCommitment = try requiredBlob(row, "commitment")
-                    guard currentCommitment.count == 32 else {
-                        throw SQLiteRepositoryError.corruptDatabase("invalid writer commitment")
-                    }
-                    if notification.wireRevision < currentRevision {
-                        advancesWriter = false
-                    } else if notification.wireRevision == currentRevision {
-                        guard currentCommitment == notification.commitment else {
-                            throw SwanError.conflict(expected: 0, actual: 1)
-                        }
-                        advancesWriter = false
-                    }
-                }
-
-                // The durable writer row is the replay-safe monotonic state.
-                // Do not retain a unique receipt for every reordered stale
-                // event; it cannot affect the state after this point.
                 guard advancesWriter else { return }
 
                 _ = try await connection.query(
@@ -8358,23 +8492,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         .text(notification.issuer),
                         .text(notification.space.rawValue),
                         .text(eventID),
-                    ]
-                )
-
-                _ = try await connection.query(
-                    """
-                    INSERT INTO permissioned_space_writers(
-                        space_uri, repo_did, wire_revision, commitment, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(space_uri, repo_did) DO UPDATE SET
-                        wire_revision = excluded.wire_revision,
-                        commitment = excluded.commitment,
-                        updated_at = excluded.updated_at
-                    """,
-                    [
-                        .text(notification.space.rawValue), .text(notification.repository),
-                        .text(notification.wireRevision), blob(notification.commitment),
-                        .integer(timestamp),
                     ]
                 )
 

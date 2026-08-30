@@ -887,6 +887,42 @@ final class PermissionedRepositoryCARStreamingTests: XCTestCase {
             overLimitRejectedWithoutSpool: overLimitRejectedWithoutSpool
         )
     }
+
+    func testTinyCARSnapshotReservesMeasuredBytesNotWorstCase() async throws {
+        let fixture = try PermissionedCARFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "text", value: "tiny value"),
+        ]))
+        let cid = CID.fromDAGCBOR(value)
+        let record = try fixture.record(rkey: "one", value: value)
+        _ = try await database.apply(
+            space: fixture.space,
+            author: fixture.author,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try TID(tidString: "222222222222a"),
+            writes: [.put(uri: record.uri, value: record.value, cid: cid.string)]
+        )
+        // Install a tight admission controller (10 MiB, much smaller than 256 MiB worst case)
+        let tightAdmission = try SpaceCARSpoolAdmission(
+            maximumGlobalBytes: 10 * 1024 * 1024,
+            maximumPerAccountBytes: 10 * 1024 * 1024
+        )
+        await database.installTestingHooks(SQLiteTestingHooks(permissionedCARSpoolAdmission: tightAdmission))
+        let snapshot = try await database.prepareRepositoryCARSnapshot(
+            space: fixture.space,
+            author: fixture.author
+        )
+        let prepared = try XCTUnwrap(snapshot)
+        XCTAssertLessThan(tightAdmission.snapshot.reservedBytes, 10 * 1024 * 1024)
+        XCTAssertGreaterThan(tightAdmission.snapshot.reservedBytes, 0)
+        try await prepared.spool.streamBody { _ in }
+        XCTAssertTrue(prepared.spool.isCleanedUp)
+        XCTAssertEqual(tightAdmission.snapshot.reservedBytes, 0)
+        try await database.close()
+    }
 }
 
 private struct PermissionedCARFixture {
