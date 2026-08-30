@@ -168,9 +168,18 @@ extension SQLiteControlDatabase: OAuthLexiconDocumentStore {
                               negCount >= 0 else {
                             throw OAuthControlStoreError.malformedRecord
                         }
-                        guard negCount < Self.lexiconDocumentNegativeRowCapacity else {
-                            throw SwanError.unavailable(
-                                "OAuth lexicon negative cache capacity is exhausted"
+                        if negCount >= Self.lexiconDocumentNegativeRowCapacity {
+                            // This runs inside the transaction, after expiry
+                            _ = try await connection.query(
+                                """
+                                DELETE FROM oauth_lexicon_documents
+                                WHERE nsid = (
+                                    SELECT nsid FROM oauth_lexicon_documents
+                                    WHERE document IS NULL
+                                    ORDER BY updated_at ASC
+                                    LIMIT 1
+                                )
+                                """
                             )
                         }
                     }

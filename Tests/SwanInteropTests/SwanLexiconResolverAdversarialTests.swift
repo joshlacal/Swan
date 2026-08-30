@@ -429,8 +429,9 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
 
         // 1. Insert 4,096 negative rows (some expired, some fresh)
         for i in 0 ..< 4_096 {
-            // First 500 rows are 2 hours old (expired > 1 hour)
-            let updatedAt = i < 500 ? now.addingTimeInterval(-7200) : now
+            let updatedAt = i < 500
+                ? now.addingTimeInterval(-7200)
+                : now.addingTimeInterval(Double(i - 500) * 0.001)
             let row = OAuthLexiconDocumentRow(
                 nsid: "com.example.neg\(i)",
                 document: nil,
@@ -471,34 +472,24 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
         let evicted = try await store.findLexicon(nsid: "com.example.neg0")
         XCTAssertNil(evicted, "expired negative row should be evicted")
 
-        // 3. Fill until all 4,096 are fresh (non-expired)
-        var nextIndex = 5000
-        var fillAttempts = 0
-        while fillAttempts < 1000 {
-            let row = OAuthLexiconDocumentRow(
-                nsid: "com.example.fresh\(nextIndex)",
-                document: nil,
-                sourceURI: nil,
-                verifiedCID: nil,
-                createdAt: now,
-                updatedAt: now,
-                lastSucceededAt: nil
+        // 3. Fill the remaining slots with fresh negatives, then verify that
+        // admission evicts the oldest negative row transactionally.
+        for i in 0 ..< 499 {
+            let timestamp = now.addingTimeInterval(Double(5000 + i) * 0.001)
+            try await store.storeLexicon(
+                OAuthLexiconDocumentRow(
+                    nsid: "com.example.fill\(i)",
+                    document: nil,
+                    sourceURI: nil,
+                    verifiedCID: nil,
+                    createdAt: timestamp,
+                    updatedAt: timestamp,
+                    lastSucceededAt: nil
+                )
             )
-            do {
-                try await store.storeLexicon(row)
-                nextIndex += 1
-                fillAttempts += 1
-            } catch let error as SwanError {
-                guard case .unavailable = error else {
-                    XCTFail("unexpected error during negative cache fill: \(error)")
-                    break
-                }
-                break
-            }
         }
-        XCTAssertLessThan(fillAttempts, 1000, "negative cache fill must stop at negative capacity ceiling")
-
-        // Now that 4,096 non-expired negative rows exist, a new negative row must be rejected
+        let oldestRow = try await store.findLexicon(nsid: "com.example.neg500")
+        XCTAssertNotNil(oldestRow)
         let overCapNegative = OAuthLexiconDocumentRow(
             nsid: "com.example.neg.overflow",
             document: nil,
@@ -508,15 +499,11 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
             updatedAt: now,
             lastSucceededAt: nil
         )
-        do {
-            try await store.storeLexicon(overCapNegative)
-            XCTFail("expected 4,096 negative row capacity exhaustion")
-        } catch let error as SwanError {
-            guard case .unavailable = error else {
-                XCTFail("expected SwanError.unavailable, got: \(error)")
-                return
-            }
-        }
+        try await store.storeLexicon(overCapNegative)
+        let evictedOldest = try await store.findLexicon(nsid: "com.example.neg500")
+        let admitted = try await store.findLexicon(nsid: overCapNegative.nsid)
+        XCTAssertNil(evictedOldest)
+        XCTAssertNotNil(admitted)
         // 4. Converting an existing negative NSID to positive frees a negative slot
         let positiveDoc = Data("valid-doc".utf8)
         let convertedPositive = OAuthLexiconDocumentRow(
@@ -599,19 +586,16 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
             updatedAt: now,
             lastSucceededAt: nil
         )
-        do {
-            try await store.storeLexicon(overCapRow)
-            XCTFail("expected negative cache capacity exhaustion")
-        } catch let error as SwanError {
-            guard case .unavailable = error else {
-                XCTFail("expected unavailable error, got \(error)")
-                return
-            }
-        }
+        // A 4,097th negative row turns over the oldest entry rather than
+        // refusing admission.
+        try await store.storeLexicon(overCapRow)
 
-        // 2. Instantiate a SwanLexiconResolver using this saturated store and a failing transport/DNS
-        let dns = AdversarialDNSResolver(records: []) // No did= records -> .noAuthorityDIDInTXT
-        let validKey = try await P256.Signing.PublicKey(x963Representation: PublicRepositoryProofFixtureBuilder.build(.valid).documentPublicKeyX963)
+        // 2. Instantiate a SwanLexiconResolver using this saturated store and
+        // a failing transport/DNS.
+        let dns = AdversarialDNSResolver(records: [])
+        let validKey = try await P256.Signing.PublicKey(
+            x963Representation: PublicRepositoryProofFixtureBuilder.build(.valid).documentPublicKeyX963
+        )
         let resolver = try SwanLexiconResolver(
             dns: dns,
             authorities: AdversarialAuthorityResolver(
