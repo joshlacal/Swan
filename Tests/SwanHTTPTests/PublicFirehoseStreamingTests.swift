@@ -683,11 +683,11 @@ final class PublicFirehoseStreamingTests: XCTestCase {
     )
   }
 
-  func testPageAdmissionLimitsConcurrentPagesToFour() async throws {
+  func testPageAdmissionDefaultConcurrentPagesIsSixteen() async throws {
     XCTAssertEqual(
       PublicFirehosePageAdmission.shared.maximumConcurrentPages,
-      4,
-      "process-wide page admission default must be exactly four concurrent pages"
+      16,
+      "process-wide page admission default must be exactly sixteen concurrent pages (four FIFO waves for 64 subscribers)"
     )
     let admission = PublicFirehosePageAdmission(maximumConcurrentPages: 4)
     let lease1 = try await admission.acquire()
@@ -715,7 +715,6 @@ final class PublicFirehoseStreamingTests: XCTestCase {
     lease6.release()
     XCTAssertEqual(admission.currentActiveLeases, 0)
   }
-
   func testPageAdmissionFIFOFairnessUnderReacquisitionContentionAndCancellation() async throws {
     let admission = PublicFirehosePageAdmission(maximumConcurrentPages: 4)
     var holderLeases: [PublicFirehosePageLease] = []
@@ -954,5 +953,131 @@ final class PublicFirehoseStreamingTests: XCTestCase {
         return XCTFail("expected admissionStarved, got \(error)")
       }
     }
+  }
+  func testTailerCaughtUpCursorWaitsWithoutReservingPage() async throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
+    defer { Task { try? await firehose.close() } }
+    for index in 1 ... 3 {
+      _ = try await firehose.appendBatch([identityItem(sourceKey: "k\(index)")], now: epoch)
+    }
+
+    // Single page slot so if a caught-up tailer reserves it, no one else can.
+    let admission = PublicFirehosePageAdmission(maximumConcurrentPages: 1)
+    let limits = try PublicFirehoseStreamingLimits(idlePollInterval: 0.01)
+    let tailer = PublicFirehoseTailer(
+      database: firehose,
+      limits: limits,
+      logger: logger,
+      pageAdmission: admission
+    )
+
+    let deliveredFrames = FrameRecorder()
+    let tailerTask = Task {
+      try await tailer.run(
+        lastSent: 3, // Already caught up with maxSeq = 3
+        outbound: { data in
+          await deliveredFrames.record(data)
+        },
+        waitForWakeup: { nil as Int64? }
+      )
+    }
+    defer { tailerTask.cancel() }
+
+    // Let the tailer enter the loop and poll.
+    // Because the cursor is caught up, active leases MUST be 0.
+    XCTAssertEqual(
+      admission.currentActiveLeases,
+      0,
+      "caught-up cursor must not hold any page lease while waiting for new events"
+    )
+    XCTAssertEqual(
+      admission.currentQueuedWaiters,
+      0,
+      "caught-up cursor must not queue for page admission"
+    )
+
+    // Another caller can freely acquire the only page lease.
+    let externalLease = try await admission.acquire(timeout: .milliseconds(20))
+    XCTAssertEqual(admission.currentActiveLeases, 1)
+    externalLease.release()
+    XCTAssertEqual(admission.currentActiveLeases, 0)
+    tailerTask.cancel()
+    _ = await tailerTask.result
+  }
+
+  func testPageAdmissionSixtyFourSubscribersFourWavesPerSlotDoNotHitAdmissionTimeoutUnderMaliciousHolds() async throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
+    defer { Task { try? await firehose.close() } }
+    for index in 1 ... 3 {
+      _ = try await firehose.appendBatch([identityItem(sourceKey: "k\(index)")], now: epoch)
+    }
+
+    // 16 slots, exactly 4 waves for 64 admitted subscribers.
+    let admission = PublicFirehosePageAdmission(maximumConcurrentPages: 16)
+    // Backfill catch-up budget = 80ms, maximumPageHold = 15ms (< 80/4 = 20ms).
+    // 3 malicious waves holding for 15ms each = 45ms < 80ms admission timeout.
+    let limits = try PublicFirehoseStreamingLimits(
+      maximumSequenceLag: 10,
+      maximumBackfillCatchUp: .milliseconds(80),
+      maximumWriteDuration: .milliseconds(50),
+      maximumPageHold: .milliseconds(15),
+      idlePollInterval: 0.01
+    )
+
+    // Run 64 subscribers concurrently.
+    // Waves 1..3 (first 48 subscribers) maliciously delay outbound until maximumPageHold drops them.
+    // Wave 4 (last 16 subscribers) complete outbound immediately.
+    let wave4CompletedSubscribers = NIOLockedValueBox(Set<Int>())
+    let wave1to3DroppedCount = NIOLockedValueBox(0)
+    let tailer = PublicFirehoseTailer(
+      database: firehose,
+      limits: limits,
+      logger: logger,
+      pageAdmission: admission
+    )
+
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      for subscriberIndex in 0..<64 {
+        group.addTask {
+          do {
+            try await tailer.run(
+              lastSent: 0,
+              outbound: { _ in
+                if subscriberIndex < 48 {
+                  // Malicious slow delivery: sleep 10ms per row across 3 rows so total hold > 15ms
+                  try await Task.sleep(for: .milliseconds(10))
+                } else {
+                  wave4CompletedSubscribers.withLockedValue { _ = $0.insert(subscriberIndex) }
+                }
+              },
+              waitForWakeup: { nil as Int64? }
+            )
+          } catch let error as PublicFirehoseTailerError {
+            switch error {
+            case .consumerTooSlow, .writeTooSlow:
+              wave1to3DroppedCount.withLockedValue { $0 += 1 }
+            case .admissionStarved:
+              XCTFail("subscriber \(subscriberIndex) hit admission timeout")
+            default:
+              XCTFail("unexpected tailer error \(error) for subscriber \(subscriberIndex)")
+            }
+          } catch is CancellationError {
+            // ok on teardown
+          }
+        }
+      }
+
+      try await waitUntil {
+        wave4CompletedSubscribers.withLockedValue { $0.count } == 16
+      }
+      group.cancelAll()
+    }
+
+    XCTAssertEqual(wave4CompletedSubscribers.withLockedValue { $0.count }, 16, "all 16 wave 4 subscribers must succeed")
+    XCTAssertEqual(wave1to3DroppedCount.withLockedValue { $0 }, 48, "all 48 wave 1-3 subscribers must drop as slow consumers, not admission-starved")
   }
 }

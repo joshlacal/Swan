@@ -1782,20 +1782,21 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(commitBlockAfter, commitBlockBefore)
             XCTAssertEqual(recordBlockAfter, recordBlockBefore)
 
-            // Assert no receipt was committed for the rejected duplicate request.
-            let duplicateRequest = try PublicRepositoryMutationRequest(
-                id: "create-duplicate",
-                canonicalDigest: Data(repeating: 0xdd, count: 32),
-                baseCommitCID: stateAfter.commitCID
+            // Assert no receipt was inserted, reserved, or committed for the rejected duplicate request.
+            let connection = try await SQLiteConnection.open(storage: .file(
+                path: SQLiteLayout.accountDatabase(in: fixture.root, did: Self.did).path
+            ))
+            defer { Task { try? await connection.close() } }
+            let requestsAfter = try await connection.query(
+                "SELECT request_id, status FROM public_repository_mutation_requests"
             )
-            let duplicateReservationOutcome = try await fixture.database.reservePublicRepositoryRevision(
-                duplicateRequest,
-                wallClockMicroseconds: 1_750_000_000_000_000
-            )
-            guard case .reserved(let unusedReservation) = duplicateReservationOutcome else {
-                return XCTFail("rejected create request must not have committed a receipt")
+            XCTAssertEqual(requestsAfter.count, 1, "rejected create must not insert or commit any mutation receipt")
+            guard let afterRequest = requestsAfter.first,
+                  case let .text(afterID) = afterRequest.column("request_id"),
+                  case let .text(afterStatus) = afterRequest.column("status") else {
+                return XCTFail("expected mutation request table to remain unchanged")
             }
-            try await fixture.database.abandonPublicRepositoryReservation(unusedReservation)
+            XCTAssertEqual(afterStatus, "committed")
         }
     }
 

@@ -14,6 +14,7 @@ public struct PublicFirehoseStreamingLimits: Sendable, Equatable {
   public let maximumSequenceLag: Int64
   public let maximumBackfillCatchUp: Duration
   public let maximumWriteDuration: Duration
+  public let maximumPageHold: Duration
   public let idlePollInterval: TimeInterval
 
   public static let standard = try! PublicFirehoseStreamingLimits()
@@ -23,6 +24,7 @@ public struct PublicFirehoseStreamingLimits: Sendable, Equatable {
     maximumSequenceLag: Int64 = 50_000,
     maximumBackfillCatchUp: Duration = .seconds(120),
     maximumWriteDuration: Duration = .seconds(30),
+    maximumPageHold: Duration? = nil,
     idlePollInterval: TimeInterval = 0.25
   ) throws {
     guard pageSize > 0, pageSize <= 1_000 else {
@@ -39,6 +41,10 @@ public struct PublicFirehoseStreamingLimits: Sendable, Equatable {
     guard maximumWriteDuration > .zero else {
       throw SwanError.malformed("firehose maximum write duration must be positive")
     }
+    let resolvedPageHold = maximumPageHold ?? (maximumBackfillCatchUp / 4)
+    guard resolvedPageHold > .zero else {
+      throw SwanError.malformed("firehose maximum page hold must be positive")
+    }
     guard idlePollInterval.isFinite, idlePollInterval > 0 else {
       throw SwanError.malformed("firehose idle poll interval must be positive")
     }
@@ -46,6 +52,7 @@ public struct PublicFirehoseStreamingLimits: Sendable, Equatable {
     self.maximumSequenceLag = maximumSequenceLag
     self.maximumBackfillCatchUp = maximumBackfillCatchUp
     self.maximumWriteDuration = maximumWriteDuration
+    self.maximumPageHold = resolvedPageHold
     self.idlePollInterval = idlePollInterval
   }
 }
@@ -65,7 +72,7 @@ public final class PublicFirehosePageAdmission: @unchecked Sendable {
     let continuation: CheckedContinuation<PublicFirehosePageLease, any Error>
   }
 
-  public init(maximumConcurrentPages: Int = 4) {
+  public init(maximumConcurrentPages: Int = 16) {
     self.maximumConcurrentPages = maximumConcurrentPages
   }
 
@@ -438,6 +445,16 @@ public struct PublicFirehoseTailer: Sendable {
         )
       }
 
+      if seqLag == 0 {
+        pendingAdmissionSeqLag = nil
+        let wakeupSeq = await waitForWakeup()
+        if wakeupSeq != nil {
+          continue
+        }
+        try await Task.sleep(for: .seconds(limits.idlePollInterval))
+        continue
+      }
+
       let pageLease: PublicFirehosePageLease
       do {
         pageLease = try await pageAdmission.reserve(
@@ -472,7 +489,7 @@ public struct PublicFirehoseTailer: Sendable {
         continue
       }
       let pageStarted = clock.now
-      let maximumPageHold = limits.maximumBackfillCatchUp / 2
+      let maximumPageHold = limits.maximumPageHold
       for row in rows {
         let currentHold = clock.now - pageStarted
         if currentHold > maximumPageHold
