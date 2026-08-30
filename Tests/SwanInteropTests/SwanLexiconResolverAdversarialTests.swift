@@ -414,6 +414,147 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
         let fetches = await harness.transport.requestedURLs.count
         XCTAssertEqual(fetches, 0)
     }
+
+    // MARK: - Task 12: Negative lexicon cache bounding and eviction
+
+    func testNegativeLexiconCacheStopsAt4096AndEvictsExpiredRows() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("lexicon-store-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let store = try await SQLiteControlDatabase(dataDirectory: tempDir)
+        defer {
+            Task { try? await store.close() }
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+        let now = Date()
+
+        // 1. Insert 4,096 negative rows (some expired, some fresh)
+        for i in 0 ..< 4_096 {
+            // First 500 rows are 2 hours old (expired > 1 hour)
+            let updatedAt = i < 500 ? now.addingTimeInterval(-7200) : now
+            let row = OAuthLexiconDocumentRow(
+                nsid: "com.example.neg\(i)",
+                document: nil,
+                sourceURI: nil,
+                verifiedCID: nil,
+                createdAt: updatedAt,
+                updatedAt: updatedAt,
+                lastSucceededAt: nil
+            )
+            try await store.storeLexicon(row)
+        }
+
+        // Updating an existing negative NSID remains allowed
+        let updatedExisting = OAuthLexiconDocumentRow(
+            nsid: "com.example.neg1000",
+            document: nil,
+            sourceURI: nil,
+            verifiedCID: nil,
+            createdAt: now,
+            updatedAt: now,
+            lastSucceededAt: nil
+        )
+        try await store.storeLexicon(updatedExisting)
+
+        // 2. Insert 4,097th negative row when expired rows exist -> evicts up to 512 expired rows and succeeds!
+        let row4097 = OAuthLexiconDocumentRow(
+            nsid: "com.example.neg4096",
+            document: nil,
+            sourceURI: nil,
+            verifiedCID: nil,
+            createdAt: now,
+            updatedAt: now,
+            lastSucceededAt: nil
+        )
+        try await store.storeLexicon(row4097)
+
+        // Check that expired rows were evicted (e.g. com.example.neg0 is gone)
+        let evicted = try await store.findLexicon(nsid: "com.example.neg0")
+        XCTAssertNil(evicted, "expired negative row should be evicted")
+
+        // 3. Fill until all 4,096 are fresh (non-expired)
+        var nextIndex = 5000
+        while true {
+            let row = OAuthLexiconDocumentRow(
+                nsid: "com.example.fresh\(nextIndex)",
+                document: nil,
+                sourceURI: nil,
+                verifiedCID: nil,
+                createdAt: now,
+                updatedAt: now,
+                lastSucceededAt: nil
+            )
+            do {
+                try await store.storeLexicon(row)
+                nextIndex += 1
+            } catch {
+                break
+            }
+        }
+
+        // Now that 4,096 non-expired negative rows exist, a new negative row must be rejected
+        let overCapNegative = OAuthLexiconDocumentRow(
+            nsid: "com.example.neg.overflow",
+            document: nil,
+            sourceURI: nil,
+            verifiedCID: nil,
+            createdAt: now,
+            updatedAt: now,
+            lastSucceededAt: nil
+        )
+        do {
+            try await store.storeLexicon(overCapNegative)
+            XCTFail("expected 4,096 negative row capacity exhaustion")
+        } catch {
+            // Expected capacity rejection
+        }
+
+        // 4. Converting an existing negative NSID to positive frees a negative slot
+        let positiveDoc = Data("valid-doc".utf8)
+        let convertedPositive = OAuthLexiconDocumentRow(
+            nsid: "com.example.neg1000",
+            document: positiveDoc,
+            sourceURI: "at://did:plc:test/com.atproto.lexicon.schema/com.example.neg1000",
+            verifiedCID: "bafytestcid",
+            createdAt: now,
+            updatedAt: now,
+            lastSucceededAt: now
+        )
+        try await store.storeLexicon(convertedPositive)
+        let foundConverted = try await store.findLexicon(nsid: "com.example.neg1000")
+        XCTAssertEqual(foundConverted?.document, positiveDoc)
+
+        // Now we can insert one more negative row because one negative slot was freed!
+        try await store.storeLexicon(overCapNegative)
+        let foundOverCap = try await store.findLexicon(nsid: "com.example.neg.overflow")
+        XCTAssertNotNil(foundOverCap)
+
+        // 5. Positive rows are NEVER purged by negative cleanup
+        let oldPositive = OAuthLexiconDocumentRow(
+            nsid: "com.example.pos.old",
+            document: positiveDoc,
+            sourceURI: "at://did:plc:test/com.atproto.lexicon.schema/com.example.pos.old",
+            verifiedCID: "bafytestcid",
+            createdAt: now.addingTimeInterval(-7200),
+            updatedAt: now.addingTimeInterval(-7200),
+            lastSucceededAt: now.addingTimeInterval(-7200)
+        )
+        try await store.storeLexicon(oldPositive)
+
+        // Trigger negative cleanup by storing another row
+        let triggerRow = OAuthLexiconDocumentRow(
+            nsid: "com.example.trigger",
+            document: positiveDoc,
+            sourceURI: "at://did:plc:test/com.atproto.lexicon.schema/com.example.trigger",
+            verifiedCID: "bafytestcid",
+            createdAt: now,
+            updatedAt: now,
+            lastSucceededAt: now
+        )
+        try await store.storeLexicon(triggerRow)
+
+        let preservedPositive = try await store.findLexicon(nsid: "com.example.pos.old")
+        XCTAssertNotNil(preservedPositive, "positive rows must never be deleted by negative eviction")
+    }
 }
 
 // MARK: - Harness

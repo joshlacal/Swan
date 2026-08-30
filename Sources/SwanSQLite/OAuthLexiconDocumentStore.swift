@@ -93,6 +93,9 @@ extension SQLiteControlDatabase: OAuthLexiconDocumentStore {
     /// chooses. The ceiling keeps that unbounded in requests rather than in
     /// disk.
     static let lexiconDocumentRowCapacity = 8_192
+    static let lexiconDocumentNegativeRowCapacity = 4_096
+    static let lexiconDocumentNegativeEvictionAgeMicroseconds: Int = 3_600 * 1_000_000
+    static let lexiconDocumentNegativeEvictionBatchSize = 512
 
     public func findLexicon(nsid: String) async throws -> OAuthLexiconDocumentRow? {
         guard Self.validLexiconNSID(nsid) else {
@@ -138,6 +141,40 @@ extension SQLiteControlDatabase: OAuthLexiconDocumentStore {
         let lastSucceededAt = try row.lastSucceededAt.map(Self.lexiconTimestamp)
         try await withConnectionGate {
             try await transaction {
+                let negativeEvictionThreshold = max(0, updatedAt - Self.lexiconDocumentNegativeEvictionAgeMicroseconds)
+                _ = try await connection.query(
+                    """
+                    DELETE FROM oauth_lexicon_documents
+                    WHERE nsid IN (
+                        SELECT nsid FROM oauth_lexicon_documents
+                        WHERE document IS NULL AND updated_at < ?
+                        ORDER BY updated_at ASC
+                        LIMIT ?
+                    )
+                    """,
+                    [.integer(negativeEvictionThreshold), .integer(Self.lexiconDocumentNegativeEvictionBatchSize)]
+                )
+                if row.document == nil {
+                    let existingNegative = try await connection.query(
+                        "SELECT 1 FROM oauth_lexicon_documents WHERE nsid = ? AND document IS NULL LIMIT 1",
+                        [.text(row.nsid)]
+                    )
+                    if existingNegative.isEmpty {
+                        let countRows = try await connection.query(
+                            "SELECT COUNT(*) AS count FROM oauth_lexicon_documents WHERE document IS NULL"
+                        )
+                        guard let countRow = countRows.first,
+                              case let .integer(negCount) = countRow.column("count"),
+                              negCount >= 0 else {
+                            throw OAuthControlStoreError.malformedRecord
+                        }
+                        guard negCount < Self.lexiconDocumentNegativeRowCapacity else {
+                            throw SwanError.unavailable(
+                                "OAuth lexicon negative cache capacity is exhausted"
+                            )
+                        }
+                    }
+                }
                 try await requireInsertionCapacity(
                     table: "oauth_lexicon_documents",
                     keyColumn: "nsid",
