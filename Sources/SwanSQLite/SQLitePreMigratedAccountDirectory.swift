@@ -689,14 +689,14 @@ public actor SQLitePreMigratedAccountDirectory:
 
     public func unregisterSpaceNotification(
         space: SpaceURI,
-        service: String,
+        serviceDID: String,
         authorization: AuthorizationContext
     ) async throws {
         let database = try await preopenedCredentialAuthorityDatabase(for: space)
         do {
             try await database.unregisterSpaceNotification(
                 space: space,
-                service: service,
+                serviceDID: serviceDID,
                 authorization: authorization
             )
             try await requireCredentialAuthorityStillAvailable(space.authority)
@@ -711,6 +711,7 @@ public actor SQLitePreMigratedAccountDirectory:
 
     public func registerSpaceNotification(
         _ registration: AuthorizedSpaceNotificationRegistration,
+        serviceDID: String,
         authorization: AuthorizationContext
     ) async throws {
         let database = try await preopenedCredentialAuthorityDatabase(
@@ -719,6 +720,7 @@ public actor SQLitePreMigratedAccountDirectory:
         do {
             try await database.registerSpaceNotification(
                 registration,
+                serviceDID: serviceDID,
                 authorization: authorization
             )
             try await requireCredentialAuthorityStillAvailable(
@@ -768,11 +770,9 @@ public actor SQLitePreMigratedAccountDirectory:
         space: SpaceURI,
         issuer: String,
         audience: String,
-        eventID: String
+        eventID: String,
+        requestBodyDigest: String?
     ) async throws {
-        // A notification addressed to a PDS that does not host this account
-        // is a successful best-effort no-op. Do not create/migrate an account
-        // database from an incoming audience claim.
         guard let database = try await preopenedActiveDatabaseIfHosted(audience) else {
             return
         }
@@ -781,7 +781,8 @@ public actor SQLitePreMigratedAccountDirectory:
                 space: space,
                 issuer: issuer,
                 audience: audience,
-                eventID: eventID
+                eventID: eventID,
+                requestBodyDigest: requestBodyDigest
             )
             guard try await isActiveAccount(audience), !isClosed else {
                 throw SwanError.unavailable("authenticated space directory is unavailable")

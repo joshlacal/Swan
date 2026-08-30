@@ -372,6 +372,7 @@ public struct AuthorizedSpaceWriteNotification: Sendable, Equatable {
     public let commitment: Data
     public let issuer: String
     public let audience: String
+    public let requestBodyDigest: String?
 
     public init(
         eventID: String,
@@ -380,7 +381,8 @@ public struct AuthorizedSpaceWriteNotification: Sendable, Equatable {
         wireRevision: String,
         commitment: Data,
         issuer: String,
-        audience: String
+        audience: String,
+        requestBodyDigest: String? = nil
     ) {
         self.eventID = eventID
         self.space = space
@@ -389,6 +391,7 @@ public struct AuthorizedSpaceWriteNotification: Sendable, Equatable {
         self.commitment = commitment
         self.issuer = issuer
         self.audience = audience
+        self.requestBodyDigest = requestBodyDigest
     }
 }
 
@@ -406,16 +409,13 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
 
     func registerSpaceNotification(
         _ registration: AuthorizedSpaceNotificationRegistration,
+        serviceDID: String,
         authorization: AuthorizationContext
     ) async throws
 
-    /// Withdraws a subscriber's registration by service identity
-    /// (`com.atproto.space.unregisterNotify`). Idempotent: succeeds whether or
-    /// not a matching registration existed. Implementations gate on a space
-    /// credential for exactly this space and on the space still being active.
     func unregisterSpaceNotification(
         space: SpaceURI,
-        service: String,
+        serviceDID: String,
         authorization: AuthorizationContext
     ) async throws
 
@@ -435,7 +435,8 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
         space: SpaceURI,
         issuer: String,
         audience: String,
-        eventID: String
+        eventID: String,
+        requestBodyDigest: String?
     ) async throws
 }
 

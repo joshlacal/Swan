@@ -139,6 +139,15 @@ private struct AuthenticatedRegisterSpaceNotifyHandler {
             request: request,
             space: space
         )
+        let authenticatedService = try await serviceAuthentication(
+            capability,
+            request: request,
+            expectedAudience: nil,
+            expectedMethod: ComAtprotoSpaceRegisterNotify.typeIdentifier
+        )
+        if let requested = input.service, requested != authenticatedService.issuer {
+            throw AuthenticatedSpaceNotificationFailure.denied
+        }
         let endpoint: String
         let service: String?
         if let identifier = input.service {
@@ -186,6 +195,7 @@ private struct AuthenticatedRegisterSpaceNotifyHandler {
                     expiresAt: expiry,
                     service: service
                 ),
+                serviceDID: authenticatedService.issuer,
                 authorization: authorization
             )
             return .init(expiresAt: ATProtocolDate(date: expiry))
@@ -205,14 +215,21 @@ private struct AuthenticatedUnregisterSpaceNotifyHandler {
     ) async throws {
         let space = try notificationSpace(input.space)
         let authorization = try await credentialAuthorization(
+            capability, request: request, space: space
+        )
+        let service = try await serviceAuthentication(
             capability,
             request: request,
-            space: space
+            expectedAudience: nil,
+            expectedMethod: ComAtprotoSpaceUnregisterNotify.typeIdentifier
         )
+        guard input.service == service.issuer else {
+            throw AuthenticatedSpaceNotificationFailure.denied
+        }
         do {
             try await capability.directory.unregisterSpaceNotification(
                 space: space,
-                service: input.service,
+                serviceDID: service.issuer,
                 authorization: authorization
             )
         } catch {
@@ -241,17 +258,18 @@ private struct AuthenticatedNotifySpaceWriteHandler:
             capability,
             request: request,
             expectedAudience: nil,
-            expectedMethod: ComAtprotoSpaceNotifyWrite.typeIdentifier
+            expectedMethod: ComAtprotoSpaceNotifyWrite.typeIdentifier,
+            expectedRequestBodyDigest: SpaceServiceRequestDigest.write(
+                space: space,
+                repository: input.repo.didString(),
+                revision: input.rev.toString(),
+                commitment: input.hash.data
+            )
         )
         // This is the only notifyWrite shape accepted by the pinned TypeScript
         // PDS: the writer signs its own announcement and addresses the space
         // authority. An authority cannot safely re-sign another writer's
         // announcement, so Swan does not claim authority-to-recipient write
-        // fanout interoperability on this endpoint.
-        guard service.issuer == input.repo.didString(),
-              service.audience == space.authority else {
-            throw AuthenticatedSpaceNotificationFailure.denied
-        }
         do {
             try await capability.directory.receiveSpaceWriteNotification(
                 .init(
@@ -261,7 +279,8 @@ private struct AuthenticatedNotifySpaceWriteHandler:
                     wireRevision: input.rev.toString(),
                     commitment: input.hash.data,
                     issuer: service.issuer,
-                    audience: service.audience
+                    audience: service.audience,
+                    requestBodyDigest: service.requestBodyDigest
                 )
             )
         } catch {
@@ -287,15 +306,12 @@ private struct AuthenticatedNotifySpaceDeletedHandler:
             capability,
             request: request,
             expectedAudience: nil,
-            expectedMethod: ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
+            expectedMethod: ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier,
+            expectedRequestBodyDigest: SpaceServiceRequestDigest.deletion(space: space)
         )
         guard service.issuer == space.authority else {
             throw AuthenticatedSpaceNotificationFailure.denied
         }
-        // A deletion receiver identity is an explicit operator binding rather
-        // than a syntactic DID check. This supports the pinned PDS's service
-        // identities (which may be endpoint-like) while ensuring an incoming
-        // audience cannot select an arbitrary local account.
         guard let recipientAccount = capability.recipientBindings.account(
             forServiceIdentity: service.audience
         ) else {
@@ -306,7 +322,8 @@ private struct AuthenticatedNotifySpaceDeletedHandler:
                 space: space,
                 issuer: service.issuer,
                 audience: recipientAccount,
-                eventID: service.eventID
+                eventID: service.eventID,
+                requestBodyDigest: service.requestBodyDigest
             )
         } catch {
             throw notificationStorageFailure(error)
@@ -732,7 +749,8 @@ private func serviceAuthentication(
     _ capability: SwanAuthenticatedSpaceNotificationsCapability,
     request: Request,
     expectedAudience: String?,
-    expectedMethod: String
+    expectedMethod: String,
+    expectedRequestBodyDigest: String? = nil
 ) async throws -> VerifiedSpaceServiceAuthentication {
     let compact: String
     do {
@@ -741,6 +759,7 @@ private func serviceAuthentication(
             compact,
             expectedAudience: expectedAudience,
             expectedMethod: expectedMethod,
+            expectedRequestBodyDigest: expectedRequestBodyDigest,
             now: Date()
         )
     } catch let failure as AuthenticatedSpaceNotificationFailure {
@@ -759,7 +778,7 @@ private func serviceAuthentication(
 /// endpoints. OAuth DPoP and generic Bearer credentials never fall through:
 /// callers must supply exactly one bounded compact service JWT.
 func exactSpaceServiceBearerToken(from headers: HTTPFields) throws -> String {
-    let values = headers[values: .authorization]
+    let values = headers[values: HTTPField.Name("Atproto-Service-Auth")!]
     guard values.count == 1,
           let raw = values.first else {
         throw SwanError.unauthorized("service authentication is invalid")

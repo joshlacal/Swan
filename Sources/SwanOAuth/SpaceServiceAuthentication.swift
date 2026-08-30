@@ -14,6 +14,7 @@ public struct VerifiedSpaceServiceAuthentication: Sendable, Equatable {
     public let audience: String
     public let method: String
     public let eventID: String
+    public let requestBodyDigest: String?
     public let expiresAt: Date
 
     public init(
@@ -21,12 +22,14 @@ public struct VerifiedSpaceServiceAuthentication: Sendable, Equatable {
         audience: String,
         method: String,
         eventID: String,
+        requestBodyDigest: String? = nil,
         expiresAt: Date
     ) {
         self.issuer = issuer
         self.audience = audience
         self.method = method
         self.eventID = eventID
+        self.requestBodyDigest = requestBodyDigest
         self.expiresAt = expiresAt
     }
 }
@@ -39,9 +42,6 @@ public protocol SpaceServicePublicKeyResolver: Sendable {
 }
 
 /// Verifies the exact service JWT shape accepted by the pinned PDS handlers.
-/// It intentionally has no replay cache: notification idempotence is a
-/// per-authority SQLite transaction so receiver restart and reordering retain
-/// the same convergence behavior.
 public protocol SpaceServiceAuthenticationVerifier: Sendable {
     func authenticate(
         _ compact: String,
@@ -49,6 +49,18 @@ public protocol SpaceServiceAuthenticationVerifier: Sendable {
         expectedMethod: String,
         now: Date
     ) async throws -> VerifiedSpaceServiceAuthentication
+}
+
+public extension SpaceServiceAuthenticationVerifier {
+    func authenticate(
+        _ compact: String,
+        expectedAudience: String?,
+        expectedMethod: String,
+        expectedRequestBodyDigest: String?,
+        now: Date
+    ) async throws -> VerifiedSpaceServiceAuthentication {
+        try await authenticate(compact, expectedAudience: expectedAudience, expectedMethod: expectedMethod, now: now)
+    }
 }
 
 /// A small authority-scoped signer used only by durable notification
@@ -244,11 +256,25 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
         self.publicKeys = publicKeys
         self.configuration = configuration
     }
-
     public func authenticate(
         _ compact: String,
         expectedAudience: String?,
         expectedMethod: String,
+        now: Date
+    ) async throws -> VerifiedSpaceServiceAuthentication {
+        try await authenticate(
+            compact,
+            expectedAudience: expectedAudience,
+            expectedMethod: expectedMethod,
+            expectedRequestBodyDigest: nil,
+            now: now
+        )
+    }
+    public func authenticate(
+        _ compact: String,
+        expectedAudience: String?,
+        expectedMethod: String,
+        expectedRequestBodyDigest: String? = nil,
         now: Date = Date()
     ) async throws -> VerifiedSpaceServiceAuthentication {
         let inspected = try SpaceServiceJWT.inspect(compact)
@@ -264,6 +290,7 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
         let claims = try SpaceServiceJWT.verify(
             compact,
             publicKey: key,
+            expectedRequestBodyDigest: expectedRequestBodyDigest,
             now: now,
             clockSkew: configuration.clockSkew,
             maximumLifetime: configuration.maximumLifetime
@@ -280,6 +307,7 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
             audience: claims.aud,
             method: expectedMethod,
             eventID: eventID,
+            requestBodyDigest: claims.requestBodyDigest,
             expiresAt: Date(timeIntervalSince1970: TimeInterval(claims.exp))
         )
     }
@@ -361,6 +389,34 @@ private func validServiceMethod(_ value: String) -> Bool {
     }
 }
 
+/// Domain-separated, length-prefixed request binding used by space service JWTs.
+public enum SpaceServiceRequestDigest {
+    public static func deletion(space: SpaceURI) -> String {
+        digest(domain: "swan.space.notify-deleted.v1", fields: [space.rawValue])
+    }
+
+    public static func write(
+        space: SpaceURI,
+        repository: String,
+        revision: String,
+        commitment: Data
+    ) -> String {
+        digest(
+            domain: "swan.space.notify-write.v1",
+            fields: [space.rawValue, repository, revision, commitment.base64EncodedString()]
+        )
+    }
+
+    private static func digest(domain: String, fields: [String]) -> String {
+        var input = Data()
+        for field in [domain] + fields {
+            var length = UInt64(field.utf8.count).bigEndian
+            withUnsafeBytes(of: &length) { input.append(contentsOf: $0) }
+            input.append(contentsOf: field.utf8)
+        }
+        return Data(SHA256.hash(data: input)).base64URLEncodedString()
+    }
+}
 private func validServiceEventID(_ value: String) -> Bool {
     !value.isEmpty && value.utf8.count <= 256 && value.utf8.allSatisfy { $0 >= 0x21 && $0 <= 0x7e }
 }
