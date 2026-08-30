@@ -2,6 +2,7 @@ import Foundation
 import Logging
 import SwanCore
 import SwanSQLite
+import PetrelFirehose
 
 /// Injectable per-connection streaming bounds for `subscribeRepos`.
 ///
@@ -45,6 +46,64 @@ public struct PublicFirehoseStreamingLimits: Sendable, Equatable {
     self.maximumBackfillCatchUp = maximumBackfillCatchUp
     self.maximumWriteDuration = maximumWriteDuration
     self.idlePollInterval = idlePollInterval
+  }
+}
+
+/// Process-wide page admission bounding concurrent firehose event page materialization.
+public final class PublicFirehosePageAdmission: @unchecked Sendable {
+  public static let shared = PublicFirehosePageAdmission()
+
+  private let lock = NSLock()
+  private var activeLeases: Int = 0
+  public let maximumConcurrentPages: Int
+
+  public init(maximumConcurrentPages: Int = 4) {
+    self.maximumConcurrentPages = maximumConcurrentPages
+  }
+
+  public func reserve() -> PublicFirehosePageLease? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard activeLeases < maximumConcurrentPages else { return nil }
+    activeLeases += 1
+    return PublicFirehosePageLease(admission: self)
+  }
+
+  fileprivate func release() {
+    lock.lock()
+    defer { lock.unlock() }
+    guard activeLeases > 0 else { return }
+    activeLeases -= 1
+  }
+
+  public var currentActiveLeases: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return activeLeases
+  }
+}
+
+public final class PublicFirehosePageLease: @unchecked Sendable {
+  private let lock = NSLock()
+  private var admission: PublicFirehosePageAdmission?
+
+  fileprivate init(admission: PublicFirehosePageAdmission) {
+    self.admission = admission
+  }
+
+  public func release() {
+    lock.lock()
+    guard let admission = self.admission else {
+      lock.unlock()
+      return
+    }
+    self.admission = nil
+    lock.unlock()
+    admission.release()
+  }
+
+  deinit {
+    release()
   }
 }
 
@@ -138,15 +197,18 @@ public struct PublicFirehoseTailer: Sendable {
   public let database: SQLiteFirehoseDatabase
   public let limits: PublicFirehoseStreamingLimits
   public let logger: Logger
+  public let pageAdmission: PublicFirehosePageAdmission
 
   public init(
     database: SQLiteFirehoseDatabase,
     limits: PublicFirehoseStreamingLimits,
-    logger: Logger
+    logger: Logger,
+    pageAdmission: PublicFirehosePageAdmission = .shared
   ) {
     self.database = database
     self.limits = limits
     self.logger = logger
+    self.pageAdmission = pageAdmission
   }
 
   /// Runs the delivery loop from `lastSent` until task cancellation.
@@ -242,25 +304,19 @@ public struct PublicFirehoseTailer: Sendable {
           retainedFromSeq: retainedFromSeq
         )
       }
-      let rows = try await database.events(after: cursor, limit: limits.pageSize)
-      if rows.isEmpty {
-        let wakeupSeq = await waitForWakeup()
-        if wakeupSeq != nil {
-          continue
-        }
-        try await Task.sleep(for: .seconds(limits.idlePollInterval))
-        continue
-      }
       let maxSeq = try await database.maxSequencedSeq()
       // Raw difference is an upper bound on deliverable rows (deletion
       // gaps only shrink the real count), so the bounded count runs only
       // when a drop is already plausible.
-      var seqLag = maxSeq - cursor
-      if seqLag > limits.maximumSequenceLag {
-        seqLag = try await database.deliverableEventCount(
-          after: cursor,
-          limit: limits.maximumSequenceLag + 1
-        )
+      var seqLag: Int64 = 0
+      if maxSeq > cursor {
+        seqLag = maxSeq - cursor
+        if seqLag > limits.maximumSequenceLag {
+          seqLag = try await database.deliverableEventCount(
+            after: cursor,
+            limit: limits.maximumSequenceLag + 1
+          )
+        }
       }
       if PublicFirehoseSlowConsumerPolicy.shouldDrop(
         seqLag: seqLag,
@@ -274,6 +330,30 @@ public struct PublicFirehoseTailer: Sendable {
           backfillElapsed: backfillElapsed
         )
       }
+      guard let pageLease = pageAdmission.reserve() else {
+        try await Task.sleep(for: .seconds(limits.idlePollInterval))
+        continue
+      }
+      let rows: [FirehoseStoredEvent]
+      do {
+        rows = try await database.events(
+          after: cursor,
+          limit: limits.pageSize,
+          maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes
+        )
+      } catch {
+        pageLease.release()
+        throw error
+      }
+      if rows.isEmpty {
+        pageLease.release()
+        let wakeupSeq = await waitForWakeup()
+        if wakeupSeq != nil {
+          continue
+        }
+        try await Task.sleep(for: .seconds(limits.idlePollInterval))
+        continue
+      }
       let pageClock = ContinuousClock()
       let pageStarted = pageClock.now
       for row in rows {
@@ -283,10 +363,12 @@ public struct PublicFirehoseTailer: Sendable {
           try watchdog.endWrite()
         } catch {
           try? watchdog.endWrite()
+          pageLease.release()
           throw error
         }
         cursor = row.seq
       }
+      pageLease.release()
       let pageElapsed = pageClock.now - pageStarted
       if seqLag > 0 {
         backfillElapsed += pageElapsed

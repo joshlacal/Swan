@@ -495,7 +495,8 @@ public actor SQLiteFirehoseDatabase {
 
   public func events(
     after seq: Int64,
-    limit: Int
+    limit: Int,
+    maximumBytes: Int = 4 * FirehoseFrameLimits.maximumFrameBytes
   ) async throws -> [FirehoseStoredEvent] {
     try checkOpen()
     guard seq >= 0, seq <= FirehoseFrameLimits.maximumSequence else {
@@ -508,17 +509,55 @@ public actor SQLiteFirehoseDatabase {
         "firehose event limit must be between 1 and \(Self.maximumCursorLimit)"
       )
     }
+    guard maximumBytes > 0 else {
+      throw SQLiteFirehoseDatabaseError.invalidRequest(
+        "firehose maximum bytes must be positive"
+      )
+    }
     return try await withConnectionGate {
-      let rows = try await connection.query(
+      let lengthRows = try await connection.query(
         """
-        SELECT seq, source_key, batch_id, batch_ordinal, did, kind,
-               sequenced_at, frame_bytes
+        SELECT seq, length(frame_bytes) AS frame_len
         FROM firehose_events
         WHERE seq > ?
         ORDER BY seq
         LIMIT ?
         """,
         [.integer(Int(seq)), .integer(limit)]
+      )
+      guard !lengthRows.isEmpty else { return [] }
+
+      var selectedSeqs: [Int] = []
+      var accumulatedBytes = 0
+      for row in lengthRows {
+        guard let s = row.column("seq")?.integer,
+              let len = row.column("frame_len")?.integer else {
+          throw SQLiteFirehoseDatabaseError.corruptDatabase("invalid seq or frame_len")
+        }
+        if selectedSeqs.isEmpty {
+          selectedSeqs.append(s)
+          accumulatedBytes += len
+        } else if accumulatedBytes + len <= maximumBytes {
+          selectedSeqs.append(s)
+          accumulatedBytes += len
+        } else {
+          break
+        }
+      }
+
+      guard let minSeq = selectedSeqs.first, let maxSeq = selectedSeqs.last else {
+        return []
+      }
+
+      let rows = try await connection.query(
+        """
+        SELECT seq, source_key, batch_id, batch_ordinal, did, kind,
+               sequenced_at, frame_bytes
+        FROM firehose_events
+        WHERE seq >= ? AND seq <= ?
+        ORDER BY seq
+        """,
+        [.integer(minSeq), .integer(maxSeq)]
       )
       return try decodeStoredEvents(rows).values.sorted { $0.seq < $1.seq }
     }

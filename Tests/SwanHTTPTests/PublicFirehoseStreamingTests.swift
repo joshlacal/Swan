@@ -681,4 +681,65 @@ final class PublicFirehoseStreamingTests: XCTestCase {
       "retention changes must wake a tailer even when no new sequence exists"
     )
   }
+
+  func testPageAdmissionLimitsConcurrentPagesToFour() {
+    let admission = PublicFirehosePageAdmission(maximumConcurrentPages: 4)
+    let lease1 = admission.reserve()
+    XCTAssertNotNil(lease1)
+    let lease2 = admission.reserve()
+    XCTAssertNotNil(lease2)
+    let lease3 = admission.reserve()
+    XCTAssertNotNil(lease3)
+    let lease4 = admission.reserve()
+    XCTAssertNotNil(lease4)
+    XCTAssertEqual(admission.currentActiveLeases, 4)
+
+    let lease5 = admission.reserve()
+    XCTAssertNil(lease5, "5th concurrent page reservation must be rejected")
+
+    lease2?.release()
+    XCTAssertEqual(admission.currentActiveLeases, 3)
+
+    let lease6 = admission.reserve()
+    XCTAssertNotNil(lease6, "reservation succeeds after lease released")
+    XCTAssertEqual(admission.currentActiveLeases, 4)
+
+    lease1?.release()
+    lease3?.release()
+    lease4?.release()
+    lease6?.release()
+    XCTAssertEqual(admission.currentActiveLeases, 0)
+  }
+
+  func testTailerReleasesPageReservationOnOutboundErrorOrCancellation() async throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
+    defer { Task { try? await firehose.close() } }
+    _ = try await firehose.appendBatch([identityItem(sourceKey: "k1")], now: epoch)
+
+    let admission = PublicFirehosePageAdmission(maximumConcurrentPages: 1)
+    let limits = try PublicFirehoseStreamingLimits(idlePollInterval: 0.01)
+    let tailer = PublicFirehoseTailer(
+      database: firehose,
+      limits: limits,
+      logger: logger,
+      pageAdmission: admission
+    )
+
+    enum InjectedOutboundError: Error { case boom }
+
+    do {
+      try await tailer.run(
+        lastSent: 0,
+        outbound: { _ in
+          throw InjectedOutboundError.boom
+        },
+        waitForWakeup: { nil as Int64? }
+      )
+      XCTFail("expected outbound error")
+    } catch is InjectedOutboundError {
+      XCTAssertEqual(admission.currentActiveLeases, 0, "page reservation must be released after outbound error")
+    }
+  }
 }

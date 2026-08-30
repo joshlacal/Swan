@@ -1000,4 +1000,39 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
       "replay must rederive the same batch-start boundary and must not delete the sibling"
     )
   }
+
+  private func largeFrameItem(
+    sourceKey: String,
+    batchID: String = "large-batch",
+    size: Int
+  ) -> FirehoseAppendItem {
+    FirehoseAppendItem(
+      sourceKey: sourceKey,
+      batchID: batchID,
+      did: did,
+      kind: .identity
+    ) { _ in
+      Data(repeating: 0x42, count: size)
+    }
+  }
+
+  func testEventsBoundedByMaximumBytes() async throws {
+    _ = try await firehose.appendBatch([
+      largeFrameItem(sourceKey: "large-1", size: 3_000_000),
+      largeFrameItem(sourceKey: "large-2", size: 3_000_000),
+      largeFrameItem(sourceKey: "large-3", size: 3_000_000),
+    ], now: epoch)
+
+    let singlePage = try await firehose.events(after: 0, limit: 10, maximumBytes: 5_000_000)
+    XCTAssertEqual(singlePage.map(\.seq), [1], "exceeding budget after first frame must stop page")
+
+    let multiPage = try await firehose.events(after: 0, limit: 10, maximumBytes: 7_000_000)
+    XCTAssertEqual(multiPage.map(\.seq), [1, 2], "two frames fit within 7_000_000")
+
+    let tinyBudget = try await firehose.events(after: 0, limit: 10, maximumBytes: 1_000_000)
+    XCTAssertEqual(tinyBudget.map(\.seq), [1], "always allows at least one frame even if larger than budget")
+
+    let fullPage = try await firehose.events(after: 0, limit: 10, maximumBytes: 20_000_000)
+    XCTAssertEqual(fullPage.map(\.seq), [1, 2, 3])
+  }
 }
