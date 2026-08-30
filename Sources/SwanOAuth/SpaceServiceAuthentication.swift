@@ -252,7 +252,12 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
         expectedRequestBodyDigest: String? = nil,
         now: Date = Date()
     ) async throws -> VerifiedSpaceServiceAuthentication {
-        let inspected = try SpaceServiceJWT.inspect(compact)
+        let inspected: SpaceServiceJWT.Inspection
+        do {
+            inspected = try SpaceServiceJWT.inspect(compact)
+        } catch {
+            throw SwanError.unauthorized("service authentication is invalid")
+        }
         guard let method = inspected.claims.lxm,
               validServiceMethod(method),
               method == expectedMethod,
@@ -262,16 +267,21 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
               let key = try await publicKeys.publicKey(for: inspected.claims.iss) else {
             throw SwanError.unauthorized("service authentication is invalid")
         }
-        let claims = try SpaceServiceJWT.verify(
-            compact,
-            publicKey: key,
-            expectedAudience: expectedAudience,
-            expectedMethod: expectedMethod,
-            expectedRequestBodyDigest: expectedRequestBodyDigest,
-            now: now,
-            clockSkew: configuration.clockSkew,
-            maximumLifetime: configuration.maximumLifetime
-        )
+        let claims: SpaceServiceJWT.Claims
+        do {
+            claims = try SpaceServiceJWT.verify(
+                compact,
+                publicKey: key,
+                expectedAudience: expectedAudience,
+                expectedMethod: expectedMethod,
+                expectedRequestBodyDigest: expectedRequestBodyDigest,
+                now: now,
+                clockSkew: configuration.clockSkew,
+                maximumLifetime: configuration.maximumLifetime
+            )
+        } catch {
+            throw SwanError.unauthorized("service authentication is invalid")
+        }
         guard claims.lxm == expectedMethod,
               validServiceMethod(expectedMethod),
               expectedAudience.map({ claims.aud == $0 }) ?? true,

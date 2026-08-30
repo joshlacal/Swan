@@ -3,6 +3,8 @@ import Foundation
 import PetrelCrypto
 import SwanCore
 import SwanOAuth
+import SwanSpaces
+import SwanStorage
 import XCTest
 
 final class TypeScriptSpaceNotificationContractTests: XCTestCase {
@@ -21,6 +23,30 @@ final class TypeScriptSpaceNotificationContractTests: XCTestCase {
                 try .init(issuer: fixture.issuer, generation: 1, secp256k1PublicKey: publicKey),
             ])
         )
+        let space = try SpaceURI(authority: fixture.audience, spaceType: "app.bsky.bookmarks", skey: "self")
+        let expectedDigest = SpaceServiceRequestDigest.write(
+            space: space,
+            repository: fixture.issuer,
+            revision: "3jzk76w5wzs2a",
+            commitment: Data(repeating: 0x24, count: 32)
+        )
+
+        // The pinned upstream token is unbound (carries no req claim), so it must be
+        // rejected when the route requires a bound request body digest.
+        do {
+            _ = try await verifier.authenticate(
+                fixture.token,
+                expectedAudience: fixture.audience,
+                expectedMethod: fixture.method,
+                expectedRequestBodyDigest: expectedDigest,
+                now: Date(timeIntervalSince1970: 1_750_000_010)
+            )
+            XCTFail("expected unbound pinned typescript token to be rejected when expected digest is required")
+        } catch let error as SwanError {
+            XCTAssertEqual(error, .unauthorized("service authentication is invalid"))
+        }
+
+        // Baseline inspection/verification without expected digest succeeds.
         let verified = try await verifier.authenticate(
             fixture.token,
             expectedAudience: fixture.audience,
@@ -30,17 +56,20 @@ final class TypeScriptSpaceNotificationContractTests: XCTestCase {
         XCTAssertEqual(verified.issuer, fixture.issuer)
         XCTAssertEqual(verified.audience, fixture.audience)
         XCTAssertEqual(verified.eventID, fixture.eventID)
+        XCTAssertNil(verified.requestBodyDigest)
 
         // This is the shape Swan emits to a pinned TypeScript authority: the
         // local writer is issuer, the configured authority service identity is
         // audience, and `lxm` binds the XRPC method. It is intentionally not
         // an authority-signed recipient fanout.
+        let swanKey = P256.Signing.PrivateKey()
         let swanToken = try SpaceServiceJWT.create(
             issuer: fixture.issuer,
             audience: fixture.audience,
             method: fixture.method,
             eventID: "swan-direct-writer-contract",
-            key: P256.Signing.PrivateKey(),
+            requestBodyDigest: expectedDigest,
+            key: swanKey,
             now: Date(timeIntervalSince1970: 1_750_000_000)
         )
         let swanInspection = try SpaceServiceJWT.inspect(swanToken)
@@ -49,6 +78,23 @@ final class TypeScriptSpaceNotificationContractTests: XCTestCase {
         XCTAssertEqual(swanInspection.claims.aud, fixture.audience)
         XCTAssertEqual(swanInspection.claims.lxm, fixture.method)
         XCTAssertEqual(swanInspection.claims.jti, "swan-direct-writer-contract")
+        XCTAssertEqual(swanInspection.claims.requestBodyDigest, expectedDigest)
+
+        let swanVerifier = DurableSpaceServiceAuthenticationVerifier(
+            publicKeys: try PinnedSpaceServicePublicKeyResolver(pins: [
+                try .init(issuer: fixture.issuer, generation: 1, publicKey: swanKey.publicKey),
+            ])
+        )
+        let swanVerified = try await swanVerifier.authenticate(
+            swanToken,
+            expectedAudience: fixture.audience,
+            expectedMethod: fixture.method,
+            expectedRequestBodyDigest: expectedDigest,
+            now: Date(timeIntervalSince1970: 1_750_000_010)
+        )
+        XCTAssertEqual(swanVerified.issuer, fixture.issuer)
+        XCTAssertEqual(swanVerified.audience, fixture.audience)
+        XCTAssertEqual(swanVerified.requestBodyDigest, expectedDigest)
 
         // The checked-in fixture records the three source-level requirements
         // from the pinned handler. If the ignored source cache is present (as

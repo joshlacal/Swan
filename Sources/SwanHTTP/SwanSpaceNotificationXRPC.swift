@@ -149,7 +149,7 @@ private struct AuthenticatedRegisterSpaceNotifyHandler {
         do {
             authenticatedService = try await capability.serviceAuthentication.authenticate(
                 serviceToken,
-                expectedAudience: nil,
+                expectedAudience: space.authority,
                 expectedMethod: ComAtprotoSpaceRegisterNotify.typeIdentifier,
                 expectedRequestBodyDigest: nil,
                 now: Date()
@@ -243,7 +243,7 @@ private struct AuthenticatedUnregisterSpaceNotifyHandler {
         do {
             authenticatedService = try await capability.serviceAuthentication.authenticate(
                 serviceToken,
-                expectedAudience: nil,
+                expectedAudience: space.authority,
                 expectedMethod: ComAtprotoSpaceUnregisterNotify.typeIdentifier,
                 expectedRequestBodyDigest: nil,
                 now: Date()
@@ -835,8 +835,12 @@ private func serviceAuthentication(
 /// endpoints. OAuth DPoP and generic Bearer credentials never fall through:
 /// callers must supply exactly one bounded compact service JWT.
 func exactSpaceServiceBearerToken(from headers: HTTPFields) throws -> String {
-    let raw = headers[values: .authorization].first ?? headers[values: HTTPField.Name("atproto-service-auth")!].first
-    guard let raw else {
+    let authValues = headers[values: .authorization]
+    let atprotoName = HTTPField.Name("atproto-service-auth")!
+    let atprotoValues = headers[values: atprotoName]
+    let totalCount = authValues.count + atprotoValues.count
+    guard totalCount == 1,
+          let raw = authValues.first ?? atprotoValues.first else {
         throw SwanError.unauthorized("service authentication is invalid")
     }
     let prefix = "Bearer "
