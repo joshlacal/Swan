@@ -1,3 +1,4 @@
+import NIOConcurrencyHelpers
 import Foundation
 import Logging
 import Petrel
@@ -682,37 +683,90 @@ final class PublicFirehoseStreamingTests: XCTestCase {
     )
   }
 
-  func testPageAdmissionLimitsConcurrentPagesToFour() {
+  func testPageAdmissionLimitsConcurrentPagesToFour() async throws {
     XCTAssertEqual(
       PublicFirehosePageAdmission.shared.maximumConcurrentPages,
       4,
       "process-wide page admission default must be exactly four concurrent pages"
     )
     let admission = PublicFirehosePageAdmission(maximumConcurrentPages: 4)
-    let lease1 = admission.reserve()
-    XCTAssertNotNil(lease1)
-    let lease2 = admission.reserve()
-    XCTAssertNotNil(lease2)
-    let lease3 = admission.reserve()
-    XCTAssertNotNil(lease3)
-    let lease4 = admission.reserve()
-    XCTAssertNotNil(lease4)
+    let lease1 = try await admission.acquire()
+    let lease2 = try await admission.acquire()
+    let lease3 = try await admission.acquire()
+    let lease4 = try await admission.acquire()
     XCTAssertEqual(admission.currentActiveLeases, 4)
 
-    let lease5 = admission.reserve()
-    XCTAssertNil(lease5, "5th concurrent page reservation must be rejected")
+    do {
+      _ = try await admission.acquire(timeout: .milliseconds(10))
+      XCTFail("5th concurrent page reservation must time out")
+    } catch {
+      // Expected timeout
+    }
 
-    lease2?.release()
+    lease2.release()
     XCTAssertEqual(admission.currentActiveLeases, 3)
 
-    let lease6 = admission.reserve()
-    XCTAssertNotNil(lease6, "reservation succeeds after lease released")
+    let lease6 = try await admission.acquire()
     XCTAssertEqual(admission.currentActiveLeases, 4)
 
-    lease1?.release()
-    lease3?.release()
-    lease4?.release()
-    lease6?.release()
+    lease1.release()
+    lease3.release()
+    lease4.release()
+    lease6.release()
+    XCTAssertEqual(admission.currentActiveLeases, 0)
+  }
+
+  func testPageAdmissionFIFOFairnessUnderReacquisitionContentionAndCancellation() async throws {
+    let admission = PublicFirehosePageAdmission(maximumConcurrentPages: 4)
+    var holderLeases: [PublicFirehosePageLease] = []
+    for _ in 0..<4 {
+      let lease = try await admission.acquire()
+      holderLeases.append(lease)
+    }
+    XCTAssertEqual(admission.currentActiveLeases, 4)
+    XCTAssertEqual(admission.currentQueuedWaiters, 0)
+
+    // 5th waiter attempts to acquire and is enqueued.
+    let waiter5Acquired = NIOLockedValueBox(false)
+    let waiter5Task = Task {
+      let lease = try await admission.acquire()
+      waiter5Acquired.withLockedValue { $0 = true }
+      return lease
+    }
+
+    try await waitUntil { admission.currentQueuedWaiters == 1 }
+    XCTAssertFalse(waiter5Acquired.withLockedValue { $0 })
+
+    // Holder 0 releases and immediately races to reacquire.
+    // In a FIFO admission, Holder 0 must go behind Waiter 5.
+    let holder0Lease = holderLeases.removeFirst()
+    holder0Lease.release()
+
+    // Waiter 5 must have acquired the lease handed off from Holder 0.
+    let waiter5Lease = try await waiter5Task.value
+    XCTAssertTrue(waiter5Acquired.withLockedValue { $0 })
+    XCTAssertEqual(admission.currentActiveLeases, 4)
+
+    // Waiter 6 queues up and is cancelled.
+    let waiter6Task = Task {
+      try await admission.acquire()
+    }
+    try await waitUntil { admission.currentQueuedWaiters == 1 }
+    waiter6Task.cancel()
+    do {
+      _ = try await waiter6Task.value
+      XCTFail("expected cancellation error for waiter 6")
+    } catch is CancellationError {
+      // Expected
+    }
+    try await waitUntil { admission.currentQueuedWaiters == 0 }
+    XCTAssertEqual(admission.currentActiveLeases, 4)
+
+    // Clean up remaining leases
+    waiter5Lease.release()
+    for lease in holderLeases {
+      lease.release()
+    }
     XCTAssertEqual(admission.currentActiveLeases, 0)
   }
 

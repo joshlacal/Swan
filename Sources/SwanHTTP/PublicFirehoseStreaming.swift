@@ -50,36 +50,132 @@ public struct PublicFirehoseStreamingLimits: Sendable, Equatable {
   }
 }
 
-/// Process-wide page admission bounding concurrent firehose event page materialization.
-public final class PublicFirehosePageAdmission: Sendable {
+/// Process-wide page admission bounding concurrent firehose event page materialization
+/// with cancellation-aware FIFO fairness.
+public final class PublicFirehosePageAdmission: @unchecked Sendable {
   public static let shared = PublicFirehosePageAdmission()
 
-  private let activeLeases = Mutex<Int>(0)
+  private let lock = NSLock()
   public let maximumConcurrentPages: Int
+  private var activeLeases: Int = 0
+  private var waiters: [Waiter] = []
+
+  private struct Waiter {
+    let id: UUID
+    let continuation: CheckedContinuation<PublicFirehosePageLease, any Error>
+  }
 
   public init(maximumConcurrentPages: Int = 4) {
     self.maximumConcurrentPages = maximumConcurrentPages
   }
 
-  public func reserve() -> PublicFirehosePageLease? {
-    let reserved = activeLeases.withLock { count -> Bool in
-      guard count < maximumConcurrentPages else { return false }
-      count += 1
-      return true
+  public var currentActiveLeases: Int {
+    lock.withLock { activeLeases }
+  }
+
+  public var currentQueuedWaiters: Int {
+    lock.withLock { waiters.count }
+  }
+
+  public func reserve(timeout: Duration? = nil) async throws -> PublicFirehosePageLease {
+    try await acquire(timeout: timeout)
+  }
+
+  public func acquire(timeout: Duration? = nil) async throws -> PublicFirehosePageLease {
+    try Task.checkCancellation()
+    let immediateLease: PublicFirehosePageLease? = lock.withLock {
+      if maximumConcurrentPages > 0 && activeLeases < maximumConcurrentPages && waiters.isEmpty {
+        activeLeases += 1
+        return PublicFirehosePageLease(admission: self)
+      }
+      return nil
     }
-    guard reserved else { return nil }
-    return PublicFirehosePageLease(admission: self)
+    if let immediateLease {
+      return immediateLease
+    }
+
+    let waiterID = UUID()
+    let lease: PublicFirehosePageLease
+    if let timeout {
+      lease = try await withThrowingTaskGroup(of: PublicFirehosePageLease.self) { group in
+        group.addTask {
+          try await self.suspend(id: waiterID)
+        }
+        group.addTask {
+          try await Task.sleep(for: timeout)
+          throw PublicFirehoseTailerError.admissionStarved
+        }
+        do {
+          let result = try await group.next()!
+          group.cancelAll()
+          return result
+        } catch {
+          group.cancelAll()
+          self.cancelWaiter(id: waiterID)
+          throw error
+        }
+      }
+    } else {
+      lease = try await suspend(id: waiterID)
+    }
+
+    do {
+      try Task.checkCancellation()
+      return lease
+    } catch {
+      lease.release()
+      throw error
+    }
+  }
+
+  private func suspend(id: UUID) async throws -> PublicFirehosePageLease {
+    try await withTaskCancellationHandler(
+      operation: {
+        try await withCheckedThrowingContinuation { continuation in
+          lock.withLock {
+            if Task.isCancelled {
+              continuation.resume(throwing: CancellationError())
+              return
+            }
+            if self.maximumConcurrentPages > 0 && self.activeLeases < self.maximumConcurrentPages && self.waiters.isEmpty {
+              self.activeLeases += 1
+              continuation.resume(returning: PublicFirehosePageLease(admission: self))
+              return
+            }
+            self.waiters.append(Waiter(id: id, continuation: continuation))
+          }
+        }
+      },
+      onCancel: {
+        self.cancelWaiter(id: id)
+      }
+    )
+  }
+
+  private func cancelWaiter(id: UUID) {
+    let continuation: CheckedContinuation<PublicFirehosePageLease, any Error>? = lock.withLock {
+      guard let index = self.waiters.firstIndex(where: { $0.id == id }) else {
+        return nil
+      }
+      return self.waiters.remove(at: index).continuation
+    }
+    continuation?.resume(throwing: CancellationError())
   }
 
   fileprivate func release() {
-    activeLeases.withLock { count in
-      guard count > 0 else { return }
-      count -= 1
+    let continuation: CheckedContinuation<PublicFirehosePageLease, any Error>? = lock.withLock {
+      guard activeLeases > 0 else { return nil }
+      if !waiters.isEmpty {
+        let waiter = waiters.removeFirst()
+        return waiter.continuation
+      } else {
+        activeLeases -= 1
+        return nil
+      }
     }
-  }
-
-  public var currentActiveLeases: Int {
-    activeLeases.withLock { $0 }
+    if let continuation {
+      continuation.resume(returning: PublicFirehosePageLease(admission: self))
+    }
   }
 }
 
@@ -294,7 +390,6 @@ public struct PublicFirehoseTailer: Sendable {
   ) async throws {
     var cursor = lastSent
     var backfillElapsed = Duration.zero
-    var starvedStarted: ContinuousClock.Instant?
     var pendingAdmissionSeqLag: Int64?
     let clock = ContinuousClock()
     while !Task.isCancelled {
@@ -343,20 +438,18 @@ public struct PublicFirehoseTailer: Sendable {
         )
       }
 
-      if let starvedStarted,
-         clock.now - starvedStarted > limits.maximumBackfillCatchUp {
+      let pageLease: PublicFirehosePageLease
+      do {
+        pageLease = try await pageAdmission.reserve(
+          timeout: limits.maximumBackfillCatchUp
+        )
+      } catch is CancellationError {
+        throw CancellationError()
+      } catch {
         logger.warning("dropping public firehose subscriber due to page admission saturation")
         throw PublicFirehoseTailerError.admissionStarved
       }
-      guard let pageLease = pageAdmission.reserve() else {
-        if starvedStarted == nil {
-          starvedStarted = clock.now
-        }
-        try await Task.sleep(for: .seconds(limits.idlePollInterval))
-        continue
-      }
       pendingAdmissionSeqLag = nil
-      starvedStarted = nil
 
       let rows: [FirehoseStoredEvent]
       do {
