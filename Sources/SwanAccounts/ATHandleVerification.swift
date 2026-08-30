@@ -101,17 +101,89 @@ public protocol ATHandleDNSResolving: Sendable {
     func addresses(host: String) async throws -> [ATHandleIPAddress]
 }
 
+final class HandleDNSAdmissionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active: Int = 0
+    private var queued: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
+    let maxActive: Int
+    let maxQueued: Int
+
+    init(maxActive: Int = 8, maxQueued: Int = 128) {
+        self.maxActive = maxActive
+        self.maxQueued = maxQueued
+    }
+
+    var activeCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return active
+    }
+
+    var queuedCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return queued.count
+    }
+
+    func acquire() async throws {
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                if active < maxActive {
+                    active += 1
+                    lock.unlock()
+                    continuation.resume()
+                } else if queued.count < maxQueued {
+                    if Task.isCancelled {
+                        lock.unlock()
+                        continuation.resume(throwing: CancellationError())
+                    } else {
+                        queued.append((id: id, continuation: continuation))
+                        lock.unlock()
+                    }
+                } else {
+                    lock.unlock()
+                    continuation.resume(throwing: ATHandleVerificationError.unavailable)
+                }
+            }
+        } onCancel: {
+            self.cancel(id: id)
+        }
+    }
+
+    private func cancel(id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let index = queued.firstIndex(where: { $0.id == id }) {
+            let item = queued.remove(at: index)
+            item.continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    func release() {
+        lock.lock()
+        defer { lock.unlock() }
+        precondition(active > 0, "HandleDNSAdmissionGate released with active count 0")
+        if !queued.isEmpty {
+            let next = queued.removeFirst()
+            next.continuation.resume()
+        } else {
+            active -= 1
+        }
+    }
+}
+
 public struct SystemATHandleDNSResolver: ATHandleDNSResolving {
-    private static let queue = DispatchQueue(
-        label: "blue.catbird.swan.handle-dns",
-        qos: .utility
-    )
+    static let gate = HandleDNSAdmissionGate(maxActive: 8, maxQueued: 128)
 
     public init() {}
 
     public func txtRecords(name: String) async throws -> [ATHandleTXTRecord] {
-        try await withCheckedThrowingContinuation { continuation in
-            Self.queue.async {
+        try await Self.gate.acquire()
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                defer { Self.gate.release() }
                 var output = [UInt8](repeating: 0, count: 64 * 1_024)
                 let count = swan_at_handle_query_txt(
                     name,
@@ -151,8 +223,10 @@ public struct SystemATHandleDNSResolver: ATHandleDNSResolving {
 
     public func addresses(host: String) async throws -> [ATHandleIPAddress] {
         if let literal = ATHandleIPAddress(literal: host) { return [literal] }
+        try await Self.gate.acquire()
         return try await withCheckedThrowingContinuation { continuation in
-            Self.queue.async {
+            DispatchQueue.global(qos: .utility).async {
+                defer { Self.gate.release() }
                 var hints = addrinfo()
                 hints.ai_flags = AI_ADDRCONFIG
                 hints.ai_family = AF_UNSPEC
@@ -211,6 +285,7 @@ public struct SystemATHandleDNSResolver: ATHandleDNSResolving {
         }
     }
 }
+
 
 public struct ATHandleHTTPResponse: Sendable {
     public let status: Int
@@ -672,80 +747,10 @@ public struct ATProtocolHandleVerifier: PLCHandleVerifying, Sendable {
     private func withDeadline<T: Sendable>(
         _ operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        let completion = ATHandleDeadline<T>()
-        let operationTask = Task {
-            do {
-                completion.complete(.success(try await operation()))
-            } catch {
-                completion.complete(.failure(error))
-            }
-        }
-        let nanoseconds = UInt64(
-            (policy.timeout * 1_000_000_000).rounded(.up)
+        try await swanRaceWithDeadline(
+            seconds: policy.timeout,
+            onExpiry: ATHandleVerificationError.unavailable,
+            operation: operation
         )
-        let timeoutTask = Task {
-            do {
-                try await Task.sleep(nanoseconds: nanoseconds)
-            } catch {
-                return
-            }
-            operationTask.cancel()
-            completion.complete(.failure(ATHandleVerificationError.unavailable))
-        }
-        defer {
-            operationTask.cancel()
-            timeoutTask.cancel()
-        }
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                completion.install(continuation)
-            }
-        } onCancel: {
-            operationTask.cancel()
-            timeoutTask.cancel()
-            completion.complete(.failure(CancellationError()))
-        }
-    }
-}
-
-private final class ATHandleDeadline<Value: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<Value, Error>?
-    private var result: Result<Value, Error>?
-
-    func install(_ continuation: CheckedContinuation<Value, Error>) {
-        lock.lock()
-        if let result {
-            lock.unlock()
-            resume(continuation, with: result)
-        } else {
-            self.continuation = continuation
-            lock.unlock()
-        }
-    }
-
-    func complete(_ result: Result<Value, Error>) {
-        lock.lock()
-        guard self.result == nil else {
-            lock.unlock()
-            return
-        }
-        self.result = result
-        let continuation = self.continuation
-        self.continuation = nil
-        lock.unlock()
-        if let continuation { resume(continuation, with: result) }
-    }
-
-    private func resume(
-        _ continuation: CheckedContinuation<Value, Error>,
-        with result: Result<Value, Error>
-    ) {
-        switch result {
-        case let .success(value):
-            continuation.resume(returning: value)
-        case let .failure(error):
-            continuation.resume(throwing: error)
-        }
     }
 }

@@ -526,6 +526,33 @@ final class OAuthLexiconScopeResolutionTests: XCTestCase {
             """
         )
     }
+
+    // MARK: - Honest deadline racing
+
+    func testNeverReturningOperationDoesNotHoldSwanLexiconDeadlinePastDeadline() async throws {
+        struct TestExpiry: Error, Equatable {}
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+
+        do {
+            _ = try await SwanLexiconDeadline.run(seconds: 0.05, onExpiry: TestExpiry()) {
+                try await withUnsafeThrowingContinuation { (_: UnsafeContinuation<Int, any Error>) in
+                    // Deliberately never resumes continuation and ignores cancellation,
+                    // simulating an uncooperative stalled blocking operation.
+                }
+            }
+            XCTFail("expected deadline expiry")
+        } catch is TestExpiry {
+            let elapsed = startedAt.duration(to: clock.now)
+            XCTAssertLessThan(
+                elapsed,
+                .milliseconds(250),
+                "SwanLexiconDeadline.run must return at deadline without awaiting uncooperative children"
+            )
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
 }
 
 // MARK: - Async throwing assertion

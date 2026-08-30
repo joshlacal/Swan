@@ -453,22 +453,10 @@ public enum SwanLexiconDeadline: Sendable {
         onExpiry expiry: any Error,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        precondition(seconds > 0)
-        return try await withThrowingTaskGroup(of: T?.self) { group in
-            group.addTask { try await operation() }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                return nil
-            }
-            // The first completion decides. `next()` returning `nil` would mean
-            // an empty group, which cannot happen here; `.some(nil)` is the
-            // sleeper winning.
-            defer { group.cancelAll() }
-            while let outcome = try await group.next() {
-                if let value = outcome { return value }
-                throw expiry
-            }
-            throw expiry
-        }
+        try await swanRaceWithDeadline(
+            seconds: seconds,
+            onExpiry: expiry,
+            operation: operation
+        )
     }
 }
