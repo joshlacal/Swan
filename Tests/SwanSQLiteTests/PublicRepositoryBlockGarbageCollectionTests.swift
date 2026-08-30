@@ -165,6 +165,78 @@ final class PublicRepositoryBlockGarbageCollectionTests: XCTestCase {
         XCTAssertEqual(blocksAfter, blocksBefore)
     }
 
+    func testOverQuotaRepositoryAdmitsDeleteOnlyMutationThatShrinksRepository() async throws {
+        let fixture = try await makeRepository()
+        defer { fixture.cleanUp() }
+
+        let path1 = try PublicRepositoryPath(collection: collection, recordKey: "item1")
+        let path2 = try PublicRepositoryPath(collection: collection, recordKey: "item2")
+
+        _ = try await fixture.commit(
+            writes: [
+                .create(
+                    path: path1,
+                    record: PublicRecord([
+                        "$type": .string(collection),
+                        "text": .string("initial item 1"),
+                    ])
+                ),
+                .create(
+                    path: path2,
+                    record: PublicRecord([
+                        "$type": .string(collection),
+                        "text": .string("initial item 2"),
+                    ])
+                ),
+            ],
+            requestID: "create-items"
+        )
+        // Run GC once to clean up any superseded blocks so only reachable blocks remain
+        let loadedStateAfterCreate = try await fixture.database.loadPublicRepositoryState()
+        let stateAfterCreate = try XCTUnwrap(loadedStateAfterCreate)
+        try await fixture.database.garbageCollectPublicRepositoryBlocksWithoutGate(state: stateAfterCreate)
+        let reachableBlockCount = try await fixture.blockCount()
+
+        // Set quota below reachable count to simulate over-quota state
+        await fixture.database.setPublicRepositoryBlockQuota(
+            PublicRepositoryBlockQuota(
+                maximumTotalBytes: 1_000_000,
+                maximumTotalBlocks: 3
+            )
+        )
+
+        // A create/growth write must be rejected
+        do {
+            _ = try await fixture.commit(
+                writes: [
+                    .create(
+                        path: try PublicRepositoryPath(collection: collection, recordKey: "item3"),
+                        record: PublicRecord([
+                            "$type": .string(collection),
+                            "text": .string("overflow item 3"),
+                        ])
+                    ),
+                ],
+                requestID: "overflow-growth"
+            )
+            XCTFail("growth write when over quota must fail")
+        } catch let storeError as PublicRepositoryMutationStoreError {
+            XCTAssertEqual(storeError, .blockQuotaExceeded)
+        }
+
+        // A delete-only mutation that shrinks the repository must be admitted
+        _ = try await fixture.commit(
+            writes: [
+                .delete(path: path1, expectedRecordCID: nil),
+            ],
+            requestID: "shrink-delete"
+        )
+
+        // Verify item1 is deleted
+        let indexed = try await fixture.database.publicRepositoryRecordCID(for: path1)
+        XCTAssertNil(indexed, "deleted item must be removed from record index")
+    }
+
     // MARK: - Helpers
 
     private struct Repository {

@@ -1192,6 +1192,151 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         )
         XCTAssertFalse(isOtherSpace, "registration for different space must return false")
     }
+
+    func testDeletedAndRecreatedSpaceAcceptsWriterNotificationAtPreviouslySeenRevision() async throws {
+        let fixture = try NotificationFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        do {
+            try await fixture.createAuthorityState(on: database)
+
+            let revision = try fixture.tid(1)
+            let writeNotification1 = fixture.writeNotification(
+                eventID: "event-1",
+                revision: revision,
+                commitmentByte: 0xaa
+            )
+            try await database.receiveSpaceWriteNotification(
+                writeNotification1,
+                now: Date()
+            )
+
+            let writersBefore = try await database.spaceWriters(
+                space: fixture.space,
+                limit: 100,
+                cursor: nil,
+                authorization: fixture.readCredential()
+            )
+            XCTAssertEqual(writersBefore.count, 1)
+
+            let authority = DurableSimpleSpaceAuthority(lifecycleDatabase: database)
+            _ = try await authority.delete(
+                space: fixture.space,
+                authorization: .accountOAuthForTesting(subject: fixture.authority, scopes: ["atproto"])
+            )
+            do {
+                _ = try await database.spaceWriters(
+                    space: fixture.space,
+                    limit: 100,
+                    cursor: nil,
+                    authorization: fixture.readCredential()
+                )
+                XCTFail("deleted space must return not found")
+            } catch let error as AuthorizedSimpleSpaceLifecycleError {
+                XCTAssertEqual(error, .notFound)
+            }
+
+            _ = try await authority.create(
+                space: fixture.space,
+                owner: fixture.authority,
+                configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+                authorization: .accountOAuthForTesting(subject: fixture.authority, scopes: ["atproto"])
+            )
+            _ = try await authority.addMember(
+                space: fixture.space,
+                member: fixture.writer,
+                authorization: .accountOAuthForTesting(subject: fixture.authority, scopes: ["atproto"])
+            )
+
+            let writeNotification2 = fixture.writeNotification(
+                eventID: "event-2",
+                revision: revision,
+                commitmentByte: 0xbb
+            )
+            try await database.receiveSpaceWriteNotification(
+                writeNotification2,
+                now: Date()
+            )
+            try await database.close()
+        } catch {
+            print("DELETE_RECREATE_ERROR: \(error)")
+            try? await database.close()
+            throw error
+        }
+    }
+
+    func testWriterForeignKeyMigrationRebuildsTableAndDropsConstraintWhilePreservingRows() async throws {
+        let fixture = try NotificationFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        try await fixture.createAuthorityState(on: database)
+        try await database.close()
+
+        let databasePath = SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.authority).path
+        let legacy = try await SQLiteConnection.open(storage: .file(path: databasePath))
+
+        _ = try await legacy.query(
+            "DELETE FROM permissioned_repository_migrations WHERE version = 21"
+        )
+        _ = try await legacy.query("DROP TABLE IF EXISTS permissioned_space_writers")
+        _ = try await legacy.query(
+            """
+            CREATE TABLE permissioned_space_writers (
+                space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+                repo_did TEXT NOT NULL,
+                wire_revision TEXT NOT NULL,
+                commitment BLOB NOT NULL CHECK(length(commitment) = 32),
+                updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+                PRIMARY KEY(space_uri, repo_did)
+            )
+            """
+        )
+        let commitment = Data(repeating: 0x42, count: 32)
+        let revision1 = try fixture.tid(1).toString()
+        _ = try await legacy.query(
+            """
+            INSERT INTO permissioned_space_writers (space_uri, repo_did, wire_revision, commitment, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                .text(fixture.space.rawValue),
+                .text(fixture.writer),
+                .text(revision1),
+                .blob(ByteBuffer(data: commitment)),
+                .integer(1_000_000)
+            ]
+        )
+        let fkListBefore = try await legacy.query("PRAGMA foreign_key_list(permissioned_space_writers)")
+        XCTAssertFalse(fkListBefore.isEmpty, "legacy table must have foreign key constraint")
+        try await legacy.close()
+
+        let reopened = try await fixture.open()
+        try await reopened.close()
+        let raw = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        let fkListAfter = try await raw.query("PRAGMA foreign_key_list(permissioned_space_writers)")
+        XCTAssertTrue(fkListAfter.isEmpty, "migrated table must have no foreign key constraint")
+
+        let migratedRows = try await raw.query(
+            "SELECT space_uri, repo_did, wire_revision, commitment FROM permissioned_space_writers"
+        )
+        XCTAssertEqual(migratedRows.count, 1)
+        XCTAssertEqual(migratedRows.first?.column("space_uri")?.string, fixture.space.rawValue)
+        XCTAssertEqual(migratedRows.first?.column("repo_did")?.string, fixture.writer)
+        XCTAssertEqual(migratedRows.first?.column("commitment")?.blob.map { Data($0.readableBytesView) }, commitment)
+        try await raw.close()
+
+        let database2 = try await fixture.open()
+        let externalSpace = try SpaceURI(authority: "did:plc:external", spaceType: "app.bsky.bookmarks", skey: "ext")
+        let revision2 = try fixture.tid(2).toString()
+        _ = try await database2.advanceWriterHighWaterWithoutGate(
+            space: externalSpace,
+            repository: "did:plc:external-writer",
+            wireRevision: revision2,
+            commitment: commitment,
+            updatedAt: 2_000_000
+        )
+        try await database2.close()
+    }
 }
 
 private struct NotificationFixture {

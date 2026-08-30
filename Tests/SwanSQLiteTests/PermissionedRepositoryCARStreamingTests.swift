@@ -923,6 +923,303 @@ final class PermissionedRepositoryCARStreamingTests: XCTestCase {
         XCTAssertEqual(tightAdmission.snapshot.reservedBytes, 0)
         try await database.close()
     }
+
+    func testCARLeaseReleasedOnStreamingError() async throws {
+        let fixture = try PermissionedCARFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "text", value: "test error lease release"),
+        ]))
+        let cid = CID.fromDAGCBOR(value)
+        let record = try fixture.record(rkey: "err-item", value: value)
+        _ = try await database.apply(
+            space: fixture.space,
+            author: fixture.author,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try TID(tidString: "222222222222a"),
+            writes: [.put(uri: record.uri, value: record.value, cid: cid.string)]
+        )
+        let tightAdmission = try SpaceCARSpoolAdmission(
+            maximumGlobalBytes: 10 * 1024 * 1024,
+            maximumPerAccountBytes: 10 * 1024 * 1024
+        )
+        await database.installTestingHooks(SQLiteTestingHooks(permissionedCARSpoolAdmission: tightAdmission))
+        let snapshot = try await database.prepareRepositoryCARSnapshot(
+            space: fixture.space,
+            author: fixture.author
+        )
+        let prepared = try XCTUnwrap(snapshot)
+        XCTAssertGreaterThan(tightAdmission.snapshot.reservedBytes, 0)
+
+        struct StreamTestError: Error {}
+        do {
+            try await prepared.spool.streamBody { _ in
+                throw StreamTestError()
+            }
+            XCTFail("streaming must throw error")
+        } catch is StreamTestError {
+            // expected
+        }
+
+        XCTAssertEqual(tightAdmission.snapshot.reservedBytes, 0, "lease must be released on streaming error")
+        try await database.close()
+    }
+
+    func testCARLeaseReleasedOnTaskCancellation() async throws {
+        let fixture = try PermissionedCARFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "text", value: "test cancel lease release"),
+        ]))
+        let cid = CID.fromDAGCBOR(value)
+        let record = try fixture.record(rkey: "cancel-item", value: value)
+        _ = try await database.apply(
+            space: fixture.space,
+            author: fixture.author,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try TID(tidString: "222222222222a"),
+            writes: [.put(uri: record.uri, value: record.value, cid: cid.string)]
+        )
+        let tightAdmission = try SpaceCARSpoolAdmission(
+            maximumGlobalBytes: 10 * 1024 * 1024,
+            maximumPerAccountBytes: 10 * 1024 * 1024
+        )
+        await database.installTestingHooks(SQLiteTestingHooks(permissionedCARSpoolAdmission: tightAdmission))
+
+        let task = Task {
+            let snapshot = try await database.prepareRepositoryCARSnapshot(
+                space: fixture.space,
+                author: fixture.author
+            )
+            let prepared = try XCTUnwrap(snapshot)
+            try await prepared.spool.streamBody { _ in
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+        try await Task.sleep(nanoseconds: 10_000_000)
+        task.cancel()
+        _ = try? await task.value
+
+        XCTAssertEqual(tightAdmission.snapshot.reservedBytes, 0, "lease must be released on cancellation")
+        try await database.close()
+    }
+
+    func testPermissionedCumulativeWritesRejectWhenCrossingRecordCountBytesOrMetadataCeilings() async throws {
+        let fixture = try PermissionedCARFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var database = try await fixture.open()
+        try await database.close()
+
+        let databasePath = SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.author).path
+
+        // (a) Record Count Ceiling (100,000)
+        let raw1 = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        do {
+            _ = try await raw1.query(
+                """
+                INSERT INTO permissioned_space_records
+                    (space_uri, author_did, collection, rkey, cid, value, revision)
+                WITH RECURSIVE filler(n) AS (
+                    SELECT 1 UNION ALL SELECT n + 1 FROM filler WHERE n < 100000
+                )
+                SELECT ?, ?, 'app.bsky.feed.post', 'pad' || printf('%08d', n), 'bafycidpad', x'0102', 1
+                FROM filler
+                """,
+                [.text(fixture.space.rawValue), .text(fixture.author)]
+            )
+            try await raw1.close()
+        } catch {
+            print("RAW1 ERROR: \(error)")
+            try? await raw1.close()
+            throw error
+        }
+
+        database = try await fixture.open()
+        let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [(key: "text", value: "overflow count")]))
+        let cid = CID.fromDAGCBOR(value)
+        let newRecord = try fixture.record(rkey: "new-overflow", value: value)
+        do {
+            _ = try await database.apply(
+                space: fixture.space,
+                author: fixture.author,
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try TID(tidString: "222222222222a"),
+                writes: [.create(uri: newRecord.uri, value: newRecord.value, cid: cid.string)]
+            )
+            XCTFail("create that crosses 100,000 count ceiling must be rejected")
+        } catch let swanError as SwanError {
+            guard case .unavailable = swanError else {
+                return XCTFail("expected unavailable limit error, got \(swanError)")
+            }
+        }
+        try await database.close()
+
+        // (b) Value Bytes Ceiling (256 MiB)
+        let raw2 = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        _ = try await raw2.query(
+            "DELETE FROM permissioned_space_records WHERE space_uri = ? AND author_did = ?",
+            [.text(fixture.space.rawValue), .text(fixture.author)]
+        )
+        let largeValue = Data(repeating: 0xaa, count: 1024)
+        let largeCID = CID.fromDAGCBOR(largeValue)
+        let oneMegabyte = ByteBuffer(data: Data(repeating: 0x01, count: 1024 * 1024))
+        _ = try await raw2.query(
+            """
+            INSERT INTO permissioned_space_records
+                (space_uri, author_did, collection, rkey, cid, value, revision)
+            WITH RECURSIVE filler(n) AS (
+                SELECT 1 UNION ALL SELECT n + 1 FROM filler WHERE n <= 260
+            )
+            SELECT ?, ?, 'app.bsky.feed.post', 'large' || printf('%04d', n), ?, ?, 1
+            FROM filler
+            """,
+            [.text(fixture.space.rawValue), .text(fixture.author), .text(largeCID.string), .blob(oneMegabyte)]
+        )
+        try await raw2.close()
+
+        database = try await fixture.open()
+        do {
+            _ = try await database.apply(
+                space: fixture.space,
+                author: fixture.author,
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try TID(tidString: "222222222222b"),
+                writes: [.create(uri: newRecord.uri, value: newRecord.value, cid: cid.string)]
+            )
+            XCTFail("create that crosses 256 MiB value bytes ceiling must be rejected")
+        } catch let swanError as SwanError {
+            guard case .unavailable = swanError else {
+                return XCTFail("expected unavailable limit error, got \(swanError)")
+            }
+        }
+        try await database.close()
+
+        // (c) Metadata Bytes Ceiling (64 MiB)
+        let raw3 = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        _ = try await raw3.query(
+            "DELETE FROM permissioned_space_records WHERE space_uri = ? AND author_did = ?",
+            [.text(fixture.space.rawValue), .text(fixture.author)]
+        )
+        _ = try await raw3.query(
+            """
+            INSERT INTO permissioned_space_records
+                (space_uri, author_did, collection, rkey, cid, value, revision)
+            WITH RECURSIVE filler(n) AS (
+                SELECT 1 UNION ALL SELECT n + 1 FROM filler WHERE n <= 60000
+            )
+            SELECT ?, ?, 'app.bsky.feed.post', printf('%0500d', n), 'bafyreib76a6e2b265v2q2y7f5pvdv6z5x262f2q6p2v5x262f2q6p2v5x2', x'01', 1
+            FROM filler
+            """,
+            [.text(fixture.space.rawValue), .text(fixture.author)]
+        )
+        try await raw3.close()
+
+        database = try await fixture.open()
+        do {
+            _ = try await database.apply(
+                space: fixture.space,
+                author: fixture.author,
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try TID(tidString: "222222222222c"),
+                writes: [.create(uri: newRecord.uri, value: newRecord.value, cid: cid.string)]
+            )
+            XCTFail("create that crosses 64 MiB metadata ceiling must be rejected")
+        } catch let swanError as SwanError {
+            guard case .unavailable = swanError else {
+                return XCTFail("expected unavailable limit error, got \(swanError)")
+            }
+        }
+        try await database.close()
+    }
+
+    func testOverCeilingPermissionedStateAdmitsOnlyStrictlyReducingMutationsAcrossAllDimensions() async throws {
+        let fixture = try PermissionedCARFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var database = try await fixture.open()
+        try await database.close()
+
+        let databasePath = SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.author).path
+        let raw = try await SQLiteConnection.open(storage: .file(path: databasePath))
+
+        let rkey1 = "shrink1"
+        let rkey2 = "shrink2"
+        let value1 = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [(key: "text", value: "item 1")]))
+        let cid1 = CID.fromDAGCBOR(value1).string
+        let value2 = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [(key: "text", value: "item 2")]))
+        let cid2 = CID.fromDAGCBOR(value2).string
+
+        _ = try await raw.query(
+            """
+            INSERT INTO permissioned_space_records
+                (space_uri, author_did, collection, rkey, cid, value, revision)
+            VALUES
+                (?, ?, 'app.bsky.feed.post', ?, ?, ?, 1),
+                (?, ?, 'app.bsky.feed.post', ?, ?, ?, 1)
+            """,
+            [
+                .text(fixture.space.rawValue), .text(fixture.author), .text(rkey1), .text(cid1), .blob(ByteBuffer(data: value1)),
+                .text(fixture.space.rawValue), .text(fixture.author), .text(rkey2), .text(cid2), .blob(ByteBuffer(data: value2))
+            ]
+        )
+        _ = try await raw.query(
+            """
+            INSERT INTO permissioned_space_records
+                (space_uri, author_did, collection, rkey, cid, value, revision)
+            WITH RECURSIVE filler(n) AS (
+                SELECT 1 UNION ALL SELECT n + 1 FROM filler WHERE n <= 100000
+            )
+            SELECT ?, ?, 'app.bsky.feed.post', 'pad' || printf('%08d', n), 'bafycidpad', x'01', 1
+            FROM filler
+            """,
+            [.text(fixture.space.rawValue), .text(fixture.author)]
+        )
+        try await raw.close()
+
+        database = try await fixture.open()
+        let record1 = try fixture.record(rkey: rkey1, value: value1)
+        let recordNew = try fixture.record(rkey: "brand-new", value: value1)
+
+        do {
+            _ = try await database.apply(
+                space: fixture.space,
+                author: fixture.author,
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try TID(tidString: "222222222222a"),
+                writes: [.create(uri: recordNew.uri, value: recordNew.value, cid: cid1)]
+            )
+            XCTFail("growth write when over ceiling must be rejected")
+        } catch let swanError as SwanError {
+            guard case .unavailable = swanError else {
+                return XCTFail("expected unavailable limit error, got \(swanError)")
+            }
+        }
+
+        _ = try await database.apply(
+            space: fixture.space,
+            author: fixture.author,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try TID(tidString: "222222222222b"),
+            writes: [.delete(uri: record1.uri)]
+        )
+        try await database.close()
+
+        let rawCheck = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        let deletedRows = try await rawCheck.query(
+            "SELECT 1 FROM permissioned_space_records WHERE space_uri = ? AND author_did = ? AND rkey = ?",
+            [.text(fixture.space.rawValue), .text(fixture.author), .text(rkey1)]
+        )
+        XCTAssertTrue(deletedRows.isEmpty, "delete must succeed and remove the record")
+        try await rawCheck.close()
+    }
 }
 
 private struct PermissionedCARFixture {

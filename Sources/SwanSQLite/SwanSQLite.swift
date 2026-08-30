@@ -2169,7 +2169,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let spaceNotificationReceiptMigrationVersion = 7
     private static let permissionedRemoteReplicaResultBindingMigrationVersion = 8
     private static let spaceNotificationReceiptCompactionMigrationVersion = 9
-    private static let permissionedSpaceWriterForeignKeyMigrationVersion = 14
+    private static let permissionedSpaceWriterForeignKeyMigrationVersion = 21
     private static let spaceNotificationOwnershipMigrationVersion = 13
     private static let accountBlobQuotaMigrationVersion = 10
     private static let permissionedRemoteReplicaIncrementalSequenceMigrationVersion = 11
@@ -2670,7 +2670,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try await migrateSpaceNotificationReceiptScopeIfNeeded()
         try await compactSpaceNotificationReceiptsIfNeeded()
         _ = try? await pruneTerminalPublicRepositoryMutationRequestsWithoutGate(
-            nowMicroseconds: 0
+            nowMicroseconds: UInt64(Date().timeIntervalSince1970 * 1_000_000)
         )
         if let state = try? await loadPublicRepositoryStateWithoutGate() {
             _ = try? await garbageCollectPublicRepositoryBlocksWithoutGate(state: state)
@@ -2710,8 +2710,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
         _ = try await connection.query("DROP TABLE permissioned_space_writers_v13")
         _ = try await connection.query(
-            "INSERT INTO permissioned_repository_migrations(version) VALUES (?)",
-            [.integer(version)]
+            "INSERT INTO permissioned_repository_migrations(version, applied_at) VALUES (?, ?)",
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000))
+            ]
         )
     }
     /// The first notification schema keyed receipts only by issuer and JTI.

@@ -888,6 +888,46 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
     )
     XCTAssertTrue(completed)
   }
+
+  func testCompletedManualSyncReplayReturnsFalseIdempotently() async throws {
+    let payload = try validCommitPayload()
+    let car = try await PublicFirehoseDiffCAR.commitOnly(
+      commitCID: CID.fromDAGCBOR(commitBytes),
+      commitBytes: commitBytes
+    )
+    let sourceKey = "did:plc:abc|sync:manual|test-uuid-12345"
+    let enqueued = try await database.enqueueAuthoritativeManualSyncEvent(
+      sourceKey: sourceKey,
+      lifecycleGeneration: 0,
+      payload: payload,
+      carBytes: car,
+      now: epoch
+    )
+    XCTAssertTrue(enqueued)
+
+    let optionalLease = try await database.leaseNextPublicFirehoseOutbox(
+      now: epoch.addingTimeInterval(1),
+      leaseDuration: 30
+    )
+    let lease = try XCTUnwrap(optionalLease)
+    XCTAssertEqual(lease.row.sourceKey, sourceKey)
+    XCTAssertEqual(lease.row.kind, .sync)
+
+    let completed = try await database.completePublicFirehoseOutboxLease(
+      id: lease.row.id,
+      token: lease.token
+    )
+    XCTAssertTrue(completed)
+
+    let replayed = try await database.enqueueAuthoritativeManualSyncEvent(
+      sourceKey: sourceKey,
+      lifecycleGeneration: 0,
+      payload: payload,
+      carBytes: car,
+      now: epoch.addingTimeInterval(10)
+    )
+    XCTAssertFalse(replayed, "completed manual sync replay must return false idempotently without decoding NULL bytes")
+  }
 }
 
 private func firehoseThrowsError<T>(

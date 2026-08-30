@@ -1426,7 +1426,6 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
     func pruneTerminalPublicRepositoryMutationRequestsWithoutGate(nowMicroseconds: UInt64) async throws {
         let oneDayMicros: UInt64 = 24 * 60 * 60 * 1_000_000
         let cutoffMicros = nowMicroseconds > oneDayMicros ? nowMicroseconds - oneDayMicros : 0
-        let maxTerminalRows = 100_000
 
         // 1. Prune terminal receipts older than 24 hours in 1,000-row batches
         if cutoffMicros > 0 {

@@ -622,4 +622,31 @@ final class PublicLifecycleEmitterTests: XCTestCase {
       XCTAssertEqual(error, .accountUnavailable("did:web:missing.example"))
     }
   }
+
+  func testCompletedManualSyncReplayIdempotency() async throws {
+    let requestUUID = UUID().uuidString.lowercased()
+    try await emitter.emitManualSync(did: did, requestUUID: requestUUID, now: epoch)
+
+    let leased = try await account.leaseNextPublicFirehoseOutbox(
+      now: epoch,
+      leaseDuration: 30
+    )
+    let lease = try XCTUnwrap(leased)
+    XCTAssertEqual(
+      lease.row.sourceKey,
+      PublicFirehoseSourceKey.syncManual(did: did, requestUUID: requestUUID)
+    )
+    let completed = try await account.completePublicFirehoseOutboxLease(
+      id: lease.row.id,
+      token: lease.token
+    )
+    XCTAssertTrue(completed)
+
+    // Replay emitManualSync with the same requestUUID
+    try await emitter.emitManualSync(did: did, requestUUID: requestUUID, now: epoch.addingTimeInterval(5))
+
+    // Assert that no new pending item is enqueued
+    let pending = try await account.oldestPendingPublicFirehoseOutbox()
+    XCTAssertNil(pending)
+  }
 }
