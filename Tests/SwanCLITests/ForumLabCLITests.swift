@@ -343,6 +343,163 @@ final class ForumLabCLITests: XCTestCase {
         XCTAssertTrue(oversizeErr.contains("live body file is unavailable"), oversizeErr)
     }
 
+    func testForumThreadRejectsUnsupportedAuthorityPasswordFileOption() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let passwordFile = root.appending(path: "authority.password")
+        try Data("secret\n".utf8).write(to: passwordFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: passwordFile.path)
+
+        let result = try runCLI(
+            command: [
+                "forum", "thread",
+                "--consumer-url", "https://127.0.0.1:1",
+                "--authority-url", "https://127.0.0.1:1",
+                "--space", spaceURI,
+                "--receiver-did", did,
+                "--data-directory", root.path,
+                "--authority-password-file", passwordFile.path,
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        let combined = String(decoding: result.stdout, as: UTF8.self) + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertTrue(
+            combined.contains("Unknown option '--authority-password-file'"),
+            "Expected unknown option error, got: \(combined)"
+        )
+    }
+
+    func testLabLivePermissionedOAuthRejectsMissingConsumerRedirectURI() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let passwordFile = directory.appending(path: "authority.password")
+        try Data("secret\n".utf8).write(to: passwordFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: passwordFile.path)
+        let bodyFile = directory.appending(path: "debug-body.json")
+        try Data("{\"space\":\"\(spaceURI)\"}\n".utf8).write(to: bodyFile)
+
+        let resultWithoutRedirect = try runCLI(
+            command: [
+                "live",
+                "--mode", "permissioned",
+                "--name", "forum-debug-lab-live",
+                "--producer-url", "https://swan.test",
+                "--consumer-url", "https://swan.test",
+                "--producer-auth", "none",
+                "--consumer-auth", "oauth",
+                "--consumer-password-file", passwordFile.path,
+                "--consumer-client-id", "http://localhost/client-id",
+                "--scope", "atproto",
+                "--space", spaceURI,
+                "--permissioned-read-host", "authority",
+                "--read-query", "space=\(spaceURI)", "repo=\(did)", "collection=blue.catbird.lab.post", "rkey=debug-0001",
+                "--body-file", bodyFile.path,
+                "--request-timeout-seconds", "0.2",
+            ],
+            environment: [
+                "SWAN_LAB_PRODUCER_HANDLE": "producer.swan.test",
+                "SWAN_LAB_CONSUMER_HANDLE": "consumer.swan.test",
+            ]
+        )
+        XCTAssertNotEqual(resultWithoutRedirect.status, 0)
+        let combinedWithout = String(decoding: resultWithoutRedirect.stdout, as: UTF8.self) + String(decoding: resultWithoutRedirect.stderr, as: UTF8.self)
+        XCTAssertTrue(
+            combinedWithout.contains("OAuth redirect URL is invalid"),
+            "Expected 'OAuth redirect URL is invalid', got: \(combinedWithout)"
+        )
+
+        let resultWithRedirect = try runCLI(
+            command: [
+                "live",
+                "--mode", "permissioned",
+                "--name", "forum-debug-lab-live",
+                "--producer-url", "https://swan.test",
+                "--consumer-url", "https://swan.test",
+                "--producer-auth", "oauth",
+                "--producer-password-file", passwordFile.path,
+                "--producer-client-id", "http://localhost/client-id",
+                "--producer-redirect-uri", "http://127.0.0.1/callback",
+                "--consumer-auth", "oauth",
+                "--consumer-password-file", passwordFile.path,
+                "--consumer-client-id", "http://localhost/client-id",
+                "--consumer-redirect-uri", "http://127.0.0.1/callback",
+                "--scope", "atproto",
+                "--space", spaceURI,
+                "--permissioned-read-host", "authority",
+                "--read-query", "space=\(spaceURI)", "repo=\(did)", "collection=blue.catbird.lab.post", "rkey=debug-0001",
+                "--body-file", bodyFile.path,
+                "--request-timeout-seconds", "0.2",
+            ],
+            environment: [
+                "SWAN_LAB_PRODUCER_HANDLE": "producer.swan.test",
+                "SWAN_LAB_CONSUMER_HANDLE": "consumer.swan.test",
+            ]
+        )
+        let combinedWith = String(decoding: resultWithRedirect.stdout, as: UTF8.self) + String(decoding: resultWithRedirect.stderr, as: UTF8.self)
+        XCTAssertFalse(
+            combinedWith.contains("OAuth redirect URL is invalid"),
+            "Should not fail with invalid redirect URL when redirect URI is provided: \(combinedWith)"
+        )
+    }
+
+    func testForumThreadAcceptsScriptArgumentSetWithoutAuthorityPasswordFile() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+        try FileManager.default.createDirectory(
+            at: data,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let control = try await SQLiteControlDatabase(dataDirectory: data)
+        _ = try await control.createAccount(
+            AccountControlRegistration(
+                did: did,
+                canonicalHandle: "carol.example.com",
+                passwordVerifier: "$argon2id$v=19$m=65536,t=3,p=1$bcdefghijklmnopqrstuvw$BCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq",
+                signingKey: try AccountControlKeyReference(purpose: .signing, generation: 1),
+                rotationKey: try AccountControlKeyReference(purpose: .rotation, generation: 1)
+            )
+        )
+        try await control.close()
+        let materialized = try await SQLiteAccountDatabase(dataDirectory: data, did: did)
+        try await materialized.close()
+
+        let passwordFile = root.appending(path: "member.password")
+        try Data("secret\n".utf8).write(to: passwordFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: passwordFile.path)
+        let output = root.appending(path: "thread.json")
+
+        // Matches run-forum-live-demo.sh forum thread invocation exactly
+        let result = try runCLI(
+            command: [
+                "forum", "thread",
+                "--consumer-url", "https://127.0.0.1:1",
+                "--authority-url", "https://127.0.0.1:1",
+                "--space", spaceURI,
+                "--receiver-did", did,
+                "--data-directory", data.path,
+                "--consumer-auth", "oauth",
+                "--consumer-password-file", passwordFile.path,
+                "--consumer-client-id", "http://localhost/client-id",
+                "--consumer-redirect-uri", "http://127.0.0.1/callback",
+                "--plc-origin", "http://127.0.0.1:2582",
+                "--plc-laboratory",
+                "--plc-laboratory-allowlisted-host", "127.0.0.1",
+                "--writer-host", "\(did)=https://127.0.0.1:2:did:key:zQ3shqwJEJyMBsBXCWyCBpUBMqxcon9oHB7mCvx4sSpMdLJwc",
+                "--request-timeout-seconds", "0.2",
+                "--output", output.path,
+                "--no-fail-on-failure",
+            ],
+            environment: [
+                "SWAN_LAB_CONSUMER_HANDLE": "carol.swan.test",
+            ]
+        )
+        let combined = String(decoding: result.stdout, as: UTF8.self) + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertFalse(combined.contains("Unknown option"), combined)
+        XCTAssertTrue(combined.contains("receiver account is active"), combined)
+    }
+
     private var spaceURI: String {
         "at://\(did)/space/blue.catbird.lab.forum/lab-1"
     }

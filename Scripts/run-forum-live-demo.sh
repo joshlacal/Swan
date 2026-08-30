@@ -761,6 +761,7 @@ PY
     --consumer-auth oauth \
     --consumer-password-file /run/secrets/swan-bootstrap/authority.password \
     --consumer-client-id "$scope_client_id" \
+    --consumer-redirect-uri http://127.0.0.1/callback \
     --scope atproto \
     --scope "$read_scope" \
     --scope "$create_scope" \
@@ -812,7 +813,6 @@ run_forum \
   --data-directory /var/lib/swan/data \
   --consumer-auth oauth \
   --consumer-password-file /run/secrets/swan-bootstrap/member.password \
-  --authority-password-file /run/secrets/swan-bootstrap/authority.password \
   --consumer-client-id "$scope_client_id" \
   --consumer-redirect-uri http://127.0.0.1/callback \
   --plc-origin http://reference-plc:2582 \
