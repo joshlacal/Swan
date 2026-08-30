@@ -295,6 +295,7 @@ public struct PublicFirehoseTailer: Sendable {
     var cursor = lastSent
     var backfillElapsed = Duration.zero
     var starvedStarted: ContinuousClock.Instant?
+    var pendingAdmissionSeqLag: Int64?
     let clock = ContinuousClock()
     while !Task.isCancelled {
       // Checked before every read so a retention advance is caught even
@@ -308,8 +309,40 @@ public struct PublicFirehoseTailer: Sendable {
         )
       }
 
-      // Admission is checked before lag accounting: server-side saturation
-      // must never be charged as consumer lag.
+      // Snapshot lag before admission so an already-lagging cursor is rejected
+      // without waiting for or reserving a page. Lag created while waiting for
+      // this server-side gate is not attributed to the consumer.
+      let seqLag: Int64
+      if let pendingAdmissionSeqLag {
+        seqLag = pendingAdmissionSeqLag
+      } else {
+        let maxSeq = try await database.maxSequencedSeq()
+        var snapshotLag: Int64 = 0
+        if maxSeq > cursor {
+          snapshotLag = maxSeq - cursor
+          if snapshotLag > limits.maximumSequenceLag {
+            snapshotLag = try await database.deliverableEventCount(
+              after: cursor,
+              limit: limits.maximumSequenceLag + 1
+            )
+          }
+        }
+        pendingAdmissionSeqLag = snapshotLag
+        seqLag = snapshotLag
+      }
+      if PublicFirehoseSlowConsumerPolicy.shouldDrop(
+        seqLag: seqLag,
+        backfillElapsed: backfillElapsed,
+        writeDuration: nil,
+        limits: limits
+      ) {
+        logger.warning("dropping slow public firehose consumer")
+        throw PublicFirehoseTailerError.consumerTooSlow(
+          seqLag: seqLag,
+          backfillElapsed: backfillElapsed
+        )
+      }
+
       if let starvedStarted,
          clock.now - starvedStarted > limits.maximumBackfillCatchUp {
         logger.warning("dropping public firehose subscriber due to page admission saturation")
@@ -322,32 +355,8 @@ public struct PublicFirehoseTailer: Sendable {
         try await Task.sleep(for: .seconds(limits.idlePollInterval))
         continue
       }
+      pendingAdmissionSeqLag = nil
       starvedStarted = nil
-
-      let maxSeq = try await database.maxSequencedSeq()
-      var seqLag: Int64 = 0
-      if maxSeq > cursor {
-        seqLag = maxSeq - cursor
-        if seqLag > limits.maximumSequenceLag {
-          seqLag = try await database.deliverableEventCount(
-            after: cursor,
-            limit: limits.maximumSequenceLag + 1
-          )
-        }
-      }
-      if PublicFirehoseSlowConsumerPolicy.shouldDrop(
-        seqLag: seqLag,
-        backfillElapsed: backfillElapsed,
-        writeDuration: nil,
-        limits: limits
-      ) {
-        pageLease.release()
-        logger.warning("dropping slow public firehose consumer")
-        throw PublicFirehoseTailerError.consumerTooSlow(
-          seqLag: seqLag,
-          backfillElapsed: backfillElapsed
-        )
-      }
 
       let rows: [FirehoseStoredEvent]
       do {
@@ -370,9 +379,10 @@ public struct PublicFirehoseTailer: Sendable {
         continue
       }
       let pageStarted = clock.now
+      let maximumPageHold = limits.maximumBackfillCatchUp / 2
       for row in rows {
         let currentHold = clock.now - pageStarted
-        if currentHold > limits.maximumBackfillCatchUp
+        if currentHold > maximumPageHold
           || (seqLag > 0 && backfillElapsed + currentHold > limits.maximumBackfillCatchUp) {
           pageLease.release()
           logger.warning("dropping slow public firehose consumer exceeding backfill catch-up budget")

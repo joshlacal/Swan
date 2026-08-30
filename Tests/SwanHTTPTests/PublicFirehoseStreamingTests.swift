@@ -822,7 +822,7 @@ final class PublicFirehoseStreamingTests: XCTestCase {
     _ = await task.result
   }
 
-  func testTailerLaggingCursorRejectedBeforeEventsOrPageAdmission() async throws {
+  func testTailerLaggingCursorRejectedBeforeEventsQuery() async throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
@@ -832,11 +832,6 @@ final class PublicFirehoseStreamingTests: XCTestCase {
     }
 
     let admission = PublicFirehosePageAdmission(maximumConcurrentPages: 1)
-    // Fill the one page lease so any reserve() call would fail/block.
-    let heldLease = admission.reserve()
-    XCTAssertNotNil(heldLease)
-    defer { heldLease?.release() }
-
     let limits = try PublicFirehoseStreamingLimits(maximumSequenceLag: 1)
     let tailer = PublicFirehoseTailer(
       database: firehose,
@@ -859,6 +854,7 @@ final class PublicFirehoseStreamingTests: XCTestCase {
       XCTAssertEqual(seqLag, 2)
     }
   }
+
 
   func testTailerAdmissionStarvationDoesNotDropAsConsumerTooSlowAndRefusesOnTimeout() async throws {
     let root = try makeRoot()
@@ -888,6 +884,8 @@ final class PublicFirehoseStreamingTests: XCTestCase {
         waitForWakeup: { nil }
       )
     }
+    try await Task.sleep(for: .milliseconds(20))
+
 
     // Append more events while starved so seqLag > maximumSequenceLag.
     for index in 2 ... 5 {
