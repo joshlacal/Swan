@@ -299,7 +299,7 @@ public struct PublicFirehoseTailer: Sendable {
     let clock = ContinuousClock()
     while !Task.isCancelled {
       // Checked before every read so a retention advance is caught even
-      // when it does not change what `events(after:, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)` would return (e.g.
+      // when it does not change what `events(after:limit:maximumBytes:)` would return (e.g.
       // the consumer is already caught up but the retained window moved
       // past its delivered cursor).
       if let retainedFromSeq = try await database.retainedFromSeq(),
