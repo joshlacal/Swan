@@ -36,7 +36,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 let first = Task {
                     try await client.execute(
                         uri: "/xrpc/com.atproto.space.registerNotify", method: .post,
-                        headers: try fixture.bearerHeaders(), body: body
+                        headers: try fixture.registerHeaders(for: self.writer), body: body
                     )
                 }
                 await barrier.waitUntilEntered()
@@ -45,7 +45,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 ))
                 let second = try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify", method: .post,
-                    headers: try fixture.bearerHeaders(), body: body
+                    headers: try fixture.registerHeaders(for: self.writer), body: body
                 )
                 XCTAssertEqual(second.status, .serviceUnavailable)
                 XCTAssertEqual(try notificationErrorCode(second.body), "temporarily_unavailable")
@@ -72,6 +72,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         do {
             let app = try fixture.server().buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests"))
             let credentialHeaders = try fixture.bearerHeaders()
+            let registerHeaders = try fixture.registerHeaders(for: writer)
             let encodedSpace = notificationPercentEncode(fixture.space.rawValue)
             let expectedWriter = writer
             let registerBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}")
@@ -94,10 +95,20 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             }()
 
             try await app.test(.router) { client in
+                // Service auth header is required alongside credential
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
                     headers: credentialHeaders,
+                    body: registerBody
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
+                }
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: registerHeaders,
                     body: registerBody
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -180,7 +191,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: credentialHeaders,
+                    headers: registerHeaders,
                     body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/x\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -235,22 +246,44 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 ByteBuffer(string: "{\"space\":\"\(spaceURI)\",\(fields)}")
             }
             try await app.test(.router) { client in
+                let validHeaders = try fixture.registerHeaders(for: subscriber)
                 // Fragment-qualified service → the matching entry's endpoint.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: validHeaders,
+                    body: registerBody("\"service\":\"\(subscriber)#bulleted_events\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(Set(try notificationJSONObject(response.body).keys), ["expiresAt"])
+                }
+                // Service header absence is rejected
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
                     headers: credentialHeaders,
                     body: registerBody("\"service\":\"\(subscriber)#bulleted_events\"")
                 ) { response in
-                    XCTAssertEqual(response.status, .ok)
-                    XCTAssertEqual(Set(try notificationJSONObject(response.body).keys), ["expiresAt"])
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
+                }
+                // Body-owner mismatch is rejected
+                let mismatchedHeaders = try fixture.registerHeaders(for: "did:web:other.example")
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: mismatchedHeaders,
+                    body: registerBody("\"service\":\"\(subscriber)#bulleted_events\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
                 }
                 // `service` decides when both are sent: the supplied endpoint
                 // is ignored in favour of the resolved one.
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: credentialHeaders,
+                    headers: validHeaders,
                     body: registerBody(
                         "\"service\":\"\(subscriber)#other\",\"endpoint\":\"https://attacker.example/sink\""
                     )
@@ -261,7 +294,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: credentialHeaders,
+                    headers: validHeaders,
                     body: registerBody("\"repo\":\"\(self.writer)\"")
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -272,7 +305,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     try await client.execute(
                         uri: "/xrpc/com.atproto.space.registerNotify",
                         method: .post,
-                        headers: credentialHeaders,
+                        headers: try fixture.registerHeaders(for: bad),
                         body: registerBody("\"service\":\"\(bad)\"")
                     ) { response in
                         XCTAssertEqual(response.status, .badRequest, "service=\(bad)")
@@ -284,7 +317,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: credentialHeaders,
+                    headers: try fixture.registerHeaders(for: subscriber),
                     body: registerBody("\"service\":\"\(subscriber)#missing\"")
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -343,11 +376,12 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 ByteBuffer(string: "{\"space\":\"\(spaceURI)\",\(fields)}")
             }
             try await app.test(.router) { client in
+                let validHeaders = try fixture.registerHeaders(for: subscriber)
                 for fragment in ["#a", "#b"] {
                     try await client.execute(
                         uri: "/xrpc/com.atproto.space.registerNotify",
                         method: .post,
-                        headers: credentialHeaders,
+                        headers: validHeaders,
                         body: body("\"service\":\"\(subscriber)\(fragment)\"")
                     ) { response in
                         XCTAssertEqual(response.status, .ok)
@@ -356,11 +390,34 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 let afterRegister = await fixture.directory.registrations()
                 XCTAssertEqual(afterRegister.count, 2)
 
-                // Withdraw exactly one subscriber; the other survives.
+                // Missing service auth header on unregister is rejected
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.unregisterNotify",
                     method: .post,
                     headers: credentialHeaders,
+                    body: body("\"service\":\"\(subscriber)#a\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
+                }
+
+                // Body-owner mismatch on unregister is rejected
+                let foreignHeaders = try fixture.registerHeaders(for: "did:web:foreign.example")
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.unregisterNotify",
+                    method: .post,
+                    headers: foreignHeaders,
+                    body: body("\"service\":\"\(subscriber)#a\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
+                }
+
+                // Withdraw exactly one subscriber; the other survives.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.unregisterNotify",
+                    method: .post,
+                    headers: validHeaders,
                     body: body("\"service\":\"\(subscriber)#a\"")
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -373,10 +430,11 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 // Idempotent: withdrawing again, or a never-registered
                 // service, still succeeds — no existence oracle.
                 for target in ["\(subscriber)#a", "did:web:never.example#x"] {
+                    let targetHeaders = try fixture.registerHeaders(for: target)
                     try await client.execute(
                         uri: "/xrpc/com.atproto.space.unregisterNotify",
                         method: .post,
-                        headers: credentialHeaders,
+                        headers: targetHeaders,
                         body: body("\"service\":\"\(target)\"")
                     ) { response in
                         XCTAssertEqual(response.status, .ok, target)
@@ -397,7 +455,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     try await client.execute(
                         uri: "/xrpc/com.atproto.space.unregisterNotify",
                         method: .post,
-                        headers: credentialHeaders,
+                        headers: validHeaders,
                         body: body(bad)
                     ) { response in
                         XCTAssertEqual(response.status, .badRequest, bad)
@@ -460,7 +518,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try fixture.dpopSchemeCredentialHeaders(),
+                    headers: try fixture.dpopSchemeCredentialHeaders(for: subscriber),
                     body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"service\":\"\(subscriber)#events\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -499,12 +557,11 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         do {
             let app = try fixture.server()
                 .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.noResolver"))
-            let credentialHeaders = try fixture.bearerHeaders()
             try await app.test(.router) { client in
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: credentialHeaders,
+                    headers: try fixture.registerHeaders(for: "did:web:events.example"),
                     body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"service\":\"did:web:events.example#e\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -513,7 +570,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: credentialHeaders,
+                    headers: try fixture.registerHeaders(for: "did:web:events.example"),
                     body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -573,8 +630,10 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             .init(
                 space: space,
                 endpoint: legacyEndpoint,
-                repository: nil,
-                expiresAt: Date(timeIntervalSinceNow: 3_600)
+                repository: "did:plc:other-writer",
+                expiresAt: Date(timeIntervalSinceNow: 3_600),
+                service: "did:web:other.example#service",
+                serviceDID: "did:web:other.example"
             ),
             authorization: credential
         )
@@ -674,15 +733,10 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         let afterStale = await recordingTransport.posts()
         XCTAssertEqual(afterStale.count, 2)
 
-        // Withdrawal-by-replacement: the subscriber re-registers the same
-        // endpoint WITHOUT a service identity, so the stored row loses it.
-        try await database.registerSpaceNotification(
-            .init(
-                space: space,
-                endpoint: serviceEndpoint,
-                repository: nil,
-                expiresAt: Date(timeIntervalSinceNow: 3_600)
-            ),
+        // Withdrawn registration: the subscriber unregisters, so the stored row is removed.
+        try await database.unregisterSpaceNotification(
+            space: space,
+            service: serviceIdentity,
             authorization: credential
         )
         let withdrawnRow = PersistedSpaceNotificationFanout(
@@ -705,7 +759,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         )
     }
 
-    func testDeletionTokenIsNotBoundToTheBodySpace() async throws {
+    func testDeletionTokenIsBoundToTheBodySpace() async throws {
         let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
         defer { fixture.cleanup() }
         do {
@@ -714,11 +768,6 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             )
             let app = try fixture.server(recipientBindings: bindings)
                 .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.deletionBinding"))
-            let sibling = try SpaceURI(
-                authority: authority,
-                spaceType: "app.bsky.bookmarks",
-                skey: "http-sibling"
-            )
             let headers: HTTPFields = {
                 var fields: HTTPFields = [.contentType: "application/json"]
                 fields[.authorization] = "Bearer authority-bound-recipient-token"
@@ -726,13 +775,26 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             }()
 
             try await app.test(.router) { client in
+                // Matches the bound space
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.notifySpaceDeleted",
                     method: .post,
                     headers: headers,
-                    body: ByteBuffer(string: "{\"space\":\"\(sibling.rawValue)\"}")
+                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
+                }
+                // A token with mismatched req / bad digest is rejected
+                var badDigestHeaders = headers
+                badDigestHeaders[.authorization] = "Bearer bad-digest-token"
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.notifySpaceDeleted",
+                    method: .post,
+                    headers: badDigestHeaders,
+                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\"}")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
                 }
                 // A space under a different authority is refused by the route.
                 let foreign = try SpaceURI(
@@ -756,7 +818,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 deletions,
                 [
                     .init(
-                        space: sibling,
+                        space: fixture.space,
                         issuer: authority,
                         audience: writer,
                         eventID: "service-event-5"
@@ -791,12 +853,12 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
 
         for _ in 0 ..< 100 {
             let counts = await transport.counts()
-            if counts.outbox == 1 { break }
+            if counts.outbox == 1 && counts.fanout == 1 { break }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         let counts = await transport.counts()
         XCTAssertEqual(counts.outbox, 1)
-        XCTAssertEqual(counts.fanout, 0)
+        XCTAssertEqual(counts.fanout, 1)
         let remainingOutbox = try await database.pendingOutbox()
         let remainingFanout = try await database.pendingNotificationFanout()
         XCTAssertTrue(remainingOutbox.isEmpty)
@@ -834,7 +896,9 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
 
         for _ in 0 ..< 200 {
             let state = await transport.state()
-            if state.attempts >= 2 { break }
+            let restartedDatabases = try await restarted.directory.notificationRecoveryDatabases()
+            let remaining = (try? await XCTUnwrap(restartedDatabases.first).pendingOutbox()) ?? []
+            if state.attempts >= 2 && remaining.isEmpty { break }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         let state = await transport.state()
@@ -922,17 +986,25 @@ private struct NotificationHTTPFixture {
         let credential = try PermissionedDataJWT.createSpaceCredential(issuer: authority, space: space, key: key)
         var headers: HTTPFields = [.contentType: "application/json"]
         headers[.authorization] = "Bearer \(credential)"
-        headers[.init("Atproto-Service-Auth")!] = "Bearer writer-token"
+        return headers
+    }
+
+    func registerHeaders(for serviceDID: String? = nil) throws -> HTTPFields {
+        var headers = try bearerHeaders()
+        let did = serviceDID ?? writer
+        headers[HTTPField.Name("atproto-service-auth")!] = "Bearer service-token:\(did)"
         return headers
     }
 
     /// The reference presentation: the credential under the `DPoP` scheme
     /// ("a space credential is bound to a key"), proof header included.
-    func dpopSchemeCredentialHeaders() throws -> HTTPFields {
+    func dpopSchemeCredentialHeaders(for serviceDID: String? = nil) throws -> HTTPFields {
         let credential = try PermissionedDataJWT.createSpaceCredential(issuer: authority, space: space, key: key)
         var headers: HTTPFields = [.contentType: "application/json"]
         headers[.authorization] = "DPoP \(credential)"
         headers[.init("DPoP")!] = "surplus-proof-swan-credentials-are-unbound"
+        let did = serviceDID ?? writer
+        headers[HTTPField.Name("atproto-service-auth")!] = "Bearer service-token:\(did)"
         return headers
     }
 
@@ -1009,7 +1081,9 @@ private struct NotificationRecoveryFixture {
                 space: space,
                 endpoint: "https://receiver.example/xrpc/com.atproto.space.notifyWrite",
                 repository: writer,
-                expiresAt: now.addingTimeInterval(3_600)
+                expiresAt: now.addingTimeInterval(3_600),
+                service: "did:web:receiver.example#service",
+                serviceDID: "did:web:receiver.example"
             ),
             authorization: .spaceCredential(.init(
                 subject: reader,
@@ -1233,7 +1307,10 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
         guard space.authority == authority else {
             throw AuthorizedSimpleSpaceLifecycleError.notFound
         }
-        registrationsValue.removeAll { $0.space == space && $0.service == serviceDID }
+        let baseDID = serviceIssuerDID(serviceDID) ?? serviceDID
+        registrationsValue.removeAll {
+            $0.space == space && ($0.service == serviceDID || $0.serviceDID == serviceDID || $0.service == baseDID || ($0.service == nil && $0.serviceDID == baseDID))
+        }
     }
 
 
@@ -1340,6 +1417,7 @@ private actor RecordingServiceIssuer: SpaceServiceAuthenticationIssuer {
         audience: String,
         method: String,
         eventID _: String,
+        requestBodyDigest: String? = nil,
         now _: Date
     ) async throws -> String {
         recorded.append(.init(issuer: issuer, audience: audience, method: method))
@@ -1362,10 +1440,22 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
         _ compact: String,
         expectedAudience: String?,
         expectedMethod: String,
+        expectedRequestBodyDigest: String?,
         now _: Date
     ) async throws -> VerifiedSpaceServiceAuthentication {
-        guard expectedAudience == nil else {
-            throw SwanError.unauthorized("service authentication is invalid")
+        if compact.hasPrefix("service-token:") {
+            let issuer = String(compact.dropFirst("service-token:".count))
+            return .init(
+                issuer: issuer,
+                audience: authority,
+                method: expectedMethod,
+                eventID: "service-event-\(UUID().uuidString)",
+                requestBodyDigest: expectedRequestBodyDigest,
+                expiresAt: Date(timeIntervalSinceNow: 60)
+            )
+        }
+        if compact == "bad-digest-token" {
+            throw SwanError.unauthorized("service authentication is invalid: digest mismatch")
         }
         switch (compact, expectedMethod) {
         case ("writer-token", "com.atproto.space.registerNotify"),
@@ -1375,6 +1465,7 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
                 audience: authority,
                 method: expectedMethod,
                 eventID: "service-event-registration",
+                requestBodyDigest: expectedRequestBodyDigest,
                 expiresAt: Date(timeIntervalSinceNow: 60)
             )
         case ("writer-token", "com.atproto.space.notifyWrite"):
@@ -1383,6 +1474,7 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
                 audience: authority,
                 method: expectedMethod,
                 eventID: "service-event-1",
+                requestBodyDigest: expectedRequestBodyDigest,
                 expiresAt: Date(timeIntervalSinceNow: 60)
             )
         case ("authority-fanout-token", "com.atproto.space.notifyWrite"):
@@ -1391,6 +1483,7 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
                 audience: "did:plc:recipientabcdefghijklmnop",
                 method: expectedMethod,
                 eventID: "service-event-2",
+                requestBodyDigest: expectedRequestBodyDigest,
                 expiresAt: Date(timeIntervalSinceNow: 60)
             )
         case ("authority-unknown-recipient-token", "com.atproto.space.notifyWrite"):
@@ -1399,6 +1492,7 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
                 audience: "did:plc:unknownabcdefghijklmnopqr",
                 method: expectedMethod,
                 eventID: "service-event-3",
+                requestBodyDigest: expectedRequestBodyDigest,
                 expiresAt: Date(timeIntervalSinceNow: 60)
             )
         case ("authority-unknown-recipient-token", "com.atproto.space.notifySpaceDeleted"):
@@ -1407,6 +1501,7 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
                 audience: "did:plc:unknownabcdefghijklmnopqr",
                 method: expectedMethod,
                 eventID: "service-event-4",
+                requestBodyDigest: expectedRequestBodyDigest,
                 expiresAt: Date(timeIntervalSinceNow: 60)
             )
         case ("authority-bound-recipient-token", "com.atproto.space.notifySpaceDeleted"):
@@ -1415,6 +1510,7 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
                 audience: NotificationServiceVerifier.boundRecipientIdentity,
                 method: expectedMethod,
                 eventID: "service-event-5",
+                requestBodyDigest: expectedRequestBodyDigest,
                 expiresAt: Date(timeIntervalSinceNow: 60)
             )
         default:

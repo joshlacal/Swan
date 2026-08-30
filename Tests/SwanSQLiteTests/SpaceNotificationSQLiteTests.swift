@@ -8,30 +8,76 @@ import SwanStorage
 import XCTest
 
 final class SpaceNotificationSQLiteTests: XCTestCase {
-    func testReusedWriterJTIIsScopedToEachSpace() async throws {
+    func testGlobalIssuerEventConflictsAndIdenticalReplay() async throws {
         let fixture = try NotificationFixture()
         let database = try await fixture.open()
         defer { Task { try? await database.close() } }
         try await fixture.createAuthorityState(on: database)
         try await fixture.createSecondaryAuthorityState(on: database)
 
-        let eventID = "writer-event-reused-across-spaces"
-        try await database.receiveSpaceWriteNotification(
-            fixture.writeNotification(
-                eventID: eventID,
-                revision: try fixture.tid(1),
-                commitmentByte: 1,
-                space: fixture.space
-            )
+        let eventID = "writer-event-global-replay"
+        let initial = fixture.writeNotification(
+            eventID: eventID,
+            revision: try fixture.tid(1),
+            commitmentByte: 1,
+            space: fixture.space
         )
-        try await database.receiveSpaceWriteNotification(
-            fixture.writeNotification(
-                eventID: eventID,
-                revision: try fixture.tid(1),
-                commitmentByte: 2,
-                space: fixture.secondarySpace
+        try await database.receiveSpaceWriteNotification(initial)
+
+        // Identical replay succeeds idempotently
+        try await database.receiveSpaceWriteNotification(initial)
+
+        // Cross-space reuse fails
+        do {
+            try await database.receiveSpaceWriteNotification(
+                fixture.writeNotification(
+                    eventID: eventID,
+                    revision: try fixture.tid(1),
+                    commitmentByte: 1,
+                    space: fixture.secondarySpace
+                )
             )
-        )
+            XCTFail("cross-space JTI reuse must fail")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                XCTFail("expected unauthorized error, got \(error)")
+                return
+            }
+        }
+
+        // Cross-action reuse fails
+        do {
+            try await database.receiveSpaceDeletionNotification(
+                space: fixture.space,
+                issuer: fixture.authority,
+                audience: fixture.writer,
+                eventID: eventID
+            )
+            XCTFail("cross-action JTI reuse must fail")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                XCTFail("expected unauthorized error, got \(error)")
+                return
+            }
+        }
+
+        // Body conflict fails
+        do {
+            try await database.receiveSpaceWriteNotification(
+                fixture.writeNotification(
+                    eventID: eventID,
+                    revision: try fixture.tid(1),
+                    commitmentByte: 2,
+                    space: fixture.space
+                )
+            )
+            XCTFail("same JTI with different commitment must fail")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                XCTFail("expected unauthorized error, got \(error)")
+                return
+            }
+        }
 
         let primary = try await database.spaceWriters(
             space: fixture.space,
@@ -39,14 +85,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             cursor: nil,
             authorization: fixture.readCredential(for: fixture.space)
         )
-        let secondary = try await database.spaceWriters(
-            space: fixture.secondarySpace,
-            limit: 100,
-            cursor: nil,
-            authorization: fixture.readCredential(for: fixture.secondarySpace)
-        )
         XCTAssertEqual(primary.first?.commitment, Data(repeating: 1, count: 32))
-        XCTAssertEqual(secondary.first?.commitment, Data(repeating: 2, count: 32))
     }
 
     func testWriterNotificationsAreIdempotentMonotonicAndNeverEnqueueAuthorityFanout() async throws {
@@ -62,10 +101,11 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             .init(
                 space: fixture.space,
                 endpoint: endpoint,
-                repository: fixture.writer,
-                expiresAt: now.addingTimeInterval(3_600)
+                repository: "did:plc:other-writer",
+                expiresAt: now.addingTimeInterval(3_600),
+                service: "did:web:notify.example#service",
+                serviceDID: "did:web:notify.example"
             ),
-            serviceDID: "did:plc:serviceabcdefghijklmnop",
             authorization: credential,
             now: now
         )
@@ -160,7 +200,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             .init(
                 space: fixture.space,
                 endpoint: legacyEndpoint,
-                repository: nil,
+                repository: "did:plc:other-writer",
                 expiresAt: now.addingTimeInterval(3_600)
             ),
             serviceDID: "did:plc:serviceabcdefghijklmnop",
@@ -309,7 +349,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         let compactedRows = try await authorityDatabase.connection.query(
             "SELECT COUNT(*) AS row_count FROM permissioned_space_notification_receipts"
         )
-        XCTAssertEqual(compactedRows.first?.column("row_count")?.integer, 1)
+        XCTAssertEqual(compactedRows.first?.column("row_count")?.integer, 2)
 
         let recipient = try await SQLiteAccountDatabase(
             dataDirectory: fixture.root,
@@ -1337,6 +1377,169 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         )
         try await database2.close()
     }
+
+    func testForeignRegistrationOverwriteIsForbidden() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+
+        let now = Date()
+        let endpoint = "https://receiver.example/notify"
+        let credential = fixture.readCredential()
+
+        // Service A registers endpoint
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpoint,
+                repository: fixture.writer,
+                expiresAt: now.addingTimeInterval(3600),
+                service: "did:web:service-a.example#srv",
+                serviceDID: "did:web:service-a.example"
+            ),
+            authorization: credential,
+            now: now
+        )
+
+        // Service B attempts to overwrite Service A's endpoint -> fails
+        do {
+            try await database.registerSpaceNotification(
+                .init(
+                    space: fixture.space,
+                    endpoint: endpoint,
+                    repository: fixture.writer,
+                    expiresAt: now.addingTimeInterval(3600),
+                    service: "did:web:service-b.example#srv",
+                    serviceDID: "did:web:service-b.example"
+                ),
+                authorization: credential,
+                now: now
+            )
+            XCTFail("foreign registration overwrite must fail")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                XCTFail("expected unauthorized error, got \(error)")
+                return
+            }
+        }
+
+        // Service A re-registering its own endpoint succeeds
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpoint,
+                repository: nil,
+                expiresAt: now.addingTimeInterval(7200),
+                service: "did:web:service-a.example#srv",
+                serviceDID: "did:web:service-a.example"
+            ),
+            authorization: credential,
+            now: now
+        )
+    }
+
+    func testForeignRegistrationDeleteIsForbidden() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+
+        let now = Date()
+        let endpoint = "https://receiver.example/notify"
+        let credential = fixture.readCredential()
+
+        // Service A registers endpoint
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpoint,
+                repository: fixture.writer,
+                expiresAt: now.addingTimeInterval(3600),
+                service: "did:web:service-a.example#srv",
+                serviceDID: "did:web:service-a.example"
+            ),
+            authorization: credential,
+            now: now
+        )
+
+        // Service B unregisters its own identity (which has no rows)
+        try await database.unregisterSpaceNotification(
+            space: fixture.space,
+            service: "did:web:service-b.example",
+            authorization: credential
+        )
+
+        // Service A's registration is still active
+        let active = try await database.isSpaceNotificationRegistrationActive(
+            space: fixture.space,
+            endpoint: endpoint,
+            repository: fixture.writer,
+            now: now
+        )
+        XCTAssertTrue(active, "foreign delete must not delete service A's registration")
+
+        // Service A unregisters
+        try await database.unregisterSpaceNotification(
+            space: fixture.space,
+            service: "did:web:service-a.example",
+            authorization: credential
+        )
+        let activeAfter = try await database.isSpaceNotificationRegistrationActive(
+            space: fixture.space,
+            endpoint: endpoint,
+            repository: fixture.writer,
+            now: now
+        )
+        XCTAssertFalse(activeAfter, "own unregister must remove registration")
+    }
+
+    func testSpaceNotificationOwnershipMigrationClearsLegacyRowsAndRebuildsTable() async throws {
+        let fixture = try NotificationFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        try await fixture.createAuthorityState(on: database)
+        try await database.close()
+
+        let databasePath = SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.authority).path
+        let raw = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        _ = try await raw.query("DELETE FROM permissioned_repository_migrations WHERE version = 22")
+        _ = try await raw.query("DROP TABLE IF EXISTS permissioned_space_notification_registrations")
+        _ = try await raw.query("""
+            CREATE TABLE permissioned_space_notification_registrations (
+                space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+                endpoint TEXT NOT NULL,
+                repo_did TEXT,
+                expires_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                service_did TEXT,
+                PRIMARY KEY(space_uri, endpoint)
+            )
+        """)
+        _ = try await raw.query("""
+            INSERT INTO permissioned_space_notification_registrations(
+                space_uri, endpoint, repo_did, expires_at, updated_at, service_did
+            ) VALUES
+                ('\(fixture.space.rawValue)', 'https://legacy.example/sink', NULL, 1800000000, 1700000000, NULL),
+                ('\(fixture.space.rawValue)', 'https://valid.example/sink', NULL, 1800000000, 1700000000, 'did:web:valid.example')
+        """)
+        try await raw.close()
+
+        // Open via SQLiteAccountDatabase which runs migrations
+        let reopened = try await fixture.open()
+        defer { Task { try? await reopened.close() } }
+
+        // Verify schema is NOT NULL
+        let columns = try await reopened.connection.query("PRAGMA table_info(permissioned_space_notification_registrations)")
+        let serviceCol = columns.first { $0.column("name")?.string == "service_did" }
+        XCTAssertEqual(serviceCol?.column("notnull")?.integer, 1, "service_did must be NOT NULL after migration")
+
+        // Verify legacy NULL row was deleted and valid row preserved
+        let rows = try await reopened.connection.query("SELECT endpoint, service_did FROM permissioned_space_notification_registrations")
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows.first?.column("endpoint")?.string, "https://valid.example/sink")
+        XCTAssertEqual(rows.first?.column("service_did")?.string, "did:web:valid.example")
+    }
 }
 
 private struct NotificationFixture {
@@ -1406,13 +1609,15 @@ private struct NotificationFixture {
         ))
     }
 
-    func register(on database: SQLiteAccountDatabase, now: Date) async throws {
+    func register(on database: SQLiteAccountDatabase, now: Date, service: String = "did:web:notify.example#service") async throws {
         try await database.registerSpaceNotification(
             .init(
                 space: space,
                 endpoint: "https://notify.example/xrpc/com.atproto.space.notifyWrite",
                 repository: writer,
-                expiresAt: now.addingTimeInterval(3_600)
+                expiresAt: now.addingTimeInterval(3_600),
+                service: service,
+                serviceDID: service
             ),
             authorization: readCredential(),
             now: now

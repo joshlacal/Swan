@@ -1,7 +1,8 @@
+import Crypto
 import Foundation
+import Petrel
 import SwanCore
 import SwanSpaces
-
 /// A caller-selected record mutation.  Unlike ``SpaceWrite``, this retains
 /// the XRPC operation's requested create/update semantics until the durable
 /// transaction has checked them against the authoritative SQLite state.
@@ -345,19 +346,22 @@ public struct AuthorizedSpaceNotificationRegistration: Sendable, Equatable {
     /// provenance. `nil` for a legacy endpoint-only registration, which stays
     /// local discovery state and is never a dynamic delivery destination.
     public let service: String?
+    public let serviceDID: String
 
     public init(
         space: SpaceURI,
         endpoint: String,
         repository: String?,
         expiresAt: Date,
-        service: String? = nil
+        service: String? = nil,
+        serviceDID: String? = nil
     ) {
         self.space = space
         self.endpoint = endpoint
         self.repository = repository
         self.expiresAt = expiresAt
         self.service = service
+        self.serviceDID = serviceDID ?? service ?? ""
     }
 }
 
@@ -438,6 +442,31 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
         eventID: String,
         requestBodyDigest: String?
     ) async throws
+}
+public extension AuthorizedSpaceNotificationDirectory {
+    func registerSpaceNotification(
+        _ registration: AuthorizedSpaceNotificationRegistration,
+        authorization: AuthorizationContext
+    ) async throws {
+        try await registerSpaceNotification(registration, serviceDID: registration.serviceDID, authorization: authorization)
+    }
+
+    func unregisterSpaceNotification(
+        space: SpaceURI,
+        service: String,
+        authorization: AuthorizationContext
+    ) async throws {
+        try await unregisterSpaceNotification(space: space, serviceDID: service, authorization: authorization)
+    }
+
+    func receiveSpaceDeletionNotification(
+        space: SpaceURI,
+        issuer: String,
+        audience: String,
+        eventID: String
+    ) async throws {
+        try await receiveSpaceDeletionNotification(space: space, issuer: issuer, audience: audience, eventID: eventID, requestBodyDigest: nil)
+    }
 }
 
 /// A deliberately narrow lifecycle/membership projection for a simple-space
@@ -636,5 +665,106 @@ public extension AuthorizedSpaceRepositoryDirectory {
         authorization: AuthorizationContext
     ) async throws -> String? {
         nil
+    }
+}
+public func serviceIssuerDID(_ value: String) -> String? {
+    let parts = value.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+    guard (1 ... 2).contains(parts.count),
+          !parts[0].isEmpty,
+          (parts.count == 1 || (!parts[1].isEmpty && parts[1].utf8.count <= 512)),
+          let did = try? DID(didString: String(parts[0])) else {
+        return nil
+    }
+    return did.didString()
+}
+
+public enum SpaceNotificationRequestDigest {
+    public static func deletion(space: SpaceURI) -> String {
+        SpaceServiceRequestDigest.deletion(space: space)
+    }
+
+    public static func write(
+        space: SpaceURI,
+        repository: String,
+        wireRevision: String,
+        commitment: Data
+    ) -> String {
+        SpaceServiceRequestDigest.write(
+            space: space,
+            repository: repository,
+            revision: wireRevision,
+            commitment: commitment
+        )
+    }
+
+    public static func deletionBytes(space: SpaceURI) -> Data {
+        SpaceServiceRequestDigest.deletionBytes(space: space)
+    }
+
+    public static func writeBytes(
+        space: SpaceURI,
+        repository: String,
+        wireRevision: String,
+        commitment: Data
+    ) -> Data {
+        SpaceServiceRequestDigest.writeBytes(
+            space: space,
+            repository: repository,
+            revision: wireRevision,
+            commitment: commitment
+        )
+    }
+}
+
+public enum SpaceServiceRequestDigest {
+    public static func deletion(space: SpaceURI) -> String {
+        base64URLEncode(deletionBytes(space: space))
+    }
+
+    public static func write(
+        space: SpaceURI,
+        repository: String,
+        revision: String,
+        commitment: Data
+    ) -> String {
+        base64URLEncode(writeBytes(space: space, repository: repository, revision: revision, commitment: commitment))
+    }
+    public static func deletionBytes(space: SpaceURI) -> Data {
+        digestBytes(domain: "swan.space.notify-deleted.v1", parts: [
+            Data(space.rawValue.utf8)
+        ])
+    }
+
+    public static func writeBytes(
+        space: SpaceURI,
+        repository: String,
+        revision: String,
+        commitment: Data
+    ) -> Data {
+        digestBytes(
+            domain: "swan.space.notify-write.v1",
+            parts: [
+                Data(space.rawValue.utf8),
+                Data(repository.utf8),
+                Data(revision.utf8),
+                commitment
+            ]
+        )
+    }
+    private static func digestBytes(domain: String, parts: [Data]) -> Data {
+        var input = Data()
+        for part in [Data(domain.utf8)] + parts {
+            var length = UInt64(part.count).bigEndian
+            withUnsafeBytes(of: &length) { input.append(contentsOf: $0) }
+            input.append(part)
+        }
+        return Data(SHA256.hash(data: input))
+    }
+
+    private static func base64URLEncode(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 }

@@ -145,9 +145,21 @@ private actor CheckUserAccessVerifier: SpaceServiceAuthenticationVerifier {
         )
     }
 
-    func authenticate(_ compact: String, expectedAudience: String?, expectedMethod: String, now: Date) async throws -> VerifiedSpaceServiceAuthentication {
+    func authenticate(
+        _ compact: String,
+        expectedAudience: String?,
+        expectedMethod: String,
+        expectedRequestBodyDigest: String?,
+        now: Date
+    ) async throws -> VerifiedSpaceServiceAuthentication {
         expectations.append((expectedAudience, expectedMethod))
-        return try await verifier.authenticate(compact, expectedAudience: expectedAudience, expectedMethod: expectedMethod, now: now)
+        return try await verifier.authenticate(
+            compact,
+            expectedAudience: expectedAudience,
+            expectedMethod: expectedMethod,
+            expectedRequestBodyDigest: expectedRequestBodyDigest,
+            now: now
+        )
     }
 
     func callCount() -> Int { expectations.count }
@@ -155,7 +167,13 @@ private actor CheckUserAccessVerifier: SpaceServiceAuthenticationVerifier {
 }
 
 private struct CheckUserAccessUnavailableVerifier: SpaceServiceAuthenticationVerifier {
-    func authenticate(_ compact: String, expectedAudience: String?, expectedMethod: String, now: Date) async throws -> VerifiedSpaceServiceAuthentication {
+    func authenticate(
+        _ compact: String,
+        expectedAudience: String?,
+        expectedMethod: String,
+        expectedRequestBodyDigest: String?,
+        now: Date
+    ) async throws -> VerifiedSpaceServiceAuthentication {
         throw SwanError.unavailable("test verifier unavailable")
     }
 }

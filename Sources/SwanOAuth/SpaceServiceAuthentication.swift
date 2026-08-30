@@ -5,7 +5,7 @@ import PetrelPLC
 import SwanAccounts
 import SwanCore
 import SwanSpaces
-
+import SwanStorage
 /// The verified, route-bound subset of an AT Protocol service JWT. It is not
 /// an OAuth authorization context: callers must still apply their endpoint's
 /// `iss`, `aud`, and `lxm` requirements before invoking storage.
@@ -41,26 +41,14 @@ public protocol SpaceServicePublicKeyResolver: Sendable {
     func publicKey(for issuer: String) async throws -> PermissionedDataJWTVerificationKey?
 }
 
-/// Verifies the exact service JWT shape accepted by the pinned PDS handlers.
 public protocol SpaceServiceAuthenticationVerifier: Sendable {
-    func authenticate(
-        _ compact: String,
-        expectedAudience: String?,
-        expectedMethod: String,
-        now: Date
-    ) async throws -> VerifiedSpaceServiceAuthentication
-}
-
-public extension SpaceServiceAuthenticationVerifier {
     func authenticate(
         _ compact: String,
         expectedAudience: String?,
         expectedMethod: String,
         expectedRequestBodyDigest: String?,
         now: Date
-    ) async throws -> VerifiedSpaceServiceAuthentication {
-        try await authenticate(compact, expectedAudience: expectedAudience, expectedMethod: expectedMethod, now: now)
-    }
+    ) async throws -> VerifiedSpaceServiceAuthentication
 }
 
 /// A small authority-scoped signer used only by durable notification
@@ -72,6 +60,7 @@ public protocol SpaceServiceAuthenticationIssuer: Sendable {
         audience: String,
         method: String,
         eventID: String,
+        requestBodyDigest: String?,
         now: Date
     ) async throws -> String
 }
@@ -260,20 +249,6 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
         _ compact: String,
         expectedAudience: String?,
         expectedMethod: String,
-        now: Date
-    ) async throws -> VerifiedSpaceServiceAuthentication {
-        try await authenticate(
-            compact,
-            expectedAudience: expectedAudience,
-            expectedMethod: expectedMethod,
-            expectedRequestBodyDigest: nil,
-            now: now
-        )
-    }
-    public func authenticate(
-        _ compact: String,
-        expectedAudience: String?,
-        expectedMethod: String,
         expectedRequestBodyDigest: String? = nil,
         now: Date = Date()
     ) async throws -> VerifiedSpaceServiceAuthentication {
@@ -290,6 +265,8 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
         let claims = try SpaceServiceJWT.verify(
             compact,
             publicKey: key,
+            expectedAudience: expectedAudience,
+            expectedMethod: expectedMethod,
             expectedRequestBodyDigest: expectedRequestBodyDigest,
             now: now,
             clockSkew: configuration.clockSkew,
@@ -330,6 +307,7 @@ public struct LocalAccountSpaceServiceAuthenticationIssuer: SpaceServiceAuthenti
         audience: String,
         method: String,
         eventID: String,
+        requestBodyDigest: String? = nil,
         now: Date = Date()
     ) async throws -> String {
         let issuer = try AccountIdentifiers.validateDID(issuer)
@@ -358,24 +336,12 @@ public struct LocalAccountSpaceServiceAuthenticationIssuer: SpaceServiceAuthenti
             audience: audience,
             method: method,
             eventID: eventID,
+            requestBodyDigest: requestBodyDigest,
             key: key,
             now: now
         )
     }
 }
-
-
-private func serviceIssuerDID(_ value: String) -> String? {
-    let parts = value.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
-    guard (1 ... 2).contains(parts.count),
-          !parts[0].isEmpty,
-          (parts.count == 1 || (!parts[1].isEmpty && parts[1].utf8.count <= 512)),
-          let did = try? AccountIdentifiers.validateDID(String(parts[0])) else {
-        return nil
-    }
-    return did
-}
-
 private func validServiceAudience(_ value: String) -> Bool {
     !value.isEmpty && value.utf8.count <= 4_096 && value.utf8.allSatisfy { $0 >= 0x21 && $0 <= 0x7e }
 }
@@ -389,34 +355,6 @@ private func validServiceMethod(_ value: String) -> Bool {
     }
 }
 
-/// Domain-separated, length-prefixed request binding used by space service JWTs.
-public enum SpaceServiceRequestDigest {
-    public static func deletion(space: SpaceURI) -> String {
-        digest(domain: "swan.space.notify-deleted.v1", fields: [space.rawValue])
-    }
-
-    public static func write(
-        space: SpaceURI,
-        repository: String,
-        revision: String,
-        commitment: Data
-    ) -> String {
-        digest(
-            domain: "swan.space.notify-write.v1",
-            fields: [space.rawValue, repository, revision, commitment.base64EncodedString()]
-        )
-    }
-
-    private static func digest(domain: String, fields: [String]) -> String {
-        var input = Data()
-        for field in [domain] + fields {
-            var length = UInt64(field.utf8.count).bigEndian
-            withUnsafeBytes(of: &length) { input.append(contentsOf: $0) }
-            input.append(contentsOf: field.utf8)
-        }
-        return Data(SHA256.hash(data: input)).base64URLEncodedString()
-    }
-}
 private func validServiceEventID(_ value: String) -> Bool {
     !value.isEmpty && value.utf8.count <= 256 && value.utf8.allSatisfy { $0 >= 0x21 && $0 <= 0x7e }
 }

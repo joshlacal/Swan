@@ -890,12 +890,14 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 localService,
                 expectedAudience: localDID,
                 expectedMethod: "com.atproto.space.notifyWrite",
+                expectedRequestBodyDigest: nil,
                 now: now
             )
             _ = try await service.authenticate(
                 Self.remoteService,
                 expectedAudience: localDID,
                 expectedMethod: "com.atproto.space.notifyWrite",
+                expectedRequestBodyDigest: nil,
                 now: now
             )
             try await fixture.close()
