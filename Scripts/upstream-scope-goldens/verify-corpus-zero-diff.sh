@@ -50,13 +50,13 @@ command -v git  >/dev/null || fail "git not on PATH"
 command -v node >/dev/null || fail "node not on PATH"
 command -v npm  >/dev/null || fail "npm not on PATH"
 
-actual_commit="$(git -C "$upstream" rev-parse HEAD 2>/dev/null || true)"
-[ "$actual_commit" = "$REFERENCE_COMMIT" ] || fail \
-  "$upstream HEAD ($actual_commit) does not match reference commit $REFERENCE_COMMIT"
-
 status_output="$(git -C "$upstream" status --porcelain -uall 2>/dev/null || true)"
 [ -z "$status_output" ] || fail \
   "$upstream working tree is not clean (porcelain status non-empty)"
+
+actual_commit="$(git -C "$upstream" rev-parse HEAD 2>/dev/null || true)"
+[ "$actual_commit" = "$REFERENCE_COMMIT" ] || fail \
+  "$upstream HEAD ($actual_commit) does not match reference commit $REFERENCE_COMMIT"
 node_major="$(node -p 'process.versions.node.split(".")[0]')"
 [ "$node_major" -ge 22 ] || fail "node >= 22 required for --experimental-transform-types (found $(node -v))"
 
@@ -67,14 +67,16 @@ up="$scratch/atproto"
 gen="$scratch/gen"
 mkdir -p "$gen"
 
-printf 'verify-corpus-zero-diff: copying upstream tree (read-only source) ...\n' >&2
-# Copy only the packages the generator's import graph reaches. The full monorepo
-# is large and none of the rest is on the path from @atproto/oauth-scopes.
-mkdir -p "$up/packages/oauth" "$up/packages/lex"
-cp -R "$upstream/packages/did"                  "$up/packages/did"
-cp -R "$upstream/packages/syntax"               "$up/packages/syntax"
-cp -R "$upstream/packages/lex/lex-document"     "$up/packages/lex/lex-document"
-cp -R "$upstream/packages/oauth/oauth-scopes"   "$up/packages/oauth/oauth-scopes"
+printf 'verify-corpus-zero-diff: extracting tracked upstream tree at HEAD ...\n' >&2
+# Extract only the packages the generator's import graph reaches directly from git
+# at HEAD. This guarantees gitignored residue or untracked modifications in the
+# upstream working tree cannot enter the generation tree.
+mkdir -p "$up"
+git -C "$upstream" archive HEAD \
+  packages/did \
+  packages/syntax \
+  packages/lex/lex-document \
+  packages/oauth/oauth-scopes | tar -x -C "$up"
 # Reject symlinks in copied package trees before linking
 if [ -n "$(find "$up" -type l 2>/dev/null)" ]; then
   fail "symlinks found in copied upstream package trees"

@@ -61,16 +61,6 @@ Swan/web/test-results
 Swan/web/test-results/**
 Swan/web/playwright-report
 Swan/web/playwright-report/**
-web/node_modules
-web/node_modules/**
-web/.svelte-kit
-web/.svelte-kit/**
-web/build
-web/build/**
-web/test-results
-web/test-results/**
-web/playwright-report
-web/playwright-report/**
 **/.env*
 !**/.env.example
 **/.swan-data/
