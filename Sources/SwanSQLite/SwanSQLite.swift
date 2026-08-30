@@ -2166,6 +2166,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let permissionedRequestReceiptRetentionMigrationVersion = 16
     private static let permissionedSpaceRecordBlobIndexMigrationVersion = 17
     private static let permissionedOplogRetentionCutoffMigrationVersion = 18
+    private static let publicFirehoseOutboxCompactionMigrationVersion = 19
 
     /// How long an uploaded blob no commit has claimed stays staged.
     ///
@@ -2628,6 +2629,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePermissionedRemoteReplicaLogicalLimitIfNeeded()
             try await migratePublicFirehoseOutboxIfNeeded()
             try await migratePublicFirehoseCompletionAnchorsIfNeeded()
+            try await compactPublicFirehoseOutboxIfNeeded()
             try await migratePermissionedRequestReceiptRetentionIfNeeded()
             try await migratePermissionedOplogRetentionCutoffIfNeeded()
             try await migrateSpaceNotificationServiceIdentityIfNeeded()
@@ -3081,13 +3083,20 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             kind TEXT NOT NULL CHECK(kind IN ('commit', 'sync')),
             lifecycle_generation INTEGER NOT NULL DEFAULT 0
                 CHECK(lifecycle_generation >= 0),
-            payload BLOB NOT NULL CHECK(length(payload) > 0),
-            car_bytes BLOB NOT NULL CHECK(length(car_bytes) > 0),
+            payload BLOB,
+            car_bytes BLOB,
+            payload_digest BLOB NOT NULL CHECK(length(payload_digest) = 32),
+            car_digest BLOB NOT NULL CHECK(length(car_digest) = 32),
             attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
             created_at INTEGER NOT NULL CHECK(created_at >= 0),
             available_at INTEGER NOT NULL CHECK(available_at >= 0),
             lease_token TEXT,
             lease_expires_at INTEGER,
+            completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+            CHECK(
+                (completed = 0 AND payload IS NOT NULL AND length(payload) > 0 AND car_bytes IS NOT NULL AND length(car_bytes) > 0)
+                OR (completed = 1 AND payload IS NULL AND car_bytes IS NULL)
+            ),
             CHECK(
                 (lease_token IS NULL AND lease_expires_at IS NULL)
                 OR (
@@ -3128,6 +3137,138 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             column: "completed",
             definition: "INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1))"
         )
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
+    /// Finding 2: completed firehose outbox rows retained full payload and CAR bytes indefinitely.
+    /// This migration nulls payload and CAR bytes for completed rows, introduces SHA-256 digest
+    /// columns for both payload and CAR bytes to anchor exact replay, and enforces integrity checks.
+    private func compactPublicFirehoseOutboxIfNeeded() async throws {
+        let version = Self.publicFirehoseOutboxCompactionMigrationVersion
+        let columns = try await connection.query("PRAGMA table_info(public_event_outbox)")
+        let hasPayloadDigest = columns.contains { $0.column("name")?.string == "payload_digest" }
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        if hasPayloadDigest, !applied.isEmpty { return }
+
+        if !hasPayloadDigest {
+            _ = try await connection.query("ALTER TABLE public_event_outbox RENAME TO public_event_outbox_v14")
+            _ = try await connection.query(
+                """
+                CREATE TABLE public_event_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_key TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL CHECK(kind IN ('commit', 'sync')),
+                    lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK(lifecycle_generation >= 0),
+                    payload BLOB,
+                    car_bytes BLOB,
+                    payload_digest BLOB NOT NULL CHECK(length(payload_digest) = 32),
+                    car_digest BLOB NOT NULL CHECK(length(car_digest) = 32),
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                    available_at INTEGER NOT NULL CHECK(available_at >= 0),
+                    lease_token TEXT,
+                    lease_expires_at INTEGER,
+                    completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+                    CHECK(
+                        (completed = 0 AND payload IS NOT NULL AND length(payload) > 0 AND car_bytes IS NOT NULL AND length(car_bytes) > 0)
+                        OR (completed = 1 AND payload IS NULL AND car_bytes IS NULL)
+                    ),
+                    CHECK(
+                        (lease_token IS NULL AND lease_expires_at IS NULL)
+                        OR (
+                            lease_token IS NOT NULL
+                            AND lease_expires_at IS NOT NULL
+                            AND lease_expires_at >= 0
+                        )
+                    )
+                );
+                """
+            )
+            var lastID: Int64 = 0
+            while true {
+                let rows = try await connection.query(
+                    """
+                    SELECT id, source_key, kind, lifecycle_generation, payload, car_bytes,
+                           attempts, created_at, available_at, lease_token, lease_expires_at, completed
+                    FROM public_event_outbox_v14
+                    WHERE id > ?
+                    ORDER BY id
+                    LIMIT 1000
+                    """,
+                    [.integer(Int(lastID))]
+                )
+                guard !rows.isEmpty else { break }
+                for row in rows {
+                    guard let idInt = row.column("id")?.integer,
+                          let sourceKey = row.column("source_key")?.string,
+                          let kind = row.column("kind")?.string,
+                          let lifecycleGen = row.column("lifecycle_generation")?.integer,
+                          let payloadBuffer = row.column("payload")?.blob,
+                          let carBuffer = row.column("car_bytes")?.blob,
+                          let attempts = row.column("attempts")?.integer,
+                          let createdAt = row.column("created_at")?.integer,
+                          let availableAt = row.column("available_at")?.integer
+                    else {
+                        throw SQLiteRepositoryError.corruptDatabase("invalid row in public_event_outbox_v14")
+                    }
+                    let id = Int64(idInt)
+                    lastID = id
+                    let rawPayload = Data(payloadBuffer.readableBytesView)
+                    let rawCAR = Data(carBuffer.readableBytesView)
+                    let leaseToken = row.column("lease_token")?.string
+                    let leaseExpiresAt = row.column("lease_expires_at")?.integer
+                    let completed = row.column("completed")?.integer ?? 0
+
+                    let payloadDigest = Data(SHA256.hash(data: rawPayload))
+                    let carDigest = Data(SHA256.hash(data: rawCAR))
+
+                    let insertPayload: SQLiteData = completed == 1 ? .null : rawPayload.sqliteData!
+                    let insertCAR: SQLiteData = completed == 1 ? .null : rawCAR.sqliteData!
+                    let tokenData: SQLiteData = leaseToken.map { .text($0) } ?? .null
+                    let expiryData: SQLiteData = leaseExpiresAt.map { .integer($0) } ?? .null
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO public_event_outbox(
+                            id, source_key, kind, lifecycle_generation, payload, car_bytes,
+                            payload_digest, car_digest, attempts, created_at, available_at,
+                            lease_token, lease_expires_at, completed
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            .integer(Int(id)),
+                            .text(sourceKey),
+                            .text(kind),
+                            .integer(lifecycleGen),
+                            insertPayload,
+                            insertCAR,
+                            payloadDigest.sqliteData!,
+                            carDigest.sqliteData!,
+                            .integer(attempts),
+                            .integer(createdAt),
+                            .integer(availableAt),
+                            tokenData,
+                            expiryData,
+                            .integer(completed),
+                        ]
+                    )
+                }
+            }
+            _ = try await connection.query("DROP TABLE public_event_outbox_v14")
+        }
+
+        guard applied.isEmpty else { return }
         _ = try await connection.query(
             """
             INSERT INTO permissioned_repository_migrations(version, applied_at)
