@@ -744,7 +744,8 @@ public enum SQLiteLayout {
             repo_did TEXT,
             expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
             updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
-            service_did TEXT NOT NULL,
+            owner_service_did TEXT NOT NULL,
+            delivery_service_did TEXT,
             PRIMARY KEY(space_uri, endpoint),
             CHECK(length(endpoint) > 0)
         )
@@ -753,8 +754,9 @@ public enum SQLiteLayout {
         CREATE TABLE IF NOT EXISTS permissioned_space_notification_receipts (
             issuer TEXT NOT NULL,
             event_id TEXT NOT NULL,
+            action TEXT NOT NULL,
             space_uri TEXT NOT NULL,
-            request_digest TEXT,
+            request_digest TEXT NOT NULL,
             received_at INTEGER NOT NULL CHECK(received_at >= 0),
             PRIMARY KEY(issuer, event_id)
         )
@@ -2751,6 +2753,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// a writer reused a JTI. Rebuild the small receipt table transactionally;
     /// no record or blob data is involved, and the existing rows remain valid.
     private func migrateSpaceNotificationReceiptScopeIfNeeded() async throws {
+        let receiptCols = try await connection.query("PRAGMA table_info(permissioned_space_notification_receipts)")
+        if !receiptCols.isEmpty && !receiptCols.contains(where: { $0.column("name")?.string == "action" }) {
+            _ = try await connection.query("ALTER TABLE permissioned_space_notification_receipts ADD COLUMN action TEXT NOT NULL DEFAULT 'write'")
+        }
         let version = Self.spaceNotificationReceiptMigrationVersion
         try await transaction {
             let applied = try await connection.query(
@@ -2758,7 +2764,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 [.integer(version)]
             )
             guard applied.isEmpty else { return }
-
             _ = try await connection.query(
                 "ALTER TABLE permissioned_space_notification_receipts RENAME TO permissioned_space_notification_receipts_v6"
             )
@@ -2767,19 +2772,25 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 CREATE TABLE permissioned_space_notification_receipts (
                     issuer TEXT NOT NULL,
                     event_id TEXT NOT NULL,
+                    action TEXT NOT NULL DEFAULT 'write',
                     space_uri TEXT NOT NULL,
-                    request_digest TEXT,
+                    request_digest TEXT NOT NULL,
                     received_at INTEGER NOT NULL CHECK(received_at >= 0),
                     PRIMARY KEY(issuer, event_id)
                 )
                 """
             )
+            let v6Cols = try await connection.query("PRAGMA table_info(permissioned_space_notification_receipts_v6)")
+            let hasAction = v6Cols.contains(where: { $0.column("name")?.string == "action" })
+            let hasDigest = v6Cols.contains(where: { $0.column("name")?.string == "request_digest" })
+            let actionSelect = hasAction ? "action" : "'write'"
+            let digestSelect = hasDigest ? "COALESCE(request_digest, '')" : "''"
             _ = try await connection.query(
                 """
                 INSERT OR IGNORE INTO permissioned_space_notification_receipts(
-                    issuer, event_id, space_uri, received_at
+                    issuer, event_id, action, space_uri, request_digest, received_at
                 )
-                SELECT issuer, event_id, space_uri, received_at
+                SELECT issuer, event_id, \(actionSelect), space_uri, \(digestSelect), received_at
                 FROM permissioned_space_notification_receipts_v6
                 """
             )
@@ -2939,20 +2950,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// Notification ownership is authenticated at registration time. Legacy
     /// rows are discarded before rebuilding the table with a required owner.
     private func migrateSpaceNotificationOwnershipIfNeeded() async throws {
-        let version = Self.spaceNotificationOwnershipMigrationVersion
-        let applied = try await connection.query(
-            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
-            [.integer(version)]
-        )
-        guard applied.isEmpty else { return }
         let columns = try await connection.query(
             "PRAGMA table_info(permissioned_space_notification_registrations)"
         )
         if !columns.isEmpty {
-            let existing = Set(columns.compactMap { $0.column("name")?.string })
-            let serviceCol = columns.first { $0.column("name")?.string == "service_did" }
-            let isNotNull = (serviceCol?.column("notnull")?.integer ?? 0) == 1
-            if !isNotNull {
+            let ownerCol = columns.first { $0.column("name")?.string == "owner_service_did" }
+            let hasDeliveryCol = columns.contains { $0.column("name")?.string == "delivery_service_did" }
+            let isNotNull = (ownerCol?.column("notnull")?.integer ?? 0) == 1
+            if !isNotNull || !hasDeliveryCol {
                 _ = try await connection.query("DROP TABLE IF EXISTS permissioned_space_notification_registrations_legacy")
                 _ = try await connection.query(
                     "ALTER TABLE permissioned_space_notification_registrations RENAME TO permissioned_space_notification_registrations_legacy"
@@ -2965,33 +2970,30 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         repo_did TEXT,
                         expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
                         updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
-                        service_did TEXT NOT NULL,
+                        owner_service_did TEXT NOT NULL,
+                        delivery_service_did TEXT,
                         PRIMARY KEY(space_uri, endpoint),
                         CHECK(length(endpoint) > 0)
                     )
                     """
                 )
-                if existing.contains("service_did") {
-                    _ = try await connection.query(
-                        """
-                        INSERT INTO permissioned_space_notification_registrations
-                            (space_uri, endpoint, repo_did, expires_at, updated_at, service_did)
-                        SELECT space_uri, endpoint, repo_did, expires_at, updated_at, service_did
-                        FROM permissioned_space_notification_registrations_legacy
-                        WHERE service_did IS NOT NULL AND length(service_did) > 0
-                        """
-                    )
-                }
                 _ = try await connection.query("DROP TABLE permissioned_space_notification_registrations_legacy")
             }
         }
-        _ = try await connection.query(
-            "INSERT INTO permissioned_repository_migrations(version, applied_at) VALUES (?, ?)",
-            [
-                .integer(version),
-                .integer(Int(Date().timeIntervalSince1970 * 1_000_000))
-            ]
+        let version = Self.spaceNotificationOwnershipMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
         )
+        if applied.isEmpty {
+            _ = try await connection.query(
+                "INSERT INTO permissioned_repository_migrations(version, applied_at) VALUES (?, ?)",
+                [
+                    .integer(version),
+                    .integer(Int(Date().timeIntervalSince1970 * 1_000_000))
+                ]
+            )
+        }
     }
 
     /// Task 42 originally shipped staging tables before the exact projection
@@ -5052,7 +5054,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         SELECT hex(randomblob(16)) AS h, endpoint
                         FROM permissioned_space_notification_registrations
                         WHERE space_uri = ?
-                          AND service_did IS NOT NULL
+                          AND delivery_service_did IS NOT NULL
                           AND expires_at > ?
                           AND (repo_did IS NULL OR repo_did = ?)
                     )
@@ -8408,7 +8410,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 _ = try await connection.query(
                     """
                     DELETE FROM permissioned_space_notification_registrations
-                    WHERE space_uri = ? AND (service_did = ? OR service_did = ? OR service_did LIKE ? || '#%')
+                    WHERE space_uri = ? AND (owner_service_did = ? OR owner_service_did = ? OR owner_service_did LIKE ? || '#%')
                     """,
                     [.text(space.rawValue), .text(owner), .text(baseDID), .text(baseDID)]
                 )
@@ -8422,24 +8424,21 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         authorization: AuthorizationContext,
         now: Date = Date()
     ) async throws {
-        let ownerCandidate = serviceDID ?? (!registration.serviceDID.isEmpty ? registration.serviceDID : registration.service)
+        let ownerCandidate = serviceDID ?? (!registration.ownerServiceDID.isEmpty ? registration.ownerServiceDID : nil)
         guard let owner = ownerCandidate,
               Self.isValidNotificationServiceIdentity(owner) else {
             throw SwanError.unauthorized("service authentication is required")
         }
-        let storedIdentity = registration.service ?? owner
-        guard Self.isValidNotificationServiceIdentity(storedIdentity) else {
-            throw SwanError.invalidIdentifier("notification service identity")
+        let deliveryService = registration.deliveryServiceDID ?? registration.service
+        if let deliveryService {
+            guard Self.isValidNotificationServiceIdentity(deliveryService) else {
+                throw SwanError.invalidIdentifier("notification service identity")
+            }
         }
         let endpoint = try validNotificationEndpoint(registration.endpoint)
         if let repository = registration.repository {
             guard isValidSimpleSpaceDID(repository) else {
                 throw SwanError.invalidIdentifier("notification repository")
-            }
-        }
-        if let service = registration.service {
-            guard Self.isValidNotificationServiceIdentity(service) else {
-                throw SwanError.invalidIdentifier("notification service identity")
             }
         }
         let timestamp = try simpleSpaceTimestamp(now)
@@ -8470,7 +8469,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 )
                 let existing = try await connection.query(
                     """
-                    SELECT service_did
+                    SELECT owner_service_did
                     FROM permissioned_space_notification_registrations
                     WHERE space_uri = ? AND endpoint = ?
                     LIMIT 1
@@ -8478,9 +8477,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     [.text(registration.space.rawValue), .text(endpoint)]
                 )
                 if let row = existing.first {
-                    let previous = row.column("service_did")?.string
+                    let previous = row.column("owner_service_did")?.string
                     let baseDID = serviceIssuerDID(owner) ?? owner
-                    guard previous == owner || previous == baseDID || previous == storedIdentity || serviceIssuerDID(previous ?? "") == baseDID else {
+                    guard previous == owner || previous == baseDID || serviceIssuerDID(previous ?? "") == baseDID else {
                         throw SwanError.unauthorized("notification registration owner mismatch")
                     }
                 } else {
@@ -8503,19 +8502,21 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_notification_registrations(
-                        space_uri, endpoint, repo_did, expires_at, updated_at, service_did
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        space_uri, endpoint, repo_did, expires_at, updated_at, owner_service_did, delivery_service_did
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(space_uri, endpoint) DO UPDATE SET
                         repo_did = excluded.repo_did,
                         expires_at = excluded.expires_at,
                         updated_at = excluded.updated_at,
-                        service_did = excluded.service_did
+                        owner_service_did = excluded.owner_service_did,
+                        delivery_service_did = excluded.delivery_service_did
                     """,
                     [
                         .text(registration.space.rawValue), .text(endpoint),
                         registration.repository.map(SQLiteData.text) ?? .null,
                         .integer(expiry), .integer(timestamp),
-                        .text(storedIdentity),
+                        .text(owner),
+                        deliveryService.map(SQLiteData.text) ?? .null,
                     ]
                 )
             }
@@ -8563,7 +8564,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await readTransaction {
                 let rows = try await connection.query(
                     """
-                    SELECT repo_did, expires_at, service_did
+                    SELECT repo_did, expires_at, delivery_service_did
                     FROM permissioned_space_notification_registrations
                     WHERE space_uri = ? AND endpoint = ?
                     """,
@@ -8578,7 +8579,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     || selectedRepository == repository else {
                     return nil
                 }
-                guard let service = row.column("service_did")?.string,
+                guard let service = row.column("delivery_service_did")?.string,
                       Self.isValidNotificationServiceIdentity(service) else {
                     return nil
                 }
@@ -8656,22 +8657,18 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     throw SwanError.unauthorized("writer is not a space member")
                 }
 
-                let expectedDigest = notification.requestBodyDigest ?? SpaceNotificationRequestDigest.write(
-                    space: notification.space,
-                    repository: notification.repository,
-                    wireRevision: notification.wireRevision,
-                    commitment: notification.commitment
-                )
+                let expectedDigest = notification.requestBodyDigest
                 let receipt = try await connection.query(
                     """
-                    SELECT space_uri, request_digest
+                    SELECT action, space_uri, request_digest
                     FROM permissioned_space_notification_receipts
                     WHERE issuer = ? AND event_id = ?
                     """,
                     [.text(notification.issuer), .text(eventID)]
                 )
                 if let prior = receipt.first {
-                    guard prior.column("space_uri")?.string == notification.space.rawValue,
+                    guard prior.column("action")?.string == "write",
+                          prior.column("space_uri")?.string == notification.space.rawValue,
                           prior.column("request_digest")?.string == expectedDigest else {
                         throw SwanError.unauthorized("service event was bound to different request")
                     }
@@ -8690,8 +8687,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_notification_receipts(
-                        issuer, event_id, space_uri, request_digest, received_at
-                    ) VALUES (?, ?, ?, ?, ?)
+                        issuer, event_id, action, space_uri, request_digest, received_at
+                    ) VALUES (?, ?, 'write', ?, ?, ?)
                     """,
                     [
                         .text(notification.issuer), .text(eventID),
@@ -8729,7 +8726,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         SELECT hex(randomblob(16)) AS h, endpoint
                         FROM permissioned_space_notification_registrations
                         WHERE space_uri = ?
-                          AND service_did IS NOT NULL
+                          AND delivery_service_did IS NOT NULL
                           AND expires_at > ?
                           AND (repo_did IS NULL OR repo_did = ?)
                     )
@@ -8761,7 +8758,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         issuer: String,
         audience: String,
         eventID: String,
-        requestBodyDigest: String? = nil,
+        requestBodyDigest: String,
         now: Date = Date()
     ) async throws {
         guard issuer == space.authority, audience == accountDID,
@@ -8772,15 +8769,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let timestamp = try simpleSpaceTimestamp(now)
         try await withConnectionGate {
             try await transaction {
-                // The deletion service JWT names no space: it carries only
-                // `iss`, `aud`, `lxm`, `jti` and time claims, and the verifier
-                // keeps no replay cache by design. The route can therefore
-                // only require that the body space's authority equals the
-                // issuer, so one valid token would otherwise mint a permanent
-                // tombstone — and a permanent receipt, since receipt identity
-                // includes `space_uri` — for every SpaceURI under that
-                // authority. The pinned receiver bounds this by no-oping
-                // unless the recipient already knows the space
+                // The deletion service JWT binds the space URI via `req`
+                // (requestBodyDigest) and the event ID is consumed transactionally.
+                // The pinned receiver bounds this by no-oping unless the
+                // recipient already knows the space
                 // (`packages/pds/src/api/com/atproto/space/notifySpaceDeleted.ts:33-34`).
                 // Participation here is the same pair of facts the hosted
                 // space projection reports: an authority row this account
@@ -8813,17 +8805,18 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 // A tombstone is terminal. Future event IDs are no-ops and
                 // must not create an unbounded replay-receipt stream.
                 guard tombstones.isEmpty else { return }
-                let expectedDigest = requestBodyDigest ?? SpaceNotificationRequestDigest.deletion(space: space)
+                let expectedDigest = requestBodyDigest
                 let duplicate = try await connection.query(
                     """
-                    SELECT space_uri, request_digest
+                    SELECT action, space_uri, request_digest
                     FROM permissioned_space_notification_receipts
                     WHERE issuer = ? AND event_id = ?
                     """,
                     [.text(issuer), .text(eventID)]
                 )
                 if let prior = duplicate.first {
-                    guard prior.column("space_uri")?.string == space.rawValue,
+                    guard prior.column("action")?.string == "deleted",
+                          prior.column("space_uri")?.string == space.rawValue,
                           prior.column("request_digest")?.string == expectedDigest else {
                         throw SwanError.unauthorized("service event was bound to different request")
                     }
@@ -8832,8 +8825,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_notification_receipts(
-                        issuer, event_id, space_uri, request_digest, received_at
-                    ) VALUES (?, ?, ?, ?, ?)
+                        issuer, event_id, action, space_uri, request_digest, received_at
+                    ) VALUES (?, ?, 'deleted', ?, ?, ?)
                     """,
                     [
                         .text(issuer), .text(eventID),

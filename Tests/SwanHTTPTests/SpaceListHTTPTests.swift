@@ -141,7 +141,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
             _ = try await ownerRepository.apply(.put(uri: ownerRecord, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2z"), authorization: createAuthorization(for: duplicate))
             _ = try await database.createSimpleSpace(space: deleted, owner: Self.alice, configuration: .init(policy: .public, appAccess: .open), authorization: .accountOAuthForTesting(subject: Self.alice, scopes: ["atproto"]))
             _ = try await database.deleteSimpleSpace(space: deleted, authorization: .accountOAuthForTesting(subject: Self.alice, scopes: ["atproto"]))
-            try await database.receiveSpaceDeletionNotification(space: tombstoned, issuer: Self.bob, audience: Self.alice, eventID: "tombstone-list")
+            try await database.receiveSpaceDeletionNotification(space: tombstoned, issuer: Self.bob, audience: Self.alice, eventID: "tombstone-list", requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: tombstoned))
             let page = try await database.hostedSpaceURIs(spaceType: nil, authority: nil, cursor: nil, limit: 100)
             XCTAssertEqual(page, [duplicate])
             try await database.close()

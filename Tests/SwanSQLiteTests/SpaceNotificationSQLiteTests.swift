@@ -45,15 +45,34 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             }
         }
 
-        // Cross-action reuse fails
+        // Cross-action reuse fails: authority announces write, then tries to reuse same eventID for deletion
+        let authEventID = "authority-event-cross-action"
+        let authCommitment = Data(repeating: 3, count: 32)
+        let authWrite = AuthorizedSpaceWriteNotification(
+            eventID: authEventID,
+            space: fixture.space,
+            repository: fixture.authority,
+            wireRevision: try fixture.tid(3).toString(),
+            commitment: authCommitment,
+            issuer: fixture.authority,
+            audience: fixture.authority,
+            requestBodyDigest: SpaceNotificationRequestDigest.write(
+                space: fixture.space,
+                repository: fixture.authority,
+                wireRevision: try fixture.tid(3).toString(),
+                commitment: authCommitment
+            )
+        )
+        try await database.receiveSpaceWriteNotification(authWrite)
         do {
             try await database.receiveSpaceDeletionNotification(
                 space: fixture.space,
                 issuer: fixture.authority,
-                audience: fixture.writer,
-                eventID: eventID
+                audience: fixture.authority,
+                eventID: authEventID,
+                requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: fixture.space)
             )
-            XCTFail("cross-action JTI reuse must fail")
+            XCTFail("cross-action JTI reuse must fail at receipt check")
         } catch let error as SwanError {
             guard case .unauthorized = error else {
                 XCTFail("expected unauthorized error, got \(error)")
@@ -85,7 +104,8 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             cursor: nil,
             authorization: fixture.readCredential(for: fixture.space)
         )
-        XCTAssertEqual(primary.first?.commitment, Data(repeating: 1, count: 32))
+        let writerRow = primary.first { $0.repository == fixture.writer }
+        XCTAssertEqual(writerRow?.commitment, Data(repeating: 1, count: 32))
     }
 
     func testWriterNotificationsAreIdempotentMonotonicAndNeverEnqueueAuthorityFanout() async throws {
@@ -200,10 +220,11 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             .init(
                 space: fixture.space,
                 endpoint: legacyEndpoint,
-                repository: "did:plc:other-writer",
-                expiresAt: now.addingTimeInterval(3_600)
+                repository: nil,
+                expiresAt: now.addingTimeInterval(3_600),
+                service: nil,
+                serviceDID: "did:plc:serviceabcdefghijklmnop"
             ),
-            serviceDID: "did:plc:serviceabcdefghijklmnop",
             authorization: credential,
             now: now
         )
@@ -283,10 +304,10 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         let legacyIdentity = try await database.spaceNotificationRegistrationService(
             space: fixture.space,
             endpoint: legacyEndpoint,
-            repository: fixture.writer,
+            repository: nil,
             now: now
         )
-        XCTAssertNil(legacyIdentity)
+        XCTAssertNil(legacyIdentity, "endpoint-only registration must have nil delivery service")
         let expiredIdentity = try await database.spaceNotificationRegistrationService(
             space: fixture.space,
             endpoint: serviceEndpoint,
@@ -366,6 +387,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                 issuer: fixture.authority,
                 audience: fixture.writer,
                 eventID: "space-delete-\(index)",
+                requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: fixture.space),
                 now: now.addingTimeInterval(TimeInterval(index))
             )
         }
@@ -585,6 +607,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             issuer: fixture.authority,
             audience: fixture.writer,
             eventID: "space-delete-1",
+            requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: fixture.space),
             now: now
         )
         // A duplicate delivery must preserve the durable closure rather than
@@ -594,6 +617,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             issuer: fixture.authority,
             audience: fixture.writer,
             eventID: "space-delete-1",
+            requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: fixture.space),
             now: now.addingTimeInterval(1)
         )
         let remainingOutbox = try await writerDatabase.pendingOutbox()
@@ -650,6 +674,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             issuer: fixture.authority,
             audience: fixture.writer,
             eventID: "cross-space-replay",
+            requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: fixture.secondarySpace),
             now: now
         )
         let tombstones = try await recipient.connection.query(
@@ -684,7 +709,8 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             space: fixture.secondarySpace,
             issuer: fixture.authority,
             audience: fixture.writer,
-            eventID: "cross-space-replay",
+            eventID: "space-delete-joined",
+            requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: fixture.secondarySpace),
             now: now.addingTimeInterval(1)
         )
         let afterJoin = try await recipient.connection.query(
@@ -1531,14 +1557,12 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
 
         // Verify schema is NOT NULL
         let columns = try await reopened.connection.query("PRAGMA table_info(permissioned_space_notification_registrations)")
-        let serviceCol = columns.first { $0.column("name")?.string == "service_did" }
-        XCTAssertEqual(serviceCol?.column("notnull")?.integer, 1, "service_did must be NOT NULL after migration")
+        let serviceCol = columns.first { $0.column("name")?.string == "owner_service_did" }
+        XCTAssertEqual(serviceCol?.column("notnull")?.integer, 1, "owner_service_did must be NOT NULL after migration")
 
-        // Verify legacy NULL row was deleted and valid row preserved
-        let rows = try await reopened.connection.query("SELECT endpoint, service_did FROM permissioned_space_notification_registrations")
-        XCTAssertEqual(rows.count, 1)
-        XCTAssertEqual(rows.first?.column("endpoint")?.string, "https://valid.example/sink")
-        XCTAssertEqual(rows.first?.column("service_did")?.string, "did:web:valid.example")
+        // Verify zero survivors: all pre-fix rows must be deleted
+        let rows = try await reopened.connection.query("SELECT endpoint, owner_service_did FROM permissioned_space_notification_registrations")
+        XCTAssertEqual(rows.count, 0, "legacy rows must be discarded during migration")
     }
 
     func testSpaceDeleteAndRecreateRemovesWriterHighWaterAndAdmitsLiveNotificationAndRecovery() async throws {
@@ -1701,14 +1725,21 @@ private struct NotificationFixture {
         space: SpaceURI? = nil
     ) -> AuthorizedSpaceWriteNotification {
         let space = space ?? self.space
+        let commitment = Data(repeating: commitmentByte, count: 32)
         return AuthorizedSpaceWriteNotification(
             eventID: eventID,
             space: space,
             repository: writer,
             wireRevision: revision.toString(),
-            commitment: Data(repeating: commitmentByte, count: 32),
+            commitment: commitment,
             issuer: writer,
-            audience: authority
+            audience: authority,
+            requestBodyDigest: SpaceNotificationRequestDigest.write(
+                space: space,
+                repository: writer,
+                wireRevision: revision.toString(),
+                commitment: commitment
+            )
         )
     }
 

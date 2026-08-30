@@ -1107,7 +1107,13 @@ private struct NotificationRecoveryFixture {
                 wireRevision: "2222222222223",
                 commitment: Data(repeating: 0xA5, count: 32),
                 issuer: writer,
-                audience: authority
+                audience: authority,
+                requestBodyDigest: SpaceNotificationRequestDigest.write(
+                    space: space,
+                    repository: writer,
+                    wireRevision: "2222222222223",
+                    commitment: Data(repeating: 0xA5, count: 32)
+                )
             ),
             now: now
         )
@@ -1328,7 +1334,7 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
         issuer: String,
         audience: String,
         eventID: String,
-        requestBodyDigest _: String?
+        requestBodyDigest _: String
     ) async throws {
         deletionsValue.append(
             .init(space: space, issuer: issuer, audience: audience, eventID: eventID)

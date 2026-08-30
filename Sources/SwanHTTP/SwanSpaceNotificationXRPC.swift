@@ -324,7 +324,8 @@ private struct AuthenticatedNotifySpaceWriteHandler:
                     wireRevision: input.rev.toString(),
                     commitment: input.hash.data,
                     issuer: service.issuer,
-                    audience: service.audience
+                    audience: service.audience,
+                    requestBodyDigest: reqDigest
                 )
             )
         } catch {

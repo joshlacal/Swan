@@ -771,7 +771,7 @@ public actor SQLitePreMigratedAccountDirectory:
         issuer: String,
         audience: String,
         eventID: String,
-        requestBodyDigest: String?
+        requestBodyDigest: String
     ) async throws {
         guard let database = try await preopenedActiveDatabaseIfHosted(audience) else {
             return

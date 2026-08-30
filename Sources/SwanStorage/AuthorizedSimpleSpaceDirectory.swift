@@ -340,13 +340,17 @@ public struct AuthorizedSpaceNotificationRegistration: Sendable, Equatable {
     public let endpoint: String
     public let repository: String?
     public let expiresAt: Date
+    /// The authenticated subscriber identity derived from verified credentials.
+    public let ownerServiceDID: String
     /// The subscriber's service identifier (`did` or `did#fragment`) when the
     /// registration named one — the audience `notifyWrite` deliveries are
     /// addressed to, and the marker that the endpoint has DID-document
     /// provenance. `nil` for a legacy endpoint-only registration, which stays
     /// local discovery state and is never a dynamic delivery destination.
-    public let service: String?
-    public let serviceDID: String
+    public let deliveryServiceDID: String?
+
+    public var serviceDID: String { ownerServiceDID }
+    public var service: String? { deliveryServiceDID }
 
     public init(
         space: SpaceURI,
@@ -354,14 +358,16 @@ public struct AuthorizedSpaceNotificationRegistration: Sendable, Equatable {
         repository: String?,
         expiresAt: Date,
         service: String? = nil,
-        serviceDID: String? = nil
+        serviceDID: String? = nil,
+        ownerServiceDID: String? = nil,
+        deliveryServiceDID: String? = nil
     ) {
         self.space = space
         self.endpoint = endpoint
         self.repository = repository
         self.expiresAt = expiresAt
-        self.service = service
-        self.serviceDID = serviceDID ?? service ?? ""
+        self.ownerServiceDID = ownerServiceDID ?? serviceDID ?? service ?? ""
+        self.deliveryServiceDID = deliveryServiceDID ?? service
     }
 }
 
@@ -376,7 +382,7 @@ public struct AuthorizedSpaceWriteNotification: Sendable, Equatable {
     public let commitment: Data
     public let issuer: String
     public let audience: String
-    public let requestBodyDigest: String?
+    public let requestBodyDigest: String
 
     public init(
         eventID: String,
@@ -386,7 +392,7 @@ public struct AuthorizedSpaceWriteNotification: Sendable, Equatable {
         commitment: Data,
         issuer: String,
         audience: String,
-        requestBodyDigest: String? = nil
+        requestBodyDigest: String
     ) {
         self.eventID = eventID
         self.space = space
@@ -440,7 +446,7 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
         issuer: String,
         audience: String,
         eventID: String,
-        requestBodyDigest: String?
+        requestBodyDigest: String
     ) async throws
 }
 public extension AuthorizedSpaceNotificationDirectory {
@@ -457,15 +463,6 @@ public extension AuthorizedSpaceNotificationDirectory {
         authorization: AuthorizationContext
     ) async throws {
         try await unregisterSpaceNotification(space: space, serviceDID: service, authorization: authorization)
-    }
-
-    func receiveSpaceDeletionNotification(
-        space: SpaceURI,
-        issuer: String,
-        audience: String,
-        eventID: String
-    ) async throws {
-        try await receiveSpaceDeletionNotification(space: space, issuer: issuer, audience: audience, eventID: eventID, requestBodyDigest: nil)
     }
 }
 

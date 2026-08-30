@@ -52,7 +52,13 @@ final class PublicFirehoseIsolationTests: XCTestCase {
         wireRevision: revision.toString(),
         commitment: Data(repeating: 0xab, count: 32),
         issuer: writer,
-        audience: authority
+        audience: authority,
+        requestBodyDigest: SpaceNotificationRequestDigest.write(
+            space: space,
+            repository: writer,
+            wireRevision: revision.toString(),
+            commitment: Data(repeating: 0xab, count: 32)
+        )
       ),
       now: now
     )
