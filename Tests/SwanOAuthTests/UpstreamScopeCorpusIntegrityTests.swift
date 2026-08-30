@@ -667,21 +667,16 @@ final class UpstreamScopeCorpusIntegrityTests: XCTestCase, @unchecked Sendable {
 
         try FileManager.default.createSymbolicLink(at: didPkg.appending(path: "link.ts"), withDestinationURL: URL(fileURLWithPath: "/etc/passwd"))
 
-        let fakeBinDir = FileManager.default.temporaryDirectory.appending(path: "test-fake-git-\(UUID().uuidString)")
+        let fakeBinDir = FileManager.default.temporaryDirectory.appending(path: "test-fake-tools-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: fakeBinDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: fakeBinDir) }
 
         let fakeGitScript = """
         #!/usr/bin/env bash
-        if [ "$1" = "-C" ]; then
-            shift 2
-        fi
-        if [ "$1" = "status" ]; then
-            exit 0
-        fi
+        if [ "$1" = "-C" ]; then shift 2; fi
+        if [ "$1" = "status" ]; then exit 0; fi
         if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ]; then
-            echo "bddc99fb24c34b4078b9bf65837283f37b49ab66"
-            exit 0
+            echo "bddc99fb24c34b4078b9bf65837283f37b49ab66"; exit 0
         fi
         if [ "$1" = "archive" ]; then
             tar -cf - -C "$SWAN_UPSTREAM_ATPROTO" packages/did packages/syntax packages/lex/lex-document packages/oauth/oauth-scopes
@@ -689,17 +684,24 @@ final class UpstreamScopeCorpusIntegrityTests: XCTestCase, @unchecked Sendable {
         fi
         exec /usr/bin/git "$@"
         """
-        let fakeGitURL = fakeBinDir.appending(path: "git")
-        try fakeGitScript.write(to: fakeGitURL, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeGitURL.path)
+        let fakeNodeScript = """
+        #!/usr/bin/env bash
+        if [ "$1" = "-p" ]; then echo "22"; exit 0; fi
+        if [ "$1" = "-e" ]; then exit 0; fi
+        exit 0
+        """
+        for (name, contents) in [("git", fakeGitScript), ("node", fakeNodeScript), ("npm", "#!/usr/bin/env bash\nexit 0\n")] {
+            let url = fakeBinDir.appending(path: name)
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
         proc.arguments = [script.path]
         var env = ProcessInfo.processInfo.environment
         env["SWAN_UPSTREAM_ATPROTO"] = tempRepo.path
-        let originalPath = env["PATH"] ?? "/usr/bin:/bin"
-        env["PATH"] = "\(fakeBinDir.path):\(originalPath)"
+        env["PATH"] = "\(fakeBinDir.path):\(env["PATH"] ?? "/usr/bin:/bin")"
         proc.environment = env
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -714,45 +716,51 @@ final class UpstreamScopeCorpusIntegrityTests: XCTestCase, @unchecked Sendable {
     }
 
     func testBuildBrowserCSSRunsNpmCiWithIgnoreScriptsViaProcessExecution() throws {
-        let repoRoot = UpstreamScopeCorpus.generatorDirectoryURL
+        let sourceRoot = UpstreamScopeCorpus.generatorDirectoryURL
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let buildScript = repoRoot.appending(path: "Scripts/build-browser-css.sh")
+        let canonicalOutput = sourceRoot.appending(path: "Sources/SwanHTTP/SwanBrowserStyleSheet.swift")
+        let canonicalBytesBefore = try Data(contentsOf: canonicalOutput)
 
-        let tempDir = FileManager.default.temporaryDirectory.appending(path: "test-fake-build-css-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let tempRoot = FileManager.default.temporaryDirectory.appending(path: "test-fake-build-css-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempRoot.appending(path: "Scripts/browser-css-tooling"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: tempRoot.appending(path: "Sources/SwanHTTP"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
 
-        let fakeBinDir = tempDir.appending(path: "bin")
-        try FileManager.default.createDirectory(at: fakeBinDir, withIntermediateDirectories: true)
-        let logFile = tempDir.appending(path: "calls.log")
+        let script = tempRoot.appending(path: "Scripts/build-browser-css.sh")
+        try FileManager.default.copyItem(
+            at: sourceRoot.appending(path: "Scripts/build-browser-css.sh"),
+            to: script
+        )
+        for name in ["package.json", "package-lock.json"] {
+            try FileManager.default.copyItem(
+                at: sourceRoot.appending(path: "Scripts/browser-css-tooling/\(name)"),
+                to: tempRoot.appending(path: "Scripts/browser-css-tooling/\(name)")
+            )
+        }
+        for name in ["SwanBrowserPages.swift", "ScopeDescription.swift", "SwanBrowserStyleSheet.swift"] {
+            try FileManager.default.copyItem(
+                at: sourceRoot.appending(path: "Sources/SwanHTTP/\(name)"),
+                to: tempRoot.appending(path: "Sources/SwanHTTP/\(name)")
+            )
+        }
 
-        let fakeNpm = """
-        #!/usr/bin/env bash
-        echo "npm $@" >> "\(logFile.path)"
-        exit 0
-        """
-        let fakeNpx = """
-        #!/usr/bin/env bash
-        echo "npx $@" >> "\(logFile.path)"
-        echo "/* test css */" > out.css
-        exit 0
-        """
-
-        let fakeNpmURL = fakeBinDir.appending(path: "npm")
-        try fakeNpm.write(to: fakeNpmURL, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeNpmURL.path)
-
-        let fakeNpxURL = fakeBinDir.appending(path: "npx")
-        try fakeNpx.write(to: fakeNpxURL, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeNpxURL.path)
+        let tempBin = tempRoot.appending(path: "bin")
+        try FileManager.default.createDirectory(at: tempBin, withIntermediateDirectories: true)
+        let logFile = tempRoot.appending(path: "calls.log")
+        let fakeNpm = "#!/usr/bin/env bash\necho \"npm $@\" >> \"\(logFile.path)\"\nexit 0\n"
+        let fakeNpx = "#!/usr/bin/env bash\necho \"npx $@\" >> \"\(logFile.path)\"\necho '/* test css */' > out.css\nexit 0\n"
+        for (name, contents) in [("npm", fakeNpm), ("npx", fakeNpx)] {
+            let url = tempBin.appending(path: name)
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = [buildScript.path]
+        proc.arguments = [script.path]
         var env = ProcessInfo.processInfo.environment
-        let originalPath = env["PATH"] ?? "/usr/bin:/bin"
-        env["PATH"] = "\(fakeBinDir.path):\(originalPath)"
+        env["PATH"] = "\(tempBin.path):\(env["PATH"] ?? "/usr/bin:/bin")"
         proc.environment = env
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -765,7 +773,9 @@ final class UpstreamScopeCorpusIntegrityTests: XCTestCase, @unchecked Sendable {
         let logContent = (try? String(contentsOf: logFile, encoding: .utf8)) ?? ""
         XCTAssertTrue(logContent.contains("npm ci --ignore-scripts --no-audit --no-fund --silent"), "build-browser-css.sh must invoke npm ci --ignore-scripts: \(logContent)")
         XCTAssertFalse(logContent.contains("npm install"), "build-browser-css.sh must not invoke npm install: \(logContent)")
+        XCTAssertEqual(try Data(contentsOf: canonicalOutput), canonicalBytesBefore, "generator test must not modify tracked stylesheet")
     }
+
 
     func testRegenerationGateRunsNpmCiWithIgnoreScriptsViaProcessExecution() throws {
         let script = UpstreamScopeCorpus.generatorDirectoryURL
