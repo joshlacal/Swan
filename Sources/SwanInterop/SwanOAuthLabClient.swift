@@ -142,6 +142,7 @@ public actor SwanOAuthLabClient {
         additionalTrustRootFile: URL? = nil,
         executeHandler: InteropHTTPExecuteHandler? = nil
     ) throws {
+        try requireCredentialSafeTransport(issuer)
         self.issuer = issuer
         self.clientID = clientID
         self.redirectURI = redirectURI

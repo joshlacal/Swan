@@ -545,27 +545,13 @@ public struct InteropXRPCClient: Sendable {
         case .none:
             break
         case let .dpop(accessToken, proof):
-            try requireSecureTransportForCredentials()
+            try requireCredentialSafeTransport(http.baseURL)
             headers["Authorization"] = "DPoP " + accessToken
             headers["DPoP"] = proof
         case let .bearer(token), let .service(token):
-            try requireSecureTransportForCredentials()
+            try requireCredentialSafeTransport(http.baseURL)
             headers["Authorization"] = "Bearer " + token
         }
-    }
-
-    private func requireSecureTransportForCredentials() throws {
-        guard let scheme = http.baseURL.scheme?.lowercased() else {
-            throw InteropHTTPError.invalidURL
-        }
-        if scheme == "https" {
-            return
-        }
-        if scheme == "http", let host = http.baseURL.host?.lowercased(),
-           host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
-            return
-        }
-        throw InteropHTTPError.invalidURL
     }
 
     private func requireJSONSuccess(_ response: InteropHTTPResponse) throws {
@@ -576,6 +562,22 @@ public struct InteropXRPCClient: Sendable {
             throw InteropHTTPError.unexpectedContentType
         }
     }
+}
+
+/// Requires HTTPS or literal loopback (localhost, 127.0.0.1, ::1, [::1]) for
+/// endpoints carrying credentials.
+public func requireCredentialSafeTransport(_ url: URL) throws {
+    guard let scheme = url.scheme?.lowercased() else {
+        throw InteropHTTPError.invalidURL
+    }
+    if scheme == "https" {
+        return
+    }
+    if scheme == "http", let host = url.host?.lowercased(),
+       host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+        return
+    }
+    throw InteropHTTPError.invalidURL
 }
 
 public struct InteropFixtureEvent: Codable, Sendable, Equatable {

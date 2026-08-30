@@ -749,17 +749,19 @@ with open(output, "x", encoding="utf-8") as handle:
     handle.write("\n")
 PY
   run_lab \
+    --producer-account member \
+    --consumer-account member \
     live \
     --mode permissioned \
     --name forum-debug-lab-live \
     --producer-url https://swan.test \
     --consumer-url https://swan.test \
     --producer-auth oauth \
-    --producer-password-file /run/secrets/swan-bootstrap/authority.password \
+    --producer-password-file /run/secrets/swan-bootstrap/member.password \
     --producer-client-id "$scope_client_id" \
     --producer-redirect-uri http://127.0.0.1/callback \
     --consumer-auth oauth \
-    --consumer-password-file /run/secrets/swan-bootstrap/authority.password \
+    --consumer-password-file /run/secrets/swan-bootstrap/member.password \
     --consumer-client-id "$scope_client_id" \
     --consumer-redirect-uri http://127.0.0.1/callback \
     --scope atproto \

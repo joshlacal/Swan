@@ -847,6 +847,16 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         process.arguments = serveArgs
         var environment = ProcessInfo.processInfo.environment
         environment.removeValue(forKey: "SWAN_OAUTH_SERVER_KEY")
+        let readSignalURL = data.deletingLastPathComponent().appending(path: "notification-read-\(UUID().uuidString)")
+        let resumeSignalURL = data.deletingLastPathComponent().appending(path: "notification-resume-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: readSignalURL)
+            try? FileManager.default.removeItem(at: resumeSignalURL)
+        }
+        if replaceFile != nil {
+            environment["SWAN_TEST_NOTIFICATION_CONFIG_READ_SIGNAL_FILE"] = readSignalURL.path
+            environment["SWAN_TEST_NOTIFICATION_CONFIG_RESUME_SIGNAL_FILE"] = resumeSignalURL.path
+        }
         process.environment = environment
 
         let outputURL = data.deletingLastPathComponent()
@@ -865,13 +875,29 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         process.standardError = error
         try process.run()
         if let replaceFile, let replacementData {
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) {
-                let deadline = Date().addingTimeInterval(2)
-                while Date() < deadline && process.isRunning {
-                    try? replacementData.write(to: replaceFile, options: .atomic)
-                    usleep(1_000)
+            let readDeadline = Date().addingTimeInterval(5)
+            var readObserved = false
+            while Date() < readDeadline && process.isRunning {
+                if FileManager.default.fileExists(atPath: readSignalURL.path) {
+                    readObserved = true
+                    break
                 }
+                Thread.sleep(forTimeInterval: 0.01)
             }
+            guard readObserved else {
+                if process.isRunning {
+                    _ = kill(process.processIdentifier, SIGKILL)
+                    process.waitUntilExit()
+                }
+                return .init(
+                    started: false,
+                    output: "",
+                    error: "Serve failed to signal notification config read before timeout",
+                    survivedReplacement: false
+                )
+            }
+            try replacementData.write(to: replaceFile, options: .atomic)
+            try Data("resume\n".utf8).write(to: resumeSignalURL)
         }
 
         let deadline = Date().addingTimeInterval(10)

@@ -441,6 +441,42 @@ final class ForumLabCLITests: XCTestCase {
             "Should not fail with invalid redirect URL when redirect URI is provided: \(combinedWith)"
         )
     }
+    func testLabLiveRejectsInsecurePlaintextCredentialTransport() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let passwordFile = directory.appending(path: "authority.password")
+        try Data("secret\n".utf8).write(to: passwordFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: passwordFile.path)
+        let bodyFile = directory.appending(path: "debug-body.json")
+        try Data("{\"space\":\"\(spaceURI)\"}\n".utf8).write(to: bodyFile)
+
+        let result = try runCLI(
+            command: [
+                "live",
+                "--mode", "permissioned",
+                "--name", "insecure-lab-live",
+                "--producer-url", "http://example.com",
+                "--consumer-url", "https://swan.test",
+                "--producer-auth", "oauth",
+                "--producer-password-file", passwordFile.path,
+                "--producer-client-id", "http://localhost/client-id",
+                "--producer-redirect-uri", "http://127.0.0.1/callback",
+                "--consumer-auth", "none",
+                "--scope", "atproto",
+                "--space", spaceURI,
+                "--permissioned-read-host", "authority",
+                "--read-query", "space=\(spaceURI)", "repo=\(did)", "collection=blue.catbird.lab.post", "rkey=debug-0001",
+                "--body-file", bodyFile.path,
+                "--request-timeout-seconds", "0.2",
+            ],
+            environment: [
+                "SWAN_LAB_PRODUCER_HANDLE": "producer.example.com",
+                "SWAN_LAB_CONSUMER_HANDLE": "consumer.swan.test",
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+    }
+
 
     func testForumThreadAcceptsScriptArgumentSetWithoutAuthorityPasswordFile() async throws {
         let root = try temporaryDirectory()

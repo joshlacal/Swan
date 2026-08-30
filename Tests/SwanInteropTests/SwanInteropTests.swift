@@ -849,6 +849,20 @@ final class SwanInteropTests: XCTestCase {
             )
         )
     }
+    func testSwanOAuthLabClientRejectsInsecurePlaintextTransport() throws {
+        let clientID = URL(string: "http://localhost?scope=atproto&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback")!
+        let redirectURI = URL(string: "http://127.0.0.1/callback")!
+        XCTAssertThrowsError(
+            try SwanOAuthLabClient(
+                issuer: URL(string: "http://example.com")!,
+                clientID: clientID,
+                redirectURI: redirectURI
+            )
+        ) { error in
+            XCTAssertEqual(error as? InteropHTTPError, .invalidURL)
+        }
+    }
+
 
     func testOAuthLabQueryPathEscapesNestedClientMetadataURL() throws {
         let clientID = URL(string: "http://localhost?scope=atproto&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback")!

@@ -3512,6 +3512,17 @@ extension SwanCommand {
                 allowlistedMetadataIPLiterals: oauthMetadataAllowedIPs,
                 publicURL: baseURL
             )
+            #if DEBUG
+            if let signalPath = ProcessInfo.processInfo.environment["SWAN_TEST_NOTIFICATION_CONFIG_READ_SIGNAL_FILE"] {
+                try? Data("read\n".utf8).write(to: URL(fileURLWithPath: signalPath))
+                if let resumePath = ProcessInfo.processInfo.environment["SWAN_TEST_NOTIFICATION_CONFIG_RESUME_SIGNAL_FILE"] {
+                    let resumeURL = URL(fileURLWithPath: resumePath)
+                    while !FileManager.default.fileExists(atPath: resumeURL.path) {
+                        try await Task.sleep(nanoseconds: 10_000_000)
+                    }
+                }
+            }
+            #endif
             let dataURL = URL(fileURLWithPath: dataDirectory)
             // Legacy bearer credentials are the one serve surface whose
             // mounted secrets must be validated as a single authority before
@@ -8815,6 +8826,7 @@ extension SwanCommand {
                     )
                     return (host, nil)
                 }
+                try requireCredentialSafeTransport(url)
                 guard let passwordFile, !passwordFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw ValidationError("live OAuth password file is unavailable")
                 }
@@ -9335,6 +9347,7 @@ private enum LabLiveSupport {
                 permissionedCommitVerificationKey: permissionedCommitVerificationKey
             )
         case "bearer":
+            try requireCredentialSafeTransport(url)
             guard let tokenFile, !tokenFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw ValidationError("live bearer token file is unavailable")
             }
@@ -9349,6 +9362,7 @@ private enum LabLiveSupport {
                 permissionedCommitVerificationKey: permissionedCommitVerificationKey
             )
         case "oauth":
+            try requireCredentialSafeTransport(url)
             guard let passwordFile, !passwordFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw ValidationError("live OAuth password file is unavailable")
             }
