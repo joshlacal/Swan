@@ -1,7 +1,7 @@
+import Crypto
 import Foundation
 import SwanCore
 import SwanSpaces
-
 /// A caller-selected record mutation.  Unlike ``SpaceWrite``, this retains
 /// the XRPC operation's requested create/update semantics until the durable
 /// transaction has checked them against the authoritative SQLite state.
@@ -345,19 +345,24 @@ public struct AuthorizedSpaceNotificationRegistration: Sendable, Equatable {
     /// provenance. `nil` for a legacy endpoint-only registration, which stays
     /// local discovery state and is never a dynamic delivery destination.
     public let service: String?
+    /// The authenticated subscriber DID (the issuer of the registration
+    /// service auth factor) that owns this registration row.
+    public let serviceDID: String
 
     public init(
         space: SpaceURI,
         endpoint: String,
         repository: String?,
         expiresAt: Date,
-        service: String? = nil
+        service: String? = nil,
+        serviceDID: String? = nil
     ) {
         self.space = space
         self.endpoint = endpoint
         self.repository = repository
         self.expiresAt = expiresAt
         self.service = service
+        self.serviceDID = serviceDID ?? service ?? ""
     }
 }
 
@@ -372,6 +377,7 @@ public struct AuthorizedSpaceWriteNotification: Sendable, Equatable {
     public let commitment: Data
     public let issuer: String
     public let audience: String
+    public let requestBodyDigest: String
 
     public init(
         eventID: String,
@@ -380,7 +386,8 @@ public struct AuthorizedSpaceWriteNotification: Sendable, Equatable {
         wireRevision: String,
         commitment: Data,
         issuer: String,
-        audience: String
+        audience: String,
+        requestBodyDigest: String
     ) {
         self.eventID = eventID
         self.space = space
@@ -389,6 +396,7 @@ public struct AuthorizedSpaceWriteNotification: Sendable, Equatable {
         self.commitment = commitment
         self.issuer = issuer
         self.audience = audience
+        self.requestBodyDigest = requestBodyDigest
     }
 }
 
@@ -406,16 +414,17 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
 
     func registerSpaceNotification(
         _ registration: AuthorizedSpaceNotificationRegistration,
+        serviceDID: String,
         authorization: AuthorizationContext
     ) async throws
 
-    /// Withdraws a subscriber's registration by service identity
+    /// Withdraws a subscriber's registration by authenticated service identity
     /// (`com.atproto.space.unregisterNotify`). Idempotent: succeeds whether or
     /// not a matching registration existed. Implementations gate on a space
     /// credential for exactly this space and on the space still being active.
     func unregisterSpaceNotification(
         space: SpaceURI,
-        service: String,
+        serviceDID: String,
         authorization: AuthorizationContext
     ) async throws
 
@@ -435,8 +444,51 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
         space: SpaceURI,
         issuer: String,
         audience: String,
-        eventID: String
+        eventID: String,
+        requestBodyDigest: String
     ) async throws
+}
+
+/// Domain-separated, length-prefixed canonical SHA-256 request digests for
+/// service-authenticated space operations.
+public enum SpaceNotificationRequestDigest {
+    private static let writeDomain = "swan.space.notify-write.v1"
+    private static let deletionDomain = "swan.space.notify-deleted.v1"
+
+    public static func deletion(space: SpaceURI) -> String {
+        var hasher = SHA256()
+        appendLengthPrefixed(writeUTF8: deletionDomain, to: &hasher)
+        appendLengthPrefixed(writeUTF8: space.rawValue, to: &hasher)
+        return Data(hasher.finalize()).base64URLEncodedString()
+    }
+
+    public static func write(
+        space: SpaceURI,
+        repository: String,
+        wireRevision: String,
+        commitment: Data
+    ) -> String {
+        var hasher = SHA256()
+        appendLengthPrefixed(writeUTF8: writeDomain, to: &hasher)
+        appendLengthPrefixed(writeUTF8: space.rawValue, to: &hasher)
+        appendLengthPrefixed(writeUTF8: repository, to: &hasher)
+        appendLengthPrefixed(writeUTF8: wireRevision, to: &hasher)
+        appendLengthPrefixed(commitment, to: &hasher)
+        return Data(hasher.finalize()).base64URLEncodedString()
+    }
+
+    private static func appendLengthPrefixed(writeUTF8 string: String, to hasher: inout SHA256) {
+        let utf8 = string.utf8
+        var length = UInt64(utf8.count).bigEndian
+        withUnsafeBytes(of: &length) { hasher.update(bufferPointer: $0) }
+        hasher.update(data: Data(utf8))
+    }
+
+    private static func appendLengthPrefixed(_ data: Data, to hasher: inout SHA256) {
+        var length = UInt64(data.count).bigEndian
+        withUnsafeBytes(of: &length) { hasher.update(bufferPointer: $0) }
+        hasher.update(data: data)
+    }
 }
 
 /// A deliberately narrow lifecycle/membership projection for a simple-space

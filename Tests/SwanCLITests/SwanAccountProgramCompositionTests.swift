@@ -294,7 +294,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
             let app = fixture.server.buildApplication(
                 logger: Logger(label: "SwanAccountProgramCompositionTests.legacy")
             )
-            try await app.test(.router) { client in
+            try await app.test(.live) { client in
                 var steered = HTTPFields()
                 steered[.contentType] = "application/json"
                 steered[HTTPField.Name("atproto-proxy")!] = "did:web:attacker.example#svc"
@@ -342,7 +342,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
             let app = fixture.server.buildApplication(
                 logger: Logger(label: "SwanAccountProgramCompositionTests.refresh")
             )
-            try await app.test(.router) { client in
+            try await app.test(.live) { client in
                 // Establish a legacy session to obtain a real refresh JWT.
                 var refreshJwt: String?
                 try await client.execute(
@@ -469,10 +469,13 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 scopes: "atproto rpc:\(method)?aud=did:web:remote.example%23pds",
                 into: control
             )
+            let factorTokens = FactorTokenService(store: control)
             let accounts = DurableAccountDirectory(
                 store: control,
                 passwordHasher: passwordHasher,
-                verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher)
+                verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher),
+                loginFactorTokenVerifier: factorTokens,
+                authenticationFactors: control
             )
             let issuer = LocalAccountProxyServiceTokenIssuer(
                 accounts: accounts,
@@ -483,7 +486,6 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     store: control,
                     appPasswords: control,
                     accountControlStore: control,
-                    credentials: credentials,
                     serviceDID: "did:web:swan.example",
                     serverKey: Data(repeating: 0x3C, count: 32)
                 ),
@@ -508,7 +510,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 profile: profile,
                 configuration: .init(
                     host: "127.0.0.1",
-                    port: 3_000,
+                    port: 0,
                     publicURL: URL(string: "https://swan.example")!
                 ),
                 oauthRuntime: oauthRuntime,
@@ -520,7 +522,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
             let app = server.buildApplication(
                 logger: Logger(label: "SwanAccountProgramCompositionTests.service-auth")
             )
-            try await app.test(.router) { client in
+            try await app.test(.live) { client in
                 var accessJWT = ""
                 try await client.execute(
                     uri: "/xrpc/com.atproto.server.createSession",
@@ -885,7 +887,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
         installLegacy: Bool = false,
         installDidWeb: Bool = false,
         publicURL: URL = URL(string: "https://swan.example")!,
-        port: Int = 3000
+        port: Int = 0
     ) async throws -> CompositionFixture {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "SwanAccountProgramCompositionTests-\(UUID().uuidString)")
@@ -966,10 +968,13 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     )
                 ))
                 let credentials = try AppPasswordCredentials()
+                let factorTokens = FactorTokenService(store: control)
                 let accounts = DurableAccountDirectory(
                     store: control,
                     passwordHasher: passwordHasher,
-                    verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher)
+                    verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher),
+                    loginFactorTokenVerifier: factorTokens,
+                    authenticationFactors: control
                 )
                 legacySessionXRPC = SwanLegacySessionXRPCServer(
                     sessions: try DurableLegacySessionService(

@@ -1952,6 +1952,172 @@ final class SwanOAuthTests: XCTestCase {
         let nilPeerRequests = await nilPeerTransport.requestCount()
         XCTAssertEqual(nilPeerRequests, 1)
     }
+
+    func testDurableSpaceServiceAuthenticationVerifierValidatesAndBindsRequestBodyDigest() async throws {
+        let privateKey = P256.Signing.PrivateKey()
+        let publicKey = privateKey.publicKey
+        let issuer = "did:plc:writer-service"
+        let audience = "did:plc:authority-space"
+        let method = "com.atproto.space.notifyWrite"
+        let eventID = "evt-test-1234"
+        let space = try SpaceURI(authority: audience, spaceType: "app.bsky.bookmarks", skey: "default")
+        let repository = issuer
+        let wireRevision = "222222222222a"
+        let commitment = Data(repeating: 0x42, count: 32)
+        let digest = SpaceNotificationRequestDigest.write(
+            space: space,
+            repository: repository,
+            wireRevision: wireRevision,
+            commitment: commitment
+        )
+
+        let token = try SpaceServiceJWT.create(
+            issuer: issuer,
+            audience: audience,
+            method: method,
+            eventID: eventID,
+            requestBodyDigest: digest,
+            key: privateKey,
+            now: Date()
+        )
+
+        let resolver = PinnedSpaceServicePublicKeyResolver(
+            pins: [try PinnedSpaceServicePublicKey(issuer: issuer, publicKey: .p256(publicKey))]
+        )
+        let verifier = DurableSpaceServiceAuthenticationVerifier(publicKeys: resolver)
+
+        // 1. Exact digest succeeds and returns verified digest in result
+        let verified = try await verifier.authenticate(
+            token,
+            expectedAudience: audience,
+            expectedMethod: method,
+            expectedRequestBodyDigest: digest,
+            now: Date()
+        )
+        XCTAssertEqual(verified.issuer, issuer)
+        XCTAssertEqual(verified.audience, audience)
+        XCTAssertEqual(verified.method, method)
+        XCTAssertEqual(verified.eventID, eventID)
+        XCTAssertEqual(verified.requestBodyDigest, digest)
+
+        // 2. Mismatched space in digest fails
+        let otherSpace = try SpaceURI(authority: audience, spaceType: "app.bsky.bookmarks", skey: "other")
+        let badSpaceDigest = SpaceNotificationRequestDigest.write(
+            space: otherSpace,
+            repository: repository,
+            wireRevision: wireRevision,
+            commitment: commitment
+        )
+        do {
+            _ = try await verifier.authenticate(
+                token,
+                expectedAudience: audience,
+                expectedMethod: method,
+                expectedRequestBodyDigest: badSpaceDigest,
+                now: Date()
+            )
+            XCTFail("mismatched space digest must fail verification")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                XCTFail("expected unauthorized error, got \(error)")
+                return
+            }
+        }
+
+        // 3. Mismatched repository in digest fails
+        let badRepoDigest = SpaceNotificationRequestDigest.write(
+            space: space,
+            repository: "did:plc:other-repo",
+            wireRevision: wireRevision,
+            commitment: commitment
+        )
+        do {
+            _ = try await verifier.authenticate(
+                token,
+                expectedAudience: audience,
+                expectedMethod: method,
+                expectedRequestBodyDigest: badRepoDigest,
+                now: Date()
+            )
+            XCTFail("mismatched repository digest must fail verification")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                XCTFail("expected unauthorized error, got \(error)")
+                return
+            }
+        }
+
+        // 4. Mismatched revision in digest fails
+        let badRevDigest = SpaceNotificationRequestDigest.write(
+            space: space,
+            repository: repository,
+            wireRevision: "222222222222b",
+            commitment: commitment
+        )
+        do {
+            _ = try await verifier.authenticate(
+                token,
+                expectedAudience: audience,
+                expectedMethod: method,
+                expectedRequestBodyDigest: badRevDigest,
+                now: Date()
+            )
+            XCTFail("mismatched revision digest must fail verification")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                XCTFail("expected unauthorized error, got \(error)")
+                return
+            }
+        }
+
+        // 5. Mismatched commitment in digest fails
+        let badCommitmentDigest = SpaceNotificationRequestDigest.write(
+            space: space,
+            repository: repository,
+            wireRevision: wireRevision,
+            commitment: Data(repeating: 0x99, count: 32)
+        )
+        do {
+            _ = try await verifier.authenticate(
+                token,
+                expectedAudience: audience,
+                expectedMethod: method,
+                expectedRequestBodyDigest: badCommitmentDigest,
+                now: Date()
+            )
+            XCTFail("mismatched commitment digest must fail verification")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                XCTFail("expected unauthorized error, got \(error)")
+                return
+            }
+        }
+
+        // 6. Token without req fails when expected digest is provided
+        let unboundToken = try SpaceServiceJWT.create(
+            issuer: issuer,
+            audience: audience,
+            method: method,
+            eventID: eventID,
+            key: privateKey,
+            now: Date()
+        )
+        do {
+            _ = try await verifier.authenticate(
+                unboundToken,
+                expectedAudience: audience,
+                expectedMethod: method,
+                expectedRequestBodyDigest: digest,
+                now: Date()
+            )
+            XCTFail("token without req claim must fail when expected digest is required")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                XCTFail("expected unauthorized error, got \(error)")
+                return
+            }
+        }
+    }
 }
 
 private func publicOAuthSession(

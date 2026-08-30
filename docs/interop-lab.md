@@ -18,12 +18,13 @@ To run an offline semantic test:
 swift run swan lab semantic --output /tmp/swan-semantic.json
 ```
 
-To run a live host-to-host test (tokens are read from environment variables):
+To run a live host-to-host test (tokens are read from owner-only mounted files):
 
 ```sh
 swift run swan lab live --mode public --body-file ./fixtures/public-put.json \
   --repository did:plc:... --collection app.bsky.feed.post --rkey fixture-1 \
-  --producer-auth bearer --consumer-auth bearer \
+  --producer-auth bearer --producer-token-file /run/secrets/swan/producer.token \
+  --consumer-auth bearer --consumer-token-file /run/secrets/swan/consumer.token \
   --output /tmp/swan-live-public.json
 ```
 
@@ -57,7 +58,7 @@ By default, the read host is `authority`. Pass `--permissioned-read-host member`
 
 Pass `--provision-space` to configure a disposable authority and member setup when testing against the Compose Swan host.
 
-Use `--producer-auth oauth` for Swan account OAuth; handle and password credentials are read from environment variables, and fresh DPoP proofs are minted per request. The alternative `--producer-auth bearer` mode reads static token values from environment variables and is intended for pinned reference hosts.
+Use `--producer-auth oauth` for Swan account OAuth; the non-secret handle and URL values are read from environment variables, while the OAuth password is read from `--producer-password-file`. The alternative `--producer-auth bearer` mode reads its static token from `--producer-token-file` and is intended for pinned reference hosts.
 
 The output artifact records only HTTP statuses, CIDs, response digests, and sanitized endpoint events. Request bodies, record values, credentials, and cryptographic proofs are never written to the artifact.
 

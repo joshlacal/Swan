@@ -478,39 +478,45 @@ final class AccountLoginHardeningTests: XCTestCase {
 
         for attempt in 0 ..< policy.attempts {
             let decision = await service.admit(
-                peer: "203.0.113.5",
-                now: start.addingTimeInterval(Double(attempt))
-            )
-            XCTAssertEqual(decision, .allowed, "attempt \(attempt)")
-        }
-        let exhausted = await service.admit(peer: "203.0.113.5", now: start)
-        XCTAssertEqual(exhausted, .rateLimited)
-
-        let other = await service.admit(peer: "198.51.100.6", now: start)
-        XCTAssertEqual(
-            other,
-            .allowed,
-            "one peer's budget must not deny every other client"
+    func testOAuthPeerAdmissionEnforcesAggregateGlobalBudgetAcrossDistinctPeers() async throws {
+        let policy = try OAuthPeerAdmissionPolicy(
+            attempts: 2,
+            globalAttempts: 6,
+            window: 10
         )
-    }
-
-    /// A request whose client address cannot be established is neither
-    /// admitted nor rejected: it is charged to one shared bounded bucket, so
-    /// a missing forwarding header degrades the control to a single global
-    /// budget instead of removing it or taking OAuth offline.
-    func testUnresolvedClientAddressesShareOneBoundedBucket() async throws {
-        let policy = try OAuthPeerAdmissionPolicy(attempts: 2, window: 10)
         let service = OAuthPeerAdmissionService(policy: policy)
         let start = Date(timeIntervalSince1970: 1_800_000_000)
-
-        let firstUnresolved = await service.admit(peer: nil, now: start)
+        for i in 1 ... 5 {
+            XCTAssertEqual(
+                await service.admit(peer: "203.0.113.\(i)", now: start.addingTimeInterval(-9)),
+                .allowed
+            )
+        }
         XCTAssertEqual(
-            firstUnresolved,
-            .allowed,
-            "an absent client address must not take OAuth offline"
+            await service.admit(peer: "203.0.113.6", now: start.addingTimeInterval(-1)),
+            .allowed
         )
-        // A value that is not a plausible address literal collapses into the
-        // same bucket rather than minting attacker-chosen bucket cardinality.
+        XCTAssertEqual(
+            await service.admit(peer: "203.0.113.6", now: start),
+            .rateLimited
+        )
+        XCTAssertEqual(
+            await service.admit(peer: "203.0.113.6", now: start.addingTimeInterval(1)),
+            .allowed,
+            "global refusal must not consume peer 6's existing bucket"
+        )
+        XCTAssertEqual(
+            await service.admit(peer: "203.0.113.6", now: start.addingTimeInterval(2)),
+            .rateLimited
+        )
+    }
+            .allowed
+        )
+        XCTAssertEqual(
+            await service.admit(peer: "203.0.113.6", now: start.addingTimeInterval(2)),
+            .rateLimited
+        )
+    }
         let malformed = await service.admit(
             peer: "not an address, with spaces",
             now: start.addingTimeInterval(1)

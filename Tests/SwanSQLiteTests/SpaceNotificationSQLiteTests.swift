@@ -1182,6 +1182,215 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         )
         XCTAssertFalse(isOtherSpace, "registration for different space must return false")
     }
+
+    func testSpaceNotificationOwnershipMigrationClearsLegacyRowsAndRebuildsTable() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanOwnershipMigrationTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let did = "did:plc:alice"
+        let spaceURI = "at://\(did)/app.bsky.bookmarks/notifications"
+        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        defer { Task { try? await database.close() } }
+
+        // Drop current table and create pre-fix legacy table structure (nullable service_did, no service_identity)
+        _ = try await database.connection.query("DROP TABLE IF EXISTS permissioned_space_notification_registrations")
+        _ = try await database.connection.query(
+            """
+            CREATE TABLE permissioned_space_notification_registrations (
+                space_uri TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                repo_did TEXT,
+                expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+                updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+                service_did TEXT,
+                PRIMARY KEY(space_uri, endpoint),
+                CHECK(length(endpoint) > 0)
+            )
+            """
+        )
+
+        // Seed 1: pre-fix row with NULL service_did
+        _ = try await database.connection.query(
+            """
+            INSERT INTO permissioned_space_notification_registrations (
+                space_uri, endpoint, repo_did, expires_at, updated_at, service_did
+            ) VALUES (?, ?, ?, ?, ?, NULL)
+            """,
+            [.text(spaceURI), .text("https://legacy.example/sink"), .null, .integer(2_000_000_000), .integer(1_000_000)]
+        )
+
+        // Seed 2: pre-fix row with unauthenticated wire service_did
+        _ = try await database.connection.query(
+            """
+            INSERT INTO permissioned_space_notification_registrations (
+                space_uri, endpoint, repo_did, expires_at, updated_at, service_did
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [.text(spaceURI), .text("https://valid.example/sink"), .null, .integer(2_000_000_000), .integer(1_000_000), .text("did:web:valid.example")]
+        )
+
+        // Reset migration version to force migrateSpaceNotificationOwnershipIfNeeded to run
+        _ = try await database.connection.query(
+            "DELETE FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(23)]
+        )
+
+        // Close and reopen database to trigger migration
+        try await database.close()
+        let migratedDB = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        defer { Task { try? await migratedDB.close() } }
+
+        // Assert schema is rebuilt with service_did NOT NULL and service_identity column
+        let columns = try await migratedDB.connection.query(
+            "PRAGMA table_info(permissioned_space_notification_registrations)"
+        )
+        let serviceCol = columns.first { $0.column("name")?.string == "service_did" }
+        XCTAssertEqual(serviceCol?.column("notnull")?.integer, 1, "service_did must be NOT NULL after migration")
+        let hasServiceIdentity = columns.contains { $0.column("name")?.string == "service_identity" }
+        XCTAssertTrue(hasServiceIdentity, "service_identity column must exist after migration")
+
+        // Assert zero survivors: both pre-fix rows must be deleted
+        let rows = try await migratedDB.connection.query(
+            "SELECT space_uri, endpoint, service_did FROM permissioned_space_notification_registrations"
+        )
+        XCTAssertEqual(rows.count, 0, "all pre-fix rows must be discarded during ownership migration")
+    }
+
+    func testForeignRegistrationOverwriteIsForbidden() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+
+        let endpoint = "https://notify.example/sink"
+        let credential = fixture.readCredential()
+        let now = Date()
+
+        // Service A registers endpoint
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpoint,
+                repository: nil,
+                expiresAt: now.addingTimeInterval(3600),
+                service: "did:web:service-a#notify",
+                serviceDID: "did:web:service-a"
+            ),
+            serviceDID: "did:web:service-a",
+            authorization: credential,
+            now: now
+        )
+
+        // Service B attempts to overwrite same endpoint -> forbidden
+        do {
+            try await database.registerSpaceNotification(
+                .init(
+                    space: fixture.space,
+                    endpoint: endpoint,
+                    repository: nil,
+                    expiresAt: now.addingTimeInterval(3600),
+                    service: "did:web:service-b#notify",
+                    serviceDID: "did:web:service-b"
+                ),
+                serviceDID: "did:web:service-b",
+                authorization: credential,
+                now: now
+            )
+            XCTFail("foreign registration overwrite must fail")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                XCTFail("expected unauthorized error, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testForeignRegistrationDeleteIsForbidden() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+
+        let endpoint = "https://notify.example/sink"
+        let credential = fixture.readCredential()
+        let now = Date()
+
+        // Service A registers endpoint
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpoint,
+                repository: nil,
+                expiresAt: now.addingTimeInterval(3600),
+                service: "did:web:service-a#notify",
+                serviceDID: "did:web:service-a"
+            ),
+            serviceDID: "did:web:service-a",
+            authorization: credential,
+            now: now
+        )
+
+        // Service B attempts to unregister -> does not delete Service A's registration
+        try await database.unregisterSpaceNotification(
+            space: fixture.space,
+            serviceDID: "did:web:service-b",
+            authorization: credential
+        )
+
+        let active = try await database.isSpaceNotificationRegistrationActive(
+            space: fixture.space,
+            endpoint: endpoint,
+            repository: nil,
+            now: now
+        )
+        XCTAssertTrue(active, "Service A registration must remain active after foreign unregister attempt")
+    }
+
+    func testEndpointOnlyRegistrationDoesNotEnqueueDynamicFanoutAndReturnsNilService() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+
+        let endpoint = "https://legacy-endpoint.example/sink"
+        let credential = fixture.readCredential()
+        let now = Date()
+
+        // Register endpoint-only (service is nil, serviceDID is authenticated owner)
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpoint,
+                repository: fixture.writer,
+                expiresAt: now.addingTimeInterval(3600),
+                service: nil,
+                serviceDID: fixture.reader
+            ),
+            serviceDID: fixture.reader,
+            authorization: credential,
+            now: now
+        )
+
+        // spaceNotificationRegistrationService must return nil for endpoint-only row
+        let svc = try await database.spaceNotificationRegistrationService(
+            space: fixture.space,
+            endpoint: endpoint,
+            repository: fixture.writer,
+            now: now
+        )
+        XCTAssertNil(svc, "endpoint-only registration must return nil service identity")
+
+        // Receive write notification -> verify no dynamic fanout row is enqueued
+        let notification = fixture.writeNotification(
+            eventID: "write-event-legacy-check",
+            revision: try fixture.tid(1),
+            commitmentByte: 1
+        )
+        try await database.receiveSpaceWriteNotification(notification, now: now)
+
+        let pendingFanouts = try await database.pendingNotificationFanout()
+        XCTAssertTrue(pendingFanouts.isEmpty, "endpoint-only registration must never enqueue dynamic fanout")
+    }
 }
 
 private struct NotificationFixture {

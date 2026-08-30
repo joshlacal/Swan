@@ -15,19 +15,22 @@ public struct VerifiedSpaceServiceAuthentication: Sendable, Equatable {
     public let method: String
     public let eventID: String
     public let expiresAt: Date
+    public let requestBodyDigest: String?
 
     public init(
         issuer: String,
         audience: String,
         method: String,
         eventID: String,
-        expiresAt: Date
+        expiresAt: Date,
+        requestBodyDigest: String? = nil
     ) {
         self.issuer = issuer
         self.audience = audience
         self.method = method
         self.eventID = eventID
         self.expiresAt = expiresAt
+        self.requestBodyDigest = requestBodyDigest
     }
 }
 
@@ -47,6 +50,7 @@ public protocol SpaceServiceAuthenticationVerifier: Sendable {
         _ compact: String,
         expectedAudience: String?,
         expectedMethod: String,
+        expectedRequestBodyDigest: String?,
         now: Date
     ) async throws -> VerifiedSpaceServiceAuthentication
 }
@@ -60,6 +64,7 @@ public protocol SpaceServiceAuthenticationIssuer: Sendable {
         audience: String,
         method: String,
         eventID: String,
+        requestBodyDigest: String?,
         now: Date
     ) async throws -> String
 }
@@ -249,6 +254,7 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
         _ compact: String,
         expectedAudience: String?,
         expectedMethod: String,
+        expectedRequestBodyDigest: String? = nil,
         now: Date = Date()
     ) async throws -> VerifiedSpaceServiceAuthentication {
         let inspected = try SpaceServiceJWT.inspect(compact)
@@ -264,6 +270,9 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
         let claims = try SpaceServiceJWT.verify(
             compact,
             publicKey: key,
+            expectedAudience: expectedAudience,
+            expectedMethod: expectedMethod,
+            expectedRequestBodyDigest: expectedRequestBodyDigest,
             now: now,
             clockSkew: configuration.clockSkew,
             maximumLifetime: configuration.maximumLifetime
@@ -280,7 +289,8 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
             audience: claims.aud,
             method: expectedMethod,
             eventID: eventID,
-            expiresAt: Date(timeIntervalSince1970: TimeInterval(claims.exp))
+            expiresAt: Date(timeIntervalSince1970: TimeInterval(claims.exp)),
+            requestBodyDigest: claims.requestBodyDigest
         )
     }
 }
@@ -302,6 +312,7 @@ public struct LocalAccountSpaceServiceAuthenticationIssuer: SpaceServiceAuthenti
         audience: String,
         method: String,
         eventID: String,
+        requestBodyDigest: String? = nil,
         now: Date = Date()
     ) async throws -> String {
         let issuer = try AccountIdentifiers.validateDID(issuer)
@@ -330,8 +341,42 @@ public struct LocalAccountSpaceServiceAuthenticationIssuer: SpaceServiceAuthenti
             audience: audience,
             method: method,
             eventID: eventID,
+            requestBodyDigest: requestBodyDigest,
             key: key,
             now: now
+        )
+    }
+
+    public func issue(
+        issuer: String,
+        audience: String,
+        method: String,
+        eventID: String,
+        now: Date
+    ) async throws -> String {
+        try await issue(
+            issuer: issuer,
+            audience: audience,
+            method: method,
+            eventID: eventID,
+            requestBodyDigest: nil,
+            now: now
+        )
+    }
+
+    public func issue(
+        issuer: String,
+        audience: String,
+        method: String,
+        eventID: String
+    ) async throws -> String {
+        try await issue(
+            issuer: issuer,
+            audience: audience,
+            method: method,
+            eventID: eventID,
+            requestBodyDigest: nil,
+            now: Date()
         )
     }
 }

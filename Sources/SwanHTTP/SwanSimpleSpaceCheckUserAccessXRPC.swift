@@ -53,6 +53,7 @@ private struct SimpleSpaceCheckUserAccessHandler:
                 compact,
                 expectedAudience: capability.managingServiceAudience,
                 expectedMethod: ComAtprotoSimplespaceCheckUserAccess.typeIdentifier,
+                expectedRequestBodyDigest: nil,
                 now: Date()
             )
         } catch let error as SwanError {

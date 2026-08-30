@@ -54,6 +54,8 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
     private enum SemanticAuthorization: Sendable {
         case oauth
         case credential
+        case registerNotify
+        case unregisterNotify
         case delegation
         case notifyWrite
         case notifyDeleted
@@ -206,8 +208,8 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.space.listRepoOps", method: .get, uri: "/xrpc/com.atproto.space.listRepoOps?space=\(encodedSpace)&repo=\(localDID)&excludeValues=true", body: nil, authorization: .oauth, invariant: .jsonArray("ops", minimumCount: 1)),
                 .init(nsid: "com.atproto.space.getRepo", method: .get, uri: "/xrpc/com.atproto.space.getRepo?space=\(encodedSpace)&repo=\(localDID)", body: nil, authorization: .oauth, invariant: .car),
                 .init(nsid: "com.atproto.space.getBlob", method: .get, uri: "/xrpc/com.atproto.space.getBlob?space=\(encodedSpace)&repo=\(localDID)&cid=\(blobCID)", body: nil, authorization: .oauth, invariant: .blob(blobPayload)),
-                .init(nsid: "com.atproto.space.registerNotify", method: .post, uri: "/xrpc/com.atproto.space.registerNotify", body: "{\"space\":\"\(space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}", authorization: .credential, invariant: .jsonNonEmptyString("expiresAt")),
-                .init(nsid: "com.atproto.space.unregisterNotify", method: .post, uri: "/xrpc/com.atproto.space.unregisterNotify", body: "{\"space\":\"\(space.rawValue)\",\"service\":\"did:web:receiver.example#notify\"}", authorization: .credential, invariant: .emptyBody),
+                .init(nsid: "com.atproto.space.registerNotify", method: .post, uri: "/xrpc/com.atproto.space.registerNotify", body: "{\"space\":\"\(space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}", authorization: .registerNotify, invariant: .jsonNonEmptyString("expiresAt")),
+                .init(nsid: "com.atproto.space.unregisterNotify", method: .post, uri: "/xrpc/com.atproto.space.unregisterNotify", body: "{\"space\":\"\(space.rawValue)\",\"service\":\"\(localDID)\"}", authorization: .unregisterNotify, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.notifyWrite", method: .post, uri: "/xrpc/com.atproto.space.notifyWrite", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"rev\":\"222222222222z\",\"hash\":{\"$bytes\":\"\(Data(repeating: 0x31, count: 32).base64EncodedString())\"}}", authorization: .notifyWrite, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.listRepos", method: .get, uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)", body: nil, authorization: .credential, invariant: .jsonArrayContains("repos", field: "did", value: localDID)),
                 .init(nsid: "com.atproto.simplespace.checkUserAccess", method: .get, uri: "/xrpc/com.atproto.simplespace.checkUserAccess?space=\(encodedSpace)&user=\(remoteDID)", body: nil, authorization: .checkUserAccess, invariant: .jsonBoolean("authorized", false)),
@@ -255,6 +257,9 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                         headers: headers,
                         body: testCase.body.map(ByteBuffer.init(string:))
                     ) { response in
+                        if response.status != .ok {
+                            print(">>> FAILED NSID \(testCase.nsid) status=\(response.status) body=\(String(decoding: response.body.readableBytesView, as: UTF8.self))")
+                        }
                         XCTAssertEqual(response.status, .ok, testCase.nsid)
                         try self.assertSemanticInvariant(
                             testCase.invariant,
@@ -1046,6 +1051,26 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
         case .credential:
             headers = [.authorization: "Bearer \(credential)"]
+        case .registerNotify:
+            headers = [.authorization: "Bearer \(credential)"]
+            let serviceJWT = try SpaceServiceJWT.create(
+                issuer: localDID,
+                audience: space.authority,
+                method: ComAtprotoSpaceRegisterNotify.typeIdentifier,
+                eventID: jti,
+                key: fixture.localKey
+            )
+            headers[HTTPField.Name("atproto-service-auth")!] = "Bearer \(serviceJWT)"
+        case .unregisterNotify:
+            headers = [.authorization: "Bearer \(credential)"]
+            let serviceJWT = try SpaceServiceJWT.create(
+                issuer: localDID,
+                audience: space.authority,
+                method: ComAtprotoSpaceUnregisterNotify.typeIdentifier,
+                eventID: jti,
+                key: fixture.localKey
+            )
+            headers[HTTPField.Name("atproto-service-auth")!] = "Bearer \(serviceJWT)"
         case .delegation:
             let delegation = try PermissionedDataJWT.createDelegationToken(
                 issuer: space.authority,
@@ -1055,20 +1080,30 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             headers = [.authorization: "Bearer \(delegation)"]
         case .notifyWrite:
+            let reqDigest = SpaceNotificationRequestDigest.write(
+                space: space,
+                repository: localDID,
+                wireRevision: "222222222222z",
+                commitment: Data(repeating: 0x31, count: 32)
+            )
             let notifyWrite = try SpaceServiceJWT.create(
-                issuer: space.authority,
-                audience: localDID,
+                issuer: localDID,
+                audience: space.authority,
                 method: ComAtprotoSpaceNotifyWrite.typeIdentifier,
                 eventID: jti,
+                requestBodyDigest: reqDigest,
                 key: fixture.localKey
             )
             headers = [.authorization: "Bearer \(notifyWrite)"]
         case .notifyDeleted:
+            let lifecycleSpace = try XCTUnwrap(fixture.lifecycleSpace)
+            let reqDigest = SpaceNotificationRequestDigest.deletion(space: lifecycleSpace)
             let notifyDeleted = try SpaceServiceJWT.create(
-                issuer: space.authority,
+                issuer: lifecycleSpace.authority,
                 audience: recipientService,
                 method: ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier,
                 eventID: jti,
+                requestBodyDigest: reqDigest,
                 key: fixture.localKey
             )
             headers = [.authorization: "Bearer \(notifyDeleted)"]

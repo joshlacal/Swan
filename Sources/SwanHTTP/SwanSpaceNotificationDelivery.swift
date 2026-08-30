@@ -157,11 +157,18 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
             destination.endpoint,
             method: ComAtprotoSpaceNotifyWrite.typeIdentifier
         )
+        let reqDigest = SpaceNotificationRequestDigest.write(
+            space: announcement.space,
+            repository: announcement.repository,
+            wireRevision: announcement.wireRevision,
+            commitment: announcement.commitment
+        )
         let token = try await serviceAuthentication.issue(
             issuer: notification.author,
             audience: destination.audience,
             method: ComAtprotoSpaceNotifyWrite.typeIdentifier,
             eventID: notification.id.uuidString,
+            requestBodyDigest: reqDigest,
             now: Date()
         )
         do {
@@ -275,12 +282,30 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
             method = ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
             body = try deletionJSON(space: notification.space)
         }
+        let reqDigest: String
+        switch notification.kind {
+        case .write:
+            guard let repository = notification.repository,
+                  let wireRevision = notification.wireRevision,
+                  let commitment = notification.commitment else {
+                throw SwanError.malformed("write fanout row is incomplete")
+            }
+            reqDigest = SpaceNotificationRequestDigest.write(
+                space: notification.space,
+                repository: repository,
+                wireRevision: wireRevision,
+                commitment: commitment
+            )
+        case .deleted:
+            reqDigest = SpaceNotificationRequestDigest.deletion(space: notification.space)
+        }
         let endpoint = try notificationEndpoint(destination.endpoint, method: method)
         let token = try await serviceAuthentication.issue(
             issuer: notification.space.authority,
             audience: destination.audience,
             method: method,
             eventID: notification.id.uuidString,
+            requestBodyDigest: reqDigest,
             now: Date()
         )
         do {

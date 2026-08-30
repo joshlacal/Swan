@@ -8088,6 +8088,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
               notification.commitment.count == 32 else {
             throw SwanError.unauthorized("invalid write notification")
         }
+        let expectedDigest = SpaceNotificationRequestDigest.write(
+            space: notification.space,
+            repository: notification.repository,
+            wireRevision: notification.wireRevision,
+            commitment: notification.commitment
+        )
+        guard notification.requestBodyDigest == expectedDigest else {
+            throw SwanError.unauthorized("write notification request body digest mismatch")
+        }
         let eventID = try validServiceEventID(notification.eventID)
         let timestamp = try simpleSpaceTimestamp(now)
         try requireAuthorityAccount(space: notification.space)
@@ -8095,21 +8104,33 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await transaction {
                 let state = try await requiredSimpleSpace(notification.space)
                 try requireActiveSimpleSpace(state.state)
-                guard state.state.space.members.contains(notification.repository) else {
-                    throw SwanError.unauthorized("writer is not a space member")
+                switch state.state.space.policy {
+                case .memberList:
+                    guard state.state.space.members.contains(notification.repository) else {
+                        throw SwanError.unauthorized("writer is not a space member")
+                    }
+                case .public, .managingApp:
+                    break
                 }
 
-                let receipt = try await connection.query(
+                let receiptRows = try await connection.query(
                     """
-                    SELECT 1 FROM permissioned_space_notification_receipts
-                    WHERE issuer = ? AND event_id = ? AND space_uri = ?
+                    SELECT space_uri, request_digest FROM permissioned_space_notification_receipts
+                    WHERE issuer = ? AND event_id = ?
                     """,
                     [
                         .text(notification.issuer), .text(eventID),
-                        .text(notification.space.rawValue),
                     ]
                 )
-                guard receipt.isEmpty else { return }
+                if let receiptRow = receiptRows.first {
+                    let receiptSpace = try requiredText(receiptRow, "space_uri")
+                    let receiptDigest = try requiredText(receiptRow, "request_digest")
+                    guard receiptSpace == notification.space.rawValue,
+                          receiptDigest == notification.requestBodyDigest else {
+                        throw SwanError.unauthorized("service notification replay conflict")
+                    }
+                    return
+                }
 
                 let existing = try await connection.query(
                     """
@@ -8136,31 +8157,18 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     }
                 }
 
-                // The durable writer row is the replay-safe monotonic state.
-                // Do not retain a unique receipt for every reordered stale
-                // event; it cannot affect the state after this point.
                 guard advancesWriter else { return }
 
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_notification_receipts(
-                        issuer, event_id, space_uri, received_at
-                    ) VALUES (?, ?, ?, ?)
+                        issuer, event_id, space_uri, request_digest, received_at
+                    ) VALUES (?, ?, ?, ?, ?)
                     """,
                     [
                         .text(notification.issuer), .text(eventID),
-                        .text(notification.space.rawValue), .integer(timestamp),
-                    ]
-                )
-                _ = try await connection.query(
-                    """
-                    DELETE FROM permissioned_space_notification_receipts
-                    WHERE issuer = ? AND space_uri = ? AND event_id != ?
-                    """,
-                    [
-                        .text(notification.issuer),
-                        .text(notification.space.rawValue),
-                        .text(eventID),
+                        .text(notification.space.rawValue), .text(notification.requestBodyDigest),
+                        .integer(timestamp),
                     ]
                 )
 
@@ -8181,16 +8189,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     ]
                 )
 
-                // Erratum 03: fan the accepted member write out to the
-                // space's SERVICE-NAMED subscribers, authority-signed —
-                // the reference contract (`notify.rs::enqueue_writes`,
-                // `iss = space authority`, `aud = subscriber service`). The
-                // old refusal reasoned from the pinned TypeScript PDS
-                // receiver (`iss == repo`), but a registered subscriber is a
-                // service that named itself in a DID document, not a PDS;
-                // its verifier checks the audience it registered. Legacy
-                // endpoint-only rows still get nothing: with no service
-                // identity there is no audience a receiver could verify.
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_notification_fanout(
@@ -8209,7 +8207,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         SELECT hex(randomblob(16)) AS h, endpoint
                         FROM permissioned_space_notification_registrations
                         WHERE space_uri = ?
-                          AND service_did IS NOT NULL
+                          AND service_identity IS NOT NULL
                           AND expires_at > ?
                           AND (repo_did IS NULL OR repo_did = ?)
                     )
@@ -8232,38 +8230,26 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    /// Records a verified deletion only on the selected local recipient
-    /// account. This alpha intentionally does not invent a remote-space row:
-    /// the tombstone is an isolated receipt used to reject later fanout state,
-    /// not a substitute for remote operation application.
     public func receiveSpaceDeletionNotification(
         space: SpaceURI,
         issuer: String,
         audience: String,
         eventID: String,
+        requestBodyDigest: String,
         now: Date = Date()
     ) async throws {
         guard issuer == space.authority, audience == accountDID,
               isValidSimpleSpaceDID(issuer) else {
             throw SwanError.unauthorized("invalid space deletion notification")
         }
+        let expectedDigest = SpaceNotificationRequestDigest.deletion(space: space)
+        guard requestBodyDigest == expectedDigest else {
+            throw SwanError.unauthorized("space deletion request body digest mismatch")
+        }
         let eventID = try validServiceEventID(eventID)
         let timestamp = try simpleSpaceTimestamp(now)
         try await withConnectionGate {
             try await transaction {
-                // The deletion service JWT names no space: it carries only
-                // `iss`, `aud`, `lxm`, `jti` and time claims, and the verifier
-                // keeps no replay cache by design. The route can therefore
-                // only require that the body space's authority equals the
-                // issuer, so one valid token would otherwise mint a permanent
-                // tombstone — and a permanent receipt, since receipt identity
-                // includes `space_uri` — for every SpaceURI under that
-                // authority. The pinned receiver bounds this by no-oping
-                // unless the recipient already knows the space
-                // (`packages/pds/src/api/com/atproto/space/notifySpaceDeleted.ts:33-34`).
-                // Participation here is the same pair of facts the hosted
-                // space projection reports: an authority row this account
-                // owns, or a local repository row it authored.
                 let participation = try await connection.query(
                     """
                     SELECT 1
@@ -8289,49 +8275,32 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     """,
                     [.text(space.rawValue)]
                 )
-                // A tombstone is terminal. Future event IDs are no-ops and
-                // must not create an unbounded replay-receipt stream.
                 guard tombstones.isEmpty else { return }
-                let duplicate = try await connection.query(
+                let receiptRows = try await connection.query(
                     """
-                    SELECT 1
+                    SELECT space_uri, request_digest
                     FROM permissioned_space_notification_receipts
-                    WHERE issuer = ? AND event_id = ? AND space_uri = ?
+                    WHERE issuer = ? AND event_id = ?
                     """,
                     [
-                        .text(issuer), .text(eventID), .text(space.rawValue),
+                        .text(issuer), .text(eventID),
                     ]
                 )
-                guard duplicate.isEmpty else { return }
-                _ = try await connection.query(
-                    """
-                    DELETE FROM permissioned_space_notification_receipts
-                    WHERE issuer = ? AND space_uri = ?
-                    """,
-                    [.text(issuer), .text(space.rawValue)]
-                )
-                _ = try await connection.query(
-                    """
-                    INSERT INTO permissioned_space_notification_receipts(
-                        issuer, event_id, space_uri, received_at
-                    ) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(issuer, event_id, space_uri) DO NOTHING
-                    """,
-                    [.text(issuer), .text(eventID), .text(space.rawValue), .integer(timestamp)]
-                )
-                // A recipient may retain a local repository for its own
-                // writes in this remote space. Persist a closure rather than
-                // creating a synthetic remote authority row or applying any
-                // remote operation. All local repository read/write entry
-                // points consult this tombstone, and stale writer outbox rows
-                // are removed in the same transaction so a later restart
-                // cannot announce a deleted repository.
+                if let receiptRow = receiptRows.first {
+                    let receiptSpace = try requiredText(receiptRow, "space_uri")
+                    let receiptDigest = try requiredText(receiptRow, "request_digest")
+                    guard receiptSpace == space.rawValue,
+                          receiptDigest == requestBodyDigest else {
+                        throw SwanError.unauthorized("service notification replay conflict")
+                    }
+                    return
+                }
+
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_recipient_tombstones(
-                        space_uri, authority_did, deletion_event_id, closed_at
+                        space_uri, issuer, event_id, received_at
                     ) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(space_uri) DO NOTHING
                     """,
                     [
                         .text(space.rawValue), .text(issuer), .text(eventID),
@@ -8339,7 +8308,32 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     ]
                 )
                 _ = try await connection.query(
-                    "DELETE FROM permissioned_space_outbox WHERE space_uri = ?",
+                    """
+                    INSERT INTO permissioned_space_notification_receipts(
+                        issuer, event_id, space_uri, request_digest, received_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        .text(issuer), .text(eventID), .text(space.rawValue),
+                        .text(requestBodyDigest), .integer(timestamp),
+                    ]
+                )
+                _ = try await connection.query(
+                    """
+                    UPDATE permissioned_space_notification_fanout
+                    SET lease_token = NULL,
+                        lease_expires_at = NULL,
+                        available_at = 9223372036854775807
+                    WHERE space_uri = ?
+                    """,
+                    [.text(space.rawValue)]
+                )
+                _ = try await connection.query(
+                    """
+                    UPDATE permissioned_repository_state
+                    SET is_open = 0
+                    WHERE space_uri = ?
+                    """,
                     [.text(space.rawValue)]
                 )
             }

@@ -8,3 +8,25 @@ import Crypto
 extension SymmetricKey: @unchecked Sendable {}
 extension P256.Signing.PrivateKey: @unchecked Sendable {}
 extension P256.Signing.PublicKey: @unchecked Sendable {}
+
+import Foundation
+
+public extension Data {
+    func base64URLEncodedString() -> String {
+        base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    init?(base64URLEncoded value: String) {
+        var text = value
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = text.count % 4
+        if remainder > 0 {
+            text += String(repeating: "=", count: 4 - remainder)
+        }
+        self.init(base64Encoded: text)
+    }
+}

@@ -3,6 +3,12 @@ import SwanSQLite
 import SwanStorage
 import XCTest
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 final class ForumLabCLITests: XCTestCase {
     private let did = "did:plc:abcdefghijklmnopqrstuvwx"
 

@@ -3,8 +3,9 @@ import Foundation
 import PetrelCrypto
 import SwanCore
 import SwanOAuth
+import SwanSpaces
+import SwanStorage
 import XCTest
-
 final class TypeScriptSpaceNotificationContractTests: XCTestCase {
     func testPinnedTypeScriptES256KNotifyWriteGoldenAndDirectWriterContract() async throws {
         let fixture = try loadFixture()
@@ -14,6 +15,7 @@ final class TypeScriptSpaceNotificationContractTests: XCTestCase {
         XCTAssertEqual(inspection.claims.aud, fixture.audience)
         XCTAssertEqual(inspection.claims.lxm, fixture.method)
         XCTAssertEqual(inspection.claims.jti, fixture.eventID)
+        XCTAssertNil(inspection.claims.requestBodyDigest, "pinned reference token is unbound (no req claim)")
 
         let publicKey = try XCTUnwrap(Data(base64URLEncoded: fixture.publicKey))
         let verifier = DurableSpaceServiceAuthenticationVerifier(
@@ -21,26 +23,57 @@ final class TypeScriptSpaceNotificationContractTests: XCTestCase {
                 try .init(issuer: fixture.issuer, generation: 1, secp256k1PublicKey: publicKey),
             ])
         )
-        let verified = try await verifier.authenticate(
+
+        let space = try SpaceURI(authority: fixture.audience, spaceType: "app.bsky.bookmarks", skey: "default")
+        let expectedDigest = SpaceNotificationRequestDigest.write(
+            space: space,
+            repository: fixture.issuer,
+            wireRevision: "222222222222a",
+            commitment: Data(repeating: 0x42, count: 32)
+        )
+
+        // The pinned reference-PDS notifyWrite token carries no req claim.
+        // When the route requires a bound requestBodyDigest, authentication must be rejected.
+        do {
+            _ = try await verifier.authenticate(
+                fixture.token,
+                expectedAudience: fixture.audience,
+                expectedMethod: fixture.method,
+                expectedRequestBodyDigest: expectedDigest,
+                now: Date(timeIntervalSince1970: 1_750_000_010)
+            )
+            XCTFail("pinned unbound token must be rejected when expectedRequestBodyDigest is required")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                XCTFail("expected unauthorized error for unbound token, got \(error)")
+                return
+            }
+        }
+
+        // When authenticated without expected digest (e.g. non-bound route), the reference token still verifies signatures.
+        let verifiedUnbound = try await verifier.authenticate(
             fixture.token,
             expectedAudience: fixture.audience,
             expectedMethod: fixture.method,
+            expectedRequestBodyDigest: nil,
             now: Date(timeIntervalSince1970: 1_750_000_010)
         )
-        XCTAssertEqual(verified.issuer, fixture.issuer)
-        XCTAssertEqual(verified.audience, fixture.audience)
-        XCTAssertEqual(verified.eventID, fixture.eventID)
+        XCTAssertEqual(verifiedUnbound.issuer, fixture.issuer)
+        XCTAssertEqual(verifiedUnbound.audience, fixture.audience)
+        XCTAssertEqual(verifiedUnbound.eventID, fixture.eventID)
+        XCTAssertNil(verifiedUnbound.requestBodyDigest)
 
         // This is the shape Swan emits to a pinned TypeScript authority: the
         // local writer is issuer, the configured authority service identity is
-        // audience, and `lxm` binds the XRPC method. It is intentionally not
-        // an authority-signed recipient fanout.
+        // audience, `lxm` binds the XRPC method, and `req` binds the canonical digest.
+        let localKey = P256.Signing.PrivateKey()
         let swanToken = try SpaceServiceJWT.create(
             issuer: fixture.issuer,
             audience: fixture.audience,
             method: fixture.method,
             eventID: "swan-direct-writer-contract",
-            key: P256.Signing.PrivateKey(),
+            requestBodyDigest: expectedDigest,
+            key: localKey,
             now: Date(timeIntervalSince1970: 1_750_000_000)
         )
         let swanInspection = try SpaceServiceJWT.inspect(swanToken)
@@ -49,7 +82,23 @@ final class TypeScriptSpaceNotificationContractTests: XCTestCase {
         XCTAssertEqual(swanInspection.claims.aud, fixture.audience)
         XCTAssertEqual(swanInspection.claims.lxm, fixture.method)
         XCTAssertEqual(swanInspection.claims.jti, "swan-direct-writer-contract")
+        XCTAssertEqual(swanInspection.claims.requestBodyDigest, expectedDigest)
 
+        let swanVerifier = DurableSpaceServiceAuthenticationVerifier(
+            publicKeys: try PinnedSpaceServicePublicKeyResolver(pins: [
+                try .init(issuer: fixture.issuer, generation: 1, publicKey: localKey.publicKey),
+            ])
+        )
+        let swanVerified = try await swanVerifier.authenticate(
+            swanToken,
+            expectedAudience: fixture.audience,
+            expectedMethod: fixture.method,
+            expectedRequestBodyDigest: expectedDigest,
+            now: Date(timeIntervalSince1970: 1_750_000_010)
+        )
+        XCTAssertEqual(swanVerified.issuer, fixture.issuer)
+        XCTAssertEqual(swanVerified.audience, fixture.audience)
+        XCTAssertEqual(swanVerified.requestBodyDigest, expectedDigest)
         // The checked-in fixture records the three source-level requirements
         // from the pinned handler. If the ignored source cache is present (as
         // it is in interop CI), also pin that evidence to the exact source.
