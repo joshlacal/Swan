@@ -2080,6 +2080,7 @@ struct SQLiteTestingHooks: Sendable {
     var beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)?
     var afterBlobReclaimCommit: (@Sendable () async throws -> Void)?
     var permissionedBlobPublicReachabilityOverride: (@Sendable (String) -> Bool?)?
+    var publicBlobDeletionReachabilityOverride: (@Sendable (String) -> Bool?)?
     var afterPublicRepositoryMutatingSQL: (@Sendable (Int) async throws -> Void)?
     var afterRemoteReplicaMutatingSQL: (@Sendable (Int) async throws -> Void)?
     var beforePermanentDeletionClose: (@Sendable () async throws -> Void)?
@@ -2099,8 +2100,9 @@ struct SQLiteTestingHooks: Sendable {
         beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)? = nil,
         afterBlobReclaimCommit: (@Sendable () async throws -> Void)? = nil,
         permissionedBlobPublicReachabilityOverride: (@Sendable (String) -> Bool?)? = nil,
-        afterPublicRepositoryMutatingSQL: (@Sendable (Int) async throws -> Void)? = nil,
+        publicBlobDeletionReachabilityOverride: (@Sendable (String) -> Bool?)? = nil,
         afterRemoteReplicaMutatingSQL: (@Sendable (Int) async throws -> Void)? = nil,
+        afterPublicRepositoryMutatingSQL: (@Sendable (Int) async throws -> Void)? = nil,
         beforePermanentDeletionClose: (@Sendable () async throws -> Void)? = nil,
         beforeWireOplogValueMaterialization: (@Sendable () async throws -> Void)? = nil,
         afterSimpleSpaceMemberPageAuthorityRead: (@Sendable () async -> Void)? = nil,
@@ -2119,6 +2121,8 @@ struct SQLiteTestingHooks: Sendable {
         self.afterBlobReclaimCommit = afterBlobReclaimCommit
         self.permissionedBlobPublicReachabilityOverride =
             permissionedBlobPublicReachabilityOverride
+        self.publicBlobDeletionReachabilityOverride =
+            publicBlobDeletionReachabilityOverride
         self.afterPublicRepositoryMutatingSQL = afterPublicRepositoryMutatingSQL
         self.afterRemoteReplicaMutatingSQL = afterRemoteReplicaMutatingSQL
         self.beforePermanentDeletionClose = beforePermanentDeletionClose
@@ -2165,6 +2169,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let spaceNotificationReceiptMigrationVersion = 7
     private static let permissionedRemoteReplicaResultBindingMigrationVersion = 8
     private static let spaceNotificationReceiptCompactionMigrationVersion = 9
+    private static let permissionedSpaceWriterForeignKeyMigrationVersion = 14
     private static let spaceNotificationOwnershipMigrationVersion = 13
     private static let accountBlobQuotaMigrationVersion = 10
     private static let permissionedRemoteReplicaIncrementalSequenceMigrationVersion = 11
@@ -2660,6 +2665,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             for statement in SQLiteLayout.spaceNotificationSchemaStatements {
                 _ = try await connection.query(statement)
             }
+            try await migratePermissionedSpaceWriterForeignKeyIfNeeded()
         }
         try await migrateSpaceNotificationReceiptScopeIfNeeded()
         try await compactSpaceNotificationReceiptsIfNeeded()
@@ -2669,6 +2675,44 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         if let state = try? await loadPublicRepositoryStateWithoutGate() {
             _ = try? await garbageCollectPublicRepositoryBlocksWithoutGate(state: state)
         }
+    }
+    private func migratePermissionedSpaceWriterForeignKeyIfNeeded() async throws {
+        let version = Self.permissionedSpaceWriterForeignKeyMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+        // CREATE TABLE IF NOT EXISTS cannot change an existing foreign key.
+        // Rebuild the tiny registry while retaining every high-water row.
+        _ = try await connection.query(
+            "ALTER TABLE permissioned_space_writers RENAME TO permissioned_space_writers_v13"
+        )
+        _ = try await connection.query(
+            """
+            CREATE TABLE permissioned_space_writers (
+                space_uri TEXT NOT NULL,
+                repo_did TEXT NOT NULL,
+                wire_revision TEXT NOT NULL,
+                commitment BLOB NOT NULL CHECK(length(commitment) = 32),
+                updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+                PRIMARY KEY(space_uri, repo_did)
+            )
+            """
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_space_writers
+                (space_uri, repo_did, wire_revision, commitment, updated_at)
+            SELECT space_uri, repo_did, wire_revision, commitment, updated_at
+            FROM permissioned_space_writers_v13
+            """
+        )
+        _ = try await connection.query("DROP TABLE permissioned_space_writers_v13")
+        _ = try await connection.query(
+            "INSERT INTO permissioned_repository_migrations(version) VALUES (?)",
+            [.integer(version)]
+        )
     }
     /// The first notification schema keyed receipts only by issuer and JTI.
     /// A service JTI is consumed in the context of one space, so retaining that
@@ -3336,13 +3380,19 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
             [.integer(version)]
         )
-        guard applied.isEmpty else { return }
-
         try await addAccountColumnIfMissing(
             table: "public_repository_mutation_requests",
             column: "created_at",
             definition: "INTEGER NOT NULL DEFAULT 0 CHECK(created_at >= 0)"
         )
+        _ = try await connection.query(
+            """
+            CREATE INDEX IF NOT EXISTS public_repository_mutation_requests_retention
+            ON public_repository_mutation_requests(status, created_at, request_id)
+            """
+        )
+        guard applied.isEmpty else { return }
+
         _ = try await connection.query(
             """
             INSERT INTO permissioned_repository_migrations(version, applied_at)
@@ -4573,7 +4623,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
         return try await withConnectionGate {
             try await transaction {
-            try await requireLocalRepositorySpaceOpen(space)
             let duplicate = try await connection.query(
                 "SELECT 1 FROM permissioned_space_requests WHERE request_id = ?",
                 [.text(requestID.uuidString)]
@@ -4622,6 +4671,25 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             var simulatedRecordCount = currentRecordCount
             var simulatedTotalBytes = currentTotalBytes
             var touchedRecordLengths: [SpaceRecordURI: Int?] = [:]
+            var simulatedMetadataBytes = 0
+            let metadataRows = try await connection.query(
+                """
+                SELECT collection, rkey, cid FROM permissioned_space_records
+                WHERE space_uri = ? AND author_did = ?
+                """,
+                [.text(space.rawValue), .text(author)]
+            )
+            for row in metadataRows {
+                guard let collection = row.column("collection")?.string,
+                      let rkey = row.column("rkey")?.string,
+                      let cid = row.column("cid")?.string else {
+                    throw SQLiteRepositoryError.corruptDatabase("invalid permissioned record metadata")
+                }
+                simulatedMetadataBytes += 2 * "\(collection)/\(rkey)".utf8.count
+                    + cid.utf8.count + 64
+            }
+            let currentMetadataBytes = simulatedMetadataBytes
+            var touchedRecordMetadata: [SpaceRecordURI: Int?] = [:]
 
             for write in writes {
                 let uri = write.uri
@@ -4632,7 +4700,24 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     let oldRecord = try await loadRecord(uri)
                     currentLength = oldRecord?.value.count
                     touchedRecordLengths[uri] = currentLength
+                    let oldMetadata = try await connection.query(
+                        "SELECT cid FROM permissioned_space_records WHERE space_uri = ? AND author_did = ? AND collection = ? AND rkey = ?",
+                        [.text(space.rawValue), .text(author), .text(uri.collection), .text(uri.rkey)]
+                    )
+                    touchedRecordMetadata[uri] = oldMetadata.first?.column("cid")?.string.map {
+                        2 * "\(uri.collection)/\(uri.rkey)".utf8.count + $0.utf8.count + 64
+                    }
                 }
+                let newMetadata: Int? = switch write {
+                case let .create(_, _, cid), let .put(_, _, cid), let .update(_, _, cid):
+                    2 * "\(uri.collection)/\(uri.rkey)".utf8.count
+                        + cid.utf8.count + 64
+                case .delete:
+                    nil
+                }
+                simulatedMetadataBytes += (newMetadata ?? 0)
+                    - (touchedRecordMetadata[uri].flatMap { $0 } ?? 0)
+                touchedRecordMetadata[uri] = newMetadata
                 switch write {
                 case let .create(_, value, _):
                     if currentLength == nil {
@@ -4681,6 +4766,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 }
             } else {
                 guard simulatedTotalBytes <= maxBytes else {
+                    throw SpaceCARProductionLimits.limitExceeded()
+                }
+            }
+            let metadataOverLimit = simulatedMetadataBytes > SpaceCARProductionLimits.maximumLogicalMetadataBytes
+            let metadataWasOverLimit = currentMetadataBytes > SpaceCARProductionLimits.maximumLogicalMetadataBytes
+            if metadataWasOverLimit {
+                guard simulatedMetadataBytes < currentMetadataBytes else {
+                    throw SpaceCARProductionLimits.limitExceeded()
+                }
+            } else {
+                guard !metadataOverLimit else {
                     throw SpaceCARProductionLimits.limitExceeded()
                 }
             }
@@ -8046,6 +8142,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         .text(space.rawValue),
                     ]
                 )
+                _ = try await connection.query(
+                    "DELETE FROM permissioned_space_writers WHERE space_uri = ?",
+                    [.text(space.rawValue)]
+                )
                 // The lifecycle tombstone and every registered-recipient
                 // notification intent commit together.  Delivery happens
                 // later through the lease worker; endpoint strings stay
@@ -9120,11 +9220,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 try await transaction {
                     if reference.namespace == .public {
                         let isStillReachable: Bool
-                        if let override = testingHooks.permissionedBlobPublicReachabilityOverride?(reference.cid) {
+                        if let override = testingHooks.publicBlobDeletionReachabilityOverride?(reference.cid) {
                             isStillReachable = override
                         } else {
                             do {
-                                isStillReachable = try await publicRepositoryContainsBlobCIDWithoutGate(reference.cid)
+                                isStillReachable = try await publicRepositoryContainsBlobCIDWithoutGate(
+                                    reference.cid
+                                )
                             } catch {
                                 isStillReachable = true
                             }

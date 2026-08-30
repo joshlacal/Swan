@@ -655,9 +655,10 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 guard marked.count == 1 else {
                     throw PublicRepositoryMutationStoreError.reservationMismatch
                 }
-                try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
-                try await garbageCollectPublicRepositoryBlocksInTransaction(state: prepared.state)
-
+                try await garbageCollectPublicRepositoryBlocksInTransaction(
+                    state: prepared.state,
+                    reductionOnly: prepared.recordResults.allSatisfy { $0.action == .delete }
+                )
                 // The stored event kind is final: the source transaction owns
                 // the commit-versus-sync decision and the sequencer must never
                 // reinterpret a persisted row.
@@ -1447,18 +1448,18 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 guard !pruned.isEmpty else { break }
             }
         }
-        // 2. Prune terminal receipts beyond 100,000 rows in 1,000-row batches
+        // A bounded indexed probe avoids a full COUNT(*) on every reservation.
+        // Only enter the deletion loop when a 100,001st terminal row exists.
         while true {
-            let countRows = try await connection.query(
+            let overLimit = try await connection.query(
                 """
-                SELECT COUNT(*) AS count FROM public_repository_mutation_requests
+                SELECT request_id FROM public_repository_mutation_requests
                 WHERE status IN ('committed', 'abandoned')
+                ORDER BY created_at ASC, request_id ASC
+                LIMIT 1 OFFSET 100000
                 """
             )
-            guard let count = countRows.first?.column("count")?.integer,
-                  count > maxTerminalRows else { break }
-            let excess = count - maxTerminalRows
-            let batchLimit = min(excess, 1000)
+            guard !overLimit.isEmpty else { break }
             let pruned = try await connection.query(
                 """
                 DELETE FROM public_repository_mutation_requests
@@ -1466,11 +1467,10 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                     SELECT request_id FROM public_repository_mutation_requests
                     WHERE status IN ('committed', 'abandoned')
                     ORDER BY created_at ASC, request_id ASC
-                    LIMIT ?
+                    LIMIT 1000
                 )
                 RETURNING request_id
-                """,
-                [.integer(batchLimit)]
+                """
             )
             guard !pruned.isEmpty else { break }
         }

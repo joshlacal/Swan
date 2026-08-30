@@ -140,13 +140,19 @@ extension SQLiteAccountDatabase {
       try await transaction {
         let existing = try await connection.query(
           """
-          SELECT id, source_key, kind, lifecycle_generation, payload, car_bytes,
-                 attempts, created_at, available_at, lease_token, lease_expires_at
+          SELECT id, source_key, kind, lifecycle_generation, completed,
+                 payload, car_bytes, attempts, created_at, available_at,
+                 lease_token, lease_expires_at
           FROM public_event_outbox WHERE source_key = ?
           """,
           [.text(sourceKey)]
         )
         if let row = existing.first {
+          // Completed rows intentionally have NULL payload/CAR bytes. They
+          // remain an idempotency tombstone and must never be decoded.
+          if row.column("completed")?.integer == 1 {
+            return false
+          }
           let stored = try decodeFirehoseOutboxRow(row)
           guard stored.sourceKey == sourceKey, stored.kind == .sync else {
             throw SQLiteRepositoryError.corruptDatabase(

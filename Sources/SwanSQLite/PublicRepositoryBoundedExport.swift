@@ -258,7 +258,8 @@ extension SQLiteAccountDatabase {
 
     /// Reclaims unreachable blocks when quota pressure triggers it or on database open.
     func garbageCollectPublicRepositoryBlocksInTransaction(
-        state: PublicRepositoryState
+        state: PublicRepositoryState,
+        reductionOnly: Bool = false
     ) async throws {
         let quota = publicRepositoryBlockQuota
         let countAndBytes = try await measurePublicRepositoryBlocksInTransaction()
@@ -290,10 +291,16 @@ extension SQLiteAccountDatabase {
             try? await resetPublicExportTables()
             throw error
         }
-
         let remeasured = try await measurePublicRepositoryBlocksInTransaction()
         if remeasured.count > quota.maximumTotalBlocks || remeasured.bytes > quota.maximumTotalBytes {
-            throw PublicRepositoryMutationStoreError.blockQuotaExceeded
+            let reducedExceededDimension =
+                (!((countAndBytes.count > quota.maximumTotalBlocks))
+                  || remeasured.count < countAndBytes.count)
+                && (!((countAndBytes.bytes > quota.maximumTotalBytes))
+                  || remeasured.bytes < countAndBytes.bytes)
+            if !(reductionOnly && reducedExceededDimension) {
+                throw PublicRepositoryMutationStoreError.blockQuotaExceeded
+            }
         }
     }
 
