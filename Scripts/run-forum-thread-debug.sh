@@ -178,11 +178,9 @@ docker run --rm \
   -ec '
     umask 077
     SWAN_LAB_AUTHORITY_HANDLE="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/authority.handle)"
-    SWAN_LAB_AUTHORITY_PASSWORD="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/authority.password)"
     SWAN_LAB_CONSUMER_HANDLE="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/member.handle)"
-    SWAN_LAB_CONSUMER_PASSWORD="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/member.password)"
-    export SWAN_LAB_AUTHORITY_HANDLE SWAN_LAB_AUTHORITY_PASSWORD
-    export SWAN_LAB_CONSUMER_HANDLE SWAN_LAB_CONSUMER_PASSWORD
+    export SWAN_LAB_AUTHORITY_HANDLE
+    export SWAN_LAB_CONSUMER_HANDLE
     exec /usr/local/bin/swan lab forum thread \
       --consumer-url https://swan.test \
       --authority-url https://swan.test \
@@ -190,6 +188,8 @@ docker run --rm \
       --receiver-did "$2" \
       --data-directory /var/lib/swan/data \
       --consumer-auth oauth \
+      --consumer-password-file /run/secrets/swan-bootstrap/member.password \
+      --authority-password-file /run/secrets/swan-bootstrap/authority.password \
       --consumer-client-id "$3" \
       --consumer-redirect-uri http://127.0.0.1/callback \
       --plc-origin http://reference-plc:2582 \

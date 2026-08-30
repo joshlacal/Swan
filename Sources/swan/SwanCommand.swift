@@ -1098,98 +1098,16 @@ private func decodeBase64URLOAuthServerKey(_ value: Data) throws -> Data {
     return key
 }
 
-private func readOAuthServerKeyFile(_ url: URL) throws -> Data {
-    let descriptor: Int32 = url.withUnsafeFileSystemRepresentation { path in
-        guard let path else { return Int32(-1) }
-        return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
-    }
-    guard descriptor >= 0 else { throw ValidationError("oauth-server-key file is unavailable") }
-    defer { _ = close(descriptor) }
-
-    var metadata = stat()
-    guard fstat(descriptor, &metadata) == 0,
-          (metadata.st_mode & S_IFMT) == S_IFREG,
-          metadata.st_uid == geteuid(),
-          (metadata.st_mode & (S_IRWXG | S_IRWXO)) == 0,
-          metadata.st_size > 0,
-          metadata.st_size <= off_t(256) else {
-        throw ValidationError("oauth-server-key file is unavailable")
-    }
-
-    do {
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
-        let raw = try handle.read(upToCount: 259) ?? Data()
-        guard raw.count <= 258 else {
-            throw ValidationError("oauth-server-key file is invalid")
-        }
-        return try decodeBase64URLOAuthServerKey(raw)
-    } catch let error as ValidationError {
-        throw error
-    } catch {
-        throw ValidationError("oauth-server-key is unavailable")
-    }
-}
-private func readOwnerOnlySecretFile(
-    _ url: URL,
-    maximumBytes: Int = 4 * 1_024,
-    validationMessage: String
-) throws -> String {
-    let descriptor: Int32 = url.withUnsafeFileSystemRepresentation { path in
-        guard let path else { return Int32(-1) }
-        return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
-    }
-    guard descriptor >= 0 else { throw ValidationError(validationMessage) }
-    defer { _ = close(descriptor) }
-
-    var metadata = stat()
-    guard fstat(descriptor, &metadata) == 0,
-          (metadata.st_mode & S_IFMT) == S_IFREG,
-          metadata.st_uid == geteuid(),
-          (metadata.st_mode & (S_IRWXG | S_IRWXO)) == 0,
-          metadata.st_size > 0,
-          metadata.st_size <= off_t(maximumBytes + 2) else {
-        throw ValidationError(validationMessage)
-    }
-
-    do {
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
-        let data = try handle.read(upToCount: maximumBytes + 3) ?? Data()
-        guard data.count <= maximumBytes + 2 else {
-            throw ValidationError(validationMessage)
-        }
-        var normalized = data
-        if normalized.last == 0x0A {
-            normalized.removeLast()
-            if normalized.last == 0x0D {
-                normalized.removeLast()
-            }
-        }
-        guard !normalized.isEmpty,
-              !normalized.contains(0),
-              let string = String(data: normalized, encoding: .utf8) else {
-            throw ValidationError(validationMessage)
-        }
-        return string
-    } catch let error as ValidationError {
-        throw error
-    } catch {
-        throw ValidationError(validationMessage)
-    }
-}
-
-
-/// Opens and validates one pathname exactly once, then performs the bounded
-/// read through that descriptor. `O_NOFOLLOW` prevents a symlink swap from
-/// turning the preflight check into authority to read a different file.
 private func readBoundedRegularFileNoFollow(
     _ url: URL,
     maximumBytes: Int,
+    requireOwnerOnly: Bool = false,
     validationMessage: String
 ) throws -> Data {
     guard maximumBytes > 0 else { throw ValidationError(validationMessage) }
     let descriptor = url.withUnsafeFileSystemRepresentation { path in
         guard let path else { return Int32(-1) }
-        return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
     }
     guard descriptor >= 0 else { throw ValidationError(validationMessage) }
     defer { _ = close(descriptor) }
@@ -1197,9 +1115,15 @@ private func readBoundedRegularFileNoFollow(
     var metadata = stat()
     guard fstat(descriptor, &metadata) == 0,
           (metadata.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+          (!requireOwnerOnly || (metadata.st_uid == geteuid() && (metadata.st_mode & (S_IRWXG | S_IRWXO)) == 0)),
           metadata.st_size > 0,
           metadata.st_size <= off_t(maximumBytes) else {
         throw ValidationError(validationMessage)
+    }
+
+    let flags = fcntl(descriptor, F_GETFL)
+    if flags >= 0 {
+        _ = fcntl(descriptor, F_SETFL, flags & ~O_NONBLOCK)
     }
 
     var data = Data()
@@ -1226,6 +1150,42 @@ private func readBoundedRegularFileNoFollow(
         throw ValidationError(validationMessage)
     }
     return data
+}
+
+private func readOAuthServerKeyFile(_ url: URL) throws -> Data {
+    let raw = try readBoundedRegularFileNoFollow(
+        url,
+        maximumBytes: 258,
+        requireOwnerOnly: true,
+        validationMessage: "oauth-server-key file is unavailable"
+    )
+    return try decodeBase64URLOAuthServerKey(raw)
+}
+
+private func readOwnerOnlySecretFile(
+    _ url: URL,
+    maximumBytes: Int = 4 * 1_024,
+    validationMessage: String
+) throws -> String {
+    let data = try readBoundedRegularFileNoFollow(
+        url,
+        maximumBytes: maximumBytes + 2,
+        requireOwnerOnly: true,
+        validationMessage: validationMessage
+    )
+    var normalized = data
+    if normalized.last == 0x0A {
+        normalized.removeLast()
+        if normalized.last == 0x0D {
+            normalized.removeLast()
+        }
+    }
+    guard !normalized.isEmpty,
+          !normalized.contains(0),
+          let string = String(data: normalized, encoding: .utf8) else {
+        throw ValidationError(validationMessage)
+    }
+    return string
 }
 
 struct RelayVerifierManifest: Decodable {

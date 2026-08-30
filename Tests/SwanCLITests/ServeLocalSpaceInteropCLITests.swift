@@ -311,6 +311,247 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         XCTAssertFalse(result.error.contains(root.path))
     }
 
+    func testServeNotificationConfigPinnedAtStartupAndReplacesWithoutAffectingLoadedRuntime() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+        try FileManager.default.createDirectory(
+            at: data,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let kek = Data(repeating: 0x61, count: 32)
+        let keyStore = try FileAccountKeyStore(
+            root: data.appending(path: "keys"),
+            configuration: try .init(activeKeyID: "mixed", activeKey: kek)
+        )
+        let signing = P256.Signing.PrivateKey()
+        let rotation = P256.Signing.PrivateKey()
+        let pdsOrigin = URL(string: "https://swan.example")!
+        let unsignedOperation = try PLCATProfile.regularOperation(
+            handle: "mixed.example.com",
+            signingPublicKey: signing.publicKey,
+            rotationPublicKeys: [rotation.publicKey],
+            pdsOrigin: pdsOrigin,
+            prev: nil
+        )
+        let operation = try PLCOperationCodec.sign(
+            .regular(unsignedOperation),
+            using: rotation
+        )
+        let localDID = try PLCOperationCodec.genesisDID(for: operation)
+        let signingReference = try AccountKeyReference(
+            accountDID: localDID,
+            purpose: .signing,
+            generation: 1
+        )
+        let rotationReference = try AccountKeyReference(
+            accountDID: localDID,
+            purpose: .rotation,
+            generation: 1
+        )
+        try await keyStore.createBatch([
+            try AccountKeyMaterial(reference: signingReference, key: signing.rawRepresentation),
+            try AccountKeyMaterial(reference: rotationReference, key: rotation.rawRepresentation),
+        ])
+        let control = try await SQLiteControlDatabase(dataDirectory: data)
+        let revision = "3jzfcijpj2z2a"
+        let publicGenesis = try PublicRepositoryGenesisCodec.create(
+            did: localDID,
+            revision: revision,
+            signingKey: signing
+        )
+        let operationCID = try operation.cid.string
+        let requestID = "serve-local-interop-pinned"
+        let operationFacts = try PLCAccountPreparationOperationFacts(
+            signingDIDKey: try XCTUnwrap(
+                operation.regular?.verificationMethods["atproto"]
+            ),
+            rotationDIDKey: try XCTUnwrap(operation.regular?.rotationKeys.first),
+            signature: try XCTUnwrap(operation.regular?.signature)
+        )
+        let journal = try PLCAccountPreparationJournal(
+            requestID: requestID,
+            canonicalHandle: "mixed.example.com",
+            pdsOrigin: pdsOrigin.absoluteString,
+            repositoryRevision: revision,
+            operation: operationFacts,
+            signingKey: try AccountControlKeyReference(
+                purpose: .signing,
+                generation: 1
+            ),
+            rotationKey: try AccountControlKeyReference(
+                purpose: .rotation,
+                generation: 1
+            ),
+            publicGenesisCommitCID: nil,
+            stage: .keysStored
+        )
+        let intent = try PLCAccountPreparationIntent(
+            requestID: requestID,
+            did: localDID,
+            canonicalHandle: "mixed.example.com",
+            pdsOrigin: pdsOrigin.absoluteString,
+            repositoryRevision: revision,
+            operationCID: operationCID,
+            stage: .keysStored
+        )
+        _ = try await control.reservePLCAccountPreparationIntent(intent)
+        _ = try await control.advancePLCAccountPreparationIntent(
+            requestID: requestID,
+            expectedStage: .keysStored,
+            to: .repositoryInstalled
+        )
+        _ = try await control.advancePLCAccountPreparationIntent(
+            requestID: requestID,
+            expectedStage: .repositoryInstalled,
+            to: .submissionPending
+        )
+        _ = try await control.advancePLCAccountPreparationIntent(
+            requestID: requestID,
+            expectedStage: .submissionPending,
+            to: .submitted
+        )
+        _ = try await control.createAccount(try .init(
+            did: localDID,
+            canonicalHandle: "mixed.example.com",
+            passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+            signingKey: .init(
+                purpose: .signing,
+                generation: 1
+            ),
+            rotationKey: .init(
+                purpose: .rotation,
+                generation: 1
+            ),
+            publicGenesisCommitCID: publicGenesis.commitCID.string,
+            createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+        ))
+        let database = try await SQLiteAccountDatabase(dataDirectory: data, did: localDID)
+        _ = try await database.installPublicRepositoryGenesis(
+            publicGenesis,
+            signingPublicKey: signing.publicKey,
+            installedAt: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        _ = try await database.installPLCAccountPreparationJournal(journal)
+        _ = try await database.advancePLCAccountPreparationJournal(
+            requestID: requestID,
+            expectedStage: .keysStored,
+            to: .repositoryInstalled,
+            publicGenesisCommitCID: publicGenesis.commitCID.string
+        )
+        _ = try await database.advancePLCAccountPreparationJournal(
+            requestID: requestID,
+            expectedStage: .repositoryInstalled,
+            to: .submissionPending,
+            publicGenesisCommitCID: nil
+        )
+        _ = try await database.advancePLCAccountPreparationJournal(
+            requestID: requestID,
+            expectedStage: .submissionPending,
+            to: .submitted,
+            publicGenesisCommitCID: nil
+        )
+        try await database.close()
+        try await control.close()
+        let mountedKEK = root.appending(path: "mounted-kek")
+        try protectedWrite(Data(base64URLEncoded(kek).utf8), to: mountedKEK)
+        let notification = root.appending(path: "notification.json")
+        let configuration: [String: Any] = [
+            "credentialPublicKeys": [],
+            "delegationPublicKeys": [],
+            "servicePublicKeys": [],
+            "authorityDestinations": [[
+                "key": localDID,
+                "endpoint": "http://localhost:3000",
+                "audience": "did:web:configured-managing.example",
+                "finalPeer": "127.0.0.1",
+            ]],
+            "registrationDestinations": [],
+            "recipientServiceBindings": [[
+                "serviceIdentity": "did:web:configured-recipient.example",
+                "recipientAccount": localDID,
+            ]],
+            "managingServiceAudience": "did:web:configured-managing.example",
+        ]
+        try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys])
+            .write(to: notification)
+
+        let result = try runServeUntilStarted(data: data, arguments: [
+            "--host", "127.0.0.1",
+            "--port", "0",
+            "--public-url", "https://swan.example",
+            "--enable-local-space-interop",
+            "--enable-oauth-authorization-server",
+            "--space-account-kek-file", mountedKEK.path,
+            "--space-account-kek-id", "mixed",
+            "--space-account-key-directory", data.appending(path: "keys").path,
+            "--notification-config", notification.path,
+            "--enable-notification-delivery",
+            "--oauth-allow-metadata-ip", "127.0.0.1",
+        ])
+
+        XCTAssertTrue(result.started, result.error)
+        // Overwrite notification file with laboratory-PLC / invalid content
+        try Data("{\"plcOrigin\":\"http://lab.invalid\"}".utf8).write(to: notification)
+        XCTAssertFalse(result.error.contains(root.path))
+    }
+
+    func testServeNotificationConfigRejectsSymlinkFIFOAndOversize() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+
+        // 1. Symlink
+        let regular = root.appending(path: "regular-notification.json")
+        try Data("{\"test\": true}\n".utf8).write(to: regular)
+        let symlink = root.appending(path: "symlink-notification.json")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: regular)
+
+        let symlinkResult = try runServe(
+            data: data,
+            arguments: [
+                "--public-url", "https://swan.example",
+                "--notification-config", symlink.path,
+            ]
+        )
+        XCTAssertNotEqual(symlinkResult.status, 0)
+        XCTAssertTrue(symlinkResult.error.contains("--notification-config is unavailable"), symlinkResult.error)
+
+        // 2. FIFO
+        let fifo = root.appending(path: "notification.fifo")
+        #if canImport(Darwin)
+        let mkfifoResult = Darwin.mkfifo(fifo.path, 0o600)
+        #else
+        let mkfifoResult = Glibc.mkfifo(fifo.path, 0o600)
+        #endif
+        XCTAssertEqual(mkfifoResult, 0)
+
+        let fifoResult = try runServe(
+            data: data,
+            arguments: [
+                "--public-url", "https://swan.example",
+                "--notification-config", fifo.path,
+            ]
+        )
+        XCTAssertNotEqual(fifoResult.status, 0)
+        XCTAssertTrue(fifoResult.error.contains("--notification-config is unavailable"), fifoResult.error)
+
+        // 3. Oversize (> 256 KiB)
+        let oversize = root.appending(path: "oversize-notification.json")
+        let bigData = Data(repeating: 0x20, count: 256 * 1024 + 10)
+        try bigData.write(to: oversize)
+        let oversizeResult = try runServe(
+            data: data,
+            arguments: [
+                "--public-url", "https://swan.example",
+                "--notification-config", oversize.path,
+            ]
+        )
+        XCTAssertNotEqual(oversizeResult.status, 0)
+        XCTAssertTrue(oversizeResult.error.contains("--notification-config is unavailable"), oversizeResult.error)
+    }
+
     func testMetadataFetchOptionsRejectInapplicableAndNonliteralModes() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

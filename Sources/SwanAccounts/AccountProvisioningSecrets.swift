@@ -103,7 +103,7 @@ public enum AccountProvisioningSecrets {
     ) throws -> Data {
         let descriptor: Int32 = url.withUnsafeFileSystemRepresentation { path in
             guard let path else { return -1 }
-            return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+            return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
         }
         guard descriptor >= 0 else {
             throw SwanError.unavailable("account provisioning secret is unavailable")
@@ -118,6 +118,10 @@ public enum AccountProvisioningSecrets {
               metadata.st_size > 0,
               metadata.st_size <= off_t(maximumPayloadBytes + 2) else {
             throw SwanError.unavailable("account provisioning secret is unavailable")
+        }
+        let flags = fcntl(descriptor, F_GETFL)
+        if flags >= 0 {
+            _ = fcntl(descriptor, F_SETFL, flags & ~O_NONBLOCK)
         }
         do {
             let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)

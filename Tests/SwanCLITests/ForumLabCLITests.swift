@@ -34,7 +34,7 @@ final class ForumLabCLITests: XCTestCase {
         let output = String(decoding: result.stdout, as: UTF8.self)
         let errors = String(decoding: result.stderr, as: UTF8.self)
         XCTAssertTrue(
-            (output + errors).contains("OAuth password file is unavailable") || (output + errors).contains("environment variable is unavailable"),
+            (output + errors).contains("OAuth password file is unavailable"),
             output + errors
         )
     }
@@ -262,6 +262,79 @@ final class ForumLabCLITests: XCTestCase {
         let serialized = String(decoding: try Data(contentsOf: output), as: UTF8.self)
         XCTAssertFalse(serialized.contains("test-consumer-token"))
         XCTAssertFalse(serialized.contains("did:key:zQ3shqw"))
+    }
+
+    func testLabLiveBodyRejectsSymlinkFIFOAndOversize() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appending(path: "output.json")
+
+        // 1. Symlink
+        let regular = directory.appending(path: "regular.json")
+        try Data("{\"test\": true}\n".utf8).write(to: regular)
+        let symlink = directory.appending(path: "symlink.json")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: regular)
+
+        let symlinkResult = try runCLI(
+            command: [
+                "live",
+                "--mode", "public",
+                "--producer-url", "https://127.0.0.1:1",
+                "--consumer-url", "https://127.0.0.1:1",
+                "--producer-auth", "none",
+                "--consumer-auth", "none",
+                "--body-file", symlink.path,
+                "--output", output.path,
+            ]
+        )
+        XCTAssertNotEqual(symlinkResult.status, 0)
+        let symlinkErr = String(decoding: symlinkResult.stderr, as: UTF8.self) + String(decoding: symlinkResult.stdout, as: UTF8.self)
+        XCTAssertTrue(symlinkErr.contains("live body file is unavailable"), symlinkErr)
+
+        // 2. FIFO
+        let fifo = directory.appending(path: "test.fifo")
+        #if canImport(Darwin)
+        let mkfifoResult = Darwin.mkfifo(fifo.path, 0o600)
+        #else
+        let mkfifoResult = Glibc.mkfifo(fifo.path, 0o600)
+        #endif
+        XCTAssertEqual(mkfifoResult, 0)
+
+        let fifoResult = try runCLI(
+            command: [
+                "live",
+                "--mode", "public",
+                "--producer-url", "https://127.0.0.1:1",
+                "--consumer-url", "https://127.0.0.1:1",
+                "--producer-auth", "none",
+                "--consumer-auth", "none",
+                "--body-file", fifo.path,
+                "--output", output.path,
+            ]
+        )
+        XCTAssertNotEqual(fifoResult.status, 0)
+        let fifoErr = String(decoding: fifoResult.stderr, as: UTF8.self) + String(decoding: fifoResult.stdout, as: UTF8.self)
+        XCTAssertTrue(fifoErr.contains("live body file is unavailable"), fifoErr)
+
+        // 3. Oversize (> 2 MiB)
+        let oversize = directory.appending(path: "oversize.json")
+        let bigData = Data(repeating: 0x20, count: 2 * 1024 * 1024 + 10)
+        try bigData.write(to: oversize)
+        let oversizeResult = try runCLI(
+            command: [
+                "live",
+                "--mode", "public",
+                "--producer-url", "https://127.0.0.1:1",
+                "--consumer-url", "https://127.0.0.1:1",
+                "--producer-auth", "none",
+                "--consumer-auth", "none",
+                "--body-file", oversize.path,
+                "--output", output.path,
+            ]
+        )
+        XCTAssertNotEqual(oversizeResult.status, 0)
+        let oversizeErr = String(decoding: oversizeResult.stderr, as: UTF8.self) + String(decoding: oversizeResult.stdout, as: UTF8.self)
+        XCTAssertTrue(oversizeErr.contains("live body file is unavailable"), oversizeErr)
     }
 
     private var spaceURI: String {

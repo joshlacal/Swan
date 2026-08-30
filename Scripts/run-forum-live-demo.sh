@@ -393,7 +393,8 @@ main().catch((error) => {
 unset SWAN_REFERENCE_HANDLE SWAN_REFERENCE_EMAIL SWAN_REFERENCE_PASSWORD
 bob_did="$(printf '%s' "$reference_account" | json_field did)" || exit 1
 bob_token="$(printf '%s' "$reference_account" | json_field accessJwt)" || exit 1
-export SWAN_LAB_PRODUCER_TOKEN="$bob_token"
+printf '%s' "$bob_token" > "${temporary_directory}/bob.token"
+chmod 0600 "${temporary_directory}/bob.token"
 unset reference_account reference_password reference_email
 
 # Swan accounts: the space authority (Alice) and the second member (Carol).
@@ -618,7 +619,6 @@ run_lab() {
     --mount "type=bind,src=${temporary_directory},dst=/run/forum" \
     --env SWAN_LAB_CA_CERT_FILE=/etc/ssl/certs/caddy-local-root.crt \
     --env SSL_CERT_FILE=/etc/ssl/certs/caddy-local-root.crt \
-    --env SWAN_LAB_PRODUCER_TOKEN \
     --env SWAN_LAB_COMMIT_KEY_ALICE="$authority_key" \
     --env SWAN_LAB_COMMIT_KEY_CAROL="$member_key" \
     --env SWAN_LAB_COMMIT_KEY_BOB="$bob_key" \
@@ -631,14 +631,11 @@ run_lab() {
       consumer="$3"
       shift 3
       SWAN_LAB_AUTHORITY_HANDLE="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/authority.handle)"
-      SWAN_LAB_AUTHORITY_PASSWORD="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/authority.password)"
       SWAN_LAB_PRODUCER_HANDLE="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/${producer}.handle)"
-      SWAN_LAB_PRODUCER_PASSWORD="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/${producer}.password)"
       SWAN_LAB_CONSUMER_HANDLE="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/${consumer}.handle)"
-      SWAN_LAB_CONSUMER_PASSWORD="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/${consumer}.password)"
-      export SWAN_LAB_AUTHORITY_HANDLE SWAN_LAB_AUTHORITY_PASSWORD
-      export SWAN_LAB_PRODUCER_HANDLE SWAN_LAB_PRODUCER_PASSWORD
-      export SWAN_LAB_CONSUMER_HANDLE SWAN_LAB_CONSUMER_PASSWORD
+      export SWAN_LAB_AUTHORITY_HANDLE
+      export SWAN_LAB_PRODUCER_HANDLE
+      export SWAN_LAB_CONSUMER_HANDLE
       exec /usr/local/bin/swan lab "$subcommand" "$@"
     ' _ "$subcommand" "$producer_secret" "$consumer_secret" "${command_line[@]}"
 }
@@ -655,6 +652,7 @@ forum_provision() {
     --space "$space_uri" \
     --member-did "$member" \
     --authority-auth oauth \
+    --authority-password-file /run/secrets/swan-bootstrap/authority.password \
     --authority-client-id "http://localhost?scope=atproto&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback" \
     --authority-redirect-uri http://127.0.0.1/callback \
     --request-timeout-seconds 20
@@ -684,7 +682,7 @@ forum_post() {
     --producer-url "$producer_url" \
     --space "$space_uri" \
     --text "$text" \
-    --producer-auth "$auth" \
+    $(if [[ "$auth" == "bearer" ]]; then echo "--producer-auth bearer --producer-token-file /run/forum/bob.token"; else echo "--producer-auth oauth --producer-password-file /run/secrets/swan-bootstrap/${producer_account}.password"; fi) \
     --producer-client-id "$scope_client_id" \
     --producer-redirect-uri http://127.0.0.1/callback \
     --request-timeout-seconds 20 \
@@ -757,11 +755,12 @@ PY
     --producer-url https://swan.test \
     --consumer-url https://swan.test \
     --producer-auth oauth \
+    --producer-password-file /run/secrets/swan-bootstrap/authority.password \
     --producer-client-id "$scope_client_id" \
     --producer-redirect-uri http://127.0.0.1/callback \
     --consumer-auth oauth \
+    --consumer-password-file /run/secrets/swan-bootstrap/authority.password \
     --consumer-client-id "$scope_client_id" \
-    --consumer-redirect-uri http://127.0.0.1/callback \
     --scope atproto \
     --scope "$read_scope" \
     --scope "$create_scope" \
@@ -812,6 +811,8 @@ run_forum \
   --receiver-did "$member_did" \
   --data-directory /var/lib/swan/data \
   --consumer-auth oauth \
+  --consumer-password-file /run/secrets/swan-bootstrap/member.password \
+  --authority-password-file /run/secrets/swan-bootstrap/authority.password \
   --consumer-client-id "$scope_client_id" \
   --consumer-redirect-uri http://127.0.0.1/callback \
   --plc-origin http://reference-plc:2582 \

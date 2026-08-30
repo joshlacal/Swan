@@ -25,8 +25,6 @@ esac
 read_scope="space:app.bsky.bookmarks?authority=${authority_did}&skey=${space_skey}&action=read"
 create_scope="space:app.bsky.bookmarks?authority=${authority_did}&skey=${space_skey}&action=create&collection=${collection}"
 export SWAN_LAB_PRODUCER_HANDLE="$member_handle"
-SWAN_LAB_PRODUCER_PASSWORD="$(tr -d '\r\n' < /run/secrets/swan-bootstrap/member.password)"
-export SWAN_LAB_PRODUCER_PASSWORD
 stage() { printf '%s\n' "$1" > /run/acceptance/stage.txt; }
 stage key-derivation-start
 SWAN_LAB_PERMISSIONED_COMMIT_KEY="$(/usr/local/bin/swan account recovery-commit-key \
@@ -43,8 +41,7 @@ provision_space() {
   local private_value
   private_value="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
   SWAN_LAB_CONSUMER_HANDLE="$authority_handle"
-  SWAN_LAB_CONSUMER_PASSWORD="$(tr -d '\r\n' < /run/secrets/swan-bootstrap/authority.password)"
-  export SWAN_LAB_CONSUMER_HANDLE SWAN_LAB_CONSUMER_PASSWORD
+  export SWAN_LAB_CONSUMER_HANDLE
   # shellcheck disable=SC2016 # `$type` is a literal AT Protocol record key.
   printf '{"space":"%s","repo":"%s","collection":"%s","rkey":"%s-setup","record":{"$type":"app.bsky.feed.post","text":"%s"}}\n' \
     "$space_uri" "$member_did" "$collection" "$run_selector" "$private_value" >/tmp/provision-record.json
@@ -53,6 +50,8 @@ provision_space() {
     --mode permissioned --name "${run_selector}-provision" \
     --producer-url https://swan.test --consumer-url https://swan.test \
     --producer-auth oauth --consumer-auth oauth \
+    --producer-password-file /run/secrets/swan-bootstrap/member.password \
+    --consumer-password-file /run/secrets/swan-bootstrap/authority.password \
     --producer-client-id "$client_id" --producer-redirect-uri http://127.0.0.1/callback \
     --consumer-client-id "$client_id" --consumer-redirect-uri http://127.0.0.1/callback \
     --scope atproto --scope "$read_scope" --scope "$create_scope" \
@@ -67,7 +66,7 @@ provision_space() {
   if grep -F -- "$private_value" /tmp/provision.json >/dev/null; then
     exit 1
   fi
-  unset SWAN_LAB_CONSUMER_HANDLE SWAN_LAB_CONSUMER_PASSWORD
+  unset SWAN_LAB_CONSUMER_HANDLE
   stage provision-passed
 }
 
@@ -85,6 +84,7 @@ write_batch() {
     --mode permissioned --permissioned-write-only-apply-writes
     --name "${run_selector}-${phase}-advance"
     --producer-url https://swan.test --producer-auth oauth
+    --producer-password-file /run/secrets/swan-bootstrap/member.password
     --producer-client-id "$client_id" --producer-redirect-uri http://127.0.0.1/callback
     --scope atproto --scope "$read_scope" --scope "$create_scope"
     --space "$space_uri" --repository "$member_did" --body-file /tmp/apply-writes.json
@@ -132,7 +132,8 @@ run_recovery() {
     --receiver-did "$authority_did" --repository "$member_did" --space "$space_uri"
     --data-directory /var/lib/swan/data --name permissioned-retention-recovery
     --source-url https://swan.test --authority-url https://swan.test
-    --source-auth oauth --source-client-id "$client_id"
+    --source-auth oauth --source-password-file /run/secrets/swan-bootstrap/member.password
+    --source-client-id "$client_id"
     --source-redirect-uri http://127.0.0.1/callback
     --scope atproto --scope "$read_scope" --scope "$create_scope"
     --since "$since" --request-id "${run_selector}-${phase}-recovery" --output "$output"
@@ -203,4 +204,4 @@ else:
     print("recovery-artifact-failed-" + (code if code in allowed else "unknown"))
 PY
 )"
-unset seed_gap_tid seed_terminal_tid SWAN_LAB_PERMISSIONED_COMMIT_KEY SWAN_LAB_PRODUCER_PASSWORD
+unset seed_gap_tid seed_terminal_tid SWAN_LAB_PERMISSIONED_COMMIT_KEY

@@ -417,6 +417,19 @@ final class SwanInteropTests: XCTestCase {
             XCTAssertEqual(error, .invalidURL)
         }
 
+        // .none authorization over plain HTTP remains permitted
+        do {
+            _ = try await insecureClient.query(
+                "com.atproto.repo.getRecord",
+                query: ["repo": "did:plc:alice", "rkey": "3k"],
+                authorization: .none
+            )
+        } catch let error as InteropHTTPError {
+            XCTAssertNotEqual(error, .invalidURL)
+        } catch {
+            // Network connection error is fine, not invalidURL
+        }
+
         // Loopback HTTP and HTTPS are permitted for credentials
         for loopbackURL in [
             URL(string: "http://127.0.0.1:8080")!,

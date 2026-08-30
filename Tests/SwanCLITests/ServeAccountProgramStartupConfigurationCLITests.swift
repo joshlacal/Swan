@@ -1171,6 +1171,7 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
         process.arguments = serveArgs
         var processEnvironment = ProcessInfo.processInfo.environment
         processEnvironment.removeValue(forKey: "SWAN_OAUTH_SERVER_KEY")
+        process.environment = processEnvironment
         let output = Pipe()
         let error = Pipe()
         process.standardOutput = output
