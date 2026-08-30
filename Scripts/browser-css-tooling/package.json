@@ -1,0 +1,11 @@
+{
+  "name": "browser-css-tooling",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned dependencies for browser CSS generation",
+  "dependencies": {
+    "@tailwindcss/cli": "4.3.3",
+    "daisyui": "5.7.19",
+    "tailwindcss": "4.3.3"
+  }
+}

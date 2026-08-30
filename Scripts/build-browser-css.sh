@@ -12,8 +12,7 @@ pages="$root/Sources/SwanHTTP/SwanBrowserPages.swift"
 scopes="$root/Sources/SwanHTTP/ScopeDescription.swift"
 output="$root/Sources/SwanHTTP/SwanBrowserStyleSheet.swift"
 
-TAILWIND_VERSION="4.3.3"
-DAISYUI_VERSION="5.7.19"
+tooling="$root/Scripts/browser-css-tooling"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -26,10 +25,9 @@ cat > "$work/input.css" <<CSS
 @source "./scopes.swift";
 @plugin "daisyui" { themes: light --default, dark --prefersdark; }
 CSS
-(cd "$work" && npm install --silent --no-save \
-  "tailwindcss@$TAILWIND_VERSION" \
-  "@tailwindcss/cli@$TAILWIND_VERSION" \
-  "daisyui@$DAISYUI_VERSION")
+cp "$tooling/package.json" "$work/package.json"
+cp "$tooling/package-lock.json" "$work/package-lock.json"
+(cd "$work" && npm ci --ignore-scripts --no-audit --no-fund --silent)
 (cd "$work" && npx --no-install @tailwindcss/cli -i input.css -o out.css --minify)
 
 {

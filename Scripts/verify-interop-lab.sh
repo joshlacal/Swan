@@ -979,7 +979,7 @@ reject_contains "$runner_block" 'https://' "planned runner must not name a live 
 reject_contains "$runner_block" 'toxiproxy' "planned runner must not mutate Toxiproxy"
 reject_contains "$runner_block" 'privileged:' "scenario runner must not be privileged"
 
-rg -q 'permissioned-data-0016-2026-07-30' Sources/SwanInterop/SwanInterop.swift
+rg -q 'permissioned-data-0016-2026-08-15' Sources/SwanInterop/SwanInterop.swift
 rg -q '1caad93dbb1f445396f6abf3b97eb4040345e78e' Sources/SwanInterop/SwanInterop.swift
 rg -q '3f6c96d5d2d25438bd40fa89d6ecc37865f8e354' "$reference_pds_dockerfile"
 rg -q '1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea' "$reference_pds_dockerfile"
@@ -1464,6 +1464,16 @@ do
   rg -qx '\*\*/\.swan-interop-secrets/' "$ignore_file"
   rg -qx '\*\*/\.swan-interop-secrets/\*\*' "$ignore_file"
 done
+rg -qx 'Swan/web/node_modules' "$swan_dockerignore"
+rg -qx 'Swan/web/node_modules/\*\*' "$swan_dockerignore"
+rg -qx 'Swan/web/\.svelte-kit' "$swan_dockerignore"
+rg -qx 'Swan/web/\.svelte-kit/\*\*' "$swan_dockerignore"
+rg -qx 'Swan/web/build' "$swan_dockerignore"
+rg -qx 'Swan/web/build/\*\*' "$swan_dockerignore"
+rg -qx 'Swan/web/test-results' "$swan_dockerignore"
+rg -qx 'Swan/web/test-results/\*\*' "$swan_dockerignore"
+rg -qx 'Swan/web/playwright-report' "$swan_dockerignore"
+rg -qx 'Swan/web/playwright-report/\*\*' "$swan_dockerignore"
 rg -qx 'Swan/\.interop-cache/\*\*' "$swan_dockerignore"
 python3 - "$swan_dockerignore" <<'PY'
 import pathlib

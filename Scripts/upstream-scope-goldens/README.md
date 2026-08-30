@@ -36,13 +36,13 @@ provenance, by regenerating and diffing.
 ## Regenerating
 
 ```bash
-UP=/path/to/atproto-export        # a full `git archive <commit>` of bluesky-social/atproto
+UP=/path/to/atproto-checkout      # a clean `git checkout bddc99fb24c34b4078b9bf65837283f37b49ab66`
 G=/path/to/scratch
 
 # 1. Leaf npm deps first — npm prunes symlinks it does not recognise, so
 #    installing after step 2 silently deletes the workspace links.
-cd "$G" && npm init -y && npm install zod@3 iso-datestring-validator multiformats
-
+cp package.json package-lock.json "$G/"
+cd "$G" && npm ci --ignore-scripts --no-audit --no-fund
 # 2. Link the workspace packages, in BOTH scratch and the export: module
 #    resolution starts at the importing file, and upstream files import each
 #    other across packages.
