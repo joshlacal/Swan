@@ -1,4 +1,5 @@
 import Foundation
+import PetrelFirehose
 import Petrel
 import SwanCore
 import SwanSpaces
@@ -52,7 +53,13 @@ final class PublicFirehoseIsolationTests: XCTestCase {
         wireRevision: revision.toString(),
         commitment: Data(repeating: 0xab, count: 32),
         issuer: writer,
-        audience: authority
+        audience: authority,
+        requestBodyDigest: SpaceNotificationRequestDigest.write(
+            space: space,
+            repository: writer,
+            wireRevision: revision.toString(),
+            commitment: Data(repeating: 0xab, count: 32)
+        )
       ),
       now: now
     )
@@ -73,7 +80,7 @@ final class PublicFirehoseIsolationTests: XCTestCase {
     )
     let result = try await sequencer.sequenceNext(now: now)
     XCTAssertEqual(result, .idle)
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertTrue(events.isEmpty, "permissioned writes must not append global firehose events")
   }
 }

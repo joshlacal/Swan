@@ -162,6 +162,7 @@ private struct AuthenticatedRegisterSpaceNotifyHandler {
         } catch {
             throw AuthenticatedSpaceNotificationFailure.denied
         }
+        let ownerDID = authenticatedService.issuer
         if let requested = input.service {
             guard requested == ownerDID || serviceIssuerDID(requested) == ownerDID else {
                 throw AuthenticatedSpaceNotificationFailure.denied
@@ -219,9 +220,7 @@ private struct AuthenticatedUnregisterSpaceNotifyHandler {
     ) async throws {
         let space = try notificationSpace(input.space)
         let authorization = try await credentialAuthorization(
-            capability,
-            request: request,
-            space: space
+            capability, request: request, space: space
         )
         let serviceToken: String
         do {
@@ -247,14 +246,14 @@ private struct AuthenticatedUnregisterSpaceNotifyHandler {
             throw AuthenticatedSpaceNotificationFailure.denied
         }
         let ownerDID = authenticatedService.issuer
-        let requested = input.service
-        guard requested == ownerDID || serviceIssuerDID(requested) == ownerDID else {
+        guard input.service == ownerDID || serviceIssuerDID(input.service) == ownerDID else {
             throw AuthenticatedSpaceNotificationFailure.denied
         }
         do {
             try await capability.directory.unregisterSpaceNotification(
                 space: space,
-                serviceDID: ownerDID,
+                ownerServiceDID: ownerDID,
+                deliveryServiceDID: input.service,
                 authorization: authorization
             )
         } catch {
@@ -267,7 +266,6 @@ private struct AuthenticatedNotifySpaceWriteHandler:
     ComAtprotoSpaceNotifyWrite.ServerHandler
 {
     typealias Context = Request
-
     let capability: SwanAuthenticatedSpaceNotificationsCapability
 
     func handle(
@@ -782,7 +780,7 @@ private func serviceAuthentication(
     request: Request,
     expectedAudience: String?,
     expectedMethod: String,
-    expectedRequestBodyDigest: String?
+    expectedRequestBodyDigest: String? = nil
 ) async throws -> VerifiedSpaceServiceAuthentication {
     let compact: String
     do {
@@ -832,19 +830,25 @@ func exactAtprotoServiceAuthBearerToken(from headers: HTTPFields) throws -> Stri
 /// endpoints. OAuth DPoP and generic Bearer credentials never fall through:
 /// callers must supply exactly one bounded compact service JWT.
 func exactSpaceServiceBearerToken(from headers: HTTPFields) throws -> String {
-    let matches = headers.filter {
+    let authMatches = headers.filter {
         $0.name == .authorization || $0.name.rawName.caseInsensitiveCompare("authorization") == .orderedSame
     }
-    guard matches.count == 1,
-          let raw = matches.first?.value else {
+    let atprotoMatches = headers.filter {
+        $0.name.rawName.caseInsensitiveCompare("atproto-service-auth") == .orderedSame
+    }
+    let totalCount = authMatches.count + atprotoMatches.count
+    guard totalCount == 1,
+          let raw = authMatches.first?.value ?? atprotoMatches.first?.value else {
         throw SwanError.unauthorized("service authentication is invalid")
     }
     let prefix = "Bearer "
-    guard raw.count >= prefix.count,
-          raw.prefix(prefix.count).caseInsensitiveCompare(prefix) == .orderedSame else {
-        throw SwanError.unauthorized("service authentication is invalid")
+    let token: String
+    if raw.count >= prefix.count,
+       raw.prefix(prefix.count).caseInsensitiveCompare(prefix) == .orderedSame {
+        token = String(raw.dropFirst(prefix.count))
+    } else {
+        token = raw
     }
-    let token = String(raw.dropFirst(prefix.count))
     guard !token.isEmpty,
           token.utf8.count <= SpaceServiceJWT.maximumCompactBytes,
           token.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {

@@ -386,6 +386,9 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                     committedDataCID: nil,
                     projection: nil
                 )
+                try await pruneTerminalPublicRepositoryMutationRequestsWithoutGate(
+                    nowMicroseconds: wallClockMicroseconds
+                )
 
                 _ = try await connection.query(
                     """
@@ -400,8 +403,8 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                     """
                     INSERT INTO public_repository_mutation_requests(
                         request_id, request_digest, base_commit_cid, base_revision,
-                        next_revision, status, integrity_digest
-                    ) VALUES (?, ?, ?, ?, ?, 'reserved', ?)
+                        next_revision, status, integrity_digest, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?)
                     """,
                     [
                         .text(request.id),
@@ -410,6 +413,7 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                         .text(state.revision),
                         .text(nextRevision),
                         integrityDigest.sqliteData!,
+                        .integer(Int(wallClockMicroseconds)),
                     ]
                 )
                 try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
@@ -652,7 +656,10 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                     throw PublicRepositoryMutationStoreError.reservationMismatch
                 }
                 try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
-
+                try await garbageCollectPublicRepositoryBlocksInTransaction(
+                    state: prepared.state,
+                    reductionOnly: prepared.recordResults.allSatisfy { $0.action == .delete }
+                )
                 // The stored event kind is final: the source transaction owns
                 // the commit-versus-sync decision and the sequencer must never
                 // reinterpret a persisted row.
@@ -1411,6 +1418,60 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
             throw error
         } catch {
             throw PublicRepositoryMutationStoreError.corruptRepository
+        }
+    }
+    public func setPublicRepositoryBlockQuota(_ quota: PublicRepositoryBlockQuota) {
+        self.publicRepositoryBlockQuota = quota
+    }
+
+    func pruneTerminalPublicRepositoryMutationRequestsWithoutGate(nowMicroseconds: UInt64) async throws {
+        let oneDayMicros: UInt64 = 24 * 60 * 60 * 1_000_000
+        let cutoffMicros = nowMicroseconds > oneDayMicros ? nowMicroseconds - oneDayMicros : 0
+
+        // 1. Prune terminal receipts older than 24 hours in 1,000-row batches
+        if cutoffMicros > 0 {
+            while true {
+                let pruned = try await connection.query(
+                    """
+                    DELETE FROM public_repository_mutation_requests
+                    WHERE request_id IN (
+                        SELECT request_id FROM public_repository_mutation_requests
+                        WHERE status IN ('committed', 'abandoned')
+                          AND created_at < ?
+                        LIMIT 1000
+                    )
+                    RETURNING request_id
+                    """,
+                    [.integer(Int(cutoffMicros))]
+                )
+                guard !pruned.isEmpty else { break }
+            }
+        }
+        // A bounded indexed probe avoids a full COUNT(*) on every reservation.
+        // Only enter the deletion loop when a 100,001st terminal row exists.
+        while true {
+            let overLimit = try await connection.query(
+                """
+                SELECT request_id FROM public_repository_mutation_requests
+                WHERE status IN ('committed', 'abandoned')
+                ORDER BY created_at ASC, request_id ASC
+                LIMIT 1 OFFSET 100000
+                """
+            )
+            guard !overLimit.isEmpty else { break }
+            let pruned = try await connection.query(
+                """
+                DELETE FROM public_repository_mutation_requests
+                WHERE request_id IN (
+                    SELECT request_id FROM public_repository_mutation_requests
+                    WHERE status IN ('committed', 'abandoned')
+                    ORDER BY created_at ASC, request_id ASC
+                    LIMIT 1000
+                )
+                RETURNING request_id
+                """
+            )
+            guard !pruned.isEmpty else { break }
         }
     }
 }

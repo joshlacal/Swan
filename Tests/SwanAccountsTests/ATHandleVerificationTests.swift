@@ -519,6 +519,231 @@ final class ATHandleVerificationTests: XCTestCase {
             )
         }
     }
+
+    // MARK: - Task 10: DNS Admission and Deadline Bounds
+
+    func testHandleDNSAdmissionGateLimitsActiveAndQueuedOperations() async throws {
+        let gate = HandleDNSAdmissionGate(maxActive: 8, maxQueued: 128)
+        var activeTasks: [Task<Void, Error>] = []
+        var queuedTasks: [Task<Void, Error>] = []
+        defer {
+            for task in activeTasks + queuedTasks { task.cancel() }
+        }
+
+        // Fill 8 active slots
+        for _ in 0 ..< 8 {
+            activeTasks.append(Task {
+                try await gate.acquire()
+            })
+        }
+        for task in activeTasks {
+            try await task.value
+        }
+        XCTAssertEqual(gate.activeCount, 8)
+        XCTAssertEqual(gate.queuedCount, 0)
+
+        // Fill 128 queued slots
+        for _ in 0 ..< 128 {
+            queuedTasks.append(Task {
+                try await gate.acquire()
+            })
+        }
+        let start = ContinuousClock.now
+        while gate.queuedCount < 128, ContinuousClock.now - start < .seconds(2) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(gate.queuedCount, 128)
+
+        // 129th queued request must immediately fail with unavailable
+        do {
+            try await gate.acquire()
+            XCTFail("expected admission failure when queue is full")
+        } catch {
+            XCTAssertEqual(error as? ATHandleDNSAdmissionError, .saturated)
+        }
+    }
+
+    func testHandleDNSAdmissionGateCancelledWaitersLeaveQueue() async throws {
+        let gate = HandleDNSAdmissionGate(maxActive: 1, maxQueued: 2)
+
+        // Fill 1 active slot
+        let activeTask = Task {
+            try await gate.acquire()
+        }
+        try await activeTask.value
+        XCTAssertEqual(gate.activeCount, 1)
+        XCTAssertEqual(gate.queuedCount, 0)
+
+        // Queue 2 waiters
+        let waiter1 = Task { try await gate.acquire() }
+        let waiter2 = Task { try await gate.acquire() }
+        let startQueue = ContinuousClock.now
+        while gate.queuedCount < 2, ContinuousClock.now - startQueue < .seconds(1) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(gate.queuedCount, 2)
+
+        // 3rd waiter fails because queue is full
+        do {
+            try await gate.acquire()
+            XCTFail("expected unavailable")
+        } catch {
+            XCTAssertEqual(error as? ATHandleDNSAdmissionError, .saturated)
+        }
+
+        // Cancel waiter1 -> must leave queue
+        waiter1.cancel()
+        let startCancel = ContinuousClock.now
+        while gate.queuedCount > 1, ContinuousClock.now - startCancel < .seconds(1) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(gate.queuedCount, 1)
+
+        // Now a new waiter can queue
+        let waiter3 = Task { try await gate.acquire() }
+        let startQueue3 = ContinuousClock.now
+        while gate.queuedCount < 2, ContinuousClock.now - startQueue3 < .seconds(1) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(gate.queuedCount, 2)
+        waiter2.cancel()
+        waiter3.cancel()
+        gate.release()
+    }
+
+    func testSystemATHandleDNSResolverFailurePathReleasesSlotAndAdmitsSubsequentWork() async throws {
+        let gate = HandleDNSAdmissionGate(maxActive: 1, maxQueued: 2)
+
+        // 1. TXT failure path releases slot
+        let failingTXTResolver = SystemATHandleDNSResolver(
+            gate: gate,
+            queryTXT: { _, _, _ in -1 }
+        )
+        do {
+            _ = try await failingTXTResolver.txtRecords(name: "_atproto.example.com")
+            XCTFail("expected unavailable error on failed TXT query")
+        } catch {
+            XCTAssertEqual(error as? ATHandleVerificationError, .unavailable)
+        }
+        let startTXT = ContinuousClock.now
+        while gate.activeCount > 0, ContinuousClock.now - startTXT < .seconds(1) {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(gate.activeCount, 0, "active permit must be released after TXT failure")
+        XCTAssertEqual(gate.queuedCount, 0)
+
+        // Subsequent TXT acquire succeeds and admits work
+        let successTXTResolver = SystemATHandleDNSResolver(
+            gate: gate,
+            queryTXT: { _, output, _ in
+                let record = "did=did:plc:test".utf8
+                output[0] = UInt8((record.count >> 8) & 0xff)
+                output[1] = UInt8(record.count & 0xff)
+                for (i, byte) in record.enumerated() {
+                    output[2 + i] = byte
+                }
+                return 2 + record.count
+            }
+        )
+        let records = try await successTXTResolver.txtRecords(name: "_atproto.example.com")
+        XCTAssertEqual(records.count, 1)
+        let startTXTOk = ContinuousClock.now
+        while gate.activeCount > 0, ContinuousClock.now - startTXTOk < .seconds(1) {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(gate.activeCount, 0, "active permit must be released after successful TXT query")
+
+        // 2. Address failure path releases slot
+        let failingAddressResolver = SystemATHandleDNSResolver(
+            gate: gate,
+            resolveAddresses: { _ in throw ATHandleVerificationError.unavailable }
+        )
+        do {
+            _ = try await failingAddressResolver.addresses(host: "example.com")
+            XCTFail("expected unavailable error on failed address lookup")
+        } catch {
+            XCTAssertEqual(error as? ATHandleVerificationError, .unavailable)
+        }
+        let startAddr = ContinuousClock.now
+        while gate.activeCount > 0, ContinuousClock.now - startAddr < .seconds(1) {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(gate.activeCount, 0, "active permit must be released after address lookup failure")
+        XCTAssertEqual(gate.queuedCount, 0)
+
+        // Subsequent address acquire succeeds and admits work
+        let successAddressResolver = SystemATHandleDNSResolver(
+            gate: gate,
+            resolveAddresses: { _ in [ATHandleIPAddress.ipv4(0x01020304)] }
+        )
+        let addresses = try await successAddressResolver.addresses(host: "example.com")
+        XCTAssertEqual(addresses.count, 1)
+        let startAddrOk = ContinuousClock.now
+        while gate.activeCount > 0, ContinuousClock.now - startAddrOk < .seconds(1) {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(gate.activeCount, 0, "active permit must be released after successful address lookup")
+    }
+
+    func testSystemATHandleDNSResolverRejectsWhenGateIsSaturated() async throws {
+        let gate = HandleDNSAdmissionGate(maxActive: 1, maxQueued: 0)
+        let resolver = SystemATHandleDNSResolver(gate: gate)
+
+        // Saturate gate with 1 active permit
+        try await gate.acquire()
+
+        // Next txtRecords and addresses calls via SystemATHandleDNSResolver must fail with .unavailable
+        do {
+            _ = try await resolver.txtRecords(name: "_atproto.example.com")
+            XCTFail("expected unavailable error when gate is saturated")
+        } catch {
+            XCTAssertEqual(error as? ATHandleDNSAdmissionError, .saturated)
+        }
+
+        do {
+            _ = try await resolver.addresses(host: "example.com")
+            XCTFail("expected unavailable error when gate is saturated")
+        } catch {
+            XCTAssertEqual(error as? ATHandleDNSAdmissionError, .saturated)
+        }
+
+        gate.release()
+    }
+
+    func testHandleVerifierMapsSaturatedDNSToUnavailableRatherThanVerificationFailed() async throws {
+        let gate = HandleDNSAdmissionGate(maxActive: 1, maxQueued: 0)
+        let dns = SystemATHandleDNSResolver(gate: gate)
+        let verifier = ATProtocolHandleVerifier(
+            policy: try .production(),
+            dns: dns,
+            http: FakeHandleHTTP([])
+        )
+        try await gate.acquire()
+        defer { gate.release() }
+
+        do {
+            _ = try await verifier.verify(
+                plcState: state(handle: "alice.example.org"),
+                expectedDID: did,
+                handle: "alice.example.org",
+                pdsOrigin: "https://pds.example.org"
+            )
+            XCTFail("expected unavailable error")
+        } catch let error as ATHandleVerificationError {
+            XCTAssertEqual(error, .unavailable, "saturated DNS must yield .unavailable, never .verificationFailed")
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        do {
+            _ = try await verifier.resolve(handle: "alice.example.org")
+            XCTFail("expected unavailable error")
+        } catch let error as ATHandleVerificationError {
+            XCTAssertEqual(error, .unavailable, "saturated DNS must yield .unavailable, never .verificationFailed")
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
 }
 
 private enum FakeDNSResult<Value: Sendable>: Sendable {

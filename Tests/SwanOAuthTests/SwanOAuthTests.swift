@@ -600,6 +600,193 @@ final class SwanOAuthTests: XCTestCase {
         }
     }
 
+    func testSpaceServiceAuthenticationVerifierBindsRequestBodyDigestAndRejectsMismatches() async throws {
+        let key = P256.Signing.PrivateKey()
+        let issuer = "did:plc:abcdefghijklmnopqrstuvwx"
+        let audience = "did:plc:zyxwvutsrqponmlkjihgfedc"
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let verifier = DurableSpaceServiceAuthenticationVerifier(
+            publicKeys: try PinnedSpaceServicePublicKeyResolver(pins: [
+                try .init(issuer: issuer, generation: 1, publicKey: key.publicKey)
+            ])
+        )
+
+        let space = try SpaceURI(authority: audience, spaceType: "app.bsky.bookmarks", skey: "self")
+        let repo = issuer
+        let rev = "222222222222z"
+        let commitment = Data(repeating: 0x42, count: 32)
+        let writeDigest = SpaceServiceRequestDigest.write(
+            space: space,
+            repository: repo,
+            revision: rev,
+            commitment: commitment
+        )
+
+        let tokenWithDigest = try SpaceServiceJWT.create(
+            issuer: issuer,
+            audience: audience,
+            method: "com.atproto.space.notifyWrite",
+            eventID: "event-digest-1",
+            requestBodyDigest: writeDigest,
+            key: key,
+            now: now
+        )
+
+        // Matching expected digest succeeds and populates requestBodyDigest
+        let verified = try await verifier.authenticate(
+            tokenWithDigest,
+            expectedAudience: audience,
+            expectedMethod: "com.atproto.space.notifyWrite",
+            expectedRequestBodyDigest: writeDigest,
+            now: now
+        )
+        XCTAssertEqual(verified.requestBodyDigest, writeDigest)
+        XCTAssertEqual(verified.issuer, issuer)
+        XCTAssertEqual(verified.audience, audience)
+
+        // Mismatched expected digest (altered space) throws unauthorized
+        let alteredSpace = try SpaceURI(authority: audience, spaceType: "app.bsky.bookmarks", skey: "other")
+        let alteredSpaceDigest = SpaceServiceRequestDigest.write(
+            space: alteredSpace,
+            repository: repo,
+            revision: rev,
+            commitment: commitment
+        )
+        do {
+            _ = try await verifier.authenticate(
+                tokenWithDigest,
+                expectedAudience: audience,
+                expectedMethod: "com.atproto.space.notifyWrite",
+                expectedRequestBodyDigest: alteredSpaceDigest,
+                now: now
+            )
+            XCTFail("expected altered space digest to fail")
+        } catch let error as SwanError {
+            XCTAssertEqual(error, .unauthorized("service authentication is invalid"))
+        }
+
+        // Mismatched expected digest (altered repository) throws unauthorized
+        let alteredRepoDigest = SpaceServiceRequestDigest.write(
+            space: space,
+            repository: "did:plc:otherrepo1234567890ab",
+            revision: rev,
+            commitment: commitment
+        )
+        do {
+            _ = try await verifier.authenticate(
+                tokenWithDigest,
+                expectedAudience: audience,
+                expectedMethod: "com.atproto.space.notifyWrite",
+                expectedRequestBodyDigest: alteredRepoDigest,
+                now: now
+            )
+            XCTFail("expected altered repo digest to fail")
+        } catch let error as SwanError {
+            XCTAssertEqual(error, .unauthorized("service authentication is invalid"))
+        }
+
+        // Mismatched expected digest (altered revision) throws unauthorized
+        let alteredRevDigest = SpaceServiceRequestDigest.write(
+            space: space,
+            repository: repo,
+            revision: "222222222223a",
+            commitment: commitment
+        )
+        do {
+            _ = try await verifier.authenticate(
+                tokenWithDigest,
+                expectedAudience: audience,
+                expectedMethod: "com.atproto.space.notifyWrite",
+                expectedRequestBodyDigest: alteredRevDigest,
+                now: now
+            )
+            XCTFail("expected altered rev digest to fail")
+        } catch let error as SwanError {
+            XCTAssertEqual(error, .unauthorized("service authentication is invalid"))
+        }
+
+        // Mismatched expected digest (altered commitment) throws unauthorized
+        let alteredCommitmentDigest = SpaceServiceRequestDigest.write(
+            space: space,
+            repository: repo,
+            revision: rev,
+            commitment: Data(repeating: 0x99, count: 32)
+        )
+        do {
+            _ = try await verifier.authenticate(
+                tokenWithDigest,
+                expectedAudience: audience,
+                expectedMethod: "com.atproto.space.notifyWrite",
+                expectedRequestBodyDigest: alteredCommitmentDigest,
+                now: now
+            )
+            XCTFail("expected altered commitment digest to fail")
+        } catch let error as SwanError {
+            XCTAssertEqual(error, .unauthorized("service authentication is invalid"))
+        }
+
+        // Unbound token (no req claim) is rejected when expected digest is required
+        let unboundToken = try SpaceServiceJWT.create(
+            issuer: issuer,
+            audience: audience,
+            method: "com.atproto.space.notifyWrite",
+            eventID: "event-unbound-1",
+            key: key,
+            now: now
+        )
+        do {
+            _ = try await verifier.authenticate(
+                unboundToken,
+                expectedAudience: audience,
+                expectedMethod: "com.atproto.space.notifyWrite",
+                expectedRequestBodyDigest: writeDigest,
+                now: now
+            )
+            XCTFail("expected unbound token to fail when digest expected")
+        } catch let error as SwanError {
+            XCTAssertEqual(error, .unauthorized("service authentication is invalid"))
+        }
+
+        // Deletion digest binding
+        let deletionDigest = SpaceServiceRequestDigest.deletion(space: space)
+        let deletionToken = try SpaceServiceJWT.create(
+            issuer: audience,
+            audience: "did:web:receiver.example",
+            method: "com.atproto.space.notifySpaceDeleted",
+            eventID: "event-del-1",
+            requestBodyDigest: deletionDigest,
+            key: key,
+            now: now
+        )
+        let deletionVerifier = DurableSpaceServiceAuthenticationVerifier(
+            publicKeys: try PinnedSpaceServicePublicKeyResolver(pins: [
+                try .init(issuer: audience, generation: 1, publicKey: key.publicKey)
+            ])
+        )
+        let verifiedDeletion = try await deletionVerifier.authenticate(
+            deletionToken,
+            expectedAudience: nil,
+            expectedMethod: "com.atproto.space.notifySpaceDeleted",
+            expectedRequestBodyDigest: deletionDigest,
+            now: now
+        )
+        XCTAssertEqual(verifiedDeletion.requestBodyDigest, deletionDigest)
+
+        // Deletion with altered space digest fails
+        do {
+            _ = try await deletionVerifier.authenticate(
+                deletionToken,
+                expectedAudience: nil,
+                expectedMethod: "com.atproto.space.notifySpaceDeleted",
+                expectedRequestBodyDigest: SpaceServiceRequestDigest.deletion(space: alteredSpace),
+                now: now
+            )
+            XCTFail("expected deletion with altered space to fail")
+        } catch let error as SwanError {
+            XCTAssertEqual(error, .unauthorized("service authentication is invalid"))
+        }
+    }
+
     func testRemoteMetadataPolicyRejectsAllPrivateLiteralRanges() throws {
         XCTAssertThrowsError(try OAuthRemoteURLPolicy.validate(URL(string: "https://172.31.1.1/metadata")!))
         XCTAssertThrowsError(try OAuthRemoteURLPolicy.validate(URL(string: "https://169.254.169.254/latest/meta-data")!))
@@ -1956,8 +2143,8 @@ final class SwanOAuthTests: XCTestCase {
     func testDurableSpaceServiceAuthenticationVerifierValidatesAndBindsRequestBodyDigest() async throws {
         let privateKey = P256.Signing.PrivateKey()
         let publicKey = privateKey.publicKey
-        let issuer = "did:plc:writer-service"
-        let audience = "did:plc:authority-space"
+        let issuer = "did:plc:bcdefghijklmnopqrstuvwxy"
+        let audience = "did:plc:abcdefghijklmnopqrstuvwx"
         let method = "com.atproto.space.notifyWrite"
         let eventID = "evt-test-1234"
         let space = try SpaceURI(authority: audience, spaceType: "app.bsky.bookmarks", skey: "default")
@@ -1981,8 +2168,8 @@ final class SwanOAuthTests: XCTestCase {
             now: Date()
         )
 
-        let resolver = PinnedSpaceServicePublicKeyResolver(
-            pins: [try PinnedSpaceServicePublicKey(issuer: issuer, publicKey: .p256(publicKey))]
+        let resolver = try PinnedSpaceServicePublicKeyResolver(
+            pins: [PinnedSpaceServicePublicKey(issuer: issuer, generation: 1, publicKey: publicKey)]
         )
         let verifier = DurableSpaceServiceAuthenticationVerifier(publicKeys: resolver)
 

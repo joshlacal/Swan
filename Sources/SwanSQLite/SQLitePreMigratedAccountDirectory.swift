@@ -689,14 +689,16 @@ public actor SQLitePreMigratedAccountDirectory:
 
     public func unregisterSpaceNotification(
         space: SpaceURI,
-        serviceDID: String,
+        ownerServiceDID: String,
+        deliveryServiceDID: String?,
         authorization: AuthorizationContext
     ) async throws {
         let database = try await preopenedCredentialAuthorityDatabase(for: space)
         do {
             try await database.unregisterSpaceNotification(
                 space: space,
-                serviceDID: serviceDID,
+                ownerServiceDID: ownerServiceDID,
+                deliveryServiceDID: deliveryServiceDID,
                 authorization: authorization
             )
             try await requireCredentialAuthorityStillAvailable(space.authority)
@@ -707,6 +709,20 @@ public actor SQLitePreMigratedAccountDirectory:
         } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
+    }
+
+    public func unregisterSpaceNotification(
+        space: SpaceURI,
+        serviceDID: String,
+        authorization: AuthorizationContext
+    ) async throws {
+        let baseDID = serviceIssuerDID(serviceDID) ?? serviceDID
+        try await unregisterSpaceNotification(
+            space: space,
+            ownerServiceDID: baseDID,
+            deliveryServiceDID: serviceDID,
+            authorization: authorization
+        )
     }
 
     public func registerSpaceNotification(
@@ -773,9 +789,6 @@ public actor SQLitePreMigratedAccountDirectory:
         eventID: String,
         requestBodyDigest: String
     ) async throws {
-        // A notification addressed to a PDS that does not host this account
-        // is a successful best-effort no-op. Do not create/migrate an account
-        // database from an incoming audience claim.
         guard let database = try await preopenedActiveDatabaseIfHosted(audience) else {
             return
         }

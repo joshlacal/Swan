@@ -246,7 +246,7 @@ final class PublicLifecycleEmitterTests: XCTestCase {
     )
     let initialSteps = try await sequencer.drainAll(now: epoch)
     XCTAssertEqual(initialSteps, 2)
-    let before = try await firehose.events(after: 0, limit: 10)
+    let before = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(before.count, 3)
 
     try await emitter.emitActivation(
@@ -259,7 +259,7 @@ final class PublicLifecycleEmitterTests: XCTestCase {
     XCTAssertEqual(generation, 1)
     let replaySteps = try await sequencer.drainAll(now: epoch.addingTimeInterval(300))
     XCTAssertEqual(replaySteps, 0)
-    let after = try await firehose.events(after: 0, limit: 10)
+    let after = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(after.map(\.sourceKey), before.map(\.sourceKey))
     XCTAssertEqual(after.map(\.seq), before.map(\.seq))
   }
@@ -292,7 +292,7 @@ final class PublicLifecycleEmitterTests: XCTestCase {
     XCTAssertEqual(replayedPendingSync.count, 1)
     let remainingSteps = try await sequencer.drainAll(now: epoch.addingTimeInterval(300))
     XCTAssertEqual(remainingSteps, 1)
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(events.count, 3)
   }
 
@@ -464,7 +464,7 @@ final class PublicLifecycleEmitterTests: XCTestCase {
       now: epoch.addingTimeInterval(2)
     )
     XCTAssertEqual(drainedAfterRelease, 0)
-    let events = try await firehose.events(after: 0, limit: 20)
+    let events = try await firehose.events(after: 0, limit: 20, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(
       events.map(\.kind),
       [.identity, .account, .account],
@@ -531,7 +531,7 @@ final class PublicLifecycleEmitterTests: XCTestCase {
       now: epoch.addingTimeInterval(2)
     )
     XCTAssertEqual(drainedAfterRelease, 0)
-    let events = try await firehose.events(after: 0, limit: 20)
+    let events = try await firehose.events(after: 0, limit: 20, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(
       events.map(\.kind),
       [.identity, .account, .sync, .account],
@@ -621,5 +621,32 @@ final class PublicLifecycleEmitterTests: XCTestCase {
     } catch let error as PublicLifecycleEmitterError {
       XCTAssertEqual(error, .accountUnavailable("did:web:missing.example"))
     }
+  }
+
+  func testCompletedManualSyncReplayIdempotency() async throws {
+    let requestUUID = UUID().uuidString.lowercased()
+    try await emitter.emitManualSync(did: did, requestUUID: requestUUID, now: epoch)
+
+    let leased = try await account.leaseNextPublicFirehoseOutbox(
+      now: epoch,
+      leaseDuration: 30
+    )
+    let lease = try XCTUnwrap(leased)
+    XCTAssertEqual(
+      lease.row.sourceKey,
+      PublicFirehoseSourceKey.syncManual(did: did, requestUUID: requestUUID)
+    )
+    let completed = try await account.completePublicFirehoseOutboxLease(
+      id: lease.row.id,
+      token: lease.token
+    )
+    XCTAssertTrue(completed)
+
+    // Replay emitManualSync with the same requestUUID
+    try await emitter.emitManualSync(did: did, requestUUID: requestUUID, now: epoch.addingTimeInterval(5))
+
+    // Assert that no new pending item is enqueued
+    let pending = try await account.oldestPendingPublicFirehoseOutbox()
+    XCTAssertNil(pending)
   }
 }

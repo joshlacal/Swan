@@ -1,3 +1,4 @@
+import Crypto
 import Foundation
 import Petrel
 import SQLiteNIO
@@ -211,25 +212,16 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
 
   func testCorruptMaterialInCompletedOutboxAnchorFailsAsCorruptDatabase() async throws {
     try await commitRow()
-    let optionalLease = try await database.leaseNextPublicFirehoseOutbox(
-      now: epoch,
-      leaseDuration: 30
-    )
-    let lease = try XCTUnwrap(optionalLease)
-    let completed = try await database.completePublicFirehoseOutboxLease(
-      id: lease.row.id,
-      token: lease.token
-    )
-    XCTAssertTrue(completed)
     try await database.close()
     database = nil
 
     let raw = try await SQLiteConnection.open(
       storage: .file(path: SQLiteLayout.accountDatabase(in: root, did: did).path)
     )
+    defer { Task { try? await raw.close() } }
     _ = try await raw.query(
-      "UPDATE public_event_outbox SET payload = ? WHERE id = ?",
-      [Data("not-json".utf8).sqliteData!, .integer(Int(lease.row.id))]
+      "UPDATE public_event_outbox SET payload = ? WHERE id = 1",
+      [Data("not-json".utf8).sqliteData!]
     )
     try await raw.close()
 
@@ -253,16 +245,6 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
 
   func testDecodableButInvalidCommitMaterialInCompletedAnchorFailsAsCorruptDatabase() async throws {
     try await commitRow()
-    let optionalLease = try await database.leaseNextPublicFirehoseOutbox(
-      now: epoch,
-      leaseDuration: 30
-    )
-    let lease = try XCTUnwrap(optionalLease)
-    let completed = try await database.completePublicFirehoseOutboxLease(
-      id: lease.row.id,
-      token: lease.token
-    )
-    XCTAssertTrue(completed)
     try await database.close()
     database = nil
 
@@ -276,9 +258,10 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
     let raw = try await SQLiteConnection.open(
       storage: .file(path: SQLiteLayout.accountDatabase(in: root, did: did).path)
     )
+    defer { Task { try? await raw.close() } }
     _ = try await raw.query(
-      "UPDATE public_event_outbox SET payload = ? WHERE id = ?",
-      [invalidPayload.sqliteData!, .integer(Int(lease.row.id))]
+      "UPDATE public_event_outbox SET payload = ? WHERE id = 1",
+      [invalidPayload.sqliteData!]
     )
     try await raw.close()
 
@@ -317,16 +300,6 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
       carBytes: originalCAR,
       now: epoch
     )
-    let optionalLease = try await database.leaseNextPublicFirehoseOutbox(
-      now: epoch,
-      leaseDuration: 30
-    )
-    let lease = try XCTUnwrap(optionalLease)
-    let completed = try await database.completePublicFirehoseOutboxLease(
-      id: lease.row.id,
-      token: lease.token
-    )
-    XCTAssertTrue(completed)
     try await database.close()
     database = nil
 
@@ -337,9 +310,10 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
     let raw = try await SQLiteConnection.open(
       storage: .file(path: SQLiteLayout.accountDatabase(in: root, did: did).path)
     )
+    defer { Task { try? await raw.close() } }
     _ = try await raw.query(
-      "UPDATE public_event_outbox SET car_bytes = ? WHERE id = ?",
-      [oversizedCAR.sqliteData!, .integer(Int(lease.row.id))]
+      "UPDATE public_event_outbox SET car_bytes = ? WHERE id = 1",
+      [oversizedCAR.sqliteData!]
     )
     try await raw.close()
 
@@ -363,25 +337,16 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
 
   func testMalformedCARInCompletedAnchorFailsAsCorruptDatabase() async throws {
     try await commitRow()
-    let optionalLease = try await database.leaseNextPublicFirehoseOutbox(
-      now: epoch,
-      leaseDuration: 30
-    )
-    let lease = try XCTUnwrap(optionalLease)
-    let completed = try await database.completePublicFirehoseOutboxLease(
-      id: lease.row.id,
-      token: lease.token
-    )
-    XCTAssertTrue(completed)
     try await database.close()
     database = nil
 
     let raw = try await SQLiteConnection.open(
       storage: .file(path: SQLiteLayout.accountDatabase(in: root, did: did).path)
     )
+    defer { Task { try? await raw.close() } }
     _ = try await raw.query(
-      "UPDATE public_event_outbox SET car_bytes = ? WHERE id = ?",
-      [Data("not-a-car".utf8).sqliteData!, .integer(Int(lease.row.id))]
+      "UPDATE public_event_outbox SET car_bytes = ? WHERE id = 1",
+      [Data("not-a-car".utf8).sqliteData!]
     )
     try await raw.close()
 
@@ -398,16 +363,6 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
 
   func testInvalidTimeInCompletedAnchorFailsAsCorruptDatabase() async throws {
     try await commitRow()
-    let optionalLease = try await database.leaseNextPublicFirehoseOutbox(
-      now: epoch,
-      leaseDuration: 30
-    )
-    let lease = try XCTUnwrap(optionalLease)
-    let completed = try await database.completePublicFirehoseOutboxLease(
-      id: lease.row.id,
-      token: lease.token
-    )
-    XCTAssertTrue(completed)
     try await database.close()
     database = nil
 
@@ -425,9 +380,10 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
     let raw = try await SQLiteConnection.open(
       storage: .file(path: SQLiteLayout.accountDatabase(in: root, did: did).path)
     )
+    defer { Task { try? await raw.close() } }
     _ = try await raw.query(
-      "UPDATE public_event_outbox SET payload = ? WHERE id = ?",
-      [invalidPayload.sqliteData!, .integer(Int(lease.row.id))]
+      "UPDATE public_event_outbox SET payload = ? WHERE id = 1",
+      [invalidPayload.sqliteData!]
     )
     try await raw.close()
 
@@ -441,7 +397,6 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
       }
     }
   }
-
   func testSameSourceKeyWithChangedContentThrowsConflict() async throws {
     try await commitRow()
     for (kind, generation, payload, car) in [
@@ -663,11 +618,44 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
 
     let databasePath = SQLiteLayout.accountDatabase(in: root, did: did).path
     let legacy = try await SQLiteConnection.open(storage: .file(path: databasePath))
+    defer { Task { try? await legacy.close() } }
     _ = try await legacy.query(
-      "DELETE FROM permissioned_repository_migrations WHERE version = 14"
+      "DELETE FROM permissioned_repository_migrations WHERE version >= 14"
+    )
+    _ = try await legacy.query("DROP TABLE IF EXISTS public_event_outbox_legacy")
+    _ = try await legacy.query("DROP TABLE IF EXISTS public_event_outbox")
+    _ = try await legacy.query(
+      """
+      CREATE TABLE public_event_outbox (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          source_key TEXT NOT NULL UNIQUE,
+          kind TEXT NOT NULL CHECK(kind IN ('commit', 'sync')),
+          lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK(lifecycle_generation >= 0),
+          payload BLOB NOT NULL CHECK(length(payload) > 0),
+          car_bytes BLOB NOT NULL CHECK(length(car_bytes) > 0),
+          attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+          created_at INTEGER NOT NULL CHECK(created_at >= 0),
+          available_at INTEGER NOT NULL CHECK(available_at >= 0),
+          lease_token TEXT,
+          lease_expires_at INTEGER
+      )
+      """
     )
     _ = try await legacy.query(
-      "ALTER TABLE public_event_outbox DROP COLUMN completed"
+      """
+      INSERT INTO public_event_outbox(
+          id, source_key, kind, lifecycle_generation, payload, car_bytes,
+          attempts, created_at, available_at, lease_token, lease_expires_at
+      ) VALUES
+      (1, ?, 'commit', 0, ?, ?, 0, ?, ?, NULL, NULL)
+      """,
+      [
+        .text(pendingBeforeUpgrade[0].sourceKey),
+        pendingBeforeUpgrade[0].payload.sqliteData!,
+        pendingBeforeUpgrade[0].carBytes.sqliteData!,
+        .integer(Int(pendingBeforeUpgrade[0].createdAt)),
+        .integer(Int(pendingBeforeUpgrade[0].availableAt)),
+      ]
     )
     let preUpgradeLedger = try await legacy.query(
       "SELECT version FROM permissioned_repository_migrations WHERE version IN (13, 14) ORDER BY version"
@@ -701,17 +689,244 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
     )
     defer { Task { try? await raw.close() } }
     let ledger = try await raw.query(
-      "SELECT version FROM permissioned_repository_migrations WHERE version IN (13, 14) ORDER BY version"
+      "SELECT version FROM permissioned_repository_migrations WHERE version IN (13, 14, 19) ORDER BY version"
     )
-    XCTAssertEqual(ledger.compactMap { $0.column("version")?.integer }, [13, 14])
+    XCTAssertEqual(ledger.compactMap { $0.column("version")?.integer }, [13, 14, 19])
     let columns = try await raw.query("PRAGMA table_info(public_event_outbox)")
     XCTAssertTrue(columns.contains { $0.column("name")?.string == "completed" })
+    XCTAssertTrue(columns.contains { $0.column("name")?.string == "payload_digest" })
     let migratedRows = try await raw.query(
       "SELECT source_key, completed FROM public_event_outbox"
     )
     XCTAssertEqual(migratedRows.count, 1)
     XCTAssertEqual(migratedRows[0].column("source_key")?.string, pendingBeforeUpgrade[0].sourceKey)
     XCTAssertEqual(migratedRows[0].column("completed")?.integer, 0)
+  }
+
+  func testCompletedOutboxNullsPayloadAndCarBytesAndRetainsDigests() async throws {
+    let payload = try validCommitPayload()
+    let car = try await validCommitCAR()
+    try await commitRow(payload: payload, carBytes: car)
+
+    let optionalLease = try await database.leaseNextPublicFirehoseOutbox(
+      now: epoch,
+      leaseDuration: 30
+    )
+    let lease = try XCTUnwrap(optionalLease)
+    let completed = try await database.completePublicFirehoseOutboxLease(
+      id: lease.row.id,
+      token: lease.token
+    )
+    XCTAssertTrue(completed)
+
+    try await database.close()
+    database = nil
+
+    let raw = try await SQLiteConnection.open(
+      storage: .file(path: SQLiteLayout.accountDatabase(in: root, did: did).path)
+    )
+    defer { Task { try? await raw.close() } }
+    let rows = try await raw.query(
+      """
+      SELECT payload, car_bytes, payload_digest, car_digest, completed
+      FROM public_event_outbox WHERE id = ?
+      """,
+      [.integer(Int(lease.row.id))]
+    )
+    XCTAssertEqual(rows.count, 1)
+    let row = rows[0]
+    XCTAssertEqual(row.column("completed")?.integer, 1)
+    XCTAssertNil(row.column("payload")?.blob)
+    XCTAssertNil(row.column("car_bytes")?.blob)
+    let expectedPayloadDigest = Data(SHA256.hash(data: payload))
+    let expectedCarDigest = Data(SHA256.hash(data: car))
+    XCTAssertEqual(row.column("payload_digest")?.blob.map { Data($0.readableBytesView) }, expectedPayloadDigest)
+    XCTAssertEqual(row.column("car_digest")?.blob.map { Data($0.readableBytesView) }, expectedCarDigest)
+
+    database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+
+    // Exact replay with identical material succeeds (returns false)
+    let replayed = try await database.enqueuePublicFirehoseEvent(
+      sourceKey: "did:plc:abc|commit|bafy1",
+      kind: .commit,
+      lifecycleGeneration: 0,
+      payload: payload,
+      carBytes: car,
+      now: epoch.addingTimeInterval(300)
+    )
+    XCTAssertFalse(replayed)
+
+    // Changed material conflicts
+    do {
+      _ = try await database.enqueuePublicFirehoseEvent(
+        sourceKey: "did:plc:abc|commit|bafy1",
+        kind: .commit,
+        lifecycleGeneration: 0,
+        payload: payload,
+        carBytes: try await PublicFirehoseDiffCAR.commitOnly(
+          commitCID: CID.fromDAGCBOR(Data([0x09, 0x08, 0x07])),
+          commitBytes: Data([0x09, 0x08, 0x07])
+        ),
+        now: epoch.addingTimeInterval(300)
+      )
+      XCTFail("expected conflict error")
+    } catch let error as SQLiteRepositoryError {
+      guard case .conflictingPublicFirehoseSourceKey = error else {
+        return XCTFail("expected conflictingPublicFirehoseSourceKey, got \(error)")
+      }
+    }
+  }
+
+  func testMigrationCompactsPreExistingCompletedRows() async throws {
+    try await database.close()
+    database = nil
+
+    let payload1 = try validCommitPayload()
+    let car1 = try await validCommitCAR()
+    let payload2 = Data("test-payload-2".utf8)
+    let car2 = Data("test-car-2".utf8)
+
+    let databasePath = SQLiteLayout.accountDatabase(in: root, did: did).path
+    let raw = try await SQLiteConnection.open(storage: .file(path: databasePath))
+
+    // Simulate v14 schema before compaction migration
+    _ = try await raw.query(
+      "DELETE FROM permissioned_repository_migrations WHERE version >= 19"
+    )
+    _ = try await raw.query("DROP TABLE IF EXISTS public_event_outbox_legacy")
+    _ = try await raw.query("DROP TABLE IF EXISTS public_event_outbox")
+    _ = try await raw.query(
+      """
+      CREATE TABLE public_event_outbox (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          source_key TEXT NOT NULL UNIQUE,
+          kind TEXT NOT NULL CHECK(kind IN ('commit', 'sync')),
+          lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK(lifecycle_generation >= 0),
+          payload BLOB NOT NULL CHECK(length(payload) > 0),
+          car_bytes BLOB NOT NULL CHECK(length(car_bytes) > 0),
+          attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+          created_at INTEGER NOT NULL CHECK(created_at >= 0),
+          available_at INTEGER NOT NULL CHECK(available_at >= 0),
+          lease_token TEXT,
+          lease_expires_at INTEGER,
+          completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1))
+      )
+      """
+    )
+    _ = try await raw.query(
+      """
+      INSERT INTO public_event_outbox(
+          id, source_key, kind, lifecycle_generation, payload, car_bytes,
+          attempts, created_at, available_at, lease_token, lease_expires_at, completed
+      ) VALUES
+      (1, 'key1', 'commit', 0, ?, ?, 0, 1000, 1000, NULL, NULL, 1),
+      (2, 'key2', 'commit', 0, ?, ?, 0, 1000, 1000, NULL, NULL, 0)
+      """,
+      [
+        payload1.sqliteData!, car1.sqliteData!,
+        payload2.sqliteData!, car2.sqliteData!
+      ]
+    )
+    try await raw.close()
+
+    // Open through SQLiteAccountDatabase to trigger migration
+    database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+    try await database.close()
+    database = nil
+
+    let verifiedRaw = try await SQLiteConnection.open(storage: .file(path: databasePath))
+    defer { Task { try? await verifiedRaw.close() } }
+
+    let row1 = try await verifiedRaw.query(
+      "SELECT payload, car_bytes, payload_digest, car_digest, completed FROM public_event_outbox WHERE id = 1"
+    )
+    XCTAssertEqual(row1.count, 1)
+    XCTAssertEqual(row1[0].column("completed")?.integer, 1)
+    XCTAssertNil(row1[0].column("payload")?.blob)
+    XCTAssertNil(row1[0].column("car_bytes")?.blob)
+    XCTAssertEqual(row1[0].column("payload_digest")?.blob.map { Data($0.readableBytesView) }, Data(SHA256.hash(data: payload1)))
+    XCTAssertEqual(row1[0].column("car_digest")?.blob.map { Data($0.readableBytesView) }, Data(SHA256.hash(data: car1)))
+
+    let row2 = try await verifiedRaw.query(
+      "SELECT payload, car_bytes, payload_digest, car_digest, completed FROM public_event_outbox WHERE id = 2"
+    )
+    XCTAssertEqual(row2.count, 1)
+    XCTAssertEqual(row2[0].column("completed")?.integer, 0)
+    XCTAssertEqual(row2[0].column("payload")?.blob.map { Data($0.readableBytesView) }, payload2)
+    XCTAssertEqual(row2[0].column("car_bytes")?.blob.map { Data($0.readableBytesView) }, car2)
+    XCTAssertEqual(row2[0].column("payload_digest")?.blob.map { Data($0.readableBytesView) }, Data(SHA256.hash(data: payload2)))
+    XCTAssertEqual(row2[0].column("car_digest")?.blob.map { Data($0.readableBytesView) }, Data(SHA256.hash(data: car2)))
+  }
+
+  func testPreCompletionCrashRetainsExactReplayBytes() async throws {
+    let payload = try validCommitPayload()
+    let car = try await validCommitCAR()
+    try await commitRow(payload: payload, carBytes: car)
+
+    // Simulate crash before completion by closing and reopening
+    try await database.close()
+    database = nil
+
+    database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+
+    let pending = try await database.pendingPublicFirehoseOutbox()
+    XCTAssertEqual(pending.count, 1)
+    XCTAssertEqual(pending[0].payload, payload)
+    XCTAssertEqual(pending[0].carBytes, car)
+
+    let optionalLease = try await database.leaseNextPublicFirehoseOutbox(
+      now: epoch,
+      leaseDuration: 30
+    )
+    let lease = try XCTUnwrap(optionalLease)
+    XCTAssertEqual(lease.row.payload, payload)
+    XCTAssertEqual(lease.row.carBytes, car)
+
+    let completed = try await database.completePublicFirehoseOutboxLease(
+      id: lease.row.id,
+      token: lease.token
+    )
+    XCTAssertTrue(completed)
+  }
+
+  func testCompletedManualSyncReplayReturnsFalseIdempotently() async throws {
+    let payload = try validCommitPayload()
+    let car = try await PublicFirehoseDiffCAR.commitOnly(
+      commitCID: CID.fromDAGCBOR(commitBytes),
+      commitBytes: commitBytes
+    )
+    let sourceKey = "did:plc:abc|sync:manual|test-uuid-12345"
+    let enqueued = try await database.enqueueAuthoritativeManualSyncEvent(
+      sourceKey: sourceKey,
+      lifecycleGeneration: 0,
+      payload: payload,
+      carBytes: car,
+      now: epoch
+    )
+    XCTAssertTrue(enqueued)
+
+    let optionalLease = try await database.leaseNextPublicFirehoseOutbox(
+      now: epoch.addingTimeInterval(1),
+      leaseDuration: 30
+    )
+    let lease = try XCTUnwrap(optionalLease)
+    XCTAssertEqual(lease.row.sourceKey, sourceKey)
+    XCTAssertEqual(lease.row.kind, .sync)
+
+    let completed = try await database.completePublicFirehoseOutboxLease(
+      id: lease.row.id,
+      token: lease.token
+    )
+    XCTAssertTrue(completed)
+
+    let replayed = try await database.enqueueAuthoritativeManualSyncEvent(
+      sourceKey: sourceKey,
+      lifecycleGeneration: 0,
+      payload: payload,
+      carBytes: car,
+      now: epoch.addingTimeInterval(10)
+    )
+    XCTAssertFalse(replayed, "completed manual sync replay must return false idempotently without decoding NULL bytes")
   }
 }
 

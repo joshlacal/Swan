@@ -34,10 +34,12 @@ final class ReferenceAdminIdentityTests: XCTestCase {
     }
 
     func testAdminLifecycleIsOperatorOnlyAndAudited() async throws {
+        let secretFile = try createOperatorSecretFile()
+        defer { try? FileManager.default.removeItem(at: secretFile.deletingLastPathComponent()) }
         let audit = ReferenceAdminAuditRecorder()
         let mutation = RecordingAdminMutation()
         let admin = ReferenceAdminLifecycleService(mutation: mutation, audit: audit)
-        let authorization = try OperatorSecretResolver.authorize(environment: ["SWAN_OPERATOR_SECRET": "secret"], secretFile: nil)
+        let authorization = try OperatorSecretResolver.authorize(secretFile: secretFile)
         let result = try await admin.suspend(accountDID: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", reason: "abuse", authorization: authorization)
         XCTAssertEqual(result.status, .suspended)
         let events = await audit.events
@@ -46,16 +48,27 @@ final class ReferenceAdminIdentityTests: XCTestCase {
     }
 
     func testAdminDoesNotAuditWhenMutationFails() async throws {
+        let secretFile = try createOperatorSecretFile()
+        defer { try? FileManager.default.removeItem(at: secretFile.deletingLastPathComponent()) }
         let audit = ReferenceAdminAuditRecorder()
         let mutation = RecordingAdminMutation(shouldFail: true)
         let admin = ReferenceAdminLifecycleService(mutation: mutation, audit: audit)
-        let authorization = try OperatorSecretResolver.authorize(environment: ["SWAN_OPERATOR_SECRET": "secret"], secretFile: nil)
+        let authorization = try OperatorSecretResolver.authorize(secretFile: secretFile)
         do {
             _ = try await admin.suspend(accountDID: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", reason: "abuse", authorization: authorization)
             XCTFail("mutation unexpectedly succeeded")
         } catch { }
         let events = await audit.events
         XCTAssertEqual(events.count, 0)
+    }
+
+    private func createOperatorSecretFile() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "AdminTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appending(path: "operator-secret")
+        try Data("secret\n".utf8).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        return file
     }
 }
 

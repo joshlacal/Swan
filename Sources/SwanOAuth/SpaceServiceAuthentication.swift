@@ -5,7 +5,7 @@ import PetrelPLC
 import SwanAccounts
 import SwanCore
 import SwanSpaces
-
+import SwanStorage
 /// The verified, route-bound subset of an AT Protocol service JWT. It is not
 /// an OAuth authorization context: callers must still apply their endpoint's
 /// `iss`, `aud`, and `lxm` requirements before invoking storage.
@@ -14,8 +14,24 @@ public struct VerifiedSpaceServiceAuthentication: Sendable, Equatable {
     public let audience: String
     public let method: String
     public let eventID: String
-    public let expiresAt: Date
     public let requestBodyDigest: String?
+    public let expiresAt: Date
+
+    public init(
+        issuer: String,
+        audience: String,
+        method: String,
+        eventID: String,
+        requestBodyDigest: String? = nil,
+        expiresAt: Date
+    ) {
+        self.issuer = issuer
+        self.audience = audience
+        self.method = method
+        self.eventID = eventID
+        self.requestBodyDigest = requestBodyDigest
+        self.expiresAt = expiresAt
+    }
 
     public init(
         issuer: String,
@@ -29,8 +45,8 @@ public struct VerifiedSpaceServiceAuthentication: Sendable, Equatable {
         self.audience = audience
         self.method = method
         self.eventID = eventID
-        self.expiresAt = expiresAt
         self.requestBodyDigest = requestBodyDigest
+        self.expiresAt = expiresAt
     }
 }
 
@@ -41,10 +57,6 @@ public protocol SpaceServicePublicKeyResolver: Sendable {
     func publicKey(for issuer: String) async throws -> PermissionedDataJWTVerificationKey?
 }
 
-/// Verifies the exact service JWT shape accepted by the pinned PDS handlers.
-/// It intentionally has no replay cache: notification idempotence is a
-/// per-authority SQLite transaction so receiver restart and reordering retain
-/// the same convergence behavior.
 public protocol SpaceServiceAuthenticationVerifier: Sendable {
     func authenticate(
         _ compact: String,
@@ -249,7 +261,6 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
         self.publicKeys = publicKeys
         self.configuration = configuration
     }
-
     public func authenticate(
         _ compact: String,
         expectedAudience: String?,
@@ -257,7 +268,12 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
         expectedRequestBodyDigest: String? = nil,
         now: Date = Date()
     ) async throws -> VerifiedSpaceServiceAuthentication {
-        let inspected = try SpaceServiceJWT.inspect(compact)
+        let inspected: SpaceServiceJWT.Inspection
+        do {
+            inspected = try SpaceServiceJWT.inspect(compact)
+        } catch {
+            throw SwanError.unauthorized("service authentication is invalid")
+        }
         guard let method = inspected.claims.lxm,
               validServiceMethod(method),
               method == expectedMethod,
@@ -267,16 +283,21 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
               let key = try await publicKeys.publicKey(for: inspected.claims.iss) else {
             throw SwanError.unauthorized("service authentication is invalid")
         }
-        let claims = try SpaceServiceJWT.verify(
-            compact,
-            publicKey: key,
-            expectedAudience: expectedAudience,
-            expectedMethod: expectedMethod,
-            expectedRequestBodyDigest: expectedRequestBodyDigest,
-            now: now,
-            clockSkew: configuration.clockSkew,
-            maximumLifetime: configuration.maximumLifetime
-        )
+        let claims: SpaceServiceJWT.Claims
+        do {
+            claims = try SpaceServiceJWT.verify(
+                compact,
+                publicKey: key,
+                expectedAudience: expectedAudience,
+                expectedMethod: expectedMethod,
+                expectedRequestBodyDigest: expectedRequestBodyDigest,
+                now: now,
+                clockSkew: configuration.clockSkew,
+                maximumLifetime: configuration.maximumLifetime
+            )
+        } catch {
+            throw SwanError.unauthorized("service authentication is invalid")
+        }
         guard claims.lxm == expectedMethod,
               validServiceMethod(expectedMethod),
               expectedAudience.map({ claims.aud == $0 }) ?? true,
@@ -289,8 +310,8 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
             audience: claims.aud,
             method: expectedMethod,
             eventID: eventID,
-            expiresAt: Date(timeIntervalSince1970: TimeInterval(claims.exp)),
-            requestBodyDigest: claims.requestBodyDigest
+            requestBodyDigest: claims.requestBodyDigest,
+            expiresAt: Date(timeIntervalSince1970: TimeInterval(claims.exp))
         )
     }
 }
@@ -380,19 +401,6 @@ public struct LocalAccountSpaceServiceAuthenticationIssuer: SpaceServiceAuthenti
         )
     }
 }
-
-
-private func serviceIssuerDID(_ value: String) -> String? {
-    let parts = value.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
-    guard (1 ... 2).contains(parts.count),
-          !parts[0].isEmpty,
-          (parts.count == 1 || (!parts[1].isEmpty && parts[1].utf8.count <= 512)),
-          let did = try? AccountIdentifiers.validateDID(String(parts[0])) else {
-        return nil
-    }
-    return did
-}
-
 private func validServiceAudience(_ value: String) -> Bool {
     !value.isEmpty && value.utf8.count <= 4_096 && value.utf8.allSatisfy { $0 >= 0x21 && $0 <= 0x7e }
 }

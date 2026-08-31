@@ -139,7 +139,7 @@ struct ServeNotificationRuntime {
     /// decode answers `false`, which cannot widen anything: ``load(from:continuityStore:)``
     /// owns the diagnostics for an unusable file and refuses the same file a
     /// few lines later with a message that names the flag.
-    static func selectsLaboratoryPLC(from url: URL) -> Bool {
+    static func selectsLaboratoryPLC(from data: Data) -> Bool {
         struct LaboratorySelection: Decodable {
             struct PLC: Decodable {
                 let laboratory: Bool?
@@ -148,25 +148,63 @@ struct ServeNotificationRuntime {
             let credentialKeyPLC: PLC?
             let delegationKeyPLC: PLC?
         }
-        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
-              data.count > 0, data.count <= 256 * 1_024,
+        guard data.count > 0, data.count <= 256 * 1_024,
               let selection = try? JSONDecoder()
               .decode(LaboratorySelection.self, from: data)
         else { return false }
         return (selection.credentialKeyPLC?.laboratory ?? false)
             || (selection.delegationKeyPLC?.laboratory ?? false)
     }
-
+    static func selectsLaboratoryPLC(from url: URL) -> Bool {
+        guard let data = try? readBoundedRegularFileNoFollow(
+            url,
+            maximumBytes: 256 * 1_024,
+            validationMessage: "--notification-config is unavailable"
+        ) else { return false }
+        return selectsLaboratoryPLC(from: data)
+    }
     static func load(
         from url: URL,
         continuityStore: any PLCCredentialKeyContinuityStore
     ) throws -> ServeNotificationRuntime {
-        let data: Data
-        do {
-            data = try Data(contentsOf: url, options: [.mappedIfSafe])
-        } catch {
-            throw ValidationError("--notification-config is unavailable")
+        let data = try readBoundedRegularFileNoFollow(
+            url,
+            maximumBytes: 256 * 1_024,
+            validationMessage: "--notification-config is unavailable"
+        )
+        return try load(from: data, continuityStore: continuityStore)
+    }
+    struct ValidatedStartupMaterial: Sendable {
+        let rawData: Data
+        let selectsLaboratoryPLC: Bool
+    }
+
+    /// Preflights and reads the notification configuration file once from disk
+    /// through a bounded descriptor read, returning immutable startup material
+    /// that cannot be mutated by later file swaps or link races.
+    static func preflight(
+        fromFile file: String?
+    ) throws -> ValidatedStartupMaterial? {
+        guard let file, !file.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
         }
+        let url = URL(fileURLWithPath: file)
+        let data = try readBoundedRegularFileNoFollow(
+            url,
+            maximumBytes: 256 * 1_024,
+            validationMessage: "--notification-config is unavailable"
+        )
+        guard data.count > 0, data.count <= 256 * 1_024 else {
+            throw ValidationError("--notification-config has invalid size")
+        }
+        let lab = selectsLaboratoryPLC(from: data)
+        return ValidatedStartupMaterial(rawData: data, selectsLaboratoryPLC: lab)
+    }
+
+    static func load(
+        from data: Data,
+        continuityStore: any PLCCredentialKeyContinuityStore
+    ) throws -> ServeNotificationRuntime {
         guard data.count > 0, data.count <= 256 * 1_024 else {
             throw ValidationError("--notification-config has invalid size")
         }
@@ -1084,50 +1122,16 @@ private func decodeBase64URLOAuthServerKey(_ value: Data) throws -> Data {
     return key
 }
 
-private func readOAuthServerKeyFile(_ url: URL) throws -> Data {
-    let descriptor: Int32 = url.withUnsafeFileSystemRepresentation { path in
-        guard let path else { return Int32(-1) }
-        return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
-    }
-    guard descriptor >= 0 else { throw ValidationError("oauth-server-key file is unavailable") }
-    defer { _ = close(descriptor) }
-
-    var metadata = stat()
-    guard fstat(descriptor, &metadata) == 0,
-          (metadata.st_mode & S_IFMT) == S_IFREG,
-          metadata.st_uid == geteuid(),
-          (metadata.st_mode & (S_IRWXG | S_IRWXO)) == 0,
-          metadata.st_size > 0,
-          metadata.st_size <= off_t(256) else {
-        throw ValidationError("oauth-server-key file is unavailable")
-    }
-
-    do {
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
-        let raw = try handle.read(upToCount: 259) ?? Data()
-        guard raw.count <= 258 else {
-            throw ValidationError("oauth-server-key file is invalid")
-        }
-        return try decodeBase64URLOAuthServerKey(raw)
-    } catch let error as ValidationError {
-        throw error
-    } catch {
-        throw ValidationError("oauth-server-key is unavailable")
-    }
-}
-
-/// Opens and validates one pathname exactly once, then performs the bounded
-/// read through that descriptor. `O_NOFOLLOW` prevents a symlink swap from
-/// turning the preflight check into authority to read a different file.
 private func readBoundedRegularFileNoFollow(
     _ url: URL,
     maximumBytes: Int,
+    requireOwnerOnly: Bool = false,
     validationMessage: String
 ) throws -> Data {
     guard maximumBytes > 0 else { throw ValidationError(validationMessage) }
     let descriptor = url.withUnsafeFileSystemRepresentation { path in
         guard let path else { return Int32(-1) }
-        return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
     }
     guard descriptor >= 0 else { throw ValidationError(validationMessage) }
     defer { _ = close(descriptor) }
@@ -1135,9 +1139,15 @@ private func readBoundedRegularFileNoFollow(
     var metadata = stat()
     guard fstat(descriptor, &metadata) == 0,
           (metadata.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+          (!requireOwnerOnly || (metadata.st_uid == geteuid() && (metadata.st_mode & (S_IRWXG | S_IRWXO)) == 0)),
           metadata.st_size > 0,
           metadata.st_size <= off_t(maximumBytes) else {
         throw ValidationError(validationMessage)
+    }
+
+    let flags = fcntl(descriptor, F_GETFL)
+    if flags >= 0 {
+        _ = fcntl(descriptor, F_SETFL, flags & ~O_NONBLOCK)
     }
 
     var data = Data()
@@ -1164,6 +1174,42 @@ private func readBoundedRegularFileNoFollow(
         throw ValidationError(validationMessage)
     }
     return data
+}
+
+private func readOAuthServerKeyFile(_ url: URL) throws -> Data {
+    let raw = try readBoundedRegularFileNoFollow(
+        url,
+        maximumBytes: 258,
+        requireOwnerOnly: true,
+        validationMessage: "oauth-server-key file is unavailable"
+    )
+    return try decodeBase64URLOAuthServerKey(raw)
+}
+
+private func readOwnerOnlySecretFile(
+    _ url: URL,
+    maximumBytes: Int = 4 * 1_024,
+    validationMessage: String
+) throws -> String {
+    let data = try readBoundedRegularFileNoFollow(
+        url,
+        maximumBytes: maximumBytes + 2,
+        requireOwnerOnly: true,
+        validationMessage: validationMessage
+    )
+    var normalized = data
+    if normalized.last == 0x0A {
+        normalized.removeLast()
+        if normalized.last == 0x0D {
+            normalized.removeLast()
+        }
+    }
+    guard !normalized.isEmpty,
+          !normalized.contains(0),
+          let string = String(data: normalized, encoding: .utf8) else {
+        throw ValidationError(validationMessage)
+    }
+    return string
 }
 
 struct RelayVerifierManifest: Decodable {
@@ -1764,7 +1810,7 @@ extension SwanCommand {
             let keyConfiguration: AccountKeyEncryptionConfiguration
             do {
                 canonicalDID = try AccountIdentifiers.validateDID(did)
-                keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                keyConfiguration = try AccountProvisioningSecrets.requiredMountedAccountKeyConfiguration(
                     activeKeyID: accountKEKID,
                     secretFile: URL(fileURLWithPath: accountKEKFile)
                 )
@@ -1954,7 +2000,7 @@ extension SwanCommand {
 
         @Option(
             name: .customLong("oauth-server-key-file"),
-            help: "Owner-only mounted file containing the URL-safe-base64 OAuth server key; SWAN_OAUTH_SERVER_KEY is the legacy alternative"
+            help: "Owner-only mounted file containing the URL-safe-base64 OAuth server key"
         )
         var oauthServerKeyFile: String?
 
@@ -2006,7 +2052,7 @@ extension SwanCommand {
         @Option(name: .customLong("management-deletion-plc-reference-compatibility"), help: "Pinned permanent-deletion PLC submit compatibility; only did-plc-server-0.0.1 is supported")
         var managementDeletionPLCReferenceCompatibility: String?
 
-        @Option(name: .customLong("management-account-kek-file"), help: "Owner-only mounted account-KEK file for management PLC provisioning/deletion; SWAN_ACCOUNT_KEK is the alternative")
+        @Option(name: .customLong("management-account-kek-file"), help: "Owner-only mounted account-KEK file for management PLC provisioning/deletion")
         var managementAccountKEKFile: String?
 
         @Option(name: .customLong("management-account-kek-id"), help: "Active account-KEK identifier for management PLC provisioning/deletion")
@@ -2051,7 +2097,7 @@ extension SwanCommand {
         )
         var publicFirehoseRetentionIntervalSeconds: Int64 = 60
 
-        @Option(name: .customLong("notification-account-kek-file"), help: "Owner-only mounted account-KEK file for notification signing; SWAN_ACCOUNT_KEK is the alternative")
+        @Option(name: .customLong("notification-account-kek-file"), help: "Owner-only mounted account-KEK file for notification signing")
         var notificationAccountKEKFile: String?
 
         @Option(name: .customLong("notification-account-kek-id"), help: "Active account-KEK identifier for notification signing (default: primary)")
@@ -3467,13 +3513,12 @@ extension SwanCommand {
             // known and before the control database, key stores, or any
             // listener exist, so a refused configuration leaves no state
             // behind.
+            let notificationStartupMaterial = try ServeNotificationRuntime.preflight(
+                fromFile: notificationConfig
+            )
             try Self.requireLaboratoryPLCStaysOffPublicOrigins(
                 notificationConfigurationSelectsLaboratoryPLC:
-                notificationConfig.map {
-                    ServeNotificationRuntime.selectsLaboratoryPLC(
-                        from: URL(fileURLWithPath: $0)
-                    )
-                } ?? false,
+                notificationStartupMaterial?.selectsLaboratoryPLC ?? false,
                 publicURL: baseURL
             )
             try Self.requireMetadataIPAllowlistStaysOffPublicOrigins(
@@ -3811,9 +3856,9 @@ extension SwanCommand {
                         UnavailableSpaceCredentialClientAttestationPolicy()
                 }
                 let notificationRuntime: ServeNotificationRuntime?
-                if let notificationConfig {
+                if let notificationStartupMaterial {
                     notificationRuntime = try ServeNotificationRuntime.load(
-                        from: URL(fileURLWithPath: notificationConfig),
+                        from: notificationStartupMaterial.rawData,
                         continuityStore: controlDatabase
                     )
                 } else {
@@ -3872,9 +3917,12 @@ extension SwanCommand {
                     } else {
                         let keyStore: FileAccountKeyStore
                         do {
-                            let keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                            guard let notificationAccountKEKFile else {
+                                throw ValidationError("notification account signing key store is unavailable")
+                            }
+                            let keyConfiguration = try AccountProvisioningSecrets.requiredMountedAccountKeyConfiguration(
                                 activeKeyID: notificationAccountKEKID ?? "primary",
-                                secretFile: notificationAccountKEKFile.map { URL(fileURLWithPath: $0) }
+                                secretFile: URL(fileURLWithPath: notificationAccountKEKFile)
                             )
                             let keyDirectory = notificationAccountKeyDirectory.map {
                                 URL(fileURLWithPath: $0)
@@ -4138,7 +4186,7 @@ extension SwanCommand {
                             // lifecycle snapshot than login.
                             accounts: accountProgramAccounts,
                             directory: SwanDurableLegacySessionDirectory(store: controlDatabase),
-                            rateLimiter: SwanInProcessLegacySessionRateLimiter(),
+                            loginClientIdentityPolicy: loginClientIdentityPolicy,
                             serviceAuthIssuer: legacySessionServiceAuthIssuer
                         )
                     } catch let error as ValidationError {
@@ -4241,10 +4289,12 @@ extension SwanCommand {
                             database: controlDatabase,
                             signupSecret: signupSecret
                         )
+                        let signupRateAdmission = try SignupInviteRateAdmission()
                         let service = SignupService(
                             policy: policyService,
                             store: controlDatabase,
                             turnstile: turnstile,
+                            rateAdmission: signupRateAdmission,
                             proofVerifier: BoundedSignupEmailProofVerifier(
                                 store: controlDatabase
                             ),
@@ -4535,9 +4585,12 @@ extension SwanCommand {
                 let managementKeyStore: FileAccountKeyStore?
                 if managementNeedsAccountKeyStore {
                     do {
-                        let keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                        guard let managementAccountKEKFile else {
+                            throw ValidationError("management account key store is unavailable")
+                        }
+                        let keyConfiguration = try AccountProvisioningSecrets.requiredMountedAccountKeyConfiguration(
                             activeKeyID: managementAccountKEKID ?? "primary",
-                            secretFile: managementAccountKEKFile.map { URL(fileURLWithPath: $0) }
+                            secretFile: URL(fileURLWithPath: managementAccountKEKFile)
                         )
                         let keyDirectory = managementAccountKeyDirectory.map {
                             URL(fileURLWithPath: $0)
@@ -4752,7 +4805,8 @@ extension SwanCommand {
                             configuration: try SwanAccountPortalConfiguration(
                                 publicOrigin: baseURL,
                                 staticDirectory: accountPortalDirectoryURL,
-                                signupPolicy: resolvedSignupPolicy
+                                signupPolicy: resolvedSignupPolicy,
+                                loginClientIdentityPolicy: loginClientIdentityPolicy
                             ),
                             sessions: managementSessions,
                             service: portalService
@@ -4966,27 +5020,11 @@ extension SwanCommand {
         }
 
         private func loadOAuthServerKey(fromFile path: String?) throws -> Data {
-            let trimmedPath = path?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let encoded = ProcessInfo.processInfo.environment["SWAN_OAUTH_SERVER_KEY"]
-            if trimmedPath != nil && encoded != nil {
-                throw ValidationError(
-                    "oauth-server-key source is ambiguous; use either --oauth-server-key-file or SWAN_OAUTH_SERVER_KEY"
-                )
+            guard let keyFilePath = path?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !keyFilePath.isEmpty else {
+                throw ValidationError("--oauth-server-key-file is required")
             }
-            if let keyFilePath = trimmedPath {
-                guard !keyFilePath.isEmpty else {
-                    throw ValidationError("oauth-server-key-file must not be empty")
-                }
-                return try readOAuthServerKeyFile(URL(fileURLWithPath: keyFilePath))
-            }
-            guard let encoded,
-                  let key = Data(base64URLEncoded: encoded),
-                  key.count == 32 else {
-                throw ValidationError(
-                    "SWAN_OAUTH_SERVER_KEY must contain a URL-safe-base64 32-byte server key"
-                )
-            }
-            return key
+            return try readOAuthServerKeyFile(URL(fileURLWithPath: keyFilePath))
         }
     }
 
@@ -5072,7 +5110,7 @@ extension SwanCommand {
             @Option(name: .long, help: "Mounted operator-secret file; never accepted as a literal argument")
             var operatorSecretFile: String?
 
-            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64); SWAN_ACCOUNT_KEK is the alternative")
+            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64)")
             var accountKEKFile: String?
 
             @Option(name: .customLong("account-kek-id"), help: "Account-KEK identifier written into encrypted envelopes")
@@ -5091,9 +5129,12 @@ extension SwanCommand {
                 let password = try AccountProvisioningSecrets.password(
                     secretFile: URL(fileURLWithPath: passwordFile)
                 )
-                let keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                guard let accountKEKFile else {
+                    throw ValidationError("--account-kek-file is required")
+                }
+                let keyConfiguration = try AccountProvisioningSecrets.requiredMountedAccountKeyConfiguration(
                     activeKeyID: accountKEKID,
-                    secretFile: accountKEKFile.map { URL(fileURLWithPath: $0) }
+                    secretFile: URL(fileURLWithPath: accountKEKFile)
                 )
                 guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw ValidationError("--data-directory must not be empty")
@@ -5193,7 +5234,7 @@ extension SwanCommand {
             @Option(name: .long, help: "Mounted operator-secret file; never accepted as a literal argument")
             var operatorSecretFile: String?
 
-            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64); SWAN_ACCOUNT_KEK is the alternative")
+            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64)")
             var accountKEKFile: String?
 
             @Option(name: .customLong("account-kek-id"), help: "Account-KEK identifier written into encrypted envelopes")
@@ -5272,11 +5313,14 @@ extension SwanCommand {
                     secretFilePath: operatorSecretFile
                 )
 
+                guard let accountKEKFile else {
+                    throw ValidationError("--account-kek-file is required")
+                }
                 let keyConfiguration: AccountKeyEncryptionConfiguration
                 do {
-                    keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                    keyConfiguration = try AccountProvisioningSecrets.requiredMountedAccountKeyConfiguration(
                         activeKeyID: accountKEKID,
-                        secretFile: accountKEKFile.map { URL(fileURLWithPath: $0) }
+                        secretFile: URL(fileURLWithPath: accountKEKFile)
                     )
                 } catch {
                     throw AccountCommandSupport.validationError(for: error)
@@ -5369,7 +5413,7 @@ extension SwanCommand {
             @Option(name: .long, help: "Mounted operator-secret file; never accepted as a literal argument")
             var operatorSecretFile: String?
 
-            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64); SWAN_ACCOUNT_KEK is the alternative")
+            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64)")
             var accountKEKFile: String?
 
             @Option(name: .customLong("account-kek-id"), help: "Account-KEK identifier used by encrypted envelopes")
@@ -5467,9 +5511,12 @@ extension SwanCommand {
                     password = try AccountProvisioningSecrets.password(
                         secretFile: URL(fileURLWithPath: passwordFile)
                     )
-                    keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                    guard let accountKEKFile else {
+                        throw ValidationError("--account-kek-file is required")
+                    }
+                    keyConfiguration = try AccountProvisioningSecrets.requiredMountedAccountKeyConfiguration(
                         activeKeyID: accountKEKID,
-                        secretFile: accountKEKFile.map { URL(fileURLWithPath: $0) }
+                        secretFile: URL(fileURLWithPath: accountKEKFile)
                     )
                 } catch {
                     throw AccountCommandSupport.validationError(for: error)
@@ -5543,7 +5590,7 @@ extension SwanCommand {
             @Option(name: .long, help: "Mounted operator-secret file; never accepted as a literal argument")
             var operatorSecretFile: String?
 
-            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64); SWAN_ACCOUNT_KEK is the alternative")
+            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64)")
             var accountKEKFile: String?
 
             @Option(name: .customLong("account-kek-id"), help: "Account-KEK identifier used by encrypted envelopes")
@@ -5588,11 +5635,14 @@ extension SwanCommand {
                 _ = try AccountCommandSupport.authorization(
                     secretFilePath: operatorSecretFile
                 )
+                guard let accountKEKFile else {
+                    throw ValidationError("--account-kek-file is required")
+                }
                 let keyConfiguration: AccountKeyEncryptionConfiguration
                 do {
-                    keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                    keyConfiguration = try AccountProvisioningSecrets.requiredMountedAccountKeyConfiguration(
                         activeKeyID: accountKEKID,
-                        secretFile: accountKEKFile.map { URL(fileURLWithPath: $0) }
+                        secretFile: URL(fileURLWithPath: accountKEKFile)
                     )
                 } catch {
                     throw AccountCommandSupport.validationError(for: error)
@@ -5907,7 +5957,7 @@ extension SwanCommand {
             @Option(name: .long, help: "Pinned PLC submit compatibility; only did-plc-server-0.0.1 is supported")
             var plcReferenceCompatibility: String?
 
-            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64); SWAN_ACCOUNT_KEK is the alternative")
+            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64)")
             var accountKEKFile: String?
 
             @Option(name: .customLong("account-kek-id"), help: "Active account-KEK identifier used by encrypted envelopes")
@@ -5949,14 +5999,15 @@ extension SwanCommand {
                 let authorization = try AccountCommandSupport.authorization(
                     secretFilePath: operatorSecretFile
                 )
+                guard let accountKEKFile else {
+                    throw ValidationError("--account-kek-file is required")
+                }
                 let keyConfiguration: AccountKeyEncryptionConfiguration
                 do {
                     keyConfiguration = try AccountProvisioningSecrets
-                        .accountKeyConfiguration(
+                        .requiredMountedAccountKeyConfiguration(
                             activeKeyID: accountKEKID,
-                            secretFile: accountKEKFile.map {
-                                URL(fileURLWithPath: $0)
-                            }
+                            secretFile: URL(fileURLWithPath: accountKEKFile)
                         )
                 } catch {
                     throw AccountCommandSupport.validationError(for: error)
@@ -6034,12 +6085,12 @@ extension SwanCommand {
             var authorityURL: String = ""
             @Option(name: .customLong("source-auth"))
             var sourceAuth: String = "oauth"
-            @Option(name: .customLong("source-token-env"))
-            var sourceTokenEnvironment = "SWAN_LAB_PRODUCER_TOKEN"
+            @Option(name: .customLong("source-token-file"))
+            var sourceTokenFile: String?
             @Option(name: .customLong("source-handle-env"))
             var sourceHandleEnvironment = "SWAN_LAB_PRODUCER_HANDLE"
-            @Option(name: .customLong("source-password-env"))
-            var sourcePasswordEnvironment = "SWAN_LAB_PRODUCER_PASSWORD"
+            @Option(name: .customLong("source-password-file"))
+            var sourcePasswordFile: String?
             @Option(name: .customLong("source-client-id"))
             var sourceClientID: String = ""
             @Option(name: .customLong("source-redirect-uri"))
@@ -6115,9 +6166,9 @@ extension SwanCommand {
                 )
                 let member = try await LabLiveSupport.host(
                     label: "member", url: sourceEndpoint, auth: sourceAuth,
-                    tokenEnvironment: sourceTokenEnvironment,
+                    tokenFile: sourceTokenFile,
                     handleEnvironment: sourceHandleEnvironment,
-                    passwordEnvironment: sourcePasswordEnvironment,
+                    passwordFile: sourcePasswordFile,
                     clientID: sourceClientID,
                     redirectURI: sourceRedirectURI, scopes: scope,
                     timeout: requestTimeoutSeconds,
@@ -6125,9 +6176,9 @@ extension SwanCommand {
                 )
                 let authority = try await LabLiveSupport.host(
                     label: "authority", url: authorityEndpoint, auth: "none",
-                    tokenEnvironment: "SWAN_UNUSED",
+                    tokenFile: nil,
                     handleEnvironment: "SWAN_UNUSED",
-                    passwordEnvironment: "SWAN_UNUSED", clientID: "",
+                    passwordFile: nil, clientID: "",
                     redirectURI: "", scopes: scope,
                     timeout: requestTimeoutSeconds,
                     permissionedCommitVerificationKey: nil
@@ -6417,14 +6468,14 @@ extension SwanCommand {
             @Option(name: .customLong("source-auth"), help: "Source/member auth: bearer or oauth")
             var sourceAuth: String = "oauth"
 
-            @Option(name: .customLong("source-token-env"), help: "Environment variable containing the source/member bearer token")
-            var sourceTokenEnvironment: String = "SWAN_LAB_PRODUCER_TOKEN"
+            @Option(name: .customLong("source-token-file"), help: "Owner-only file containing the source/member bearer token")
+            var sourceTokenFile: String?
 
             @Option(name: .customLong("source-handle-env"), help: "Source/member OAuth handle environment variable")
             var sourceHandleEnvironment: String = "SWAN_LAB_PRODUCER_HANDLE"
 
-            @Option(name: .customLong("source-password-env"), help: "Source/member OAuth password environment variable")
-            var sourcePasswordEnvironment: String = "SWAN_LAB_PRODUCER_PASSWORD"
+            @Option(name: .customLong("source-password-file"), help: "Owner-only file containing the source/member OAuth password")
+            var sourcePasswordFile: String?
 
             @Option(name: .customLong("source-client-id"), help: "Source/member OAuth client metadata URL")
             var sourceClientID: String = ""
@@ -6593,9 +6644,9 @@ extension SwanCommand {
                     label: "member",
                     url: sourceEndpoint,
                     auth: normalizedSourceAuth,
-                    tokenEnvironment: sourceTokenEnvironment,
+                    tokenFile: sourceTokenFile,
                     handleEnvironment: sourceHandleEnvironment,
-                    passwordEnvironment: sourcePasswordEnvironment,
+                    passwordFile: sourcePasswordFile,
                     clientID: sourceClientID,
                     redirectURI: sourceRedirectURI,
                     scopes: scope,
@@ -6606,9 +6657,9 @@ extension SwanCommand {
                     label: "authority",
                     url: authorityEndpoint,
                     auth: "none",
-                    tokenEnvironment: "SWAN_UNUSED",
+                    tokenFile: nil,
                     handleEnvironment: "SWAN_UNUSED",
-                    passwordEnvironment: "SWAN_UNUSED",
+                    passwordFile: nil,
                     clientID: "",
                     redirectURI: "",
                     scopes: scope,
@@ -7562,24 +7613,23 @@ extension SwanCommand {
             @Option(name: .long, help: "Consumer auth: none or bearer (ignored for permissioned credential reads)")
             var consumerAuth: String = "none"
 
-            @Option(name: .long, help: "Environment variable containing producer/member bearer token")
-            var producerTokenEnv: String = "SWAN_LAB_PRODUCER_TOKEN"
+            @Option(name: .customLong("producer-token-file"), help: "Owner-only file containing producer/member bearer token")
+            var producerTokenFile: String?
 
-            @Option(name: .long, help: "Environment variable containing consumer bearer token")
-            var consumerTokenEnv: String = "SWAN_LAB_CONSUMER_TOKEN"
+            @Option(name: .customLong("consumer-token-file"), help: "Owner-only file containing consumer bearer token")
+            var consumerTokenFile: String?
 
-            @Option(name: .long, help: "Producer/member OAuth handle environment variable")
+            @Option(name: .customLong("producer-handle-env"), help: "Producer/member OAuth handle environment variable")
             var producerHandleEnv: String = "SWAN_LAB_PRODUCER_HANDLE"
 
-            @Option(name: .long, help: "Producer/member OAuth password environment variable")
-            var producerPasswordEnv: String = "SWAN_LAB_PRODUCER_PASSWORD"
+            @Option(name: .customLong("producer-password-file"), help: "Owner-only file containing producer/member OAuth password")
+            var producerPasswordFile: String?
 
-            @Option(name: .long, help: "Consumer OAuth handle environment variable")
+            @Option(name: .customLong("consumer-handle-env"), help: "Consumer OAuth handle environment variable")
             var consumerHandleEnv: String = "SWAN_LAB_CONSUMER_HANDLE"
 
-            @Option(name: .long, help: "Consumer OAuth password environment variable")
-            var consumerPasswordEnv: String = "SWAN_LAB_CONSUMER_PASSWORD"
-
+            @Option(name: .customLong("consumer-password-file"), help: "Owner-only file containing consumer OAuth password")
+            var consumerPasswordFile: String?
             @Option(name: .long, help: "Producer/member OAuth client metadata URL")
             var producerClientID: String = ""
 
@@ -7749,9 +7799,9 @@ extension SwanCommand {
                         label: "member",
                         url: producerURL,
                         auth: producerAuth,
-                        tokenEnvironment: producerTokenEnv,
+                        tokenFile: producerTokenFile,
                         handleEnvironment: producerHandleEnv,
-                        passwordEnvironment: producerPasswordEnv,
+                        passwordFile: producerPasswordFile,
                         clientID: producerClientID,
                         redirectURI: producerRedirectURI,
                         scopes: scope,
@@ -7799,9 +7849,9 @@ extension SwanCommand {
                     label: normalizedMode == "permissioned" ? "member" : "producer",
                     url: producerURL,
                     auth: producerAuth,
-                    tokenEnvironment: producerTokenEnv,
+                    tokenFile: producerTokenFile,
                     handleEnvironment: producerHandleEnv,
-                    passwordEnvironment: producerPasswordEnv,
+                    passwordFile: producerPasswordFile,
                     clientID: producerClientID,
                     redirectURI: producerRedirectURI,
                     scopes: scope,
@@ -7812,9 +7862,9 @@ extension SwanCommand {
                     label: normalizedMode == "permissioned" ? "authority" : "consumer",
                     url: consumerURL,
                     auth: consumerAuth,
-                    tokenEnvironment: consumerTokenEnv,
+                    tokenFile: consumerTokenFile,
                     handleEnvironment: consumerHandleEnv,
-                    passwordEnvironment: consumerPasswordEnv,
+                    passwordFile: consumerPasswordFile,
                     clientID: consumerClientID,
                     redirectURI: consumerRedirectURI,
                     scopes: scope,
@@ -7958,14 +8008,14 @@ extension SwanCommand {
                 @Option(name: .customLong("authority-auth"), help: "Authority auth: none, bearer, or oauth")
                 var authorityAuth: String = "oauth"
 
-                @Option(name: .customLong("authority-token-env"), help: "Environment variable containing the authority bearer token")
-                var authorityTokenEnvironment = "SWAN_LAB_AUTHORITY_TOKEN"
+                @Option(name: .customLong("authority-token-file"), help: "Owner-only file containing the authority bearer token")
+                var authorityTokenFile: String?
 
                 @Option(name: .customLong("authority-handle-env"), help: "Environment variable containing the authority OAuth handle")
                 var authorityHandleEnvironment = "SWAN_LAB_AUTHORITY_HANDLE"
 
-                @Option(name: .customLong("authority-password-env"), help: "Environment variable containing the authority OAuth password")
-                var authorityPasswordEnvironment = "SWAN_LAB_AUTHORITY_PASSWORD"
+                @Option(name: .customLong("authority-password-file"), help: "Owner-only file containing the authority OAuth password")
+                var authorityPasswordFile: String?
 
                 @Option(name: .customLong("authority-client-id"), help: "Authority OAuth client metadata URL")
                 var authorityClientID: String = ""
@@ -7994,9 +8044,9 @@ extension SwanCommand {
                             fallback: "https://swan.test"
                         ),
                         auth: authorityAuth,
-                        tokenEnvironment: authorityTokenEnvironment,
+                        tokenFile: authorityTokenFile,
                         handleEnvironment: authorityHandleEnvironment,
-                        passwordEnvironment: authorityPasswordEnvironment,
+                        passwordFile: authorityPasswordFile,
                         clientID: authorityClientID,
                         redirectURI: authorityRedirectURI,
                         scopes: scope,
@@ -8050,14 +8100,14 @@ extension SwanCommand {
                 @Option(name: .customLong("producer-auth"), help: "Caller auth: none, bearer, or oauth")
                 var producerAuth: String = "oauth"
 
-                @Option(name: .customLong("producer-token-env"), help: "Environment variable containing the caller bearer token")
-                var producerTokenEnvironment = "SWAN_LAB_PRODUCER_TOKEN"
+                @Option(name: .customLong("producer-token-file"), help: "Owner-only file containing the caller bearer token")
+                var producerTokenFile: String?
 
                 @Option(name: .customLong("producer-handle-env"), help: "Environment variable containing the caller OAuth handle")
                 var producerHandleEnvironment = "SWAN_LAB_PRODUCER_HANDLE"
 
-                @Option(name: .customLong("producer-password-env"), help: "Environment variable containing the caller OAuth password")
-                var producerPasswordEnvironment = "SWAN_LAB_PRODUCER_PASSWORD"
+                @Option(name: .customLong("producer-password-file"), help: "Owner-only file containing the caller OAuth password")
+                var producerPasswordFile: String?
 
                 @Option(name: .customLong("producer-client-id"), help: "Caller OAuth client metadata URL")
                 var producerClientID: String = ""
@@ -8119,9 +8169,9 @@ extension SwanCommand {
                         label: "member",
                         url: producerURL,
                         auth: producerAuth,
-                        tokenEnvironment: producerTokenEnvironment,
+                        tokenFile: producerTokenFile,
                         handleEnvironment: producerHandleEnvironment,
-                        passwordEnvironment: producerPasswordEnvironment,
+                        passwordFile: producerPasswordFile,
                         clientID: producerClientID,
                         redirectURI: producerRedirectURI,
                         scopes: requestedScopes,
@@ -8298,14 +8348,14 @@ extension SwanCommand {
                 @Option(name: .customLong("consumer-auth"), help: "Acting user auth: none, bearer, or oauth")
                 var consumerAuth: String = "oauth"
 
-                @Option(name: .customLong("consumer-token-env"), help: "Environment variable containing the acting user bearer token")
-                var consumerTokenEnvironment = "SWAN_LAB_CONSUMER_TOKEN"
+                @Option(name: .customLong("consumer-token-file"), help: "Owner-only file containing the acting user bearer token")
+                var consumerTokenFile: String?
 
                 @Option(name: .customLong("consumer-handle-env"), help: "Environment variable containing the acting user OAuth handle")
                 var consumerHandleEnvironment = "SWAN_LAB_CONSUMER_HANDLE"
 
-                @Option(name: .customLong("consumer-password-env"), help: "Environment variable containing the acting user OAuth password")
-                var consumerPasswordEnvironment = "SWAN_LAB_CONSUMER_PASSWORD"
+                @Option(name: .customLong("consumer-password-file"), help: "Owner-only file containing the acting user OAuth password")
+                var consumerPasswordFile: String?
 
                 @Option(name: .customLong("consumer-client-id"), help: "Acting user OAuth client metadata URL")
                 var consumerClientID: String = ""
@@ -8383,9 +8433,9 @@ extension SwanCommand {
                             fallback: "https://pds.test"
                         ),
                         auth: consumerAuth,
-                        tokenEnvironment: consumerTokenEnvironment,
+                        tokenFile: consumerTokenFile,
                         handleEnvironment: consumerHandleEnvironment,
-                        passwordEnvironment: consumerPasswordEnvironment,
+                        passwordFile: consumerPasswordFile,
                         clientID: consumerClientID,
                         redirectURI: consumerRedirectURI,
                         scopes: Forum.scopes(
@@ -8405,9 +8455,9 @@ extension SwanCommand {
                             fallback: "https://swan.test"
                         ),
                         auth: "none",
-                        tokenEnvironment: "SWAN_UNUSED",
+                        tokenFile: nil,
                         handleEnvironment: "SWAN_UNUSED",
-                        passwordEnvironment: "SWAN_UNUSED",
+                        passwordFile: nil,
                         clientID: "",
                         redirectURI: "",
                         scopes: ["atproto"],
@@ -8756,9 +8806,9 @@ extension SwanCommand {
                 label: String,
                 url: URL,
                 auth: String,
-                tokenEnvironment: String,
+                tokenFile: String?,
                 handleEnvironment: String,
-                passwordEnvironment: String,
+                passwordFile: String?,
                 clientID: String,
                 redirectURI: String,
                 scopes: [String],
@@ -8770,9 +8820,9 @@ extension SwanCommand {
                         label: label,
                         url: url,
                         auth: normalized,
-                        tokenEnvironment: tokenEnvironment,
+                        tokenFile: tokenFile,
                         handleEnvironment: handleEnvironment,
-                        passwordEnvironment: passwordEnvironment,
+                        passwordFile: passwordFile,
                         clientID: clientID,
                         redirectURI: redirectURI,
                         scopes: scopes,
@@ -8781,13 +8831,17 @@ extension SwanCommand {
                     )
                     return (host, nil)
                 }
+                try requireCredentialSafeTransport(url)
+                guard let passwordFile, !passwordFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw ValidationError("live OAuth password file is unavailable")
+                }
+                let password = try readOwnerOnlySecretFile(
+                    URL(fileURLWithPath: passwordFile),
+                    validationMessage: "live OAuth password file is unavailable"
+                )
                 let handle = try LabLiveSupport.environmentValue(
                     handleEnvironment,
                     label: "OAuth handle"
-                )
-                let password = try LabLiveSupport.environmentValue(
-                    passwordEnvironment,
-                    label: "OAuth password"
                 )
                 let clientIDURL = try LabLiveSupport.requiredURL(
                     clientID,
@@ -9270,9 +9324,9 @@ private enum LabLiveSupport {
         label: String,
         url: URL,
         auth: String,
-        tokenEnvironment: String,
+        tokenFile: String?,
         handleEnvironment: String,
-        passwordEnvironment: String,
+        passwordFile: String?,
         clientID: String,
         redirectURI: String,
         scopes: [String],
@@ -9298,15 +9352,30 @@ private enum LabLiveSupport {
                 permissionedCommitVerificationKey: permissionedCommitVerificationKey
             )
         case "bearer":
+            try requireCredentialSafeTransport(url)
+            guard let tokenFile, !tokenFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ValidationError("live bearer token file is unavailable")
+            }
+            let token = try readOwnerOnlySecretFile(
+                URL(fileURLWithPath: tokenFile),
+                validationMessage: "live bearer token file is unavailable"
+            )
             return LiveInteropHost(
                 label: label,
                 client: client,
-                authorization: .bearer(token: try environmentValue(tokenEnvironment, label: "bearer token")),
+                authorization: .bearer(token: token),
                 permissionedCommitVerificationKey: permissionedCommitVerificationKey
             )
         case "oauth":
+            try requireCredentialSafeTransport(url)
+            guard let passwordFile, !passwordFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ValidationError("live OAuth password file is unavailable")
+            }
+            let password = try readOwnerOnlySecretFile(
+                URL(fileURLWithPath: passwordFile),
+                validationMessage: "live OAuth password file is unavailable"
+            )
             let handle = try environmentValue(handleEnvironment, label: "OAuth handle")
-            let password = try environmentValue(passwordEnvironment, label: "OAuth password")
             // The AT Protocol localhost development client encodes its
             // requested scope and redirect URI in the client-id query. Remote
             // metadata URLs remain query-free and are validated by Swan's
@@ -9418,22 +9487,11 @@ private enum LabLiveSupport {
     }
 
     static func body(at url: URL) throws -> Data {
-        let attributes: [FileAttributeKey: Any]
-        do {
-            attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        } catch {
-            throw ValidationError("live body file is unavailable")
-        }
-        guard (attributes[.type] as? FileAttributeType) == .typeRegular,
-              let size = attributes[.size] as? NSNumber,
-              size.intValue <= 2 * 1024 * 1024 else {
-            throw ValidationError("live body file must be a regular file no larger than 2 MiB")
-        }
-        do {
-            return try Data(contentsOf: url, options: [.mappedIfSafe])
-        } catch {
-            throw ValidationError("live body file is unavailable")
-        }
+        try readBoundedRegularFileNoFollow(
+            url,
+            maximumBytes: 2 * 1024 * 1024,
+            validationMessage: "live body file is unavailable"
+        )
     }
 
     static func query(_ rawValues: [String]) throws -> [String: String] {

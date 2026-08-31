@@ -16,7 +16,6 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let key = P256.Signing.PrivateKey()
         let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
-        defer { Task { try? await database.close() } }
         let genesis = try PublicRepositoryGenesisCodec.create(
             did: did,
             revision: genesisRevision,
@@ -88,6 +87,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
         )
         let indexed = try await database.publicRepositoryRecordCID(for: path)
         XCTAssertNil(indexed)
+        try await database.close()
     }
 
     func testGenesisBecomesRepositoryTruthAndPreparedCreateSurvivesReopen() async throws {
@@ -122,9 +122,10 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
             baseCommitCID: initial.commitCID
         )
         let reservation: PublicRepositoryMutationReservation
+        let nowMicros = UInt64(Date().timeIntervalSince1970 * 1_000_000)
         switch try await database.reservePublicRepositoryRevision(
             request,
-            wallClockMicroseconds: 1_750_000_000_000_000
+            wallClockMicroseconds: nowMicros
         ) {
         case let .reserved(value):
             reservation = value
@@ -184,7 +185,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
         XCTAssertEqual(reopenedIndexed, prepared.recordResults[0].recordCID)
         switch try await reopened.reservePublicRepositoryRevision(
             request,
-            wallClockMicroseconds: 1
+            wallClockMicroseconds: nowMicros
         ) {
         case .reserved:
             XCTFail("committed request was reserved again")
@@ -211,7 +212,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
         await XCTAssertThrowsAsync(
             try await corruptedReplay.reservePublicRepositoryRevision(
                 request,
-                wallClockMicroseconds: 1
+                wallClockMicroseconds: nowMicros
             )
         ) {
             XCTAssertEqual(
@@ -881,6 +882,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
             let root = try temporaryDirectory()
             defer { try? FileManager.default.removeItem(at: root) }
             let key = P256.Signing.PrivateKey()
+            let nowMicros = UInt64(Date().timeIntervalSince1970 * 1_000_000)
             let database = try await installedDatabase(root: root, key: key)
             let maybeState = try await database.loadPublicRepositoryState()
             let state = try XCTUnwrap(maybeState)
@@ -891,7 +893,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
                 requestID: "replay-\(column)",
                 digestByte: 0x93,
                 rkey: "replay-\(column)",
-                clock: 1_750_000_000_000_000
+                clock: nowMicros
             )
             _ = try await database.applyPublicRepositoryMutation(
                 reservation: candidate.reservation,
@@ -930,7 +932,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
             await XCTAssertThrowsAsync(
                 try await corrupted.reservePublicRepositoryRevision(
                     candidate.reservation.request,
-                    wallClockMicroseconds: 1
+                    wallClockMicroseconds: nowMicros
                 )
             ) {
                 XCTAssertEqual(
@@ -964,6 +966,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
             request,
             wallClockMicroseconds: 1
         ) else {
+            try await upgraded.close()
             return XCTFail("empty legacy request table did not upgrade")
         }
         try await upgraded.close()
@@ -1177,6 +1180,100 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
         return root
+    }
+
+    func testEngineCreateFailsWhenRecordAlreadyExists() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let key = P256.Signing.PrivateKey()
+        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        defer { Task { try? await database.close() } }
+        let genesis = try PublicRepositoryGenesisCodec.create(
+            did: did,
+            revision: genesisRevision,
+            signingKey: key
+        )
+        _ = try await database.installPublicRepositoryGenesis(
+            genesis,
+            signingPublicKey: key.publicKey,
+            installedAt: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        let rawInitial = try await database.loadPublicRepositoryState()
+        let initial = try XCTUnwrap(rawInitial)
+        let path = try PublicRepositoryPath(
+            collection: "app.bsky.feed.post",
+            recordKey: "occupied-record"
+        )
+        let request1 = try PublicRepositoryMutationRequest(
+            id: "create-initial",
+            canonicalDigest: Data(repeating: 0x11, count: 32),
+            baseCommitCID: initial.commitCID
+        )
+        let reservation1: PublicRepositoryMutationReservation
+        switch try await database.reservePublicRepositoryRevision(
+            request1,
+            wallClockMicroseconds: 1_750_000_000_000_000
+        ) {
+        case let .reserved(value): reservation1 = value
+        case .committed: return XCTFail("unexpected replay")
+        }
+        let prepared1 = try await PublicRepositoryEngine.apply(
+            repositoryDID: did,
+            currentState: initial,
+            blocks: database,
+            revision: reservation1.nextRevision,
+            batch: try PublicRepositoryWriteBatch(
+                writes: [.create(
+                    path: path,
+                    record: PublicRecord([
+                        "$type": .string("app.bsky.feed.post"),
+                        "text": .string("first"),
+                    ])
+                )],
+                expectedCommitCID: initial.commitCID
+            ),
+            signer: P256PublicRepositoryCommitSigner(privateKey: key)
+        )
+        let committed1 = try await database.applyPublicRepositoryMutation(
+            reservation: reservation1,
+            prepared: prepared1
+        )
+
+        let request2 = try PublicRepositoryMutationRequest(
+            id: "create-duplicate",
+            canonicalDigest: Data(repeating: 0x22, count: 32),
+            baseCommitCID: committed1.state.commitCID
+        )
+        let reservation2: PublicRepositoryMutationReservation
+        switch try await database.reservePublicRepositoryRevision(
+            request2,
+            wallClockMicroseconds: 1_750_000_001_000_000
+        ) {
+        case let .reserved(value): reservation2 = value
+        case .committed: return XCTFail("unexpected replay")
+        }
+        do {
+            _ = try await PublicRepositoryEngine.apply(
+                repositoryDID: did,
+                currentState: committed1.state,
+                blocks: database,
+                revision: reservation2.nextRevision,
+                batch: try PublicRepositoryWriteBatch(
+                    writes: [.create(
+                        path: path,
+                        record: PublicRecord([
+                            "$type": .string("app.bsky.feed.post"),
+                            "text": .string("second"),
+                        ])
+                    )],
+                    expectedCommitCID: committed1.state.commitCID
+                ),
+                signer: P256PublicRepositoryCommitSigner(privateKey: key)
+            )
+            XCTFail("expected PublicRepositoryEngineError.recordAlreadyExists")
+        } catch let error as PublicRepositoryEngineError {
+            XCTAssertEqual(error, .recordAlreadyExists)
+        }
     }
 }
 

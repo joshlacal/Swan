@@ -239,7 +239,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
     )
     let pending = try await accountA.pendingPublicFirehoseOutbox()
     XCTAssertTrue(pending.isEmpty)
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(events.count, 1)
     XCTAssertEqual(events[0].seq, 1)
     XCTAssertEqual(events[0].kind, .commit)
@@ -275,14 +275,14 @@ final class PublicFirehoseSequencerTests: XCTestCase {
       _ = try await sequencer.sequenceNext(now: epoch)
       XCTFail("expected injected failure")
     } catch SequencerInjectedFailure.expected {}
-    let afterCrash = try await firehose.events(after: 0, limit: 10)
+    let afterCrash = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(afterCrash.count, 1)
     XCTAssertEqual(afterCrash[0].seq, 1)
     XCTAssertEqual(afterCrash[0].sourceKey, sourceKey)
 
     let retried = try await sequencer.sequenceNext(now: epoch.addingTimeInterval(31))
     XCTAssertEqual(retried, .sequencedAccountEvent(sourceKey: sourceKey, seq: 1))
-    let afterRetry = try await firehose.events(after: 0, limit: 10)
+    let afterRetry = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(afterRetry.count, 1)
     let pending = try await accountA.pendingPublicFirehoseOutbox()
     XCTAssertTrue(pending.isEmpty)
@@ -306,7 +306,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
       _ = try await sequencer.sequenceNext(now: epoch)
       XCTFail("expected injected failure")
     } catch SequencerInjectedFailure.expected {}
-    let afterCrash = try await firehose.events(after: 0, limit: 10)
+    let afterCrash = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(afterCrash.map(\.seq), [1, 2])
 
     let retried = try await sequencer.sequenceNext(now: epoch.addingTimeInterval(1))
@@ -315,7 +315,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
     }
     XCTAssertEqual(seqs, [1, 2])
     XCTAssertEqual(batchID, PublicFirehoseSourceKey.lifecycleBatch(did: didA, operationID: "op-1"))
-    let afterRetry = try await firehose.events(after: 0, limit: 10)
+    let afterRetry = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(afterRetry.map(\.seq), [1, 2])
     let pendingBatch = try await control.nextPendingLifecycleBatch(did: didA)
     XCTAssertNil(pendingBatch)
@@ -332,7 +332,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
     _ = try await enqueueCommit(database: accountA, did: didA, generation: 1, seed: 0x04)
     _ = try await sequencer.sequenceNext(now: epoch)
     _ = try await sequencer.sequenceNext(now: epoch)
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(events.map(\.kind), [.identity, .account, .commit])
     XCTAssertEqual(events.map(\.seq), [1, 2, 3])
   }
@@ -356,7 +356,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
     _ = try await enqueueCommit(database: accountA, did: didA, generation: 2, seed: 0x12)
     let steps = try await sequencer.drainAll(now: epoch)
     XCTAssertEqual(steps, 5)
-    let events = try await firehose.events(after: 0, limit: 20)
+    let events = try await firehose.events(after: 0, limit: 20, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(
       events.map(\.kind),
       [.commit, .identity, .account, .commit, .identity, .account, .commit]
@@ -380,7 +380,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
       now: epoch
     )
     _ = try await sequencer.drainAll(now: epoch)
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(events.map(\.kind), [.identity, .commit, .account])
   }
 
@@ -447,7 +447,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
     _ = try await enqueueCommit(database: accountA, did: didA, generation: 0, seed: 0x50, kind: .commit)
     _ = try await enqueueCommit(database: accountA, did: didA, generation: 0, seed: 0x51, kind: .sync)
     _ = try await sequencer.drainAll(now: epoch)
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(events.map(\.kind), [.commit, .sync])
   }
 
@@ -469,7 +469,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
       now: epoch
     )
     _ = try await sequencer.sequenceNext(now: epoch)
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(events.count, 1)
     XCTAssertEqual(events[0].kind, .sync)
     let expected = try FirehoseFrameEncoder.syncFrame(seq: 1, material: material, commitCAR: car)
@@ -517,7 +517,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
     let pending = try await accountA.pendingPublicFirehoseOutbox()
     XCTAssertEqual(pending.count, 1)
     XCTAssertEqual(pending.first?.sourceKey, sourceKey)
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(events.count, 1)
     XCTAssertEqual(events[0].kind, .identity)
   }
@@ -542,7 +542,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
     }
     let result = try await sequencer.sequenceNext(now: epoch)
     XCTAssertEqual(result, .leaseLost(sourceKey: sourceKey, seq: 1))
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(events.count, 1)
     XCTAssertEqual(events[0].seq, 1)
     XCTAssertEqual(events[0].sourceKey, sourceKey)
@@ -560,7 +560,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
     )
     let steps = try await sequencer.drainAll(now: epoch)
     XCTAssertEqual(steps, 3)
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(events.count, 4)
   }
 
@@ -578,7 +578,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
 
     let steps = try await sequencer.drainAll(now: epoch)
     XCTAssertEqual(steps, 4)
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(events.map(\.seq), [2, 4])
     XCTAssertEqual(events.map(\.did), [didB, didA])
     XCTAssertEqual(events.last?.kind, .account)
@@ -639,7 +639,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
       XCTFail("expected injected failure after the deletion transaction")
     } catch SequencerInjectedFailure.expected {}
 
-    let afterCrash = try await firehose.events(after: 0, limit: 10)
+    let afterCrash = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(afterCrash.map(\.seq), [3])
     XCTAssertEqual(afterCrash.first?.kind, .account)
     let pendingAfterCrash = try await control.nextPendingLifecycleBatch(did: didA)
@@ -650,7 +650,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
       return XCTFail("expected the exact deletion batch replay")
     }
     XCTAssertEqual(seqs, [3])
-    let afterRetry = try await firehose.events(after: 0, limit: 10)
+    let afterRetry = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(afterRetry.map(\.seq), [3])
     let pendingAfterRetry = try await control.nextPendingLifecycleBatch(did: didA)
     XCTAssertNil(pendingAfterRetry)
@@ -676,7 +676,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
 
     let steps = try await sequencer.drainAll(now: epoch)
     XCTAssertEqual(steps, 2)
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(
       events.map(\.kind),
       [.identity, .account],
@@ -706,7 +706,7 @@ final class PublicFirehoseSequencerTests: XCTestCase {
     let secondDrain = try await sequencer.drainAll(now: epoch)
     XCTAssertEqual(secondDrain, 1)
 
-    let events = try await firehose.events(after: 0, limit: 10)
+    let events = try await firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     XCTAssertEqual(events.map(\.seq), [2, 4])
     XCTAssertEqual(events.map(\.did), [didB, didA])
     XCTAssertEqual(events.last?.kind, .account)

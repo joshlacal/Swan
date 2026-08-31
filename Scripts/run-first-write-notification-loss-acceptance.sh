@@ -197,7 +197,7 @@ print(value)
 cleanup() {
   local result=$?
   trap - EXIT INT TERM HUP
-  unset reference_access_token SWAN_LAB_PRODUCER_TOKEN SWAN_LAB_CONSUMER_TOKEN 2>/dev/null || true
+  unset reference_access_token 2>/dev/null || true
   if ((swan_stopped)) && [[ -n "$swan_id" ]]; then
     docker start "$swan_id" >/dev/null 2>&1 || true
     local deadline=$((SECONDS + 120))
@@ -375,7 +375,9 @@ unset reference_account
 # (this authority rejects the TypeScript member delegation token), so no
 # record write may occur; the script verifies that explicitly below.
 provisioning_artifact="${temporary_directory}/provisioning-artifact.json"
-export SWAN_LAB_PRODUCER_TOKEN="$reference_access_token"
+producer_token_path="${temporary_directory}/producer.token"
+printf '%s' "$reference_access_token" > "$producer_token_path"
+chmod 0600 "$producer_token_path"
 docker run --rm \
   --network "$network_name" \
   --read-only \
@@ -383,7 +385,6 @@ docker run --rm \
   --mount "type=volume,src=${bootstrap_secrets_volume},dst=/run/secrets/swan-bootstrap,readonly" \
   --mount "type=volume,src=${caddy_trust_volume},dst=/etc/ssl/certs,readonly" \
   --mount "type=bind,src=${temporary_directory},dst=/run/first-write" \
-  --env SWAN_LAB_PRODUCER_TOKEN \
   --entrypoint /bin/sh \
   "$swan_image" \
   -ec '
@@ -395,15 +396,15 @@ docker run --rm \
       >/tmp/provision-record.json
     export SSL_CERT_FILE=/etc/ssl/certs/caddy-local-root.crt
     export SWAN_LAB_CONSUMER_HANDLE="$5"
-    SWAN_LAB_CONSUMER_PASSWORD="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/authority.password)"
-    export SWAN_LAB_CONSUMER_PASSWORD
     if ! /usr/local/bin/swan lab live \
       --mode permissioned \
       --name first-write-notification-loss-provision \
       --producer-url https://pds.test \
       --consumer-url https://swan.test \
       --producer-auth bearer \
+      --producer-token-file /run/first-write/producer.token \
       --consumer-auth oauth \
+      --consumer-password-file /run/secrets/swan-bootstrap/authority.password \
       --consumer-client-id "http://localhost?scope=atproto&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback" \
       --consumer-redirect-uri http://127.0.0.1/callback \
       --scope atproto \
@@ -424,10 +425,10 @@ docker run --rm \
     fi
     cp /tmp/sanitized-artifact.json /run/first-write/provisioning-artifact.json
     chmod 0600 /run/first-write/provisioning-artifact.json
-    unset private_value SWAN_LAB_CONSUMER_PASSWORD
+    unset private_value
   ' _ \
   "$space_uri" "$reference_did" "$collection" "provision-${suffix}" "$authority_handle"
-unset SWAN_LAB_PRODUCER_TOKEN
+rm -f "$producer_token_path"
 
 provisioning_status="$(python3 - "$provisioning_artifact" <<'PY'
 import json

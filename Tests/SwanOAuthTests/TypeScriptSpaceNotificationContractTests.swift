@@ -23,7 +23,6 @@ final class TypeScriptSpaceNotificationContractTests: XCTestCase {
                 try .init(issuer: fixture.issuer, generation: 1, secp256k1PublicKey: publicKey),
             ])
         )
-
         let space = try SpaceURI(authority: fixture.audience, spaceType: "app.bsky.bookmarks", skey: "default")
         let expectedDigest = SpaceNotificationRequestDigest.write(
             space: space,
@@ -44,13 +43,10 @@ final class TypeScriptSpaceNotificationContractTests: XCTestCase {
             )
             XCTFail("pinned unbound token must be rejected when expectedRequestBodyDigest is required")
         } catch let error as SwanError {
-            guard case .unauthorized = error else {
-                XCTFail("expected unauthorized error for unbound token, got \(error)")
-                return
-            }
+            XCTAssertEqual(error, .unauthorized("service authentication is invalid"))
         }
 
-        // When authenticated without expected digest (e.g. non-bound route), the reference token still verifies signatures.
+        // Baseline inspection/verification without expected digest succeeds.
         let verifiedUnbound = try await verifier.authenticate(
             fixture.token,
             expectedAudience: fixture.audience,

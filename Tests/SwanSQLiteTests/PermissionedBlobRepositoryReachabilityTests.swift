@@ -388,12 +388,15 @@ final class PermissionedBlobRepositoryReachabilityTests: XCTestCase {
                     uri: fixture.record, value: privateValue, cid: privateCID
                 )]
             )
-            try await database.removeBlobReference(uploaded)
             await database.installTestingHooks(SQLiteTestingHooks(
                 permissionedBlobPublicReachabilityOverride: { cid in
                     cid == uploaded.cid ? true : nil
+                },
+                publicBlobDeletionReachabilityOverride: { cid in
+                    cid == uploaded.cid ? false : nil
                 }
             ))
+            try await database.removeBlobReference(uploaded)
             let fillerOne = try await database.putBlob(Data("filler-one".utf8), namespace: .public)
             let fillerTwo = try await database.putBlob(Data("filler-two".utf8), namespace: .public)
 

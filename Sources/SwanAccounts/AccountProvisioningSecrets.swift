@@ -7,30 +7,12 @@ import Darwin
 import Glibc
 #endif
 
-/// Loads the two secret inputs needed by the local account-installation
-/// workflow without accepting either one as a command-line value. Account
-/// KEKs stay deployment configuration; account passwords are deliberately
-/// read only from an owner-protected mounted file.
+/// Loads the secret inputs needed by the local account-installation
+/// workflow. Account KEKs and account passwords are read only from an
+/// owner-protected mounted file.
 public enum AccountProvisioningSecrets {
-    public static let kekEnvironmentName = "SWAN_ACCOUNT_KEK"
     private static let maximumPasswordBytes = 4 * 1_024
     private static let maximumEncodedKEKBytes = 128
-
-    /// Builds the development file-key-store configuration from an injected
-    /// environment value and/or a selected mounted secret file. When both
-    /// sources are present they must carry the exact same 32-byte decoded
-    /// key; no source silently overrides another.
-    public static func accountKeyConfiguration(
-        activeKeyID: String = "primary",
-        secretFile: URL? = nil
-    ) throws -> AccountKeyEncryptionConfiguration {
-        try accountKeyConfiguration(
-            environment: ProcessInfo.processInfo.environment,
-            activeKeyID: activeKeyID,
-            secretFile: secretFile
-        )
-    }
-
     /// Loads the account KEK for an offline operator backup from exactly one
     /// selected mounted file. Unlike the general provisioning entry point,
     /// this never consults process environment and requires canonical,
@@ -83,43 +65,6 @@ public enum AccountProvisioningSecrets {
         }
         return password
     }
-
-    /// Module-visible so the account suite can validate source conflicts and
-    /// descriptor-safe file behavior without mutating process environment.
-    static func accountKeyConfiguration(
-        environment: [String: String],
-        activeKeyID: String,
-        secretFile: URL?
-    ) throws -> AccountKeyEncryptionConfiguration {
-        let environmentKey = try environment[kekEnvironmentName].map(decodeKEKString)
-        let fileKey = try secretFile.map { url in
-            try decodeKEKData(
-                try readOwnerOnlyRegularFile(url, maximumPayloadBytes: maximumEncodedKEKBytes)
-            )
-        }
-        guard let key = environmentKey ?? fileKey else {
-            throw SwanError.unavailable("account KEK is unavailable")
-        }
-        if let environmentKey, let fileKey,
-           !constantTimeEqual(environmentKey, fileKey) {
-            throw SwanError.malformed("account KEK sources do not match")
-        }
-        return try AccountKeyEncryptionConfiguration(activeKeyID: activeKeyID, activeKey: key)
-    }
-
-    private static func decodeKEKString(_ value: String) throws -> Data {
-        try decodeKEKData(Data(value.utf8))
-    }
-
-    private static func decodeKEKData(_ encoded: Data) throws -> Data {
-        let normalized = try normalize(encoded, maximumBytes: maximumEncodedKEKBytes)
-        guard let text = String(data: normalized, encoding: .utf8),
-              let key = decodeBase64URL(text), key.count == 32 else {
-            throw SwanError.malformed("account KEK is invalid")
-        }
-        return key
-    }
-
     private static func decodeBase64URL(_ value: String) -> Data? {
         var base64 = value
             .replacingOccurrences(of: "-", with: "+")
@@ -152,13 +97,13 @@ public enum AccountProvisioningSecrets {
     /// Opens exactly one filesystem object without following a link, then
     /// validates and reads that same descriptor. Path metadata plus a later
     /// path read would permit a rename/link swap between the checks.
-    private static func readOwnerOnlyRegularFile(
+    static func readOwnerOnlyRegularFile(
         _ url: URL,
         maximumPayloadBytes: Int
     ) throws -> Data {
         let descriptor: Int32 = url.withUnsafeFileSystemRepresentation { path in
             guard let path else { return -1 }
-            return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+            return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
         }
         guard descriptor >= 0 else {
             throw SwanError.unavailable("account provisioning secret is unavailable")
@@ -174,6 +119,10 @@ public enum AccountProvisioningSecrets {
               metadata.st_size <= off_t(maximumPayloadBytes + 2) else {
             throw SwanError.unavailable("account provisioning secret is unavailable")
         }
+        let flags = fcntl(descriptor, F_GETFL)
+        if flags >= 0 {
+            _ = fcntl(descriptor, F_SETFL, flags & ~O_NONBLOCK)
+        }
         do {
             let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
             let data = try handle.read(upToCount: maximumPayloadBytes + 3) ?? Data()
@@ -188,14 +137,4 @@ public enum AccountProvisioningSecrets {
         }
     }
 
-    private static func constantTimeEqual(_ lhs: Data, _ rhs: Data) -> Bool {
-        let count = max(lhs.count, rhs.count)
-        var difference = UInt64(lhs.count) ^ UInt64(rhs.count)
-        for index in 0 ..< count {
-            let left = index < lhs.count ? lhs[lhs.startIndex + index] : 0
-            let right = index < rhs.count ? rhs[rhs.startIndex + index] : 0
-            difference |= UInt64(left ^ right)
-        }
-        return difference == 0
-    }
 }

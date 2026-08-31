@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   generateQrMatrix,
   generateQrSvg,
   generateQrSvgPath,
   generateOtpauthUri,
+  generateBase32Secret,
   rsEncode,
   getGeneratorPoly,
   getVersionBch,
@@ -368,7 +369,7 @@ describe('QR Code SVG Path & Full SVG Generator', () => {
   });
 });
 
-describe('OTPAuth URI Helper', () => {
+describe('OTPAuth URI Helper & Base32 Secret Generator', () => {
   it('builds a canonical otpauth URL', () => {
     const uri = generateOtpauthUri({
       secret: 'JBSWY3DPEHPK3PXP',
@@ -393,5 +394,24 @@ describe('OTPAuth URI Helper', () => {
     expect(uri).toContain('digits=8');
     expect(uri).toContain('period=60');
     expect(uri).toContain('issuer=CustomSwan');
+  });
+
+  it('generateBase32Secret throws a fixed error when crypto.getRandomValues is unavailable', () => {
+    const originalCrypto = globalThis.crypto;
+    try {
+      // @ts-ignore
+      delete globalThis.crypto;
+      expect(() => generateBase32Secret(20)).toThrow(/Web Crypto/);
+    } finally {
+      globalThis.crypto = originalCrypto;
+    }
+  });
+
+  it('generateBase32Secret generates the exact requested length using Web Crypto', () => {
+    const spy = vi.spyOn(crypto, 'getRandomValues');
+    const secret = generateBase32Secret(20);
+    expect(secret.length).toBe(32);
+    expect(spy).toHaveBeenCalled();
+    spy.mockRestore();
   });
 });

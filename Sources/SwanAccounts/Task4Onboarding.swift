@@ -700,20 +700,37 @@ public protocol SignupRateAdmission: Sendable {
 /// with the shared IP/token-bucket service through the protocol seam.
 public actor SignupInviteRateAdmission: SignupRateAdmission {
     private let maximum: Int
+    private let globalMaximum: Int
     private let window: TimeInterval
     private var buckets: [Data: (started: Date, count: Int)] = [:]
+    private var globalBucket: (started: Date, count: Int)?
     private let maximumBuckets = 4096
 
-    public init(maximum: Int = 5, window: TimeInterval = 60) throws {
-        guard (1 ... 100).contains(maximum), window.isFinite, (1 ... 3600).contains(window) else { throw SwanError.invalidIdentifier("signup admission") }
-        self.maximum = maximum; self.window = window
+    public init(maximum: Int = 5, globalMaximum: Int = 100, window: TimeInterval = 60) throws {
+        guard (1 ... 100).contains(maximum), (1 ... 10_000).contains(globalMaximum), window.isFinite, (1 ... 3600).contains(window) else { throw SwanError.invalidIdentifier("signup admission") }
+        self.maximum = maximum; self.globalMaximum = globalMaximum; self.window = window
     }
 
     public func permits(bucket: Data, now: Date) async throws -> Bool {
         guard bucket.count == 32 else { throw SwanError.invalidIdentifier("signup bucket") }
         buckets = buckets.filter { now.timeIntervalSince($0.value.started) < window }
+
+        // Check global bucket without mutating
+        if let currentGlobal = globalBucket, now.timeIntervalSince(currentGlobal.started) < window {
+            guard currentGlobal.count < globalMaximum else { return false }
+        }
+
+        // Check peer bucket without mutating
         guard buckets[bucket] != nil || buckets.count < maximumBuckets else { return false }
         if let current = buckets[bucket], current.count >= maximum { return false }
+
+        // Both admit: commit mutations
+        if let currentGlobal = globalBucket, now.timeIntervalSince(currentGlobal.started) < window {
+            globalBucket = (currentGlobal.started, currentGlobal.count + 1)
+        } else {
+            globalBucket = (now, 1)
+        }
+
         let current = buckets[bucket] ?? (now, 0)
         buckets[bucket] = (current.started, current.count + 1)
         return true
@@ -733,26 +750,38 @@ public struct SignupService: Sendable {
     }
 
     public func authorize(_ input: SignupAuthorizationInput, verificationCode: String? = nil, turnstileToken: String? = nil, remoteIP: String? = nil, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupAuthorization {
+        // 1. Cheap structural and lifetime checks
         guard policy.policy.permitsPublicSignup, input.isTrustedBucket else { throw SignupServiceError.closed }
         guard lifetime.isFinite, (1 ... 900).contains(lifetime) else { throw SwanError.invalidIdentifier("signup authorization lifetime") }
+        // 2. Rate admission
+        guard let rateAdmission else {
+            if policy.policy == .inviteRequired { throw SignupServiceError.inviteRequired }
+            throw SwanError.unavailable("signup admission")
+        }
+        guard try await rateAdmission.permits(bucket: input.clientIPBucketDigest, now: now) else { throw SignupServiceError.rateLimited }
+
         guard input.email != nil, input.emailProofDigest != nil else { throw SignupServiceError.emailProofRequired }
-        if policy.policy == .openProtected { guard proofVerifier != nil, proofService != nil, verificationCode != nil else { throw SignupServiceError.emailProofRequired } }
-        guard policy.permits(handle: input.handle, inviteCode: input.inviteDigest == nil ? nil : "present") else { throw SignupServiceError.inviteRequired }
-        if policy.policy == .inviteRequired {
-            guard let rateAdmission, try await rateAdmission.permits(bucket: input.clientIPBucketDigest, now: now) else { throw SignupServiceError.inviteRequired }
-        }
-        if policy.policy == .openProtected {
-            guard input.emailProofDigest != nil else { throw SignupServiceError.emailProofRequired }
-            guard let turnstile else { throw SignupServiceError.turnstileRequired }
-            guard let turnstileToken, !turnstileToken.isEmpty else { throw SignupServiceError.turnstileRequired }
-            try await turnstile.verify(token: turnstileToken, remoteIP: remoteIP, now: now)
-        }
         guard AccountControlIdentifiers.isDID(input.identityDID) else { throw SignupServiceError.invalidIdentity }
-        let authorization = try SignupAuthorization(id: input.authorizationID, requestID: input.requestID, policy: policy.policy, handle: input.handle, email: input.email?.value, identityDID: input.identityDID, emailProofDigest: input.emailProofDigest, inviteDigest: input.inviteDigest, clientIPBucketDigest: input.clientIPBucketDigest, issuedAt: now, expiresAt: now.addingTimeInterval(lifetime), leaseExpiresAt: now.addingTimeInterval(120))
+        guard policy.permits(handle: input.handle, inviteCode: input.inviteDigest == nil ? nil : "present") else { throw SignupServiceError.inviteRequired }
+        if policy.policy == .openProtected {
+            guard proofVerifier != nil, proofService != nil, verificationCode != nil else { throw SignupServiceError.emailProofRequired }
+            guard turnstile != nil, let turnstileToken, !turnstileToken.isEmpty else { throw SignupServiceError.turnstileRequired }
+        }
+
+        // 3. Local email-proof verification
         if let verificationCode, let verifier = proofVerifier, let proofService, let email = input.email {
             let digest = try await verifier.verifySubmittedCode(verificationCode, email: email, handle: input.handle, authorizationID: input.authorizationID, proof: proofService, now: now)
             guard digest == input.emailProofDigest else { throw SignupServiceError.emailProofRequired }
         }
+
+        // 4. Turnstile verification
+        if policy.policy == .openProtected {
+            guard let turnstile, let turnstileToken else { throw SignupServiceError.turnstileRequired }
+            try await turnstile.verify(token: turnstileToken, remoteIP: remoteIP, now: now)
+        }
+
+        // 5. Durable reservation
+        let authorization = try SignupAuthorization(id: input.authorizationID, requestID: input.requestID, policy: policy.policy, handle: input.handle, email: input.email?.value, identityDID: input.identityDID, emailProofDigest: input.emailProofDigest, inviteDigest: input.inviteDigest, clientIPBucketDigest: input.clientIPBucketDigest, issuedAt: now, expiresAt: now.addingTimeInterval(lifetime), leaseExpiresAt: now.addingTimeInterval(120))
         try await store.reserve(authorization, now: now)
         return authorization
     }

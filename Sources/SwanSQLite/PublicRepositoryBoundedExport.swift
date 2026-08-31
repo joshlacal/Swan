@@ -16,8 +16,57 @@ extension SQLiteAccountDatabase {
         to sink: any PublicRepositoryCARByteSink
     ) async throws {
         let limits = PublicRepositoryLimits.standard
-        try await resetPublicExportTables()
+        try await populatePublicExportReachabilityTables(state: state, limits: limits)
         do {
+            let missing = try await connection.query(
+                """
+                SELECT collection, rkey, record_cid
+                FROM temp.swan_public_export_index
+                EXCEPT
+                SELECT collection, rkey, record_cid
+                FROM public_repository_record_index
+                LIMIT 1
+                """
+            )
+            let extra = try await connection.query(
+                """
+                SELECT collection, rkey, record_cid
+                FROM public_repository_record_index
+                EXCEPT
+                SELECT collection, rkey, record_cid
+                FROM temp.swan_public_export_index
+                LIMIT 1
+                """
+            )
+            guard missing.isEmpty, extra.isEmpty else {
+                throw PublicRepositoryReadError.unavailable(reason: .projectionMismatch)
+            }
+
+            let stream = SQLitePublicRepositoryExportStream(
+                connection: connection,
+                commit: PublicRepositoryBlock(
+                    cid: commit.commitCID, bytes: commit.signedCommitBytes
+                )
+            )
+            _ = try await PublicRepositoryCAR.write(
+                rootCID: commit.commitCID,
+                blocks: stream,
+                to: sink,
+                limits: limits
+            )
+            try await resetPublicExportTables()
+        } catch {
+            try? await resetPublicExportTables()
+            throw error
+        }
+    }
+
+    /// The single canonical reachability walk shared between export and GC so definitions cannot drift.
+    func populatePublicExportReachabilityTables(
+        state: PublicRepositoryState,
+        limits: PublicRepositoryLimits = .standard
+    ) async throws {
+        try await resetPublicExportTables()
         try await enqueuePublicExportNode(
             cid: state.dataCID,
             level: 0,
@@ -205,48 +254,87 @@ extension SQLiteAccountDatabase {
                 }
             }
         }
+    }
 
-        let missing = try await connection.query(
-            """
-            SELECT collection, rkey, record_cid
-            FROM temp.swan_public_export_index
-            EXCEPT
-            SELECT collection, rkey, record_cid
-            FROM public_repository_record_index
-            LIMIT 1
-            """
-        )
-        let extra = try await connection.query(
-            """
-            SELECT collection, rkey, record_cid
-            FROM public_repository_record_index
-            EXCEPT
-            SELECT collection, rkey, record_cid
-            FROM temp.swan_public_export_index
-            LIMIT 1
-            """
-        )
-        guard missing.isEmpty, extra.isEmpty else {
-            throw PublicRepositoryReadError.unavailable(reason: .projectionMismatch)
+    /// Reclaims unreachable blocks when quota pressure triggers it or on database open.
+    func garbageCollectPublicRepositoryBlocksInTransaction(
+        state: PublicRepositoryState,
+        reductionOnly: Bool = false
+    ) async throws {
+        let quota = publicRepositoryBlockQuota
+        let countAndBytes = try await measurePublicRepositoryBlocksInTransaction()
+        guard countAndBytes.count > quota.maximumTotalBlocks || countAndBytes.bytes > quota.maximumTotalBytes else {
+            return
         }
 
-        let stream = SQLitePublicRepositoryExportStream(
-            connection: connection,
-            commit: PublicRepositoryBlock(
-                cid: commit.commitCID, bytes: commit.signedCommitBytes
-            )
-        )
-        _ = try await PublicRepositoryCAR.write(
-            rootCID: commit.commitCID,
-            blocks: stream,
-            to: sink,
-            limits: limits
-        )
-        try await resetPublicExportTables()
+        try await populatePublicExportReachabilityTables(state: state, limits: .standard)
+        do {
+            while true {
+                let deleted = try await connection.query(
+                    """
+                    DELETE FROM public_repository_blocks
+                    WHERE cid IN (
+                        SELECT b.cid FROM public_repository_blocks AS b
+                        WHERE b.cid != ?
+                          AND b.cid NOT IN (SELECT cid FROM temp.swan_public_export_nodes)
+                          AND b.cid NOT IN (SELECT cid FROM temp.swan_public_export_records)
+                        LIMIT 1000
+                    )
+                    RETURNING cid
+                    """,
+                    [.text(state.commitCID.string)]
+                )
+                guard !deleted.isEmpty else { break }
+            }
+            try await resetPublicExportTables()
         } catch {
             try? await resetPublicExportTables()
             throw error
         }
+        let remeasured = try await measurePublicRepositoryBlocksInTransaction()
+        if remeasured.count > quota.maximumTotalBlocks || remeasured.bytes > quota.maximumTotalBytes {
+            let reducedExceededDimension =
+                (!((countAndBytes.count > quota.maximumTotalBlocks))
+                  || remeasured.count < countAndBytes.count)
+                && (!((countAndBytes.bytes > quota.maximumTotalBytes))
+                  || remeasured.bytes < countAndBytes.bytes)
+            if !(reductionOnly && reducedExceededDimension) {
+                throw PublicRepositoryMutationStoreError.blockQuotaExceeded
+            }
+        }
+    }
+
+    func garbageCollectPublicRepositoryBlocksWithoutGate(state: PublicRepositoryState) async throws {
+        try await transaction {
+            try await garbageCollectPublicRepositoryBlocksInTransaction(state: state)
+        }
+    }
+
+    func measurePublicRepositoryBlocksInTransaction() async throws -> (count: Int, bytes: Int) {
+        let rows = try await connection.query(
+            "SELECT block_count, total_bytes FROM public_repository_block_usage WHERE singleton = 1"
+        )
+        if let row = rows.first,
+           let count = row.column("block_count")?.integer,
+           let bytes = row.column("total_bytes")?.integer {
+            return (count, bytes)
+        }
+        let fallbackRows = try await connection.query(
+            "SELECT COUNT(*) AS block_count, COALESCE(SUM(length(bytes)), 0) AS total_bytes FROM public_repository_blocks"
+        )
+        let count = fallbackRows.first?.column("block_count")?.integer ?? 0
+        let bytes = fallbackRows.first?.column("total_bytes")?.integer ?? 0
+        _ = try await connection.query(
+            """
+            INSERT INTO public_repository_block_usage(singleton, block_count, total_bytes)
+            VALUES (1, ?, ?)
+            ON CONFLICT(singleton) DO UPDATE SET
+                block_count = excluded.block_count,
+                total_bytes = excluded.total_bytes
+            """,
+            [.integer(count), .integer(bytes)]
+        )
+        return (count, bytes)
     }
 
     private func resetPublicExportTables() async throws {

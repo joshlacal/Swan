@@ -1,0 +1,11 @@
+{
+  "name": "upstream-scope-goldens",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned dependencies for upstream scope golden vector verification",
+  "dependencies": {
+    "iso-datestring-validator": "2.2.2",
+    "multiformats": "13.4.2",
+    "zod": "3.24.2"
+  }
+}

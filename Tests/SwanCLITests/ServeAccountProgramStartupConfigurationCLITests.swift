@@ -1160,12 +1160,17 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
     ) throws -> ProcessResult {
         let process = Process()
         process.executableURL = try XCTUnwrap(executableURL())
-        process.arguments = ["serve", "--data-directory", data.path] + arguments
+        var serveArgs = ["serve", "--data-directory", data.path] + arguments
+        if !arguments.contains("--oauth-server-key-file") {
+            let defaultKeyFile = data.deletingLastPathComponent().appending(path: "default-oauth-server-key")
+            if !FileManager.default.fileExists(atPath: defaultKeyFile.path) {
+                try protectedWrite(Data(repeating: 0x5A, count: 43), to: defaultKeyFile)
+            }
+            serveArgs.append(contentsOf: ["--oauth-server-key-file", defaultKeyFile.path])
+        }
+        process.arguments = serveArgs
         var processEnvironment = ProcessInfo.processInfo.environment
         processEnvironment.removeValue(forKey: "SWAN_OAUTH_SERVER_KEY")
-        processEnvironment["SWAN_OAUTH_SERVER_KEY"] = base64URLEncoded(
-            Data(repeating: 0x5A, count: 32)
-        )
         process.environment = processEnvironment
         let output = Pipe()
         let error = Pipe()

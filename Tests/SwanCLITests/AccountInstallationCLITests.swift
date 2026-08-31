@@ -14,12 +14,22 @@ final class AccountInstallationCLITests: XCTestCase {
         let password = "correct horse 🦢"
         try Data((password + "\n").utf8).write(to: passwordFile)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: passwordFile.path)
+        let operatorFile = root.appending(path: "operator-secret")
+        let operatorSecret = "operator-secret"
+        try Data((operatorSecret + "\n").utf8).write(to: operatorFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: operatorFile.path)
 
-        let environment = [
-            "SWAN_OPERATOR_SECRET": "operator-secret",
-            "SWAN_ACCOUNT_KEK": base64URLEncoded(Data(repeating: 0xA7, count: 32)),
-        ]
-        let first = try runInstall(root: root, passwordFile: passwordFile, environment: environment)
+        let kekFile = root.appending(path: "account-kek")
+        let kek = base64URLEncoded(Data(repeating: 0xA7, count: 32))
+        try Data((kek + "\n").utf8).write(to: kekFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: kekFile.path)
+
+        let first = try runInstall(
+            root: root,
+            passwordFile: passwordFile,
+            operatorFile: operatorFile,
+            kekFile: kekFile
+        )
         XCTAssertEqual(first["did"] as? String, did)
         XCTAssertEqual(first["canonicalHandle"] as? String, handle)
         XCTAssertEqual(first["status"] as? String, "active")
@@ -27,7 +37,7 @@ final class AccountInstallationCLITests: XCTestCase {
         XCTAssertEqual(first["recovered"] as? Bool, false)
         XCTAssertNotNil(first["publicGenesisCommitCID"] as? String)
         XCTAssertFalse(String(decoding: try JSONSerialization.data(withJSONObject: first), as: UTF8.self).contains(password))
-        XCTAssertFalse(String(decoding: try JSONSerialization.data(withJSONObject: first), as: UTF8.self).contains(environment["SWAN_ACCOUNT_KEK"]!))
+        XCTAssertFalse(String(decoding: try JSONSerialization.data(withJSONObject: first), as: UTF8.self).contains(kek))
 
         let control = try await SQLiteControlDatabase(dataDirectory: root)
         let account = try await control.account(did: did)
@@ -35,14 +45,21 @@ final class AccountInstallationCLITests: XCTestCase {
         XCTAssertEqual(account?.status.rawValue, "active")
         try await control.close()
 
-        let second = try runInstall(root: root, passwordFile: passwordFile, environment: environment)
+        let second = try runInstall(
+            root: root,
+            passwordFile: passwordFile,
+            operatorFile: operatorFile,
+            kekFile: kekFile
+        )
         XCTAssertEqual(second["recovered"] as? Bool, true)
     }
 
     private func runInstall(
         root: URL,
         passwordFile: URL,
-        environment: [String: String]
+        operatorFile: URL,
+        kekFile: URL,
+        environment: [String: String]? = nil
     ) throws -> [String: Any] {
         let process = Process()
         process.executableURL = try XCTUnwrap(executableURL())
@@ -53,8 +70,18 @@ final class AccountInstallationCLITests: XCTestCase {
             "--handle", handle,
             "--revision", revision,
             "--password-file", passwordFile.path,
+            "--operator-secret-file", operatorFile.path,
+            "--account-kek-file", kekFile.path,
         ]
-        process.environment = environment
+        var processEnvironment = ProcessInfo.processInfo.environment
+        processEnvironment.removeValue(forKey: "SWAN_OPERATOR_SECRET")
+        processEnvironment.removeValue(forKey: "SWAN_ACCOUNT_KEK")
+        if let environment {
+            for (key, value) in environment {
+                processEnvironment[key] = value
+            }
+        }
+        process.environment = processEnvironment
         let standardOutput = Pipe()
         let standardError = Pipe()
         process.standardOutput = standardOutput

@@ -544,6 +544,10 @@ private func publicFirehoseRunTailer(
         )
         try? await outbound.close(.normalClosure, reason: "ConsumerTooSlow")
         return .failure(.consumerTooSlow)
+      case .admissionStarved:
+        logger.warning("dropping public firehose subscriber due to page admission saturation")
+        try? await outbound.close(publicFirehoseCapacityRefusalCode, reason: nil)
+        return .failure(.subscriberCapacity)
       }
     } catch {
       if Task.isCancelled || error is CancellationError {

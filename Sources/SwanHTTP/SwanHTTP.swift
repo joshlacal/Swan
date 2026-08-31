@@ -975,6 +975,7 @@ public struct SwanHTTPServer: Sendable {
         // runtime is not assembled; a registered route is never a bare 404.
         if let accountLifecycleXRPC {
             let adapter = accountLifecycleXRPC
+            let policy = loginClientIdentityPolicy
             router.post("/xrpc/com.atproto.server.createAccount") { request, context async -> Response in
                 let now = Date()
                 do {
@@ -983,9 +984,24 @@ public struct SwanHTTPServer: Sendable {
                         context: context,
                         requestBodyAdmission: requestBodyAdmission
                     )
+                    let clientIP: String
+                    do {
+                        clientIP = try policy.clientIPAddress(
+                            directPeer: context.remoteAddress?.ipAddress,
+                            headers: request.headers
+                        )
+                    } catch {
+                        throw SwanError.unavailable("signup peer")
+                    }
+                    guard let resolvedPeerAddress = try? SocketAddress(
+                        ipAddress: clientIP,
+                        port: context.remoteAddress?.port ?? 0
+                    ) else {
+                        throw SwanError.unavailable("signup peer")
+                    }
                     let result = try await adapter.createAccount(
                         input,
-                        peerAddress: context.remoteAddress,
+                        peerAddress: resolvedPeerAddress,
                         now: now
                     )
                     return jsonResponseWithStatus(.ok, body: CreateAccountResponse(

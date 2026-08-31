@@ -431,11 +431,10 @@ PY
     --entrypoint /bin/sh "$swan_image" -ec '
       export SSL_CERT_FILE=/etc/ssl/certs/caddy-local-root.crt
       export SWAN_LAB_PRODUCER_HANDLE="$1"
-      SWAN_LAB_PRODUCER_PASSWORD="$(tr -d "\r\n" </run/task6c-secrets/account.password)"
-      export SWAN_LAB_PRODUCER_PASSWORD
       /usr/local/bin/swan lab live --mode public --name "reference-relay-${2}" \
         --producer-url https://swan.test --consumer-url https://swan.test \
-        --producer-auth oauth --consumer-auth none \
+        --producer-auth oauth --producer-password-file /run/task6c-secrets/account.password \
+        --consumer-auth none \
         --producer-client-id "http://localhost?scope=atproto&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback" \
         --producer-redirect-uri http://127.0.0.1/callback --scope atproto \
         --repository "$3" --collection app.bsky.feed.post --rkey "$4" \
@@ -445,7 +444,6 @@ PY
         *\"status\":\"passed\"*) ;;
         *) exit 1 ;;
       esac
-      unset SWAN_LAB_PRODUCER_PASSWORD
     ' _ "$fresh_handle" "$ordinal" "$fresh_did" "$rkey"
   chmod 0600 "$live_artifact"
   rm -f "$body" "$live_artifact"

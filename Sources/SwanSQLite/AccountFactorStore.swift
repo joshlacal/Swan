@@ -798,7 +798,7 @@ extension SQLiteControlDatabase {
         if !tokenNames.contains("client_id") { _ = try await connection.query("ALTER TABLE mfa_factor_tokens ADD COLUMN client_id TEXT") }
         if !tokenNames.contains("request_digest") { _ = try await connection.query("ALTER TABLE mfa_factor_tokens ADD COLUMN request_digest BLOB") }
         _ = try await connection.query("CREATE TABLE IF NOT EXISTS mfa_factor_revisions (account_did TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(revision >= 0)) WITHOUT ROWID")
-        _ = try await connection.query("CREATE TABLE IF NOT EXISTS account_authorization_grants (grant_digest BLOB PRIMARY KEY CHECK(length(grant_digest) = 32), account_did TEXT NOT NULL, channel TEXT NOT NULL, session_id TEXT NOT NULL, purpose TEXT NOT NULL, csrf_digest BLOB, client_id TEXT, request_digest BLOB, factor_revision INTEGER NOT NULL CHECK(factor_revision >= 0), strength BLOB NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER)")
+        _ = try await connection.query("CREATE TABLE IF NOT EXISTS account_authorization_grants (grant_digest BLOB PRIMARY KEY CHECK(length(grant_digest) = 32), account_did TEXT NOT NULL, channel TEXT NOT NULL, session_id TEXT NOT NULL, purpose TEXT NOT NULL, csrf_digest BLOB, client_id TEXT, request_digest BLOB, factor_revision INTEGER NOT NULL CHECK(factor_revision >= 0), credential_revision INTEGER NOT NULL CHECK(credential_revision >= 0), strength BLOB NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER)")
         _ = try await connection.query("CREATE INDEX IF NOT EXISTS account_authorization_grants_expiry ON account_authorization_grants(expires_at, consumed_at)")
         _ = try await connection.query("CREATE TABLE IF NOT EXISTS oauth_mfa_phases (phase_digest BLOB PRIMARY KEY CHECK(length(phase_digest) = 32), account_did TEXT NOT NULL, session_id TEXT NOT NULL, csrf_digest BLOB NOT NULL CHECK(length(csrf_digest) = 32), client_id TEXT NOT NULL, request_digest BLOB NOT NULL CHECK(length(request_digest) = 32), factor_revision INTEGER NOT NULL CHECK(factor_revision >= 0), issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER)")
         _ = try await connection.query("CREATE INDEX IF NOT EXISTS oauth_mfa_phases_expiry ON oauth_mfa_phases(expires_at, consumed_at)")
@@ -812,6 +812,12 @@ extension SQLiteControlDatabase {
         let contextNames = Set(contextColumns.compactMap { $0.column("name")?.string })
         if !contextNames.contains("session_id") { _ = try await connection.query("ALTER TABLE mfa_webauthn_challenge_context ADD COLUMN session_id TEXT") }
         if !contextNames.contains("factor_id") { _ = try await connection.query("ALTER TABLE mfa_webauthn_challenge_context ADD COLUMN factor_id TEXT") }
+        let grantColumns = try await connection.query("PRAGMA table_info(account_authorization_grants)")
+        let grantNames = Set(grantColumns.compactMap { $0.column("name")?.string })
+        if !grantNames.contains("credential_revision") {
+            _ = try await connection.query("ALTER TABLE account_authorization_grants ADD COLUMN credential_revision INTEGER NOT NULL DEFAULT 0")
+            _ = try await connection.query("UPDATE account_authorization_grants SET credential_revision = -1 WHERE credential_revision = 0")
+        }
     }
 
     func currentFactorRevision(accountDID: String) async throws -> Int64 {
@@ -855,15 +861,23 @@ extension SQLiteControlDatabase {
         let expiresAt = now.addingTimeInterval(120)
         let expires = try factorTimestamp(expiresAt)
         let encodedStrength = try JSONEncoder().encode(strength)
+        let accountRows = try await connection.query(
+            "SELECT COALESCE(updated_at, created_at, 0) AS credential_revision FROM accounts WHERE did = ?",
+            [.text(accountDID)]
+        )
+        guard let credentialRevision = accountRows.first?.column("credential_revision")?.integer,
+              credentialRevision >= 0 else {
+            throw AccountControlStoreError.notFound
+        }
         _ = try await connection.query(
-            "INSERT INTO account_authorization_grants(grant_digest, account_did, channel, session_id, purpose, csrf_digest, client_id, request_digest, factor_revision, strength, issued_at, expires_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            "INSERT INTO account_authorization_grants(grant_digest, account_did, channel, session_id, purpose, csrf_digest, client_id, request_digest, factor_revision, credential_revision, strength, issued_at, expires_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
             [
                 grantDigest.sqliteData!, .text(accountDID), .text(context.channel.rawValue),
                 .text(context.sessionID), .text(context.purpose),
                 context.csrfDigest.map { $0.sqliteData! } ?? .null,
                 context.clientID.map(SQLiteData.text) ?? .null,
                 context.requestDigest.map { $0.sqliteData! } ?? .null,
-                .integer(Int(factorRevision)), encodedStrength.sqliteData!,
+                .integer(Int(factorRevision)), .integer(credentialRevision), encodedStrength.sqliteData!,
                 .integer(issued), .integer(expires),
             ]
         )
@@ -902,6 +916,7 @@ extension SQLiteControlDatabase {
                AND expires_at > ?
                AND consumed_at IS NULL
                AND factor_revision = COALESCE((SELECT revision FROM mfa_factor_revisions WHERE account_did = ?), 0)
+               AND credential_revision = (SELECT COALESCE(updated_at, created_at, 0) FROM accounts WHERE did = ?)
             RETURNING grant_digest, account_did, channel, session_id, purpose,
                       csrf_digest, client_id, request_digest, factor_revision,
                       strength, issued_at, expires_at
@@ -914,6 +929,7 @@ extension SQLiteControlDatabase {
                 context.clientID.map(SQLiteData.text) ?? .null,
                 context.requestDigest.map { $0.sqliteData! } ?? .null,
                 .integer(timestamp), .integer(timestamp), .text(accountDID),
+                .text(accountDID),
             ]
         )
         guard let row = rows.first,

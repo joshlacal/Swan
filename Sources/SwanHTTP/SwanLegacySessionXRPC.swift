@@ -109,11 +109,6 @@ public protocol SwanLegacySessionDirectory: Sendable {
     func canonicalHandle(did: String) async throws -> String?
 }
 
-public protocol SwanLegacySessionRateLimiting: Sendable {
-    /// `false` refuses the attempt.
-    func admitSessionCreation(identifier: String, now: Date) async -> Bool
-}
-
 public struct SwanLegacySessionXRPCServer: Sendable {
     static let maximumJSONBytes = 8 * 1024
 
@@ -146,7 +141,7 @@ public struct SwanLegacySessionXRPCServer: Sendable {
     private let appPasswords: any AppPasswordStore
     private let accounts: DurableAccountDirectory
     private let directory: any SwanLegacySessionDirectory
-    private let rateLimiter: any SwanLegacySessionRateLimiting
+    public let loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
     /// Account-key-backed service-JWT issuer. The route remains installed when
     /// composition has no key store, but fails closed as unavailable rather
     /// than falling back to the obsolete HMAC ``LegacyAuthService``.
@@ -165,7 +160,7 @@ public struct SwanLegacySessionXRPCServer: Sendable {
         appPasswords: any AppPasswordStore,
         accounts: DurableAccountDirectory,
         directory: any SwanLegacySessionDirectory,
-        rateLimiter: any SwanLegacySessionRateLimiting,
+        loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         serviceAuthIssuer: (any SwanProxyServiceTokenIssuing)? = nil,
         minimumFailedLoginDuration: Duration = .milliseconds(350)
     ) {
@@ -174,7 +169,7 @@ public struct SwanLegacySessionXRPCServer: Sendable {
         self.appPasswords = appPasswords
         self.accounts = accounts
         self.directory = directory
-        self.rateLimiter = rateLimiter
+        self.loginClientIdentityPolicy = loginClientIdentityPolicy
         self.serviceAuthIssuer = serviceAuthIssuer
         self.minimumFailedLoginDuration = minimumFailedLoginDuration
     }
@@ -196,7 +191,7 @@ public struct SwanLegacySessionXRPCServer: Sendable {
             appPasswords: appPasswords,
             accounts: accounts,
             directory: directory,
-            rateLimiter: rateLimiter,
+            loginClientIdentityPolicy: loginClientIdentityPolicy,
             serviceAuthIssuer: serviceAuthIssuer,
             requestBodyAdmission: requestBodyAdmission,
             minimumFailedLoginDuration: minimumFailedLoginDuration
@@ -245,7 +240,7 @@ private struct Handlers: Sendable {
     let appPasswords: any AppPasswordStore
     let accounts: DurableAccountDirectory
     let directory: any SwanLegacySessionDirectory
-    let rateLimiter: any SwanLegacySessionRateLimiting
+    let loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
     let serviceAuthIssuer: (any SwanProxyServiceTokenIssuing)?
     let requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
     let minimumFailedLoginDuration: Duration
@@ -262,15 +257,30 @@ private struct Handlers: Sendable {
                 request,
                 context: context,
                 required: ["identifier", "password"],
-                // Both are sent by the official client. `authFactorToken` is
-                // optional for password-only accounts and is validated by the
-                // canonical directory when the additive MFA runtime is active.
                 optional: ["authFactorToken", "allowTakendown"]
             )
-            guard await rateLimiter.admitSessionCreation(
-                identifier: input.identifier, now: Date()
+            let rawPeer = context.remoteAddress?.ipAddress
+            guard let clientIP = try? loginClientIdentityPolicy.clientIPAddress(
+                directPeer: rawPeer,
+                headers: request.headers
             ) else {
-                throw SwanLegacySessionXRPCFailure.rateLimited
+                throw SwanLegacySessionXRPCFailure.unavailable
+            }
+            do {
+                let decision = try await accounts.admitLogin(
+                    handle: input.identifier,
+                    directPeer: clientIP,
+                    now: Date()
+                )
+                guard decision == .allowed else {
+                    throw SwanLegacySessionXRPCFailure.rateLimited
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let failure as SwanLegacySessionXRPCFailure {
+                throw failure
+            } catch {
+                throw SwanLegacySessionXRPCFailure.unavailable
             }
 
             // An empty `authFactorToken` is a client sending the field it always
@@ -821,45 +831,3 @@ public struct SwanDurableLegacySessionDirectory: SwanLegacySessionDirectory {
     }
 }
 
-/// A per-identifier sliding-window limit on `createSession`.
-///
-/// An app password is a machine-generated 100-bit secret and the account
-/// password is Argon2id-verified, so this is not the thing standing between an
-/// attacker and a guess. It bounds COST: every attempt spends two Argon2id
-/// evaluations at 64 MiB each, so an unthrottled login endpoint is a memory and
-/// CPU amplifier pointed at the host by anyone who can name a handle.
-///
-/// Keyed by the presented identifier rather than by account, deliberately: an
-/// unknown identifier must be throttled the same as a known one, or the limiter
-/// itself becomes the existence oracle the login path is careful not to be.
-public actor SwanInProcessLegacySessionRateLimiter: SwanLegacySessionRateLimiting {
-    private let limit: Int
-    private let window: TimeInterval
-    private var attempts: [String: [Date]] = [:]
-
-    public init(limit: Int = 30, window: TimeInterval = 300) {
-        self.limit = limit
-        self.window = window
-    }
-
-    public func admitSessionCreation(identifier: String, now: Date) async -> Bool {
-        let key = identifier.lowercased()
-        let cutoff = now.addingTimeInterval(-window)
-        var recent = (attempts[key] ?? []).filter { $0 > cutoff }
-        guard recent.count < limit else {
-            attempts[key] = recent
-            return false
-        }
-        recent.append(now)
-        attempts[key] = recent
-        // Opportunistic sweep so a long-lived process does not accumulate one
-        // entry per identifier ever presented.
-        if attempts.count > 4096 {
-            attempts = attempts.compactMapValues { stamps in
-                let live = stamps.filter { $0 > cutoff }
-                return live.isEmpty ? nil : live
-            }
-        }
-        return true
-    }
-}

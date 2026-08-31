@@ -94,24 +94,29 @@ public struct OAuthPeerAdmissionPolicy: Sendable, Equatable {
     /// rather than better — so it is deliberately one named constant and one
     /// edit to change.
     public static let defaultAttempts = 600
+    public static let defaultGlobalAttempts = 1_000
     public static let defaultWindow: TimeInterval = 10
 
     public let attempts: Int
+    public let globalAttempts: Int
     public let window: TimeInterval
     public let maximumTrackedPeers: Int
 
     public init(
         attempts: Int = OAuthPeerAdmissionPolicy.defaultAttempts,
+        globalAttempts: Int = OAuthPeerAdmissionPolicy.defaultGlobalAttempts,
         window: TimeInterval = OAuthPeerAdmissionPolicy.defaultWindow,
         maximumTrackedPeers: Int = 50_000
     ) throws {
         guard (1 ... 1_000_000).contains(attempts),
+              (1 ... 1_000_000).contains(globalAttempts),
               window.isFinite,
               (1 ... 86_400).contains(window),
               (2 ... 1_000_000).contains(maximumTrackedPeers) else {
             throw AccountLoginAdmissionError.invalidConfiguration
         }
         self.attempts = attempts
+        self.globalAttempts = globalAttempts
         self.window = window
         self.maximumTrackedPeers = maximumTrackedPeers
     }
@@ -170,13 +175,14 @@ public actor OAuthPeerAdmissionService {
     public static let shared = OAuthPeerAdmissionService()
 
     private let policy: OAuthPeerAdmissionPolicy
+    private var globalBucket: Bucket?
     private var buckets: [String: Bucket] = [:]
 
     public init(policy: OAuthPeerAdmissionPolicy = try! .init()) {
         self.policy = policy
     }
 
-    /// Charges one request against `peer`'s budget.
+    /// Charges one request against `peer`'s budget and the aggregate global budget.
     ///
     /// `peer` is the address the login client-identity policy resolved, or
     /// `nil` when it could not resolve one. Values that are not plausible
@@ -186,6 +192,15 @@ public actor OAuthPeerAdmissionService {
         peer: String?,
         now: Date = Date()
     ) -> OAuthPeerAdmissionDecision {
+        // Check aggregate global budget without mutation.
+        if let currentGlobal = globalBucket,
+           now.timeIntervalSince(currentGlobal.startedAt) < policy.window {
+            guard currentGlobal.attempts < policy.globalAttempts else {
+                return .rateLimited
+            }
+        }
+
+        // Check per-peer budget without mutation.
         let key = Self.bucketKey(for: peer)
         if let current = buckets[key] {
             // A backwards clock leaves the window open rather than starting a
@@ -194,11 +209,6 @@ public actor OAuthPeerAdmissionService {
                 guard current.attempts < policy.attempts else {
                     return .rateLimited
                 }
-                buckets[key] = Bucket(
-                    startedAt: current.startedAt,
-                    attempts: current.attempts + 1
-                )
-                return .allowed
             }
         } else if buckets.count >= policy.maximumTrackedPeers {
             buckets = buckets.filter {
@@ -210,10 +220,29 @@ public actor OAuthPeerAdmissionService {
                 return .rateLimited
             }
         }
-        buckets[key] = Bucket(startedAt: now, attempts: 1)
+
+        // Both budgets admit: commit mutations to both.
+        if let currentGlobal = globalBucket,
+           now.timeIntervalSince(currentGlobal.startedAt) < policy.window {
+            globalBucket = Bucket(
+                startedAt: currentGlobal.startedAt,
+                attempts: currentGlobal.attempts + 1
+            )
+        } else {
+            globalBucket = Bucket(startedAt: now, attempts: 1)
+        }
+
+        if let current = buckets[key],
+           now.timeIntervalSince(current.startedAt) < policy.window {
+            buckets[key] = Bucket(
+                startedAt: current.startedAt,
+                attempts: current.attempts + 1
+            )
+        } else {
+            buckets[key] = Bucket(startedAt: now, attempts: 1)
+        }
         return .allowed
     }
-
     private static func bucketKey(for peer: String?) -> String {
         guard let peer else { return unidentifiedPeer }
         let bytes = Array(peer.utf8)
@@ -271,7 +300,8 @@ public actor AccountLoginAdmissionService {
         now: Date = Date()
     ) async throws -> AccountLoginAdmissionDecision {
         try Task.checkCancellation()
-        let handleBytes = Array(handle.utf8)
+        let trimmed = handle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let handleBytes = Array(trimmed.utf8)
         let peerBytes = Array(directPeer.utf8)
         guard (1 ... 253).contains(handleBytes.count),
               !handleBytes.contains(0),
@@ -283,7 +313,9 @@ public actor AccountLoginAdmissionService {
         }
 
         let normalizedHandle: Data
-        if let canonicalHandle = try? AccountIdentifiers.canonicalHandle(handle) {
+        if let canonicalDID = try? AccountIdentifiers.validateDID(trimmed) {
+            normalizedHandle = Data(canonicalDID.utf8)
+        } else if let canonicalHandle = try? AccountIdentifiers.canonicalHandle(trimmed) {
             normalizedHandle = Data(canonicalHandle.utf8)
         } else {
             normalizedHandle = Self.invalidHandleSentinel

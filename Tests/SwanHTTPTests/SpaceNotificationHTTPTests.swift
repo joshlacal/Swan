@@ -36,7 +36,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 let first = Task {
                     try await client.execute(
                         uri: "/xrpc/com.atproto.space.registerNotify", method: .post,
-                        headers: try fixture.bearerHeaders(), body: body
+                        headers: try fixture.registerHeaders(for: self.writer), body: body
                     )
                 }
                 await barrier.waitUntilEntered()
@@ -45,7 +45,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 ))
                 let second = try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify", method: .post,
-                    headers: try fixture.bearerHeaders(), body: body
+                    headers: try fixture.registerHeaders(for: self.writer), body: body
                 )
                 XCTAssertEqual(second.status, .serviceUnavailable)
                 XCTAssertEqual(try notificationErrorCode(second.body), "temporarily_unavailable")
@@ -71,8 +71,8 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         defer { fixture.cleanup() }
         do {
             let app = try fixture.server().buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests"))
-            let credentialHeaders = try fixture.bearerHeaders(serviceAuth: "register-service-token")
-            let credentialOnlyHeaders = try fixture.credentialOnlyHeaders()
+            let credentialHeaders = try fixture.credentialOnlyHeaders()
+            let registerHeaders = try fixture.registerHeaders(for: writer)
             let wrongAudienceHeaders = try fixture.bearerHeaders(serviceAuth: "wrong-audience-token")
             let encodedSpace = notificationPercentEncode(fixture.space.rawValue)
             let expectedWriter = writer
@@ -105,7 +105,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: credentialOnlyHeaders,
+                    headers: credentialHeaders,
                     body: registerBody
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -128,10 +128,42 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     headers: credentialHeaders,
                     body: registerBody
                 ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
+                }
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: registerHeaders,
+                    body: registerBody
+                ) { response in
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertEqual(response.headers[.cacheControl], "no-store")
                     let value = try notificationJSONObject(response.body)
                     XCTAssertEqual(Set(value.keys), ["expiresAt"])
+                }
+                // Cross-host / foreign-audience service authentication on registerNotify is rejected
+                let foreignRegisterHeaders = try fixture.foreignAudienceRegisterHeaders(for: writer)
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: foreignRegisterHeaders,
+                    body: registerBody
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
+                }
+                // A notifyWrite request with altered body / mismatched digest is rejected
+                let badCommitment = Data(repeating: 0xCC, count: 32).base64EncodedString()
+                let alteredWriteBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"rev\":\"2222222222222\",\"hash\":{\"$bytes\":\"\(badCommitment)\"}}")
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.notifyWrite",
+                    method: .post,
+                    headers: serviceHeaders,
+                    body: alteredWriteBody
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
                 }
                 // Valid notifyWrite succeeds
                 try await client.execute(
@@ -219,7 +251,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: credentialHeaders,
+                    headers: registerHeaders,
                     body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/x\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -268,28 +300,50 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             )
             let app = try fixture.server(serviceEndpointResolver: resolver)
                 .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.service"))
-            let credentialHeaders = try fixture.bearerHeaders()
+            let credentialHeaders = try fixture.credentialOnlyHeaders()
             let spaceURI = fixture.space.rawValue
             let registerBody: @Sendable (String) -> ByteBuffer = { fields in
                 ByteBuffer(string: "{\"space\":\"\(spaceURI)\",\(fields)}")
             }
             try await app.test(.router) { client in
+                let validHeaders = try fixture.registerHeaders(for: subscriber)
                 // Fragment-qualified service → the matching entry's endpoint.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: validHeaders,
+                    body: registerBody("\"service\":\"\(subscriber)#bulleted_events\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(Set(try notificationJSONObject(response.body).keys), ["expiresAt"])
+                }
+                // Service header absence is rejected
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
                     headers: credentialHeaders,
                     body: registerBody("\"service\":\"\(subscriber)#bulleted_events\"")
                 ) { response in
-                    XCTAssertEqual(response.status, .ok)
-                    XCTAssertEqual(Set(try notificationJSONObject(response.body).keys), ["expiresAt"])
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
+                }
+                // Body-owner mismatch is rejected
+                let mismatchedHeaders = try fixture.registerHeaders(for: "did:web:other.example")
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: mismatchedHeaders,
+                    body: registerBody("\"service\":\"\(subscriber)#bulleted_events\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
                 }
                 // `service` decides when both are sent: the supplied endpoint
                 // is ignored in favour of the resolved one.
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: credentialHeaders,
+                    headers: validHeaders,
                     body: registerBody(
                         "\"service\":\"\(subscriber)#other\",\"endpoint\":\"https://attacker.example/sink\""
                     )
@@ -300,7 +354,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: credentialHeaders,
+                    headers: validHeaders,
                     body: registerBody("\"repo\":\"\(self.writer)\"")
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -311,7 +365,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     try await client.execute(
                         uri: "/xrpc/com.atproto.space.registerNotify",
                         method: .post,
-                        headers: credentialHeaders,
+                        headers: try fixture.registerHeaders(for: bad),
                         body: registerBody("\"service\":\"\(bad)\"")
                     ) { response in
                         XCTAssertEqual(response.status, .badRequest, "service=\(bad)")
@@ -323,7 +377,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: credentialHeaders,
+                    headers: try fixture.registerHeaders(for: subscriber),
                     body: registerBody("\"service\":\"\(subscriber)#missing\"")
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -376,17 +430,18 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             )
             let app = try fixture.server(serviceEndpointResolver: resolver)
                 .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.unregister"))
-            let credentialHeaders = try fixture.bearerHeaders()
+            let credentialHeaders = try fixture.credentialOnlyHeaders()
             let spaceURI = fixture.space.rawValue
             let body: @Sendable (String) -> ByteBuffer = { fields in
                 ByteBuffer(string: "{\"space\":\"\(spaceURI)\",\(fields)}")
             }
             try await app.test(.router) { client in
+                let validHeaders = try fixture.registerHeaders(for: subscriber)
                 for fragment in ["#a", "#b"] {
                     try await client.execute(
                         uri: "/xrpc/com.atproto.space.registerNotify",
                         method: .post,
-                        headers: credentialHeaders,
+                        headers: validHeaders,
                         body: body("\"service\":\"\(subscriber)\(fragment)\"")
                     ) { response in
                         XCTAssertEqual(response.status, .ok)
@@ -395,11 +450,45 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 let afterRegister = await fixture.directory.registrations()
                 XCTAssertEqual(afterRegister.count, 2)
 
-                // Withdraw exactly one subscriber; the other survives.
+                // Missing service auth header on unregister is rejected
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.unregisterNotify",
                     method: .post,
                     headers: credentialHeaders,
+                    body: body("\"service\":\"\(subscriber)#a\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
+                }
+
+                // Body-owner mismatch on unregister is rejected
+                let foreignHeaders = try fixture.registerHeaders(for: "did:web:foreign.example")
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.unregisterNotify",
+                    method: .post,
+                    headers: foreignHeaders,
+                    body: body("\"service\":\"\(subscriber)#a\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
+                }
+                // Cross-host / foreign-audience service authentication on unregisterNotify is rejected
+                let foreignAudienceHeaders = try fixture.foreignAudienceRegisterHeaders(for: subscriber)
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.unregisterNotify",
+                    method: .post,
+                    headers: foreignAudienceHeaders,
+                    body: body("\"service\":\"\(subscriber)#a\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
+                }
+
+                // Withdraw exactly one subscriber; the other survives.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.unregisterNotify",
+                    method: .post,
+                    headers: validHeaders,
                     body: body("\"service\":\"\(subscriber)#a\"")
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -412,10 +501,11 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 // Idempotent: withdrawing again, or a never-registered
                 // service, still succeeds — no existence oracle.
                 for target in ["\(subscriber)#a", "did:web:never.example#x"] {
+                    let targetHeaders = try fixture.registerHeaders(for: target)
                     try await client.execute(
                         uri: "/xrpc/com.atproto.space.unregisterNotify",
                         method: .post,
-                        headers: credentialHeaders,
+                        headers: targetHeaders,
                         body: body("\"service\":\"\(target)\"")
                     ) { response in
                         XCTAssertEqual(response.status, .ok, target)
@@ -436,7 +526,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     try await client.execute(
                         uri: "/xrpc/com.atproto.space.unregisterNotify",
                         method: .post,
-                        headers: credentialHeaders,
+                        headers: validHeaders,
                         body: body(bad)
                     ) { response in
                         XCTAssertEqual(response.status, .badRequest, bad)
@@ -499,7 +589,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try fixture.dpopSchemeCredentialHeaders(),
+                    headers: try fixture.dpopSchemeCredentialHeaders(for: subscriber),
                     body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"service\":\"\(subscriber)#events\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -538,12 +628,11 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         do {
             let app = try fixture.server()
                 .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.noResolver"))
-            let credentialHeaders = try fixture.bearerHeaders()
             try await app.test(.router) { client in
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: credentialHeaders,
+                    headers: try fixture.registerHeaders(for: "did:web:events.example"),
                     body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"service\":\"did:web:events.example#e\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -552,7 +641,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: credentialHeaders,
+                    headers: try fixture.registerHeaders(for: "did:web:events.example"),
                     body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -612,8 +701,10 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             .init(
                 space: space,
                 endpoint: legacyEndpoint,
-                repository: nil,
-                expiresAt: Date(timeIntervalSinceNow: 3_600)
+                repository: "did:plc:other-writer",
+                expiresAt: Date(timeIntervalSinceNow: 3_600),
+                service: "did:web:other.example#service",
+                serviceDID: "did:web:other.example"
             ),
             authorization: credential
         )
@@ -713,15 +804,10 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         let afterStale = await recordingTransport.posts()
         XCTAssertEqual(afterStale.count, 2)
 
-        // Withdrawal-by-replacement: the subscriber re-registers the same
-        // endpoint WITHOUT a service identity, so the stored row loses it.
-        try await database.registerSpaceNotification(
-            .init(
-                space: space,
-                endpoint: serviceEndpoint,
-                repository: nil,
-                expiresAt: Date(timeIntervalSinceNow: 3_600)
-            ),
+        // Withdrawn registration: the subscriber unregisters, so the stored row is removed.
+        try await database.unregisterSpaceNotification(
+            space: space,
+            service: serviceIdentity,
             authorization: credential
         )
         let withdrawnRow = PersistedSpaceNotificationFanout(
@@ -753,11 +839,6 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             )
             let app = try fixture.server(recipientBindings: bindings)
                 .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.deletionBinding"))
-            let sibling = try SpaceURI(
-                authority: authority,
-                spaceType: "app.bsky.bookmarks",
-                skey: "http-sibling"
-            )
             let headers: HTTPFields = {
                 var fields: HTTPFields = [.contentType: "application/json"]
                 fields[.authorization] = "Bearer authority-bound-recipient-token"
@@ -765,13 +846,26 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             }()
 
             try await app.test(.router) { client in
+                // Matches the bound space
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.notifySpaceDeleted",
                     method: .post,
                     headers: headers,
-                    body: ByteBuffer(string: "{\"space\":\"\(sibling.rawValue)\"}")
+                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
+                }
+                // A token with mismatched req / bad digest is rejected
+                var badDigestHeaders = headers
+                badDigestHeaders[.authorization] = "Bearer bad-digest-token"
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.notifySpaceDeleted",
+                    method: .post,
+                    headers: badDigestHeaders,
+                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\"}")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
                 }
                 // A space under a different authority is refused by the route.
                 let foreign = try SpaceURI(
@@ -791,12 +885,12 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             }
 
             let deletions = await fixture.directory.deletions()
-            let expectedDelDigest = SpaceNotificationRequestDigest.deletion(space: sibling)
+            let expectedDelDigest = SpaceNotificationRequestDigest.deletion(space: fixture.space)
             XCTAssertEqual(
                 deletions,
                 [
                     .init(
-                        space: sibling,
+                        space: fixture.space,
                         issuer: authority,
                         audience: writer,
                         eventID: "service-event-5",
@@ -850,11 +944,6 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         }
         try await fixture.close()
     }
-        } catch {
-            try? await fixture.close()
-            throw error
-        }
-    }
 
     func testNotificationRecoveryServiceDrainsCommittedWriterAndAuthorityQueues() async throws {
         let fixture = try NotificationRecoveryFixture()
@@ -877,12 +966,12 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
 
         for _ in 0 ..< 100 {
             let counts = await transport.counts()
-            if counts.outbox == 1 { break }
+            if counts.outbox == 1 && counts.fanout == 1 { break }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         let counts = await transport.counts()
         XCTAssertEqual(counts.outbox, 1)
-        XCTAssertEqual(counts.fanout, 0)
+        XCTAssertEqual(counts.fanout, 1)
         let remainingOutbox = try await database.pendingOutbox()
         let remainingFanout = try await database.pendingNotificationFanout()
         XCTAssertTrue(remainingOutbox.isEmpty)
@@ -920,7 +1009,9 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
 
         for _ in 0 ..< 200 {
             let state = await transport.state()
-            if state.attempts >= 2 { break }
+            let restartedDatabases = try await restarted.directory.notificationRecoveryDatabases()
+            let remaining = (try? await XCTUnwrap(restartedDatabases.first).pendingOutbox()) ?? []
+            if state.attempts >= 2 && remaining.isEmpty { break }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         let state = await transport.state()
@@ -1021,16 +1112,28 @@ private struct NotificationHTTPFixture {
         return headers
     }
 
+    func registerHeaders(for serviceDID: String? = nil) throws -> HTTPFields {
+        var headers = try bearerHeaders()
+        let did = serviceDID ?? writer
+        headers[HTTPField.Name("atproto-service-auth")!] = "Bearer service-token:\(did)"
+        return headers
+    }
+    func foreignAudienceRegisterHeaders(for serviceDID: String? = nil) throws -> HTTPFields {
+        var headers = try bearerHeaders()
+        let did = serviceDID ?? writer
+        headers[HTTPField.Name("atproto-service-auth")!] = "Bearer foreign-audience-token:\(did)"
+        return headers
+    }
+
     /// The reference presentation: the credential under the `DPoP` scheme
     /// ("a space credential is bound to a key"), proof header included.
-    func dpopSchemeCredentialHeaders(serviceAuth: String? = "register-service-token") throws -> HTTPFields {
+    func dpopSchemeCredentialHeaders(for serviceDID: String? = nil) throws -> HTTPFields {
         let credential = try PermissionedDataJWT.createSpaceCredential(issuer: authority, space: space, key: key)
         var headers: HTTPFields = [.contentType: "application/json"]
         headers[.authorization] = "DPoP \(credential)"
         headers[.init("DPoP")!] = "surplus-proof-swan-credentials-are-unbound"
-        if let serviceAuth {
-            headers[.init("Atproto-Service-Auth")!] = "Bearer \(serviceAuth)"
-        }
+        let did = serviceDID ?? writer
+        headers[HTTPField.Name("atproto-service-auth")!] = "Bearer service-token:\(did)"
         return headers
     }
 
@@ -1107,7 +1210,9 @@ private struct NotificationRecoveryFixture {
                 space: space,
                 endpoint: "https://receiver.example/xrpc/com.atproto.space.notifyWrite",
                 repository: writer,
-                expiresAt: now.addingTimeInterval(3_600)
+                expiresAt: now.addingTimeInterval(3_600),
+                service: "did:web:receiver.example#service",
+                serviceDID: "did:web:receiver.example"
             ),
             authorization: .spaceCredential(.init(
                 subject: reader,
@@ -1131,7 +1236,13 @@ private struct NotificationRecoveryFixture {
                 wireRevision: "2222222222223",
                 commitment: Data(repeating: 0xA5, count: 32),
                 issuer: writer,
-                audience: authority
+                audience: authority,
+                requestBodyDigest: SpaceNotificationRequestDigest.write(
+                    space: space,
+                    repository: writer,
+                    wireRevision: "2222222222223",
+                    commitment: Data(repeating: 0xA5, count: 32)
+                )
             ),
             now: now
         )
@@ -1323,16 +1434,51 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
         registrationsValue.removeAll { $0.endpoint == registration.endpoint }
         registrationsValue.append(registration)
     }
-
     func unregisterSpaceNotification(
         space: SpaceURI,
-        serviceDID: String,
+        ownerServiceDID: String,
+        deliveryServiceDID: String?,
         authorization _: AuthorizationContext
     ) async throws {
         guard space.authority == authority else {
             throw AuthorizedSimpleSpaceLifecycleError.notFound
         }
-        registrationsValue.removeAll { $0.space == space && ($0.serviceDID == serviceDID || $0.service == serviceDID) }
+        let baseOwner = serviceIssuerDID(ownerServiceDID) ?? ownerServiceDID
+        if let requested = deliveryServiceDID {
+            if !requested.contains("#") && (requested == ownerServiceDID || requested == baseOwner) {
+                registrationsValue.removeAll {
+                    $0.space == space &&
+                    ($0.ownerServiceDID == ownerServiceDID || $0.ownerServiceDID == baseOwner || $0.serviceDID == baseOwner) &&
+                    ($0.deliveryServiceDID == requested || $0.service == requested || ($0.deliveryServiceDID == nil && $0.service == nil))
+                }
+            } else {
+                registrationsValue.removeAll {
+                    $0.space == space &&
+                    ($0.ownerServiceDID == ownerServiceDID || $0.ownerServiceDID == baseOwner || $0.serviceDID == baseOwner) &&
+                    ($0.deliveryServiceDID == requested || $0.service == requested)
+                }
+            }
+        } else {
+            registrationsValue.removeAll {
+                $0.space == space &&
+                ($0.ownerServiceDID == ownerServiceDID || $0.ownerServiceDID == baseOwner || $0.serviceDID == baseOwner) &&
+                ($0.deliveryServiceDID == nil && $0.service == nil)
+            }
+        }
+    }
+
+    func unregisterSpaceNotification(
+        space: SpaceURI,
+        serviceDID: String,
+        authorization: AuthorizationContext
+    ) async throws {
+        let baseDID = serviceIssuerDID(serviceDID) ?? serviceDID
+        try await unregisterSpaceNotification(
+            space: space,
+            ownerServiceDID: baseDID,
+            deliveryServiceDID: serviceDID,
+            authorization: authorization
+        )
     }
 
     func receiveSpaceWriteNotification(_ notification: AuthorizedSpaceWriteNotification) async throws {
@@ -1450,6 +1596,13 @@ private actor RecordingServiceIssuer: SpaceServiceAuthenticationIssuer {
 }
 
 private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
+    struct TokenMeta {
+        let issuer: String
+        let audience: String
+        let eventID: String
+        let requestBodyDigest: String?
+    }
+
     /// The pinned reference PDS registers a raw endpoint as the recipient
     /// service identity, so the binding key is not a DID.
     static let boundRecipientIdentity =
@@ -1465,125 +1618,150 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
         expectedRequestBodyDigest: String?,
         now _: Date
     ) async throws -> VerifiedSpaceServiceAuthentication {
-        if let expectedAudience {
-            switch compact {
-            case "writer-token":
-                guard expectedAudience == authority else { throw SwanError.unauthorized("audience mismatch") }
-            case "register-service-token", "unregister-service-token":
-                guard expectedAudience == authority else { throw SwanError.unauthorized("audience mismatch") }
-            case "wrong-audience-token":
-                guard expectedAudience == "did:plc:other-authority" else { throw SwanError.unauthorized("audience mismatch") }
+        let meta: TokenMeta
+        if compact.hasPrefix("service-token:") {
+            let issuer = String(compact.dropFirst("service-token:".count))
+            meta = TokenMeta(
+                issuer: issuer,
+                audience: authority,
+                eventID: "service-event-\(UUID().uuidString)",
+                requestBodyDigest: expectedRequestBodyDigest
+            )
+        } else if compact.hasPrefix("foreign-audience-token:") {
+            let issuer = String(compact.dropFirst("foreign-audience-token:".count))
+            meta = TokenMeta(
+                issuer: issuer,
+                audience: "did:plc:foreignauthority99999",
+                eventID: "service-event-foreign",
+                requestBodyDigest: nil
+            )
+        } else {
+            switch (compact, expectedMethod) {
+            case ("register-service-token", "com.atproto.space.registerNotify"):
+                meta = TokenMeta(
+                    issuer: "did:web:events.bulleted.example",
+                    audience: authority,
+                    eventID: "service-event-reg",
+                    requestBodyDigest: nil
+                )
+            case ("unregister-service-token", "com.atproto.space.unregisterNotify"):
+                meta = TokenMeta(
+                    issuer: "did:web:events.bulleted.example",
+                    audience: authority,
+                    eventID: "service-event-unreg",
+                    requestBodyDigest: nil
+                )
+            case ("wrong-audience-token", "com.atproto.space.registerNotify"),
+                 ("wrong-audience-token", "com.atproto.space.unregisterNotify"):
+                meta = TokenMeta(
+                    issuer: "did:web:events.bulleted.example",
+                    audience: "did:plc:other-authority",
+                    eventID: "service-event-wrong-aud",
+                    requestBodyDigest: nil
+                )
+            case ("writer-token", "com.atproto.space.registerNotify"),
+                 ("writer-token", "com.atproto.space.unregisterNotify"):
+                meta = TokenMeta(
+                    issuer: writer,
+                    audience: authority,
+                    eventID: "service-event-registration",
+                    requestBodyDigest: nil
+                )
+            case ("writer-token", "com.atproto.space.notifyWrite"):
+                let space = try SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "http")
+                let writeDigest = SpaceNotificationRequestDigest.write(
+                    space: space,
+                    repository: writer,
+                    wireRevision: "3l72c4e2y2222",
+                    commitment: Data(repeating: 0x01, count: 32)
+                )
+                meta = TokenMeta(
+                    issuer: writer,
+                    audience: authority,
+                    eventID: "service-event-1",
+                    requestBodyDigest: writeDigest
+                )
+            case ("mismatched-digest-token", "com.atproto.space.notifyWrite"):
+                meta = TokenMeta(
+                    issuer: writer,
+                    audience: authority,
+                    eventID: "service-event-bad",
+                    requestBodyDigest: "mismatched-digest"
+                )
+            case ("bad-digest-token", "com.atproto.space.notifySpaceDeleted"):
+                meta = TokenMeta(
+                    issuer: authority,
+                    audience: NotificationServiceVerifier.boundRecipientIdentity,
+                    eventID: "service-event-bad-digest",
+                    requestBodyDigest: "sha256:mismatched-digest"
+                )
+            case ("bad-digest-token", "com.atproto.space.notifyWrite"):
+                meta = TokenMeta(
+                    issuer: writer,
+                    audience: authority,
+                    eventID: "service-event-bad-digest",
+                    requestBodyDigest: "sha256:mismatched-digest"
+                )
+            case ("authority-fanout-token", "com.atproto.space.notifyWrite"):
+                meta = TokenMeta(
+                    issuer: authority,
+                    audience: "did:plc:recipientabcdefghijklmnop",
+                    eventID: "service-event-2",
+                    requestBodyDigest: expectedRequestBodyDigest
+                )
+            case ("authority-unknown-recipient-token", "com.atproto.space.notifyWrite"):
+                meta = TokenMeta(
+                    issuer: authority,
+                    audience: "did:plc:unknownabcdefghijklmnopqr",
+                    eventID: "service-event-3",
+                    requestBodyDigest: expectedRequestBodyDigest
+                )
+            case ("authority-unknown-recipient-token", "com.atproto.space.notifySpaceDeleted"):
+                let space = try SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "http")
+                meta = TokenMeta(
+                    issuer: authority,
+                    audience: "did:plc:unknownabcdefghijklmnopqr",
+                    eventID: "service-event-4",
+                    requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: space)
+                )
+            case ("authority-bound-recipient-token", "com.atproto.space.notifySpaceDeleted"):
+                let space = try SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "http")
+                let sibling = try? SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "http-sibling")
+                let digest: String
+                if let sibling, expectedRequestBodyDigest == SpaceNotificationRequestDigest.deletion(space: sibling) {
+                    digest = SpaceNotificationRequestDigest.deletion(space: sibling)
+                } else {
+                    digest = SpaceNotificationRequestDigest.deletion(space: space)
+                }
+                meta = TokenMeta(
+                    issuer: authority,
+                    audience: NotificationServiceVerifier.boundRecipientIdentity,
+                    eventID: "service-event-5",
+                    requestBodyDigest: digest
+                )
             default:
-                break
+                throw SwanError.unauthorized("service authentication is invalid")
             }
         }
 
-        switch (compact, expectedMethod) {
-        case ("register-service-token", "com.atproto.space.registerNotify"):
-            return .init(
-                issuer: "did:web:events.bulleted.example",
-                audience: authority,
-                method: expectedMethod,
-                eventID: "service-event-reg",
-                expiresAt: Date(timeIntervalSinceNow: 60)
-            )
-        case ("unregister-service-token", "com.atproto.space.unregisterNotify"):
-            return .init(
-                issuer: "did:web:events.bulleted.example",
-                audience: authority,
-                method: expectedMethod,
-                eventID: "service-event-unreg",
-                expiresAt: Date(timeIntervalSinceNow: 60)
-            )
-        case ("wrong-audience-token", "com.atproto.space.registerNotify"),
-             ("wrong-audience-token", "com.atproto.space.unregisterNotify"):
-            return .init(
-                issuer: "did:web:events.bulleted.example",
-                audience: "did:plc:other-authority",
-                method: expectedMethod,
-                eventID: "service-event-wrong-aud",
-                expiresAt: Date(timeIntervalSinceNow: 60)
-            )
-        case ("writer-token", "com.atproto.space.notifyWrite"):
-            let expectedWriteDigest = SpaceNotificationRequestDigest.write(
-                space: try! SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "http"),
-                repository: writer,
-                wireRevision: "3l72c4e2y2222",
-                commitment: Data(repeating: 0x01, count: 32)
-            )
-            guard expectedRequestBodyDigest == expectedWriteDigest else {
-                throw SwanError.unauthorized("request body digest mismatch")
+        if let expectedAudience {
+            guard meta.audience == expectedAudience else {
+                throw SwanError.unauthorized("service authentication audience mismatch")
             }
-            return .init(
-                issuer: writer,
-                audience: authority,
-                method: expectedMethod,
-                eventID: "service-event-1",
-                expiresAt: Date(timeIntervalSinceNow: 60),
-                requestBodyDigest: expectedWriteDigest
-            )
-        case ("mismatched-digest-token", "com.atproto.space.notifyWrite"):
-            guard expectedRequestBodyDigest == "mismatched-digest" else {
-                throw SwanError.unauthorized("request body digest mismatch")
-            }
-            return .init(
-                issuer: writer,
-                audience: authority,
-                method: expectedMethod,
-                eventID: "service-event-bad",
-                expiresAt: Date(timeIntervalSinceNow: 60),
-                requestBodyDigest: "mismatched-digest"
-            )
-        case ("authority-fanout-token", "com.atproto.space.notifyWrite"):
-            return .init(
-                issuer: authority,
-                audience: "did:plc:recipientabcdefghijklmnop",
-                method: expectedMethod,
-                eventID: "service-event-2",
-                expiresAt: Date(timeIntervalSinceNow: 60),
-                requestBodyDigest: expectedRequestBodyDigest
-            )
-        case ("authority-unknown-recipient-token", "com.atproto.space.notifyWrite"):
-            return .init(
-                issuer: authority,
-                audience: "did:plc:unknownabcdefghijklmnopqr",
-                method: expectedMethod,
-                eventID: "service-event-3",
-                expiresAt: Date(timeIntervalSinceNow: 60),
-                requestBodyDigest: expectedRequestBodyDigest
-            )
-        case ("authority-unknown-recipient-token", "com.atproto.space.notifySpaceDeleted"):
-            let expectedDelDigest = SpaceNotificationRequestDigest.deletion(
-                space: try! SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "http")
-            )
-            guard expectedRequestBodyDigest == expectedDelDigest else {
-                throw SwanError.unauthorized("request body digest mismatch")
-            }
-            return .init(
-                issuer: authority,
-                audience: "did:plc:unknownabcdefghijklmnopqr",
-                method: expectedMethod,
-                eventID: "service-event-4",
-                expiresAt: Date(timeIntervalSinceNow: 60),
-                requestBodyDigest: expectedDelDigest
-            )
-        case ("authority-bound-recipient-token", "com.atproto.space.notifySpaceDeleted"):
-            let sibling = try! SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "http-sibling")
-            let expectedDelDigest = SpaceNotificationRequestDigest.deletion(space: sibling)
-            guard expectedRequestBodyDigest == expectedDelDigest else {
-                throw SwanError.unauthorized("request body digest mismatch")
-            }
-            return .init(
-                issuer: authority,
-                audience: NotificationServiceVerifier.boundRecipientIdentity,
-                method: expectedMethod,
-                eventID: "service-event-5",
-                expiresAt: Date(timeIntervalSinceNow: 60),
-                requestBodyDigest: expectedDelDigest
-            )
-        default:
-            throw SwanError.unauthorized("service authentication is invalid")
         }
+        if let expectedRequestBodyDigest {
+            guard let tokenDigest = meta.requestBodyDigest, tokenDigest == expectedRequestBodyDigest else {
+                throw SwanError.unauthorized("service authentication digest mismatch")
+            }
+        }
+        return VerifiedSpaceServiceAuthentication(
+            issuer: meta.issuer,
+            audience: meta.audience,
+            method: expectedMethod,
+            eventID: meta.eventID,
+            requestBodyDigest: meta.requestBodyDigest,
+            expiresAt: Date(timeIntervalSinceNow: 60)
+        )
     }
 }
 

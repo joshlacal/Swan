@@ -4,8 +4,7 @@
   "sourceRequirements": [
     "auth.credentials.iss !== repo",
     "iss: ownerDid",
-    "aud: recipient.serviceDid",
-    "req: requestBodyDigest"
+    "aud: recipient.serviceDid"
   ],
   "issuer": "did:plc:bcdefghijklmnopqrstuvwxy",
   "audience": "did:plc:abcdefghijklmnopqrstuvwx",

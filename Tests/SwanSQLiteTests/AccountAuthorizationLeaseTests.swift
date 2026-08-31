@@ -193,30 +193,73 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         )
 
         if case .failure = grantResult {
-            // The active-account insert failure occurs after grant consumption
-            // in the same transaction. Reactivation and a second attempt with
-            // that exact grant proves the first consume rolled back.
+            // Deactivation updates accounts.updated_at, which durably invalidates
+            // pre-existing grants. Reactivation must not allow the stale grant to be consumed.
             _ = try await control.transitionStatus(
                 did: did,
                 to: .active,
                 declaration: .init(),
                 now: now.addingTimeInterval(3)
             )
-            try await control.createLegacySessionFamilyConsumingGrant(
-                familyID: "grant-after-reactivation",
-                did: did,
-                appPasswordID: nil,
-                accessDigest: Data(repeating: 0x66, count: 32),
-                accessExpiresAt: now.addingTimeInterval(3_600),
-                refreshDigest: Data(repeating: 0x67, count: 32),
-                refreshExpiresAt: now.addingTimeInterval(90 * 86_400),
-                authorizationGrantDigest: grant.grantDigest,
-                authorizationContext: context,
-                now: now.addingTimeInterval(4)
-            )
+            do {
+                try await control.createLegacySessionFamilyConsumingGrant(
+                    familyID: "grant-after-reactivation",
+                    did: did,
+                    appPasswordID: nil,
+                    accessDigest: Data(repeating: 0x66, count: 32),
+                    accessExpiresAt: now.addingTimeInterval(3_600),
+                    refreshDigest: Data(repeating: 0x67, count: 32),
+                    refreshExpiresAt: now.addingTimeInterval(90 * 86_400),
+                    authorizationGrantDigest: grant.grantDigest,
+                    authorizationContext: context,
+                    now: now.addingTimeInterval(4)
+                )
+                XCTFail("stale grant must not be usable after reactivation")
+            } catch AccountControlStoreError.invalidTransition {}
         }
         await control.setConnectionGateWaiterEnqueuedForTesting(nil)
         try await control.close()
+    }
+
+    
+    func testFailedGrantFamilyInsertRollsBackGrantConsumption() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("SwanGrantRollback-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        addTeardownBlock { [control, root] in
+            try? await control.close()
+            try? FileManager.default.removeItem(at: root)
+        }
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        _ = try await control.createAccount(AccountControlRegistration(
+            did: did, canonicalHandle: "grant-rollback.example.com",
+            passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+            signingKey: .init(purpose: .signing, generation: 1), rotationKey: .init(purpose: .rotation, generation: 1), createdAt: now
+        ))
+        let context = try AccountAuthorizationContext(channel: .legacy, sessionID: "grant-rollback", purpose: "managementLogin")
+        let grant = try await control.createPasswordAuthorizationGrant(
+            grantDigest: Data(repeating: 0x71, count: 32), accountDID: did, context: context, now: now
+        )
+        try await control.createLegacySessionFamily(
+            familyID: "occupied-family", did: did, appPasswordID: nil,
+            accessDigest: Data(repeating: 0x72, count: 32), accessExpiresAt: now.addingTimeInterval(3_600),
+            refreshDigest: Data(repeating: 0x73, count: 32), refreshExpiresAt: now.addingTimeInterval(90 * 86_400), now: now
+        )
+        do {
+            try await control.createLegacySessionFamilyConsumingGrant(
+                familyID: "occupied-family", did: did, appPasswordID: nil,
+                accessDigest: Data(repeating: 0x74, count: 32), accessExpiresAt: now.addingTimeInterval(3_600),
+                refreshDigest: Data(repeating: 0x75, count: 32), refreshExpiresAt: now.addingTimeInterval(90 * 86_400),
+                authorizationGrantDigest: grant.grantDigest, authorizationContext: context, now: now
+            )
+            XCTFail("duplicate family insertion must fail")
+        } catch {}
+        try await control.createLegacySessionFamilyConsumingGrant(
+            familyID: "after-rollback-family", did: did, appPasswordID: nil,
+            accessDigest: Data(repeating: 0x76, count: 32), accessExpiresAt: now.addingTimeInterval(3_600),
+            refreshDigest: Data(repeating: 0x77, count: 32), refreshExpiresAt: now.addingTimeInterval(90 * 86_400),
+            authorizationGrantDigest: grant.grantDigest, authorizationContext: context, now: now
+        )
     }
 
     func testFirehoseAuthorizationFencePassesLiveGenerationAndRejectsInactive() async throws {
@@ -747,6 +790,67 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
             durable,
             "the batch must still commit once it leaves staging"
         )
+    }
+
+    func testStalePasswordGrantRejectedAfterCredentialUpdate() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwanGrantStale-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        addTeardownBlock { [control, root] in
+            try? await control.close()
+            try? FileManager.default.removeItem(at: root)
+        }
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        _ = try await control.createAccount(
+            AccountControlRegistration(
+                did: did,
+                canonicalHandle: "grant-stale.example.com",
+                passwordVerifier:
+                    "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: .init(purpose: .signing, generation: 1),
+                rotationKey: .init(purpose: .rotation, generation: 1),
+                createdAt: now
+            )
+        )
+        let context = try AccountAuthorizationContext(
+            channel: .legacy,
+            sessionID: "grant-stale-session",
+            purpose: "managementLogin"
+        )
+        let grantDigest = Data(repeating: 0x77, count: 32)
+        _ = try await control.createPasswordAuthorizationGrant(
+            grantDigest: grantDigest,
+            accountDID: did,
+            context: context,
+            now: now
+        )
+        let positiveDigest = Data(repeating: 0x78, count: 32)
+        _ = try await control.createPasswordAuthorizationGrant(
+            grantDigest: positiveDigest,
+            accountDID: did,
+            context: context,
+            now: now
+        )
+        _ = try await control.consumeAuthorizationGrant(
+            grantDigest: positiveDigest,
+            accountDID: did,
+            context: context,
+            now: now.addingTimeInterval(1)
+        )
+        // Status change updates accounts.updated_at
+        _ = try await control.transitionStatus(did: did, to: .deactivated, declaration: .init(), emitting: nil, now: now.addingTimeInterval(5))
+        _ = try await control.transitionStatus(did: did, to: .active, declaration: .init(), emitting: nil, now: now.addingTimeInterval(10))
+
+        do {
+            _ = try await control.consumeAuthorizationGrant(
+                grantDigest: grantDigest,
+                accountDID: did,
+                context: context,
+                now: now.addingTimeInterval(15)
+            )
+            XCTFail("grant consumption must fail after credential revision change")
+        } catch {}
     }
 }
 

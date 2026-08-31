@@ -1,5 +1,6 @@
 import Foundation
 import PetrelPLC
+import SwanCore
 import SwanStorage
 
 #if os(Linux)
@@ -85,99 +86,46 @@ public struct OperatorSecretVerifier: Sendable {
 }
 
 /// Resolves the local operator secret without offering a command-line secret
-/// argument. A deployment may expose exactly one OS-protected source (an
-/// environment variable or a mounted secret file). If both are supplied, they
-/// must match through a no-early-exit comparison so one source cannot silently
-/// override the other due to a configuration mistake.
+/// argument. The operator secret is read only from an owner-protected mounted
+/// secret file.
 public enum OperatorSecretResolver {
 
     /// Production entry point. The command receives its credential only from
-    /// the process environment injected by its supervisor and/or a mounted
-    /// secret file explicitly selected by the operator.
+    /// a mounted secret file explicitly selected by the operator.
     public static func authorize(secretFile: URL? = nil) throws -> AccountOperatorAuthorization {
-        try loadVerifier(
-            environment: ProcessInfo.processInfo.environment,
-            secretFile: secretFile
-        ).authorizeLocalProcess()
+        guard let secretFile else {
+            throw AccountOperatorError.operatorSecretMissing
+        }
+        return try loadVerifier(secretFile: secretFile).authorizeLocalProcess()
     }
 
     /// Production entry point for the separate management listener. The
     /// returned verifier is opaque and retains the expected bytes only in
     /// process memory; it is never placed in SQLite, JSON, or logs.
     public static func loadVerifier(secretFile: URL? = nil) throws -> OperatorSecretVerifier {
-        try loadVerifier(
-            environment: ProcessInfo.processInfo.environment,
-            secretFile: secretFile
-        )
-    }
-
-    /// Internal seam for unit tests. It is deliberately not public API: a
-    /// library consumer must not be able to manufacture an authorization by
-    /// passing an arbitrary dictionary instead of the real process environment.
-    static func authorize(
-        environment: [String: String],
-        secretFile: URL?
-    ) throws -> AccountOperatorAuthorization {
-        try loadVerifier(environment: environment, secretFile: secretFile)
-            .authorizeLocalProcess()
-    }
-
-    /// Internal seam for focused resolver/verifier tests. It deliberately
-    /// remains non-public so package consumers cannot configure a verifier
-    /// from an arbitrary dictionary rather than an OS-protected source.
-    static func loadVerifier(
-        environment: [String: String],
-        secretFile: URL?
-    ) throws -> OperatorSecretVerifier {
-        let environmentSecret = try environment["SWAN_OPERATOR_SECRET"].map(secretData)
-        let fileSecret = try secretFile.map(readSecretFile)
-
-        guard environmentSecret != nil || fileSecret != nil else {
+        guard let secretFile else {
             throw AccountOperatorError.operatorSecretMissing
         }
-        if let environmentSecret, let fileSecret,
-           !OperatorSecretPolicy.constantTimeEqual(environmentSecret, fileSecret) {
-            throw AccountOperatorError.operatorSecretRejected
-        }
-        return OperatorSecretVerifier(expected: environmentSecret ?? fileSecret!)
-    }
-
-    private static func secretData(_ value: String) throws -> Data {
-        try validatedSecret(Data(value.utf8))
+        let fileSecret = try readSecretFile(secretFile)
+        return OperatorSecretVerifier(expected: fileSecret)
     }
 
     private static func readSecretFile(_ url: URL) throws -> Data {
-        // Open the selected object once, without following links, then inspect
-        // that same descriptor. Checking path metadata followed by a separate
-        // path read would permit a link/rename race to swap in a different
-        // secret after validation.
-        let descriptor: Int32 = url.withUnsafeFileSystemRepresentation { path in
-            guard let path else { return -1 }
-            return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
-        }
-        guard descriptor >= 0 else { throw AccountOperatorError.operatorSecretFileUnavailable }
-        defer { _ = close(descriptor) }
-
-        var metadata = stat()
-        guard fstat(descriptor, &metadata) == 0,
-              (metadata.st_mode & S_IFMT) == S_IFREG,
-              metadata.st_uid == geteuid(),
-              (metadata.st_mode & (S_IRWXG | S_IRWXO)) == 0,
-              metadata.st_size > 0,
-              metadata.st_size <= off_t(OperatorSecretPolicy.maximumSecretBytes + 2) else {
-            throw AccountOperatorError.operatorSecretFileUnavailable
-        }
         do {
-            // Read one byte past the largest legal on-disk form so a file that
-            // grew after fstat still cannot evade the bounded input rule.
-            let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
-            let data = try handle.read(upToCount: OperatorSecretPolicy.maximumSecretBytes + 3) ?? Data()
-            guard data.count <= OperatorSecretPolicy.maximumSecretBytes + 2 else {
-                throw AccountOperatorError.operatorSecretRejected
-            }
+            let data = try AccountProvisioningSecrets.readOwnerOnlyRegularFile(
+                url,
+                maximumPayloadBytes: OperatorSecretPolicy.maximumSecretBytes
+            )
             return try validatedSecret(data)
         } catch let error as AccountOperatorError {
             throw error
+        } catch let error as SwanError {
+            switch error {
+            case .malformed:
+                throw AccountOperatorError.operatorSecretRejected
+            default:
+                throw AccountOperatorError.operatorSecretFileUnavailable
+            }
         } catch {
             throw AccountOperatorError.operatorSecretFileUnavailable
         }

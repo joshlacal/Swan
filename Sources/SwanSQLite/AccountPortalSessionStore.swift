@@ -157,37 +157,18 @@ extension SQLiteControlDatabase: ManagementSessionStore,
     }
 
     public func upgradeManagementSession(
-        digest: Data,
-        accountDID: String,
-        strength: AuthenticationStrength,
-        lastStepUpAt: Date,
-        now: Date
+        digest: Data, accountDID: String, strength: AuthenticationStrength,
+        lastStepUpAt: Date, now: Date
     ) async throws {
-        guard digest.count == 32, !accountDID.isEmpty,
-              strength.isStepUp else {
-            throw AccountControlStoreError.invalidInput
-        }
+        guard digest.count == 32, !accountDID.isEmpty, strength.isStepUp else { throw AccountControlStoreError.invalidInput }
         let current = try portalTimestampOrThrow(now)
         let verified = try portalTimestampOrThrow(lastStepUpAt)
         guard verified <= current else { throw AccountControlStoreError.invalidInput }
         try await withConnectionGate {
             try await transaction {
                 let rows = try await connection.query(
-                    """
-                    UPDATE management_sessions
-                       SET last_step_up_at = ?, strength = ?
-                     WHERE session_digest = ?
-                       AND account_did = ?
-                       AND revoked_at IS NULL
-                       AND idle_expires_at >= ?
-                       AND absolute_expires_at >= ?
-                    RETURNING session_digest
-                    """,
-                    [
-                        .integer(verified), .text(portalStrengthName(strength)),
-                        digest.sqliteData!, .text(accountDID),
-                        .integer(current), .integer(current),
-                    ]
+                    "UPDATE management_sessions SET last_step_up_at = ?, strength = ? WHERE session_digest = ? AND account_did = ? AND revoked_at IS NULL AND idle_expires_at >= ? AND absolute_expires_at >= ? RETURNING session_digest",
+                    [.integer(verified), .text(portalStrengthName(strength)), digest.sqliteData!, .text(accountDID), .integer(current), .integer(current)]
                 )
                 guard !rows.isEmpty else { throw AccountControlStoreError.notFound }
             }

@@ -158,7 +158,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
     if let maxSeq = sequences.max() {
       await hub.firehoseDidAppend(maxSeq: maxSeq)
     }
-    let events = try await firehose.events(after: 0, limit: 1_000)
+    let events = try await firehose.events(after: 0, limit: 1_000, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
     return try XCTUnwrap(events.last { $0.sourceKey == sourceKey })
   }
 
@@ -504,7 +504,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
         }
         try await self.waitUntil { await recorder.snapshot().count == 2 }
         _ = try await self.awaitWithDeadline { try await wsTask.value }
-        let stored = try await fixture.firehose.events(after: 0, limit: 10)
+        let stored = try await fixture.firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
         let delivered = await recorder.snapshot().map { Data(buffer: $0.data) }
         XCTAssertEqual(
           delivered,
@@ -784,7 +784,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
         try await self.waitUntil { await recorder.snapshot().count == 2 }
         let closeFrame = try await self.awaitWithDeadline { try await wsTask.value }
         XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
-        let stored = try await fixture.firehose.events(after: 3, limit: 10)
+        let stored = try await fixture.firehose.events(after: 3, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
         XCTAssertEqual(stored.map(\.seq), [4, 5])
         let delivered = await recorder.snapshot().map { Data(buffer: $0.data) }
         XCTAssertEqual(
@@ -843,7 +843,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
         try await self.waitUntil { await recorder.snapshot().count == 4 }
         let closeFrame = try await self.awaitWithDeadline { try await wsTask.value }
         XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
-        let stored = try await fixture.firehose.events(after: 0, limit: 10)
+        let stored = try await fixture.firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
         XCTAssertEqual(stored.map(\.seq), [1, 2, 3, 4])
         let delivered = await recorder.snapshot().map { Data(buffer: $0.data) }
         XCTAssertEqual(
@@ -876,7 +876,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
           seed: UInt8(0x30 + index)
         )
       }
-      let seeded = try await fixture.firehose.events(after: 0, limit: 10)
+      let seeded = try await fixture.firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
       XCTAssertEqual(seeded.map(\.seq), [1, 2, 3, 4, 5])
       let backfillBytes = seeded.filter { $0.seq >= 4 }.map(\.frameBytes)
       let app = fixture.server.buildApplication(
@@ -907,7 +907,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
         try await self.waitUntil { await recorder.snapshot().count == 3 }
         let closeFrame = try await self.awaitWithDeadline { try await wsTask.value }
         XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
-        let liveSix = try await fixture.firehose.events(after: 5, limit: 10)
+        let liveSix = try await fixture.firehose.events(after: 5, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
         XCTAssertEqual(liveSix.map(\.seq), [6])
         let delivered = await recorder.snapshot().map { Data(buffer: $0.data) }
         XCTAssertEqual(
@@ -971,7 +971,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
         try await self.waitUntil { await recorder.snapshot().count == 1 }
         let closeFrame = try await self.awaitWithDeadline { try await wsTask.value }
         XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
-        let stored = try await fixture.firehose.events(after: 3, limit: 10)
+        let stored = try await fixture.firehose.events(after: 3, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
         XCTAssertEqual(stored.map(\.seq), [4])
         let delivered = await recorder.snapshot().map { Data(buffer: $0.data) }
         XCTAssertEqual(delivered, stored.map(\.frameBytes))
@@ -1168,7 +1168,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
           [self.commitItem(sourceKey: "active-5", seed: 0xA5)],
           now: self.epoch.addingTimeInterval(20)
         )
-        let seeded = try await fixture.firehose.events(after: 2, limit: 10)
+        let seeded = try await fixture.firehose.events(after: 2, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
         let retained = try XCTUnwrap(seeded.last { $0.sourceKey == "active-5" })
 
         // The live session's cursor (2) is behind the two events about to
@@ -1297,7 +1297,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
         )
         try await self.waitUntil { await recorderA.snapshot().count == 5 }
         try await self.waitUntil { await recorderB.snapshot().count == 3 }
-        let storedUpTo5 = try await fixture.firehose.events(after: 0, limit: 10)
+        let storedUpTo5 = try await fixture.firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
         XCTAssertEqual(storedUpTo5.map(\.seq), [1, 2, 3, 4, 5])
         let deliveredA = await recorderA.snapshot().map { Data(buffer: $0.data) }
         XCTAssertEqual(deliveredA, storedUpTo5.map(\.frameBytes))
@@ -1316,7 +1316,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
         try await self.waitUntil { await recorderB.snapshot().count == 4 }
         let closeFrameB = try await self.awaitWithDeadline { try await wsTaskB.value }
         XCTAssertEqual(closeFrameB?.closeCode, .normalClosure)
-        let storedUpTo6 = try await fixture.firehose.events(after: 0, limit: 10)
+        let storedUpTo6 = try await fixture.firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
         let deliveredBAfter = await recorderB.snapshot().map { Data(buffer: $0.data) }
         XCTAssertEqual(
           deliveredBAfter,
@@ -1381,7 +1381,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
         try await self.waitUntil { await recorder.snapshot().count == 4 }
         let closeFrame = try await self.awaitWithDeadline { try await wsTask.value }
         XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
-        let stored = try await fixture.firehose.events(after: 0, limit: 10)
+        let stored = try await fixture.firehose.events(after: 0, limit: 10, maximumBytes: 4 * FirehoseFrameLimits.maximumFrameBytes)
         XCTAssertEqual(stored.map(\.seq), [1, 2, 3, 4])
         let delivered = await recorder.snapshot().map { Data(buffer: $0.data) }
         XCTAssertEqual(

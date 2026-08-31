@@ -6,35 +6,29 @@ import SwanStorage
 import XCTest
 
 final class AccountOperatorServiceTests: XCTestCase {
-    func testOperatorSecretResolverRejectsMissingAndMismatchedSources() throws {
+    func testOperatorSecretResolverRejectsMissingAndInvalidSources() throws {
         XCTAssertThrowsError(
-            try OperatorSecretResolver.authorize(
-                environment: [:],
-                secretFile: nil
-            )
+            try OperatorSecretResolver.authorize(secretFile: nil)
+        ) { error in
+            XCTAssertEqual(error as? AccountOperatorError, .operatorSecretMissing)
+        }
+        XCTAssertThrowsError(
+            try OperatorSecretResolver.loadVerifier(secretFile: nil)
         ) { error in
             XCTAssertEqual(error as? AccountOperatorError, .operatorSecretMissing)
         }
 
-        let file = try temporaryDirectory().appending(path: "operator-secret")
-        defer { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appending(path: "operator-secret")
         try Data("operator-secret\n".utf8).write(to: file)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
         XCTAssertNoThrow(
-            try OperatorSecretResolver.authorize(environment: [:], secretFile: file)
+            try OperatorSecretResolver.authorize(secretFile: file)
         )
-        try Data("not-the-operator-secret\n".utf8).write(to: file)
-
-        XCTAssertThrowsError(
-            try OperatorSecretResolver.authorize(
-                environment: ["SWAN_OPERATOR_SECRET": "operator-secret"],
-                secretFile: file
-            )
-        ) { error in
-            XCTAssertEqual(error as? AccountOperatorError, .operatorSecretRejected)
-            XCTAssertFalse(error.localizedDescription.contains("operator-secret"))
-            XCTAssertFalse(error.localizedDescription.contains("not-the-operator-secret"))
-        }
+        XCTAssertNoThrow(
+            try OperatorSecretResolver.loadVerifier(secretFile: file)
+        )
     }
 
     func testOperatorSecretResolverRejectsLinksAndBroadlyReadableFiles() throws {
@@ -47,24 +41,37 @@ final class AccountOperatorServiceTests: XCTestCase {
         try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: secret.path)
 
         XCTAssertThrowsError(
-            try OperatorSecretResolver.authorize(environment: [:], secretFile: link)
+            try OperatorSecretResolver.authorize(secretFile: link)
         ) { error in
             XCTAssertEqual(error as? AccountOperatorError, .operatorSecretFileUnavailable)
         }
 
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: secret.path)
         XCTAssertThrowsError(
-            try OperatorSecretResolver.authorize(environment: [:], secretFile: secret)
+            try OperatorSecretResolver.authorize(secretFile: secret)
+        ) { error in
+            XCTAssertEqual(error as? AccountOperatorError, .operatorSecretFileUnavailable)
+        }
+
+        let fifo = root.appending(path: "operator-secret-fifo")
+        mkfifo(fifo.path, 0o600)
+        XCTAssertThrowsError(
+            try OperatorSecretResolver.authorize(secretFile: fifo)
+        ) { error in
+            XCTAssertEqual(error as? AccountOperatorError, .operatorSecretFileUnavailable)
+        }
+        XCTAssertThrowsError(
+            try OperatorSecretResolver.loadVerifier(secretFile: fifo)
         ) { error in
             XCTAssertEqual(error as? AccountOperatorError, .operatorSecretFileUnavailable)
         }
     }
 
     func testOperatorSecretVerifierRejectsWrongMalformedAndOversizedBearerValues() throws {
-        let verifier = try OperatorSecretResolver.loadVerifier(
-            environment: ["SWAN_OPERATOR_SECRET": "operator-secret"],
-            secretFile: nil
-        )
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = try createOperatorSecretFile(root: root, secret: "operator-secret")
+        let verifier = try OperatorSecretResolver.loadVerifier(secretFile: file)
         XCTAssertNoThrow(try verifier.authorize(bearerValue: "operator-secret"))
         for value in ["wrong-secret", "", "operator secret", String(repeating: "a", count: 4_097)] {
             XCTAssertThrowsError(try verifier.authorize(bearerValue: value)) { error in
@@ -82,10 +89,8 @@ final class AccountOperatorServiceTests: XCTestCase {
             try await createAlice(in: control)
 
             let service = AccountOperatorService(store: control)
-            let authorization = try OperatorSecretResolver.authorize(
-                environment: ["SWAN_OPERATOR_SECRET": "operator-secret"],
-                secretFile: nil
-            )
+            let secretFile = try createOperatorSecretFile(root: root)
+            let authorization = try OperatorSecretResolver.authorize(secretFile: secretFile)
 
             let shown = try await service.show(.handle("Alice.Example.COM"))
             XCTAssertEqual(shown.did, Self.aliceDID)
@@ -138,10 +143,8 @@ final class AccountOperatorServiceTests: XCTestCase {
                 store: control,
                 permanentDeletionCoordinator: deletion
             )
-            let authorization = try OperatorSecretResolver.authorize(
-                environment: ["SWAN_OPERATOR_SECRET": "operator-secret"],
-                secretFile: nil
-            )
+            let secretFile = try createOperatorSecretFile(root: root)
+            let authorization = try OperatorSecretResolver.authorize(secretFile: secretFile)
 
             let deleted = try await service.delete(
                 did: Self.aliceDID,
@@ -218,10 +221,8 @@ final class AccountOperatorServiceTests: XCTestCase {
         do {
             try await createAlice(in: control)
             let service = AccountOperatorService(store: control)
-            let authorization = try OperatorSecretResolver.authorize(
-                environment: ["SWAN_OPERATOR_SECRET": "operator-secret"],
-                secretFile: nil
-            )
+            let secretFile = try createOperatorSecretFile(root: root)
+            let authorization = try OperatorSecretResolver.authorize(secretFile: secretFile)
 
             do {
                 _ = try await service.delete(
@@ -250,10 +251,8 @@ final class AccountOperatorServiceTests: XCTestCase {
         let control = try await SQLiteControlDatabase(dataDirectory: root)
         do {
             let service = AccountOperatorService(store: control)
-            let authorization = try OperatorSecretResolver.authorize(
-                environment: ["SWAN_OPERATOR_SECRET": "operator-secret"],
-                secretFile: nil
-            )
+            let secretFile = try createOperatorSecretFile(root: root)
+            let authorization = try OperatorSecretResolver.authorize(secretFile: secretFile)
 
             do {
                 _ = try await service.show(.did(Self.aliceDID))
@@ -284,10 +283,8 @@ final class AccountOperatorServiceTests: XCTestCase {
         defer { Task { try? await control.close() } }
         try await createAlice(in: control)
         let service = AccountOperatorService(store: control)
-        let authorization = try OperatorSecretResolver.authorize(
-            environment: ["SWAN_OPERATOR_SECRET": "operator-secret"],
-            secretFile: nil
-        )
+        let secretFile = try createOperatorSecretFile(root: root)
+        let authorization = try OperatorSecretResolver.authorize(secretFile: secretFile)
         let digest = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 
         let declared = try await service.declareExport(
@@ -325,10 +322,8 @@ final class AccountOperatorServiceTests: XCTestCase {
                 store: control,
                 lifecycleEmitter: emitter
             )
-            let authorization = try OperatorSecretResolver.authorize(
-                environment: ["SWAN_OPERATOR_SECRET": "operator-secret"],
-                secretFile: nil
-            )
+            let secretFile = try createOperatorSecretFile(root: root)
+            let authorization = try OperatorSecretResolver.authorize(secretFile: secretFile)
 
             let deactivated = try await service.deactivate(
                 did: Self.aliceDID,
@@ -425,6 +420,12 @@ final class AccountOperatorServiceTests: XCTestCase {
     }
 
     private static let aliceDID = "did:plc:abcdefghijklmnopqrstuvwx"
+    private func createOperatorSecretFile(root: URL, secret: String = "operator-secret") throws -> URL {
+        let file = root.appending(path: "operator-secret-\(UUID().uuidString)")
+        try Data((secret + "\n").utf8).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        return file
+    }
 }
 
 private let testVerifier = "$argon2id$v=19$m=65536,t=3,p=1$bcdefghijklmnopqrstuvw$BCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq"

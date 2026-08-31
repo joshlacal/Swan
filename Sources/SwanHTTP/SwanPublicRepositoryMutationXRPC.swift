@@ -320,13 +320,12 @@ private struct PublicMutationHandlers {
         let path = try PublicRepositoryPath(collection: input.collection.nsidString(), recordKey: rkey.value)
         let record = try PublicRepositoryRecordCodec.publicRecord(from: input.record, collection: path.collection)
         try await validatePublicBlobLinks(in: [.create(path: path, record: record)], target: target)
-        let result = try await SwanPublicRepositoryMutationCoordinator.put(
+        let result = try await SwanPublicRepositoryMutationCoordinator.create(
             store: target.store, did: target.did, path: path, record: record,
-            swapRecord: nil, swapCommit: input.swapCommit,
+            swapCommit: input.swapCommit,
             requestID: UUID().uuidString, bodyDigest: bodyDigest,
             signerProvider: capability.signerProvider
         )
-        guard result.action == .create else { throw PublicMutationFailure.invalidRequest }
         let uri = try ATProtocolURI(uriString: "at://\(target.did)/\(path.mstKey)")
         return SwanPublicWire.ComAtprotoRepoCreateRecord.Output(
             uri: uri, cid: try result.recordCID ?? PublicRepositoryRecordCodec.prepare(record, for: path).cid,
@@ -904,8 +903,10 @@ private func publicMutationResponse(
     switch failure {
     case .invalidSwap: return publicMutationError(.badRequest, "InvalidSwap")
     case .invalidBlobReference: return publicMutationError(.badRequest, "BlobNotFound")
+    case .quotaExceeded: return publicMutationError(.badRequest, "QuotaExceeded")
     case .repositoryNotFound: return publicMutationError(.notFound, "RepoNotFound")
     case .inactiveAccount: return publicMutationError(.forbidden, "AccountInactive")
+    case .recordAlreadyExists: return publicMutationError(.badRequest, "InvalidRequest")
     case .unavailable: return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
     }
 }

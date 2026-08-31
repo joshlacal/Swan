@@ -351,6 +351,592 @@ final class UpstreamScopeCorpusIntegrityTests: XCTestCase, @unchecked Sendable {
             "corpus regeneration is not a zero diff:\n\(String(decoding: data, as: UTF8.self))"
         )
     }
+
+    // MARK: - Task 16: Supply chain and maintenance integrity
+
+    func testDockerContextExcludesWebBuildArtifactsAndCaches() throws {
+        let repoRoot = UpstreamScopeCorpus.generatorDirectoryURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let dockerignoreURL = repoRoot.appending(path: "Dockerfile.dockerignore")
+        let content = try String(contentsOf: dockerignoreURL, encoding: .utf8)
+        let rules = content.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+
+        func isIgnored(_ candidate: String) -> Bool {
+            var ignored = false
+            for rule in rules {
+                let negated = rule.hasPrefix("!")
+                var pattern = negated ? String(rule.dropFirst()) : rule
+                if pattern.hasPrefix("/") { pattern = String(pattern.dropFirst()) }
+                if pattern.hasSuffix("/") { pattern += "**" }
+                if matchesGlob(candidate: candidate, pattern: pattern) {
+                    ignored = !negated
+                }
+            }
+            return ignored
+        }
+        func matchesGlob(candidate: String, pattern: String) -> Bool {
+            if pattern == "**" || pattern == candidate { return true }
+            if pattern.hasPrefix("**/") {
+                let suffix = String(pattern.dropFirst(3))
+                if suffix.hasSuffix("/**") {
+                    let middle = String(suffix.dropLast(3))
+                    return candidate.contains("/\(middle)/") || candidate.hasPrefix("\(middle)/") || candidate.hasSuffix("/\(middle)") || candidate == middle
+                }
+                if suffix.hasSuffix("*") {
+                    let pfx = String(suffix.dropLast(1))
+                    let filename = candidate.components(separatedBy: "/").last ?? candidate
+                    return filename.hasPrefix(pfx) || candidate.contains("/\(pfx)")
+                }
+                if suffix.hasPrefix("*.") {
+                    let ext = String(suffix.dropFirst(1))
+                    return candidate.hasSuffix(ext)
+                }
+                return candidate.hasSuffix("/\(suffix)") || candidate == suffix || candidate.contains("/\(suffix)/")
+            }
+            if pattern.hasSuffix("/**") {
+                let prefix = String(pattern.dropLast(3))
+                return candidate.hasPrefix("\(prefix)/") || candidate == prefix
+            }
+            if pattern.hasSuffix("/*") {
+                let prefix = String(pattern.dropLast(2))
+                return candidate.hasPrefix("\(prefix)/") && !candidate.dropFirst(prefix.count + 1).contains("/")
+            }
+            if pattern.hasPrefix("*.") {
+                let ext = String(pattern.dropFirst(1))
+                return candidate.hasSuffix(ext)
+            }
+            if pattern.hasSuffix("*") {
+                let prefix = String(pattern.dropLast(1))
+                return candidate.hasPrefix(prefix)
+            }
+            return candidate == pattern
+        }
+
+        XCTAssertTrue(isIgnored("Swan/web/node_modules"), "Swan/web/node_modules must be ignored")
+        XCTAssertTrue(isIgnored("Swan/web/node_modules/foo.js"), "Swan/web/node_modules/** must be ignored")
+        XCTAssertTrue(isIgnored("Swan/web/.svelte-kit"), "Swan/web/.svelte-kit must be ignored")
+        XCTAssertTrue(isIgnored("Swan/web/.svelte-kit/tsconfig.json"), "Swan/web/.svelte-kit/** must be ignored")
+        XCTAssertTrue(isIgnored("Swan/web/build"), "Swan/web/build must be ignored")
+        XCTAssertTrue(isIgnored("Swan/web/build/index.js"), "Swan/web/build/** must be ignored")
+        XCTAssertTrue(isIgnored("Swan/web/test-results"), "Swan/web/test-results must be ignored")
+        XCTAssertTrue(isIgnored("Swan/web/test-results/report.json"), "Swan/web/test-results/** must be ignored")
+        XCTAssertTrue(isIgnored("Swan/web/playwright-report"), "Swan/web/playwright-report must be ignored")
+        XCTAssertTrue(isIgnored("Swan/web/playwright-report/index.html"), "Swan/web/playwright-report/** must be ignored")
+
+        XCTAssertFalse(isIgnored("Swan/web/package.json"), "Swan/web/package.json must not be ignored")
+        XCTAssertFalse(isIgnored("Swan/web/package-lock.json"), "Swan/web/package-lock.json must not be ignored")
+        XCTAssertFalse(isIgnored("Swan/web/src/app.html"), "Swan/web/src/app.html must not be ignored")
+        XCTAssertFalse(isIgnored("Swan/Sources/SwanHTTP/SwanHTTP.swift"), "Swan/Sources must not be ignored")
+        XCTAssertTrue(isIgnored("Swan/test.sqlite"), "Swan/*.sqlite must be ignored")
+        XCTAssertTrue(isIgnored("Swan/.env"), "Swan/.env must be ignored")
+        XCTAssertFalse(isIgnored("Swan/.env.example"), "Swan/.env.example must not be ignored")
+    }
+
+    func testBrowserCSSToolingPackageHasPinnedLockfileAndSuppressesScripts() throws {
+        let repoRoot = UpstreamScopeCorpus.generatorDirectoryURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let packageDir = repoRoot.appending(path: "Scripts/browser-css-tooling")
+        let packageJSONURL = packageDir.appending(path: "package.json")
+        let packageLockURL = packageDir.appending(path: "package-lock.json")
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: packageJSONURL.path), "browser-css-tooling package.json missing")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: packageLockURL.path), "browser-css-tooling package-lock.json missing")
+
+        let pkgData = try Data(contentsOf: packageJSONURL)
+        let pkgJSON = try JSONSerialization.jsonObject(with: pkgData) as? [String: Any]
+        let deps = pkgJSON?["dependencies"] as? [String: String] ?? [:]
+        XCTAssertEqual(deps["tailwindcss"], "4.3.3", "tailwindcss must be pinned to 4.3.3")
+        XCTAssertEqual(deps["@tailwindcss/cli"], "4.3.3", "@tailwindcss/cli must be pinned to 4.3.3")
+        XCTAssertEqual(deps["daisyui"], "5.7.19", "daisyui must be pinned to 5.7.19")
+
+        let lockData = try Data(contentsOf: packageLockURL)
+        let lockJSON = try JSONSerialization.jsonObject(with: lockData) as? [String: Any]
+        let lockVersion = lockJSON?["lockfileVersion"] as? Int ?? 0
+        XCTAssertGreaterThanOrEqual(lockVersion, 2, "package-lock.json must be lockfileVersion >= 2")
+
+        let packages = lockJSON?["packages"] as? [String: [String: Any]] ?? [:]
+        let rootPkg = packages[""] ?? [:]
+        let rootDeps = rootPkg["dependencies"] as? [String: String] ?? [:]
+        XCTAssertEqual(rootDeps, deps, "root dependencies in lockfile must match package.json exactly")
+
+        XCTAssertFalse(packages.isEmpty, "packages block in lockfile must not be empty")
+        for (pkgPath, info) in packages {
+            if pkgPath.isEmpty { continue }
+            if info["inBundle"] as? Bool == true { continue }
+            let resolved = info["resolved"] as? String ?? ""
+            let integrity = info["integrity"] as? String ?? ""
+            XCTAssertFalse(resolved.isEmpty, "resolved URL missing for package \(pkgPath)")
+            XCTAssertTrue(integrity.hasPrefix("sha512-") || integrity.hasPrefix("sha1-"), "integrity hash missing or invalid for package \(pkgPath)")
+        }
+
+        if ProcessInfo.processInfo.environment["SWAN_ONLINE_NPM_TESTS"] != nil {
+            let tempDir = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+
+            try FileManager.default.copyItem(at: packageJSONURL, to: tempDir.appending(path: "package.json"))
+            try FileManager.default.copyItem(at: packageLockURL, to: tempDir.appending(path: "package-lock.json"))
+
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            proc.arguments = ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+            proc.currentDirectoryURL = tempDir
+            let output = Pipe()
+            proc.standardOutput = output
+            proc.standardError = output
+            try proc.run()
+            proc.waitUntilExit()
+            XCTAssertEqual(proc.terminationStatus, 0, "npm ci --ignore-scripts failed in temporary directory")
+        }
+    }
+
+    func testUpstreamScopeToolingPackageHasPinnedLockfileAndInstallsCleanly() throws {
+        let repoRoot = UpstreamScopeCorpus.generatorDirectoryURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let packageDir = repoRoot.appending(path: "Scripts/upstream-scope-goldens")
+        let packageJSONURL = packageDir.appending(path: "package.json")
+        let packageLockURL = packageDir.appending(path: "package-lock.json")
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: packageJSONURL.path), "upstream-scope-goldens package.json missing")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: packageLockURL.path), "upstream-scope-goldens package-lock.json missing")
+
+        let pkgData = try Data(contentsOf: packageJSONURL)
+        let pkgJSON = try JSONSerialization.jsonObject(with: pkgData) as? [String: Any]
+        let deps = pkgJSON?["dependencies"] as? [String: String] ?? [:]
+        XCTAssertEqual(deps["zod"], "3.24.2", "zod must be pinned to 3.24.2")
+        XCTAssertEqual(deps["iso-datestring-validator"], "2.2.2", "iso-datestring-validator must be pinned to 2.2.2")
+        XCTAssertEqual(deps["multiformats"], "13.4.2", "multiformats must be pinned to 13.4.2")
+
+        let lockData = try Data(contentsOf: packageLockURL)
+        let lockJSON = try JSONSerialization.jsonObject(with: lockData) as? [String: Any]
+        let lockVersion = lockJSON?["lockfileVersion"] as? Int ?? 0
+        XCTAssertGreaterThanOrEqual(lockVersion, 2, "package-lock.json must be lockfileVersion >= 2")
+
+        let packages = lockJSON?["packages"] as? [String: [String: Any]] ?? [:]
+        let rootPkg = packages[""] ?? [:]
+        let rootDeps = rootPkg["dependencies"] as? [String: String] ?? [:]
+        XCTAssertEqual(rootDeps, deps, "root dependencies in lockfile must match package.json exactly")
+
+        for (pkgPath, info) in packages {
+            if pkgPath.isEmpty { continue }
+            if info["inBundle"] as? Bool == true { continue }
+            let resolved = info["resolved"] as? String ?? ""
+            let integrity = info["integrity"] as? String ?? ""
+            XCTAssertFalse(resolved.isEmpty, "resolved URL missing for package \(pkgPath)")
+            XCTAssertTrue(integrity.hasPrefix("sha512-") || integrity.hasPrefix("sha1-"), "integrity hash missing or invalid for package \(pkgPath)")
+        }
+
+        if ProcessInfo.processInfo.environment["SWAN_ONLINE_NPM_TESTS"] != nil {
+            let tempDir = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+
+            try FileManager.default.copyItem(at: packageJSONURL, to: tempDir.appending(path: "package.json"))
+            try FileManager.default.copyItem(at: packageLockURL, to: tempDir.appending(path: "package-lock.json"))
+
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            proc.arguments = ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+            proc.currentDirectoryURL = tempDir
+            let output = Pipe()
+            proc.standardOutput = output
+            proc.standardError = output
+            try proc.run()
+            proc.waitUntilExit()
+            XCTAssertEqual(proc.terminationStatus, 0, "npm ci --ignore-scripts failed in temporary directory")
+        }
+    }
+
+    func testRegenerationGateRejectsWrongRevisionBeforeNpmOrNode() throws {
+        let script = UpstreamScopeCorpus.generatorDirectoryURL
+            .appending(path: "verify-corpus-zero-diff.sh")
+        let tempRepo = FileManager.default.temporaryDirectory.appending(path: "test-fake-atproto-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempRepo, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRepo) }
+
+        let initProc = Process()
+        initProc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        initProc.arguments = ["git", "-C", tempRepo.path, "init", "-b", "main"]
+        try initProc.run()
+        initProc.waitUntilExit()
+
+        let pkgPath = tempRepo.appending(path: "packages/oauth/oauth-scopes/src/scopes")
+        try FileManager.default.createDirectory(at: pkgPath, withIntermediateDirectories: true)
+        try "export const space = true;\n".write(to: pkgPath.appending(path: "space-permission.ts"), atomically: true, encoding: .utf8)
+
+        let addProc = Process()
+        addProc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        addProc.arguments = ["git", "-C", tempRepo.path, "add", "."]
+        try addProc.run()
+        addProc.waitUntilExit()
+
+        let commitProc = Process()
+        commitProc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        commitProc.arguments = ["git", "-C", tempRepo.path, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "wrong commit"]
+        try commitProc.run()
+        commitProc.waitUntilExit()
+
+        let fakeBinDir = FileManager.default.temporaryDirectory.appending(path: "test-fake-tools-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: fakeBinDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fakeBinDir) }
+
+        let fakeNodeScript = """
+        #!/usr/bin/env bash
+        if [ "$1" = "-p" ]; then echo "22"; exit 0; fi
+        if [ "$1" = "-e" ]; then exit 0; fi
+        exit 0
+        """
+        for (name, contents) in [("node", fakeNodeScript), ("npm", "#!/usr/bin/env bash\nexit 0\n")] {
+            let url = fakeBinDir.appending(path: name)
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [script.path]
+        var env = ProcessInfo.processInfo.environment
+        env["SWAN_UPSTREAM_ATPROTO"] = tempRepo.path
+        let originalPath = env["PATH"] ?? "/usr/bin:/bin"
+        env["PATH"] = "\(fakeBinDir.path):\(originalPath)"
+        proc.environment = env
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        try proc.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+
+        XCTAssertNotEqual(proc.terminationStatus, 0, "verify-corpus-zero-diff.sh must reject non-pinned git commit")
+        let outputStr = String(decoding: data, as: UTF8.self)
+        XCTAssertFalse(outputStr.contains("not on PATH"), "must not exit on toolchain dependency probe: \(outputStr)")
+        XCTAssertFalse(outputStr.contains("working tree is not clean"), "must not exit on working tree check: \(outputStr)")
+        XCTAssertTrue(outputStr.contains("does not match reference commit"), "output must describe commit mismatch: \(outputStr)")
+        XCTAssertTrue(outputStr.contains("bddc99fb"), "output must name reference commit: \(outputStr)")
+    }
+
+    func testRegenerationGateRejectsDirtyWorkingTree() throws {
+        let script = UpstreamScopeCorpus.generatorDirectoryURL
+            .appending(path: "verify-corpus-zero-diff.sh")
+        let tempRepo = FileManager.default.temporaryDirectory.appending(path: "test-fake-atproto-dirty-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempRepo, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRepo) }
+
+        let initProc = Process()
+        initProc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        initProc.arguments = ["git", "-C", tempRepo.path, "init", "-b", "main"]
+        try initProc.run()
+        initProc.waitUntilExit()
+
+        let pkgPath = tempRepo.appending(path: "packages/oauth/oauth-scopes/src/scopes")
+        try FileManager.default.createDirectory(at: pkgPath, withIntermediateDirectories: true)
+        try "export const space = true;\n".write(to: pkgPath.appending(path: "space-permission.ts"), atomically: true, encoding: .utf8)
+
+        let addProc = Process()
+        addProc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        addProc.arguments = ["git", "-C", tempRepo.path, "add", "."]
+        try addProc.run()
+        addProc.waitUntilExit()
+
+        let commitProc = Process()
+        commitProc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        commitProc.arguments = ["git", "-C", tempRepo.path, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial commit"]
+        try commitProc.run()
+        commitProc.waitUntilExit()
+
+        try "untracked\n".write(to: tempRepo.appending(path: "untracked.txt"), atomically: true, encoding: .utf8)
+
+        let fakeBinDir = FileManager.default.temporaryDirectory.appending(path: "test-fake-tools-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: fakeBinDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fakeBinDir) }
+
+        let fakeNodeScript = """
+        #!/usr/bin/env bash
+        if [ "$1" = "-p" ]; then echo "22"; exit 0; fi
+        if [ "$1" = "-e" ]; then exit 0; fi
+        exit 0
+        """
+        for (name, contents) in [("node", fakeNodeScript), ("npm", "#!/usr/bin/env bash\nexit 0\n")] {
+            let url = fakeBinDir.appending(path: name)
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [script.path]
+        var env = ProcessInfo.processInfo.environment
+        env["SWAN_UPSTREAM_ATPROTO"] = tempRepo.path
+        let originalPath = env["PATH"] ?? "/usr/bin:/bin"
+        env["PATH"] = "\(fakeBinDir.path):\(originalPath)"
+        proc.environment = env
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        try proc.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+
+        let outputStr = String(decoding: data, as: UTF8.self)
+        XCTAssertNotEqual(proc.terminationStatus, 0, "verify-corpus-zero-diff.sh must reject dirty git repository")
+        XCTAssertFalse(outputStr.contains("not on PATH"), "must not exit on toolchain dependency probe: \(outputStr)")
+        XCTAssertTrue(outputStr.contains("working tree is not clean"), "output must describe dirty working tree: \(outputStr)")
+    }
+
+    func testRegenerationGateRejectsSymlinksInCopiedPackageTrees() throws {
+        let script = UpstreamScopeCorpus.generatorDirectoryURL
+            .appending(path: "verify-corpus-zero-diff.sh")
+        let tempRepo = FileManager.default.temporaryDirectory.appending(path: "test-fake-atproto-symlink-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempRepo, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRepo) }
+
+        let didPkg = tempRepo.appending(path: "packages/did")
+        try FileManager.default.createDirectory(at: didPkg, withIntermediateDirectories: true)
+        let syntaxPkg = tempRepo.appending(path: "packages/syntax")
+        try FileManager.default.createDirectory(at: syntaxPkg, withIntermediateDirectories: true)
+        let lexPkg = tempRepo.appending(path: "packages/lex/lex-document")
+        try FileManager.default.createDirectory(at: lexPkg, withIntermediateDirectories: true)
+        let oauthPkg = tempRepo.appending(path: "packages/oauth/oauth-scopes/src/scopes")
+        try FileManager.default.createDirectory(at: oauthPkg, withIntermediateDirectories: true)
+        try "export const space = true;\n".write(to: oauthPkg.appending(path: "space-permission.ts"), atomically: true, encoding: .utf8)
+
+        try FileManager.default.createSymbolicLink(at: didPkg.appending(path: "link.ts"), withDestinationURL: URL(fileURLWithPath: "/etc/passwd"))
+
+        let fakeBinDir = FileManager.default.temporaryDirectory.appending(path: "test-fake-tools-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: fakeBinDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fakeBinDir) }
+
+        let fakeGitScript = """
+        #!/usr/bin/env bash
+        if [ "$1" = "-C" ]; then shift 2; fi
+        if [ "$1" = "status" ]; then exit 0; fi
+        if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ]; then
+            echo "bddc99fb24c34b4078b9bf65837283f37b49ab66"; exit 0
+        fi
+        if [ "$1" = "archive" ]; then
+            tar -cf - -C "$SWAN_UPSTREAM_ATPROTO" packages/did packages/syntax packages/lex/lex-document packages/oauth/oauth-scopes
+            exit 0
+        fi
+        exec /usr/bin/git "$@"
+        """
+        let fakeNodeScript = """
+        #!/usr/bin/env bash
+        if [ "$1" = "-p" ]; then echo "22"; exit 0; fi
+        if [ "$1" = "-e" ]; then exit 0; fi
+        exit 0
+        """
+        for (name, contents) in [("git", fakeGitScript), ("node", fakeNodeScript), ("npm", "#!/usr/bin/env bash\nexit 0\n")] {
+            let url = fakeBinDir.appending(path: name)
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [script.path]
+        var env = ProcessInfo.processInfo.environment
+        env["SWAN_UPSTREAM_ATPROTO"] = tempRepo.path
+        env["PATH"] = "\(fakeBinDir.path):\(env["PATH"] ?? "/usr/bin:/bin")"
+        proc.environment = env
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        try proc.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+
+        let outputStr = String(decoding: data, as: UTF8.self)
+        XCTAssertNotEqual(proc.terminationStatus, 0, "verify-corpus-zero-diff.sh must reject symlinks in package trees")
+        XCTAssertFalse(outputStr.contains("not on PATH"), "must not exit on toolchain dependency probe: \(outputStr)")
+        XCTAssertTrue(outputStr.contains("symlinks found in copied upstream package trees"), "output must describe symlink rejection: \(outputStr)")
+    }
+
+    func testBuildBrowserCSSRunsNpmCiWithIgnoreScriptsViaProcessExecution() throws {
+        let sourceRoot = UpstreamScopeCorpus.generatorDirectoryURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let canonicalOutput = sourceRoot.appending(path: "Sources/SwanHTTP/SwanBrowserStyleSheet.swift")
+        let canonicalBytesBefore = try Data(contentsOf: canonicalOutput)
+
+        let tempRoot = FileManager.default.temporaryDirectory.appending(path: "test-fake-build-css-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempRoot.appending(path: "Scripts/browser-css-tooling"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: tempRoot.appending(path: "Sources/SwanHTTP"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let script = tempRoot.appending(path: "Scripts/build-browser-css.sh")
+        try FileManager.default.copyItem(
+            at: sourceRoot.appending(path: "Scripts/build-browser-css.sh"),
+            to: script
+        )
+        for name in ["package.json", "package-lock.json"] {
+            try FileManager.default.copyItem(
+                at: sourceRoot.appending(path: "Scripts/browser-css-tooling/\(name)"),
+                to: tempRoot.appending(path: "Scripts/browser-css-tooling/\(name)")
+            )
+        }
+        for name in ["SwanBrowserPages.swift", "ScopeDescription.swift", "SwanBrowserStyleSheet.swift"] {
+            try FileManager.default.copyItem(
+                at: sourceRoot.appending(path: "Sources/SwanHTTP/\(name)"),
+                to: tempRoot.appending(path: "Sources/SwanHTTP/\(name)")
+            )
+        }
+
+        let tempBin = tempRoot.appending(path: "bin")
+        try FileManager.default.createDirectory(at: tempBin, withIntermediateDirectories: true)
+        let logFile = tempRoot.appending(path: "calls.log")
+        let fakeNpm = "#!/usr/bin/env bash\necho \"npm $@\" >> \"\(logFile.path)\"\nexit 0\n"
+        let fakeNpx = "#!/usr/bin/env bash\necho \"npx $@\" >> \"\(logFile.path)\"\necho '/* test css */' > out.css\nexit 0\n"
+        for (name, contents) in [("npm", fakeNpm), ("npx", fakeNpx)] {
+            let url = tempBin.appending(path: name)
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [script.path]
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "\(tempBin.path):\(env["PATH"] ?? "/usr/bin:/bin")"
+        proc.environment = env
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        try proc.run()
+        _ = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+
+        XCTAssertEqual(proc.terminationStatus, 0, "build-browser-css.sh should execute cleanly with fake tools")
+        let logContent = (try? String(contentsOf: logFile, encoding: .utf8)) ?? ""
+        XCTAssertTrue(logContent.contains("npm ci --ignore-scripts --no-audit --no-fund --silent"), "build-browser-css.sh must invoke npm ci --ignore-scripts: \(logContent)")
+        XCTAssertFalse(logContent.contains("npm install"), "build-browser-css.sh must not invoke npm install: \(logContent)")
+        XCTAssertEqual(try Data(contentsOf: canonicalOutput), canonicalBytesBefore, "generator test must not modify tracked stylesheet")
+    }
+
+
+    func testRegenerationGateRunsNpmCiWithIgnoreScriptsViaProcessExecution() throws {
+        let script = UpstreamScopeCorpus.generatorDirectoryURL
+            .appending(path: "verify-corpus-zero-diff.sh")
+        let tempRepo = FileManager.default.temporaryDirectory.appending(path: "test-fake-atproto-npm-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempRepo, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRepo) }
+
+        let didPkg = tempRepo.appending(path: "packages/did/src")
+        try FileManager.default.createDirectory(at: didPkg, withIntermediateDirectories: true)
+        try "export const did = true;\n".write(to: didPkg.appending(path: "index.ts"), atomically: true, encoding: .utf8)
+        let didPkgJSON = """
+        { "name": "@atproto/did", "version": "0.1.0", "main": "./src/index.ts" }
+        """
+        try didPkgJSON.write(to: tempRepo.appending(path: "packages/did/package.json"), atomically: true, encoding: .utf8)
+
+        let syntaxPkg = tempRepo.appending(path: "packages/syntax/src")
+        try FileManager.default.createDirectory(at: syntaxPkg, withIntermediateDirectories: true)
+        try "export const syntax = true;\n".write(to: syntaxPkg.appending(path: "index.ts"), atomically: true, encoding: .utf8)
+        let syntaxPkgJSON = """
+        { "name": "@atproto/syntax", "version": "0.1.0", "main": "./src/index.ts" }
+        """
+        try syntaxPkgJSON.write(to: tempRepo.appending(path: "packages/syntax/package.json"), atomically: true, encoding: .utf8)
+
+        let lexPkg = tempRepo.appending(path: "packages/lex/lex-document/src")
+        try FileManager.default.createDirectory(at: lexPkg, withIntermediateDirectories: true)
+        try "export const lex = true;\n".write(to: lexPkg.appending(path: "index.ts"), atomically: true, encoding: .utf8)
+        let lexPkgJSON = """
+        { "name": "@atproto/lex-document", "version": "0.1.0", "main": "./src/index.ts" }
+        """
+        try lexPkgJSON.write(to: tempRepo.appending(path: "packages/lex/lex-document/package.json"), atomically: true, encoding: .utf8)
+
+        let oauthPkg = tempRepo.appending(path: "packages/oauth/oauth-scopes/src/scopes")
+        try FileManager.default.createDirectory(at: oauthPkg, withIntermediateDirectories: true)
+        try "export const space = true;\n".write(to: oauthPkg.appending(path: "space-permission.ts"), atomically: true, encoding: .utf8)
+        try "export * from './scopes/space-permission.js';\n".write(to: tempRepo.appending(path: "packages/oauth/oauth-scopes/src/index.ts"), atomically: true, encoding: .utf8)
+        let oauthPkgJSON = """
+        { "name": "@atproto/oauth-scopes", "version": "0.1.0", "main": "./src/index.ts" }
+        """
+        try oauthPkgJSON.write(to: tempRepo.appending(path: "packages/oauth/oauth-scopes/package.json"), atomically: true, encoding: .utf8)
+
+        let fakeBinDir = FileManager.default.temporaryDirectory.appending(path: "test-fake-bin-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: fakeBinDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fakeBinDir) }
+        let logFile = fakeBinDir.appending(path: "calls.log")
+
+        let fakeGitScript = """
+        #!/usr/bin/env bash
+        if [ "$1" = "-C" ]; then
+            shift 2
+        fi
+        if [ "$1" = "status" ]; then
+            exit 0
+        fi
+        if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ]; then
+            echo "bddc99fb24c34b4078b9bf65837283f37b49ab66"
+            exit 0
+        fi
+        if [ "$1" = "archive" ]; then
+            tar -cf - -C "$SWAN_UPSTREAM_ATPROTO" packages/did packages/syntax packages/lex/lex-document packages/oauth/oauth-scopes
+            exit 0
+        fi
+        exec /usr/bin/git "$@"
+        """
+        let fakeGitURL = fakeBinDir.appending(path: "git")
+        try fakeGitScript.write(to: fakeGitURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeGitURL.path)
+
+        let fakeNpm = """
+        #!/usr/bin/env bash
+        echo "npm $@" >> "\(logFile.path)"
+        exit 0
+        """
+        let fakeNpmURL = fakeBinDir.appending(path: "npm")
+        try fakeNpm.write(to: fakeNpmURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeNpmURL.path)
+
+        let repoRoot = UpstreamScopeCorpus.generatorDirectoryURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let fixtureURL = repoRoot
+            .appending(path: "Tests/SwanOAuthTests/Fixtures/pinned-typescript-oauth-scopes.json")
+
+        let fakeNode = """
+        #!/usr/bin/env bash
+        if [ "$1" = "-p" ]; then
+            echo "22"
+            exit 0
+        fi
+        if [ "$1" = "-e" ]; then
+            exit 0
+        fi
+        cat "\(fixtureURL.path)"
+        exit 0
+        """
+        let fakeNodeURL = fakeBinDir.appending(path: "node")
+        try fakeNode.write(to: fakeNodeURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeNodeURL.path)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [script.path]
+        var env = ProcessInfo.processInfo.environment
+        env["SWAN_UPSTREAM_ATPROTO"] = tempRepo.path
+        let originalPath = env["PATH"] ?? "/usr/bin:/bin"
+        env["PATH"] = "\(fakeBinDir.path):\(originalPath)"
+        proc.environment = env
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        try proc.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+
+        let outputStr = String(decoding: data, as: UTF8.self)
+        XCTAssertEqual(proc.terminationStatus, 0, "verify-corpus-zero-diff.sh failed: \(outputStr)")
+        let logContent = (try? String(contentsOf: logFile, encoding: .utf8)) ?? ""
+        XCTAssertTrue(logContent.contains("npm ci --ignore-scripts --no-audit --no-fund --silent"), "verify-corpus-zero-diff.sh must invoke npm ci --ignore-scripts: \(logContent)")
+        XCTAssertFalse(logContent.contains("npm install"), "verify-corpus-zero-diff.sh must not invoke npm install: \(logContent)")
+    }
 }
 
 /// bulleted.app's five real scopes (§1, §7.4). Declared once so the corpus

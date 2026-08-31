@@ -131,7 +131,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
             let app = fixture.server.buildApplication(
                 logger: Logger(label: "SwanAccountProgramCompositionTests.credentials")
             )
-            try await app.test(.router) { client in
+            try await app.test(.live) { client in
                 var steered = HTTPFields()
                 steered[.contentType] = "application/json"
                 steered[HTTPField.Name("atproto-proxy")!] = "did:web:attacker.example#svc"
@@ -178,7 +178,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
             let app = fixture.server.buildApplication(
                 logger: Logger(label: "SwanAccountProgramCompositionTests.assembled")
             )
-            try await app.test(.router) { client in
+            try await app.test(.live) { client in
                 try await client.execute(
                     uri: "/xrpc/com.atproto.server.createSession",
                     method: .post,
@@ -474,6 +474,10 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 store: control,
                 passwordHasher: passwordHasher,
                 verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher),
+                loginAdmissionService: AccountLoginAdmissionService(
+                    store: control,
+                    key: try AccountLoginAdmissionKey(Data(repeating: 0xD5, count: 32))
+                ),
                 loginFactorTokenVerifier: factorTokens,
                 authenticationFactors: control
             )
@@ -486,6 +490,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     store: control,
                     appPasswords: control,
                     accountControlStore: control,
+                    credentials: credentials,
                     serviceDID: "did:web:swan.example",
                     serverKey: Data(repeating: 0x3C, count: 32)
                 ),
@@ -493,7 +498,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 appPasswords: control,
                 accounts: accounts,
                 directory: SwanDurableLegacySessionDirectory(store: control),
-                rateLimiter: SwanInProcessLegacySessionRateLimiter(),
+                loginClientIdentityPolicy: .direct,
                 serviceAuthIssuer: issuer,
                 minimumFailedLoginDuration: .milliseconds(1)
             )
@@ -973,6 +978,10 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     store: control,
                     passwordHasher: passwordHasher,
                     verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher),
+                    loginAdmissionService: AccountLoginAdmissionService(
+                        store: control,
+                        key: try AccountLoginAdmissionKey(Data(repeating: 0xD5, count: 32))
+                    ),
                     loginFactorTokenVerifier: factorTokens,
                     authenticationFactors: control
                 )
@@ -989,7 +998,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     appPasswords: control,
                     accounts: accounts,
                     directory: SwanDurableLegacySessionDirectory(store: control),
-                    rateLimiter: SwanInProcessLegacySessionRateLimiter(),
+                    loginClientIdentityPolicy: .direct,
                     minimumFailedLoginDuration: .milliseconds(1)
                 )
             } else {
@@ -1132,6 +1141,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     policy: policyService,
                     store: control,
                     turnstile: turnstile,
+                    rateAdmission: try SignupInviteRateAdmission(),
                     proofVerifier: BoundedSignupEmailProofVerifier(store: control),
                     proofService: proofService
                 )

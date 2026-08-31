@@ -25,12 +25,14 @@ final class SwanLegacySessionXRPCTests: XCTestCase {
     private struct Fixture {
         let root: URL
         let database: SQLiteControlDatabase
+        let credentials: AppPasswordCredentials
         let server: SwanHTTPServer
     }
 
     private func makeFixture(
         enableLegacy: Bool = true,
-        enableActorPreferences: Bool = false
+        enableActorPreferences: Bool = false,
+        loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct
     ) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "SwanLegacySessionXRPCTests-\(UUID().uuidString)")
@@ -38,7 +40,7 @@ final class SwanLegacySessionXRPCTests: XCTestCase {
         let passwordHasher = try LibsodiumArgon2idHasher()
         _ = try await database.createAccount(try AccountControlRegistration(
             did: "did:plc:abcdefghijklmnopqrstuvwx",
-            canonicalHandle: "alice.test",
+            canonicalHandle: "alice.example.com",
             passwordVerifier: try passwordHasher.hash("password"),
             signingKey: try AccountControlKeyReference(
                 purpose: .signing,
@@ -50,10 +52,17 @@ final class SwanLegacySessionXRPCTests: XCTestCase {
             )
         ))
         let credentials = try AppPasswordCredentials()
+        let factorTokens = FactorTokenService(store: database)
         let accounts = DurableAccountDirectory(
             store: database,
             passwordHasher: passwordHasher,
-            verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher)
+            verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher),
+            loginAdmissionService: AccountLoginAdmissionService(
+                store: database,
+                key: try AccountLoginAdmissionKey(Data(repeating: 0x88, count: 32))
+            ),
+            loginFactorTokenVerifier: factorTokens,
+            authenticationFactors: database
         )
         let legacySessionXRPC: SwanLegacySessionXRPCServer?
         if enableLegacy {
@@ -70,7 +79,7 @@ final class SwanLegacySessionXRPCTests: XCTestCase {
                 appPasswords: database,
                 accounts: accounts,
                 directory: SwanDurableLegacySessionDirectory(store: database),
-                rateLimiter: SwanInProcessLegacySessionRateLimiter(),
+                loginClientIdentityPolicy: loginClientIdentityPolicy,
                 minimumFailedLoginDuration: .milliseconds(1)
             )
         } else {
@@ -102,9 +111,10 @@ final class SwanLegacySessionXRPCTests: XCTestCase {
                 serverKey: Data(repeating: 0x71, count: 32)
             ),
             legacySessionXRPC: legacySessionXRPC,
-            actorPreferencesXRPC: actorPreferencesXRPC
+            actorPreferencesXRPC: actorPreferencesXRPC,
+            loginClientIdentityPolicy: loginClientIdentityPolicy
         )
-        return Fixture(root: root, database: database, server: server)
+        return Fixture(root: root, database: database, credentials: credentials, server: server)
     }
 
     private func cleanup(_ fixture: Fixture) async {
@@ -280,6 +290,65 @@ final class SwanLegacySessionXRPCTests: XCTestCase {
         } catch {
             await cleanup(fixture)
             throw error
+        }
+    }
+    func testLegacySessionLoginClientIdentityPolicyAndTrustedProxy() async throws {
+        let trustedPolicy = try SwanLoginClientIdentityPolicy(trustedProxyPeerLiterals: ["127.0.0.1", "::1"])
+        let fixture = try await makeFixture(loginClientIdentityPolicy: trustedPolicy)
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let app = fixture.server.buildApplication(logger: Logger(label: "test"))
+        let password = try await fixture.credentials.issue(
+            did: "did:plc:abcdefghijklmnopqrstuvwx",
+            name: "test-app",
+            scopes: "atproto",
+            into: fixture.database
+        ).password
+        try await app.test(.live) { client in
+            // 1. Trusted proxy forwards valid client IP
+            try await client.execute(
+                uri: "/xrpc/\(ComAtprotoServerCreateSession.typeIdentifier)",
+                method: .post,
+                headers: [
+                    .contentType: "application/json",
+                    HTTPField.Name("X-Swan-Client-IP")!: "203.0.113.195",
+                ],
+                body: ByteBuffer(string: "{\"identifier\":\"alice.example.com\",\"password\":\"\(password)\"}")
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+
+            // 2. Malformed forwarded header fails closed with 503
+            try await client.execute(
+                uri: "/xrpc/\(ComAtprotoServerCreateSession.typeIdentifier)",
+                method: .post,
+                headers: [
+                    .contentType: "application/json",
+                    HTTPField.Name("X-Swan-Client-IP")!: "invalid,ip,header",
+                ],
+                body: ByteBuffer(string: "{\"identifier\":\"alice.example.com\",\"password\":\"\(password)\"}")
+            ) { response in
+                XCTAssertEqual(response.status, .serviceUnavailable)
+            }
+        }
+
+        // Router tests have no socket peer; forwarding must not be trusted.
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/xrpc/\(ComAtprotoServerCreateSession.typeIdentifier)",
+                method: .post,
+                headers: [
+                    .contentType: "application/json",
+                    HTTPField.Name("X-Swan-Client-IP")!: "203.0.113.195",
+                ],
+                body: ByteBuffer(string: "{\"identifier\":\"alice.example.com\",\"password\":\"\(password)\"}")
+            ) { response in
+                XCTAssertEqual(response.status, .serviceUnavailable)
+            }
         }
     }
 }

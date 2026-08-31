@@ -704,13 +704,15 @@ final class PLCAccountPreparationCLITests: XCTestCase {
     ) throws -> ProcessResult {
         let process = Process()
         process.executableURL = try XCTUnwrap(executableURL())
-        process.arguments = [
+        var serveArgs = [
             "serve", "--data-directory", fixture.data.path,
-        ] + arguments
+        ]
+        if !arguments.contains("--oauth-server-key-file") {
+            serveArgs.append(contentsOf: ["--oauth-server-key-file", fixture.oauthServerKeyFile.path])
+        }
+        process.arguments = serveArgs + arguments
         var environment = ProcessInfo.processInfo.environment
-        environment["SWAN_OAUTH_SERVER_KEY"] = Self.base64URLEncoded(
-            Data(repeating: 0x31, count: 32)
-        )
+        environment.removeValue(forKey: "SWAN_OAUTH_SERVER_KEY")
         environment.removeValue(forKey: "SWAN_OPERATOR_SECRET")
         environment.removeValue(forKey: "SWAN_ACCOUNT_KEK")
         process.environment = environment
@@ -811,6 +813,7 @@ private final class Fixture {
     let operatorSecretFile: URL
     let kekFile: URL
     let passwordFile: URL
+    let oauthServerKeyFile: URL
     let operatorSecret = "operator-secret-MUST-NOT-PERSIST-71D9"
     let password = "password-MUST-NOT-PERSIST-E28AC7"
     let rawKEK: Data
@@ -838,6 +841,7 @@ private final class Fixture {
         operatorSecretFile = secrets.appending(path: "operator")
         kekFile = secrets.appending(path: "account-kek")
         passwordFile = secrets.appending(path: "password")
+        oauthServerKeyFile = secrets.appending(path: "oauth-server-key")
         rawKEK = Data(repeating: 0xD7, count: 32)
         encodedKEK = Self.base64URLEncoded(rawKEK)
         try FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
@@ -851,7 +855,8 @@ private final class Fixture {
         try Data((operatorSecret + "\n").utf8).write(to: operatorSecretFile)
         try Data((encodedKEK + "\n").utf8).write(to: kekFile)
         try Data((password + "\n").utf8).write(to: passwordFile)
-        for file in [operatorSecretFile, kekFile, passwordFile] {
+        try Data((Self.base64URLEncoded(Data(repeating: 0x31, count: 32)) + "\n").utf8).write(to: oauthServerKeyFile)
+        for file in [operatorSecretFile, kekFile, passwordFile, oauthServerKeyFile] {
             try FileManager.default.setAttributes(
                 [.posixPermissions: 0o600],
                 ofItemAtPath: file.path

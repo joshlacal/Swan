@@ -307,9 +307,9 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
     /// failed")` before the resolver sees it (`OAuthRemoteFetch.swift:674-677`),
     /// and the same laundering is available to any injected DNS or DID-document
     /// resolver. Whether the bare `CancellationError` reaches this file at all
-    /// then depends on which task in `SwanLexiconDeadline.run`'s group finishes
-    /// first — the sleeper (which throws `CancellationError`) or the operation
-    /// (which throws its laundered error). That race was measured at roughly
+    /// then depends on the first completion in `swanRaceWithDeadline`: both
+    /// `onCancel` and the operation task call `relay.complete`, and the
+    /// operation's laundered error can win. That race was measured at roughly
     /// 50/50 for a cancelled fetch.
     ///
     /// Losing it is not cosmetic. `resolveAll` cancels every in-flight sibling
@@ -324,6 +324,7 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
         _ error: any Error, as failure: SwanLexiconResolverFailure
     ) throws -> Never {
         if error is CancellationError { throw CancellationError() }
+        if error is ATHandleDNSAdmissionError { throw error }
         try Task.checkCancellation()
         throw failure
     }
@@ -413,6 +414,8 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
             }
         } catch is CancellationError {
             throw CancellationError()
+        } catch is ATHandleDNSAdmissionError {
+            throw ATHandleDNSAdmissionError.saturated
         } catch let failure as SwanLexiconResolverFailure {
             throw failure
         } catch {

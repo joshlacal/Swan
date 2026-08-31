@@ -398,6 +398,13 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaIncrementalStore {
                         outcome: .casConflict
                     )
                 }
+                try await advanceWriterHighWaterWithoutGate(
+                    space: batch.target.space,
+                    repository: batch.target.repositoryDID,
+                    wireRevision: installedHead.wireRevision.toString(),
+                    commitment: installedHead.commitment,
+                    updatedAt: appliedAt
+                )
 
                 let result = AppliedPermissionedRemoteReplicaIncrementalBatch(
                     requestID: batch.requestID,

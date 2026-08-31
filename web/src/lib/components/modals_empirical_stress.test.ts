@@ -861,18 +861,18 @@ describe('Empirical Adversarial Stress & Verification Suite: Parameterized Modal
       }
     });
 
-    it('fallback when crypto.getRandomValues is stubbed uses Math.random fallback without error', () => {
-      const spy = vi.spyOn(crypto, 'getRandomValues').mockImplementation((arr: any) => {
-        for (let i = 0; i < arr.length; i++) arr[i] = Math.floor(Math.random() * 256);
-        return arr;
-      });
-
-      const secret = generateBase32Secret(20);
-      expect(secret.length).toBe(32);
-      for (const char of secret) {
-        expect(RFC4648_BASE32).toContain(char);
+    it('fails closed when crypto.getRandomValues is unavailable', () => {
+      const mathRandomSpy = vi.spyOn(Math, 'random');
+      const originalCrypto = globalThis.crypto;
+      try {
+        // @ts-ignore
+        delete globalThis.crypto;
+        expect(() => generateBase32Secret(20)).toThrow(/Web Crypto/);
+        expect(mathRandomSpy).not.toHaveBeenCalled();
+      } finally {
+        globalThis.crypto = originalCrypto;
+        mathRandomSpy.mockRestore();
       }
-      expect(spy).toHaveBeenCalled();
     });
   });
 });

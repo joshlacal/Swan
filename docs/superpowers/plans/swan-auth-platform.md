@@ -37,7 +37,7 @@ production deployment.
 - `swan account install-local` now exposes that exact offline installation
   workflow to an operator. It requires the operator capability, an
   owner-only password file, and a 32-byte URL-safe-base64 KEK supplied through
-  `SWAN_ACCOUNT_KEK` and/or an owner-only mounted KEK file. It creates only
+  an owner-only mounted KEK file. It creates only
   encrypted file envelopes, the empty public genesis, and the local control
   row; PLC registration and remote handle verification remain explicitly
   outside this command.

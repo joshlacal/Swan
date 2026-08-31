@@ -578,13 +578,8 @@ PY
 )"
 collection="app.bsky.feed.post"
 rkey="dynamic-${suffix}"
-if [[ "$direction" == "member" ]]; then
-  export SWAN_LAB_PRODUCER_TOKEN="$reference_access_token"
-  export SWAN_LAB_CONSUMER_TOKEN=""
-else
-  export SWAN_LAB_PRODUCER_TOKEN=""
-  export SWAN_LAB_CONSUMER_TOKEN="$reference_access_token"
-fi
+printf '%s' "$reference_access_token" > "${temporary_directory}/reference-access.token"
+chmod 0600 "${temporary_directory}/reference-access.token"
 
 docker run --rm \
   --network "$network_name" \
@@ -594,8 +589,6 @@ docker run --rm \
   --mount "type=volume,src=${data_volume},dst=/var/lib/swan" \
   --mount "type=volume,src=${caddy_trust_volume},dst=/etc/ssl/certs,readonly" \
   --mount "type=bind,src=${temporary_directory},dst=/run/acceptance" \
-  --env SWAN_LAB_PRODUCER_TOKEN \
-  --env SWAN_LAB_CONSUMER_TOKEN \
   --env SWAN_DYNAMIC_DELEGATION_DIRECTION="$direction" \
   --env SWAN_DYNAMIC_DELEGATION_STATEFUL="$stateful_mode" \
   --env SWAN_DYNAMIC_DELEGATION_RECOVERY="$recovery_mode" \
@@ -619,23 +612,20 @@ docker run --rm \
     export SSL_CERT_FILE=/etc/ssl/certs/caddy-local-root.crt
     if [ "${SWAN_DYNAMIC_DELEGATION_DIRECTION:-member}" = "member" ]; then
       export SWAN_LAB_CONSUMER_HANDLE="$5"
-      SWAN_LAB_CONSUMER_PASSWORD="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/authority.password)"
-      export SWAN_LAB_CONSUMER_PASSWORD
       producer_url="https://pds.test"
       consumer_url="https://swan.test"
-      producer_auth_args="--producer-auth bearer"
-      consumer_auth_args="--consumer-auth oauth --consumer-client-id http://localhost?scope=atproto&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback --consumer-redirect-uri http://127.0.0.1/callback"
+      producer_auth_args="--producer-auth bearer --producer-token-file /run/acceptance/reference-access.token"
+      consumer_auth_args="--consumer-auth oauth --consumer-password-file /run/secrets/swan-bootstrap/authority.password --consumer-client-id http://localhost?scope=atproto&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback --consumer-redirect-uri http://127.0.0.1/callback"
       scope_args="--scope atproto"
       read_host="member"
       scenario_name="reference-member-dynamic-delegation"
     else
       SWAN_LAB_PRODUCER_HANDLE="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/member.handle)"
-      SWAN_LAB_PRODUCER_PASSWORD="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/member.password)"
-      export SWAN_LAB_PRODUCER_HANDLE SWAN_LAB_PRODUCER_PASSWORD
+      export SWAN_LAB_PRODUCER_HANDLE
       producer_url="https://swan.test"
       consumer_url="https://pds.test"
-      producer_auth_args="--producer-auth oauth --producer-handle-env SWAN_LAB_PRODUCER_HANDLE --producer-password-env SWAN_LAB_PRODUCER_PASSWORD --producer-client-id ${SWAN_DYNAMIC_DELEGATION_SCOPE_CLIENT_ID} --producer-redirect-uri http://127.0.0.1/callback"
-      consumer_auth_args="--consumer-auth bearer --consumer-token-env SWAN_LAB_CONSUMER_TOKEN"
+      producer_auth_args="--producer-auth oauth --producer-password-file /run/secrets/swan-bootstrap/member.password --producer-handle-env SWAN_LAB_PRODUCER_HANDLE --producer-client-id ${SWAN_DYNAMIC_DELEGATION_SCOPE_CLIENT_ID} --producer-redirect-uri http://127.0.0.1/callback"
+      consumer_auth_args="--consumer-auth bearer --consumer-token-file /run/acceptance/reference-access.token"
       scope_args="--scope atproto --scope ${SWAN_DYNAMIC_DELEGATION_SPACE_SCOPE} --scope ${SWAN_DYNAMIC_DELEGATION_WRITE_SCOPE}"
       read_host="member"
       scenario_name="reference-authority-dynamic-credential"
@@ -694,7 +684,7 @@ docker run --rm \
           --receiver-did "$6" --repository "$2" --space "$1" \
           --data-directory /var/lib/swan/data \
           --source-url https://pds.test --authority-url https://swan.test \
-          --source-auth bearer --source-token-env SWAN_LAB_PRODUCER_TOKEN \
+          --source-auth bearer --source-token-file /run/acceptance/reference-access.token \
           --scope atproto \
           --permissioned-commit-key-env SWAN_LAB_PERMISSIONED_COMMIT_KEY \
           --request-id "$sync_request_id" \
@@ -879,7 +869,7 @@ PY
             --receiver-did "$6" --repository "$2" --space "$1" \
             --data-directory /var/lib/swan/data \
             --source-url https://pds.test --authority-url https://swan.test \
-            --source-auth bearer --source-token-env SWAN_LAB_PRODUCER_TOKEN \
+            --source-auth bearer --source-token-file /run/acceptance/reference-access.token \
             --scope atproto --since 2222222222222 \
             --allow-full-car-fallback --require-prior-head \
             --permissioned-commit-key-env SWAN_LAB_PERMISSIONED_COMMIT_KEY \
@@ -956,7 +946,7 @@ PY
         --source-url https://pds.test \
         --authority-url https://swan.test \
         --source-auth bearer \
-        --source-token-env SWAN_LAB_PRODUCER_TOKEN \
+        --source-token-file /run/acceptance/reference-access.token \
         --scope atproto \
         --since 2222222222222 \
         --allow-full-car-fallback \
@@ -1027,11 +1017,12 @@ PY
     if [ "${recovery_failed:-0}" -ne 0 ]; then
       exit 1
     fi
-    unset private_value blob_value SWAN_LAB_CONSUMER_PASSWORD
+    unset private_value blob_value
   ' _ \
   "$space_uri" "$space_member_did" "$collection" "$rkey" "${local_consumer_handle:-}" "$space_authority_did"
 
-unset SWAN_LAB_PRODUCER_TOKEN SWAN_LAB_CONSUMER_TOKEN reference_access_token reference_commit_key
+rm -f "${temporary_directory}/reference-access.token"
+unset reference_access_token reference_commit_key
 mkdir -p "$(dirname "$output_path")"
 install -m 0600 "$runner_output_path" "$output_path"
 

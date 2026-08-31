@@ -747,6 +747,116 @@ final class AccountPortalSecurityHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testConnectedAppDeleteRouteRevokesTargetFamily() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "AccountPortalSecurityHTTPTests-connapp-" + UUID().uuidString)
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer {
+            Task {
+                try? await database.close()
+                try? FileManager.default.removeItem(at: root)
+            }
+        }
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        let now = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
+        _ = try await database.createAccount(
+            try AccountControlRegistration(
+                did: did,
+                canonicalHandle: "connapp.example.com",
+                passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$initialsalt$initial-precomputed-verifier",
+                signingKey: try .init(purpose: .signing, generation: 1),
+                rotationKey: try .init(purpose: .rotation, generation: 1),
+                createdAt: now.addingTimeInterval(-100)
+            )
+        )
+        let familyID1 = UUID()
+        let familyID2 = UUID()
+        let binding1 = try OAuthClientBinding(
+            issuer: "https://issuer.example",
+            clientID: "https://app1.example/client.json",
+            redirectURI: "https://app1.example/callback",
+            scopes: ["atproto"],
+            dpopJKT: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+            confidentialClientKey: nil,
+            refreshTokenAllowed: true
+        )
+        let binding2 = try OAuthClientBinding(
+            issuer: "https://issuer.example",
+            clientID: "https://app2.example/client.json",
+            redirectURI: "https://app2.example/callback",
+            scopes: ["atproto"],
+            dpopJKT: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+            confidentialClientKey: nil,
+            refreshTokenAllowed: true
+        )
+        try await database.issueTokenPair(
+            family: OAuthTokenFamily(familyID: familyID1, subject: did, binding: binding1, expiresAt: now.addingTimeInterval(14 * 86_400), createdAt: now),
+            tokens: OAuthIssuedTokenDigests(familyID: familyID1, accessTokenDigest: Data(repeating: 0xA1, count: 32), refreshTokenDigest: Data(repeating: 0xA2, count: 32), accessExpiresAt: now.addingTimeInterval(300), refreshExpiresAt: now.addingTimeInterval(14 * 86_400)),
+            now: now
+        )
+        try await database.issueTokenPair(
+            family: OAuthTokenFamily(familyID: familyID2, subject: did, binding: binding2, expiresAt: now.addingTimeInterval(14 * 86_400), createdAt: now),
+            tokens: OAuthIssuedTokenDigests(familyID: familyID2, accessTokenDigest: Data(repeating: 0xB1, count: 32), refreshTokenDigest: Data(repeating: 0xB2, count: 32), accessExpiresAt: now.addingTimeInterval(300), refreshExpiresAt: now.addingTimeInterval(14 * 86_400)),
+            now: now
+        )
+        let sessions = SwanManagementSessionRuntime(
+            store: database,
+            preAuthStore: database,
+            csrfStore: database,
+            preAuthSessionCoordinator: database
+        )
+        let issued = try await sessions.issue(
+            accountDID: did,
+            strength: .stepUpPassword(verifiedAt: now),
+            now: now
+        )
+        let storedAccount = try await database.account(did: did)
+        let account = try XCTUnwrap(storedAccount)
+        let service = SwanAccountPortalService(
+            accountDirectory: FixedPortalAccountDirectory(account: account),
+            oauth: SwanAccountPortalOAuthProjectionProduction(store: database),
+            stepUpReceiptConsumer: SwanAccountPortalDurableStepUpReceiptConsumer(store: database),
+            sessions: sessions
+        )
+        let buildDirectory = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appending(path: "portal-assets-conn-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: buildDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try Data("<!doctype html><title>Swan</title>".utf8).write(to: buildDirectory.appending(path: "index.html"))
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: buildDirectory)
+        }
+        let configuration = try SwanAccountPortalConfiguration(
+            publicOrigin: URL(string: "https://accounts.example")!,
+            staticDirectory: buildDirectory
+        )
+        let portal = SwanAccountPortalHTTP(configuration: configuration, sessions: sessions, service: service)
+        let router = Router(context: SwanHTTPRequestContext.self)
+        portal.register(on: router)
+        let app = Application(router: router)
+
+        try await app.test(.router) { client in
+            var headers = HTTPFields()
+            headers[.contentType] = "application/json"
+            headers[HTTPField.Name("Origin")!] = "https://accounts.example"
+            headers[HTTPField.Name("Sec-Fetch-Site")!] = "same-origin"
+            headers[HTTPField.Name("X-Swan-CSRF")!] = issued.csrfValue
+            headers[.cookie] = "\(SwanManagementSessionRuntime.sessionCookieName)=\(issued.sessionValue); \(SwanManagementSessionRuntime.csrfCookieName)=\(issued.csrfValue)"
+            try await client.execute(
+                uri: "/account/api/connected-apps/\(familyID1.uuidString.lowercased())",
+                method: .delete,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+
+        let family1 = try await database.tokenFamily(tokenDigest: Data(repeating: 0xA2, count: 32), kind: .refreshToken, now: now)
+        XCTAssertNil(family1, "revoked family should not be active")
+        let family2 = try await database.tokenFamily(tokenDigest: Data(repeating: 0xB2, count: 32), kind: .refreshToken, now: now)
+        XCTAssertNotNil(family2, "unrevoked family should remain active")
+    }
+
     private func makePortalRouter(policy: SignupPolicy = .closed) throws -> Router<SwanHTTPRequestContext> {
         let router = Router(context: SwanHTTPRequestContext.self)
         try makePortal(policy: policy).register(on: router)

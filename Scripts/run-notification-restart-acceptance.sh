@@ -638,9 +638,6 @@ docker run --rm \
     export SSL_CERT_FILE=/etc/ssl/certs/caddy-local-root.crt
     export SWAN_LAB_PRODUCER_HANDLE="$5"
     export SWAN_LAB_CONSUMER_HANDLE="$6"
-    SWAN_LAB_PRODUCER_PASSWORD="$(tr -d "\r\n" < "${secrets}/member.password")"
-    SWAN_LAB_CONSUMER_PASSWORD="$(tr -d "\r\n" < "${secrets}/authority.password")"
-    export SWAN_LAB_PRODUCER_PASSWORD SWAN_LAB_CONSUMER_PASSWORD
     # The resource server deliberately distinguishes the management scope from
     # the space-scoped read/create grants. Encode the same qualified scopes in
     # the localhost client metadata so the lab exercises the real authorization
@@ -656,7 +653,9 @@ docker run --rm \
       --producer-url https://swan.test \
       --consumer-url https://swan.test \
       --producer-auth oauth \
+      --producer-password-file "${secrets}/member.password" \
       --consumer-auth oauth \
+      --consumer-password-file "${secrets}/authority.password" \
       --producer-client-id "$client_id" \
       --producer-redirect-uri http://127.0.0.1/callback \
       --consumer-client-id "$client_id" \
@@ -689,7 +688,7 @@ docker run --rm \
       tail -n 40 /tmp/live-interop.log >&2 || true
       exit 1
     fi
-    unset private_value SWAN_LAB_PRODUCER_PASSWORD SWAN_LAB_CONSUMER_PASSWORD
+    unset private_value
   ' _ \
   "$space_uri" "$member_did" "$collection" "$rkey" \
   "$member_handle" "$authority_handle"

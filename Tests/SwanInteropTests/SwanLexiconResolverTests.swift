@@ -550,6 +550,23 @@ final class SwanLexiconResolverTests: XCTestCase {
         XCTAssertEqual(SwanLexiconResolutionPopulation.spaceTypes.maximumDistinctNSIDs, 8)
     }
 
+    func testNegativeCacheStoreFaultPropagates() async throws {
+        let harness = try await Harness(
+            .valid,
+            transportFails: true,
+            store: ThrowingLexiconStore()
+        )
+        do {
+            _ = try await harness.resolver.resolve("com.example.foo.auth")
+            XCTFail("expected negative-cache storage fault to propagate")
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                XCTFail("expected SwanError.unavailable, got \(error)")
+                return
+            }
+        }
+    }
+
     // MARK: - Durable store
 
     func testSQLiteStoreRoundTripsPositiveAndNegativeRows() async throws {
@@ -873,6 +890,7 @@ private actor StubCARTransport: OAuthRemoteTransport {
 private actor InMemoryLexiconStore: OAuthLexiconDocumentStore {
     private var rows: [String: OAuthLexiconDocumentRow] = [:]
 
+
     func findLexicon(nsid: String) async throws -> OAuthLexiconDocumentRow? {
         rows[nsid]
     }
@@ -889,4 +907,18 @@ private actor InMemoryLexiconStore: OAuthLexiconDocumentStore {
     func deleteLexicon(nsid: String) async throws {
         rows[nsid] = nil
     }
+
+    func countNegativeLexicons() async throws -> Int {
+        rows.values.filter { $0.document == nil }.count
+    }
+}
+private actor ThrowingLexiconStore: OAuthLexiconDocumentStore {
+    func findLexicon(nsid: String) async throws -> OAuthLexiconDocumentRow? { nil }
+
+    func storeLexicon(_ row: OAuthLexiconDocumentRow) async throws {
+        throw SwanError.unavailable("injected lexicon cache failure")
+    }
+
+    func deleteLexicon(nsid: String) async throws {}
+    func countNegativeLexicons() async throws -> Int { 0 }
 }

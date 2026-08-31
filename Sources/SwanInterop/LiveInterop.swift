@@ -53,7 +53,7 @@ public enum InteropHTTPMethod: String, Sendable, Equatable {
     case patch = "PATCH"
 }
 
-public enum InteropHTTPError: Error, Sendable, Equatable {
+public enum InteropHTTPError: Error, Sendable, Equatable, LocalizedError {
     case invalidURL
     case responseTooLarge
     case unexpectedRedirect
@@ -61,6 +61,25 @@ public enum InteropHTTPError: Error, Sendable, Equatable {
     case unexpectedStatus(Int)
     case transportFailure
     case fileFailure
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidURL:
+            "credential transport requires HTTPS or literal loopback"
+        case .responseTooLarge:
+            "HTTP response exceeds size limit"
+        case .unexpectedRedirect:
+            "HTTP redirect is unexpected"
+        case .unexpectedContentType:
+            "HTTP content type is unexpected"
+        case let .unexpectedStatus(status):
+            "HTTP status \(status) is unexpected"
+        case .transportFailure:
+            "HTTP transport failure"
+        case .fileFailure:
+            "HTTP file operation failed"
+        }
+    }
 }
 
 /// The only authorization shapes accepted by the live runner.  This keeps
@@ -438,7 +457,7 @@ public struct InteropXRPCClient: Sendable {
             "Accept": "application/json",
             "Content-Type": contentType,
         ]
-        addAuthorization(authorization, to: &headers)
+        try addAuthorization(authorization, to: &headers)
         return try await http.execute(
             method: .post,
             path: path,
@@ -482,7 +501,7 @@ public struct InteropXRPCClient: Sendable {
     ) async throws -> InteropHTTPResponse {
         let path = try xrpcPath(nsid, query: query)
         var headers = ["Accept": "application/vnd.ipld.car, application/octet-stream, */*"]
-        addAuthorization(authorization, to: &headers)
+        try addAuthorization(authorization, to: &headers)
         return try await http.executeStreaming(
             method: .get,
             path: path,
@@ -510,7 +529,7 @@ public struct InteropXRPCClient: Sendable {
         let path = try makeXRPCPath(nsid, query: query)
         var headers = ["Accept": "application/json"]
         if body != nil { headers["Content-Type"] = "application/json" }
-        addAuthorization(authorization, to: &headers)
+        try addAuthorization(authorization, to: &headers)
         return try await http.execute(
             method: method,
             path: path,
@@ -540,14 +559,16 @@ public struct InteropXRPCClient: Sendable {
     private func addAuthorization(
         _ authorization: InteropAuthorization,
         to headers: inout [String: String]
-    ) {
+    ) throws {
         switch authorization {
         case .none:
             break
         case let .dpop(accessToken, proof):
+            try requireCredentialSafeTransport(http.baseURL)
             headers["Authorization"] = "DPoP " + accessToken
             headers["DPoP"] = proof
         case let .bearer(token), let .service(token):
+            try requireCredentialSafeTransport(http.baseURL)
             headers["Authorization"] = "Bearer " + token
         }
     }
@@ -560,6 +581,22 @@ public struct InteropXRPCClient: Sendable {
             throw InteropHTTPError.unexpectedContentType
         }
     }
+}
+
+/// Requires HTTPS or literal loopback (localhost, 127.0.0.1, ::1, [::1]) for
+/// endpoints carrying credentials.
+public func requireCredentialSafeTransport(_ url: URL) throws {
+    guard let scheme = url.scheme?.lowercased() else {
+        throw InteropHTTPError.invalidURL
+    }
+    if scheme == "https" {
+        return
+    }
+    if scheme == "http", let host = url.host?.lowercased(),
+       host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+        return
+    }
+    throw InteropHTTPError.invalidURL
 }
 
 public struct InteropFixtureEvent: Codable, Sendable, Equatable {

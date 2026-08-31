@@ -8,6 +8,8 @@ public enum PublicRepositoryMutationCoordinatorError: Error, Sendable, Equatable
     case inactiveAccount
     case invalidSwap
     case invalidBlobReference
+    case recordAlreadyExists
+    case quotaExceeded
     case unavailable
 }
 
@@ -50,7 +52,8 @@ public enum SwanPublicRepositoryMutationCoordinator {
         while true {
             attempts += 1
             guard let current = try await store.loadPublicRepositoryState() else { throw PublicRepositoryMutationCoordinatorError.repositoryNotFound }
-            let request = try PublicRepositoryMutationRequest(id: requestID, canonicalDigest: bodyDigest, baseCommitCID: current.commitCID)
+            let attemptRequestID = attempts == 1 ? requestID : "\(requestID):retry-\(attempts)"
+            let request = try PublicRepositoryMutationRequest(id: attemptRequestID, canonicalDigest: bodyDigest, baseCommitCID: current.commitCID)
             switch try await store.reservePublicRepositoryRevision(request, wallClockMicroseconds: now()) {
             case let .committed(committed): return committed
             case let .reserved(reservation):
@@ -72,6 +75,40 @@ public enum SwanPublicRepositoryMutationCoordinator {
                 }
             }
         }
+    }
+
+    public static func create(
+        store: any PublicRepositoryMutationStore,
+        did: String,
+        path: PublicRepositoryPath,
+        record: PublicRecord,
+        swapCommit: CID?,
+        requestID: String,
+        bodyDigest: Data,
+        signerProvider: any PublicRepositoryMutationSignerProvider,
+        now: @Sendable () -> UInt64 = currentWallClockMicroseconds
+    ) async throws -> PublicRepositoryMutationResult {
+        guard try await store.loadPublicRepositoryState() != nil else {
+            throw PublicRepositoryMutationCoordinatorError.repositoryNotFound
+        }
+        let current = try await store.publicRepositoryRecordCID(for: path)
+        if current != nil {
+            throw PublicRepositoryMutationCoordinatorError.recordAlreadyExists
+        }
+        return try await applyWithRetry(
+            store: store,
+            did: did,
+            path: path,
+            batch: .init(
+                writes: [.create(path: path, record: record)],
+                expectedCommitCID: swapCommit
+            ),
+            requestID: requestID,
+            bodyDigest: bodyDigest,
+            signerProvider: signerProvider,
+            now: now,
+            action: .create
+        )
     }
 
     public static func put(
@@ -173,8 +210,9 @@ public enum SwanPublicRepositoryMutationCoordinator {
             guard let current = try await store.loadPublicRepositoryState() else {
                 throw PublicRepositoryMutationCoordinatorError.repositoryNotFound
             }
+            let attemptRequestID = attempts == 1 ? requestID : "\(requestID):retry-\(attempts)"
             let request = try PublicRepositoryMutationRequest(
-                id: requestID,
+                id: attemptRequestID,
                 canonicalDigest: bodyDigest,
                 baseCommitCID: current.commitCID
             )
@@ -264,18 +302,24 @@ public enum SwanPublicRepositoryMutationCoordinator {
     }
 
     private static func map(_ error: Error) -> PublicRepositoryMutationCoordinatorError {
-        if let error = error as? PublicRepositoryMutationStoreError,
-           error == .commitCASConflict {
-            return .unavailable
-        }
-        if let error = error as? PublicRepositoryMutationStoreError,
-           error == .publicBlobNotReachable {
-            return .invalidBlobReference
+        if let error = error as? PublicRepositoryMutationStoreError {
+            switch error {
+            case .commitCASConflict:
+                return .unavailable
+            case .publicBlobNotReachable:
+                return .invalidBlobReference
+            case .blockQuotaExceeded:
+                return .quotaExceeded
+            default:
+                break
+            }
         }
         if let error = error as? PublicRepositoryEngineError {
             switch error {
             case .commitCIDMismatch, .recordCIDMismatch:
                 return .invalidSwap
+            case .recordAlreadyExists:
+                return .recordAlreadyExists
             default:
                 return .unavailable
             }

@@ -98,6 +98,7 @@ public enum PublicRepositoryCARImportFailureCode {
             case .corruptRepository: return "MutationCorruptRepository"
             case .repositoryNotInstalled: return "MutationRepositoryNotInstalled"
             case .revisionExhausted: return "MutationRevisionExhausted"
+            case .blockQuotaExceeded: return "MutationBlockQuotaExceeded"
             }
         case let error as SQLiteRepositoryError:
             switch error {

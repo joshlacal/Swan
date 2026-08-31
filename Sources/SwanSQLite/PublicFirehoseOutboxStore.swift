@@ -1,3 +1,4 @@
+import Crypto
 import Foundation
 import Petrel
 import SQLiteNIO
@@ -55,7 +56,8 @@ extension SQLiteAccountDatabase {
     let existing = try await connection.query(
       """
       SELECT id, source_key, kind, lifecycle_generation, payload, car_bytes,
-             attempts, created_at, available_at, lease_token, lease_expires_at
+             payload_digest, car_digest,
+             attempts, created_at, available_at, lease_token, lease_expires_at, completed
       FROM public_event_outbox
       WHERE source_key = ?
       """,
@@ -72,12 +74,16 @@ extension SQLiteAccountDatabase {
       )
     }
 
+    let payloadDigest = Data(SHA256.hash(data: payload))
+    let carDigest = Data(SHA256.hash(data: carBytes))
+
     _ = try await connection.query(
       """
       INSERT INTO public_event_outbox(
           source_key, kind, lifecycle_generation, payload, car_bytes,
-          attempts, created_at, available_at, lease_token, lease_expires_at
-      ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL)
+          payload_digest, car_digest,
+          attempts, created_at, available_at, lease_token, lease_expires_at, completed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL, 0)
       """,
       [
         .text(sourceKey),
@@ -85,6 +91,8 @@ extension SQLiteAccountDatabase {
         .integer(Int(lifecycleGeneration)),
         firehoseBlob(payload),
         firehoseBlob(carBytes),
+        payloadDigest.sqliteData!,
+        carDigest.sqliteData!,
         .integer(Int(createdAt)),
         .integer(Int(createdAt)),
       ]
@@ -132,13 +140,19 @@ extension SQLiteAccountDatabase {
       try await transaction {
         let existing = try await connection.query(
           """
-          SELECT id, source_key, kind, lifecycle_generation, payload, car_bytes,
-                 attempts, created_at, available_at, lease_token, lease_expires_at
+          SELECT id, source_key, kind, lifecycle_generation, completed,
+                 payload, car_bytes, attempts, created_at, available_at,
+                 lease_token, lease_expires_at
           FROM public_event_outbox WHERE source_key = ?
           """,
           [.text(sourceKey)]
         )
         if let row = existing.first {
+          // Completed rows intentionally have NULL payload/CAR bytes. They
+          // remain an idempotency tombstone and must never be decoded.
+          if row.column("completed")?.integer == 1 {
+            return false
+          }
           let stored = try decodeFirehoseOutboxRow(row)
           guard stored.sourceKey == sourceKey, stored.kind == .sync else {
             throw SQLiteRepositoryError.corruptDatabase(
@@ -257,7 +271,7 @@ extension SQLiteAccountDatabase {
         _ = try await connection.query(
           """
           UPDATE public_event_outbox
-          SET completed = 1, lease_token = NULL, lease_expires_at = NULL
+          SET completed = 1, payload = NULL, car_bytes = NULL, lease_token = NULL, lease_expires_at = NULL
           WHERE id = ? AND lease_token = ? AND completed = 0
           """,
           [.integer(Int(id)), .text(token.uuidString)]
@@ -350,71 +364,93 @@ extension SQLiteAccountDatabase {
       )
     }
     let storedGeneration = Int64(try requiredFirehoseInteger(row, "lifecycle_generation"))
-    let storedPayload = try requiredFirehoseBlob(row, "payload")
-    let storedCAR = try requiredFirehoseBlob(row, "car_bytes")
     guard storedGeneration >= 0 else {
       throw SQLiteRepositoryError.corruptDatabase(
         "invalid public firehose outbox generation"
       )
     }
-    do {
-      let commitCID: String
-      switch storedKind {
-      case .commit:
-        let material = try JSONDecoder().decode(
-          PublicFirehoseCommitMaterial.self,
-          from: storedPayload
-        )
-        try validateStoredFirehoseTime(material.time)
-        _ = try FirehoseFrameEncoder.commitFrame(
-          seq: FirehoseFrameLimits.maximumSequence,
-          material: material,
-          diffCAR: storedCAR
-        )
-        commitCID = material.commitCID
-      case .sync:
-        let material = try JSONDecoder().decode(
-          PublicFirehoseSyncMaterial.self,
-          from: storedPayload
-        )
-        try validateStoredFirehoseTime(material.time)
-        _ = try FirehoseFrameEncoder.syncFrame(
-          seq: FirehoseFrameLimits.maximumSequence,
-          material: material,
-          commitCAR: storedCAR
-        )
-        commitCID = material.commitCID
-      case .identity, .account:
-        throw StoredFirehoseReplayValidationError.invalidMaterial
-      }
-      let expectedRoot = try CID.parse(commitCID)
-      try PublicRepositoryCID.validate(expectedRoot)
-      guard expectedRoot.string == commitCID else {
-        throw StoredFirehoseReplayValidationError.invalidMaterial
-      }
-      let source = StoredFirehoseCARSource(storedCAR)
-      let sink = StoredFirehoseCARSink()
-      let parsed = try await PublicRepositoryCAR.parseIncrementally(
-        from: source,
-        to: sink
-      )
-      guard parsed.rootCID == expectedRoot,
-            parsed.frameCount > 0,
-            await sink.contains(expectedRoot) else {
-        throw StoredFirehoseReplayValidationError.invalidCAR
-      }
-    } catch {
+    let storedPayloadDigest = try requiredFirehoseBlob(row, "payload_digest")
+    let storedCarDigest = try requiredFirehoseBlob(row, "car_digest")
+    guard storedPayloadDigest.count == 32, storedCarDigest.count == 32 else {
       throw SQLiteRepositoryError.corruptDatabase(
-        "invalid public firehose outbox material"
+        "invalid public firehose outbox digest length"
       )
     }
+
+    let storedPayloadBlob = row.column("payload")?.blob.map { Data($0.readableBytesView) }
+    let storedCARBlob = row.column("car_bytes")?.blob.map { Data($0.readableBytesView) }
+
+    if let storedPayloadBlob, let storedCARBlob {
+      do {
+        let commitCID: String
+        switch storedKind {
+        case .commit:
+          let material = try JSONDecoder().decode(
+            PublicFirehoseCommitMaterial.self,
+            from: storedPayloadBlob
+          )
+          try validateStoredFirehoseTime(material.time)
+          _ = try FirehoseFrameEncoder.commitFrame(
+            seq: FirehoseFrameLimits.maximumSequence,
+            material: material,
+            diffCAR: storedCARBlob
+          )
+          commitCID = material.commitCID
+        case .sync:
+          let material = try JSONDecoder().decode(
+            PublicFirehoseSyncMaterial.self,
+            from: storedPayloadBlob
+          )
+          try validateStoredFirehoseTime(material.time)
+          _ = try FirehoseFrameEncoder.syncFrame(
+            seq: FirehoseFrameLimits.maximumSequence,
+            material: material,
+            commitCAR: storedCARBlob
+          )
+          commitCID = material.commitCID
+        case .identity, .account:
+          throw StoredFirehoseReplayValidationError.invalidMaterial
+        }
+        let expectedRoot = try CID.parse(commitCID)
+        try PublicRepositoryCID.validate(expectedRoot)
+        guard expectedRoot.string == commitCID else {
+          throw StoredFirehoseReplayValidationError.invalidMaterial
+        }
+        let source = StoredFirehoseCARSource(storedCARBlob)
+        let sink = StoredFirehoseCARSink()
+        let parsed = try await PublicRepositoryCAR.parseIncrementally(
+          from: source,
+          to: sink
+        )
+        guard parsed.rootCID == expectedRoot,
+              parsed.frameCount > 0,
+              await sink.contains(expectedRoot) else {
+          throw StoredFirehoseReplayValidationError.invalidCAR
+        }
+      } catch {
+        throw SQLiteRepositoryError.corruptDatabase(
+          "invalid public firehose outbox material"
+        )
+      }
+    }
+
+    let candidatePayloadDigest = Data(SHA256.hash(data: payload))
+    let candidateCarDigest = Data(SHA256.hash(data: carBytes))
+
     guard storedKind == kind,
           storedGeneration == lifecycleGeneration,
-          storedPayload == payload,
-          storedCAR == carBytes
+          storedPayloadDigest == candidatePayloadDigest,
+          storedCarDigest == candidateCarDigest
     else {
       throw SQLiteRepositoryError.conflictingPublicFirehoseSourceKey(sourceKey)
     }
+
+    if let storedPayloadBlob, let storedCARBlob {
+      guard storedPayloadBlob == payload, storedCARBlob == carBytes else {
+        throw SQLiteRepositoryError.conflictingPublicFirehoseSourceKey(sourceKey)
+      }
+    }
+
     return false
   }
 

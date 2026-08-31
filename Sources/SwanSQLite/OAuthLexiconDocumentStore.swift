@@ -73,6 +73,7 @@ public protocol OAuthLexiconDocumentStore: Sendable {
     func findLexicon(nsid: String) async throws -> OAuthLexiconDocumentRow?
     func storeLexicon(_ row: OAuthLexiconDocumentRow) async throws
     func deleteLexicon(nsid: String) async throws
+    func countNegativeLexicons() async throws -> Int
 }
 
 /// Durable resolved-lexicon cache in `control.sqlite`.
@@ -93,6 +94,9 @@ extension SQLiteControlDatabase: OAuthLexiconDocumentStore {
     /// chooses. The ceiling keeps that unbounded in requests rather than in
     /// disk.
     static let lexiconDocumentRowCapacity = 8_192
+    static let lexiconDocumentNegativeRowCapacity = 4_096
+    static let lexiconDocumentNegativeEvictionAgeMicroseconds: Int = 3_600 * 1_000_000
+    static let lexiconDocumentNegativeEvictionBatchSize = 512
 
     public func findLexicon(nsid: String) async throws -> OAuthLexiconDocumentRow? {
         guard Self.validLexiconNSID(nsid) else {
@@ -138,6 +142,66 @@ extension SQLiteControlDatabase: OAuthLexiconDocumentStore {
         let lastSucceededAt = try row.lastSucceededAt.map(Self.lexiconTimestamp)
         try await withConnectionGate {
             try await transaction {
+                let negativeEvictionThreshold = max(0, updatedAt - Self.lexiconDocumentNegativeEvictionAgeMicroseconds)
+                _ = try await connection.query(
+                    """
+                    DELETE FROM oauth_lexicon_documents
+                    WHERE nsid IN (
+                        SELECT nsid FROM oauth_lexicon_documents
+                        WHERE document IS NULL AND updated_at < ?
+                        ORDER BY updated_at ASC, nsid ASC
+                        LIMIT ?
+                    )
+                    """,
+                    [.integer(negativeEvictionThreshold), .integer(Self.lexiconDocumentNegativeEvictionBatchSize)]
+                )
+                let countRows = try await connection.query(
+                    "SELECT COUNT(*) AS count FROM oauth_lexicon_documents WHERE document IS NULL"
+                )
+                guard let countRow = countRows.first,
+                      case let .integer(negCount) = countRow.column("count"),
+                      negCount >= 0 else {
+                    throw OAuthControlStoreError.malformedRecord
+                }
+                var currentNegCount = negCount
+                let excess = negCount - Self.lexiconDocumentNegativeRowCapacity
+                if excess > 0 {
+                    _ = try await connection.query(
+                        """
+                        DELETE FROM oauth_lexicon_documents
+                        WHERE nsid IN (
+                            SELECT nsid FROM oauth_lexicon_documents
+                            WHERE document IS NULL
+                            ORDER BY updated_at ASC, nsid ASC
+                            LIMIT ?
+                        )
+                        """,
+                        [.integer(excess)]
+                    )
+                    currentNegCount = Self.lexiconDocumentNegativeRowCapacity
+                }
+                if row.document == nil {
+                    let existingNegative = try await connection.query(
+                        "SELECT 1 FROM oauth_lexicon_documents WHERE nsid = ? AND document IS NULL LIMIT 1",
+                        [.text(row.nsid)]
+                    )
+                    if existingNegative.isEmpty {
+                        if currentNegCount >= Self.lexiconDocumentNegativeRowCapacity {
+                            // This runs inside the transaction, after expiry and excess trim
+                            _ = try await connection.query(
+                                """
+                                DELETE FROM oauth_lexicon_documents
+                                WHERE nsid = (
+                                    SELECT nsid FROM oauth_lexicon_documents
+                                    WHERE document IS NULL
+                                    ORDER BY updated_at ASC, nsid ASC
+                                    LIMIT 1
+                                )
+                                """
+                            )
+                        }
+                    }
+                }
                 try await requireInsertionCapacity(
                     table: "oauth_lexicon_documents",
                     keyColumn: "nsid",
@@ -187,6 +251,44 @@ extension SQLiteControlDatabase: OAuthLexiconDocumentStore {
             }
         }
     }
+
+    public func countNegativeLexicons() async throws -> Int {
+        try await withConnectionGate {
+            let rows = try await connection.query(
+                "SELECT COUNT(*) AS count FROM oauth_lexicon_documents WHERE document IS NULL"
+            )
+            guard let row = rows.first,
+                  case let .integer(count) = row.column("count") else {
+                throw OAuthControlStoreError.malformedRecord
+            }
+            return count
+        }
+    }
+
+    func migrateOAuthLexiconDocumentsSchema() async throws {
+        let countRows = try await connection.query(
+            "SELECT COUNT(*) AS count FROM oauth_lexicon_documents WHERE document IS NULL"
+        )
+        guard let countRow = countRows.first,
+              case let .integer(negCount) = countRow.column("count"),
+              negCount > Self.lexiconDocumentNegativeRowCapacity else {
+            return
+        }
+        let excess = negCount - Self.lexiconDocumentNegativeRowCapacity
+        _ = try await connection.query(
+            """
+            DELETE FROM oauth_lexicon_documents
+            WHERE nsid IN (
+                SELECT nsid FROM oauth_lexicon_documents
+                WHERE document IS NULL
+                ORDER BY updated_at ASC, nsid ASC
+                LIMIT ?
+            )
+            """,
+            [.integer(excess)]
+        )
+    }
+
 
     // MARK: - Row coding
 

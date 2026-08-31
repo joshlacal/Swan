@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import Petrel
 import SwanCore
 import SwanSpaces
 /// A caller-selected record mutation.  Unlike ``SpaceWrite``, this retains
@@ -339,15 +340,17 @@ public struct AuthorizedSpaceNotificationRegistration: Sendable, Equatable {
     public let endpoint: String
     public let repository: String?
     public let expiresAt: Date
+    /// The authenticated subscriber identity derived from verified credentials.
+    public let ownerServiceDID: String
     /// The subscriber's service identifier (`did` or `did#fragment`) when the
     /// registration named one — the audience `notifyWrite` deliveries are
     /// addressed to, and the marker that the endpoint has DID-document
     /// provenance. `nil` for a legacy endpoint-only registration, which stays
     /// local discovery state and is never a dynamic delivery destination.
-    public let service: String?
-    /// The authenticated subscriber DID (the issuer of the registration
-    /// service auth factor) that owns this registration row.
-    public let serviceDID: String
+    public let deliveryServiceDID: String?
+
+    public var serviceDID: String { ownerServiceDID }
+    public var service: String? { deliveryServiceDID }
 
     public init(
         space: SpaceURI,
@@ -355,14 +358,16 @@ public struct AuthorizedSpaceNotificationRegistration: Sendable, Equatable {
         repository: String?,
         expiresAt: Date,
         service: String? = nil,
-        serviceDID: String? = nil
+        serviceDID: String? = nil,
+        ownerServiceDID: String? = nil,
+        deliveryServiceDID: String? = nil
     ) {
         self.space = space
         self.endpoint = endpoint
         self.repository = repository
         self.expiresAt = expiresAt
-        self.service = service
-        self.serviceDID = serviceDID ?? service ?? ""
+        self.ownerServiceDID = ownerServiceDID ?? serviceDID ?? service ?? ""
+        self.deliveryServiceDID = deliveryServiceDID ?? service
     }
 }
 
@@ -424,7 +429,8 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
     /// credential for exactly this space and on the space still being active.
     func unregisterSpaceNotification(
         space: SpaceURI,
-        serviceDID: String,
+        ownerServiceDID: String,
+        deliveryServiceDID: String?,
         authorization: AuthorizationContext
     ) async throws
 
@@ -448,46 +454,34 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
         requestBodyDigest: String
     ) async throws
 }
-
-/// Domain-separated, length-prefixed canonical SHA-256 request digests for
-/// service-authenticated space operations.
-public enum SpaceNotificationRequestDigest {
-    private static let writeDomain = "swan.space.notify-write.v1"
-    private static let deletionDomain = "swan.space.notify-deleted.v1"
-
-    public static func deletion(space: SpaceURI) -> String {
-        var hasher = SHA256()
-        appendLengthPrefixed(writeUTF8: deletionDomain, to: &hasher)
-        appendLengthPrefixed(writeUTF8: space.rawValue, to: &hasher)
-        return Data(hasher.finalize()).base64URLEncodedString()
+public extension AuthorizedSpaceNotificationDirectory {
+    func registerSpaceNotification(
+        _ registration: AuthorizedSpaceNotificationRegistration,
+        authorization: AuthorizationContext
+    ) async throws {
+        try await registerSpaceNotification(registration, serviceDID: registration.serviceDID, authorization: authorization)
     }
 
-    public static func write(
+    func unregisterSpaceNotification(
         space: SpaceURI,
-        repository: String,
-        wireRevision: String,
-        commitment: Data
-    ) -> String {
-        var hasher = SHA256()
-        appendLengthPrefixed(writeUTF8: writeDomain, to: &hasher)
-        appendLengthPrefixed(writeUTF8: space.rawValue, to: &hasher)
-        appendLengthPrefixed(writeUTF8: repository, to: &hasher)
-        appendLengthPrefixed(writeUTF8: wireRevision, to: &hasher)
-        appendLengthPrefixed(commitment, to: &hasher)
-        return Data(hasher.finalize()).base64URLEncodedString()
+        serviceDID: String,
+        authorization: AuthorizationContext
+    ) async throws {
+        let baseDID = serviceIssuerDID(serviceDID) ?? serviceDID
+        try await unregisterSpaceNotification(
+            space: space,
+            ownerServiceDID: baseDID,
+            deliveryServiceDID: serviceDID,
+            authorization: authorization
+        )
     }
 
-    private static func appendLengthPrefixed(writeUTF8 string: String, to hasher: inout SHA256) {
-        let utf8 = string.utf8
-        var length = UInt64(utf8.count).bigEndian
-        withUnsafeBytes(of: &length) { hasher.update(bufferPointer: $0) }
-        hasher.update(data: Data(utf8))
-    }
-
-    private static func appendLengthPrefixed(_ data: Data, to hasher: inout SHA256) {
-        var length = UInt64(data.count).bigEndian
-        withUnsafeBytes(of: &length) { hasher.update(bufferPointer: $0) }
-        hasher.update(data: data)
+    func unregisterSpaceNotification(
+        space: SpaceURI,
+        service: String,
+        authorization: AuthorizationContext
+    ) async throws {
+        try await unregisterSpaceNotification(space: space, serviceDID: service, authorization: authorization)
     }
 }
 
@@ -687,5 +681,106 @@ public extension AuthorizedSpaceRepositoryDirectory {
         authorization: AuthorizationContext
     ) async throws -> String? {
         nil
+    }
+}
+public func serviceIssuerDID(_ value: String) -> String? {
+    let parts = value.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+    guard (1 ... 2).contains(parts.count),
+          !parts[0].isEmpty,
+          (parts.count == 1 || (!parts[1].isEmpty && parts[1].utf8.count <= 512)),
+          let did = try? DID(didString: String(parts[0])) else {
+        return nil
+    }
+    return did.didString()
+}
+
+public enum SpaceNotificationRequestDigest {
+    public static func deletion(space: SpaceURI) -> String {
+        SpaceServiceRequestDigest.deletion(space: space)
+    }
+
+    public static func write(
+        space: SpaceURI,
+        repository: String,
+        wireRevision: String,
+        commitment: Data
+    ) -> String {
+        SpaceServiceRequestDigest.write(
+            space: space,
+            repository: repository,
+            revision: wireRevision,
+            commitment: commitment
+        )
+    }
+
+    public static func deletionBytes(space: SpaceURI) -> Data {
+        SpaceServiceRequestDigest.deletionBytes(space: space)
+    }
+
+    public static func writeBytes(
+        space: SpaceURI,
+        repository: String,
+        wireRevision: String,
+        commitment: Data
+    ) -> Data {
+        SpaceServiceRequestDigest.writeBytes(
+            space: space,
+            repository: repository,
+            revision: wireRevision,
+            commitment: commitment
+        )
+    }
+}
+
+public enum SpaceServiceRequestDigest {
+    public static func deletion(space: SpaceURI) -> String {
+        base64URLEncode(deletionBytes(space: space))
+    }
+
+    public static func write(
+        space: SpaceURI,
+        repository: String,
+        revision: String,
+        commitment: Data
+    ) -> String {
+        base64URLEncode(writeBytes(space: space, repository: repository, revision: revision, commitment: commitment))
+    }
+    public static func deletionBytes(space: SpaceURI) -> Data {
+        digestBytes(domain: "swan.space.notify-deleted.v1", parts: [
+            Data(space.rawValue.utf8)
+        ])
+    }
+
+    public static func writeBytes(
+        space: SpaceURI,
+        repository: String,
+        revision: String,
+        commitment: Data
+    ) -> Data {
+        digestBytes(
+            domain: "swan.space.notify-write.v1",
+            parts: [
+                Data(space.rawValue.utf8),
+                Data(repository.utf8),
+                Data(revision.utf8),
+                commitment
+            ]
+        )
+    }
+    private static func digestBytes(domain: String, parts: [Data]) -> Data {
+        var input = Data()
+        for part in [Data(domain.utf8)] + parts {
+            var length = UInt64(part.count).bigEndian
+            withUnsafeBytes(of: &length) { input.append(contentsOf: $0) }
+            input.append(part)
+        }
+        return Data(SHA256.hash(data: input))
+    }
+
+    private static func base64URLEncode(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 }

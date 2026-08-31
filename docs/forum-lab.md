@@ -15,10 +15,13 @@ The `provision` subcommand creates a forum space on an authority host and regist
 
 ```sh
 export SWAN_LAB_AUTHORITY_HANDLE=admin.swan.test
-export SWAN_LAB_AUTHORITY_PASSWORD=operator-password
+install -m 0600 /dev/stdin /tmp/authority.password <<'EOF'
+operator-password
+EOF
 
 swift run swan lab forum provision \
   --authority-url https://swan.test \
+  --authority-password-file /tmp/authority.password \
   --space at://did:plc:authority123/space/blue.catbird.lab.forum/lab-1 \
   --member-did did:plc:member456
 ```
@@ -29,10 +32,13 @@ The `post` subcommand writes a record into the caller's own permissioned reposit
 
 ```sh
 export SWAN_LAB_PRODUCER_HANDLE=alice.pds.test
-export SWAN_LAB_PRODUCER_PASSWORD=member-password
+install -m 0600 /dev/stdin /tmp/producer.password <<'EOF'
+member-password
+EOF
 
 swift run swan lab forum post \
   --producer-url https://pds.test \
+  --producer-password-file /tmp/producer.password \
   --space at://did:plc:authority123/space/blue.catbird.lab.forum/lab-1 \
   --text "hello forum" \
   --reply-to at://did:plc:authority123/space/blue.catbird.lab.forum/lab-1/did:plc:member456/blue.catbird.lab.post/2222222222222
@@ -57,11 +63,14 @@ The `thread` subcommand acts as a consumer client (such as Carol reading the for
 
 ```sh
 export SWAN_LAB_CONSUMER_HANDLE=carol.pds.test
-export SWAN_LAB_CONSUMER_PASSWORD=consumer-password
+install -m 0600 /dev/stdin /tmp/consumer.password <<'EOF'
+consumer-password
+EOF
 export SWAN_LAB_PERMISSIONED_COMMIT_KEY=... # base64url secp256k1 writer public key
 
 swift run swan lab forum thread \
   --consumer-url https://pds.test \
+  --consumer-password-file /tmp/consumer.password \
   --authority-url https://swan.test \
   --space at://did:plc:authority123/space/blue.catbird.lab.forum/lab-1 \
   --receiver-did did:plc:consumer789 \
