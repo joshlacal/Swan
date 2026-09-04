@@ -72,6 +72,7 @@ public actor SQLiteFirehoseDatabase {
   private var dataDirectoryDescriptor: Int32
   private var databaseFileDescriptor: Int32
   private var isClosed = false
+  private var commitBarrier: SQLiteLayout.CommitBarrier?
 
   public static func firehoseDatabase(in dataDirectory: URL) -> URL {
     SQLiteLayout.firehoseDatabase(in: dataDirectory)
@@ -808,11 +809,20 @@ public actor SQLiteFirehoseDatabase {
     do {
       let result = try await body()
       _ = try await connection.query("COMMIT")
+      if let commitBarrier { try await commitBarrier() }
       return result
     } catch {
       _ = try? await connection.query("ROLLBACK")
       throw error
     }
+  }
+
+  /// See `SQLiteAccountDatabase.installCommitBarrier(_:)`.
+  public func installCommitBarrier(_ barrier: SQLiteLayout.CommitBarrier?) async throws {
+    commitBarrier = barrier
+    _ = try await connection.query(
+      barrier == nil ? "PRAGMA wal_autocheckpoint=1000" : "PRAGMA wal_autocheckpoint=0"
+    )
   }
 
   private let connectionGate = SQLiteFirehoseConnectionGate()

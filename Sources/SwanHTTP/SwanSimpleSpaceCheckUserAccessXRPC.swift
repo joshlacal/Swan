@@ -106,7 +106,7 @@ private func parseSimpleSpaceCheckUserAccessParameters(
           query.utf8.count <= 4_096 else {
         throw SimpleSpaceCheckUserAccessFailure.denied
     }
-    let allowed: Set<String> = ["space", "user", "clientId"]
+    let allowed: Set<String> = ["space", "user", "access", "clientId"]
     var values: [String: String] = [:]
     for segment in query.split(separator: "&", omittingEmptySubsequences: false) {
         let pair = segment.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
@@ -121,18 +121,23 @@ private func parseSimpleSpaceCheckUserAccessParameters(
     }
     guard let rawSpace = values["space"],
           let rawUser = values["user"],
+          let rawAccess = values["access"],
           !rawSpace.isEmpty,
           !rawUser.isEmpty,
+          (rawAccess == "read" || rawAccess == "write"),
           rawSpace.utf8.count <= 2_048,
           rawUser.utf8.count <= 2_048,
           values["clientId"].map({ !$0.isEmpty && $0.utf8.count <= 2_048 }) ?? true else {
+        throw SimpleSpaceCheckUserAccessFailure.denied
+    }
+    if rawAccess == "write" && values["clientId"] != nil {
         throw SimpleSpaceCheckUserAccessFailure.denied
     }
     do {
         let space = try SpaceRef(uriString: rawSpace)
         let user = try DID(didString: rawUser)
         _ = try SpaceURI(space.uriString())
-        return .init(space: space, user: user, clientId: values["clientId"])
+        return .init(space: space, user: user, access: rawAccess, clientId: values["clientId"])
     } catch {
         throw SimpleSpaceCheckUserAccessFailure.denied
     }

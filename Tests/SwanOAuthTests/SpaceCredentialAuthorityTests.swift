@@ -21,7 +21,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
         do {
             let space = try await fixture.installSpace(
                 skey: "public",
-                configuration: try .init(policy: .public, appAccess: .open)
+                configuration: try .init(readPolicy: .public, writePolicy: .public, appAccess: .open)
             )
             let issuer = fixture.authorityIssuer()
             let token = try await issuer.issueSpaceCredential(
@@ -136,7 +136,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
         do {
             let space = try await fixture.installSpace(
                 skey: "verify",
-                configuration: try .init(policy: .public, appAccess: .open)
+                configuration: try .init(readPolicy: .public, writePolicy: .public, appAccess: .open)
             )
             let token = try await fixture.authorityIssuer().issueSpaceCredential(
                 space: space,
@@ -378,7 +378,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
         do {
             let memberSpace = try await fixture.installSpace(
                 skey: "members",
-                configuration: try .init(policy: .memberList, appAccess: .open),
+                configuration: try .init(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
                 members: [member]
             )
             let issuer = fixture.authorityIssuer()
@@ -408,7 +408,8 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             let allowListed = try await fixture.installSpace(
                 skey: "allow-listed",
                 configuration: try .init(
-                    policy: .public,
+                    readPolicy: .public,
+                    writePolicy: .public,
                     appAccess: .allowList(["https://reader.example/client-metadata.json"])
                 )
             )
@@ -446,9 +447,11 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             let managing = try await fixture.installSpace(
                 skey: "managed",
                 configuration: try .init(
-                    policy: .managingApp,
-                    appAccess: .open,
-                    managingApp: "did:web:app.example#space"
+                    readPolicy: .managingApp,
+                    readManagingApp: "did:web:app.example#space",
+                    writePolicy: .managingApp,
+                    writeManagingApp: "did:web:app.example#space",
+                    appAccess: .open
                 )
             )
             await XCTAssertThrowsErrorAsync(
@@ -472,7 +475,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
         do {
             let space = try await fixture.installSpace(
                 skey: "concurrent",
-                configuration: try .init(policy: .public, appAccess: .open)
+                configuration: try .init(readPolicy: .public, writePolicy: .public, appAccess: .open)
             )
             let issuer = fixture.authorityIssuer()
             let tokens = try await withThrowingTaskGroup(

@@ -35,6 +35,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
         let database: SQLiteControlDatabase
         let credentials: AppPasswordCredentials
         let serviceAuthIssuer: TestServiceAuthIssuer
+        let oauthRuntime: SwanOAuthRuntime
         let router: Router<SwanHTTPRequestContext>
     }
 
@@ -72,6 +73,9 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
         )
         let credentials = try AppPasswordCredentials()
         let serviceAuthIssuer = serviceAuthIssuer ?? TestServiceAuthIssuer()
+        let oauthRuntime = try SwanOAuthRuntime(
+            controlStore: database, serverKey: Data(repeating: 0x72, count: 32)
+        )
         let router = Router(context: SwanHTTPRequestContext.self)
         SwanLegacySessionXRPCServer(
             sessions: try DurableLegacySessionService(
@@ -96,12 +100,17 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             requestBodyAdmission: .init(
                 admission: .processShared,
                 policy: .productionDefault
+            ),
+            resourceAuthorizer: try SwanOAuthResourceAuthorizer(
+                publicURL: URL(string: "https://swan.test")!,
+                runtime: oauthRuntime,
+                accountControlStore: database
             )
         )
         // The fence these routes must coexist with, registered exactly as the
         // production assembly does.
         registerUnknownPublicEndpointGuards(on: router)
-        return Fixture(root: root, database: database, credentials: credentials, serviceAuthIssuer: serviceAuthIssuer, router: router)
+        return Fixture(root: root, database: database, credentials: credentials, serviceAuthIssuer: serviceAuthIssuer, oauthRuntime: oauthRuntime, router: router)
     }
 
     private func app(_ fixture: Fixture) -> some ApplicationProtocol {
@@ -699,6 +708,114 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
     }
 
     // MARK: - Service authentication
+
+    func testOAuthServiceAuthHonorsDPoPAndDownstreamScope() async throws {
+        let fixture = try await makeFixture()
+        addTeardownBlock {
+            try? await fixture.database.close()
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
+        let audience = "did:web:circles.catbird.blue#atproto_circles"
+        let method = "blue.catbird.circle.getFeed"
+        let oauthClient = try PermissionedScopeClient(
+            scopes: ["atproto", "rpc:\(method)?aud=\(scopeQueryEncode(audience))"]
+        )
+        let now = Date()
+        let session = try OAuthValidatedSession(
+            issuer: "https://swan.test",
+            client: OAuthResolvedClientMetadata(metadata: try oauthClient.metadata(), keySet: nil),
+            redirectURI: oauthClient.redirectURI,
+            scopes: oauthClient.scopeSet,
+            dpopProof: OAuthValidatedDPoPProof(
+                keyThumbprint: oauthClient.jwk.thumbprint(),
+                jwtID: UUID().uuidString,
+                issuedAt: now
+            ),
+            now: now
+        )
+        let tokens = try await fixture.oauthRuntime.tokenService.issue(subject: did, session: session, now: now)
+        let path = "/xrpc/com.atproto.server.getServiceAuth"
+        let query = "?aud=\(scopeQueryEncode(audience))&lxm=\(method)"
+        try await app(fixture).test(.live) { client in
+            var nonce = ""
+            try await client.execute(
+                uri: path + query, method: .get,
+                headers: [.authorization: "DPoP \(tokens.accessToken)"]
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized, self.body(response))
+                XCTAssertEqual(try self.json(response)["error"] as? String, "use_dpop_nonce")
+                nonce = try XCTUnwrap(response.headers[HTTPField.Name("DPoP-Nonce")!])
+            }
+            let proof = try makeScopeDPoPProof(
+                key: oauthClient.signingKey, jwk: oauthClient.jwk,
+                jti: UUID().uuidString, nonce: nonce, method: "GET",
+                target: "https://swan.test" + path, accessToken: tokens.accessToken
+            )
+            let headers: HTTPFields = [
+                .authorization: "DPoP \(tokens.accessToken)",
+                HTTPField.Name("DPoP")!: proof,
+            ]
+            try await client.execute(uri: path + query, method: .get, headers: headers) { response in
+                XCTAssertEqual(response.status, .ok, self.body(response))
+                let token = try XCTUnwrap(try self.json(response)["token"] as? String)
+                let claims = try XCTUnwrap(
+                    JSONSerialization.jsonObject(
+                        with: try XCTUnwrap(Data(base64URLEncoded: String(token.split(separator: ".")[1])))
+                    ) as? [String: Any]
+                )
+                XCTAssertEqual(claims["iss"] as? String, self.did)
+                XCTAssertEqual(claims["aud"] as? String, audience)
+                XCTAssertEqual(claims["lxm"] as? String, method)
+            }
+            // Reusing the same proof must not mint another service token.
+            try await client.execute(uri: path + query, method: .get, headers: headers) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+            let freshProof = try makeScopeDPoPProof(
+                key: oauthClient.signingKey, jwk: oauthClient.jwk,
+                jti: UUID().uuidString, nonce: nonce, method: "GET",
+                target: "https://swan.test" + path, accessToken: tokens.accessToken
+            )
+            try await client.execute(
+                uri: path + "?aud=\(scopeQueryEncode(audience))&lxm=blue.catbird.circle.activateCircle",
+                method: .get,
+                headers: [.authorization: "DPoP \(tokens.accessToken)", HTTPField.Name("DPoP")!: freshProof]
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+            let sessionPath = "/xrpc/com.atproto.server.getSession"
+            // A cached nonce can expire while the token remains valid. The
+            // resource must challenge, not strand every subsequent login.
+            let staleProof = try makeScopeDPoPProof(
+                key: oauthClient.signingKey, jwk: oauthClient.jwk,
+                jti: UUID().uuidString,
+                nonce: fixture.oauthRuntime.dpopNonceService.issue(now: now.addingTimeInterval(-3_600)),
+                method: "GET", target: "https://swan.test" + sessionPath,
+                accessToken: tokens.accessToken
+            )
+            try await client.execute(
+                uri: sessionPath, method: .get,
+                headers: [.authorization: "DPoP \(tokens.accessToken)", HTTPField.Name("DPoP")!: staleProof]
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+                XCTAssertEqual(try self.json(response)["error"] as? String, "use_dpop_nonce")
+                nonce = try XCTUnwrap(response.headers[HTTPField.Name("DPoP-Nonce")!])
+            }
+            let sessionProof = try makeScopeDPoPProof(
+                key: oauthClient.signingKey, jwk: oauthClient.jwk,
+                jti: UUID().uuidString, nonce: nonce, method: "GET",
+                target: "https://swan.test" + sessionPath, accessToken: tokens.accessToken
+            )
+            try await client.execute(
+                uri: sessionPath, method: .get,
+                headers: [.authorization: "DPoP \(tokens.accessToken)", HTTPField.Name("DPoP")!: sessionProof]
+            ) { response in
+                XCTAssertEqual(response.status, .ok, self.body(response))
+                XCTAssertEqual(try self.json(response)["did"] as? String, self.did)
+                XCTAssertEqual(try self.json(response)["handle"] as? String, self.handle)
+            }
+        }
+    }
 
     func testGetServiceAuthRequiresBothMethodAndAudienceAndBindsTheSignedClaims() async throws {
         let fixture = try await makeFixture()

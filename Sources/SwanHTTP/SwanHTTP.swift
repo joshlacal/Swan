@@ -352,6 +352,7 @@ public struct SwanHTTPServer: Sendable {
     /// `OAuthTokenVault` fallback: an incomplete or missing durable runtime is
     /// a startup failure, not a switch back to process-local bearer state.
     public let oauthRuntime: SwanOAuthRuntime
+    private let accountResourceAuthorizer: SwanOAuthResourceAuthorizer?
     /// Discovery is unavailable unless a later complete OAuth HTTP assembly
     /// explicitly supplies a ready gate. Durable OAuth primitives alone are
     /// not sufficient authorization-server behavior.
@@ -616,17 +617,17 @@ public struct SwanHTTPServer: Sendable {
         // Never accept a caller-supplied authorizer here: it might bind DPoP
         // to another public URL or runtime. Failure to form the exact local
         // binding is a safe closed route, not a best-effort fallback.
-        if let authenticatedGetSpaceDirectory,
-           let accountControlStore,
-           Self.permitsResourceAuthorization(on: configuration),
-           let authorizer = try? SwanOAuthResourceAuthorizer(
-               publicURL: configuration.publicURL,
-               runtime: oauthRuntime,
-               accountControlStore: accountControlStore,
-               // `nil` unless the deployment enabled legacy sessions, which
-               // leaves this authorizer DPoP-only exactly as before.
-               legacySessions: legacySessionXRPC?.sessions
-           ) {
+        if let accountControlStore, Self.permitsResourceAuthorization(on: configuration) {
+            accountResourceAuthorizer = try? SwanOAuthResourceAuthorizer(
+                publicURL: configuration.publicURL,
+                runtime: oauthRuntime,
+                accountControlStore: accountControlStore,
+                legacySessions: legacySessionXRPC?.sessions
+            )
+        } else {
+            accountResourceAuthorizer = nil
+        }
+        if let authenticatedGetSpaceDirectory, let authorizer = accountResourceAuthorizer {
             // Formed once, ahead of every capability that verifies compact
             // space credentials — including the description endpoint, whose
             // live contract admits a member hosted elsewhere by credential.
@@ -1027,7 +1028,8 @@ public struct SwanHTTPServer: Sendable {
         )
         legacySessionXRPC?.register(
             on: router,
-            requestBodyAdmission: requestBodyAdmission
+            requestBodyAdmission: requestBodyAdmission,
+            resourceAuthorizer: accountResourceAuthorizer
         )
         actorPreferencesXRPC?.register(
             on: router,
@@ -1327,7 +1329,7 @@ public struct SwanHTTPServer: Sendable {
         case ComAtprotoSimplespaceCreateSpace.typeIdentifier,
              ComAtprotoSimplespaceUpdateSpace.typeIdentifier,
              ComAtprotoSimplespaceDeleteSpace.typeIdentifier,
-             ComAtprotoSimplespaceAddMember.typeIdentifier,
+             ComAtprotoSimplespacePutMember.typeIdentifier,
              ComAtprotoSimplespaceRemoveMember.typeIdentifier,
              ComAtprotoSimplespaceListMembers.typeIdentifier:
             true

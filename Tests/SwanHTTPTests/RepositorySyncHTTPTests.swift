@@ -1426,7 +1426,7 @@ private struct Fixture: Sendable {
             _ = try await aliceDatabase.createSimpleSpace(
                 space: space,
                 owner: RepositorySyncHTTPTests.alice,
-                configuration: .init(policy: .public, appAccess: .open),
+                configuration: try .init(readPolicy: .public, writePolicy: .public, appAccess: .open),
                 authorization: authorization
             )
             let aliceRepository = try DurableSpaceRepository(database: aliceDatabase, space: space, author: RepositorySyncHTTPTests.alice)

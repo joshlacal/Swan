@@ -1906,7 +1906,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Run Swan's Hummingbird server")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-08-15.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-09-10.json"
 
         /// The public route surface is a separate contract family from
         /// `--profile`, and gets a separate flag rather than a widened one.
@@ -5032,7 +5032,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Verify a pinned Swan artifact")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-08-15.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-09-10.json"
 
         @Option(name: .long, help: "Swan package root containing generated wire sources")
         var sourceRoot: String?
@@ -7989,7 +7989,7 @@ extension SwanCommand {
             /// Creates a forum space on an authority and adds one member.
             /// Mirrors `lab live --provision-space`: it reuses
             /// `LabLiveSupport.provisionSpace` (simplespace.createSpace +
-            /// addMember) through the OAuth-authorized procedure helper.
+            /// putMember) through the OAuth-authorized procedure helper.
             struct Provision: AsyncParsableCommand {
                 static let configuration = CommandConfiguration(
                     commandName: "provision",
@@ -9537,6 +9537,9 @@ private enum LabLiveSupport {
                 "did": space.authority,
                 "type": space.spaceType,
                 "skey": space.skey,
+                "readPolicy": ["$type": "com.atproto.simplespace.defs#memberListPolicy"],
+                "writePolicy": ["$type": "com.atproto.simplespace.defs#memberListPolicy"],
+                "appAccess": ["$type": "com.atproto.simplespace.defs#open"],
             ],
             options: [.sortedKeys]
         )
@@ -9553,19 +9556,19 @@ private enum LabLiveSupport {
             )
         }
 
-        let addBody = try JSONSerialization.data(
-            withJSONObject: ["space": space.rawValue, "did": member],
+        let putBody = try JSONSerialization.data(
+            withJSONObject: ["space": space.rawValue, "did": member, "read": true, "write": true],
             options: [.sortedKeys]
         )
-        let add = try await authorizedProcedure(
+        let put = try await authorizedProcedure(
             host: authority,
-            nsid: "com.atproto.simplespace.addMember",
-            body: addBody
+            nsid: "com.atproto.simplespace.putMember",
+            body: putBody
         )
-        guard (200 ... 299).contains(add.status) else {
-            let error = responseError(add) ?? "unknown"
+        guard (200 ... 299).contains(put.status) else {
+            let error = responseError(put) ?? "unknown"
             throw ValidationError(
-                "permissioned space membership failed (status=\(add.status), error=\(error))"
+                "permissioned space membership failed (status=\(put.status), error=\(error))"
             )
         }
     }

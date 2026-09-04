@@ -35,7 +35,7 @@ final class PublicFirehoseIsolationTests: XCTestCase {
     _ = try await lifecycle.create(
       space: space,
       owner: authority,
-      configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+      configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
       authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"])
     )
     _ = try await lifecycle.addMember(

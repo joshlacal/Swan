@@ -48,6 +48,30 @@ final class SwanInteropTests: XCTestCase {
                 "Profiles/permissioned-data-0016-2026-07-03.generated-wire.sha256",
                 "c1d5697f351a4209c7f8a9faaf460d423f9f44f37845ae2c92e150e78c552609"
             ),
+            (
+                "Profiles/permissioned-data-0016-2026-07-30.json",
+                "431294d96a4a82f15fe5cd0807d89dbcd76d1768a1762d2a0c6a5905e8083988"
+            ),
+            (
+                "Profiles/permissioned-data-0016-2026-07-30.lexicons.sha256",
+                "9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f"
+            ),
+            (
+                "Profiles/permissioned-data-0016-2026-07-30.generated-wire.sha256",
+                "80f9f7b93127826d95d516a4a9d18b7ca245d82fc74f8fa484bbf3423d1f51db"
+            ),
+            (
+                "Profiles/permissioned-data-0016-2026-08-15.json",
+                "b3edfc13675d4273cf036f1f74391795b3f1307d4b1fd24ad021f26fa60e4023"
+            ),
+            (
+                "Profiles/permissioned-data-0016-2026-08-15.lexicons.sha256",
+                "873fb88439cadd447ee6a90f9fadb262fa84bdb6689735b53e667db13d7219c3"
+            ),
+            (
+                "Profiles/permissioned-data-0016-2026-08-15.generated-wire.sha256",
+                "7e7fe09868a7fcda0c6ab824ebe19e7f64ba147db63fd02a27762ed538e02704"
+            ),
         ]
 
         for (path, checksum) in expected {
@@ -68,6 +92,18 @@ final class SwanInteropTests: XCTestCase {
         XCTAssertEqual(report.profileID, "permissioned-data-0016-2026-07-03")
         XCTAssertEqual(
             report.diagnostics,
+            [.init(.unsupportedProfileID, artifact: "profile")]
+        )
+
+        let report815 = OfflineProtocolProfileVerifier.verify(
+            profileURL: packageRoot.appending(
+                path: "Profiles/permissioned-data-0016-2026-08-15.json"
+            ),
+            sourceRoot: packageRoot
+        )
+        XCTAssertEqual(report815.profileID, "permissioned-data-0016-2026-08-15")
+        XCTAssertEqual(
+            report815.diagnostics,
             [.init(.unsupportedProfileID, artifact: "profile")]
         )
     }
@@ -92,7 +128,7 @@ final class SwanInteropTests: XCTestCase {
         defer { fixture.remove() }
 
         try fixture.replaceInProfile(
-            "bddc99fb24c34b4078b9bf65837283f37b49ab66",
+            "9d787ebff231ff8f4e01c63717e9f5bcd6e1bc33",
             with: String(repeating: "a", count: 40)
         )
 
@@ -1641,11 +1677,11 @@ private final class ProfileFixture {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let profileName = "permissioned-data-0016-2026-08-15.json"
-        let lexiconName = "permissioned-data-0016-2026-08-15.lexicons.sha256"
+        let profileName = "permissioned-data-0016-2026-09-10.json"
+        let lexiconName = "permissioned-data-0016-2026-09-10.lexicons.sha256"
         profileURL = profiles.appending(path: profileName)
         lexiconManifestURL = profiles.appending(path: lexiconName)
-        generatedWireManifestURL = profiles.appending(path: "permissioned-data-0016-2026-08-15.generated-wire.sha256")
+        generatedWireManifestURL = profiles.appending(path: "permissioned-data-0016-2026-09-10.generated-wire.sha256")
         generatedWireSourceURL = sources.appending(path: "SwanSpacesWire/SwanSpacesWire.swift")
 
         try FileManager.default.copyItem(
@@ -1657,7 +1693,7 @@ private final class ProfileFixture {
             to: lexiconManifestURL
         )
         try FileManager.default.copyItem(
-            at: packageRoot.appending(path: "Profiles/permissioned-data-0016-2026-08-15.generated-wire.sha256"),
+            at: packageRoot.appending(path: "Profiles/permissioned-data-0016-2026-09-10.generated-wire.sha256"),
             to: generatedWireManifestURL
         )
         try FileManager.default.copyItem(
@@ -1687,7 +1723,7 @@ private final class ProfileFixture {
         try data.write(to: generatedWireManifestURL)
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         try replaceInProfile(
-            "7e7fe09868a7fcda0c6ab824ebe19e7f64ba147db63fd02a27762ed538e02704",
+            "9b3df8b2b04445a3c2a623fc556469b6aa430a0901ead90709abf3f4fd7af876",
             with: digest
         )
     }

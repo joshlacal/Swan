@@ -49,7 +49,8 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         )
         let description = try XCTUnwrap(loaded)
         XCTAssertEqual(description.space, space)
-        XCTAssertEqual(description.configuration.policy, .memberList)
+        XCTAssertEqual(description.configuration.readPolicy, .memberList)
+        XCTAssertEqual(description.configuration.writePolicy, .memberList)
 
         // The public result type cannot accidentally grow a durable authority
         // snapshot: none of owner, members, revision, deletion state, or app
@@ -332,12 +333,16 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         let raw = try await SQLiteConnection.open(
             storage: .file(path: SQLiteLayout.accountDatabase(in: root, did: alice).path)
         )
-        _ = try await raw.query(
-            "INSERT INTO permissioned_simple_space_clients(space_uri, client_id) VALUES (?, ?)",
-            [.text(space.rawValue), .text("app.example.client")]
-        )
-        try await raw.close()
-
+        do {
+            _ = try await raw.query(
+                "INSERT INTO permissioned_simple_space_clients(space_uri, client_id) VALUES (?, ?)",
+                [.text(space.rawValue), .text("app.example.client")]
+            )
+            try await raw.close()
+        } catch {
+            try? await raw.close()
+            throw error
+        }
         let reopened = try await SQLitePreMigratedAccountDirectory.bootstrap(
             dataDirectory: root,
             controlStore: control,
@@ -449,7 +454,7 @@ private extension PreMigratedAccountDirectoryTests {
         _ = try await authority.create(
             space: space,
             owner: did,
-            configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+            configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
             authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"]),
             now: Date(timeIntervalSince1970: 1_750_000_000)
         )

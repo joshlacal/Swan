@@ -9,11 +9,10 @@ import SwanStorage
 /// The only failures a future resource HTTP adapter needs to render. They do
 /// not carry a token, DPoP proof, JTI, account identifier, or storage detail.
 ///
-/// A missing or structurally unusable proof receives a fresh nonce challenge.
-/// Once a proof has enough structure to attempt validation, every invalid,
-/// expired, replayed, token-binding, and account-lifecycle predicate becomes
-/// the same denial. This avoids turning the protected-resource boundary into
-/// a DPoP or account-status oracle.
+/// Missing, malformed, or expired nonces receive a fresh nonce challenge.
+/// Other proof, token-binding, and account-lifecycle failures remain opaque
+/// denials. Challenging a stale nonce does not authorize the request: the
+/// retry must still pass every proof, token, and account check.
 public enum SwanResourceAuthorizationFailure: Error, Sendable, Equatable {
     case nonceChallengeRequired
     case denied
@@ -142,6 +141,11 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
                 now: now
             )
         } catch {
+            // Cached nonces outlive their five-minute validity, including
+            // across fresh logins. A bare denial leaves the client stuck.
+            if !runtime.dpopNonceService.isValid(presentedNonce, now: now) {
+                throw SwanResourceAuthorizationFailure.nonceChallengeRequired
+            }
             throw Self.proofFailure(for: error)
         }
 

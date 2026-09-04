@@ -132,6 +132,8 @@ All mutation endpoints require authentication and enforce granular scope authori
 ### Legacy session and app password management
 
 Legacy session management implements password and app password authentication for clients that do not support OAuth 2.1.
+The read-only `getSession` and `getServiceAuth` routes also accept OAuth DPoP access tokens. These requests require a matching DPoP proof; a nonce challenge returns `401 use_dpop_nonce` with a `DPoP-Nonce` header.
+Missing, invalid, or expired resource nonces receive a fresh challenge. Clients retry with the returned nonce and a newly signed DPoP proof; successful token exchange or re-login does not renew a cached resource nonce.
 
 #### `com.atproto.server.createSession`
 - **Method**: `POST`
@@ -147,14 +149,14 @@ Legacy session management implements password and app password authentication fo
 
 #### `com.atproto.server.getSession`
 - **Method**: `GET`
-- **Authentication**: `Authorization: Bearer <accessJwt>`.
+- **Authentication**: OAuth DPoP access token and proof, or `Authorization: Bearer <accessJwt>`.
 - **Parameters**: None.
 - **Returns**: JSON object containing account status and metadata (`did`, `handle`, `email`, `emailConfirmed`, `active`).
 
 #### `com.atproto.server.getServiceAuth`
 - **Method**: `GET`
-- **Authentication**: `Authorization: Bearer <accessJwt>`.
-- **Parameters**: Query parameters `aud` (service DID, required), `exp` (integer timestamp, optional), `lxm` (lexicon method NSID, optional).
+- **Authentication**: OAuth DPoP access token and proof, or `Authorization: Bearer <accessJwt>`. The grant must permit the exact downstream `aud` and `lxm`.
+- **Parameters**: Query parameters `aud` (service DID or DID service reference, required), `exp` (bounded integer expiry timestamp, optional), `lxm` (lexicon method NSID, required).
 - **Returns**: JSON object `{ "token": "<signed-inter-service-jwt>" }`.
 
 #### `com.atproto.server.deleteSession`
@@ -289,57 +291,57 @@ When an inbound request under `/xrpc/**` matches no exact local route, Swan eval
 
 ## Permissioned spaces plane
 
-Swan implements the `permissioned-data-0016-2026-08-15` profile for access-controlled collaborative data spaces. All endpoints are mounted under `/xrpc/`.
+Swan implements the `permissioned-data-0016-2026-09-10` profile for access-controlled collaborative data spaces. All endpoints are mounted under `/xrpc/`. Space references are `at://` URIs, not bare DIDs. Policy and app-access values are tagged union objects with a lexicon `$type`, not strings.
 
 ### Space lifecycle and membership (`com.atproto.simplespace.*`)
 
 #### `com.atproto.simplespace.createSpace`
 - **Method**: `POST`
-- **Authentication**: Account Auth (OAuth DPoP or Session).
-- **Request Body**: JSON object `{ "name": "<name>", "policy": "<policy-type>", "appAccess": "<access-mode>" }`.
-- **Returns**: JSON object containing created space DID and descriptor metadata.
+- **Authentication**: Account OAuth DPoP.
+- **Request Body**: JSON object with required `type` (space-type NSID), `readPolicy`, `writePolicy`, and `appAccess`; optional `skey` (record key). The authenticated account is the authority; do not send a `did` field.
+- **Returns**: JSON object `{ "uri": "<space-ref>" }`.
 
 #### `com.atproto.simplespace.getSpace`
 - **Method**: `GET`
-- **Authentication**: Space Credential.
-- **Parameters**: Query parameter `space` (space DID string, required).
-- **Returns**: JSON object containing space declaration, member list, and policy attributes.
+- **Authentication**: OAuth or a space credential; the caller must be authorized for the space.
+- **Parameters**: Query parameter `space` (space reference, required).
+- **Returns**: JSON object with `uri`, `readPolicy`, `writePolicy`, and `appAccess`. Use `listMembers` for the member roster.
 
 #### `com.atproto.simplespace.updateSpace`
 - **Method**: `POST`
 - **Authentication**: Space Owner.
-- **Request Body**: JSON object `{ "space": "did:...", "name": "...", "policy": "...", "appAccess": "..." }`.
+- **Request Body**: JSON object `{ "space": "<space URI>", "readPolicy": <policy (optional)>, "writePolicy": <policy (optional)>, "appAccess": <access (optional)> }` — each policy updates independently; omitted policies are preserved.
 - **Returns**: 200 OK empty response.
 
 #### `com.atproto.simplespace.deleteSpace`
 - **Method**: `POST`
 - **Authentication**: Space Owner.
-- **Request Body**: JSON object `{ "space": "did:..." }`.
+- **Request Body**: JSON object `{ "space": "<space-ref>" }`.
 - **Returns**: 200 OK empty response.
 
-#### `com.atproto.simplespace.addMember`
+#### `com.atproto.simplespace.putMember`
 - **Method**: `POST`
 - **Authentication**: Space Owner.
-- **Request Body**: JSON object `{ "space": "did:...", "member": "did:...", "role": "admin" | "writer" | "reader" }`.
+- **Request Body**: JSON object `{ "space": "<space-ref>", "did": "<member DID>", "read": true|false, "write": true|false }` (all fields required; both flags replaced atomically).
 - **Returns**: 200 OK empty response.
 
 #### `com.atproto.simplespace.removeMember`
 - **Method**: `POST`
 - **Authentication**: Space Owner.
-- **Request Body**: JSON object `{ "space": "did:...", "member": "did:..." }`.
+- **Request Body**: JSON object `{ "space": "<space-ref>", "did": "<member DID>" }`.
 - **Returns**: 200 OK empty response.
 
 #### `com.atproto.simplespace.listMembers`
 - **Method**: `GET`
-- **Authentication**: Space Credential.
-- **Parameters**: Query parameters `space` (space DID string, required), `cursor` (optional), `limit` (integer, optional).
-- **Returns**: JSON object `{ "members": [ { "did": "...", "role": "..." } ], "cursor": "..." }`.
+- **Authentication**: Owner OAuth on the authority's PDS, with a covering read grant. A space credential is not sufficient.
+- **Parameters**: Query parameters `space` (space reference, required), `cursor` (optional), `limit` (integer, 1–1000; default 100).
+- **Returns**: JSON object `{ "members": [ { "did": "...", "read": true, "write": false } ], "cursor": "..." }`.
 
 #### `com.atproto.simplespace.checkUserAccess`
 - **Method**: `GET`
 - **Authentication**: Service JWT.
-- **Parameters**: Query parameters `space` (space DID, required), `user` (user DID, required).
-- **Returns**: JSON object `{ "hasAccess": true, "role": "writer" }`.
+- **Parameters**: Query parameters `space` (space reference, required), `user` (user DID, required), `access` (`read` or `write`, required), `clientId` (optional; must be omitted for `access=write`).
+- **Returns**: JSON object `{ "authorized": true|false }`.
 
 ---
 

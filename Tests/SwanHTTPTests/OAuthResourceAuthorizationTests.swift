@@ -184,7 +184,7 @@ final class OAuthResourceAuthorizationTests: XCTestCase {
         try await fixture.control.close()
     }
 
-    func testNonceReplayAndWrongJKTAllFailWithoutDetail() async throws {
+    func testStaleNonceChallengesWhileReplayAndWrongJKTStayDenied() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
@@ -200,7 +200,7 @@ final class OAuthResourceAuthorizationTests: XCTestCase {
             now: now
         )
         try await assertFailure(
-            .denied,
+            .nonceChallengeRequired,
             fixture: fixture,
             request: makeRequest(headers: authorizationHeaders(accessToken: fixture.accessToken, proof: staleNonceProof)),
             now: now

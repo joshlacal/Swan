@@ -508,9 +508,11 @@ public protocol AuthorizedSimpleSpaceLifecycleDirectory: Sendable {
         authorization: AuthorizationContext
     ) async throws
 
-    func addSimpleSpaceMember(
+    func putSimpleSpaceMember(
         _ member: String,
-        to space: SpaceURI,
+        read: Bool,
+        write: Bool,
+        in space: SpaceURI,
         authorization: AuthorizationContext
     ) async throws
 
@@ -551,11 +553,28 @@ public protocol AuthorizedSimpleSpaceCredentialDirectory: Sendable {
 /// authority account and lifecycle-scope checks.  Member identities are
 /// intentionally unavailable from the generic `getSpace` projection.
 public struct AuthorizedSimpleSpaceMemberPage: Sendable, Equatable {
-    public let members: [String]
+    public struct Member: Sendable, Equatable {
+        public let did: String
+        public let read: Bool
+        public let write: Bool
+
+        public init(did: String, read: Bool, write: Bool) {
+            self.did = did
+            self.read = read
+            self.write = write
+        }
+    }
+
+    public let members: [Member]
     public let cursor: String?
 
-    public init(members: [String], cursor: String?) {
+    public init(members: [Member], cursor: String?) {
         self.members = members
+        self.cursor = cursor
+    }
+
+    public init(dids: [String], cursor: String?) {
+        self.members = dids.map { Member(did: $0, read: true, write: true) }
         self.cursor = cursor
     }
 }

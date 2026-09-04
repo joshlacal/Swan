@@ -26,7 +26,7 @@ public struct XRPCMethodDescriptor: Sendable, Codable, Equatable {
 }
 
 public enum PermissionedData0016 {
-    public static let profileID = "permissioned-data-0016-2026-08-15"
+    public static let profileID = "permissioned-data-0016-2026-09-10"
 
     /// Mechanically transcribed bootstrap registry from the profile's verified
     /// lexicon manifest. Petrel's opt-in server-contract generation replaces
@@ -51,7 +51,7 @@ public enum PermissionedData0016 {
         .init(nsid: "com.atproto.space.putRecord", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["SpaceNotFound"]),
         .init(nsid: "com.atproto.space.registerNotify", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "ServiceNotResolvable"]),
         .init(nsid: "com.atproto.space.unregisterNotify", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound"]),
-        .init(nsid: "com.atproto.simplespace.addMember", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "NotSpaceOwner"]),
+        .init(nsid: "com.atproto.simplespace.putMember", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "NotSpaceOwner"]),
         .init(nsid: "com.atproto.simplespace.checkUserAccess", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: []),
         .init(nsid: "com.atproto.simplespace.createSpace", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["SpaceAlreadyExists", "UnsupportedPolicy", "UnsupportedAppAccess"]),
         .init(nsid: "com.atproto.simplespace.deleteSpace", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "NotSpaceOwner"]),

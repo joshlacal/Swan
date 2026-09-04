@@ -230,6 +230,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
     private var databaseFileDescriptor: Int32
     private let descriptorBackedRestore: Bool
     private var activeWriteTransactions = 0
+    private var commitBarrier: SQLiteLayout.CommitBarrier?
     var beforeRotationCommitForTesting: (@Sendable () async throws -> Void)?
     private var oauthControlStorageLimits = OAuthControlStorageLimits.production
 
@@ -1723,12 +1724,21 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
             let result = try await body()
             _ = try await connection.query("COMMIT")
             activeWriteTransactions -= 1
+            if let commitBarrier { try await commitBarrier() }
             return result
         } catch {
             _ = try? await connection.query("ROLLBACK")
             activeWriteTransactions -= 1
             throw error
         }
+    }
+
+    /// See `SQLiteAccountDatabase.installCommitBarrier(_:)`.
+    public func installCommitBarrier(_ barrier: SQLiteLayout.CommitBarrier?) async throws {
+        commitBarrier = barrier
+        _ = try await connection.query(
+            barrier == nil ? "PRAGMA wal_autocheckpoint=1000" : "PRAGMA wal_autocheckpoint=0"
+        )
     }
 
     func hasActiveWriteTransactionForTesting() -> Bool {

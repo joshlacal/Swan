@@ -3,7 +3,9 @@ import PackageDescription
 
 let package = Package(
     name: "Swan",
-    platforms: [.macOS(.v15)],
+    // tvOS 18 is the floor Petrel declares; it exists only for the SwanTV
+    // experiment (docs/apple-tv-pds) and changes nothing for macOS/Linux.
+    platforms: [.macOS(.v15), .tvOS(.v18)],
     products: [
         .library(name: "SwanCore", targets: ["SwanCore"]),
         .library(name: "SwanSpacesWire", targets: ["SwanSpacesWire"]),
@@ -11,6 +13,7 @@ let package = Package(
         .library(name: "SwanSpaces", targets: ["SwanSpaces"]),
         .library(name: "SwanStorage", targets: ["SwanStorage"]),
         .library(name: "SwanSQLite", targets: ["SwanSQLite"]),
+        .library(name: "SwanDurableStore", targets: ["SwanDurableStore"]),
         .library(name: "SwanAccounts", targets: ["SwanAccounts"]),
         .library(name: "SwanAccountExport", targets: ["SwanAccountExport"]),
         .library(name: "SwanOAuth", targets: ["SwanOAuth"]),
@@ -24,13 +27,12 @@ let package = Package(
         // against whatever line the neighbouring working copy happens to be
         // sitting on, which is invisible in this manifest and unreproducible
         // anywhere else: Swan silently built against three different Petrel
-        // lines depending on who had checked out what. The pin below is the
-        // commit that makes `CIDAsLink` public, which every record carrying a
-        // blob or a StrongRef needs. Bump it deliberately, in a commit that
-        // says why.
+        // lines depending on who had checked out what. This revision adds the
+        // September 10 Spaces alpha on Swan's existing request-body-digest
+        // security baseline, without dropping its service-JWT protections.
         .package(
             url: "https://github.com/joshlacal/Petrel.git",
-            revision: "5c42f60325d10b8a75a4671e3a94df0c8134d648"
+            revision: "35155c926fb7e49e139883feb29308d61aff8db5"
         ),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),
@@ -119,6 +121,13 @@ let package = Package(
                 .product(name: "PetrelPLC", package: "Petrel"),
                 .product(name: "PetrelCrypto", package: "Petrel"),
                 .product(name: "Petrel", package: "Petrel"),
+                .product(name: "SQLiteNIO", package: "sqlite-nio"),
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
+        .target(
+            name: "SwanDurableStore",
+            dependencies: [
                 .product(name: "SQLiteNIO", package: "sqlite-nio"),
                 .product(name: "Crypto", package: "swift-crypto"),
             ]
@@ -215,6 +224,13 @@ let package = Package(
             ]
         ),
         .testTarget(name: "SwanCoreTests", dependencies: ["SwanCore", "SwanSpacesWire"]),
+        .testTarget(
+            name: "SwanDurableStoreTests",
+            dependencies: [
+                "SwanDurableStore", "SwanSQLite", "SwanStorage",
+                .product(name: "SQLiteNIO", package: "sqlite-nio"),
+            ]
+        ),
         .testTarget(
             name: "SwanSpacesTests",
             dependencies: [

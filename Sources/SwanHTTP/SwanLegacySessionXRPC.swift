@@ -183,7 +183,8 @@ public struct SwanLegacySessionXRPCServer: Sendable {
     /// NOT weakened — every other `com.atproto.server.*` method still 404s.
     func register(
         on router: Router<SwanHTTPRequestContext>,
-        requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+        requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
+        resourceAuthorizer: SwanOAuthResourceAuthorizer?
     ) {
         let handlers = Handlers(
             sessions: sessions,
@@ -193,6 +194,7 @@ public struct SwanLegacySessionXRPCServer: Sendable {
             directory: directory,
             loginClientIdentityPolicy: loginClientIdentityPolicy,
             serviceAuthIssuer: serviceAuthIssuer,
+            resourceAuthorizer: resourceAuthorizer,
             requestBodyAdmission: requestBodyAdmission,
             minimumFailedLoginDuration: minimumFailedLoginDuration
         )
@@ -242,6 +244,7 @@ private struct Handlers: Sendable {
     let directory: any SwanLegacySessionDirectory
     let loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
     let serviceAuthIssuer: (any SwanProxyServiceTokenIssuing)?
+    let resourceAuthorizer: SwanOAuthResourceAuthorizer?
     let requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
     let minimumFailedLoginDuration: Duration
 
@@ -514,14 +517,14 @@ private struct Handlers: Sendable {
 
     func getSession(_ request: Request, context: SwanHTTPRequestContext) async -> Response {
         do {
-            let presented = try bearerToken(request)
-            let authorization: AuthorizationContext
-            do {
-                authorization = try await sessions.authorize(accessJWT: presented)
-            } catch {
-                throw SwanLegacySessionXRPCFailure.expiredToken
-            }
-            guard case let .accountLegacySession(did, _) = authorization else {
+            let authorization = try await authorizeAccount(
+                request, fixedPath: "/xrpc/\(ComAtprotoServerGetSession.typeIdentifier)"
+            )
+            let did: String
+            switch authorization {
+            case let .accountOAuth(subject, _), let .accountLegacySession(subject, _):
+                did = subject
+            default:
                 throw SwanLegacySessionXRPCFailure.expiredToken
             }
             let handle = try await directory.canonicalHandle(did: did)
@@ -563,17 +566,14 @@ private struct Handlers: Sendable {
 
     // MARK: getServiceAuth
 
-    /// Mints the canonical ES256 service token only after the durable legacy
-    /// access token has been authorized and the typed scope evaluator admits
-    /// the exact `(lxm, aud)` target. This endpoint never enters the obsolete
-    /// HMAC ``LegacyAuthService`` path.
+    /// Mints an account-key service token only after OAuth or legacy
+    /// authorization admits the exact downstream `(lxm, aud)` target.
     func getServiceAuth(_ request: Request, context: SwanHTTPRequestContext) async -> Response {
         do {
             let now = Date()
             guard let issuer = serviceAuthIssuer else {
                 throw SwanLegacySessionXRPCFailure.unavailable
             }
-            let presented = try bearerToken(request)
             let parameters = try serviceAuthParameters(from: request.uri.query)
             if let requestedExpiry = parameters.exp {
                 let nowEpoch = Int64(now.timeIntervalSince1970.rounded(.towardZero))
@@ -582,13 +582,17 @@ private struct Handlers: Sendable {
                     throw SwanLegacySessionXRPCFailure.invalidRequest
                 }
             }
-            let authorization: AuthorizationContext
-            do {
-                authorization = try await sessions.authorize(accessJWT: presented, now: now)
-            } catch {
-                throw SwanLegacySessionXRPCFailure.expiredToken
-            }
-            guard case let .accountLegacySession(did, permissions) = authorization else {
+            let authorization = try await authorizeAccount(
+                request, fixedPath: "/xrpc/\(ComAtprotoServerGetServiceAuth.typeIdentifier)", now: now
+            )
+            let did: String
+            let permissions: SwanScopePermissions
+            switch authorization {
+            case let .accountOAuth(subject, scopePermissions),
+                 let .accountLegacySession(subject, scopePermissions):
+                did = subject
+                permissions = scopePermissions
+            default:
                 throw SwanLegacySessionXRPCFailure.expiredToken
             }
             do {
@@ -620,6 +624,25 @@ private struct Handlers: Sendable {
 
 
     // MARK: shared
+
+    private func authorizeAccount(
+        _ request: Request, fixedPath: String, now: Date = Date()
+    ) async throws -> AuthorizationContext {
+        if request.headers[.authorization]?.hasPrefix("DPoP ") == true {
+            guard let resourceAuthorizer else {
+                throw SwanResourceAuthorizationFailure.unavailable
+            }
+            return try await resourceAuthorizer.authorize(
+                request: request, method: "GET", fixedPath: fixedPath, now: now
+            )
+        }
+        let presented = try bearerToken(request)
+        do {
+            return try await sessions.authorize(accessJWT: presented, now: now)
+        } catch {
+            throw SwanLegacySessionXRPCFailure.expiredToken
+        }
+    }
 
     private func bearerToken(_ request: Request) throws -> String {
         guard let header = request.headers[.authorization],
@@ -694,6 +717,19 @@ private struct Handlers: Sendable {
     }
 
     private func response(for error: any Error) -> Response {
+        if let failure = error as? SwanResourceAuthorizationFailure {
+            switch failure {
+            case .nonceChallengeRequired:
+                guard let resourceAuthorizer else {
+                    return errorResponse(.serviceUnavailable, "temporarily_unavailable")
+                }
+                return authenticatedGetSpaceNonceChallenge(authorizer: resourceAuthorizer)
+            case .denied:
+                return errorResponse(.unauthorized, "AuthenticationRequired")
+            case .unavailable:
+                return errorResponse(.serviceUnavailable, "temporarily_unavailable")
+            }
+        }
         // A staged rejection uses its configured failure on the wire.
         // For noCredentialMatched / identifierUnresolved, failure is
         // AuthenticationRequired. For authFactorTokenRequired, failure is

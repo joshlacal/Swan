@@ -164,18 +164,26 @@ private struct AuthenticatedGetSpaceHandler: ComAtprotoSimplespaceGetSpace.Serve
     private func output(
         for description: AuthenticatedSimpleSpaceDescription
     ) throws -> ComAtprotoSimplespaceGetSpace.Output {
-        let policy: ComAtprotoSimplespaceGetSpace.OutputPolicyUnion
-        switch description.configuration.policy {
+        let readPolicy: ComAtprotoSimplespaceGetSpace.OutputReadPolicyUnion
+        switch description.configuration.readPolicy {
         case .public:
-            policy = .comAtprotoSimplespaceDefsPublicPolicy(.init())
+            readPolicy = .comAtprotoSimplespaceDefsPublicPolicy(.init())
         case .memberList:
-            policy = .comAtprotoSimplespaceDefsMemberListPolicy(.init())
+            readPolicy = .comAtprotoSimplespaceDefsMemberListPolicy(.init())
         case .managingApp:
-            // The managing app is carried inside its policy variant, exactly
-            // where the lexicon puts it. A stored managing app under a policy
-            // that does not consult one is deliberately not emitted.
-            policy = .comAtprotoSimplespaceDefsManagingAppPolicy(
-                .init(managingApp: description.configuration.managingApp ?? "")
+            readPolicy = .comAtprotoSimplespaceDefsManagingAppPolicy(
+                .init(managingApp: description.configuration.readManagingApp ?? "")
+            )
+        }
+        let writePolicy: ComAtprotoSimplespaceGetSpace.OutputWritePolicyUnion
+        switch description.configuration.writePolicy {
+        case .public:
+            writePolicy = .comAtprotoSimplespaceDefsPublicPolicy(.init())
+        case .memberList:
+            writePolicy = .comAtprotoSimplespaceDefsMemberListPolicy(.init())
+        case .managingApp:
+            writePolicy = .comAtprotoSimplespaceDefsManagingAppPolicy(
+                .init(managingApp: description.configuration.writeManagingApp ?? "")
             )
         }
         let appAccess: ComAtprotoSimplespaceGetSpace.OutputAppAccessUnion
@@ -183,13 +191,12 @@ private struct AuthenticatedGetSpaceHandler: ComAtprotoSimplespaceGetSpace.Serve
         case .open:
             appAccess = .comAtprotoSimplespaceDefsOpen(.init())
         case let .allowList(allowed):
-            // Client IDs are an intentional part of the wire description.
-            // They become visible only after the authorization above.
             appAccess = .comAtprotoSimplespaceDefsAllowList(.init(allowed: allowed.sorted()))
         }
         return ComAtprotoSimplespaceGetSpace.Output(
             uri: try SpaceRef(uriString: description.space.rawValue),
-            policy: policy,
+            readPolicy: readPolicy,
+            writePolicy: writePolicy,
             appAccess: appAccess
         )
     }

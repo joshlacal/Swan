@@ -1639,13 +1639,13 @@ private struct Fixture: Sendable {
             _ = try await authority.create(
                 space: publicSpace,
                 owner: SpaceCredentialHTTPTests.authority,
-                configuration: try .init(policy: .public, appAccess: .open),
+                configuration: try .init(readPolicy: .public, writePolicy: .public, appAccess: .open),
                 authorization: controlAuthorization
             )
             _ = try await authority.create(
                 space: memberSpace,
                 owner: SpaceCredentialHTTPTests.authority,
-                configuration: try .init(policy: .memberList, appAccess: .open),
+                configuration: try .init(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
                 authorization: controlAuthorization
             )
             _ = try await authority.addMember(
@@ -1657,7 +1657,8 @@ private struct Fixture: Sendable {
                 space: allowListSpace,
                 owner: SpaceCredentialHTTPTests.authority,
                 configuration: try .init(
-                    policy: .public,
+                    readPolicy: .public,
+                    writePolicy: .public,
                     appAccess: .allowList(["https://reader.example/client-metadata.json"])
                 ),
                 authorization: controlAuthorization
@@ -1666,9 +1667,11 @@ private struct Fixture: Sendable {
                 space: managingSpace,
                 owner: SpaceCredentialHTTPTests.authority,
                 configuration: try .init(
-                    policy: .managingApp,
-                    appAccess: .open,
-                    managingApp: "did:web:managing.example#space"
+                    readPolicy: .managingApp,
+                    readManagingApp: "did:web:managing.example#space",
+                    writePolicy: .managingApp,
+                    writeManagingApp: "did:web:managing.example#space",
+                    appAccess: .open
                 ),
                 authorization: controlAuthorization
             )

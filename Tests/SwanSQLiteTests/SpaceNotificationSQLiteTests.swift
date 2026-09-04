@@ -1304,7 +1304,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             _ = try await authority.create(
                 space: fixture.space,
                 owner: fixture.authority,
-                configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+                configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
                 authorization: .accountOAuthForTesting(subject: fixture.authority, scopes: ["atproto"])
             )
             _ = try await authority.addMember(
@@ -1752,7 +1752,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         _ = try await authority.create(
             space: fixture.space,
             owner: fixture.authority,
-            configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+            configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
             authorization: authContext
         )
         _ = try await authority.addMember(
@@ -1813,7 +1813,7 @@ private struct NotificationFixture {
         _ = try await authority.create(
             space: space,
             owner: self.authority,
-            configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+            configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
             authorization: .accountOAuthForTesting(subject: self.authority, scopes: ["atproto"])
         )
         _ = try await authority.addMember(
@@ -1828,7 +1828,7 @@ private struct NotificationFixture {
         _ = try await authority.create(
             space: secondarySpace,
             owner: self.authority,
-            configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+            configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
             authorization: .accountOAuthForTesting(subject: self.authority, scopes: ["atproto"])
         )
         _ = try await authority.addMember(

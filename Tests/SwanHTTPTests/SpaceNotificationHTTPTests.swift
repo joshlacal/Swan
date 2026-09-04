@@ -675,7 +675,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         _ = try await lifecycle.create(
             space: space,
             owner: authorityDID,
-            configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+            configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
             authorization: .accountOAuthForTesting(subject: authorityDID, scopes: ["atproto"])
         )
         let credential = AuthorizationContext.spaceCredential(.init(
@@ -1069,7 +1069,7 @@ private struct NotificationHTTPFixture {
             try .init(authority: authority, generation: 1, publicKey: key.publicKey),
         ])
         return SwanHTTPServer(
-            profile: try ProtocolProfile.load(from: notificationPackageRoot().appending(path: "Profiles/permissioned-data-0016-2026-08-15.json")),
+            profile: try ProtocolProfile.load(from: notificationPackageRoot().appending(path: "Profiles/permissioned-data-0016-2026-09-10.json")),
             configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: URL(string: "https://swan.example")!),
             oauthRuntime: runtime,
             authenticatedGetSpaceDirectory: directory,
@@ -1196,7 +1196,7 @@ private struct NotificationRecoveryFixture {
         _ = try await lifecycle.create(
             space: space,
             owner: authority,
-            configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+            configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
             authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"])
         )
         _ = try await lifecycle.addMember(
@@ -1337,7 +1337,7 @@ private struct PreopenedRecoveryFixture {
             _ = try await lifecycle.create(
                 space: space,
                 owner: authority,
-                configuration: try .init(policy: .public, appAccess: .open),
+                configuration: try .init(readPolicy: .public, writePolicy: .public, appAccess: .open),
                 authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"])
             )
             _ = try await database.appendOplogAndOutbox(
@@ -1409,7 +1409,7 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
 
     func space(_ space: SpaceURI, authorization _: AuthorizationContext) async throws -> AuthenticatedSimpleSpaceDescription? {
         guard space.authority == authority else { return nil }
-        return .init(space: space, configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open))
+        return .init(space: space, configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open))
     }
 
     func close() async throws {}

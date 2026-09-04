@@ -872,7 +872,8 @@ private extension AccountAuthorizationLeaseTests {
             space: space,
             owner: did,
             configuration: try SimpleSpaceConfiguration(
-                policy: .memberList,
+                readPolicy: .memberList,
+                writePolicy: .memberList,
                 appAccess: .open
             ),
             authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"]),

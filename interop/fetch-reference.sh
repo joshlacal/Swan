@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Two pinned reference archives coexist deliberately:
-#  - bddc99fb… is the wire/profile pin (permissioned-data-0016-2026-08-15):
+# Three pinned reference archives coexist deliberately:
+#  - 9d787ebf… is the wire/profile pin (permissioned-data-0016-2026-09-10):
 #    lexicons, generated wire sources, and contract tests read this tree.
+#  - bddc99fb… is the historical August profile pin (permissioned-data-0016-2026-08-15).
 #  - 3f6c96d5… is the interop-lab pin: the dockerized reference PDS and its
 #    overlay patches still build from this tree until the lab is re-pinned.
 # Fetching is idempotent per pin; an already-materialized tree is left alone.
 readonly PINS=(
+  "9d787ebff231ff8f4e01c63717e9f5bcd6e1bc33 1ab99c2be340640f14b74c8c4d051f0a8963df061b939874db62d76205f434a6"
   "bddc99fb24c34b4078b9bf65837283f37b49ab66 84b9a245be65758c577020dbe68a78039ce2d8acb5ead052043ed30c314f4d7e"
   "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354 1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea"
 )

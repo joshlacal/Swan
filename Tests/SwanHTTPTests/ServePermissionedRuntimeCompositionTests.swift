@@ -90,7 +90,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-08-15.json"
+                        path: "Profiles/permissioned-data-0016-2026-09-10.json"
                     )
                 ),
                 configuration: .init(
@@ -168,7 +168,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(
-                    path: "Profiles/permissioned-data-0016-2026-08-15.json"
+                    path: "Profiles/permissioned-data-0016-2026-09-10.json"
                 )
             )
             let server = composition.makeServer(
@@ -190,9 +190,9 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let encodedLifecycle = percentEncode(lifecycle.rawValue)
             let recordPrefix = "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"collection\":\"app.bsky.feed.post\""
             let cases: [SemanticCase] = [
-                .init(nsid: "com.atproto.simplespace.createSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.createSpace", body: "{\"did\":\"\(localDID)\",\"type\":\"app.bsky.bookmarks\",\"skey\":\"\(lifecycle.skey)\"}", authorization: .oauth, invariant: .jsonString("uri", lifecycle.rawValue)),
-                .init(nsid: "com.atproto.simplespace.updateSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.updateSpace", body: "{\"space\":\"\(lifecycle.rawValue)\",\"policy\":\"public\"}", authorization: .oauth, invariant: .emptyBody),
-                .init(nsid: "com.atproto.simplespace.addMember", method: .post, uri: "/xrpc/com.atproto.simplespace.addMember", body: "{\"space\":\"\(lifecycle.rawValue)\",\"did\":\"\(remoteDID)\"}", authorization: .oauth, invariant: .emptyBody),
+                .init(nsid: "com.atproto.simplespace.createSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.createSpace", body: "{\"did\":\"\(localDID)\",\"type\":\"app.bsky.bookmarks\",\"skey\":\"\(lifecycle.skey)\",\"readPolicy\":{\"$type\":\"com.atproto.simplespace.defs#publicPolicy\"},\"writePolicy\":{\"$type\":\"com.atproto.simplespace.defs#publicPolicy\"},\"appAccess\":{\"$type\":\"com.atproto.simplespace.defs#open\"}}", authorization: .oauth, invariant: .jsonString("uri", lifecycle.rawValue)),
+                .init(nsid: "com.atproto.simplespace.updateSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.updateSpace", body: "{\"space\":\"\(lifecycle.rawValue)\",\"readPolicy\":{\"$type\":\"com.atproto.simplespace.defs#publicPolicy\"}}", authorization: .oauth, invariant: .emptyBody),
+                .init(nsid: "com.atproto.simplespace.putMember", method: .post, uri: "/xrpc/com.atproto.simplespace.putMember", body: "{\"space\":\"\(lifecycle.rawValue)\",\"did\":\"\(remoteDID)\",\"read\":true,\"write\":true}", authorization: .oauth, invariant: .emptyBody),
                 .init(nsid: "com.atproto.simplespace.listMembers", method: .get, uri: "/xrpc/com.atproto.simplespace.listMembers?space=\(encodedLifecycle)", body: nil, authorization: .oauth, invariant: .jsonArrayContains("members", field: "did", value: remoteDID)),
                 .init(nsid: "com.atproto.simplespace.getSpace", method: .get, uri: "/xrpc/com.atproto.simplespace.getSpace?space=\(encodedSpace)", body: nil, authorization: .oauth, invariant: .jsonString("uri", space.rawValue)),
                 .init(nsid: "com.atproto.space.listSpaces", method: .get, uri: "/xrpc/com.atproto.space.listSpaces", body: nil, authorization: .oauth, invariant: .jsonArrayContains("spaces", field: "uri", value: lifecycle.rawValue)),
@@ -212,7 +212,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.space.unregisterNotify", method: .post, uri: "/xrpc/com.atproto.space.unregisterNotify", body: "{\"space\":\"\(space.rawValue)\",\"service\":\"\(remoteDID)#notify\"}", authorization: .unregisterNotify, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.notifyWrite", method: .post, uri: "/xrpc/com.atproto.space.notifyWrite", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"rev\":\"222222222222z\",\"hash\":{\"$bytes\":\"\(Data(repeating: 0x31, count: 32).base64EncodedString())\"}}", authorization: .notifyWrite, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.listRepos", method: .get, uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)", body: nil, authorization: .credential, invariant: .jsonArrayContains("repos", field: "did", value: localDID)),
-                .init(nsid: "com.atproto.simplespace.checkUserAccess", method: .get, uri: "/xrpc/com.atproto.simplespace.checkUserAccess?space=\(encodedSpace)&user=\(remoteDID)", body: nil, authorization: .checkUserAccess, invariant: .jsonBoolean("authorized", false)),
+                .init(nsid: "com.atproto.simplespace.checkUserAccess", method: .get, uri: "/xrpc/com.atproto.simplespace.checkUserAccess?space=\(encodedSpace)&user=\(remoteDID)&access=read", body: nil, authorization: .checkUserAccess, invariant: .jsonBoolean("authorized", false)),
                 .init(nsid: "com.atproto.space.deleteRecord", method: .post, uri: "/xrpc/com.atproto.space.deleteRecord", body: recordPrefix + ",\"rkey\":\"delete-me\"}", authorization: .oauth, invariant: .jsonEmptyObject),
                 .init(nsid: "com.atproto.simplespace.removeMember", method: .post, uri: "/xrpc/com.atproto.simplespace.removeMember", body: "{\"space\":\"\(lifecycle.rawValue)\",\"did\":\"\(remoteDID)\"}", authorization: .oauth, invariant: .emptyBody),
                 .init(nsid: "com.atproto.simplespace.deleteSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.deleteSpace", body: "{\"space\":\"\(lifecycle.rawValue)\"}", authorization: .oauth, invariant: .emptyBody),
@@ -509,16 +509,20 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 )
                 let lifecycleRows = try await evidenceConnection.query(
                     """
-                    SELECT policy, revision, is_deleted
+                    SELECT read_policy, write_policy, revision, is_deleted
                     FROM permissioned_simple_space_authorities
                     WHERE space_uri = ?
                     """,
                     [.text(lifecycle.rawValue)]
                 )
                 XCTAssertEqual(
-                    lifecycleRows.first?.column("policy")?.string,
+                    lifecycleRows.first?.column("read_policy")?.string,
                     "public",
                     "updateSpace did not durably replace the default member-list policy"
+                )
+                XCTAssertEqual(
+                    lifecycleRows.first?.column("write_policy")?.string,
+                    "public"
                 )
                 XCTAssertGreaterThan(
                     lifecycleRows.first?.column("revision")?.integer ?? 0,
@@ -757,7 +761,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-08-15.json"
+                        path: "Profiles/permissioned-data-0016-2026-09-10.json"
                     )
                 ),
                 configuration: .init(
@@ -1573,7 +1577,7 @@ private struct Fixture {
                 _ = try await database.createSimpleSpace(
                     space: space,
                     owner: localDID,
-                    configuration: .init(policy: .public, appAccess: .open),
+                    configuration: try .init(readPolicy: .public, writePolicy: .public, appAccess: .open),
                     authorization: authorization
                 )
                 let repository = try DurableSpaceRepository(

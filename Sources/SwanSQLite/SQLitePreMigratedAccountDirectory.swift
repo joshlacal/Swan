@@ -570,21 +570,39 @@ public actor SQLitePreMigratedAccountDirectory:
         try await requireLifecycleAuthorityStillAvailable(space.authority)
     }
 
-    public func addSimpleSpaceMember(
+    public func putSimpleSpaceMember(
         _ member: String,
-        to space: SpaceURI,
+        read: Bool,
+        write: Bool,
+        in space: SpaceURI,
         authorization: AuthorizationContext
     ) async throws {
         let authority = try await lifecycleAuthority(
             for: space,
             authorization: authorization
         )
-        _ = try await authority.addMember(
+        _ = try await authority.putMember(
             space: space,
             member: member,
+            read: read,
+            write: write,
             authorization: authorization
         )
         try await requireLifecycleAuthorityStillAvailable(space.authority)
+    }
+
+    public func addSimpleSpaceMember(
+        _ member: String,
+        to space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws {
+        try await putSimpleSpaceMember(
+            member,
+            read: true,
+            write: true,
+            in: space,
+            authorization: authorization
+        )
     }
 
     public func removeSimpleSpaceMember(

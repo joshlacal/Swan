@@ -2,14 +2,17 @@
 
 Swan is a Swift-native AT Protocol server and permissioned-data interoperability engine. It provides an AT Protocol Personal Data Server (PDS) implementation, an OAuth 2.1 authorization server with DPoP, multi-factor authentication (TOTP and WebAuthn passkeys), a SvelteKit account portal, multi-plane SQLite storage, an XRPC proxy, and protocol testing harnesses.
 
-The active protocol profile is `permissioned-data-0016-2026-08-15`. Its upstream pins and security definitions live in `Profiles/`.
+The active protocol profile is `permissioned-data-0016-2026-09-10`. Its upstream pins and security definitions live in `Profiles/`.
 
 ## Scope and trust boundaries
 
 Swan is developed for protocol interoperability testing and self-hosted environments; it does not claim to be a general-purpose public production PDS on the open federation today.
 
-Permissioned data in Swan is access-controlled rather than end-to-end encrypted. A hosting PDS remains inside the trust boundary and is responsible for enforcing read and write capabilities across spaces and repositories.
+**September 10 alpha migration:** The current profile uses independent read/write policies, `putMember` flags, and access-specific `checkUserAccess` requests. SQLite v23 copies each legacy policy and managing-app choice to both axes and preserves existing members' read/write access. It does not reset account or session data.
 
+This is a breaking wire cutover: update clients that send `policy` or call `addMember` before switching their PDS to this profile. Historical profile tags marked `destructiveBeforeAlpha` describe earlier protocol iteration boundaries, not a requirement to reset current databases. Production qualification for federated multi-tenant deployments remains deferred until the upstream specification stabilizes.
+
+Permissioned data in Swan is access-controlled rather than end-to-end encrypted. A hosting PDS remains inside the trust boundary and is responsible for enforcing read and write capabilities across spaces and repositories.
 ## Architecture
 
 Swan is organized around the following subsystems:
