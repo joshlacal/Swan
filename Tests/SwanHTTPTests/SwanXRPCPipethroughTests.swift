@@ -1603,7 +1603,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
             let attempts = PipethroughCallRecorder()
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(
-                    path: "Profiles/permissioned-data-0016-2026-09-10.json"
+                    path: "Profiles/permissioned-data-0016-2026-09-19.json"
                 )
             )
             let server = SwanHTTPServer(
@@ -1700,7 +1700,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
             let sender = RecordingProxySender()
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(
-                    path: "Profiles/permissioned-data-0016-2026-09-10.json"
+                    path: "Profiles/permissioned-data-0016-2026-09-19.json"
                 )
             )
             let server = SwanHTTPServer(

@@ -96,6 +96,27 @@ public struct LexiconSpace: Sendable, Equatable, Decodable {
         self.collections = collections
         self.description = description
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case type, name, collections, description
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let collections = try container.decode([String].self, forKey: .collections)
+        guard collections.allSatisfy(AtprotoSyntax.isValidNSID) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .collections, in: container,
+                debugDescription: "space collections must be concrete NSIDs"
+            )
+        }
+        self.init(
+            type: try container.decode(String.self, forKey: .type),
+            name: try container.decode(String.self, forKey: .name),
+            collections: collections,
+            description: try container.decodeIfPresent(String.self, forKey: .description)
+        )
+    }
 }
 
 // MARK: - SwanLexiconDocument

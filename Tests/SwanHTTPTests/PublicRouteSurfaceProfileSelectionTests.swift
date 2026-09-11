@@ -287,6 +287,7 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
             "permissioned-data-0016-2026-07-30",
             "permissioned-data-0016-2026-08-15",
             "permissioned-data-0016-2026-09-10",
+            "permissioned-data-0016-2026-09-19",
         ] {
             XCTAssertNil(SwanPublicRouteSurface(profileID: name), name)
             let url = Self.packageRoot().appending(path: "Profiles/\(name).json")
@@ -717,7 +718,7 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
             )
             let profile = try ProtocolProfile.load(
                 from: Self.packageRoot()
-                    .appending(path: "Profiles/permissioned-data-0016-2026-09-10.json")
+                    .appending(path: "Profiles/permissioned-data-0016-2026-09-19.json")
             )
             let configuration = surface.map {
                 SwanHTTPConfiguration(
@@ -788,7 +789,7 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
                 )
                 let profile = try ProtocolProfile.load(
                     from: Self.packageRoot()
-                        .appending(path: "Profiles/permissioned-data-0016-2026-09-10.json")
+                        .appending(path: "Profiles/permissioned-data-0016-2026-09-19.json")
                 )
                 let directory = SurfaceGateReadDirectory()
                 let server = SwanHTTPServer(

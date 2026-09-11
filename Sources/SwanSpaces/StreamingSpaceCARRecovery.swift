@@ -25,16 +25,21 @@ public struct SpaceCARRecoveryIndexEntry: Sendable, Equatable {
 /// paths/CIDs is retained in process memory.
 public protocol SpaceCARRecoveryIndex: Sendable {
     func insert(_ entry: SpaceCARRecoveryIndexEntry) async throws
-    func nextUnconsumedLexicographicEntry() async throws -> SpaceCARRecoveryIndexEntry?
-    /// Marks every indexed path that references `cid` as satisfied by the one
-    /// corresponding CAR block. The return value is the number of paths
-    /// consumed, not the number of block frames.
-    func consumeEntries(forCID cid: CID) async throws -> Int
+    /// Returns the first unconsumed path in canonical DAG-CBOR map order:
+    /// shortest UTF-8 path first, then bytewise order for equal lengths.
+    func nextUnconsumedCanonicalEntry() async throws -> SpaceCARRecoveryIndexEntry?
+    /// Whether an earlier, already verified frame satisfied a path with this
+    /// CID. Repeated frames are still verified but need not be staged again.
+    func hasConsumedCID(_ cid: CID) async throws -> Bool
+    /// Marks exactly the next canonical path as satisfied by its frame.
+    func consumeEntry(_ entry: SpaceCARRecoveryIndexEntry) async throws
 }
 
 /// A durable recovery consumer. The verifier tees at most 64 KiB at a time
 /// into this sink while validating the same bytes. `completeRecord` is called
 /// only after canonical validation, CID verification, and DRISL consumption.
+/// Each distinct CID is staged once even when multiple index paths repeat its
+/// frame on the wire; every repeated frame is independently verified.
 public protocol SpaceCARRecoveryRecordSink: Sendable {
     func receiveRoots(commit: CID, index: CID) async throws
     func receiveCommit(cid: CID, body: Data) async throws
@@ -245,9 +250,9 @@ extension SpaceCARCodec {
 
     /// Strictly verifies a proposal-0016 two-root recovery without retaining
     /// the CAR, its DRISL index, or its record set. The first two frames must
-    /// be the signed commit and DRISL roots. Each unique record CID then
-    /// appears exactly once, ordered by the first lexical path that references
-    /// it.
+    /// be the signed commit and DRISL roots. Exactly one record frame follows
+    /// per index entry in canonical length-then-byte order, including shared
+    /// CIDs. The durable sink retains only the first verified copy of each CID.
     public static func verifyStreamingRecovery(
         from source: any SpaceCARRecoveryByteSource,
         space: SpaceURI,
@@ -394,14 +399,6 @@ extension SpaceCARCodec {
         var logicalRestoredByteCount = 0
         while let frameLength = try await reader.readCanonicalVarintOrEOF() {
             try Task.checkCancellation()
-            let (nextUniqueBlockCount, uniqueCountOverflow) =
-                uniqueBlockCount.addingReportingOverflow(1)
-            guard !uniqueCountOverflow,
-                  nextUniqueBlockCount <= limits.maximumUniqueBlocks
-            else {
-                throw SpaceCARStreamingError.uniqueBlockLimitExceeded
-            }
-            uniqueBlockCount = nextUniqueBlockCount
             guard frameLength > UInt64(SpaceCARStreamingInput.cidByteCount),
                   frameLength <= UInt64(
                       SpaceCARStreamingInput.cidByteCount + limits.maximumRecordBytes
@@ -412,13 +409,21 @@ extension SpaceCARCodec {
             let cid = try parseStreamingCID(
                 try await reader.readExactly(SpaceCARStreamingInput.cidByteCount)
             )
-            guard let expected = try await index.nextUnconsumedLexicographicEntry(),
+            guard let expected = try await index.nextUnconsumedCanonicalEntry(),
                   expected.cid == cid
             else {
                 throw SpaceCARStreamingError.invalidRecordOrder
             }
+            let repeatedCID = try await index.hasConsumedCID(cid)
+            if !repeatedCID {
+                guard uniqueBlockCount < limits.maximumUniqueBlocks else {
+                    throw SpaceCARStreamingError.uniqueBlockLimitExceeded
+                }
+                uniqueBlockCount += 1
+            }
+            let frameSink = repeatedCID ? nil : recordSink
             let bodyLength = Int(frameLength) - SpaceCARStreamingInput.cidByteCount
-            try await recordSink?.beginRecord(
+            try await frameSink?.beginRecord(
                 cid: cid,
                 byteCount: bodyLength
             )
@@ -427,7 +432,7 @@ extension SpaceCARCodec {
                 byteCount: bodyLength,
                 boundsError: .invalidRecordValue,
                 recordCID: cid,
-                recordSink: recordSink
+                recordSink: frameSink
             )
             try await StreamingCanonicalSpaceRecordValidator.validate(
                 recordFrame
@@ -438,36 +443,27 @@ extension SpaceCARCodec {
             guard recordFrame.finalizedDAGCBORCID() == cid else {
                 throw SpaceCARStreamingError.blockCIDMismatch
             }
-            let consumedForCID = try await index.consumeEntries(forCID: cid)
-            let (nextCount, overflow) = consumedPathCount.addingReportingOverflow(
-                consumedForCID
-            )
-            guard consumedForCID > 0, !overflow, nextCount <= indexedCount else {
+            try await index.consumeEntry(expected)
+            guard consumedPathCount < indexedCount else {
                 throw SpaceCARStreamingError.unindexedBlocks
             }
-            let (logicalBytesForCID, productOverflow) =
-                bodyLength.multipliedReportingOverflow(by: consumedForCID)
-            let (nextLogicalRestoredByteCount, sumOverflow) =
-                logicalRestoredByteCount.addingReportingOverflow(
-                    logicalBytesForCID
-                )
-            guard !productOverflow,
-                  !sumOverflow,
-                  nextLogicalRestoredByteCount
-                    <= limits.maximumLogicalRestoredBytes else {
+            let (nextLogicalRestoredByteCount, overflow) =
+                logicalRestoredByteCount.addingReportingOverflow(bodyLength)
+            guard !overflow,
+                  nextLogicalRestoredByteCount <= limits.maximumLogicalRestoredBytes else {
                 throw SpaceCARStreamingError.byteLimitExceeded
             }
-            consumedPathCount = nextCount
+            consumedPathCount += 1
             logicalRestoredByteCount = nextLogicalRestoredByteCount
             let chunkCount = try await recordFrame.finishRecordStaging()
-            try await recordSink?.completeRecord(
+            try await frameSink?.completeRecord(
                 cid: cid,
                 byteCount: bodyLength,
                 chunkCount: chunkCount
             )
         }
         guard consumedPathCount == indexedCount,
-              try await index.nextUnconsumedLexicographicEntry() == nil
+              try await index.nextUnconsumedCanonicalEntry() == nil
         else {
             throw SpaceCARStreamingError.unindexedBlocks
         }

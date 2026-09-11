@@ -18,7 +18,7 @@ final class SwanHTTPTests: XCTestCase {
     func testProfileAndGeneratedWireHaveTheSamePermissionedCoverage() throws {
         let profile = try ProtocolProfile.load(
             from: packageRoot().appending(
-                path: "Profiles/permissioned-data-0016-2026-09-10.json"
+                path: "Profiles/permissioned-data-0016-2026-09-19.json"
             )
         )
         let generated = PermissionedData0016.methods
@@ -873,7 +873,7 @@ final class SwanHTTPTests: XCTestCase {
 
     private func loadPinnedProfile() throws -> ProtocolProfile {
         try ProtocolProfile.load(from: packageRoot()
-            .appending(path: "Profiles/permissioned-data-0016-2026-09-10.json"))
+            .appending(path: "Profiles/permissioned-data-0016-2026-09-19.json"))
     }
 
     private func makeServer(profile: ProtocolProfile) async throws -> (SwanHTTPServer, SQLiteControlDatabase, URL) {

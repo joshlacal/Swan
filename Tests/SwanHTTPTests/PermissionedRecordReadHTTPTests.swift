@@ -363,7 +363,7 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    func testSelfOnlyAndNarrowSpaceReadGrantsCannotRevealOtherRepositoriesOrCollections() async throws {
+    func testReadSelfGrantsIgnoreCollectionsButCannotRevealOtherRepositoriesOrAuthorities() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         do {
@@ -371,7 +371,7 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                 logger: Logger(label: "PermissionedRecordReadHTTPTests.scope")
             )
             let broadOther = try signedHeaders(fixture, subject: Self.bob, path: Self.getPath, jti: "other-repository")
-            let narrowScope = "space:app.bsky.bookmarks?authority=\(Self.alice)&skey=record-read&action=read&collection=\(Self.collection)"
+            let narrowScope = "space:app.bsky.bookmarks?authority=\(Self.alice)&skey=record-read&action=read_self&collection=\(Self.collection)"
             let narrow = try await issueToken(fixture.runtime, subject: Self.alice, scopes: [narrowScope])
             let narrowGet = try signedHeaders(
                 token: narrow.token,
@@ -438,9 +438,9 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                     method: .get,
                     headers: narrowOtherCollection
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(response.status, .ok)
                     self.assertNoStore(response)
-                    XCTAssertEqual(try self.errorCode(response.body), "Unauthorized")
+                    XCTAssertNotNil((try self.jsonObject(response.body))["value"])
                 }
                 // The record exists in Alice's opened repository, but an
                 // exact grant for Alice's space cannot be replayed against a

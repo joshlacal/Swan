@@ -389,11 +389,17 @@ public protocol PermissionedRemoteReplicaRecoveryStore: Sendable {
         now: Int64
     ) async throws -> SpaceCARRecoveryIndexEntry?
 
-    func consumePermissionedRemoteReplicaIndexEntries(
+    func hasConsumedPermissionedRemoteReplicaCID(
         sessionID: String,
         cid: CID,
         now: Int64
-    ) async throws -> Int
+    ) async throws -> Bool
+
+    func consumePermissionedRemoteReplicaIndexEntry(
+        sessionID: String,
+        entry: SpaceCARRecoveryIndexEntry,
+        now: Int64
+    ) async throws
 
     func beginPermissionedRemoteReplicaRecord(
         sessionID: String,

@@ -325,15 +325,8 @@ final class UpstreamScopeConformanceTests: XCTestCase, @unchecked Sendable {
     ///
     /// The corpus's space checks are concrete `{type, authority, skey, action}`
     /// tuples — upstream's own `SPACE_CHECKS`, which probe one named space, not a
-    /// listing surface. `aggregate: true` would make every corpus space-read
-    /// assertion an aggregate read, which requires an unqualified or wildcard
-    /// collection GRANT (§6.5.5), and would quietly change what this suite
-    /// tests: rows that upstream says are allowed would start failing against a
-    /// hardening upstream has no equivalent of, and the conformance suite would
-    /// be asserting a Swan divergence while claiming to assert conformance.
-    ///
-    /// `collection: nil` matches the corpus too — its rows carry no collection
-    /// filter, and a read stays collection-independent by default.
+    /// listing surface. Its rows carry no collection filter. Both read arms
+    /// ignore collections, including when the request spans collections.
     ///
     /// Swan's aggregate surface is exercised where it actually lives, through
     /// `allowsSpaceListing(type:authority:)`, in the §9-D23 listing-fence tests.

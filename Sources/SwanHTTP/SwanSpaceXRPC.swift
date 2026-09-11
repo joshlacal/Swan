@@ -66,8 +66,8 @@ private struct AuthenticatedGetSpaceHandler: ComAtprotoSimplespaceGetSpace.Serve
         // The live reference serves this to either the space authority's own
         // OAuth session or a space credential (a member hosted elsewhere
         // cannot present OAuth here — its token is audience-bound to its own
-        // PDS). `Bearer` is reserved for the compact credential; any other
-        // scheme stays on the exact OAuth/DPoP authorizer.
+        // PDS). Compact credentials and OAuth tokens are both proof-bound;
+        // the JOSE type selects which verifier validates the presentation.
         let bearerToken: String?
         do {
             bearerToken = try spaceCredentialSchemeToken(from: request.headers)
@@ -80,9 +80,13 @@ private struct AuthenticatedGetSpaceHandler: ComAtprotoSimplespaceGetSpace.Serve
                 throw AuthenticatedGetSpaceFailure.denied
             }
             do {
-                authorization = try await credentialAuthorizer.authorization(
-                    for: token,
+                authorization = try await capability.authorizer.authorizeSpaceCredential(
+                    token,
+                    verifier: credentialAuthorizer,
+                    request: request,
                     expectedSpace: space,
+                    method: "GET",
+                    fixedPath: "/xrpc/com.atproto.simplespace.getSpace",
                     now: Date()
                 )
             } catch let error as SwanError {
@@ -388,8 +392,8 @@ public struct SwanAuthenticatedSpaceRecordsCapability: Sendable {
     let authorizer: SwanOAuthResourceAuthorizer
     let directory: any AuthorizedSpaceRepositoryDirectory
     /// Nil means only the established OAuth/DPoP route is enabled. A present
-    /// verifier is invoked only for an exact `Authorization: Bearer` space
-    /// credential; it never sees DPoP access tokens.
+    /// verifier is invoked only for a DPoP-bound compact space credential;
+    /// it never sees OAuth access tokens.
     let credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)?
     let tidAllocator: SwanPermissionedTIDAllocator
     /// Shared with anonymous public JSON reads so authenticated permissioned
@@ -838,11 +842,8 @@ private func authorize(
     }
 }
 
-/// Selects the authenticated read mechanism without allowing the two bearer
-/// formats to bleed into one another. `Bearer` is reserved for a compact
-/// space credential and does not require or inspect DPoP. Any other scheme,
-/// including the established `DPoP` OAuth scheme, stays on the exact
-/// OAuth/DPoP authorizer and retains its nonce/replay behavior.
+/// Selects the credential or OAuth verifier while retaining sender constraint
+/// and replay protection for either presentation.
 private func authorizeRecordRead(
     _ capability: SwanAuthenticatedSpaceRecordsCapability,
     request: Request,
@@ -860,9 +861,13 @@ private func authorizeRecordRead(
             throw AuthenticatedSpaceRecordFailure.denied
         }
         do {
-            return try await credentialAuthorizer.authorization(
-                for: token,
+            return try await capability.authorizer.authorizeSpaceCredential(
+                token,
+                verifier: credentialAuthorizer,
+                request: request,
                 expectedSpace: expectedSpace,
+                method: "GET",
+                fixedPath: fixedPath,
                 now: Date()
             )
         } catch let error as SwanError {

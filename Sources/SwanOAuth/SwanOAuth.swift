@@ -255,11 +255,16 @@ public enum PermissionedDataJWT {
     }
 
     public struct SpaceCredentialClaims: Codable, Sendable, Equatable {
+        public struct Confirmation: Codable, Sendable, Equatable {
+            public let jkt: String
+        }
+
         public let iss: String
         public let sub: String
         public let iat: Int64
         public let exp: Int64
         public let jti: String
+        public let cnf: Confirmation
     }
 
     /// The unsigned, bounded metadata needed to select a verification key.
@@ -427,11 +432,13 @@ public enum PermissionedDataJWT {
         issuer: String,
         space: SpaceURI,
         key: P256.Signing.PrivateKey,
+        dpopKeyThumbprint: String,
         now: Date = Date(),
         lifetime: TimeInterval = spaceCredentialLifetime,
         kid: String = spaceCredentialKeyID
     ) throws -> String {
         guard issuer == space.authority,
+              SpaceCredentialDPoPValidator.isValidKeyThumbprint(dpopKeyThumbprint),
               isSpaceCredentialKeyID(kid),
               lifetime > 0,
               lifetime <= spaceCredentialLifetime,
@@ -444,7 +451,8 @@ public enum PermissionedDataJWT {
             kid: kid,
             claims: SpaceCredentialClaims(
                 iss: issuer, sub: space.rawValue, iat: issuedAt,
-                exp: issuedAt + Int64(lifetime), jti: UUID().uuidString
+                exp: issuedAt + Int64(lifetime), jti: UUID().uuidString,
+                cnf: .init(jkt: dpopKeyThumbprint)
             ),
             key: key
         )
@@ -479,9 +487,10 @@ public enum PermissionedDataJWT {
             throw SwanError.malformed("invalid space credential clock skew")
         }
         let parsed = try verifySpaceCredentialStructure(token, publicKey: publicKey)
-        let claims = try decode(SpaceCredentialClaims.self, from: parsed.payload)
+        let claims = try StrictJSON.decode(SpaceCredentialClaims.self, from: parsed.payload)
         guard let space = try? SpaceURI(claims.sub),
               space.authority == claims.iss,
+              SpaceCredentialDPoPValidator.isValidKeyThumbprint(claims.cnf.jkt),
               claims.jti.isValidPermissionedDataJTI,
               expectedSpace.map({ $0 == space }) ?? true else {
             throw SwanError.unauthorized("space credential issuer or subject is invalid")
@@ -509,9 +518,10 @@ public enum PermissionedDataJWT {
               parsed.header.kid.map(isSpaceCredentialKeyID) == true else {
             throw SwanError.unauthorized("JWT type, algorithm, or key ID is invalid")
         }
-        let claims = try decode(SpaceCredentialClaims.self, from: parsed.payload)
+        let claims = try StrictJSON.decode(SpaceCredentialClaims.self, from: parsed.payload)
         guard let space = try? SpaceURI(claims.sub),
               space.authority == claims.iss,
+              SpaceCredentialDPoPValidator.isValidKeyThumbprint(claims.cnf.jkt),
               claims.jti.isValidPermissionedDataJTI else {
             throw SwanError.unauthorized("space credential issuer or subject is invalid")
         }

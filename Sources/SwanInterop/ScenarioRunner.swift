@@ -34,7 +34,7 @@ public struct InteropScenarioFixtureArtifact: Codable, Sendable, Equatable {
     ) {
         self.scenario = scenario
         self.profileID = profileID
-        self.scenarioCommit = "1caad93dbb1f445396f6abf3b97eb4040345e78e"
+        self.scenarioCommit = "119fa6b63476d30c2516846c714319046e0422f3"
         self.referenceImplementationCommit = "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354"
         self.faultModes = faultModes
         self.convergence = convergence

@@ -1,0 +1,7 @@
+/// Independent Node.js crypto ES256K fixture, using secp256k1 scalar 2,
+/// SHA-256, IEEE P1363 encoding, and low-S normalization. The retained
+/// pre-DPoP TypeScript fixture remains a rejection case.
+enum SpaceCredentialGoldenFixtures {
+    static let boundSecp256k1 =
+        "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWNyZWRlbnRpYWwrand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eCIsInN1YiI6ImF0Oi8vZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3gvc3BhY2UvYXBwLmJza3kuYm9va21hcmtzL3RzLWdvbGRlbiIsImlhdCI6MTc1MDAwMDAwMCwiZXhwIjoxNzUwMDA3MjAwLCJqdGkiOiJub2RlLWJvdW5kLWNyZWRlbnRpYWwtMDEiLCJjbmYiOnsiamt0IjoiQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQSJ9fQ.UezNylbYXYppJZ3-m0oxdDLjRYDxRlMfk3FFKBmD_GxsCo05DICKvTZIXXbCdmahQqBFUo45_Z3y4lJYszvrHw"
+}

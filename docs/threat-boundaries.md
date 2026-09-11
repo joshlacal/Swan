@@ -10,8 +10,11 @@ preventing accidental public exposure and unauthorized cross-space access.
 - Delegation JWTs are valid only for one short authority exchange and have no
   repository permission. They resolve exclusively through local or pinned
   `#atproto` keys; unknown issuers never cause DID/PLC/DNS/HTTP lookup.
-- A space credential is read-only at the repo host. Writes require a scope
-  covering the authenticated account’s own `(space, repo)`.
+- A space credential is read-only at the repo host and bound to its client
+  through `cnf.jkt`. Each use requires a fresh DPoP proof binding the token,
+  request method, and origin/path. A repo host cannot replay a received token
+  against another host without the client’s private key. Writes require a
+  scope covering the authenticated account’s own `(space, repo)`.
 - The content-binding MAC is a deniable integrity check, never an author
   signature. `verifyContextSignature` and `verifyContentBinding` remain
   separate APIs.
@@ -36,7 +39,7 @@ preventing accidental public exposure and unauthorized cross-space access.
   default `lifetime: 60`, ceiling 300 s) with active eviction of the cached
   entry when a refresh fails (`:477-486`). That 60 s is the accepted key-
   revocation latency window. It was deliberately not tightened to a refresh
-  per verification: a remote bearer-token holder would then be able to drive
+  per verification: a remote credential holder would then be able to drive
   one PLC directory request per presented credential, which is a network
   amplification primitive against the PLC directory.
 - Account keys are encrypted in owner-only files with a process/mounted-secret

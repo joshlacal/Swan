@@ -73,24 +73,29 @@ final class RepositoryCARPaginationTests: XCTestCase {
       )
       assertIndexedWithoutTemporarySort(canonicalPlan)
 
-      let lexicalPlan = try await database.connection.query(
+      let recordPlan = try await database.connection.query(
         """
         EXPLAIN QUERY PLAN
-        SELECT collection, rkey, value, cid, revision
-        FROM permissioned_space_records
-        WHERE space_uri = ? AND author_did = ?
-          AND (collection, rkey) > (?, ?)
-        ORDER BY collection, rkey
+        SELECT records.collection, records.rkey, records.cid,
+               records.revision, length(records.value) AS value_byte_count
+        FROM temp.swan_repository_car_index AS metadata
+        JOIN permissioned_space_records AS records
+          ON records.space_uri = ? AND records.author_did = ?
+         AND records.collection = metadata.collection
+         AND records.rkey = metadata.rkey
+         AND records.cid = metadata.cid
+        WHERE (metadata.path_length, metadata.path_bytes) > (?, ?)
+        ORDER BY metadata.path_length, metadata.path_bytes
         LIMIT 1
         """,
         [
           .text(fixture.space.rawValue),
           .text(fixture.author),
-          .text("app.bsky.feed.post"),
-          .text("alpha"),
+          .integer(0),
+          Data().sqliteData!,
         ]
       )
-      assertIndexedWithoutTemporarySort(lexicalPlan)
+      assertIndexedWithoutTemporarySort(recordPlan)
     }
 
     await barrier.release()

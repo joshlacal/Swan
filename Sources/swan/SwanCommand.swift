@@ -1906,7 +1906,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Run Swan's Hummingbird server")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-09-10.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-09-19.json"
 
         /// The public route surface is a separate contract family from
         /// `--profile`, and gets a separate flag rather than a widened one.
@@ -5032,7 +5032,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Verify a pinned Swan artifact")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-09-10.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-09-19.json"
 
         @Option(name: .long, help: "Swan package root containing generated wire sources")
         var sourceRoot: String?
@@ -6193,7 +6193,7 @@ extension SwanCommand {
                 )
                 let source = LiveInteropHost(
                     label: "source", client: member.client,
-                    authorization: .bearer(token: credential),
+                    authorization: .spaceCredential(credential),
                     permissionedCommitVerificationKey: key
                 )
                 let database = try await SQLiteAccountDatabase(
@@ -6749,7 +6749,7 @@ extension SwanCommand {
                     let source = LiveInteropHost(
                         label: "source",
                         client: sourceMember.client,
-                        authorization: .bearer(token: credential),
+                        authorization: .spaceCredential(credential),
                         permissionedCommitVerificationKey: verificationKey
                     )
                     let gap = try await source.client.query(
@@ -8491,12 +8491,7 @@ extension SwanCommand {
                             memberAuthorizationProvider: consumer.authorizationProvider
                         )
                         Forum.log("forum thread: space credential issued")
-                        guard !credential.isEmpty else {
-                            throw ValidationError("space credential exchange returned an empty credential")
-                        }
-                        let credentialAuthorization = InteropAuthorization.bearer(
-                            token: credential
-                        )
+                        let credentialAuthorization = InteropAuthorization.spaceCredential(credential)
                         Forum.log("forum thread: listing writers")
                         let writers = try await Forum.listWriters(
                             authority: authority,

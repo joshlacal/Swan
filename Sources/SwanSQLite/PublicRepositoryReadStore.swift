@@ -160,8 +160,12 @@ extension SQLiteAccountDatabase {
     /// from a blob that is also still reachable through a public record. The
     /// walk is keyset-paged and uses the same projection limits as the public
     /// read/promoter path; it never retains record values or the full CID set.
-    func publicRepositoryContainsBlobCIDWithoutGate(_ cid: String) async throws -> Bool {
-        try await preflightPublicReadProjectionWithoutGate()
+    func publicRepositoryContainsBlobCIDWithoutGate(
+        _ cid: String,
+        connection: SQLiteConnection? = nil
+    ) async throws -> Bool {
+        let conn = connection ?? self.connection
+        try await preflightPublicReadProjectionWithoutGate(connection: conn)
         var lastCollection: String?
         var lastRecordKey: String?
         var scannedRecords = 0
@@ -169,7 +173,7 @@ extension SQLiteAccountDatabase {
             try Task.checkCancellation()
             let rows: [SQLiteRow]
             if let lastCollection, let lastRecordKey {
-                rows = try await connection.query(
+                rows = try await conn.query(
                     """
                     SELECT collection, rkey, record_cid
                     FROM public_repository_record_index
@@ -186,7 +190,7 @@ extension SQLiteAccountDatabase {
                     ]
                 )
             } else {
-                rows = try await connection.query(
+                rows = try await conn.query(
                     """
                     SELECT collection, rkey, record_cid
                     FROM public_repository_record_index
@@ -218,7 +222,7 @@ extension SQLiteAccountDatabase {
                     ),
                     reason: .recordIndexMalformed
                 )
-                let bytes = try await blockBytesWithoutGate(recordCID)
+                let bytes = try await blockBytesWithoutGate(recordCID, connection: conn)
                 let value = try RepositoryMSTValidation.decodeRecordBlock(
                     bytes, for: path
                 )

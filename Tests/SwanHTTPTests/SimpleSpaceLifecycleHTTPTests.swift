@@ -676,7 +676,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
         authenticatedDirectory: (any AuthorizedSimpleSpaceDirectory)? = nil
     ) throws -> SwanHTTPServer {
         SwanHTTPServer(
-            profile: try ProtocolProfile.load(from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-09-10.json")),
+            profile: try ProtocolProfile.load(from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-09-19.json")),
             configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: Self.publicURL),
             oauthRuntime: fixture.runtime,
             authenticatedGetSpaceDirectory: authenticatedDirectory ?? fixture.directory,

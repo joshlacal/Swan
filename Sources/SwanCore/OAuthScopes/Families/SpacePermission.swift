@@ -233,19 +233,12 @@ public struct SpacePermission: ScopePermission {
 /// and would invert the dependency.
 public struct SpaceScopeTarget: Sendable, Hashable {
     public enum Operation: Sendable, Hashable {
-        /// Whole-space read. Upstream is collection-independent
-        /// (space-permission.ts:104-107); Swan adds two hardenings, both
-        /// carried explicitly on the case rather than folded into the generic
-        /// matcher (§6.5.5):
-        ///   - `aggregate`: an AGGREGATE surface (e.g. listSpaces) must not
-        ///     silently censor its response, so it requires an unqualified or
-        ///     wildcard collection GRANT — SwanSpaces.swift:329-341.
-        ///   - `collection`: a caller MAY additionally scope the request to one
-        ///     collection; a grant naming no collections still satisfies this
-        ///     (reads stay collection-independent by default), matching
-        ///     upstream. `nil` means "no collection filter on the request".
+        /// Whole-space read. Proposal 0016 makes read access independent of
+        /// collections, including aggregate reads. The request metadata is
+        /// retained for callers, but does not restrict the grant.
         case read(aggregate: Bool, collection: String?)
-        /// Own-repo read. Same two hardenings as `.read` (§6.5.5).
+        /// Own-repo read. Like `.read`, ignores collections; the repository
+        /// authorization layer additionally requires the holder's own repo.
         case readSelf(aggregate: Bool, collection: String?)
         /// Record write. `collection` is REQUIRED here by construction —
         /// upstream makes it non-optional only in the write arm (:70-74).
@@ -322,16 +315,14 @@ extension SpacePermission {
             // Collection and action are irrelevant to a manage check (:100-102).
             return manage.contains(op)
 
-        case let .read(aggregate, requestCollection):
-            // Reads are collection-independent by default (:104-107); the two
-            // Swan hardenings below are opt-in via the case payload (§6.5.5).
-            guard action.contains(.read) else { return false }
-            return collectionGate(aggregate: aggregate, requestCollection: requestCollection)
+        case .read:
+            // Read access is all-or-nothing at the space boundary. Collection
+            // parameters only constrain record writes, never read or sync.
+            return action.contains(.read)
 
-        case let .readSelf(aggregate, requestCollection):
+        case .readSelf:
             // `read` implies `read_self`, but not the reverse (:108-110).
-            guard action.contains(.read) || action.contains(.readSelf) else { return false }
-            return collectionGate(aggregate: aggregate, requestCollection: requestCollection)
+            return action.contains(.read) || action.contains(.readSelf)
 
         case let .write(verb, collection):
             // Writes need BOTH the verb AND a collection target (:112-115).
@@ -353,26 +344,6 @@ extension SpacePermission {
             // collection: nil))` call on the resolved grant.
             return false
         }
-    }
-
-    /// Shared post-action-gate logic for `.read` / `.readSelf` (§6.5.5). Both
-    /// Swan hardenings are opt-in via the case payload; when neither applies
-    /// the read stays collection-independent, matching upstream.
-    private func collectionGate(aggregate: Bool, requestCollection: String?) -> Bool {
-        if aggregate {
-            // SwanSpaces.swift:329-341 — an aggregate surface (e.g. listSpaces)
-            // must not silently censor its response, so it requires an
-            // unqualified or wildcard collection GRANT.
-            return collection.isEmpty || collection.contains(.any)
-        }
-        if let requestCollection {
-            // A caller MAY scope a single-space read to one collection. A
-            // grant naming no collections at all still satisfies it — reads
-            // stay collection-independent by default (upstream's rule); a
-            // grant that DOES name collections must include this one.
-            return collection.isEmpty || collectionAllows(requestCollection)
-        }
-        return true
     }
 
     /// space-permission.ts:118-123. `.any` is exact membership in the set, not
@@ -529,11 +500,8 @@ extension SpacePermission {
         values.set("skey", [target.skey])
         switch target.operation {
         case .read(_, _), .delegationExchange:
-            // A bare (no-collection) grant already satisfies a collection-
-            // qualified or aggregate read request (§6.5.5's `collectionGate`
-            // treats an empty grant collection list as unrestricted), so the
-            // minimal grant never needs to state `collection` here even when
-            // the target's own `collection`/`aggregate` payload is set.
+            // Reads ignore collection restrictions, so the minimal grant
+            // never needs to state a collection for any read target.
             values.set("action", [SpaceAction.read.rawValue])
         case .readSelf(_, _):
             values.set("action", [SpaceAction.readSelf.rawValue])

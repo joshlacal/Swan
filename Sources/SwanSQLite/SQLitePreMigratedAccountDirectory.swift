@@ -1531,7 +1531,7 @@ public actor SQLitePreMigratedAccountDirectory:
             try PublicRepositoryReadBlobTarget(
                 did: account.did,
                 status: account.status,
-                store: database
+                store: SQLitePublicRepositoryReadBlobStore(database: database)
             )
         )
     }
@@ -3110,6 +3110,21 @@ private actor SQLiteGenerationRefreshingPublicMutationStore:
 
     func uploadedBlobMetadata(cid: String) async throws -> PublicBlobMetadata? {
         try await database.uploadedBlobMetadata(cid: cid)
+    }
+}
+
+/// Public blob serving is narrower than retained namespace storage: a CID
+/// must still be referenced by a public record when metadata or bytes open.
+/// The database checks the record projection and namespace in one snapshot.
+private struct SQLitePublicRepositoryReadBlobStore: PublicRepositoryReadBlobStore {
+    let database: SQLiteAccountDatabase
+
+    func publicBlob(cid: String) async throws -> PublicBlob? {
+        try await database.publicRepositoryBlob(cid: cid)
+    }
+
+    func publicBlobMetadata(cid: String) async throws -> PublicBlobMetadata? {
+        try await database.publicRepositoryBlobMetadata(cid: cid)
     }
 }
 

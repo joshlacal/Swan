@@ -584,6 +584,9 @@ public struct AuthorizedSimpleSpaceMemberPage: Sendable, Equatable {
 /// storage detail.
 public enum AuthorizedSimpleSpaceLifecycleError: Error, Sendable, Equatable {
     case notFound
+    /// Credential renewal distinguishes a durable tombstone from a missing
+    /// space so a syncer can discard retained data after a missed notification.
+    case deleted
 }
 
 /// Startup-preopened, authenticated projection of a permissioned repository.

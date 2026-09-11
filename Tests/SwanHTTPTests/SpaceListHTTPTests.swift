@@ -128,7 +128,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
         } catch { try? await close(fixture); throw error }
     }
 
-    func testStorageProjectionDeduplicatesAndExcludesDeletedTombstonedAndRestoredClosureSpaces() async throws {
+    func testStorageProjectionRetainsNotifiedMemberRepoAndExcludesAuthorityDeletionAndRestoreClosures() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let duplicate = fixture.owner
@@ -143,8 +143,20 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
             _ = try await database.deleteSimpleSpace(space: deleted, authorization: .accountOAuthForTesting(subject: Self.alice, scopes: ["atproto"]))
             try await database.receiveSpaceDeletionNotification(space: tombstoned, issuer: Self.bob, audience: Self.alice, eventID: "tombstone-list", requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: tombstoned))
             let page = try await database.hostedSpaceURIs(spaceType: nil, authority: nil, cursor: nil, limit: 100)
-            XCTAssertEqual(page, [duplicate])
+            XCTAssertEqual(page, [duplicate, tombstoned])
             try await database.close()
+
+            let app = try makeServer(fixture).buildApplication(logger: Logger(label: "SpaceListHTTPTests.notified-member"))
+            let headers = try signedHeaders(fixture.token, path: Self.path, runtime: fixture.runtime, jti: "notified-member-list")
+            try await app.test(.router) { client in
+                try await client.execute(uri: Self.path, method: .get, headers: headers) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(
+                        ((try self.json(response.body))["spaces"] as? [[String: Any]])?.map { $0["uri"] as? String },
+                        [duplicate.rawValue, tombstoned.rawValue]
+                    )
+                }
+            }
 
             let source = try await SQLiteAccountDatabase(dataDirectory: fixture.root.appending(path: "closure-source"), did: Self.alice)
             let closureRepository = try DurableSpaceRepository(database: source, space: fixture.remote, author: Self.alice)

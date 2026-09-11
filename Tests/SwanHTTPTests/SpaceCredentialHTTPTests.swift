@@ -24,6 +24,81 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
     private static let getPath = "/xrpc/com.atproto.space.getRecord"
     private static let listPath = "/xrpc/com.atproto.space.listRecords"
 
+    func testCredentialRenewalReportsSpaceDeletedOnlyAfterValidDelegationAndProof() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let app = try makeServer(fixture).buildApplication(
+                logger: Logger(label: "SpaceCredentialHTTPTests.deleted-renewal")
+            )
+            let missingSpace = try SpaceURI(
+                authority: Self.authority,
+                spaceType: fixture.publicSpace.spaceType,
+                skey: "never-created"
+            )
+            try await app.test(.router) { client in
+                let initialDelegation = try self.delegation(
+                    fixture, user: Self.member, space: fixture.publicSpace
+                )
+                try await client.execute(
+                    uri: Self.credentialPath, method: .post,
+                    headers: try self.exchangeHeaders(initialDelegation),
+                    body: self.exchangeBody(space: fixture.publicSpace)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertNotNil(try self.jsonObject(response.body)["credential"] as? String)
+                }
+
+                try await fixture.directory.deleteSimpleSpace(
+                    fixture.publicSpace,
+                    authorization: .accountOAuthForTesting(subject: Self.authority, scopes: ["atproto"])
+                )
+
+                for (space, expectedStatus, expectedError) in [
+                    (fixture.publicSpace, HTTPResponse.Status.badRequest, "SpaceDeleted"),
+                    (missingSpace, HTTPResponse.Status.notFound, "SpaceNotFound"),
+                ] {
+                    let renewalDelegation = try self.delegation(fixture, user: Self.member, space: space)
+                    try await client.execute(
+                        uri: Self.credentialPath, method: .post,
+                        headers: try self.exchangeHeaders(renewalDelegation),
+                        body: self.exchangeBody(space: space)
+                    ) { response in
+                        XCTAssertEqual(response.status, expectedStatus)
+                        XCTAssertEqual(try self.errorCode(response.body), expectedError)
+                        XCTAssertNil(try self.jsonObject(response.body)["credential"])
+                        self.assertNoStore(response)
+                    }
+                }
+
+                let validDelegation = try self.delegation(
+                    fixture, user: Self.member, space: fixture.publicSpace
+                )
+                var missingProof = try self.exchangeHeaders(validDelegation)
+                missingProof[HTTPField.Name("DPoP")!] = nil
+                try await client.execute(
+                    uri: Self.credentialPath, method: .post, headers: missingProof,
+                    body: self.exchangeBody(space: fixture.publicSpace)
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidDPoPProof")
+                }
+                try await client.execute(
+                    uri: Self.credentialPath, method: .post,
+                    headers: try self.exchangeHeaders("invalid-delegation"),
+                    body: self.exchangeBody(space: fixture.publicSpace)
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidDelegationToken")
+                }
+            }
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     func testPublicAndMemberDelegationExchangeIssueCredentialsForCrossRepositoryReads() async throws {
         let fixture = try await Fixture.make()
         defer { fixture.cleanup() }
@@ -36,7 +111,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 user: Self.outsider,
                 space: fixture.publicSpace
             )
-            let caseInsensitivePublicHeaders = exchangeHeaders(
+            let caseInsensitivePublicHeaders = try exchangeHeaders(
                 publicDelegation,
                 authorizationScheme: "bearer"
             )
@@ -74,8 +149,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
 
                 let publicToken = try XCTUnwrap(publicCredential.value)
                 let memberToken = try XCTUnwrap(memberCredential.value)
-                let publicReadHeaders = bearerHeaders(publicToken, dpop: "intentionally-not-a-dpop-proof")
-                let memberReadHeaders = bearerHeaders(memberToken)
+                let publicReadHeaders = try credentialHeaders(publicToken)
+                let memberReadHeaders = try credentialHeaders(memberToken, path: Self.listPath)
                 try await client.execute(
                     uri: self.getURI(space: fixture.publicSpace, repo: Self.member, rkey: "public"),
                     method: .get,
@@ -885,7 +960,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         let credentialHeader = try PermissionedDataJWT.createSpaceCredential(
             issuer: Self.authority,
             space: fixture.allowListSpace,
-            key: fixture.authorityKey
+            key: fixture.authorityKey,
+            dpopKeyThumbprint: try SpaceCredentialDPoPTestSupport.thumbprint
         ).split(separator: ".", maxSplits: 1).first.map(String.init)!
         let publicJWK = try credentialAttestationJWK(
             key: publishedKey,
@@ -1049,12 +1125,14 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             let credential = try PermissionedDataJWT.createSpaceCredential(
                 issuer: Self.authority,
                 space: fixture.publicSpace,
-                key: fixture.authorityKey
+                key: fixture.authorityKey,
+                dpopKeyThumbprint: try SpaceCredentialDPoPTestSupport.thumbprint
             )
             let expired = try PermissionedDataJWT.createSpaceCredential(
                 issuer: Self.authority,
                 space: fixture.publicSpace,
                 key: fixture.authorityKey,
+                dpopKeyThumbprint: try SpaceCredentialDPoPTestSupport.thumbprint,
                 now: Date(timeIntervalSinceNow: -7_300),
                 lifetime: 60
             )
@@ -1066,7 +1144,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     (expired, self.getURI(space: fixture.publicSpace, repo: Self.member, rkey: "public")),
                     (tampered, self.getURI(space: fixture.publicSpace, repo: Self.member, rkey: "public")),
                 ] {
-                    try await client.execute(uri: uri, method: .get, headers: self.bearerHeaders(token)) { response in
+                    try await client.execute(uri: uri, method: .get, headers: self.credentialHeaders(token)) { response in
                         XCTAssertEqual(response.status, .unauthorized)
                         self.assertNoStore(response)
                         XCTAssertEqual(try self.errorCode(response.body), "Unauthorized")
@@ -1076,7 +1154,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.createRecord",
                     method: .post,
-                    headers: self.bearerHeaders(credential, contentType: true),
+                    headers: self.credentialHeaders(credential, path: "/xrpc/com.atproto.space.createRecord", method: "POST", contentType: true),
                     body: ByteBuffer(string: "{\"space\":\"\(fixture.publicSpace.rawValue)\",\"repo\":\"\(Self.member)\",\"collection\":\"app.bsky.feed.post\",\"rkey\":\"blocked\",\"record\":{\"$type\":\"app.bsky.feed.post\",\"text\":\"blocked\"}}")
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -1086,7 +1164,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.getDelegationToken?space=\(self.percentEncode(fixture.publicSpace.rawValue))",
                     method: .get,
-                    headers: self.bearerHeaders(credential)
+                    headers: self.credentialHeaders(credential, path: "/xrpc/com.atproto.space.getDelegationToken")
                 ) { response in
                     XCTAssertEqual(response.status, .serviceUnavailable)
                     self.assertNoStore(response)
@@ -1111,7 +1189,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             let credential = try PermissionedDataJWT.createSpaceCredential(
                 issuer: Self.authority,
                 space: fixture.publicSpace,
-                key: fixture.authorityKey
+                key: fixture.authorityKey,
+                dpopKeyThumbprint: try SpaceCredentialDPoPTestSupport.thumbprint
             )
             let duplicate = "{\"space\":\"\(fixture.publicSpace.rawValue)\",\"space\":\"\(fixture.publicSpace.rawValue)\"}"
             let oversized = "{\"space\":\"\(String(repeating: "a", count: SwanSpaceCredentialHTTP.maximumJSONBytes))\"}"
@@ -1139,7 +1218,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: self.getURI(space: fixture.publicSpace, repo: Self.member, rkey: "public"),
                     method: .get,
-                    headers: self.bearerHeaders(credential)
+                    headers: self.credentialHeaders(credential)
                 ) { response in
                     XCTAssertEqual(response.status, .serviceUnavailable)
                     self.assertNoStore(response)
@@ -1249,24 +1328,21 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
     private func exchangeHeaders(
         _ token: String,
         authorizationScheme: String = "Bearer"
-    ) -> HTTPFields {
-        bearerHeaders(
-            token,
-            contentType: true,
+    ) throws -> HTTPFields {
+        try SpaceCredentialDPoPTestSupport.exchangeHeaders(
+            token: token,
             authorizationScheme: authorizationScheme
         )
     }
 
-    private func bearerHeaders(
+    private func credentialHeaders(
         _ token: String,
-        dpop: String? = nil,
-        contentType: Bool = false,
-        authorizationScheme: String = "Bearer"
-    ) -> HTTPFields {
-        var headers = HTTPFields()
-        headers[.authorization] = "\(authorizationScheme) \(token)"
+        path: String = SpaceCredentialHTTPTests.getPath,
+        method: String = "GET",
+        contentType: Bool = false
+    ) throws -> HTTPFields {
+        var headers = try SpaceCredentialDPoPTestSupport.headers(token: token, path: path, method: method)
         if contentType { headers[.contentType] = "application/json" }
-        if let dpop { headers[HTTPField.Name("DPoP")!] = dpop }
         return headers
     }
 

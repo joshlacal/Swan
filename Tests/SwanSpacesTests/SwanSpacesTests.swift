@@ -778,7 +778,7 @@ final class SwanSpacesTests: XCTestCase {
         )
     }
 
-    func testQualifiedCollectionReadScopesDenyAggregatePermissionedReads() async throws {
+    func testQualifiedCollectionReadScopesPermitAllCollectionsAndAggregateReads() async throws {
         let fixture = try DurableRepositoryFixture()
         let database = try await fixture.open()
         defer { Task { try? await database.close() } }
@@ -824,23 +824,21 @@ final class SwanSpacesTests: XCTestCase {
             authorization: collectionLimited
         )
         XCTAssertEqual(allowedRecord?.value, fixture.firstValue)
-        await XCTAssertThrowsErrorAsync(
-            try await repository.record(otherCollection, authorization: collectionLimited)
-        )
-        await XCTAssertThrowsErrorAsync(
-            try await repository.snapshot(authorization: collectionLimited)
-        )
-        await XCTAssertThrowsErrorAsync(
-            try await repository.sync(since: 0, authorization: collectionLimited)
-        )
+        let otherRecord = try await repository.record(otherCollection, authorization: collectionLimited)
+        XCTAssertEqual(otherRecord?.value, fixture.secondValue)
+        let qualifiedSnapshot = try await repository.snapshot(authorization: collectionLimited)
+        XCTAssertEqual(qualifiedSnapshot.map(\.uri), [otherCollection, fixture.first])
+        guard case let .incremental(qualifiedEntries) = try await repository.sync(
+            since: 0, authorization: collectionLimited
+        ) else { return XCTFail("a collection-qualified read must permit aggregate sync") }
+        XCTAssertEqual(qualifiedEntries.count, 2)
         let signingKey = P256.Signing.PrivateKey()
-        await XCTAssertThrowsErrorAsync(
-            try await repository.exportCAR(
-                rev: try fixture.tid(2).toString(),
-                signingKey: signingKey,
-                authorization: collectionLimited
-            )
+        let qualifiedExport = try await repository.exportCAR(
+            rev: try fixture.tid(2).toString(),
+            signingKey: signingKey,
+            authorization: collectionLimited
         )
+        XCTAssertFalse(qualifiedExport.data.isEmpty)
 
         let wildcardScope = """
         space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=*

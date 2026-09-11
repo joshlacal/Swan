@@ -62,6 +62,7 @@ final class SpaceCredentialLifetimeTests: XCTestCase {
             issuer: Self.authority,
             space: space,
             key: key,
+            dpopKeyThumbprint: String(repeating: "A", count: 43),
             now: now,
             lifetime: PermissionedDataJWT.spaceCredentialLifetime
         )

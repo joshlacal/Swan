@@ -90,7 +90,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-09-10.json"
+                        path: "Profiles/permissioned-data-0016-2026-09-19.json"
                     )
                 ),
                 configuration: .init(
@@ -168,7 +168,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(
-                    path: "Profiles/permissioned-data-0016-2026-09-10.json"
+                    path: "Profiles/permissioned-data-0016-2026-09-19.json"
                 )
             )
             let server = composition.makeServer(
@@ -232,7 +232,8 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let credential = try PermissionedDataJWT.createSpaceCredential(
                 issuer: localDID,
                 space: space,
-                key: fixture.localKey
+                key: fixture.localKey,
+                dpopKeyThumbprint: SpaceCredentialDPoPTestSupport.thumbprint
             )
             let app = server.buildApplication(
                 logger: Logger(label: "ServePermissionedRuntimeCompositionTests.semantic")
@@ -761,7 +762,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-09-10.json"
+                        path: "Profiles/permissioned-data-0016-2026-09-19.json"
                     )
                 ),
                 configuration: .init(
@@ -854,15 +855,25 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 issuer: local,
                 space: localSpace,
                 key: fixture.localKey,
+                dpopKeyThumbprint: SpaceCredentialDPoPTestSupport.thumbprint,
                 now: now
             )
             _ = try await DurableSpaceCredentialVerifier(
                 publicKeys: credentials.credentialPublicKeys
             ).authorization(for: localCredential, expectedSpace: localSpace, now: now)
-            _ = try await DurableSpaceCredentialVerifier(
+            let remoteVerifier = DurableSpaceCredentialVerifier(
                 publicKeys: credentials.credentialPublicKeys
-            ).authorization(
-                for: Self.remoteCredential,
+            )
+            do {
+                _ = try await remoteVerifier.authorization(
+                    for: Self.remoteCredential, expectedSpace: remoteSpace, now: now
+                )
+                XCTFail("the retained pre-DPoP credential must be rejected")
+            } catch {}
+            let boundInspection = try PermissionedDataJWT.inspectSpaceCredential(Self.remoteBoundCredential)
+            XCTAssertEqual(boundInspection.claims.cnf.jkt, try SpaceCredentialDPoPTestSupport.thumbprint)
+            _ = try await remoteVerifier.authorization(
+                for: Self.remoteBoundCredential,
                 expectedSpace: remoteSpace,
                 now: now
             )
@@ -1021,6 +1032,11 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWRlbGVnYXRpb24rand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eSIsImF1ZCI6ImRpZDpwbGM6YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4I2F0cHJvdG9fc3BhY2VfaG9zdCIsInN1YiI6ImF0Oi8vZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3gvc3BhY2UvYXBwLmJza3kuYm9va21hcmtzL3RzLWdvbGRlbiIsImlhdCI6MTc1MDAwMDAwMCwiZXhwIjoxNzUwMDAwMDYwLCJqdGkiOiJ0cy1ub25jZV8wMSJ9.CiWW_bplyq9ZtybzoUL9f7J_lqlcFKkmAbY2YsVlf5Bly4Ufue7e9QN6_8PioonLWqKnmm6T-RW3Mq2C_JTC6A"
     private static let remoteCredential =
         "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWNyZWRlbnRpYWwrand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eCIsInN1YiI6ImF0Oi8vZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3gvc3BhY2UvYXBwLmJza3kuYm9va21hcmtzL3RzLWdvbGRlbiIsImlhdCI6MTc1MDAwMDAwMCwiZXhwIjoxNzUwMDA3MjAwLCJqdGkiOiJ0cy1jcmVkZW50aWFsLW5vbmNlXzAxIn0.kgRbwHruWKzbsHZlMjmSFYmz1dKBjpP0eQBvJLRYlzMAClhsOpYnRYpe2fBMGtuciGngcQgEwWYSjHpa9YmIEQ"
+    // Independently signed with Node.js crypto, secp256k1 scalar 2, SHA-256,
+    // P1363 signature encoding and low-S normalization. cnf binds the actual
+    // P-256 holder key from SpaceCredentialDPoPTestSupport.
+    private static let remoteBoundCredential =
+        "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWNyZWRlbnRpYWwrand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eCIsInN1YiI6ImF0Oi8vZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3gvc3BhY2UvYXBwLmJza3kuYm9va21hcmtzL3RzLWdvbGRlbiIsImlhdCI6MTc1MDAwMDAwMCwiZXhwIjoxNzUwMDA3MjAwLCJqdGkiOiJub2RlLWJvdW5kLWh0dHAtY3JlZGVudGlhbC0wMSIsImNuZiI6eyJqa3QiOiJOeTNCZENEUExWeWtNaGZCY3dYZnFJNWk5NVNwZzMyaC0zWDFITkNMZEg0In19.zwCc4W7gb2PusAWXr3mcHy-1lh7PJsNlcgjIVtukJ35IpmgqTrgkqtPo3CqWp1Q2RtDGVbFrp9f05yjuB4fWoA"
     private static let remoteService =
         "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NksifQ.eyJpYXQiOjE3NTAwMDAwMDAsImlzcyI6ImRpZDpwbGM6YmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5IiwiYXVkIjoiZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3giLCJleHAiOjE3NTAwMDAwNjAsImx4bSI6ImNvbS5hdHByb3RvLnNwYWNlLm5vdGlmeVdyaXRlIiwianRpIjoicGlubmVkLXRzLW5vdGlmeS0wMDEifQ.o782N9f1U23FL8bWXqQiNDBjp7c-5Cxj4IIlvqLdEUZFC4K0C-vUz-AN8PuGZINo1K2Y6_DY-qJmgak6Fk-aPA"
 
@@ -1067,7 +1083,9 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 jti: jti
             )
         case .credential:
-            headers = [.authorization: "Bearer \(credential)"]
+            headers = try SpaceCredentialDPoPTestSupport.headers(
+                token: credential, path: path, method: method.rawValue
+            )
         case .delegation:
             let delegation = try PermissionedDataJWT.createDelegationToken(
                 issuer: space.authority,
@@ -1075,7 +1093,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 space: space,
                 key: fixture.localKey
             )
-            headers = [.authorization: "Bearer \(delegation)"]
+            headers = try SpaceCredentialDPoPTestSupport.exchangeHeaders(token: delegation, path: path)
         case .registerNotify:
             let registerToken = try SpaceServiceJWT.create(
                 issuer: localDID,
@@ -1084,10 +1102,10 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 eventID: jti,
                 key: fixture.localKey
             )
-            headers = [
-                .authorization: "Bearer \(credential)",
-                HTTPField.Name("atproto-service-auth")!: "Bearer \(registerToken)",
-            ]
+            headers = try SpaceCredentialDPoPTestSupport.headers(
+                token: credential, path: path, method: method.rawValue
+            )
+            headers[HTTPField.Name("atproto-service-auth")!] = "Bearer \(registerToken)"
         case .unregisterNotify:
             let unregisterToken = try SpaceServiceJWT.create(
                 issuer: remoteDID,
@@ -1096,10 +1114,10 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 eventID: jti,
                 key: fixture.localKey
             )
-            headers = [
-                .authorization: "Bearer \(credential)",
-                HTTPField.Name("atproto-service-auth")!: "Bearer \(unregisterToken)",
-            ]
+            headers = try SpaceCredentialDPoPTestSupport.headers(
+                token: credential, path: path, method: method.rawValue
+            )
+            headers[HTTPField.Name("atproto-service-auth")!] = "Bearer \(unregisterToken)"
         case .notifyWrite:
             let writeDigest = SpaceNotificationRequestDigest.write(
                 space: space,

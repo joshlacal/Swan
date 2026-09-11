@@ -71,6 +71,61 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         runtime.dpopNonceService.issue(now: now)
     }
 
+    /// Permissioned credentials use the same canonical route binding as OAuth,
+    /// with their own proof policy: no server nonce at exchange, and an `ath`
+    /// claim over the credential on every use.
+    func validateSpaceCredentialProof(
+        request: Request,
+        method: String,
+        fixedPath: String,
+        credential: String? = nil,
+        now: Date = Date()
+    ) async throws -> OAuthValidatedDPoPProof {
+        guard let proof = Self.dpopProof(from: request.headers) else {
+            throw SwanError.unauthorized("space credential proof is invalid")
+        }
+        let target = try Self.target(publicURL: publicURL, fixedPath: fixedPath)
+        try Self.validateFixedMethod(method)
+        // This bounded parse supplies a candidate key binding to the proof
+        // validator. It grants no authority: the credential verifier below
+        // must still verify the signed claims and repeat the key binding.
+        let thumbprint = try credential.map {
+            try PermissionedDataJWT.inspectSpaceCredential($0).claims.cnf.jkt
+        }
+        return try await SpaceCredentialDPoPValidator(runtime: runtime).validate(
+            proof,
+            method: method,
+            target: target,
+            credential: credential,
+            expectedKeyThumbprint: thumbprint,
+            now: now
+        )
+    }
+
+    func authorizeSpaceCredential(
+        _ token: String,
+        verifier: any SpaceCredentialAuthorizationVerifier,
+        request: Request,
+        expectedSpace: SpaceURI,
+        method: String,
+        fixedPath: String,
+        now: Date = Date()
+    ) async throws -> AuthorizationContext {
+        let proof = try await validateSpaceCredentialProof(
+            request: request,
+            method: method,
+            fixedPath: fixedPath,
+            credential: token,
+            now: now
+        )
+        return try await verifier.authorization(
+            for: token,
+            expectedSpace: expectedSpace,
+            dpopProof: proof,
+            now: now
+        )
+    }
+
     /// Returns only a domain authorization context. A raw opaque token, a
     /// parsed subject, or a DPoP JKT is never treated as authorization on its
     /// own: all three durable/token/lifecycle checks must complete first.
@@ -86,6 +141,17 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         fixedPath: String,
         now: Date = Date()
     ) async throws -> AuthorizationContext {
+        // Credential-aware read routes have already selected their separate
+        // verifier. A space credential presented to an account-only route is
+        // never an OAuth token and cannot acquire write access by satisfying
+        // that route's nonce challenge.
+        do {
+            guard try spaceCredentialSchemeToken(from: request.headers) == nil else {
+                throw SwanResourceAuthorizationFailure.denied
+            }
+        } catch {
+            throw SwanResourceAuthorizationFailure.denied
+        }
         // A legacy session presents `Bearer`, an OAuth token presents `DPoP`.
         // The two prefixes are disjoint, so this dispatch cannot mistake one for
         // the other, and it is the ONLY place a bearer credential enters the

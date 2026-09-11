@@ -272,7 +272,7 @@ final class SwanCORSTests: XCTestCase {
             )
             let profile = try ProtocolProfile.load(
                 from: Self.packageRoot()
-                    .appending(path: "Profiles/permissioned-data-0016-2026-09-10.json")
+                    .appending(path: "Profiles/permissioned-data-0016-2026-09-19.json")
             )
             let server = SwanHTTPServer(
                 profile: profile,

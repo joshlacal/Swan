@@ -2,11 +2,15 @@
 
 Swan is a Swift-native AT Protocol server and permissioned-data interoperability engine. It provides an AT Protocol Personal Data Server (PDS) implementation, an OAuth 2.1 authorization server with DPoP, multi-factor authentication (TOTP and WebAuthn passkeys), a SvelteKit account portal, multi-plane SQLite storage, an XRPC proxy, and protocol testing harnesses.
 
-The active protocol profile is `permissioned-data-0016-2026-09-10`. Its upstream pins and security definitions live in `Profiles/`.
+The active protocol profile is `permissioned-data-0016-2026-09-19`. Its upstream pins and security definitions live in `Profiles/`.
+
+The [September 19 upstream alignment notes](docs/notes/permissioned-data-2026-09-19.md) record the researched revisions, behavior changes, and validation boundaries.
 
 ## Scope and trust boundaries
 
 Swan is developed for protocol interoperability testing and self-hosted environments; it does not claim to be a general-purpose public production PDS on the open federation today.
+
+**September 19 credential cutover:** Space credentials require a DPoP key at issuance and a fresh proof on each request. Existing bearer space credentials must be replaced through a new delegation exchange. Account OAuth sessions and repository data are retained.
 
 **September 10 alpha migration:** The current profile uses independent read/write policies, `putMember` flags, and access-specific `checkUserAccess` requests. SQLite v23 copies each legacy policy and managing-app choice to both axes and preserves existing members' read/write access. It does not reset account or session data.
 

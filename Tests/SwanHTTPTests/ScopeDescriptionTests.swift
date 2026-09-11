@@ -89,17 +89,16 @@ struct ScopeDescriptionTests {
         #expect(!grant.isUniversal)
     }
 
-    @Test("a specific skey narrows the WHOLE grant to one record, and that must be visible in the label")
+    @Test("a specific skey selects a space, not a single record")
     func specificSkeyIsDisclosedInTheSpaceLabel() {
         // Two grants differing ONLY in skey must not render identically —
-        // one lets the app touch a single record, the other every record
-        // in the space (found in review as a live D19 gap: skey was parsed
-        // but never disclosed).
+        // one selects a particular space key, the other every matching space.
         let scoped = ScopeDescription.render(scopes: ["space:app.bulleted.space?skey=abc123"])
         let unscoped = ScopeDescription.render(scopes: ["space:app.bulleted.space"])
-        #expect(scoped.contains("limited to one record"))
+        #expect(scoped.contains("limited to space key"))
+        #expect(!scoped.contains("limited to one record"))
         #expect(scoped.contains("<code>abc123</code>"))
-        #expect(!unscoped.contains("limited to one record"))
+        #expect(!unscoped.contains("limited to space key"))
         #expect(scoped != unscoped)
 
         let scope = ConsentScope.classify("space:app.bulleted.space?skey=abc123")
@@ -261,6 +260,30 @@ struct ScopeDescriptionTests {
         #expect(html.contains("app.bulleted.space"))
         #expect(html.contains("read only your own data"))
         #expect(html.contains("Update the space"))
+    }
+
+    @Test("collection-qualified reads describe all collections while writes retain their collection constraint")
+    func spaceReadsAndWritesHaveSeparateCollectionDescriptions() {
+        for (action, expectedRead) in [
+            ("read", "read all data in the space"),
+            ("read_self", "read only your own data across all collections in the space"),
+        ] {
+            let html = ScopeDescription.render(scopes: [
+                "space:app.example.space?action=\(action)&action=create&collection=app.example.record",
+            ])
+            #expect(html.contains(expectedRead))
+            #expect(html.contains("create records in <code>app.example.record</code>"))
+            #expect(!html.contains("declared collections"))
+        }
+    }
+
+    @Test("omitted collections disclose changing declaration defaults for concrete space types only")
+    func defaultSpaceWriteCollectionsAreDisclosed() {
+        let concrete = ScopeDescription.render(scopes: ["space:app.example.space"])
+        #expect(concrete.contains("create, update, and delete records in this space type's declared collections, which may change"))
+        let wildcard = ScopeDescription.render(scopes: ["space:*"])
+        #expect(!wildcard.contains("declared collections"))
+        #expect(!wildcard.contains("create, update, and delete records"))
     }
 
     @Test("type=='*' && authority=='*' triggers the universal-space warning; a scoped grant does not")

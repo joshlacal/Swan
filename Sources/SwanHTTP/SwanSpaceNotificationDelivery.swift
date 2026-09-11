@@ -218,13 +218,25 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
         // A replacement, expiry, or future explicit removal wins over a row
         // that was already queued. Treat the stale delivery as a successful
         // no-op; the lease worker will acknowledge it without network I/O.
-        guard try await database.isSpaceNotificationRegistrationActive(
-            space: notification.space,
-            endpoint: notification.endpoint,
-            repository: notification.repository,
-            now: Date()
-        ) else {
-            return
+        let service: String?
+        if notification.kind == .deleted {
+            guard let registration = try await database.currentSpaceDeletionDeliveryRegistration(
+                for: notification
+            ) else { return }
+            service = registration.serviceIdentity
+        } else {
+            guard try await database.isSpaceNotificationRegistrationActive(
+                space: notification.space,
+                endpoint: notification.endpoint,
+                repository: notification.repository,
+                now: Date()
+            ) else { return }
+            service = try await database.spaceNotificationRegistrationService(
+                space: notification.space,
+                endpoint: notification.endpoint,
+                repository: notification.repository,
+                now: Date()
+            )
         }
         // Erratum 03: a SERVICE-NAMED registration is its own destination —
         // the endpoint carries DID-document provenance from registration-time
@@ -234,12 +246,6 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
         // Endpoint-only legacy rows keep requiring the operator map: with no
         // service identity there is no audience a receiver could verify, and
         // their raw URLs never became network destinations before.
-        let service = try await database.spaceNotificationRegistrationService(
-            space: notification.space,
-            endpoint: notification.endpoint,
-            repository: notification.repository,
-            now: Date()
-        )
         let destination: SwanSpaceNotificationDestination
         if let service {
             guard let registered = URL(string: notification.endpoint) else {

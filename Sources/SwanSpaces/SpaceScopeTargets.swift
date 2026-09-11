@@ -32,49 +32,9 @@ public enum SpaceRecordAction: Sendable, Hashable {
 }
 
 public extension SpaceScopeTarget {
-    /// A record-plane target.
-    ///
-    /// `collection == nil` means an AGGREGATE surface — a read that returns
-    /// rows across collections. Today's rule (`SwanSpaces.swift:329-341`) is
-    /// that such a read requires an *unqualified or wildcard* collection grant,
-    /// because "aggregate surfaces must not silently censor their response".
-    /// §6.5.5 rules that this travels on the TARGET as an explicit flag, not in
-    /// the generic matcher.
-    ///
-    /// **This is a Swan HARDENING of an upstream rule, not a Swan invention,
-    /// and upstream's rule is the opposite** — which is what makes the
-    /// hardening necessary. Upstream reads are unconditionally
-    /// collection-independent: `space-permission.ts:104-110` takes the `read` /
-    /// `read_self` arms *before* `collectionAllows` is ever consulted
-    /// (`:112-115`), and the test "read_self is not constrained by collection"
-    /// (`:320-327`) pins that. It must stay visible.
-    ///
-    /// A write with no collection is unrepresentable upstream
-    /// (`space-permission.ts:70-74` makes `collection` non-optional in the
-    /// write arm) and is a denial here: `nil` is returned so the caller throws
-    /// rather than silently widening.
-    ///
-    /// **Why `aggregate` is DERIVED from `collection == nil` rather than taken
-    /// as a parameter, and why that is faithful to the rule being ported.**
-    /// §6.5.5 calls the flag "explicit", which invites a later reader to add an
-    /// `aggregate:` argument and let callers pass it. Do not — the derivation
-    /// *is* the ported rule. Today's behaviour lives in one branch,
-    /// `SwanSpaces.swift:329-341`, and that branch is selected by exactly this
-    /// condition: `guard let collection else { …aggregate rule… }`. The caller
-    /// never had a separate say. `collection` reaches here as `uri?.collection`
-    /// (`SwanSpaces.swift:261-266`), so "no record URI in hand" and "this
-    /// surface spans collections" are the same fact, and a `nil` collection is
-    /// the only way an aggregate surface can present itself.
-    ///
-    /// Taking the flag as a parameter would let a caller pass
-    /// `aggregate: false` beside a `nil` collection and silently opt out of the
-    /// hardening — a widening reachable from one mistaken argument, at a call
-    /// site that would still compile and still look correct. Deriving it makes
-    /// that state unrepresentable, the same principle `SpaceRecordAction`
-    /// applies to `.manage` above.
-    ///
-    /// Pinned by `testAggregateReadRefusesACollectionQualifiedGrant`, which
-    /// fails under the literal §5.6.2 port.
+    /// A record-plane target. Reads carry request metadata for callers but
+    /// ignore collection restrictions when matching OAuth grants. A write
+    /// must name its collection; otherwise this returns nil and denies it.
     static func record(
         _ space: SpaceURI,
         action: SpaceRecordAction,
@@ -103,25 +63,8 @@ public extension SpaceScopeTarget {
         )
     }
 
-    /// A single-blob read target — **Erratum 03's one deliberate exception**
-    /// to the rule above that `aggregate` is derived from `collection == nil`.
-    ///
-    /// A blob fetch arrives with no record URI, so `record(_:action:collection:)`
-    /// classified it as an aggregate read and §6.5.5 refused every
-    /// collection-qualified grant. But "no record URI in hand" and "this
-    /// surface spans collections" are NOT the same fact here: a blob is one
-    /// content-addressed object whose row is already namespace-scoped to the
-    /// space — nothing about fetching it enumerates or censors a
-    /// cross-collection response, which is the hazard §6.5.5 exists for.
-    /// And post-Erratum-02 the same grant can exchange for a whole-space
-    /// credential and read the identical bytes through the credential arm, so
-    /// the aggregate classification refused conformant clients (bulleted.app's
-    /// six-collection grant, `getBlob` 401) while protecting nothing.
-    ///
-    /// This constructor is for SINGLE-blob retrieval only. Any surface that
-    /// answers with a set spanning collections keeps `record` and its derived
-    /// aggregate flag — do not reach for this to quiet a §6.5.5 refusal on a
-    /// listing.
+    /// A single-blob read target. Like all space reads, it ignores the
+    /// collection parameter. OAuth policy separately enforces own-repo access.
     static func blobRead(_ space: SpaceURI) -> SpaceScopeTarget {
         SpaceScopeTarget(
             type: space.spaceType,
@@ -131,14 +74,8 @@ public extension SpaceScopeTarget {
         )
     }
 
-    /// The `simplespace.getSpace` configuration read — the same deliberate
-    /// exception ``blobRead(_:)`` makes to the derived-aggregate rule, for the
-    /// same reason. The read answers with ONE configuration object for one
-    /// space; nothing about it enumerates or censors a cross-collection
-    /// record response, which is the hazard §6.5.5 exists for. The live
-    /// reference gates this surface on `action=read_self` and its read arms
-    /// are collection-independent, so a collection-qualified grant that can
-    /// read its own records can also describe the space they live in.
+    /// The `simplespace.getSpace` configuration read accepts read_self and
+    /// read grants regardless of their collection parameters.
     static func spaceDescriptionRead(_ space: SpaceURI) -> SpaceScopeTarget {
         SpaceScopeTarget(
             type: space.spaceType,

@@ -13,6 +13,10 @@ import SwanStorage
 /// 2. **Token mint / refresh.** ``resolvingLexiconGrants`` — (a) `include:` →
 ///    concrete, (b) ``expandSpaceCollections``, (c) `resolveSpaceSelfAuthority`,
 ///    in that order, after §6.3 stage C.
+///    Default collection changes reach existing sessions on refresh, using
+///    the original requested scopes. An issued access token retains its
+///    materialized collection set until then. This matches the reference
+///    provider's `buildTokenScope` calls at issuance and rotation.
 /// 3. **Request time (resource plane): NEVER.** This is structural rather than a
 ///    convention, and the structure is visible from here: nothing in this file
 ///    is reachable from `SwanOAuthResourceAuthorization`. A bearer token's
@@ -80,6 +84,9 @@ public enum OAuthScopeResolutionFailure: Error, Sendable, Equatable, CustomStrin
     case spaceTypeUnresolvable(nsid: String)
     /// Proved, but `defs.main` is not a `space` (`lexicon-manager.ts:156-159`).
     case spaceTypeNotASpace(nsid: String)
+    /// Space declarations may list concrete NSIDs from any namespace, but
+    /// cannot declare wildcard or malformed collection defaults.
+    case spaceTypeInvalidCollections(nsid: String)
     /// The EXPANDED-GRANT count cap or the 10 s group deadline (§5.7.4). A
     /// property of the request, never of an authority — which is why it is not
     /// cached against any NSID.
@@ -98,6 +105,7 @@ public enum OAuthScopeResolutionFailure: Error, Sendable, Equatable, CustomStrin
         case let .includeNotAPermissionSet(nsid): "lexicon \(nsid) is not a permission set"
         case let .spaceTypeUnresolvable(nsid): "space type \(nsid) could not be resolved"
         case let .spaceTypeNotASpace(nsid): "lexicon \(nsid) is not a space"
+        case let .spaceTypeInvalidCollections(nsid): "space type \(nsid) has invalid collections"
         case let .budget(error): "lexicon resolution budget exceeded: \(error)"
         case let .unserialisableExpansion(nsid): "expansion of \(nsid) did not serialise"
         }
@@ -348,6 +356,11 @@ public enum OAuthLexiconScopeResolution {
                 guard case let .space(space) = document else {
                     throw OAuthScopeResolutionError(
                         stage: stage, failure: .spaceTypeNotASpace(nsid: type)
+                    )
+                }
+                guard space.collections.allSatisfy(AtprotoSyntax.isValidNSID) else {
+                    throw OAuthScopeResolutionError(
+                        stage: stage, failure: .spaceTypeInvalidCollections(nsid: type)
                     )
                 }
                 spaces[type] = space

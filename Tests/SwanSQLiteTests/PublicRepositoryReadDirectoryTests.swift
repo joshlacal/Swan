@@ -1130,6 +1130,37 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
             try await sink(payload)
         }
 
+        let currentState = try await database.loadPublicRepositoryState()
+        let state = try XCTUnwrap(currentState)
+        let request = try PublicRepositoryMutationRequest(
+            id: "public-blob-read-fixture",
+            canonicalDigest: Data(repeating: 0x62, count: 32),
+            baseCommitCID: state.commitCID
+        )
+        guard case let .reserved(reservation) = try await database.reservePublicRepositoryRevision(
+            request, wallClockMicroseconds: 1_750_000_002_000_000
+        ) else { return XCTFail("blob fixture mutation unexpectedly replayed") }
+        let record: PublicRecord = [
+            "$type": .string("app.bsky.feed.post"),
+            "blob": .object([
+                "$type": .string("blob"), "ref": .link(try CID.parse(reference.cid)),
+                "mimeType": .string("image/png"), "size": .integer(payload.count),
+            ]),
+        ]
+        let prepared = try await PublicRepositoryEngine.apply(
+            repositoryDID: did, currentState: state, blocks: database,
+            revision: reservation.nextRevision,
+            batch: try PublicRepositoryWriteBatch(
+                writes: [.create(
+                    path: try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "avatar"),
+                    record: record
+                )],
+                expectedCommitCID: state.commitCID
+            ),
+            signer: P256PublicRepositoryCommitSigner(privateKey: fixture.key)
+        )
+        _ = try await database.applyPublicRepositoryMutation(reservation: reservation, prepared: prepared)
+
         guard case let .active(target) = try await fixture.directory
             .publicRepositoryBlobOutcome(did: did) else {
             try await fixture.directory.close()

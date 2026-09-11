@@ -299,7 +299,9 @@ public enum SpaceAuthorizationPolicy {
                   let action = SpaceRecordAction(permission),
                   let target = SpaceScopeTarget.record(
                       space,
-                      action: action,
+                      // OAuth reaches only its own repository here, so either
+                      // read_self or read authorizes a repository read.
+                      action: action == .read ? .readSelf : action,
                       collection: uri?.collection
                   ),
                   permissions.allowsSpace(target)
@@ -330,15 +332,11 @@ public enum SpaceAuthorizationPolicy {
         }
     }
 
-    /// A single-blob read (Erratum 03). Every arm except `accountOAuth`
+    /// A single-blob read. Every arm except `accountOAuth`
     /// delegates to ``require(space:author:uri:authorization:permission:)``
     /// with `.read` — credentials, self-reads, service auth, and the refusals
-    /// are unchanged. The OAuth arm alone differs: it matches against
-    /// ``SpaceScopeTarget/blobRead(_:)`` (non-aggregate, collection-free)
-    /// instead of the derived aggregate target, so a collection-qualified
-    /// grant that reads its records can also fetch the blobs those records
-    /// reference. See the constructor's doc for why this is not a §6.5.5
-    /// bypass.
+    /// are unchanged. The OAuth arm requires the holder's own repository and
+    /// accepts read_self as well as read. Collections never constrain reads.
     public static func requireBlobRead(
         space: SpaceURI,
         author: String,
@@ -346,7 +344,8 @@ public enum SpaceAuthorizationPolicy {
     ) throws {
         if case let .accountOAuth(subject, permissions) = authorization {
             guard subject == author,
-                  permissions.allowsSpace(SpaceScopeTarget.blobRead(space))
+                  let target = SpaceScopeTarget.record(space, action: .readSelf, collection: nil),
+                  permissions.allowsSpace(target)
             else {
                 throw SwanError.unauthorized("OAuth scope does not cover this space operation")
             }
@@ -1011,12 +1010,22 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
 /// exactly `[signedCommit, index]`; records are neither public-repository CAR
 /// data nor blobs and therefore cannot be passed to public export surfaces.
 public enum SpaceCARCodec {
+    /// The DRISL map and its record blocks share canonical DAG-CBOR key order:
+    /// shortest UTF-8 path first, then bytewise order for equally long paths.
+    public static func canonicalRecordPathPrecedes(_ left: String, _ right: String) -> Bool {
+        let leftBytes = left.utf8
+        let rightBytes = right.utf8
+        return leftBytes.count < rightBytes.count
+            || (leftBytes.count == rightBytes.count
+                && leftBytes.lexicographicallyPrecedes(rightBytes))
+    }
+
     public static func encode(commit: SpaceCommitEnvelope, records: [SpaceRecord]) throws -> SpaceCAR {
         let commitBlock = try encodeCommit(commit)
         let commitCID = CID.fromDAGCBOR(commitBlock)
 
         let orderedRecords = records.sorted { left, right in
-            recordPath(left).utf8.lexicographicallyPrecedes(recordPath(right).utf8)
+            canonicalRecordPathPrecedes(recordPath(left), recordPath(right))
         }
         guard Set(orderedRecords.map(recordPath)).count == orderedRecords.count else {
             throw SwanError.malformed("duplicate permissioned record path")
@@ -1037,15 +1046,10 @@ public enum SpaceCARCodec {
         output.append(headerBlock)
         appendBlock(cid: commitCID, data: commitBlock, to: &output)
         appendBlock(cid: indexCID, data: indexBlock, to: &output)
-        var emittedCIDs = Set<String>()
         for record in orderedRecords {
-            let cid = CID.fromDAGCBOR(record.value)
-            // DRISL retains every path, while CAR block storage is
-            // content-addressed. Proposal 0016 and the pinned TypeScript PDS
-            // therefore emit one block per unique CID, ordered by the first
-            // lexical path that references it.
-            guard emittedCIDs.insert(cid.string).inserted else { continue }
-            appendBlock(cid: cid, data: record.value, to: &output)
+            // Each index entry has a corresponding frame, including paths
+            // sharing a CID, as required by the reference streaming consumer.
+            appendBlock(cid: CID.fromDAGCBOR(record.value), data: record.value, to: &output)
         }
         return SpaceCAR(data: output, commitCID: commitCID, indexCID: indexCID)
     }
@@ -1083,8 +1087,8 @@ public enum SpaceCARCodec {
 
     /// Starts a canonical DAG-CBOR DRISL index map without retaining the map
     /// or its values in memory. Entries must follow Petrel's canonical
-    /// length-then-byte key order; record blocks themselves remain in the
-    /// proposal's lexicographic `collection/rkey` order.
+    /// length-then-byte key order; one record block follows for every entry
+    /// in that same order, including entries sharing a CID.
     public static func streamingIndexPrefix(recordCount: Int) throws -> Data {
         guard recordCount >= 0 else {
             throw SwanError.malformed("permissioned CAR record count is invalid")
@@ -1242,13 +1246,7 @@ public enum SpaceCARCodec {
             validatedIndex.append((path, cid))
         }
         let canonicalIndex = validatedIndex.sorted {
-            let left = Data($0.path.utf8)
-            let right = Data($1.path.utf8)
-            return left.count < right.count
-                || (
-                    left.count == right.count
-                        && left.lexicographicallyPrecedes(right)
-                )
+            canonicalRecordPathPrecedes($0.path, $1.path)
         }
         let canonicalIndexBlock = try DAGCBOR.encodeValue(
             OrderedCBORMap(entries: canonicalIndex.map {
@@ -1264,29 +1262,22 @@ public enum SpaceCARCodec {
         let lexicalIndex = validatedIndex.sorted {
             $0.path.utf8.lexicographicallyPrecedes($1.path.utf8)
         }
-        var orderedUniqueCIDs: [CID] = []
-        var seenRecordCIDs = Set<String>()
-        for entry in lexicalIndex
-        where seenRecordCIDs.insert(entry.cid.string).inserted {
-            orderedUniqueCIDs.append(entry.cid)
-        }
-        guard frames.count == orderedUniqueCIDs.count + 2 else {
-            throw SwanError.malformed("permissioned CAR has unindexed blocks")
+        guard frames.count == canonicalIndex.count + 2 else {
+            throw SwanError.malformed("permissioned CAR has missing or unindexed blocks")
         }
         var recordBlocks: [String: Data] = [:]
-        recordBlocks.reserveCapacity(orderedUniqueCIDs.count)
-        for (offset, expectedCID) in orderedUniqueCIDs.enumerated() {
+        recordBlocks.reserveCapacity(canonicalIndex.count)
+        for (offset, entry) in canonicalIndex.enumerated() {
             let frame = frames[offset + 2]
-            guard frame.cid == expectedCID,
-                  recordBlocks.updateValue(
-                      frame.body,
-                      forKey: frame.cid.string
-                  ) == nil
-            else {
+            guard frame.cid == entry.cid else {
                 throw SwanError.malformed(
                     "permissioned CAR record block order is invalid"
                 )
             }
+            if let existing = recordBlocks[frame.cid.string], existing != frame.body {
+                throw SwanError.malformed("permissioned CAR shared record block is inconsistent")
+            }
+            recordBlocks[frame.cid.string] = frame.body
         }
 
         var setHash = LtHash()

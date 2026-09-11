@@ -88,8 +88,46 @@ public enum InteropHTTPError: Error, Sendable, Equatable, LocalizedError {
 public enum InteropAuthorization: Sendable, Equatable {
     case none
     case dpop(accessToken: String, proof: String)
+    case spaceDelegation(token: String, proof: String)
+    case spaceCredential(InteropSpaceCredential)
     case bearer(token: String)
     case service(token: String)
+}
+
+/// A credential and its per-credential proof key. Both are kept in memory;
+/// callers reuse this value while the transport signs a fresh DPoP proof for
+/// every request, including pagination, retries, and requests to other hosts.
+public struct InteropSpaceCredential: Sendable, Equatable {
+    private let token: String
+    private let key: InteropDPoPKey
+    private let keyThumbprint: String
+
+    fileprivate init(token: String, key: InteropDPoPKey, space: SpaceURI) throws {
+        let inspection = try PermissionedDataJWT.inspectSpaceCredential(token)
+        let thumbprint = try key.thumbprint
+        guard inspection.claims.sub == space.rawValue,
+              inspection.claims.cnf.jkt == thumbprint else {
+            throw SwanError.malformed("space credential response binding is invalid")
+        }
+        self.token = token
+        self.key = key
+        self.keyThumbprint = thumbprint
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.token == rhs.token && lhs.keyThumbprint == rhs.keyThumbprint
+    }
+
+    fileprivate func authorize(
+        method: InteropHTTPMethod,
+        target: URL,
+        headers: inout [String: String]
+    ) throws {
+        headers["Authorization"] = "DPoP " + token
+        headers["DPoP"] = try key.proof(
+            method: method.rawValue, target: target, accessToken: token
+        )
+    }
 }
 
 /// Optional per-request authorization used by live OAuth runs. A static
@@ -457,7 +495,7 @@ public struct InteropXRPCClient: Sendable {
             "Accept": "application/json",
             "Content-Type": contentType,
         ]
-        try addAuthorization(authorization, to: &headers)
+        try addAuthorization(authorization, method: .post, path: path, to: &headers)
         return try await http.execute(
             method: .post,
             path: path,
@@ -501,7 +539,7 @@ public struct InteropXRPCClient: Sendable {
     ) async throws -> InteropHTTPResponse {
         let path = try xrpcPath(nsid, query: query)
         var headers = ["Accept": "application/vnd.ipld.car, application/octet-stream, */*"]
-        try addAuthorization(authorization, to: &headers)
+        try addAuthorization(authorization, method: .get, path: path, to: &headers)
         return try await http.executeStreaming(
             method: .get,
             path: path,
@@ -529,7 +567,7 @@ public struct InteropXRPCClient: Sendable {
         let path = try makeXRPCPath(nsid, query: query)
         var headers = ["Accept": "application/json"]
         if body != nil { headers["Content-Type"] = "application/json" }
-        try addAuthorization(authorization, to: &headers)
+        try addAuthorization(authorization, method: method, path: path, to: &headers)
         return try await http.execute(
             method: method,
             path: path,
@@ -558,6 +596,8 @@ public struct InteropXRPCClient: Sendable {
 
     private func addAuthorization(
         _ authorization: InteropAuthorization,
+        method: InteropHTTPMethod,
+        path: String,
         to headers: inout [String: String]
     ) throws {
         switch authorization {
@@ -567,6 +607,16 @@ public struct InteropXRPCClient: Sendable {
             try requireCredentialSafeTransport(http.baseURL)
             headers["Authorization"] = "DPoP " + accessToken
             headers["DPoP"] = proof
+        case let .spaceDelegation(token, proof):
+            try requireCredentialSafeTransport(http.baseURL)
+            headers["Authorization"] = "Bearer " + token
+            headers["DPoP"] = proof
+        case let .spaceCredential(credential):
+            try requireCredentialSafeTransport(http.baseURL)
+            guard let target = URL(string: path, relativeTo: http.baseURL)?.absoluteURL else {
+                throw InteropHTTPError.invalidURL
+            }
+            try credential.authorize(method: method, target: target, headers: &headers)
         case let .bearer(token), let .service(token):
             try requireCredentialSafeTransport(http.baseURL)
             headers["Authorization"] = "Bearer " + token
@@ -2044,8 +2094,7 @@ public enum LiveInteropRunner {
                 memberLabel: member.label,
                 authorityLabel: authority.label
             )
-            credentialIssued = !credential.isEmpty
-            guard credentialIssued else { throw InteropHTTPError.unexpectedStatus(502) }
+            credentialIssued = true
             // The proposal's space credential authorizes reads only. The
             // repository write is therefore made by the member account using
             // the same fresh OAuth/DPoP provider used to mint its delegation.
@@ -2138,7 +2187,7 @@ public enum LiveInteropRunner {
                     converged: false, errorCode: errorCode, recorder: recorder
                 )
             }
-            let credentialAuthorization = InteropAuthorization.bearer(token: credential)
+            let credentialAuthorization = InteropAuthorization.spaceCredential(credential)
             // A space credential is presented to the repository host.  In a
             // local laboratory the authority may also host the member repo,
             // which is the historical default.  Cross-implementation runs
@@ -3609,13 +3658,12 @@ public struct SpaceCredentialBroker: Sendable {
     public func exchange(
         space: SpaceURI,
         memberAuthorization: InteropAuthorization,
-        delegationAuthorization: InteropAuthorization? = nil,
         clientAttestation: String? = nil,
         recorder: InteropFixtureRecorder? = nil,
         memberAuthorizationProvider: InteropAuthorizationProvider? = nil,
         memberLabel: String = "member",
         authorityLabel: String = "authority"
-    ) async throws -> String {
+    ) async throws -> InteropSpaceCredential {
         let delegationPath = try member.xrpcPath(
             "com.atproto.space.getDelegationToken",
             query: ["space": space.rawValue]
@@ -3642,7 +3690,17 @@ public struct SpaceCredentialBroker: Sendable {
         )
         try requireJSONSuccess(delegation)
         let delegationObject = try StrictJSON.decode(TokenResponse.self, from: delegation.body)
-        let credentialAuthorization = delegationAuthorization ?? .bearer(token: delegationObject.token)
+        let credentialKey = InteropDPoPKey()
+        let credentialPath = try authority.xrpcPath("com.atproto.space.getSpaceCredential")
+        guard let credentialTarget = URL(
+            string: credentialPath, relativeTo: authority.http.baseURL
+        )?.absoluteURL else {
+            throw InteropHTTPError.invalidURL
+        }
+        let credentialAuthorization = InteropAuthorization.spaceDelegation(
+            token: delegationObject.token,
+            proof: try credentialKey.proof(method: "POST", target: credentialTarget)
+        )
         let input = CredentialRequest(space: space.rawValue, clientAttestation: clientAttestation)
         let inputBody = try encode(input)
         let credential = try await authority.procedure(
@@ -3658,7 +3716,11 @@ public struct SpaceCredentialBroker: Sendable {
             response: credential
         )
         try requireJSONSuccess(credential)
-        return try StrictJSON.decode(TokenResponse.self, from: credential.body).token
+        return try InteropSpaceCredential(
+            token: StrictJSON.decode(TokenResponse.self, from: credential.body).token,
+            key: credentialKey,
+            space: space
+        )
     }
 
     private struct TokenResponse: Decodable {

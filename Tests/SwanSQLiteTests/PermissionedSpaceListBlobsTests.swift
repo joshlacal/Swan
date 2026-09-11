@@ -91,10 +91,8 @@ final class PermissionedSpaceListBlobsTests: XCTestCase {
             let afterUpdate = try await database.spaceRecordBlobCIDPage(space: space, author: author, since: nil, cursor: nil, limit: 500)
             XCTAssertEqual(afterUpdate, [cids[1].string])
 
-            // The domain facade applies the aggregate-read policy: an
-            // unqualified space read grant is admitted; a collection-qualified
-            // one is refused (§6.5.5) — the blobs a caller may enumerate here
-            // are exactly those a cross-collection listRecords would show it.
+            // Collection filters constrain writes, never space reads; blob
+            // enumeration is available to both read grant shapes.
             let repository = try DurableSpaceRepository(database: database, space: space, author: author)
             let admitted = try await repository.listBlobCIDs(
                 since: nil, cursor: nil, limit: 100,
@@ -104,18 +102,14 @@ final class PermissionedSpaceListBlobsTests: XCTestCase {
                 )
             )
             XCTAssertEqual(admitted, [cids[1].string])
-            do {
-                _ = try await repository.listBlobCIDs(
-                    since: nil, cursor: nil, limit: 100,
-                    authorization: .accountOAuthForTesting(
-                        subject: author,
-                        scopes: ["space:app.bsky.bookmarks?authority=\(author)&skey=self&collection=app.bsky.feed.post&action=read"]
-                    )
+            let collectionQualified = try await repository.listBlobCIDs(
+                since: nil, cursor: nil, limit: 100,
+                authorization: .accountOAuthForTesting(
+                    subject: author,
+                    scopes: ["space:app.bsky.bookmarks?authority=\(author)&skey=self&collection=app.bsky.feed.post&action=read"]
                 )
-                XCTFail("collection-qualified grant must not enumerate an aggregate blob surface")
-            } catch let error as SwanError {
-                guard case .unauthorized = error else { throw error }
-            }
+            )
+            XCTAssertEqual(collectionQualified, admitted)
             try await database.close()
         } catch {
             try? await database.close()

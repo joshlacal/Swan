@@ -702,6 +702,7 @@ public struct SwanHTTPServer: Sendable {
                 as? any AuthorizedSimpleSpaceCredentialDirectory,
                let exchangeCredentialConfiguration {
                 authenticatedSpaceCredentialExchange = SwanSpaceCredentialExchangeCapability(
+                    authorizer: authorizer,
                     delegationAuthorizer: DurableSpaceDelegationVerifier(
                         publicKeys: exchangeCredentialConfiguration.delegationPublicKeys
                     ),
@@ -775,6 +776,7 @@ public struct SwanHTTPServer: Sendable {
                let spaceCredentialConfiguration,
                let spaceNotificationConfiguration {
                 authenticatedSpaceNotifications = SwanAuthenticatedSpaceNotificationsCapability(
+                    authorizer: authorizer,
                     directory: notificationDirectory,
                     credentialAuthorizer: DurableSpaceCredentialVerifier(
                         publicKeys: spaceCredentialConfiguration.credentialPublicKeys

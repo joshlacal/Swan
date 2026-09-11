@@ -151,6 +151,7 @@ private struct AuthenticatedGetLatestCommitHandler:
 {
     typealias Context = Request
     let capability: SwanAuthenticatedSpaceRepositorySyncCapability
+    let fixedPath: String
 
     func handle(
         parameters: ComAtprotoSpaceGetLatestCommit.Parameters,
@@ -162,7 +163,7 @@ private struct AuthenticatedGetLatestCommitHandler:
             capability,
             request: request,
             expectedSpace: target.space,
-            fixedPath: "/xrpc/com.atproto.space.getLatestCommit"
+            fixedPath: fixedPath
         )
         try requireRepositoryReadAuthorization(authorization, author: target.author)
         let state = try await repositoryCommitState(
@@ -315,9 +316,13 @@ private func authorizeRepositorySyncRead(
             throw AuthenticatedSpaceRepositorySyncFailure.denied
         }
         do {
-            return try await credentialAuthorizer.authorization(
-                for: bearerToken,
+            return try await capability.authorizer.authorizeSpaceCredential(
+                bearerToken,
+                verifier: credentialAuthorizer,
+                request: request,
                 expectedSpace: expectedSpace,
+                method: "GET",
+                fixedPath: fixedPath,
                 now: Date()
             )
         } catch let error as SwanError {
@@ -472,12 +477,15 @@ func registerAuthenticatedGetLatestCommitEndpoint(
     on router: Router<BasicRequestContext>,
     capability: SwanAuthenticatedSpaceRepositorySyncCapability
 ) {
-    let handler = AuthenticatedGetLatestCommitHandler(capability: capability)
-    let paths: [RouterPath] = [
+    let paths = [
         "/xrpc/com.atproto.space.getLatestCommit",
-        RouterPath("/xrpc/\(spaceGetRepoStateAliasNSID)"),
+        "/xrpc/\(spaceGetRepoStateAliasNSID)",
     ]
-    for path in paths {
+    for fixedPath in paths {
+        let path = RouterPath(fixedPath)
+        let handler = AuthenticatedGetLatestCommitHandler(
+            capability: capability, fixedPath: fixedPath
+        )
         router.get(path) { request, _ async -> Response in
             let parameters: ComAtprotoSpaceGetLatestCommit.Parameters
             do {

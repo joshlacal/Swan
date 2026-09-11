@@ -300,9 +300,13 @@ private func authorizeBlobRead(
             throw AuthenticatedSpaceBlobFailure.denied
         }
         do {
-            return try await verifier.authorization(
-                for: bearer,
+            return try await capability.authorizer.authorizeSpaceCredential(
+                bearer,
+                verifier: verifier,
+                request: request,
                 expectedSpace: expectedSpace,
+                method: "GET",
+                fixedPath: "/xrpc/com.atproto.space.getBlob",
                 now: Date()
             )
         } catch let error as SwanError {

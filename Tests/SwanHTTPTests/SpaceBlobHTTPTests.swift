@@ -509,15 +509,21 @@ private extension SpaceBlobHTTPTests {
                 + "&repo=\(SpaceBlobHTTPTests.author)&cid=\(cid)"
         }
 
-        func credentialHeaders() -> HTTPFields {
-            [.authorization: "Bearer stub-space-credential"]
+        func credentialHeaders() throws -> HTTPFields {
+            let token = try PermissionedDataJWT.createSpaceCredential(
+                issuer: SpaceBlobHTTPTests.author,
+                space: space,
+                key: SpaceCredentialDPoPTestSupport.key,
+                dpopKeyThumbprint: SpaceCredentialDPoPTestSupport.thumbprint
+            )
+            return try SpaceCredentialDPoPTestSupport.headers(token: token, path: SpaceBlobHTTPTests.path)
         }
     }
 }
 
-/// Grants exactly the aggregate space read the route requires, without
-/// standing up a credential authority: the finding is about admission, and a
-/// real credential would only add unrelated failure modes to these tests.
+/// Grants exactly the aggregate space read the route requires. The request
+/// still carries a signed, key-bound credential and a real DPoP presentation;
+/// only authority trust resolution is stubbed to isolate admission behavior.
 private struct StubSpaceCredentialVerifier: SpaceCredentialAuthorizationVerifier {
     let space: SpaceURI
 

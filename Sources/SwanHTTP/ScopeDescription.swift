@@ -33,10 +33,7 @@ enum ConsentScope: Sendable, Hashable {
     struct SpaceGrant: Sendable, Hashable {
         let type: String        // NSID, or "*"
         let authority: String   // DID, "self" (unresolved default), or "*"
-        /// A specific record key, or "*" (default — every record). D19 gap
-        /// found in review: dropping this field made a single-record grant
-        /// (`skey=abc123`) and an every-record grant (`skey=*`, the default)
-        /// render identically.
+        /// A specific space key, or "*" (default — every matching space).
         let skey: String
         let actions: [String]   // subset of read_self/read/create/update/delete
         let manage: [String]    // subset of create/update/delete (space lifecycle)
@@ -277,16 +274,19 @@ enum ScopeDescription {
         if grant.actions.contains("read") {
             details.append("read all data in the space")
         } else if grant.actions.contains("read_self") {
-            details.append("read only your own data")
+            details.append("read only your own data across all collections in the space")
         }
         let writeVerbs = grant.actions.filter { ["create", "update", "delete"].contains($0) }
-        // Empty `collection` means no write targets even if write verbs are
-        // present — §5.6.2. "empty means NO WRITE TARGETS, not all collections".
+        // Explicit collections constrain writes only. For a concrete space
+        // type, an omitted collection uses the declaration's live defaults;
+        // a wildcard type has no declaration and therefore no default targets.
         if !writeVerbs.isEmpty, !grant.collection.isEmpty {
             let target = grant.collection.contains("*")
                 ? "any collection"
                 : grant.collection.map { "<code>\(escape($0))</code>" }.joined(separator: ", ")
             details.append("\(joinedProse(writeVerbs)) records in \(target)")
+        } else if !writeVerbs.isEmpty, grant.type != "*" {
+            details.append("\(joinedProse(writeVerbs)) records in this space type's declared collections, which may change")
         }
         if details.isEmpty { details.append("no access") }
         return "<li><b>\(spaceLabel(grant))</b>: \(details.joined(separator: "; ")).</li>"
@@ -301,15 +301,8 @@ enum ScopeDescription {
         default: base = "\(typeLabel) on <code>\(escape(grant.authority))</code>"
         }
         guard grant.skey != "*" else { return base }
-        // A specific `skey` narrows the WHOLE grant — read, write, and
-        // manage alike — to one record, not just a subset of reads (§5.6.3's
-        // match arms all consult `skey` before any operation-specific
-        // check). This has to be visible in the label itself, not buried
-        // among the per-verb detail below, since it changes what every verb
-        // there actually means: found in review as a live D19 gap — without
-        // it, `skey=abc123` (one record) and the `skey=*` default (every
-        // record in the space) rendered identically.
-        return "\(base), limited to one record (<code>\(escape(grant.skey))</code>)"
+        // skey selects spaces, never individual records within a space.
+        return "\(base), limited to space key <code>\(escape(grant.skey))</code>"
     }
 
     /// S4.2 — the one canonical wording for an unexpanded or empty `include:`

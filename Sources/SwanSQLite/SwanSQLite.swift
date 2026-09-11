@@ -1308,6 +1308,19 @@ public enum SQLiteLayout {
         """,
         """
         CREATE INDEX IF NOT EXISTS
+            permissioned_remote_replica_import_index_unconsumed_canonical
+        ON permissioned_remote_replica_import_index(
+            session_id, length(path), path
+        ) WHERE consumed = 0
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
+            permissioned_remote_replica_import_index_consumed_cid
+        ON permissioned_remote_replica_import_index(session_id, cid)
+        WHERE consumed = 1
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
             permissioned_remote_replica_import_index_cid
         ON permissioned_remote_replica_import_index(session_id, cid)
         """,
@@ -2034,6 +2047,12 @@ public struct PersistedSpaceNotificationFanout: Sendable, Equatable {
         self.endpoint = endpoint
         self.attempts = attempts
     }
+}
+
+/// A current delivery binding read together with its durable deletion intent.
+/// A nil service identity denotes a legacy endpoint requiring the operator map.
+public struct PersistedSpaceDeletionDeliveryRegistration: Sendable {
+    public let serviceIdentity: String?
 }
 
 /// A lease for one authority fanout intent. The endpoint is exposed only to a
@@ -5048,13 +5067,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     id, space_uri, author_did, revision,
                     payload, attempts, created_at, available_at,
                     lease_token, lease_expires_at
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL)
+                ) SELECT ?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM permissioned_space_recipient_tombstones
+                    WHERE space_uri = ?
+                )
                 """,
                 [
                     .text(eventID.uuidString), .text(space.rawValue),
                     .text(author), .integer(storedFinalRevision),
                     blob(notificationPayload), .integer(createdAt),
-                    .integer(createdAt),
+                    .integer(createdAt), .text(space.rawValue),
                 ]
             )
 
@@ -5250,12 +5273,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
     public func repositorySnapshot(
         space: SpaceURI,
-        author: String
+        author: String,
+        authorization: AuthorizationContext? = nil
     ) async throws -> PersistedRepositorySnapshot? {
         try requireAccount(author)
         return try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space, connection: readConnection)
+                try await requireLocalRepositorySpaceOpen(space, authorization: authorization, connection: readConnection)
                 return try await repositorySnapshotWithoutTransaction(
                     space: space,
                     author: author,
@@ -6133,7 +6157,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// transaction open.
     public func prepareRepositoryCARSnapshot(
         space: SpaceURI,
-        author: String
+        author: String,
+        authorization: AuthorizationContext? = nil
     ) async throws -> AuthorizedSpaceRepositoryCARSnapshot? {
         try requireAccount(author)
         let admission = testingHooks.permissionedCARSpoolAdmission ?? sqlitePermissionedCARSpoolAdmission
@@ -6141,7 +6166,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await withRepositoryCARIndexTable {
                 try await writerReadTransaction {
                     try Task.checkCancellation()
-                    try await requireLocalRepositorySpaceOpen(space)
+                    try await requireLocalRepositorySpaceOpen(space, authorization: authorization)
                     guard let state = try await loadState(space: space, author: author) else {
                         return nil
                     }
@@ -6301,61 +6326,38 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try indexHandle.close()
         indexClosed = true
 
-        var lexicalCursor: (collection: String, rkey: String)?
+        var recordCursor: (length: Int, pathBytes: Data)?
         var visitedCount = 0
         while true {
             try Task.checkCancellation()
-            guard let selected = try await nextRepositoryCARRecord(
-                space: space,
-                author: author,
-                after: lexicalCursor
-            ) else {
-                break
-            }
-            let record = selected.record
-            if let cursor = lexicalCursor,
-               record.uri.collection < cursor.collection ||
-               (record.uri.collection == cursor.collection && record.uri.rkey <= cursor.rkey) {
+            guard let record = try await nextRepositoryCARIndexRecord(
+                space: space, author: author, after: recordCursor
+            ) else { break }
+            let pathBytes = Data("\(record.uri.collection)/\(record.uri.rkey)".utf8)
+            if let cursor = recordCursor,
+               pathBytes.count < cursor.length
+                || (pathBytes.count == cursor.length
+                    && !cursor.pathBytes.lexicographicallyPrecedes(pathBytes)) {
                 throw SQLiteRepositoryError.corruptDatabase("permissioned CAR record order is invalid")
             }
             let cid = try repositoryCARCID(for: record)
-            if selected.shouldEmit {
-                guard record.valueByteCount
-                    <= SpaceCARProductionLimits.maximumRecordBytes
-                else {
-                    throw SpaceCARProductionLimits.limitExceeded()
-                }
-                let blockPrefix = try SpaceCARCodec.streamingBlockPrefix(
-                    cid: cid,
-                    dataLength: record.valueByteCount
-                )
-                let (blockByteCount, overflow) = blockPrefix.count
-                    .addingReportingOverflow(record.valueByteCount)
-                guard !overflow else {
-                    throw SpaceCARProductionLimits.limitExceeded()
-                }
-                try reserveRepositoryCARBodyBytes(
-                    blockByteCount,
-                    currentByteCount: &bodyByteCount
-                )
-                try writeCARSpoolData(blockPrefix, to: bodyHandle)
-                try await streamAndValidateRepositoryCARValue(
-                    for: record,
-                    expectedCID: cid,
-                    to: bodyHandle
-                )
-                try await markRepositoryCARCIDEmitted(cid.string)
-            } else {
-                // A shared CID still requires validating every persisted value.
-                // Otherwise a corrupt duplicate row could be hidden behind the
-                // one canonical CAR block emitted for an earlier path.
-                try await streamAndValidateRepositoryCARValue(
-                    for: record,
-                    expectedCID: cid,
-                    to: nil
-                )
+            guard record.valueByteCount <= SpaceCARProductionLimits.maximumRecordBytes else {
+                throw SpaceCARProductionLimits.limitExceeded()
             }
-            lexicalCursor = (record.uri.collection, record.uri.rkey)
+            let blockPrefix = try SpaceCARCodec.streamingBlockPrefix(
+                cid: cid, dataLength: record.valueByteCount
+            )
+            let (blockByteCount, overflow) = blockPrefix.count
+                .addingReportingOverflow(record.valueByteCount)
+            guard !overflow else { throw SpaceCARProductionLimits.limitExceeded() }
+            try reserveRepositoryCARBodyBytes(blockByteCount, currentByteCount: &bodyByteCount)
+            try writeCARSpoolData(blockPrefix, to: bodyHandle)
+            // The reference wire format requires one frame per indexed path;
+            // even shared CIDs are emitted and validated for every record.
+            try await streamAndValidateRepositoryCARValue(
+                for: record, expectedCID: cid, to: bodyHandle
+            )
+            recordCursor = (pathBytes.count, pathBytes)
             visitedCount += 1
         }
         guard visitedCount == recordCount else {
@@ -6467,14 +6469,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         _ = try await connection.query(
             """
             INSERT INTO temp.swan_repository_car_index(
-                path_length, path_bytes, collection, rkey, cid, emitted
+                path_length, path_bytes, collection, rkey, cid
             )
             SELECT length(CAST(collection || '/' || rkey AS BLOB)),
                    CAST(collection || '/' || rkey AS BLOB),
                    collection,
                    rkey,
-                   cid,
-                   0
+                   cid
             FROM permissioned_space_records
             WHERE space_uri = ? AND author_did = ?
             """,
@@ -6554,103 +6555,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
     }
 
-    /// The proposal requires record blocks to follow lexicographic
-    /// `collection/rkey` order, which is intentionally distinct from the
-    /// canonical map-key order used for the DRISL index.
-    private func nextRepositoryCARRecord(
-        space: SpaceURI,
-        author: String,
-        after cursor: (collection: String, rkey: String)?
-    ) async throws -> (
-        record: RepositoryCARRecordMetadata,
-        shouldEmit: Bool
-    )? {
-        let rows: [SQLiteRow]
-        if let cursor {
-            rows = try await connection.query(
-                """
-                SELECT records.collection, records.rkey,
-                       records.cid, records.revision,
-                       length(records.value) AS value_byte_count,
-                       metadata.emitted AS car_cid_emitted
-                FROM permissioned_space_records AS records
-                JOIN temp.swan_repository_car_index AS metadata
-                  ON metadata.collection = records.collection
-                 AND metadata.rkey = records.rkey
-                 AND metadata.cid = records.cid
-                WHERE records.space_uri = ? AND records.author_did = ?
-                  AND (records.collection, records.rkey) > (?, ?)
-                ORDER BY records.collection, records.rkey
-                LIMIT 1
-                """,
-                [
-                    .text(space.rawValue), .text(author),
-                    .text(cursor.collection), .text(cursor.rkey),
-                ]
-            )
-        } else {
-            rows = try await connection.query(
-                """
-                SELECT records.collection, records.rkey,
-                       records.cid, records.revision,
-                       length(records.value) AS value_byte_count,
-                       metadata.emitted AS car_cid_emitted
-                FROM permissioned_space_records AS records
-                JOIN temp.swan_repository_car_index AS metadata
-                  ON metadata.collection = records.collection
-                 AND metadata.rkey = records.rkey
-                 AND metadata.cid = records.cid
-                WHERE records.space_uri = ? AND records.author_did = ?
-                ORDER BY records.collection, records.rkey
-                LIMIT 1
-                """,
-                [.text(space.rawValue), .text(author)]
-            )
-        }
-        guard let row = rows.first else { return nil }
-        guard let emitted = row.column("car_cid_emitted")?.integer,
-              emitted == 0 || emitted == 1
-        else {
-            throw SQLiteRepositoryError.corruptDatabase(
-                "permissioned CAR CID projection is invalid"
-            )
-        }
-        return (
-            try decodeRepositoryCARRecordMetadata(
-                row,
-                space: space,
-                author: author
-            ),
-            emitted == 0
-        )
-    }
-
-    private func markRepositoryCARCIDEmitted(_ cid: String) async throws {
-        _ = try await connection.query(
-            """
-            UPDATE temp.swan_repository_car_index
-            SET emitted = 1
-            WHERE cid = ? AND emitted = 0
-            """,
-            [.text(cid)]
-        )
-        // This runs while the caller owns `connectionGate`, so no other
-        // statement can replace SQLite's connection-local changes count
-        // between the UPDATE and this constant-size scalar query.
-        let rows = try await connection.query(
-            "SELECT changes() AS changed_count"
-        )
-        guard rows.count == 1,
-              let changed = rows[0].column("changed_count")?.integer,
-              changed > 0,
-              changed <= SpaceCARProductionLimits.maximumRecordCount
-        else {
-            throw SQLiteRepositoryError.corruptDatabase(
-                "permissioned CAR CID projection is invalid"
-            )
-        }
-    }
-
     private struct RepositoryCARRecordMetadata {
         let uri: SpaceRecordURI
         let cid: String
@@ -6690,8 +6594,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try CID.parse(record.cid)
     }
 
-    /// Hashes every persisted record through bounded SQLite BLOB slices and,
-    /// for the first path referencing a CID, copies those same slices into the
+    /// Hashes every persisted record through bounded SQLite BLOB slices and
+    /// copies those same slices into the
     /// private CAR spool. Avoiding a full `SQLiteRow` BLOB here is essential:
     /// Foundation's debug allocator can retain one freed ~1 MiB region per row,
     /// turning a nominally streaming 256 MiB read into a 256 MiB RSS increase.
@@ -6806,12 +6710,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// commitment and wire TID.
     public func repositoryState(
         space: SpaceURI,
-        author: String
+        author: String,
+        authorization: AuthorizationContext? = nil
     ) async throws -> PersistedRepositoryState? {
         try requireAccount(author)
         let state = try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space, connection: readConnection)
+                try await requireLocalRepositorySpaceOpen(space, authorization: authorization, connection: readConnection)
                 return try await loadState(space: space, author: author, connection: readConnection)
             }
         }
@@ -6839,8 +6744,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 // `UNION` de-duplicates exact identity rows before Swift
                 // validates their canonical `SpaceURI` spelling and applies
                 // type/authority/cursor paging.  A local authority deletion,
-                // recipient tombstone, or v1 restored-policy closure always
-                // wins over a repository-state row.
+                // or v1 restored-policy closure always wins over a repository
+                // row. A syncer deletion notice preserves this account's own
+                // authored repository and its self-read projection.
                 let rows = try await readConnection.query(
                     """
                     SELECT space_uri, MAX(is_local_authority) AS is_local_authority
@@ -6849,11 +6755,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         FROM permissioned_simple_space_authorities AS a
                         WHERE a.owner_did = ?
                           AND a.is_deleted = 0
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM permissioned_space_recipient_tombstones AS t
-                              WHERE t.space_uri = a.space_uri
-                          )
                         UNION
                         SELECT r.space_uri AS space_uri, 0 AS is_local_authority
                         FROM permissioned_repository_state AS r
@@ -6862,11 +6763,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                               SELECT 1
                               FROM permissioned_simple_space_authorities AS a
                               WHERE a.space_uri = r.space_uri AND a.is_deleted != 0
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM permissioned_space_recipient_tombstones AS t
-                              WHERE t.space_uri = r.space_uri
                           )
                           AND NOT EXISTS (
                               SELECT 1
@@ -6955,12 +6851,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     }
 
     public func spaceRecord(
-        _ uri: SpaceRecordURI
+        _ uri: SpaceRecordURI,
+        authorization: AuthorizationContext? = nil
     ) async throws -> PersistedSpaceRecord? {
         try requireAccount(uri.author)
         return try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(uri.space, connection: readConnection)
+                try await requireLocalRepositorySpaceOpen(uri.space, authorization: authorization, connection: readConnection)
                 guard try await loadState(space: uri.space, author: uri.author, connection: readConnection) != nil else {
                     return nil
                 }
@@ -7021,7 +6918,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         author: String,
         since: String?,
         cursor: String?,
-        limit: Int
+        limit: Int,
+        authorization: AuthorizationContext? = nil
     ) async throws -> [String] {
         try requireAccount(author)
         guard (1 ... 1_000).contains(limit) else {
@@ -7043,9 +6941,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
         sql += " ORDER BY blob_cid ASC LIMIT ?"
         bindings.append(.integer(limit))
-        return try await withConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
-                let rows = try await connection.query(sql, bindings)
+                try await requireLocalRepositorySpaceOpen(space, authorization: authorization, connection: readConnection)
+                let rows = try await readConnection.query(sql, bindings)
                 return try rows.map { try requiredText($0, "blob_cid") }
             }
         }
@@ -7059,7 +6958,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         cursorRKey: String?,
         reverse: Bool,
         limit: Int,
-        maximumAggregateRecordBytes: Int
+        maximumAggregateRecordBytes: Int,
+        authorization: AuthorizationContext? = nil
     ) async throws -> [PersistedSpaceRecord] {
         try requireAccount(author)
         guard (1 ... 100).contains(limit),
@@ -7086,7 +6986,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
         return try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space, connection: readConnection)
+                try await requireLocalRepositorySpaceOpen(space, authorization: authorization, connection: readConnection)
                 var predicates = [
                     "space_uri = ?",
                     "author_did = ?",
@@ -7183,12 +7083,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     public func spaceOplog(
         space: SpaceURI,
         author: String,
-        since requestedRevision: UInt64
+        since requestedRevision: UInt64,
+        authorization: AuthorizationContext? = nil
     ) async throws -> PersistedOplogRead {
         try requireAccount(author)
         return try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space, connection: readConnection)
+                try await requireLocalRepositorySpaceOpen(space, authorization: authorization, connection: readConnection)
                 return try await spaceOplogWithoutTransaction(
                     space: space,
                     author: author,
@@ -7216,7 +7117,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         limit: Int,
         includeValues: Bool,
         maximumAggregateValueBytes: Int = PublicRepositoryJSONReadLimits
-            .maximumListRepoOpsValueBytes
+            .maximumListRepoOpsValueBytes,
+        authorization: AuthorizationContext? = nil
     ) async throws -> PersistedWireOplogRead {
         try requireAccount(author)
         guard (1 ... 1_000).contains(limit),
@@ -7225,7 +7127,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
         return try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space, connection: readConnection)
+                try await requireLocalRepositorySpaceOpen(space, authorization: authorization, connection: readConnection)
                 return try await wireOplogWithoutTransaction(
                     space: space,
                     author: author,
@@ -7442,12 +7344,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     public func spaceOplog(
         space: SpaceURI,
         author: String,
-        after cursor: PersistedOplogCursor?
+        after cursor: PersistedOplogCursor?,
+        authorization: AuthorizationContext? = nil
     ) async throws -> PersistedOplogRead {
         try requireAccount(author)
         return try await withReadConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space, connection: readConnection)
+                try await requireLocalRepositorySpaceOpen(space, authorization: authorization, connection: readConnection)
                 return try await spaceOplogWithoutTransaction(
                     space: space,
                     author: author,
@@ -7577,7 +7480,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     ) async throws -> DurableSimpleSpaceState {
         try validateSimpleSpaceConfiguration(configuration)
         let timestamp = try simpleSpaceTimestamp(now)
-        return try await withConnectionGate {
+        let createdState = try await withConnectionGate {
             try await transaction {
                 try requireAuthorityAccount(space: space, owner: owner)
                 try requireAuthorityManagement(
@@ -7609,6 +7512,20 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                           (row.column("is_deleted")?.integer ?? 0) != 0 else {
                         throw SwanError.conflict(expected: 0, actual: 1)
                     }
+                    // Older Swan tombstones retained the authority repo.
+                    // Reviving one is a fresh create, never a way to expose
+                    // pre-deletion records or reapply old managing decisions.
+                    try await deleteAuthorityRepositoryWithoutGate(space: space)
+                    // A fresh incarnation cannot inherit either subscriptions
+                    // or queued deletion signals from its predecessor.
+                    _ = try await connection.query(
+                        "DELETE FROM permissioned_space_notification_fanout WHERE space_uri = ?",
+                        [.text(space.rawValue)]
+                    )
+                    _ = try await connection.query(
+                        "DELETE FROM permissioned_space_notification_registrations WHERE space_uri = ?",
+                        [.text(space.rawValue)]
+                    )
                     let storedRevision = try requiredRevision(row, "revision")
                     let nextRevision = try nextSimpleSpaceRevision(storedRevision)
                     _ = try await connection.query(
@@ -7681,6 +7598,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 return try await requiredSimpleSpace(space).state
             }
         }
+        try await recoverPrivateBlobLifecycle()
+        return createdState
     }
 
     /// Reads authority facts from the account database. This local storage API
@@ -8316,7 +8235,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         now: Date = Date()
     ) async throws -> DurableSimpleSpaceState {
         let timestamp = try simpleSpaceTimestamp(now)
-        return try await withConnectionGate {
+        let deletedState = try await withConnectionGate {
             try await transaction {
                 try requireAuthorityAccount(space: space)
                 try requireAuthorityManagement(
@@ -8325,7 +8244,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     operation: .delete
                 )
                 let stored = try await requiredSimpleSpace(space)
-                guard !stored.state.space.isDeleted else { return stored.state }
+                if stored.state.space.isDeleted {
+                    // Retry also repairs tombstones created before authority
+                    // repository cleanup became part of deletion.
+                    try await deleteAuthorityRepositoryWithoutGate(space: space)
+                    try await pruneCompletedDeletionRegistrationsWithoutGate(space: space)
+                    return try await requiredSimpleSpace(space).state
+                }
                 let nextRevision = try nextSimpleSpaceRevision(stored.state.revision)
                 _ = try await connection.query(
                     """
@@ -8344,6 +8269,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     "DELETE FROM permissioned_space_writers WHERE space_uri = ?",
                     [.text(space.rawValue)]
                 )
+                try await deleteAuthorityRepositoryWithoutGate(space: space)
                 // The lifecycle tombstone and every registered-recipient
                 // notification intent commit together.  Delivery happens
                 // later through the lease worker; endpoint strings stay
@@ -8378,9 +8304,125 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         ]
                     )
                 }
+                // Delivery rechecks this registration's expiry and resolved
+                // service audience. Retain it until its deletion intent drains;
+                // an idempotent delete must not cancel pending delivery either.
+                try await pruneCompletedDeletionRegistrationsWithoutGate(space: space)
                 return try await requiredSimpleSpace(space).state
             }
         }
+        // Physical deletion takes the existing per-digest lifecycle lock,
+        // outside the SQLite transaction. A concurrent re-reference wins over
+        // reclamation, and a crash leaves a durable intent for startup repair.
+        try await recoverPrivateBlobLifecycle()
+        return deletedState
+    }
+
+    /// Preserve the registration facts needed by pending deletion deliveries,
+    /// and reclaim them once their exact endpoint has no deletion intent left.
+    /// A live/recreated authority never loses a current registration here.
+    private func pruneCompletedDeletionRegistrationsWithoutGate(space: SpaceURI) async throws {
+        _ = try await connection.query(
+            """
+            DELETE FROM permissioned_space_notification_registrations
+            WHERE space_uri = ?
+              AND EXISTS (
+                  SELECT 1 FROM permissioned_simple_space_authorities AS authority
+                  WHERE authority.space_uri = permissioned_space_notification_registrations.space_uri
+                    AND authority.is_deleted != 0
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM permissioned_space_notification_fanout AS pending
+                  WHERE pending.space_uri = permissioned_space_notification_registrations.space_uri
+                    AND pending.endpoint = permissioned_space_notification_registrations.endpoint
+                    AND pending.kind = 'deleted'
+              )
+            """,
+            [.text(space.rawValue)]
+        )
+    }
+
+    /// Deletes only the authority's own repository in this account database.
+    /// Other members own their repositories and are never visited here.
+    private func deleteAuthorityRepositoryWithoutGate(space: SpaceURI) async throws {
+        let repositoryValues: [SQLiteData] = [
+            .text(space.rawValue), .text(accountDID),
+        ]
+        for table in [
+            "permissioned_space_record_blobs",
+            "permissioned_space_records",
+            "permissioned_space_oplog",
+            "permissioned_space_requests",
+            "permissioned_space_outbox",
+            "permissioned_repository_state",
+            "permissioned_restored_repository_closures",
+        ] {
+            _ = try await connection.query(
+                "DELETE FROM \(table) WHERE space_uri = ? AND author_did = ?",
+                repositoryValues
+            )
+        }
+        // Pre-permissioned-repository storage used account-local tables
+        // without an author column. This database is the authority's, so the
+        // exact space selector cannot reach another member's repository.
+        for table in ["space_records", "space_oplog"] {
+            _ = try await connection.query(
+                "DELETE FROM \(table) WHERE space_uri = ?",
+                [.text(space.rawValue)]
+            )
+        }
+        _ = try await connection.query(
+            "DELETE FROM permissioned_space_notification_fanout WHERE space_uri = ? AND kind = 'write'",
+            [.text(space.rawValue)]
+        )
+        _ = try await connection.query(
+            "DELETE FROM permissioned_simple_space_managing_app_decisions WHERE space_uri = ?",
+            [.text(space.rawValue)]
+        )
+
+        // Mark only payloads whose last namespace edge is this space. Shared
+        // public/other-space payloads retain their metadata and private file.
+        // The set-based operations keep a large blob set out of process memory.
+        _ = try await connection.query(
+            """
+            INSERT INTO blob_cas_lifecycle(digest_hex, state, updated_at)
+            SELECT DISTINCT payload.cas_digest, 'reclaiming', ?
+            FROM blob_payloads AS payload
+            JOIN blob_namespace_references AS target ON target.cid = payload.cid
+            WHERE target.namespace_kind = 'space' AND target.space_uri = ?
+              AND payload.storage_kind = 'cas-v1'
+              AND NOT EXISTS (
+                  SELECT 1 FROM blob_namespace_references AS other
+                  WHERE other.cid = payload.cid
+                    AND (other.namespace_kind != 'space' OR other.space_uri != ?)
+              )
+            ON CONFLICT(digest_hex) DO UPDATE SET
+                state = excluded.state, updated_at = excluded.updated_at
+            """,
+            [
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+                .text(space.rawValue), .text(space.rawValue),
+            ]
+        )
+        _ = try await connection.query(
+            """
+            DELETE FROM blob_payloads
+            WHERE cid IN (
+                SELECT target.cid FROM blob_namespace_references AS target
+                WHERE target.namespace_kind = 'space' AND target.space_uri = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM blob_namespace_references AS other
+                      WHERE other.cid = target.cid
+                        AND (other.namespace_kind != 'space' OR other.space_uri != ?)
+                  )
+            )
+            """,
+            [.text(space.rawValue), .text(space.rawValue)]
+        )
+        _ = try await connection.query(
+            "DELETE FROM blob_namespace_references WHERE namespace_kind = 'space' AND space_uri = ?",
+            [.text(space.rawValue)]
+        )
     }
 
     // MARK: Authority writer set and notification registry
@@ -8700,6 +8742,50 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return true
     }
 
+    /// Atomically binds a queued deletion's exact identity to its still-active
+    /// registration. Recreating a space cancels old intents, including events
+    /// a worker has already leased into memory; reusing the endpoint cannot
+    /// make that predecessor's deletion current again.
+    public func currentSpaceDeletionDeliveryRegistration(
+        for notification: PersistedSpaceNotificationFanout,
+        now: Date = Date()
+    ) async throws -> PersistedSpaceDeletionDeliveryRegistration? {
+        try requireAuthorityAccount(space: notification.space)
+        guard notification.kind == .deleted,
+              notification.sourceIssuer == notification.space.authority,
+              notification.repository == nil, notification.wireRevision == nil,
+              notification.commitment == nil else { return nil }
+        let timestamp = try simpleSpaceTimestamp(now)
+        return try await withReadConnectionGate {
+            try await readTransaction {
+                let rows = try await readConnection.query(
+                    """
+                    SELECT registration.delivery_service_did
+                    FROM permissioned_space_notification_fanout AS pending
+                    JOIN permissioned_space_notification_registrations AS registration
+                      ON registration.space_uri = pending.space_uri
+                     AND registration.endpoint = pending.endpoint
+                    WHERE pending.id = ? AND pending.source_issuer = ?
+                      AND pending.source_event_id = ? AND pending.kind = 'deleted'
+                      AND pending.space_uri = ? AND pending.endpoint = ?
+                      AND registration.expires_at > ?
+                    """,
+                    [
+                        .text(notification.id.uuidString), .text(notification.sourceIssuer),
+                        .text(notification.sourceEventID), .text(notification.space.rawValue),
+                        .text(notification.endpoint), .integer(timestamp),
+                    ]
+                )
+                guard let row = rows.first else { return nil }
+                let service = row.column("delivery_service_did")?.string
+                if let service, !Self.isValidNotificationServiceIdentity(service) {
+                    throw SwanError.unavailable("registered notification destination is unavailable")
+                }
+                return PersistedSpaceDeletionDeliveryRegistration(serviceIdentity: service)
+            }
+        }
+    }
+
     /// The active registration's service identity for one `(space, endpoint)`
     /// row, or `nil` when the row is absent, expired, filtered out by its
     /// per-repo binding, or a legacy endpoint-only registration. Delivery
@@ -8942,9 +9028,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 // The pinned receiver bounds this by no-oping unless the
                 // recipient already knows the space
                 // (`packages/pds/src/api/com/atproto/space/notifySpaceDeleted.ts:33-34`).
-                // Participation here is the same pair of facts the hosted
-                // space projection reports: an authority row this account
-                // owns, or a local repository row it authored.
+                // A syncer may have only a downloaded replica or an in-flight
+                // import. A member's own authored repository is a separate
+                // storage plane and remains available to that account.
                 let participation = try await connection.query(
                     """
                     SELECT 1
@@ -8954,11 +9040,22 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     SELECT 1
                     FROM permissioned_simple_space_authorities
                     WHERE space_uri = ? AND owner_did = ?
+                    UNION ALL
+                    SELECT 1 FROM permissioned_remote_replica_state
+                    WHERE space_uri = ?
+                    UNION ALL
+                    SELECT 1 FROM permissioned_remote_replica_import_sessions
+                    WHERE space_uri = ?
+                    UNION ALL
+                    SELECT 1 FROM permissioned_space_recipient_tombstones
+                    WHERE space_uri = ?
                     LIMIT 1
                     """,
                     [
                         .text(space.rawValue), .text(accountDID),
                         .text(space.rawValue), .text(accountDID),
+                        .text(space.rawValue), .text(space.rawValue),
+                        .text(space.rawValue),
                     ]
                 )
                 guard !participation.isEmpty else { return }
@@ -8970,7 +9067,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     """,
                     [.text(space.rawValue)]
                 )
-                guard tombstones.isEmpty else { return }
                 let duplicate = try await connection.query(
                     """
                     SELECT action, space_uri, request_digest
@@ -8985,28 +9081,26 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                           prior.column("request_digest")?.string == expectedDigest else {
                         throw SwanError.unauthorized("service event was bound to different request")
                     }
-                    return
                 }
-                _ = try await connection.query(
-                    """
-                    INSERT INTO permissioned_space_notification_receipts(
-                        issuer, event_id, action, space_uri, request_digest, received_at
-                    ) VALUES (?, ?, 'deleted', ?, ?, ?)
-                    """,
-                    [
-                        .text(issuer), .text(eventID),
-                        .text(space.rawValue),
-                        .text(expectedDigest),
-                        .integer(timestamp),
-                    ]
-                )
-                // A recipient may retain a local repository for its own
-                // writes in this remote space. Persist a closure rather than
-                // creating a synthetic remote authority row or applying any
-                // remote operation. All local repository read/write entry
-                // points consult this tombstone, and stale writer outbox rows
-                // are removed in the same transaction so a later restart
-                // cannot announce a deleted repository.
+                if duplicate.isEmpty, tombstones.isEmpty {
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO permissioned_space_notification_receipts(
+                            issuer, event_id, action, space_uri, request_digest, received_at
+                        ) VALUES (?, ?, 'deleted', ?, ?, ?)
+                        """,
+                        [
+                            .text(issuer), .text(eventID),
+                            .text(space.rawValue),
+                            .text(expectedDigest),
+                            .integer(timestamp),
+                        ]
+                    )
+                }
+                // Durable notice revokes synchronized access and prevents a
+                // delayed import from reinstalling replicas. It does not erase
+                // the recipient account's own authored repository or blob
+                // namespace; explicit self-read remains available after deletion.
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_recipient_tombstones(
@@ -9019,6 +9113,25 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         .integer(timestamp),
                     ]
                 )
+                // Records must precede blocks because their FK deliberately
+                // has no cascade. Block chunks and import staging cascade from
+                // their exact-space parent rows. Repeat notices also clean up
+                // replica residue left by older versions of this receiver.
+                for table in [
+                    "permissioned_remote_replica_records",
+                    "permissioned_remote_replica_blocks",
+                    "permissioned_remote_replica_state",
+                    "permissioned_remote_replica_import_sessions",
+                    "permissioned_remote_replica_import_results",
+                    "permissioned_remote_replica_incremental_results",
+                    "permissioned_remote_replica_incremental_progress",
+                    "permissioned_space_writers",
+                ] {
+                    _ = try await connection.query(
+                        "DELETE FROM \(table) WHERE space_uri = ?",
+                        [.text(space.rawValue)]
+                    )
+                }
                 _ = try await connection.query(
                     "DELETE FROM permissioned_space_outbox WHERE space_uri = ?",
                     [.text(space.rawValue)]
@@ -9029,7 +9142,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     SET lease_token = NULL,
                         lease_expires_at = NULL,
                         available_at = 9223372036854775807
-                    WHERE space_uri = ?
+                    WHERE space_uri = ? AND kind = 'write'
                     """,
                     [.text(space.rawValue)]
                 )
@@ -9061,7 +9174,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     authorization: authorization
                 )
                 let stored = try await requiredSimpleSpace(space, connection: readConnection)
-                try requireActiveSimpleSpace(stored.state)
+                guard !stored.state.space.isDeleted else {
+                    throw AuthorizedSimpleSpaceLifecycleError.deleted
+                }
                 switch stored.state.space.configuration.appAccess {
                 case .open:
                     break
@@ -9317,6 +9432,37 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
         let body = try await fileBackedBlobBody(stored)
         return PublicBlob(mimeType: stored.mimeType, body: body)
+    }
+
+    /// The anonymous repository read surface requires a current public record
+    /// reference as well as a public namespace edge. Edges are retained for
+    /// garbage collection and can outlive the last public record, including
+    /// when the same payload remains in a permissioned space.
+    func publicRepositoryBlob(cid: String) async throws -> PublicBlob? {
+        _ = try canonicalRawBlobCID(cid)
+        guard let stored = try await publicBlobMetadataIfReachable(
+            cid: cid,
+            namespaceKind: "public",
+            spaceURI: "",
+            requiringPublicRecord: true
+        ) else {
+            return nil
+        }
+        let body = try await fileBackedBlobBody(stored)
+        return PublicBlob(mimeType: stored.mimeType, body: body)
+    }
+
+    func publicRepositoryBlobMetadata(cid: String) async throws -> PublicBlobMetadata? {
+        _ = try canonicalRawBlobCID(cid)
+        guard let stored = try await publicBlobMetadataIfReachable(
+            cid: cid,
+            namespaceKind: "public",
+            spaceURI: "",
+            requiringPublicRecord: true
+        ) else {
+            return nil
+        }
+        return PublicBlobMetadata(mimeType: stored.mimeType, size: stored.byteCount)
     }
 
     public func publicBlobExists(cid: String) async throws -> Bool {
@@ -9586,7 +9732,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     public func permissionedBlob(
         space: SpaceURI,
         author: String,
-        cid: String
+        cid: String,
+        authorization: AuthorizationContext? = nil
     ) async throws -> AuthorizedSpaceBlob? {
         try requireAccount(author)
         guard author == accountDID else {
@@ -9595,7 +9742,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         _ = try canonicalRawBlobCID(cid)
         let stored = try await withReadConnectionGate {
             try await readTransaction {
-                try await requireReadablePermissionedBlobRepository(space, connection: readConnection)
+                try await requireReadablePermissionedBlobRepository(space, authorization: authorization, connection: readConnection)
                 return try await blobPayloadIfReachableWithoutGate(
                     cid: cid,
                     namespaceKind: "space",
@@ -9622,7 +9769,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     public func permissionedBlobMetadata(
         space: SpaceURI,
         author: String,
-        cid: String
+        cid: String,
+        authorization: AuthorizationContext? = nil
     ) async throws -> AuthorizedSpaceBlobMetadata? {
         try requireAccount(author)
         guard author == accountDID else {
@@ -9631,7 +9779,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         _ = try canonicalRawBlobCID(cid)
         let stored = try await withReadConnectionGate {
             try await readTransaction {
-                try await requireReadablePermissionedBlobRepository(space, connection: readConnection)
+                try await requireReadablePermissionedBlobRepository(space, authorization: authorization, connection: readConnection)
                 return try await blobPayloadIfReachableWithoutGate(
                     cid: cid,
                     namespaceKind: "space",
@@ -9812,6 +9960,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         try await requirePortableBlobRestoreRepository(
                             restoreRepositorySpace
                         )
+                    } else if case let .space(space) = namespace {
+                        // Recheck after CAS staging, in the same transaction
+                        // that publishes its edge, so a concurrent deletion
+                        // cannot recreate the closed space's blob namespace.
+                        try await requireLocalRepositorySpaceOpen(space)
                     }
                     try await admitBlobQuotaWithoutGate(
                         cid: cid,
@@ -10206,55 +10359,63 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private func publicBlobMetadataIfReachable(
         cid: String,
         namespaceKind: String,
-        spaceURI: String
+        spaceURI: String,
+        requiringPublicRecord: Bool = false
     ) async throws -> StoredBlobPayload? {
         try await withReadConnectionGate {
-            let rows = try await readConnection.query(
-                """
-                SELECT blob_payloads.cid, blob_payloads.storage_kind,
-                       blob_payloads.cas_digest, blob_payloads.byte_count,
-                       blob_payloads.mime_type
-                FROM blob_payloads
-                JOIN blob_namespace_references USING(cid)
-                WHERE blob_payloads.cid = ? AND namespace_kind = ? AND space_uri = ?
-                """,
-                [.text(cid), .text(namespaceKind), .text(spaceURI)]
-            )
-            guard let row = rows.first else { return nil }
-            let storedCID = try requiredText(row, "cid")
-            guard storedCID == cid,
-                  try requiredText(row, "storage_kind") == StoredBlobPayload.StorageKind.casV1.rawValue else {
-                throw SwanError.unavailable("public blob storage is unavailable")
-            }
-            guard let byteValue = row.column("byte_count"),
-                  !byteValue.isNull,
-                  let byteCount = byteValue.integer,
-                  byteCount >= 0 else {
-                throw SQLiteRepositoryError.corruptDatabase("missing public blob size")
-            }
-            let digest = try blobDigestHex(cid: storedCID, allowLegacy: false)
-            guard let storedDigest = row.column("cas_digest")?.string,
-                  storedDigest == digest,
-                  legacyBlobDigest("sha256:\(storedDigest)") != nil else {
-                throw SQLiteRepositoryError.corruptDatabase("invalid public blob CID")
-            }
-            let mimeType: String?
-            if let value = row.column("mime_type"), !value.isNull {
-                guard let raw = value.string else {
-                    throw SQLiteRepositoryError.corruptDatabase("invalid public blob MIME type")
+            try await readTransaction {
+                let rows = try await readConnection.query(
+                    """
+                    SELECT blob_payloads.cid, blob_payloads.storage_kind,
+                           blob_payloads.cas_digest, blob_payloads.byte_count,
+                           blob_payloads.mime_type
+                    FROM blob_payloads
+                    JOIN blob_namespace_references USING(cid)
+                    WHERE blob_payloads.cid = ? AND namespace_kind = ? AND space_uri = ?
+                    """,
+                    [.text(cid), .text(namespaceKind), .text(spaceURI)]
+                )
+                guard let row = rows.first else { return nil }
+                if requiringPublicRecord {
+                    guard try await publicRepositoryContainsBlobCIDWithoutGate(
+                        cid, connection: readConnection
+                    ) else { return nil }
                 }
-                mimeType = safeBlobMIMEType(raw)
-            } else {
-                mimeType = nil
+                let storedCID = try requiredText(row, "cid")
+                guard storedCID == cid,
+                      try requiredText(row, "storage_kind") == StoredBlobPayload.StorageKind.casV1.rawValue else {
+                    throw SwanError.unavailable("public blob storage is unavailable")
+                }
+                guard let byteValue = row.column("byte_count"),
+                      !byteValue.isNull,
+                      let byteCount = byteValue.integer,
+                      byteCount >= 0 else {
+                    throw SQLiteRepositoryError.corruptDatabase("missing public blob size")
+                }
+                let digest = try blobDigestHex(cid: storedCID, allowLegacy: false)
+                guard let storedDigest = row.column("cas_digest")?.string,
+                      storedDigest == digest,
+                      legacyBlobDigest("sha256:\(storedDigest)") != nil else {
+                    throw SQLiteRepositoryError.corruptDatabase("invalid public blob CID")
+                }
+                let mimeType: String?
+                if let value = row.column("mime_type"), !value.isNull {
+                    guard let raw = value.string else {
+                        throw SQLiteRepositoryError.corruptDatabase("invalid public blob MIME type")
+                    }
+                    mimeType = safeBlobMIMEType(raw)
+                } else {
+                    mimeType = nil
+                }
+                return StoredBlobPayload(
+                    cid: storedCID,
+                    storageKind: .casV1,
+                    byteCount: byteCount,
+                    mimeType: mimeType,
+                    casDigest: storedDigest,
+                    legacyPayload: nil
+                )
             }
-            return StoredBlobPayload(
-                cid: storedCID,
-                storageKind: .casV1,
-                byteCount: byteCount,
-                mimeType: mimeType,
-                casDigest: storedDigest,
-                legacyPayload: nil
-            )
         }
     }
 
@@ -10839,13 +11000,16 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     [.text(eventID.uuidString)]
                 )
                 guard let row = rows.first else { return false }
-                _ = try decodeNotificationFanout(row)
+                let event = try decodeNotificationFanout(row)
                 let lease = try decodeNotificationFanoutLease(row)
                 guard lease.token == token else { return false }
                 _ = try await connection.query(
                     "DELETE FROM permissioned_space_notification_fanout WHERE id = ? AND lease_token = ?",
                     [.text(eventID.uuidString), .text(token.uuidString)]
                 )
+                if event.kind == .deleted {
+                    try await pruneCompletedDeletionRegistrationsWithoutGate(space: event.space)
+                }
                 return true
             }
         }
@@ -11033,16 +11197,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 collection TEXT NOT NULL,
                 rkey TEXT NOT NULL,
                 cid TEXT NOT NULL,
-                emitted INTEGER NOT NULL DEFAULT 0
-                    CHECK(emitted IN (0, 1)),
                 PRIMARY KEY(path_length, path_bytes)
             ) WITHOUT ROWID
-            """
-        )
-        _ = try await connection.query(
-            """
-            CREATE INDEX temp.swan_repository_car_index_cid
-            ON swan_repository_car_index(cid, emitted)
             """
         )
         do {
@@ -11641,8 +11797,31 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// transaction is held, so it cannot race a deletion into a stale read or
     /// write. It intentionally does not reveal whether the receiver retained
     /// records before the closure.
-    private func requireLocalRepositorySpaceOpen(_ space: SpaceURI, connection: SQLiteConnection? = nil) async throws {
+    private func requireLocalRepositorySpaceOpen(
+        _ space: SpaceURI,
+        authorization: AuthorizationContext? = nil,
+        connection: SQLiteConnection? = nil
+    ) async throws {
         let conn = connection ?? self.connection
+        if let authorization {
+            try SpaceAuthorizationPolicy.require(
+                space: space, author: accountDID, uri: nil,
+                authorization: authorization, permission: .read
+            )
+        }
+        if space.authority == accountDID {
+            let authorityTombstones = try await conn.query(
+                """
+                SELECT 1 FROM permissioned_simple_space_authorities
+                WHERE space_uri = ? AND owner_did = ? AND is_deleted != 0
+                LIMIT 1
+                """,
+                [.text(space.rawValue), .text(accountDID)]
+            )
+            guard authorityTombstones.isEmpty else {
+                throw SwanError.unauthorized("permissioned space is closed")
+            }
+        }
         let rows = try await conn.query(
             "SELECT 1 FROM permissioned_space_recipient_tombstones WHERE space_uri = ?",
             [.text(space.rawValue)]
@@ -11655,15 +11834,33 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             """,
             [.text(space.rawValue), .text(accountDID)]
         )
-        guard rows.isEmpty, restoredClosures.isEmpty else {
+        guard restoredClosures.isEmpty else {
             throw SwanError.unauthorized("permissioned space is closed")
+        }
+        // Low-level operations without a request context are already confined
+        // to this account's own database (writes, restore, and offline export).
+        // Request reads carry the full verified context into this snapshot;
+        // known deletion revokes shared access while preserving own self reads.
+        if !rows.isEmpty, let authorization {
+            switch authorization {
+            case let .accountOAuth(subject, _):
+                guard subject == accountDID else {
+                    throw SwanError.unauthorized("permissioned space is closed")
+                }
+            case let .spaceSelfRead(subject, grantSpace):
+                guard subject == accountDID, grantSpace == space else {
+                    throw SwanError.unauthorized("permissioned space is closed")
+                }
+            default:
+                throw SwanError.unauthorized("permissioned space is closed")
+            }
         }
     }
 
     /// Portable restore may stage bytes for a repository that is deliberately
     /// HTTP-closed by `missing-authority-policy-v1`. It still requires the
-    /// matching account-owned repository state and rejects authority or
-    /// recipient tombstones before creating lifecycle metadata, CAS content,
+    /// matching account-owned repository state and rejects authority
+    /// tombstones before creating lifecycle metadata, CAS content,
     /// or a namespace reference.
     private func requirePortableBlobRestoreRepository(
         _ space: SpaceURI
@@ -11674,11 +11871,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             FROM permissioned_repository_state AS repository
             WHERE repository.space_uri = ?
               AND repository.author_did = ?
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM permissioned_space_recipient_tombstones AS recipient
-                  WHERE recipient.space_uri = repository.space_uri
-              )
               AND NOT EXISTS (
                   SELECT 1
                   FROM permissioned_simple_space_authorities AS authority
@@ -11701,20 +11893,19 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// reference are all read from the caller's one SQLite snapshot.
     private func requireReadablePermissionedBlobRepository(
         _ space: SpaceURI,
+        authorization: AuthorizationContext? = nil,
         connection: SQLiteConnection? = nil
     ) async throws {
         let conn = connection ?? self.connection
+        try await requireLocalRepositorySpaceOpen(
+            space, authorization: authorization, connection: conn
+        )
         let rows = try await conn.query(
             """
             SELECT 1
             FROM permissioned_repository_state AS repository
             WHERE repository.space_uri = ?
               AND repository.author_did = ?
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM permissioned_space_recipient_tombstones AS recipient
-                  WHERE recipient.space_uri = repository.space_uri
-              )
               AND NOT EXISTS (
                   SELECT 1
                   FROM permissioned_restored_repository_closures AS closure
@@ -13005,7 +13196,7 @@ public actor DurableSpaceRepository {
     ) async throws -> SpaceRecord? {
         try requireRepositoryURI(uri)
         try requireRead(uri: uri, authorization: authorization)
-        return try await database.spaceRecord(uri).map(record(from:))
+        return try await database.spaceRecord(uri, authorization: authorization).map(record(from:))
     }
 
     /// Applies one write with an exact SQLite revision CAS, a caller-selected
@@ -13291,7 +13482,8 @@ public actor DurableSpaceRepository {
         switch try await database.spaceOplog(
             space: space,
             author: author,
-            since: requestedRevision
+            since: requestedRevision,
+            authorization: authorization
         ) {
         case let .incremental(entries):
             return .incremental(entries.map(oplogEntry(from:)))
@@ -13310,7 +13502,8 @@ public actor DurableSpaceRepository {
         try requireRead(uri: nil, authorization: authorization)
         let snapshot = try await database.repositorySnapshot(
             space: space,
-            author: author
+            author: author,
+            authorization: authorization
         )
         if let snapshot {
             return state(from: snapshot.state)
@@ -13334,7 +13527,7 @@ public actor DurableSpaceRepository {
         authorization: AuthorizationContext
     ) async throws -> AuthorizedSpaceRepositoryCommitState {
         try requireRead(uri: nil, authorization: authorization)
-        if let state = try await database.repositoryState(space: space, author: author) {
+        if let state = try await database.repositoryState(space: space, author: author, authorization: authorization) {
             return AuthorizedSpaceRepositoryCommitState(
                 space: state.space,
                 author: state.author,
@@ -13399,7 +13592,8 @@ public actor DurableSpaceRepository {
         try requireRead(uri: nil, authorization: authorization)
         return try await database.prepareRepositoryCARSnapshot(
             space: space,
-            author: author
+            author: author,
+            authorization: authorization
         )
     }
 
@@ -13413,7 +13607,8 @@ public actor DurableSpaceRepository {
         return try await database.permissionedBlobMetadata(
             space: space,
             author: author,
-            cid: cid
+            cid: cid,
+            authorization: authorization
         )
     }
 
@@ -13433,7 +13628,8 @@ public actor DurableSpaceRepository {
         return try await database.permissionedBlob(
             space: space,
             author: author,
-            cid: cid
+            cid: cid,
+            authorization: authorization
         )
     }
 
@@ -13456,7 +13652,8 @@ public actor DurableSpaceRepository {
             since: since,
             limit: limit,
             includeValues: includeValues,
-            maximumAggregateValueBytes: maximumAggregateValueBytes
+            maximumAggregateValueBytes: maximumAggregateValueBytes,
+            authorization: authorization
         ) {
         case let .incremental(state, entries):
             let projectedState: AuthorizedSpaceRepositoryCommitState
@@ -13499,7 +13696,8 @@ public actor DurableSpaceRepository {
         try requireRead(uri: nil, authorization: authorization)
         return try await database.repositorySnapshot(
             space: space,
-            author: author
+            author: author,
+            authorization: authorization
         )?.records.map(record(from:)) ?? []
     }
 
@@ -13533,7 +13731,8 @@ public actor DurableSpaceRepository {
             author: author,
             since: since,
             cursor: cursor,
-            limit: limit
+            limit: limit,
+            authorization: authorization
         )
     }
 
@@ -13573,7 +13772,8 @@ public actor DurableSpaceRepository {
             reverse: reverse,
             limit: limit,
             maximumAggregateRecordBytes: PublicRepositoryJSONReadLimits
-                .maximumAggregateRecordBlockBytes
+                .maximumAggregateRecordBlockBytes,
+            authorization: authorization
         )
         return records.map(record(from:))
     }
@@ -13589,7 +13789,8 @@ public actor DurableSpaceRepository {
         try requireRead(uri: nil, authorization: authorization)
         let snapshot = try await database.repositorySnapshot(
             space: space,
-            author: author
+            author: author,
+            authorization: authorization
         )
         let ltHash = try LtHash(
             serialized: snapshot?.state.ltHash

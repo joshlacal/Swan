@@ -80,11 +80,12 @@ public protocol SpaceCredentialAuthoritySigner: Sendable {
         user: String,
         authorization: AuthorizationContext,
         clientAttestation: String?,
+        dpopKeyThumbprint: String,
         now: Date
     ) async throws -> String
 }
 
-/// The narrow bearer-token boundary used by future repository routes. It
+/// The narrow JWT signature boundary used by repository routes. It
 /// returns a space credential context only after compact parsing, exact
 /// issuer/space binding, public-key selection, signature verification, and
 /// time validation have all succeeded.
@@ -94,6 +95,25 @@ public protocol SpaceCredentialAuthorizationVerifier: Sendable {
         expectedSpace: SpaceURI,
         now: Date
     ) async throws -> AuthorizationContext
+}
+
+public extension SpaceCredentialAuthorizationVerifier {
+    /// Binds a validated request proof to the credential's confirmation key.
+    /// HTTP callers must use this overload after validating the proof's
+    /// method, target, access-token hash, freshness, and replay reservation.
+    func authorization(
+        for token: String,
+        expectedSpace: SpaceURI,
+        dpopProof: OAuthValidatedDPoPProof,
+        now: Date
+    ) async throws -> AuthorizationContext {
+        let authorization = try await authorization(for: token, expectedSpace: expectedSpace, now: now)
+        let confirmation = try PermissionedDataJWT.inspectSpaceCredential(token).claims.cnf
+        guard spaceCredentialConstantTimeTextEqual(confirmation.jkt, dpopProof.keyThumbprint) else {
+            throw SwanError.unauthorized("space credential proof key is invalid")
+        }
+        return authorization
+    }
 }
 
 /// Resolves the public material for an inspected user-to-space-host
@@ -739,6 +759,7 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
         user: String,
         authorization: AuthorizationContext,
         clientAttestation: String? = nil,
+        dpopKeyThumbprint: String,
         now: Date = Date()
     ) async throws -> String {
         // A credential never authorizes creation of another credential. The
@@ -756,6 +777,7 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
             requesterMatches = false
         }
         guard requesterMatches,
+              SpaceCredentialDPoPValidator.isValidKeyThumbprint(dpopKeyThumbprint),
               (try? AccountIdentifiers.validateDID(user)) != nil else {
             throw SwanError.unauthorized("credential requester does not match the requested user")
         }
@@ -787,6 +809,7 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
             issuer: space.authority,
             space: space,
             key: signingKey.privateKey,
+            dpopKeyThumbprint: dpopKeyThumbprint,
             now: now,
             lifetime: configuration.lifetime,
             kid: signingKey.keyID
@@ -869,8 +892,8 @@ public struct DurableSpaceDelegationVerifier: SpaceDelegationAuthorizationVerifi
 /// read-only authorization context. The `SpaceGrant.subject` is the authority
 /// issuer because proposal 0016 credentials intentionally contain no reader
 /// identity; issuance is separately bound to a reader by
-/// ``DurableSpaceCredentialAuthority`` and is never inferred during bearer
-/// verification.
+/// ``DurableSpaceCredentialAuthority``. HTTP requests additionally prove
+/// possession of the credential's confirmation key through DPoP.
 public struct DurableSpaceCredentialVerifier: SpaceCredentialAuthorizationVerifier {
     public struct Configuration: Sendable, Equatable {
         public static let standard = Configuration(uncheckedClockSkew: 60)

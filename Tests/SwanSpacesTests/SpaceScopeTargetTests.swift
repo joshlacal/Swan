@@ -3,9 +3,8 @@ import XCTest
 @testable import SwanCore
 @testable import SwanSpaces
 
-/// Pins the ergonomic target layer (§6.2, §6.5.5): where the aggregate flag is
-/// decided, and the two illegal states that are removed by construction rather
-/// than documented.
+/// Pins request metadata and prevents management operations or writes without
+/// collections from becoming record-operation targets.
 final class SpaceScopeTargetTests: XCTestCase {
     private static let space = try! SpaceURI(
         authority: "did:plc:user",
@@ -15,11 +14,8 @@ final class SpaceScopeTargetTests: XCTestCase {
 
     // MARK: - The aggregate flag is DERIVED, and derived here
 
-    /// §6.5.5 puts the decision in this factory, "**not** into the generic
-    /// matcher". These assertions are what stop a later reader from adding an
-    /// `aggregate:` parameter and letting a caller pass `aggregate: false`
-    /// beside a `nil` collection — which would opt out of the hardening from a
-    /// single mistaken argument at a call site that still compiles.
+    /// An absent collection identifies a request spanning collections. The
+    /// matcher ignores this metadata for both read actions.
     func testAggregateIsDerivedFromAnAbsentCollection() {
         guard let target = SpaceScopeTarget.record(Self.space, action: .read, collection: nil),
               case let .read(aggregate, collection) = target.operation else {
@@ -39,7 +35,7 @@ final class SpaceScopeTargetTests: XCTestCase {
         XCTAssertEqual(collection, "app.example.records")
     }
 
-    /// `read_self` carries the same two hardenings as `read` (§6.5.5).
+    /// `read_self` carries the same request metadata as `read`.
     func testReadSelfCarriesTheSameDerivation() {
         guard let target = SpaceScopeTarget.record(Self.space, action: .readSelf, collection: nil),
               case let .readSelf(aggregate, collection) = target.operation else {
@@ -143,6 +139,39 @@ final class SpaceScopeTargetTests: XCTestCase {
                 permissions: collectionQualifiedReadPermissions()
             )
         )
+    }
+
+    func testReadSelfReadsOwnRecordsAndBlobsButCannotWriteOrReadAnotherRepository() throws {
+        let scope = "space:x.y.z?authority=\(Self.author)&skey=self&action=read_self&collection=app.example.records"
+        let authorization = AuthorizationContext.accountOAuth(
+            subject: Self.author,
+            permissions: SwanScopePermissions(rawScopes: [scope], subject: Self.author)
+        )
+        let otherCollectionRecord = try SpaceRecordURI(
+            space: Self.space, author: Self.author, collection: "app.other.records", rkey: "one"
+        )
+        try SpaceAuthorizationPolicy.require(
+            space: Self.space, author: Self.author, uri: otherCollectionRecord,
+            authorization: authorization, permission: .read
+        )
+        try SpaceAuthorizationPolicy.require(
+            space: Self.space, author: Self.author, uri: nil,
+            authorization: authorization, permission: .read
+        )
+        try SpaceAuthorizationPolicy.requireBlobRead(
+            space: Self.space, author: Self.author, authorization: authorization
+        )
+        XCTAssertThrowsError(try SpaceAuthorizationPolicy.require(
+            space: Self.space, author: "did:plc:other", uri: nil,
+            authorization: authorization, permission: .read
+        ))
+        XCTAssertThrowsError(try SpaceAuthorizationPolicy.requireBlobRead(
+            space: Self.space, author: "did:plc:other", authorization: authorization
+        ))
+        XCTAssertThrowsError(try SpaceAuthorizationPolicy.require(
+            space: Self.space, author: Self.author, uri: otherCollectionRecord,
+            authorization: authorization, permission: .create
+        ))
     }
 
     /// The reclassification widens nothing across accounts: a foreign token

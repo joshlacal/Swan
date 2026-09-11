@@ -168,9 +168,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 )
             }
             let delegation = await observedTokens.tokens().delegation
-            var exchangeHeaders = HTTPFields()
-            exchangeHeaders[.authorization] = "Bearer \(delegation)"
-            exchangeHeaders[.contentType] = "application/json"
+            let exchangeHeaders = try SpaceCredentialDPoPTestSupport.exchangeHeaders(token: delegation)
             let exchangeBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\"}")
             try await client.execute(uri: credentialPath, method: .post, headers: exchangeHeaders, body: exchangeBody) { response in
                 XCTAssertEqual(response.status, .ok)
@@ -179,7 +177,9 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 )
             }
             let credential = await observedTokens.tokens().credential
-            try await client.execute(uri: credentialPath, method: .post, headers: exchangeHeaders, body: exchangeBody) { response in
+            // Reuse the delegation with a fresh proof so this still exercises
+            // delegation replay protection, independent of DPoP replay checks.
+            try await client.execute(uri: credentialPath, method: .post, headers: SpaceCredentialDPoPTestSupport.exchangeHeaders(token: delegation), body: exchangeBody) { response in
                 XCTAssertEqual(response.status, .unauthorized)
                 self.assertRuntimeSecretsAbsent(
                     response.body,
@@ -189,17 +189,16 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     credential: credential
                 )
             }
-            let bearer = self.bearerHeaders(credential)
-            try await client.execute(uri: self.latestURI(space: fixture.space, repo: Self.alice), method: .get, headers: bearer) { XCTAssertEqual($0.status, .ok) }
-            try await client.execute(uri: self.oplogURI(space: fixture.space, repo: Self.alice), method: .get, headers: bearer) { XCTAssertEqual($0.status, .ok) }
-            try await client.execute(uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: bearer) { response in
+            try await client.execute(uri: self.latestURI(space: fixture.space, repo: Self.alice), method: .get, headers: self.credentialHeaders(credential, path: Self.latestPath)) { XCTAssertEqual($0.status, .ok) }
+            try await client.execute(uri: self.oplogURI(space: fixture.space, repo: Self.alice), method: .get, headers: self.credentialHeaders(credential, path: Self.oplogPath)) { XCTAssertEqual($0.status, .ok) }
+            try await client.execute(uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: self.credentialHeaders(credential, path: Self.repoPath)) { response in
                 XCTAssertEqual(response.status, .ok)
                 self.assertCARNoStore(response)
                 _ = try self.assertRecoveryCAR(
                     Data(buffer: response.body), fixture: fixture, author: Self.alice
                 )
             }
-            try await client.execute(uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID), method: .get, headers: bearer) { response in
+            try await client.execute(uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID), method: .get, headers: self.credentialHeaders(credential, path: Self.blobPath)) { response in
                 XCTAssertEqual(response.status, .unauthorized)
                 self.assertRuntimeSecretsAbsent(
                     response.body,
@@ -262,7 +261,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID),
                     method: .get,
-                    headers: self.bearerHeaders(credential, dpop: "ignored-for-credential")
+                    headers: self.credentialHeaders(credential, path: Self.blobPath)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertEqual(Data(buffer: response.body), fixture.blobPayload)
@@ -285,7 +284,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             )
             let alice = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: [wholeSpaceReadScope(for: fixture.space)])
             let bob = try await issueToken(runtime: fixture.runtime, subject: Self.bob, scopes: [wholeSpaceReadScope(for: fixture.space)])
-            let narrowScope = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=app.bsky.feed.post"
+            let narrowScope = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read_self&collection=app.bsky.feed.post"
             let narrow = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: [narrowScope])
             try await app.test(.router) { client in
                 for uri in [
@@ -409,9 +408,11 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(
                         Array(blockCIDs.dropFirst(2)),
                         [
+                            // Canonical DAG-CBOR keys sort shortest first,
+                            // then bytewise: first, third, fourth.
                             CID.fromDAGCBOR(try XCTUnwrap(verified["app.bsky.feed.post/first"])),
-                            CID.fromDAGCBOR(try XCTUnwrap(verified["app.bsky.feed.post/fourth"])),
                             CID.fromDAGCBOR(try XCTUnwrap(verified["app.bsky.feed.post/third"])),
+                            CID.fromDAGCBOR(try XCTUnwrap(verified["app.bsky.feed.post/fourth"])),
                         ]
                     )
                 }
@@ -439,7 +440,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: self.repoURI(space: fixture.space, repo: Self.bob),
                     method: .get,
-                    headers: self.bearerHeaders(credential, dpop: "not-a-dpop-proof")
+                    headers: self.credentialHeaders(credential, path: Self.repoPath)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     self.assertCARNoStore(response)
@@ -505,12 +506,12 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertNotEqual(try self.bytes("ikm", in: commit), firstCommitIKM)
                 }
 
-                // A Bearer space credential is intentionally not routed
-                // through DPoP and may read a different member repository.
+                // A key-bound space credential may read a different member
+                // repository when its request proof matches the credential.
                 try await client.execute(
                     uri: self.latestURI(space: fixture.space, repo: Self.bob),
                     method: .get,
-                    headers: self.bearerHeaders(credential, dpop: "not-a-dpop-proof")
+                    headers: self.credentialHeaders(credential, path: Self.latestPath)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     self.assertNoStore(response)
@@ -521,14 +522,29 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 // The pre-rename `getRepoState` alias answers identically to
                 // the canonical name: clients built on the atproto-crates
                 // lineage (bulleted.app) know only the alias.
+                let aliasURI = self.latestURI(space: fixture.space, repo: Self.bob)
+                    .replacingOccurrences(
+                        of: "com.atproto.space.getLatestCommit",
+                        with: "com.atproto.space.getRepoState"
+                    )
+                // Sharing a handler never makes the two target URLs
+                // interchangeable for proof-of-possession validation.
                 try await client.execute(
-                    uri: self.latestURI(space: fixture.space, repo: Self.bob)
-                        .replacingOccurrences(
-                            of: "com.atproto.space.getLatestCommit",
-                            with: "com.atproto.space.getRepoState"
-                        ),
+                    uri: aliasURI, method: .get,
+                    headers: self.credentialHeaders(credential, path: Self.latestPath)
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+                try await client.execute(
+                    uri: self.latestURI(space: fixture.space, repo: Self.bob), method: .get,
+                    headers: self.credentialHeaders(credential, path: "/xrpc/com.atproto.space.getRepoState")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+                try await client.execute(
+                    uri: aliasURI,
                     method: .get,
-                    headers: self.bearerHeaders(credential, dpop: "not-a-dpop-proof")
+                    headers: self.credentialHeaders(credential, path: "/xrpc/com.atproto.space.getRepoState")
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     let commit = try XCTUnwrap((try self.jsonObject(response.body))["commit"] as? [String: Any])
@@ -696,7 +712,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             )
             let alice = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: [wholeSpaceReadScope(for: fixture.space)])
             let bob = try await issueToken(runtime: fixture.runtime, subject: Self.bob, scopes: [wholeSpaceReadScope(for: fixture.space)])
-            let narrowScope = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=app.bsky.feed.post"
+            let narrowScope = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read_self&collection=app.bsky.feed.post"
             let narrow = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: [narrowScope])
             let sibling = try SpaceURI(authority: Self.alice, spaceType: fixture.space.spaceType, skey: "other")
             let wrongCredential = try await fixture.credential(for: sibling)
@@ -762,8 +778,9 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: self.oplogURI(space: fixture.space, repo: Self.alice), method: .get, headers: narrowHeaders
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(response.status, .ok)
                     self.assertNoStore(response)
+                    XCTAssertNotNil((try self.jsonObject(response.body))["ops"])
                 }
 
                 let narrowCARHeaders = try self.dpopHeaders(
@@ -774,13 +791,14 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: narrowCARHeaders
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
-                    self.assertNoStore(response)
+                    XCTAssertEqual(response.status, .ok)
+                    self.assertCARNoStore(response)
+                    XCTAssertFalse(response.body.readableBytesView.isEmpty)
                 }
 
                 try await client.execute(
                     uri: self.latestURI(space: fixture.space, repo: Self.bob), method: .get,
-                    headers: self.bearerHeaders(wrongCredential)
+                    headers: self.credentialHeaders(wrongCredential, path: Self.latestPath)
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
                     self.assertNoStore(response)
@@ -789,7 +807,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
 
                 try await client.execute(
                     uri: self.repoURI(space: fixture.space, repo: Self.bob), method: .get,
-                    headers: self.bearerHeaders(wrongCredential)
+                    headers: self.credentialHeaders(wrongCredential, path: Self.repoPath)
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
                     self.assertNoStore(response)
@@ -1175,11 +1193,8 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         return fields
     }
 
-    private func bearerHeaders(_ credential: String, dpop: String? = nil) -> HTTPFields {
-        var fields = HTTPFields()
-        fields[.authorization] = "Bearer \(credential)"
-        if let dpop { fields[HTTPField.Name("DPoP")!] = dpop }
-        return fields
+    private func credentialHeaders(_ credential: String, path: String) throws -> HTTPFields {
+        try SpaceCredentialDPoPTestSupport.headers(token: credential, path: path)
     }
 
     private func assertCommit(
@@ -1493,7 +1508,8 @@ private struct Fixture: Sendable {
         return try PermissionedDataJWT.createSpaceCredential(
             issuer: RepositorySyncHTTPTests.alice,
             space: space,
-            key: try P256.Signing.PrivateKey(rawRepresentation: scalar)
+            key: try P256.Signing.PrivateKey(rawRepresentation: scalar),
+            dpopKeyThumbprint: try SpaceCredentialDPoPTestSupport.thumbprint
         )
     }
 

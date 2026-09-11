@@ -292,7 +292,7 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
             }
 
             let profile = try ProtocolProfile.load(
-                from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-09-10.json")
+                from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-09-19.json")
             )
             let closedServer = SwanHTTPServer(
                 profile: profile,
@@ -427,7 +427,7 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
         directory: (any AuthorizedSimpleSpaceDirectory)? = nil
     ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
-            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-09-10.json")
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-09-19.json")
         )
         return SwanHTTPServer(
             profile: profile,

@@ -18,6 +18,7 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaIncrementalStore {
         }
         return try await withConnectionGate {
             try await writerReadTransaction {
+                try await requireRemoteReplicaSpaceOpen(target.space)
                 guard let head = try await incrementalHead(target: target) else {
                     return nil
                 }
@@ -49,6 +50,7 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaIncrementalStore {
         return try await withConnectionGate {
             do {
                 return try await transaction {
+                try await requireRemoteReplicaSpaceOpen(batch.target.space)
                 let bindingDigest = incrementalBatchDigest(batch)
                 guard bindingDigest == batch.requestDigest else {
                     throw PermissionedRemoteReplicaIncrementalRollback(

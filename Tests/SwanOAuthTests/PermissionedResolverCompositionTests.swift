@@ -74,16 +74,21 @@ final class PermissionedResolverCompositionTests: XCTestCase {
             issuer: localDID,
             space: localSpace,
             key: localKey,
+            dpopKeyThumbprint: String(repeating: "A", count: 43),
             now: now
         )
         _ = try await DurableSpaceCredentialVerifier(publicKeys: credentialKeys)
             .authorization(for: localCredential, expectedSpace: localSpace, now: now)
         _ = try await DurableSpaceCredentialVerifier(publicKeys: credentialKeys)
             .authorization(
-                for: Self.remoteCredential,
+                for: SpaceCredentialGoldenFixtures.boundSecp256k1,
                 expectedSpace: remoteSpace,
                 now: now
             )
+        await XCTAssertCompositionThrowsError {
+            _ = try await DurableSpaceCredentialVerifier(publicKeys: credentialKeys)
+                .authorization(for: Self.remoteCredential, expectedSpace: remoteSpace, now: self.now)
+        }
 
         let localDelegation = try PermissionedDataJWT.createDelegationToken(
             issuer: localDID,

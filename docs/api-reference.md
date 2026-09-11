@@ -19,7 +19,7 @@ All XRPC endpoints are mounted under `/xrpc/`. Responses use JSON encoding with 
 - **Method**: `GET`
 - **Authentication**: None
 - **Parameters**: None
-- **Returns**: JSON object containing `did` (service DID, e.g. `did:web:example.com`), `availableUserDomains` (array of supported domain suffixes), `inviteCodeRequired` (boolean, always `false` in standard Swan builds), and `swanProfile` (active permissioned profile ID, e.g. `permissioned-data-0016-2026-09-10`).
+- **Returns**: JSON object containing `did` (service DID, e.g. `did:web:example.com`), `availableUserDomains` (array of supported domain suffixes), `inviteCodeRequired` (boolean, always `false` in standard Swan builds), and `swanProfile` (active permissioned profile ID, e.g. `permissioned-data-0016-2026-09-19`).
 
 #### `community.lexicon.service.describe`
 - **Method**: `GET`
@@ -291,7 +291,7 @@ When an inbound request under `/xrpc/**` matches no exact local route, Swan eval
 
 ## Permissioned spaces plane
 
-Swan implements the `permissioned-data-0016-2026-09-10` profile for access-controlled collaborative data spaces. All endpoints are mounted under `/xrpc/`. Space references are `at://` URIs, not bare DIDs. Policy and app-access values are tagged union objects with a lexicon `$type`, not strings.
+Swan implements the `permissioned-data-0016-2026-09-19` profile for access-controlled collaborative data spaces. All endpoints are mounted under `/xrpc/`. Space references are `at://` URIs, not bare DIDs. Policy and app-access values are tagged union objects with a lexicon `$type`, not strings.
 
 ### Space lifecycle and membership (`com.atproto.simplespace.*`)
 
@@ -356,14 +356,16 @@ Swan implements the `permissioned-data-0016-2026-09-10` profile for access-contr
 #### `com.atproto.space.getDelegationToken`
 - **Method**: `GET`
 - **Authentication**: Account Auth.
-- **Parameters**: Query parameters `space` (space DID, required), `targetDID` (service DID, required).
+- **Parameters**: Query parameter `space` (space reference, required). A covering account OAuth `read` grant is required; `read_self` does not permit delegation.
 - **Returns**: JSON object `{ "token": "<delegation-token-jwt>" }`.
 
 #### `com.atproto.space.getSpaceCredential`
 - **Method**: `POST`
-- **Authentication**: Delegation token or client attestation.
-- **Request Body**: JSON object `{ "delegationToken": "<delegation-jwt>" }`.
-- **Returns**: JSON object `{ "credential": "<space-read-credential>" }`.
+- **Authentication**: `Authorization: Bearer <delegation-token>` plus a `DPoP` proof signed by the key to bind to the resulting credential. This initial proof omits `ath`; space credential proofs do not use server nonces.
+- **Request Body**: JSON object `{ "space": "<space-ref>", "clientAttestation": "<optional-attestation-jwt>" }`. An attestation is required when the space gates access on client identity.
+- **Returns**: JSON object `{ "credential": "<space-read-credential>" }`; the JWT carries the signing key thumbprint in `cnf.jkt`. Deleted spaces return `SpaceDeleted`.
+
+Use the credential with `Authorization: DPoP <credential>` and a fresh `DPoP` proof on every space request. The proof binds the credential through `ath`, the HTTP method through `htm`, and the origin and path (without query or fragment) through `htu`. Bearer space credentials are rejected. Credentials remain read-only at repository hosts; writes use the account's OAuth grant.
 
 ---
 

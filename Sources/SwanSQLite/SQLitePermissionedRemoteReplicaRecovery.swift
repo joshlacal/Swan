@@ -2,6 +2,7 @@ import Crypto
 import Foundation
 import Petrel
 import SQLiteNIO
+import SwanCore
 import SwanSpaces
 import SwanStorage
 
@@ -53,7 +54,7 @@ public struct SQLitePermissionedRemoteReplicaRecoveryStaging:
         )
     }
 
-    public func nextUnconsumedLexicographicEntry() async throws
+    public func nextUnconsumedCanonicalEntry() async throws
         -> SpaceCARRecoveryIndexEntry?
     {
         try await database
@@ -63,11 +64,15 @@ public struct SQLitePermissionedRemoteReplicaRecoveryStaging:
             )
     }
 
-    public func consumeEntries(forCID cid: CID) async throws -> Int {
-        try await database.consumePermissionedRemoteReplicaIndexEntries(
-            sessionID: sessionID,
-            cid: cid,
-            now: now()
+    public func hasConsumedCID(_ cid: CID) async throws -> Bool {
+        try await database.hasConsumedPermissionedRemoteReplicaCID(
+            sessionID: sessionID, cid: cid, now: now()
+        )
+    }
+
+    public func consumeEntry(_ entry: SpaceCARRecoveryIndexEntry) async throws {
+        try await database.consumePermissionedRemoteReplicaIndexEntry(
+            sessionID: sessionID, entry: entry, now: now()
         )
     }
 
@@ -119,7 +124,9 @@ extension SQLiteAccountDatabase:
             throw PermissionedRemoteReplicaRecoveryError.receiverMismatch
         }
         return try await withConnectionGate {
-            try await loadPermissionedRemoteReplicaHead(target: target)
+            try await writerReadTransaction {
+                try await loadPermissionedRemoteReplicaHead(target: target)
+            }
         }
     }
 
@@ -140,6 +147,7 @@ extension SQLiteAccountDatabase:
         }
         return try await withConnectionGate {
             try await transaction {
+                try await requireRemoteReplicaSpaceOpen(binding.target.space)
                 if let committed = try await loadPermissionedRemoteReplicaResult(
                     requestID: binding.requestID,
                     expectedBinding: binding
@@ -295,7 +303,11 @@ extension SQLiteAccountDatabase:
         id: String
     ) async throws -> PermissionedRemoteReplicaImportSession {
         try await withConnectionGate {
-            try await loadPermissionedRemoteReplicaSession(id: id)
+            try await writerReadTransaction {
+                let session = try await loadPermissionedRemoteReplicaSession(id: id)
+                try await requireRemoteReplicaSpaceOpen(session.binding.target.space)
+                return session
+            }
         }
     }
 
@@ -469,74 +481,78 @@ extension SQLiteAccountDatabase:
         now: Int64
     ) async throws -> SpaceCARRecoveryIndexEntry? {
         try await withConnectionGate {
-            _ = try await requireActiveRemoteReplicaSession(
-                id: sessionID, now: now, allowed: [.receiving]
-            )
-            let rows = try await connection.query(
-                """
-                SELECT path, cid
-                FROM permissioned_remote_replica_import_index
-                WHERE session_id = ? AND consumed = 0
-                ORDER BY path
-                LIMIT 1
-                """,
-                [.text(sessionID)]
-            )
-            guard let row = rows.first else { return nil }
-            guard let pathData = remoteReplicaData(row, "path"),
-                  let path = String(data: pathData, encoding: .utf8),
-                  let cidRaw = row.column("cid")?.string,
-                  let cid = try? CID.parse(cidRaw) else {
-                throw PermissionedRemoteReplicaRecoveryError.corruptStaging
+            try await writerReadTransaction {
+                _ = try await requireActiveRemoteReplicaSession(
+                    id: sessionID, now: now, allowed: [.receiving]
+                )
+                let rows = try await connection.query(
+                    """
+                    SELECT path, cid
+                    FROM permissioned_remote_replica_import_index
+                    WHERE session_id = ? AND consumed = 0
+                    ORDER BY length(path), path
+                    LIMIT 1
+                    """,
+                    [.text(sessionID)]
+                )
+                guard let row = rows.first else { return nil }
+                guard let pathData = remoteReplicaData(row, "path"),
+                      let path = String(data: pathData, encoding: .utf8),
+                      let cidRaw = row.column("cid")?.string,
+                      let cid = try? CID.parse(cidRaw) else {
+                    throw PermissionedRemoteReplicaRecoveryError.corruptStaging
+                }
+                try validateRemoteReplicaCID(cid)
+                return SpaceCARRecoveryIndexEntry(path: path, cid: cid)
             }
-            try validateRemoteReplicaCID(cid)
-            return SpaceCARRecoveryIndexEntry(path: path, cid: cid)
         }
     }
 
-    public func consumePermissionedRemoteReplicaIndexEntries(
-        sessionID: String,
-        cid: CID,
-        now: Int64
-    ) async throws -> Int {
+    public func hasConsumedPermissionedRemoteReplicaCID(
+        sessionID: String, cid: CID, now: Int64
+    ) async throws -> Bool {
+        try await withConnectionGate {
+            try await writerReadTransaction {
+                _ = try await requireActiveRemoteReplicaSession(
+                    id: sessionID, now: now, allowed: [.receiving]
+                )
+                let rows = try await connection.query(
+                    """
+                    SELECT 1 FROM permissioned_remote_replica_import_index
+                    WHERE session_id = ? AND cid = ? AND consumed = 1 LIMIT 1
+                    """,
+                    [.text(sessionID), .text(cid.string)]
+                )
+                return !rows.isEmpty
+            }
+        }
+    }
+
+    public func consumePermissionedRemoteReplicaIndexEntry(
+        sessionID: String, entry: SpaceCARRecoveryIndexEntry, now: Int64
+    ) async throws {
         try await withConnectionGate {
             try await transaction {
                 _ = try await requireActiveRemoteReplicaSession(
                     id: sessionID, now: now, allowed: [.receiving]
                 )
-                let countRows = try await connection.query(
+                let rows = try await connection.query(
                     """
-                    SELECT COUNT(*) AS count
-                    FROM permissioned_remote_replica_import_index
-                    WHERE session_id = ? AND cid = ? AND consumed = 0
+                    UPDATE permissioned_remote_replica_import_index SET consumed = 1
+                    WHERE session_id = ? AND path = ? AND cid = ? AND consumed = 0
+                      AND path = (
+                        SELECT path FROM permissioned_remote_replica_import_index
+                        WHERE session_id = ? AND consumed = 0
+                        ORDER BY length(path), path LIMIT 1
+                      )
+                    RETURNING path
                     """,
-                    [.text(sessionID), .text(cid.string)]
+                    [.text(sessionID), Data(entry.path.utf8).sqliteData!,
+                     .text(entry.cid.string), .text(sessionID)]
                 )
-                let count = remoteReplicaInteger(
-                    countRows.first, "count"
-                )
-                guard count > 0,
-                      count <= SpaceCARRecoveryLimits
-                        .absoluteMaximumIndexEntries else {
+                guard rows.count == 1 else {
                     throw SpaceCARStreamingError.invalidRecordOrder
                 }
-                _ = try await connection.query(
-                    """
-                    UPDATE permissioned_remote_replica_import_index
-                    SET consumed = 1
-                    WHERE session_id = ? AND cid = ? AND consumed = 0
-                    """,
-                    [.text(sessionID), .text(cid.string)]
-                )
-                let changedRows = try await connection.query(
-                    "SELECT changes() AS count"
-                )
-                guard remoteReplicaInteger(
-                    changedRows.first, "count"
-                ) == count else {
-                    throw SpaceCARStreamingError.invalidRecordOrder
-                }
-                return count
             }
         }
     }
@@ -1632,6 +1648,7 @@ extension SQLiteAccountDatabase:
         committedAt: Int64,
         requiredStatus: PermissionedRemoteReplicaImportStatus
     ) async throws -> CommittedPermissionedRemoteReplicaRecovery {
+        try await requireRemoteReplicaSpaceOpen(session.binding.target.space)
         let integrity = remoteReplicaResultIntegrityDigest(
             binding: session.binding,
             head: head,
@@ -2876,6 +2893,7 @@ extension SQLiteAccountDatabase:
             throw PermissionedRemoteReplicaRecoveryError.invalidTimestamp
         }
         let session = try await loadPermissionedRemoteReplicaSession(id: id)
+        try await requireRemoteReplicaSpaceOpen(session.binding.target.space)
         guard session.expiresAt > now else {
             throw PermissionedRemoteReplicaRecoveryError.expiredSession
         }
@@ -2982,9 +3000,23 @@ extension SQLiteAccountDatabase:
         )
     }
 
+    /// The caller owns the connection gate; reads and mutations check inside
+    /// their data transaction. A recipient deletion closes imported content
+    /// durably, including sessions and batches verified before it arrived.
+    func requireRemoteReplicaSpaceOpen(_ space: SpaceURI) async throws {
+        let tombstones = try await connection.query(
+            "SELECT 1 FROM permissioned_space_recipient_tombstones WHERE space_uri = ? LIMIT 1",
+            [.text(space.rawValue)]
+        )
+        guard tombstones.isEmpty else {
+            throw SwanError.unauthorized("permissioned space is closed")
+        }
+    }
+
     func loadPermissionedRemoteReplicaHead(
         target: PermissionedRemoteReplicaTarget
     ) async throws -> PermissionedRemoteReplicaHead? {
+        try await requireRemoteReplicaSpaceOpen(target.space)
         let rows = try await connection.query(
             """
             SELECT *

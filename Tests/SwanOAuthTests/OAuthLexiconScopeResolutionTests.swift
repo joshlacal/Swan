@@ -64,6 +64,38 @@ final class OAuthLexiconScopeResolutionTests: XCTestCase {
 
     // MARK: - (b) expandSpaceCollections — the ported LexiconManager vectors
 
+    func testSpaceDeclarationAllowsLongNamesAndCrossNamespaceCollections() throws {
+        let name = String(repeating: "Forum", count: 20)
+        let bytes = try JSONSerialization.data(withJSONObject: [
+            "type": "space", "name": name,
+            "collections": [Self.thread, "org.other.reply"],
+        ])
+        let space = try JSONDecoder().decode(LexiconSpace.self, from: bytes)
+        XCTAssertEqual(space.name, name)
+        XCTAssertEqual(space.collections, [Self.thread, "org.other.reply"])
+    }
+
+    func testSpaceDeclarationRejectsWildcardAndMalformedCollections() throws {
+        for collection in ["*", "com.example.*", "invalid"] {
+            let bytes = try JSONSerialization.data(withJSONObject: [
+                "type": "space", "name": "Forum", "collections": [collection],
+            ])
+            XCTAssertThrowsError(try JSONDecoder().decode(LexiconSpace.self, from: bytes))
+        }
+    }
+
+    func testInvalidDeclaredDefaultsCannotBecomeWildcardWriteGrants() async throws {
+        let resolver = StubLexiconResolver([Self.forum: Self.space(["*"])])
+        do {
+            _ = try await OAuthLexiconScopeResolution.expandSpaceCollections(
+                ["space:\(Self.forum)"], resolver: resolver, stage: .tokenMint
+            )
+            XCTFail("a declaration cannot supply a wildcard write default")
+        } catch let error as OAuthScopeResolutionError {
+            XCTAssertEqual(error.failure, .spaceTypeInvalidCollections(nsid: Self.forum))
+        }
+    }
+
     /// `'materializes the declared collections into a bare grant'`.
     func testMaterialisesDeclaredCollectionsIntoABareGrant() async throws {
         let resolver = StubLexiconResolver([Self.forum: Self.space([Self.thread, Self.reply])])

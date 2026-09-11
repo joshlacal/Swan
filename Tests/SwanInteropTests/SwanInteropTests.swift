@@ -72,6 +72,18 @@ final class SwanInteropTests: XCTestCase {
                 "Profiles/permissioned-data-0016-2026-08-15.generated-wire.sha256",
                 "7e7fe09868a7fcda0c6ab824ebe19e7f64ba147db63fd02a27762ed538e02704"
             ),
+            (
+                "Profiles/permissioned-data-0016-2026-09-10.json",
+                "3214c31ab5c277f4958a2d3dd5ecd03331f348f869f35a5d3916ee59d9528acc"
+            ),
+            (
+                "Profiles/permissioned-data-0016-2026-09-10.lexicons.sha256",
+                "7ecbc75972d592e349f0227ff3bc1f0841fe3fda83e16ff1d3c39bbfaeca9de8"
+            ),
+            (
+                "Profiles/permissioned-data-0016-2026-09-10.generated-wire.sha256",
+                "9b3df8b2b04445a3c2a623fc556469b6aa430a0901ead90709abf3f4fd7af876"
+            ),
         ]
 
         for (path, checksum) in expected {
@@ -106,6 +118,18 @@ final class SwanInteropTests: XCTestCase {
             report815.diagnostics,
             [.init(.unsupportedProfileID, artifact: "profile")]
         )
+
+        let report910 = OfflineProtocolProfileVerifier.verify(
+            profileURL: packageRoot.appending(
+                path: "Profiles/permissioned-data-0016-2026-09-10.json"
+            ),
+            sourceRoot: packageRoot
+        )
+        XCTAssertEqual(report910.profileID, "permissioned-data-0016-2026-09-10")
+        XCTAssertEqual(
+            report910.diagnostics,
+            [.init(.unsupportedProfileID, artifact: "profile")]
+        )
     }
 
     func testInvalidRevisionPinFailsWithTypedDiagnostic() throws {
@@ -113,7 +137,7 @@ final class SwanInteropTests: XCTestCase {
         defer { fixture.remove() }
 
         try fixture.replaceInProfile(
-            "1caad93dbb1f445396f6abf3b97eb4040345e78e",
+            "119fa6b63476d30c2516846c714319046e0422f3",
             with: String(repeating: "g", count: 40)
         )
 
@@ -128,7 +152,7 @@ final class SwanInteropTests: XCTestCase {
         defer { fixture.remove() }
 
         try fixture.replaceInProfile(
-            "9d787ebff231ff8f4e01c63717e9f5bcd6e1bc33",
+            "907f41a7b379a7e649a6c4842864946eef6eb757",
             with: String(repeating: "a", count: 40)
         )
 
@@ -1677,11 +1701,11 @@ private final class ProfileFixture {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let profileName = "permissioned-data-0016-2026-09-10.json"
-        let lexiconName = "permissioned-data-0016-2026-09-10.lexicons.sha256"
+        let profileName = "permissioned-data-0016-2026-09-19.json"
+        let lexiconName = "permissioned-data-0016-2026-09-19.lexicons.sha256"
         profileURL = profiles.appending(path: profileName)
         lexiconManifestURL = profiles.appending(path: lexiconName)
-        generatedWireManifestURL = profiles.appending(path: "permissioned-data-0016-2026-09-10.generated-wire.sha256")
+        generatedWireManifestURL = profiles.appending(path: "permissioned-data-0016-2026-09-19.generated-wire.sha256")
         generatedWireSourceURL = sources.appending(path: "SwanSpacesWire/SwanSpacesWire.swift")
 
         try FileManager.default.copyItem(
@@ -1693,7 +1717,7 @@ private final class ProfileFixture {
             to: lexiconManifestURL
         )
         try FileManager.default.copyItem(
-            at: packageRoot.appending(path: "Profiles/permissioned-data-0016-2026-09-10.generated-wire.sha256"),
+            at: packageRoot.appending(path: "Profiles/permissioned-data-0016-2026-09-19.generated-wire.sha256"),
             to: generatedWireManifestURL
         )
         try FileManager.default.copyItem(
@@ -1723,7 +1747,7 @@ private final class ProfileFixture {
         try data.write(to: generatedWireManifestURL)
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         try replaceInProfile(
-            "9b3df8b2b04445a3c2a623fc556469b6aa430a0901ead90709abf3f4fd7af876",
+            "3f4efbc98fb24c7b6883f5255c5b2e59bc74c971dc7753da1da2a1e2ab1b667e",
             with: digest
         )
     }

@@ -13,6 +13,7 @@ import SwanStorage
 /// notification endpoints. It has no repository-value access and is formed
 /// only after the server has selected a startup-preopened account directory.
 public struct SwanAuthenticatedSpaceNotificationsCapability: Sendable {
+    let authorizer: SwanOAuthResourceAuthorizer
     let directory: any AuthorizedSpaceNotificationDirectory
     let credentialAuthorizer: any SpaceCredentialAuthorizationVerifier
     let serviceAuthentication: any SpaceServiceAuthenticationVerifier
@@ -26,6 +27,7 @@ public struct SwanAuthenticatedSpaceNotificationsCapability: Sendable {
     let serviceEndpointResolver: SwanServiceEndpointResolver?
 
     init(
+        authorizer: SwanOAuthResourceAuthorizer,
         directory: any AuthorizedSpaceNotificationDirectory,
         credentialAuthorizer: any SpaceCredentialAuthorizationVerifier,
         serviceAuthentication: any SpaceServiceAuthenticationVerifier,
@@ -33,6 +35,7 @@ public struct SwanAuthenticatedSpaceNotificationsCapability: Sendable {
         notificationJSONDecodeObserver: (@Sendable () async -> Void)? = nil,
         serviceEndpointResolver: SwanServiceEndpointResolver? = nil
     ) {
+        self.authorizer = authorizer
         self.directory = directory
         self.credentialAuthorizer = credentialAuthorizer
         self.serviceAuthentication = serviceAuthentication
@@ -80,7 +83,9 @@ private struct AuthenticatedListSpaceReposHandler:
         let authorization = try await credentialAuthorization(
             capability,
             request: request,
-            space: space
+            space: space,
+            method: "GET",
+            fixedPath: "/xrpc/com.atproto.space.listRepos"
         )
         let writers: [AuthorizedSpaceWriter]
         do {
@@ -137,7 +142,9 @@ private struct AuthenticatedRegisterSpaceNotifyHandler {
         let authorization = try await credentialAuthorization(
             capability,
             request: request,
-            space: space
+            space: space,
+            method: "POST",
+            fixedPath: "/xrpc/com.atproto.space.registerNotify"
         )
         let serviceToken: String
         do {
@@ -220,7 +227,8 @@ private struct AuthenticatedUnregisterSpaceNotifyHandler {
     ) async throws {
         let space = try notificationSpace(input.space)
         let authorization = try await credentialAuthorization(
-            capability, request: request, space: space
+            capability, request: request, space: space,
+            method: "POST", fixedPath: "/xrpc/com.atproto.space.unregisterNotify"
         )
         let serviceToken: String
         do {
@@ -745,7 +753,9 @@ private func notificationSpace(_ value: SpaceRef) throws -> SpaceURI {
 private func credentialAuthorization(
     _ capability: SwanAuthenticatedSpaceNotificationsCapability,
     request: Request,
-    space: SpaceURI
+    space: SpaceURI,
+    method: String,
+    fixedPath: String
 ) async throws -> AuthorizationContext {
     let token: String
     do {
@@ -753,9 +763,13 @@ private func credentialAuthorization(
             throw AuthenticatedSpaceNotificationFailure.denied
         }
         token = bearer
-        let authorization = try await capability.credentialAuthorizer.authorization(
-            for: token,
+        let authorization = try await capability.authorizer.authorizeSpaceCredential(
+            token,
+            verifier: capability.credentialAuthorizer,
+            request: request,
             expectedSpace: space,
+            method: method,
+            fixedPath: fixedPath,
             now: Date()
         )
         guard case let .spaceCredential(grant) = authorization,
