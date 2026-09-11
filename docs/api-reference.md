@@ -19,7 +19,7 @@ All XRPC endpoints are mounted under `/xrpc/`. Responses use JSON encoding with 
 - **Method**: `GET`
 - **Authentication**: None
 - **Parameters**: None
-- **Returns**: JSON object containing `did` (service DID, e.g. `did:web:example.com`), `availableUserDomains` (array of supported domain suffixes), `inviteCodeRequired` (boolean, always `false` in standard Swan builds), and `swanProfile` (active permissioned profile ID, e.g. `permissioned-data-0016-2026-08-15`).
+- **Returns**: JSON object containing `did` (service DID, e.g. `did:web:example.com`), `availableUserDomains` (array of supported domain suffixes), `inviteCodeRequired` (boolean, always `false` in standard Swan builds), and `swanProfile` (active permissioned profile ID, e.g. `permissioned-data-0016-2026-09-10`).
 
 #### `community.lexicon.service.describe`
 - **Method**: `GET`
