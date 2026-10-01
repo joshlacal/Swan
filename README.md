@@ -82,6 +82,7 @@ Swan is organized around the following subsystems:
 - [Forum test vehicle](docs/forum-lab.md): Minimal multi-writer forum vehicle, subcommands, and thread merge ordering rules.
 - [Threat boundaries](docs/threat-boundaries.md): Security model, cryptographic accumulators, and PLC resolution caching.
 - [OAuth scope limits](docs/oauth-scope-limits.md): Input budgets, grant limits, and protocol admission rules.
+- [Spaces open interop](docs/notes/2026-10-01-spaces-open-interop.md): The opt-in `--enable-spaces-open-interop` posture and every behaviour it changes.
 
 ## License
 

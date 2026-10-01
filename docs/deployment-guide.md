@@ -160,6 +160,7 @@ The primary server daemon is started using `swan serve`. Below is the complete r
 | `--public-account-kek-id <id>` | String (`primary`) | Active account KEK identifier for public repository mutations. |
 | `--public-account-key-directory <path>` | String (`<data-directory>/keys`) | Account key-envelope directory for public repository mutations. |
 | `--enable-local-space-interop` | Flag (`false`) | Enables local account-key credential, delegation, and repository-sync interop. |
+| `--enable-spaces-open-interop` | Flag (`false`) | Opt-in upstream atproto-spaces interop: unbound notify service auth, optional `Atproto-Service-Auth` on (un)registerNotify, open DID-document federation, and upstream scope / legacy-session semantics. See [notes/2026-10-01-spaces-open-interop.md](notes/2026-10-01-spaces-open-interop.md). |
 | `--space-account-kek-file <path>` | String (File path) | Account KEK file for local space interop. |
 | `--space-account-kek-id <id>` | String (`primary`) | Active account KEK identifier for local space interop. |
 | `--space-account-key-directory <path>` | String (`<data-directory>/keys`) | Key-envelope directory for local space interop. |
