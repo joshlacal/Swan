@@ -50,6 +50,12 @@ private enum AuthenticatedSimpleSpaceLifecycleFailure: Error {
 /// retired string form (`"public"` / `"member-list"` / `"managing-app"`) that
 /// pre-bddc99fb clients still emit. An unrecognized union `$type` is the
 /// lexicon's `UnsupportedPolicy`, not a malformed request.
+///
+/// `#managingAppPolicy` is also `UnsupportedPolicy` (SWAN-24 option B).
+/// Swan has no outbound `com.atproto.simplespace.checkUserAccess` client, so
+/// a managing-app space would silently deny every non-owner; proposal 0016
+/// says a host MUST reject a policy it does not implement at createSpace /
+/// updateSpace time.
 private enum SimpleSpacePolicyWire: Decodable {
     case union(SimpleSpacePolicy, managingApp: String?)
 
@@ -60,8 +66,8 @@ private enum SimpleSpacePolicyWire: Decodable {
             self = .union(.public, managingApp: nil)
         case .comAtprotoSimplespaceDefsMemberListPolicy:
             self = .union(.memberList, managingApp: nil)
-        case let .comAtprotoSimplespaceDefsManagingAppPolicy(value):
-            self = .union(.managingApp, managingApp: value.managingApp)
+        case .comAtprotoSimplespaceDefsManagingAppPolicy:
+            throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
         case .unexpected:
             throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
         }
@@ -766,6 +772,8 @@ private func validateSimpleSpacePolicyJSON(_ value: Any) throws {
               managingApp.utf8.count <= 2_048 else {
             throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
         }
+        // Well-formed but not implemented: see `SimpleSpacePolicyWire`.
+        throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
     default:
         throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
     }
