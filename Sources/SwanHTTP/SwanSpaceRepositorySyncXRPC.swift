@@ -389,7 +389,7 @@ private func authorizeRepositorySyncRead(
         }
     }
     do {
-        return try await capability.authorizer.authorize(
+        return try await capability.authorizer.authorizeSpaceRoute(
             request: request,
             method: "GET",
             fixedPath: fixedPath

@@ -454,3 +454,65 @@ final class ScopePermissionsFenceTests: XCTestCase {
         XCTAssertNotEqual(value, permissions(wire, stated: ["skey", "action"]))
     }
 }
+
+// MARK: - `--enable-spaces-open-interop` upstream defaults (SWAN-09)
+
+extension ScopePermissionsFenceTests {
+    private func upstream(_ scope: String, stated: Set<String> = []) -> SwanScopePermissions {
+        SwanScopePermissions(
+            rawScopes: [scope],
+            subject: "did:plc:user",
+            statedKeys: [scope: stated]
+        ).withUpstreamSpaceDefaults()
+    }
+
+    private func exchange(type: String, authority: String) -> SpaceScopeTarget {
+        SpaceScopeTarget(type: type, authority: authority, skey: "forum", operation: .delegationExchange)
+    }
+
+    /// The proposal's canonical bare grants exchange under upstream defaults
+    /// and are refused by the hardened fence (positive and negative control).
+    func testUpstreamDefaultsLetBareAndWildcardGrantsExchange() {
+        let other = "did:plc:otherauthority"
+        let cases: [(scope: String, target: SpaceScopeTarget)] = [
+            ("space:com.example.forum?authority=*", exchange(type: "com.example.forum", authority: other)),
+            ("space:com.example.forum", exchange(type: "com.example.forum", authority: "did:plc:user")),
+            ("space:*?authority=*&action=read", exchange(type: "com.example.forum", authority: other)),
+        ]
+        for (scope, target) in cases {
+            let stated: Set<String> = scope.contains("action=") ? ["authority", "action"] : (scope.contains("authority=") ? ["authority"] : [])
+            XCTAssertTrue(upstream(scope, stated: stated).allowsSpace(target), scope)
+            XCTAssertFalse(permissions(scope, stated: stated).allowsSpace(target), scope)
+        }
+    }
+
+    /// Value coverage still applies: a defaulted `self` authority does not
+    /// exchange for another authority's space, and a write-only grant never
+    /// exchanges.
+    func testUpstreamDefaultsKeepTupleMatchingAndRequireRead() {
+        XCTAssertFalse(
+            upstream("space:com.example.forum").allowsSpace(
+                exchange(type: "com.example.forum", authority: "did:plc:otherauthority")
+            )
+        )
+        XCTAssertFalse(
+            upstream("space:com.example.forum?authority=*&action=create", stated: ["authority", "action"])
+                .allowsSpace(exchange(type: "com.example.forum", authority: "did:plc:otherauthority"))
+        )
+    }
+
+    /// Listing: a defaulted action suffices under upstream defaults; an
+    /// unfiltered listing still needs a wildcard-type grant, as upstream.
+    func testUpstreamDefaultsListingUsesDefaultedActions() {
+        XCTAssertTrue(upstream("space:x.y.z").allowsSpaceListing(type: "x.y.z", authority: "did:plc:user"))
+        XCTAssertFalse(permissions("space:x.y.z", stated: []).allowsSpaceListing(type: "x.y.z", authority: "did:plc:user"))
+        XCTAssertFalse(upstream("space:x.y.z?authority=*").allowsSpaceListing(type: nil, authority: nil))
+        XCTAssertTrue(upstream("space:*?authority=*").allowsSpaceListing(type: nil, authority: nil))
+    }
+
+    func testUpstreamDefaultsParticipateInEquality() {
+        let scope = "space:x.y.z"
+        XCTAssertNotEqual(permissions(scope, stated: []), upstream(scope))
+        XCTAssertEqual(upstream(scope), upstream(scope))
+    }
+}

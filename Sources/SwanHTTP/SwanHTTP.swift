@@ -679,7 +679,8 @@ public struct SwanHTTPServer: Sendable {
                 publicURL: configuration.publicURL,
                 runtime: oauthRuntime,
                 accountControlStore: accountControlStore,
-                legacySessions: legacySessionXRPC?.sessions
+                legacySessions: legacySessionXRPC?.sessions,
+                spacesOpenInterop: spacesOpenInterop != nil
             )
         } else {
             accountResourceAuthorizer = nil

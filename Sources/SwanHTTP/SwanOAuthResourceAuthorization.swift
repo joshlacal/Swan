@@ -44,6 +44,9 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
     /// without `--enable-legacy-sessions` gets: a `Bearer` credential then falls
     /// through to the DPoP parser and is refused exactly as it is today.
     private let legacySessions: DurableLegacySessionService?
+    /// `--enable-spaces-open-interop` (decision B(d)); consulted only by
+    /// ``authorizeSpaceRoute(request:method:fixedPath:legacyAdmission:now:)``.
+    private let spacesOpenInterop: Bool
 
     /// `publicURL` is the process's configured canonical public identity, not
     /// a request-derived origin. It must be a scheme/host root URL so each
@@ -52,7 +55,8 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         publicURL: URL,
         runtime: SwanOAuthRuntime,
         accountControlStore: any AccountControlStore,
-        legacySessions: DurableLegacySessionService? = nil
+        legacySessions: DurableLegacySessionService? = nil,
+        spacesOpenInterop: Bool = false
     ) throws {
         guard Self.validPublicURL(publicURL) else {
             throw SwanError.malformed("resource authorization public URL is invalid")
@@ -61,6 +65,7 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         self.runtime = runtime
         self.accountControlStore = accountControlStore
         self.legacySessions = legacySessions
+        self.spacesOpenInterop = spacesOpenInterop
     }
 
     /// Issues a challenge nonce from the exact OAuth runtime used by
@@ -124,6 +129,81 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
             dpopProof: proof,
             now: now
         )
+    }
+
+    /// Which legacy sessions a space route admits under open interop.
+    enum SpaceRouteLegacyAdmission: Sendable {
+        /// Upstream `ACCESS_STANDARD`: account-password and app-password
+        /// sessions (own-repo space reads/writes, listSpaces).
+        case standard
+        /// Upstream `ACCESS_FULL`: account-password sessions only
+        /// (getDelegationToken).
+        case fullAccessOnly
+    }
+
+    /// ``authorize(request:method:fixedPath:now:)`` for an atproto-spaces
+    /// route. Without `--enable-spaces-open-interop` it is exactly that.
+    ///
+    /// With the flag (decision B(d)), an OAuth grant is evaluated under
+    /// upstream space-scope defaults, and a legacy session is admitted as
+    /// upstream admits it: it becomes an account grant for
+    /// `space:*?authority=*&collection=*` with default actions, so the domain
+    /// policy still confines it to the subject's own repository and grants no
+    /// `manage` operation. App-password sessions are refused where
+    /// `legacyAdmission` is ``SpaceRouteLegacyAdmission/fullAccessOnly``.
+    func authorizeSpaceRoute(
+        request: Request,
+        method: String,
+        fixedPath: String,
+        legacyAdmission: SpaceRouteLegacyAdmission = .standard,
+        now: Date = Date()
+    ) async throws -> AuthorizationContext {
+        let context = try await authorize(
+            request: request,
+            method: method,
+            fixedPath: fixedPath,
+            now: now
+        )
+        guard spacesOpenInterop else { return context }
+        switch context {
+        case let .accountOAuth(subject, permissions):
+            return .accountOAuth(
+                subject: subject,
+                permissions: permissions.withUpstreamSpaceDefaults()
+            )
+        case let .accountLegacySession(subject, _):
+            guard let legacySessions,
+                  let bearer = Self.bearerToken(from: request.headers) else {
+                throw SwanResourceAuthorizationFailure.denied
+            }
+            if legacyAdmission == .fullAccessOnly {
+                do {
+                    let fullAccessSubject = try await legacySessions.authorizeFullAccess(
+                        accessJWT: bearer,
+                        now: now
+                    )
+                    guard fullAccessSubject == subject else {
+                        throw SwanResourceAuthorizationFailure.denied
+                    }
+                } catch {
+                    throw SwanResourceAuthorizationFailure.denied
+                }
+            }
+            return .accountOAuth(
+                subject: subject,
+                permissions: Self.upstreamLegacySpacePermissions(subject: subject)
+            )
+        default:
+            return context
+        }
+    }
+
+    /// The space grant an upstream legacy session carries under open interop.
+    static func upstreamLegacySpacePermissions(subject: String) -> SwanScopePermissions {
+        SwanScopePermissions(
+            rawScopes: ["atproto", "space:*?authority=*&collection=*"],
+            subject: subject
+        ).withUpstreamSpaceDefaults()
     }
 
     /// Returns only a domain authorization context. A raw opaque token, a

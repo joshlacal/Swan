@@ -59,10 +59,11 @@ private struct AuthenticatedGetSpaceDelegationTokenHandler:
 
         let authorization: AuthorizationContext
         do {
-            authorization = try await capability.authorizer.authorize(
+            authorization = try await capability.authorizer.authorizeSpaceRoute(
                 request: request,
                 method: "GET",
-                fixedPath: "/xrpc/com.atproto.space.getDelegationToken"
+                fixedPath: "/xrpc/com.atproto.space.getDelegationToken",
+                legacyAdmission: .fullAccessOnly
             )
         } catch let failure as SwanResourceAuthorizationFailure {
             throw switch failure {

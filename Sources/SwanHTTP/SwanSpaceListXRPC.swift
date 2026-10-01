@@ -59,7 +59,7 @@ private struct AuthenticatedListSpacesHandler: ComAtprotoSpaceListSpaces.ServerH
 
         let authorization: AuthorizationContext
         do {
-            authorization = try await capability.authorizer.authorize(
+            authorization = try await capability.authorizer.authorizeSpaceRoute(
                 request: request,
                 method: "GET",
                 fixedPath: "/xrpc/com.atproto.space.listSpaces"

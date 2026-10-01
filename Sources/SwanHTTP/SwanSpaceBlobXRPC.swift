@@ -319,7 +319,7 @@ private func authorizeBlobRead(
         }
     }
     do {
-        return try await capability.authorizer.authorize(
+        return try await capability.authorizer.authorizeSpaceRoute(
             request: request,
             method: "GET",
             fixedPath: "/xrpc/com.atproto.space.getBlob"

@@ -103,7 +103,7 @@ private struct AuthenticatedGetSpaceHandler: ComAtprotoSimplespaceGetSpace.Serve
             }
         } else {
             do {
-                authorization = try await capability.authorizer.authorize(
+                authorization = try await capability.authorizer.authorizeSpaceRoute(
                     request: request,
                     method: "GET",
                     fixedPath: "/xrpc/com.atproto.simplespace.getSpace"
@@ -826,7 +826,7 @@ private func authorize(
     method: String = "GET"
 ) async throws -> AuthorizationContext {
     do {
-        return try await authorizer.authorize(
+        return try await authorizer.authorizeSpaceRoute(
             request: request,
             method: method,
             fixedPath: fixedPath
@@ -897,7 +897,7 @@ private func authorizeWrite(
     method: String = "POST"
 ) async throws -> AuthorizationContext {
     do {
-        return try await authorizer.authorize(
+        return try await authorizer.authorizeSpaceRoute(
             request: request,
             method: method,
             fixedPath: fixedPath
