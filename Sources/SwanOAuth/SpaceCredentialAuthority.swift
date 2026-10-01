@@ -719,10 +719,11 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
         /// that window to something an operator can reason about while leaving
         /// the exchange cheap enough to repeat.
         ///
-        /// This changes only what this authority mints.
-        /// ``PermissionedDataJWT/spaceCredentialLifetime`` remains the two-hour
-        /// interop ceiling, so credentials minted by another proposal-0016
-        /// implementation are still accepted unchanged.
+        /// This changes only what this authority mints. It is already below
+        /// upstream's 600-second default (#5567).
+        /// ``PermissionedDataJWT/spaceCredentialLifetime`` is the one-hour
+        /// ceiling both minting and verification enforce, so a credential
+        /// minted by another implementation with upstream's default verifies.
         public static let defaultLifetime: TimeInterval = 5 * 60
 
         public static let standard = Configuration(uncheckedLifetime: defaultLifetime)

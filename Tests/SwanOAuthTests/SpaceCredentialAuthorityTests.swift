@@ -136,6 +136,14 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
         }
         XCTAssertEqual(grant.space, space)
         XCTAssertEqual(grant.permissions, [.read])
+
+        // The same independent signer's two-hour credential has a valid
+        // signature but exceeds the one-hour ceiling (upstream #5567).
+        await XCTAssertThrowsErrorAsync(try await credentialVerifier.authorization(
+            for: SpaceCredentialGoldenFixtures.boundSecp256k1TwoHour,
+            expectedSpace: space,
+            now: timestamp
+        ))
     }
 
     func testVerifierRejectsWrongSpaceExpiredTamperedMalformedAndUnknownKeys() async throws {
@@ -307,7 +315,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             issuer: authority,
             space: space,
             iat: issuedAt,
-            exp: issuedAt + 7_200,
+            exp: issuedAt + 3_600,
             key: key
         )
         _ = try PermissionedDataJWT.verifySpaceCredential(
@@ -321,7 +329,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             issuer: authority,
             space: space,
             iat: issuedAt,
-            exp: issuedAt + 7_201,
+            exp: issuedAt + 3_601,
             key: key
         )
         XCTAssertThrowsError(try PermissionedDataJWT.verifySpaceCredential(
@@ -334,7 +342,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
         let expiryAtSkewBoundary = try signedSpaceCredential(
             issuer: authority,
             space: space,
-            iat: issuedAt - 7_200,
+            iat: issuedAt - 3_600,
             exp: issuedAt - 60,
             key: key
         )
@@ -344,6 +352,38 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             expectedSpace: space,
             now: now
         )
+    }
+
+    /// Upstream #5567: a credential `iat` may lead the verifier by at most
+    /// five seconds, independent of the (wider) expiry clock skew; `exp` must
+    /// be strictly after `iat`; and `jti` is required.
+    func testCredentialIssuedAtLeadExpiryOrderAndJTIFollowUpstreamRules() throws {
+        let space = try SpaceURI(
+            authority: authority,
+            spaceType: "app.bsky.bookmarks",
+            skey: "iat-lead"
+        )
+        let key = P256.Signing.PrivateKey()
+        let current = Int64(now.timeIntervalSince1970)
+        func verify(iat: Int64, exp: Int64, jti: String? = UUID().uuidString) throws {
+            _ = try PermissionedDataJWT.verifySpaceCredential(
+                try signedSpaceCredential(
+                    issuer: authority, space: space, iat: iat, exp: exp,
+                    key: key, jti: jti
+                ),
+                publicKey: key.publicKey,
+                expectedSpace: space,
+                now: now,
+                clockSkew: 60
+            )
+        }
+        XCTAssertNoThrow(try verify(iat: current + 4, exp: current + 600))
+        XCTAssertNoThrow(try verify(iat: current + 5, exp: current + 600))
+        XCTAssertThrowsError(try verify(iat: current + 6, exp: current + 600))
+        XCTAssertThrowsError(try verify(iat: current + 60, exp: current + 600))
+        XCTAssertThrowsError(try verify(iat: current, exp: current))
+        XCTAssertThrowsError(try verify(iat: current, exp: current + 600, jti: nil))
+        XCTAssertThrowsError(try verify(iat: current, exp: current + 600, jti: ""))
     }
 
     func testVerificationOnlyResolverNeverReadsPrivateSigningMaterial() async throws {
@@ -588,7 +628,8 @@ private func signedSpaceCredential(
     space: SpaceURI,
     iat: Int64,
     exp: Int64,
-    key: P256.Signing.PrivateKey
+    key: P256.Signing.PrivateKey,
+    jti: String? = UUID().uuidString
 ) throws -> String {
     let header = try JSONSerialization.data(
         withJSONObject: [
@@ -598,15 +639,16 @@ private func signedSpaceCredential(
         ],
         options: [.sortedKeys, .withoutEscapingSlashes]
     )
+    var claims: [String: Any] = [
+        "cnf": ["jkt": String(repeating: "A", count: 43)],
+        "exp": NSNumber(value: exp),
+        "iat": NSNumber(value: iat),
+        "iss": issuer,
+        "sub": space.rawValue,
+    ]
+    if let jti { claims["jti"] = jti }
     let payload = try JSONSerialization.data(
-        withJSONObject: [
-            "cnf": ["jkt": String(repeating: "A", count: 43)],
-            "exp": NSNumber(value: exp),
-            "iat": NSNumber(value: iat),
-            "iss": issuer,
-            "jti": UUID().uuidString,
-            "sub": space.rawValue,
-        ],
+        withJSONObject: claims,
         options: [.sortedKeys, .withoutEscapingSlashes]
     )
     let signingInput = "\(header.base64URLEncodedString()).\(payload.base64URLEncodedString())"

@@ -236,7 +236,21 @@ public enum PermissionedDataJWT {
     /// 401 BadJwtIss. Swan-hosted did:plc and did:web authorities publish
     /// only `#atproto`, and the signing key is that method's key.
     public static let spaceCredentialIssuedKeyID = spaceCredentialFallbackKeyID
-    public static let spaceCredentialLifetime: TimeInterval = 2 * 60 * 60
+    /// The hard ceiling on a space credential's `exp - iat`, enforced both
+    /// when Swan mints and when it verifies (upstream #5567,
+    /// `SPACE_CREDENTIAL_MAX_AGE_SEC`). A longer credential is rejected even
+    /// when its signature is valid, because the lifetime is the revocation
+    /// window of a token that names no reader.
+    public static let spaceCredentialLifetime: TimeInterval = 60 * 60
+    /// The lifetime minted when a caller does not choose one (upstream
+    /// #5567's credential `expiresInSec`). Swan's own authority issues a
+    /// shorter credential still; see
+    /// `DurableSpaceCredentialAuthority.Configuration.defaultLifetime`.
+    public static let spaceCredentialDefaultLifetime: TimeInterval = 10 * 60
+    /// How far a credential's `iat` may lead the verifier's clock (upstream
+    /// #5567 `CLOCK_SKEW_SEC`). This is deliberately independent of, and never
+    /// wider than, the general `clockSkew` that bounds expiry.
+    public static let spaceCredentialMaximumIssuedAtLead: Int64 = 5
     public static let maximumCompactDelegationBytes = 8 * 1_024
     public static let maximumCompactSpaceCredentialBytes = 8 * 1_024
     /// `jti` is a bounded opaque nonce in proposal 0016, not a UUID grammar.
@@ -443,7 +457,7 @@ public enum PermissionedDataJWT {
         key: P256.Signing.PrivateKey,
         dpopKeyThumbprint: String,
         now: Date = Date(),
-        lifetime: TimeInterval = spaceCredentialLifetime,
+        lifetime: TimeInterval = spaceCredentialDefaultLifetime,
         kid: String = spaceCredentialIssuedKeyID
     ) throws -> String {
         guard issuer == space.authority,
@@ -504,12 +518,18 @@ public enum PermissionedDataJWT {
               expectedSpace.map({ $0 == space }) ?? true else {
             throw SwanError.unauthorized("space credential issuer or subject is invalid")
         }
+        // Upstream #5567: a credential must have `exp > iat`, at most the
+        // one-hour ceiling, and an `iat` at most five seconds ahead.
+        guard claims.exp > claims.iat else {
+            throw SwanError.expired
+        }
         try validateTimes(
             iat: claims.iat,
             exp: claims.exp,
             now: now,
             clockSkew: clockSkew,
-            maximumLifetime: Int64(spaceCredentialLifetime)
+            maximumLifetime: Int64(spaceCredentialLifetime),
+            maximumIssuedAtLead: spaceCredentialMaximumIssuedAtLead
         )
         return claims
     }
@@ -744,7 +764,8 @@ public enum PermissionedDataJWT {
         exp: Int64,
         now: Date,
         clockSkew: TimeInterval,
-        maximumLifetime: Int64? = nil
+        maximumLifetime: Int64? = nil,
+        maximumIssuedAtLead: Int64? = nil
     ) throws {
         guard let current = integerTimestamp(now),
               let allowedSkew = integerClockSkew(clockSkew),
@@ -755,7 +776,11 @@ public enum PermissionedDataJWT {
                   return !duration.overflow && duration.partialValue <= maximumLifetime
               }) ?? true,
               isNotTooFarInPast(exp, comparedTo: current, allowedSkew: allowedSkew),
-              isNotTooFarInFuture(iat, comparedTo: current, allowedSkew: allowedSkew) else {
+              isNotTooFarInFuture(
+                  iat,
+                  comparedTo: current,
+                  allowedSkew: maximumIssuedAtLead.map { min($0, allowedSkew) } ?? allowedSkew
+              ) else {
             throw SwanError.expired
         }
     }
