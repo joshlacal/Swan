@@ -18,7 +18,7 @@ public struct SpaceCredentialAuthoritySigningKey: Sendable {
 
     init(
         authority: String,
-        keyID: String = PermissionedDataJWT.spaceCredentialKeyID,
+        keyID: String = PermissionedDataJWT.spaceCredentialIssuedKeyID,
         privateKey: P256.Signing.PrivateKey
     ) {
         self.authority = authority
@@ -119,8 +119,9 @@ public extension SpaceCredentialAuthorizationVerifier {
 /// Resolves the public material for an inspected user-to-space-host
 /// delegation. This is a separate protocol from
 /// ``SpaceCredentialPublicKeyResolver`` because delegations are signed by the
-/// user's `#atproto` key while space credentials are signed by an authority's
-/// dedicated `#atproto_space` key. Implementations may be local,
+/// user's `#atproto` key while space credentials are signed by the space
+/// authority's key (`#atproto`, or a dedicated `#atproto_space` method where
+/// a peer publishes one). Implementations may be local,
 /// operator-pinned, or explicitly startup-bound to a PLC. Any remote
 /// implementation must keep its issuer allowlist, transport policy,
 /// continuity checks, and cache bounds outside request input; the protocol
@@ -263,8 +264,12 @@ public struct LocalAccountSpaceCredentialSigningKeyResolver:
         else {
             throw SwanError.unavailable("space credential signing key is unavailable")
         }
+        // The account's `#atproto` method is the only verification method a
+        // Swan-hosted did:plc or did:web authority publishes, and this is its
+        // key, so the credential must name `#atproto`.
         return SpaceCredentialAuthoritySigningKey(
             authority: authority,
+            keyID: PermissionedDataJWT.spaceCredentialIssuedKeyID,
             privateKey: privateKey
         )
     }
@@ -471,7 +476,7 @@ public struct PinnedSpaceCredentialPublicKey: Sendable {
 
     public init(
         authority: String,
-        keyID: String = PermissionedDataJWT.spaceCredentialKeyID,
+        keyID: String = PermissionedDataJWT.spaceCredentialIssuedKeyID,
         generation: UInt64,
         publicKey: P256.Signing.PublicKey
     ) throws {
@@ -491,7 +496,7 @@ public struct PinnedSpaceCredentialPublicKey: Sendable {
     /// local and does not parse a DID document or make a network request.
     public init(
         authority: String,
-        keyID: String = PermissionedDataJWT.spaceCredentialKeyID,
+        keyID: String = PermissionedDataJWT.spaceCredentialIssuedKeyID,
         generation: UInt64,
         secp256k1PublicKey: Data
     ) throws {
@@ -543,10 +548,11 @@ public struct PinnedSpaceCredentialPublicKeyResolver:
     ) async throws -> PermissionedDataJWTVerificationKey? {
         let exact = PinnedKey(authority: issuer, keyID: keyID)
         if let key = keys[exact] { return key }
-        // A credential header normally names `#atproto_space`, but proposal
-        // 0016 permits the ordinary account key if no dedicated method is
-        // published. The pinned TypeScript PDS currently resolves exactly
-        // this fallback for simplespace authorities.
+        // Proposal 0016 permits the ordinary account key when no dedicated
+        // `#atproto_space` method is published, so a `#atproto_space` header
+        // may fall back to an `#atproto` pin. The reverse never happens: the
+        // reference implementation and Swan both mint `#atproto`, which
+        // resolves exactly.
         guard keyID == PermissionedDataJWT.spaceCredentialKeyID else {
             return nil
         }

@@ -546,14 +546,14 @@ struct ServeNotificationRuntime {
         case .es256:
             return try .init(
                 authority: pin.issuer,
-                keyID: pin.keyID ?? PermissionedDataJWT.spaceCredentialKeyID,
+                keyID: pin.keyID ?? PermissionedDataJWT.spaceCredentialIssuedKeyID,
                 generation: pin.generation,
                 publicKey: P256.Signing.PublicKey(x963Representation: bytes.value)
             )
         case .es256k:
             return try .init(
                 authority: pin.issuer,
-                keyID: pin.keyID ?? PermissionedDataJWT.spaceCredentialKeyID,
+                keyID: pin.keyID ?? PermissionedDataJWT.spaceCredentialIssuedKeyID,
                 generation: pin.generation,
                 secp256k1PublicKey: bytes.value
             )

@@ -33,7 +33,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             )
             let inspection = try PermissionedDataJWT.inspectSpaceCredential(token)
             XCTAssertEqual(inspection.header.typ, PermissionedDataJWT.credentialType)
-            XCTAssertEqual(inspection.header.kid, PermissionedDataJWT.spaceCredentialKeyID)
+            XCTAssertEqual(inspection.header.kid, "#atproto")
             XCTAssertEqual(inspection.claims.iss, authority)
             XCTAssertEqual(inspection.claims.sub, space.rawValue)
             // Swan issues a five-minute credential, because a credential names

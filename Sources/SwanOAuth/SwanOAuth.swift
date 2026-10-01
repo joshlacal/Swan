@@ -215,18 +215,27 @@ public enum PermissionedDataJWT {
     public static let credentialType = "atproto-space-credential+jwt"
     public static let clientAttestationType = "atproto-client-attestation+jwt"
     /// Proposal 0016 signs user-to-space-host delegations with the user's
-    /// regular AT Protocol signing key. This is intentionally distinct from
-    /// the authority-owned `#atproto_space` credential key below.
+    /// regular AT Protocol signing key. Space credentials are signed by the
+    /// space authority's key (see ``spaceCredentialIssuedKeyID``).
     public static let delegationKeyID = "#atproto"
     public static let delegationLifetime: TimeInterval = 60
-    /// Proposal 0016 assigns a dedicated DID verification method to space
-    /// credentials. Local issuance defaults to that method; verification has
-    /// a separately named, profile-reviewed ordinary-account-key fallback.
+    /// Proposal 0016 names an optional dedicated DID verification method for
+    /// space credentials. Swan never publishes it, so Swan never mints it;
+    /// verification still accepts it (resolving the dedicated method first
+    /// and the ordinary `#atproto` method only when the dedicated one is
+    /// absent) for peers that do publish one.
     public static let spaceCredentialKeyID = "#atproto_space"
-    /// Proposal 0016 permits the authority's ordinary AT Protocol verification
-    /// method when no dedicated `#atproto_space` method is published. The
-    /// pinned TypeScript PDS currently exercises this fallback in practice.
+    /// The authority's ordinary AT Protocol verification method. Proposal
+    /// 0016 permits it when no dedicated `#atproto_space` method is
+    /// published, and the reference implementation has minted exactly this
+    /// kid (resolving it with no fallback) since d7849741 (2026-07-30).
     public static let spaceCredentialFallbackKeyID = "#atproto"
+    /// The kid Swan writes into credentials it mints. A kid must name a
+    /// verification method the authority's DID document actually publishes:
+    /// the reference repo host rejects an unpublished `#atproto_space` with
+    /// 401 BadJwtIss. Swan-hosted did:plc and did:web authorities publish
+    /// only `#atproto`, and the signing key is that method's key.
+    public static let spaceCredentialIssuedKeyID = spaceCredentialFallbackKeyID
     public static let spaceCredentialLifetime: TimeInterval = 2 * 60 * 60
     public static let maximumCompactDelegationBytes = 8 * 1_024
     public static let maximumCompactSpaceCredentialBytes = 8 * 1_024
@@ -435,7 +444,7 @@ public enum PermissionedDataJWT {
         dpopKeyThumbprint: String,
         now: Date = Date(),
         lifetime: TimeInterval = spaceCredentialLifetime,
-        kid: String = spaceCredentialKeyID
+        kid: String = spaceCredentialIssuedKeyID
     ) throws -> String {
         guard issuer == space.authority,
               SpaceCredentialDPoPValidator.isValidKeyThumbprint(dpopKeyThumbprint),

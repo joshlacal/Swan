@@ -36,7 +36,7 @@ final class PermissionedResolverCompositionTests: XCTestCase {
 
         let credentialKeys = try await CompositeSpaceCredentialPublicKeyResolver(
             local: StaticCredentialKeys(keys: [
-                "\(localDID)|\(PermissionedDataJWT.spaceCredentialKeyID)": .p256(localKey.publicKey),
+                "\(localDID)|\(PermissionedDataJWT.spaceCredentialIssuedKeyID)": .p256(localKey.publicKey),
             ]),
             pinned: [
                 try .init(
@@ -136,7 +136,7 @@ final class PermissionedResolverCompositionTests: XCTestCase {
         await XCTAssertCompositionThrowsError {
             _ = try await CompositeSpaceCredentialPublicKeyResolver(
                 local: StaticCredentialKeys(keys: [
-                    "\(self.localDID)|\(PermissionedDataJWT.spaceCredentialKeyID)": .p256(localKey.publicKey),
+                    "\(self.localDID)|\(PermissionedDataJWT.spaceCredentialIssuedKeyID)": .p256(localKey.publicKey),
                 ]),
                 pinned: [
                     try .init(

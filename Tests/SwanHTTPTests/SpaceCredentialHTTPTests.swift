@@ -182,7 +182,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             )
             XCTAssertEqual(inspection.claims.iss, Self.authority)
             XCTAssertEqual(inspection.claims.sub, fixture.publicSpace.rawValue)
-            XCTAssertEqual(inspection.header.kid, PermissionedDataJWT.spaceCredentialKeyID)
+            XCTAssertEqual(inspection.header.kid, "#atproto")
             try await fixture.close()
         } catch {
             try? await fixture.close()

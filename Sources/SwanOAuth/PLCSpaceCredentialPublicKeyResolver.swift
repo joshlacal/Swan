@@ -357,11 +357,11 @@ public actor PLCSpaceCredentialPublicKeyResolver:
             return nil
         }
 
-        // The pinned TypeScript PDS emits `kid: #atproto_space` while its
-        // current simplespace authority publishes only the ordinary
-        // `#atproto` method. Proposal 0016 defines the dedicated method as
-        // preferred with an ordinary-account-key fallback, so try the
-        // fallback only when the dedicated method is genuinely absent. A
+        // Current authorities (the reference implementation since
+        // d7849741, and Swan) mint `kid: #atproto`, which resolves exactly.
+        // Proposal 0016 also permits `kid: #atproto_space` with an
+        // ordinary-account-key fallback, so for that kid try `#atproto` only
+        // when the dedicated method is genuinely absent. A
         // present-but-malformed dedicated method remains fail-closed and
         // never silently downgrades to another key.
         for methodName in methodNames {
