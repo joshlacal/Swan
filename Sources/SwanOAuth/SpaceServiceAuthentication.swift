@@ -16,6 +16,9 @@ public struct VerifiedSpaceServiceAuthentication: Sendable, Equatable {
     public let eventID: String
     public let requestBodyDigest: String?
     public let expiresAt: Date
+    /// The token's `iat`, when it carries one. Unbound (no `req`) upstream
+    /// tokens are admitted only with an `iat` and a lifetime of at most 60 s.
+    public let issuedAt: Date?
 
     public init(
         issuer: String,
@@ -23,7 +26,8 @@ public struct VerifiedSpaceServiceAuthentication: Sendable, Equatable {
         method: String,
         eventID: String,
         requestBodyDigest: String? = nil,
-        expiresAt: Date
+        expiresAt: Date,
+        issuedAt: Date? = nil
     ) {
         self.issuer = issuer
         self.audience = audience
@@ -31,6 +35,7 @@ public struct VerifiedSpaceServiceAuthentication: Sendable, Equatable {
         self.eventID = eventID
         self.requestBodyDigest = requestBodyDigest
         self.expiresAt = expiresAt
+        self.issuedAt = issuedAt
     }
 
     public init(
@@ -47,6 +52,7 @@ public struct VerifiedSpaceServiceAuthentication: Sendable, Equatable {
         self.eventID = eventID
         self.requestBodyDigest = requestBodyDigest
         self.expiresAt = expiresAt
+        issuedAt = nil
     }
 }
 
@@ -311,7 +317,8 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
             method: expectedMethod,
             eventID: eventID,
             requestBodyDigest: claims.requestBodyDigest,
-            expiresAt: Date(timeIntervalSince1970: TimeInterval(claims.exp))
+            expiresAt: Date(timeIntervalSince1970: TimeInterval(claims.exp)),
+            issuedAt: claims.iat.map { Date(timeIntervalSince1970: TimeInterval($0)) }
         )
     }
 }

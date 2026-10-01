@@ -878,6 +878,8 @@ struct ServePermissionedRuntime {
     let repositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration?
     let notificationConfiguration: SwanSpaceNotificationHTTPConfiguration?
     let checkUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration?
+    /// `--enable-spaces-open-interop`; `nil` keeps hardened behaviour.
+    var spacesOpenInterop: SwanSpacesOpenInteropConfiguration? = nil
 
     static func compose(
         local: ServeLocalSpaceRuntime?,
@@ -885,7 +887,8 @@ struct ServePermissionedRuntime {
         managingServiceAudience: String? = nil,
         clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy =
             UnavailableSpaceCredentialClientAttestationPolicy(),
-        serviceEndpointResolver: SwanServiceEndpointResolver? = nil
+        serviceEndpointResolver: SwanServiceEndpointResolver? = nil,
+        spacesOpenInterop: SwanSpacesOpenInteropConfiguration? = nil
     ) async throws -> ServePermissionedRuntime {
         let credentialPublicKeys: (any SpaceCredentialPublicKeyResolver)?
         let delegationPublicKeys: (any SpaceDelegationPublicKeyResolver)?
@@ -998,7 +1001,8 @@ struct ServePermissionedRuntime {
                 .init(credentialPublicKeys: $0)
             },
             notificationConfiguration: notificationConfiguration,
-            checkUserAccessConfiguration: checkUserAccessConfiguration
+            checkUserAccessConfiguration: checkUserAccessConfiguration,
+            spacesOpenInterop: spacesOpenInterop
         )
     }
 
@@ -1041,6 +1045,7 @@ struct ServePermissionedRuntime {
             spaceRepositoryCredentialConfiguration: repositoryCredentialConfiguration,
             spaceNotificationConfiguration: notificationConfiguration,
             simpleSpaceCheckUserAccessConfiguration: checkUserAccessConfiguration,
+            spacesOpenInterop: spacesOpenInterop,
             publicRepositoryReadDirectory: directory,
             publicRepositoryMutationDirectory: publicMutationRuntime.map { _ in
                 ServePublicMutationDirectory(directory: directory, controls: accountControlStore)
@@ -2276,6 +2281,12 @@ extension SwanCommand {
             help: "Enable local account-key credential, delegation, and repository-sync interop."
         )
         var enableLocalSpaceInterop = false
+
+        @Flag(
+            name: .customLong("enable-spaces-open-interop"),
+            help: "Opt into upstream atproto-spaces interop: unbound notify service auth, optional Atproto-Service-Auth on (un)registerNotify, open DID-document federation, and upstream scope/legacy-session semantics. Off by default."
+        )
+        var enableSpacesOpenInterop = false
 
         @Flag(
             name: .customLong("enable-public-repository-mutations"),
@@ -3897,7 +3908,8 @@ extension SwanCommand {
                         notification: notificationRuntime,
                         managingServiceAudience: managingServiceAudience,
                         clientAttestationPolicy: clientAttestationPolicy,
-                        serviceEndpointResolver: notifyServiceResolver
+                        serviceEndpointResolver: notifyServiceResolver,
+                        spacesOpenInterop: enableSpacesOpenInterop ? .standard : nil
                     )
                 } catch {
                     throw ValidationError("permissioned runtime key composition is invalid")

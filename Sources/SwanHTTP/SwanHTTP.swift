@@ -292,6 +292,62 @@ public struct SwanSpaceRepositorySyncHTTPConfiguration: Sendable {
 /// solely by `registerNotify` (Erratum 03) to resolve the credentialed
 /// caller's OWN `service` identifier through its DID document — a lookup the
 /// caller explicitly requested by naming it.
+/// The opt-in upstream-interop posture for atproto spaces, selected only by
+/// `swan serve --enable-spaces-open-interop`. Absent (the default) keeps
+/// Swan's hardened behaviour unchanged. When present:
+///
+/// - (a) notifyWrite / notifySpaceDeleted admit *unbound* upstream service
+///   JWTs (no `req` claim) whose `iss`/`aud`/`lxm` check out, whose lifetime
+///   is at most 60 s, and whose `jti` is unused; `aud` may be the bare
+///   authority DID or `<authority>#atproto_space_host`. A token that does
+///   carry `req` must still match the body, and Swan still sends `req`.
+/// - (b) registerNotify / unregisterNotify accept the space credential alone;
+///   `Atproto-Service-Auth`, when present, still proves service ownership.
+///   Header-less registrations are rate-capped per space and per
+///   credential subject.
+/// - (d) space OAuth scopes use upstream defaults (an omitted `action`
+///   defaults to read/create/update/delete for getDelegationToken and
+///   listSpaces, and a wildcard type may exchange), and legacy sessions reach
+///   spaces as upstream: account-password sessions at getDelegationToken,
+///   and both kinds for own-repo reads/writes and listSpaces.
+///
+/// Open federation (c) is composed by `swan serve` into the key resolvers and
+/// notifyWrite destinations; it has no HTTP-layer state.
+public struct SwanSpacesOpenInteropConfiguration: Sendable, Equatable {
+    /// Upstream `createServiceJwt` mints `exp = iat + 60`.
+    public static let maximumUnboundServiceLifetime: TimeInterval = 60
+    public static let standard = SwanSpacesOpenInteropConfiguration(
+        uncheckedPerSpace: 32,
+        uncheckedPerSubject: 8
+    )
+
+    /// Header-less registerNotify calls admitted per space per hour.
+    public let maximumHeaderlessRegistrationsPerSpacePerHour: Int
+    /// Header-less registerNotify calls admitted per (space, credential
+    /// subject) per hour.
+    public let maximumHeaderlessRegistrationsPerSubjectPerHour: Int
+
+    public init(
+        maximumHeaderlessRegistrationsPerSpacePerHour: Int = 32,
+        maximumHeaderlessRegistrationsPerSubjectPerHour: Int = 8
+    ) throws {
+        guard (1 ... 1_024).contains(maximumHeaderlessRegistrationsPerSpacePerHour),
+              (1 ... maximumHeaderlessRegistrationsPerSpacePerHour)
+                .contains(maximumHeaderlessRegistrationsPerSubjectPerHour) else {
+            throw SwanError.malformed("spaces open interop registration caps are invalid")
+        }
+        self.maximumHeaderlessRegistrationsPerSpacePerHour =
+            maximumHeaderlessRegistrationsPerSpacePerHour
+        self.maximumHeaderlessRegistrationsPerSubjectPerHour =
+            maximumHeaderlessRegistrationsPerSubjectPerHour
+    }
+
+    private init(uncheckedPerSpace: Int, uncheckedPerSubject: Int) {
+        maximumHeaderlessRegistrationsPerSpacePerHour = uncheckedPerSpace
+        maximumHeaderlessRegistrationsPerSubjectPerHour = uncheckedPerSubject
+    }
+}
+
 public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
     public let serviceAuthentication: any SpaceServiceAuthenticationVerifier
     let recipientBindings: SwanSpaceNotificationRecipientBindings
@@ -505,6 +561,7 @@ public struct SwanHTTPServer: Sendable {
         spaceRepositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration? = nil,
         spaceNotificationConfiguration: SwanSpaceNotificationHTTPConfiguration? = nil,
         simpleSpaceCheckUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration? = nil,
+        spacesOpenInterop: SwanSpacesOpenInteropConfiguration? = nil,
         publicRepositoryReadDirectory: (any PublicRepositoryReadDirectory)? = nil,
         publicRepositoryMutationDirectory: (any PublicRepositoryMutationDirectory)? = nil,
         publicRepositoryMutationSignerProvider: (any PublicRepositoryMutationSignerProvider)? = nil,
@@ -786,7 +843,13 @@ public struct SwanHTTPServer: Sendable {
                     notificationJSONDecodeObserver:
                         spaceNotificationConfiguration.notificationJSONDecodeObserver,
                     serviceEndpointResolver:
-                        spaceNotificationConfiguration.serviceEndpointResolver
+                        spaceNotificationConfiguration.serviceEndpointResolver,
+                    openInterop: spacesOpenInterop.map {
+                        SwanSpacesOpenInteropNotificationPolicy(
+                            configuration: $0,
+                            replayStore: oauthRuntime.spaceServiceJWTReplayStore
+                        )
+                    }
                 )
             } else {
                 authenticatedSpaceNotifications = nil
