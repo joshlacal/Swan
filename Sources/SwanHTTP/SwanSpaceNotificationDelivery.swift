@@ -89,6 +89,41 @@ public struct StaticSwanSpaceNotificationDestinations:
     }
 }
 
+/// `--enable-spaces-open-interop` (decision B(c)): an operator-configured
+/// destination wins; otherwise the authority's DID document decides —
+/// `#atproto_space_host` (type `AtprotoSpaceHost`), else `#atproto_pds`.
+/// A present-but-malformed entry is an error, so the outbox row retries
+/// rather than silently routing elsewhere.
+public struct SwanOpenFederationAuthorityNotificationDestinations:
+    SwanSpaceAuthorityNotificationDestinationResolving
+{
+    private let configured: any SwanSpaceAuthorityNotificationDestinationResolving
+    private let resolver: SwanDIDDocumentSpaceResolver
+
+    public init(
+        configured: any SwanSpaceAuthorityNotificationDestinationResolving,
+        resolver: SwanDIDDocumentSpaceResolver
+    ) {
+        self.configured = configured
+        self.resolver = resolver
+    }
+
+    public func destination(
+        forAuthority authority: String
+    ) async throws -> SwanSpaceNotificationDestination? {
+        if let destination = try await configured.destination(forAuthority: authority) {
+            return destination
+        }
+        guard let resolved = try await resolver.notifyDestination(forAuthority: authority) else {
+            return nil
+        }
+        return try SwanSpaceNotificationDestination(
+            endpoint: resolved.endpoint,
+            audience: resolved.audience
+        )
+    }
+}
+
 /// Looks up the latest durable repository state only after the outbox lease
 /// has committed. It returns commitment metadata, not records, CAR bytes,
 /// CIDs, credentials, or a database connection. A coalesced older event may

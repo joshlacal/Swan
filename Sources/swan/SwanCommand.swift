@@ -888,11 +888,12 @@ struct ServePermissionedRuntime {
         clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy =
             UnavailableSpaceCredentialClientAttestationPolicy(),
         serviceEndpointResolver: SwanServiceEndpointResolver? = nil,
-        spacesOpenInterop: SwanSpacesOpenInteropConfiguration? = nil
+        spacesOpenInterop: SwanSpacesOpenInteropConfiguration? = nil,
+        openFederation: SwanDIDDocumentSpaceResolver? = nil
     ) async throws -> ServePermissionedRuntime {
-        let credentialPublicKeys: (any SpaceCredentialPublicKeyResolver)?
-        let delegationPublicKeys: (any SpaceDelegationPublicKeyResolver)?
-        let servicePublicKeys: (any SpaceServicePublicKeyResolver)?
+        var credentialPublicKeys: (any SpaceCredentialPublicKeyResolver)?
+        var delegationPublicKeys: (any SpaceDelegationPublicKeyResolver)?
+        var servicePublicKeys: (any SpaceServicePublicKeyResolver)?
 
         switch (local, notification) {
         case let (.some(local), .some(notification)):
@@ -930,6 +931,21 @@ struct ServePermissionedRuntime {
             credentialPublicKeys = nil
             delegationPublicKeys = nil
             servicePublicKeys = nil
+        }
+        // `--enable-spaces-open-interop` (decision B(c)): after local, PLC,
+        // and pinned sources have no answer, resolve any did:plc / did:web
+        // issuer from its DID document. Only resolvers that already exist are
+        // widened, so the flag never enables a route by itself.
+        if let openFederation {
+            credentialPublicKeys = credentialPublicKeys.map {
+                FallbackSpaceCredentialPublicKeyResolver(primary: $0, fallback: openFederation)
+            }
+            delegationPublicKeys = delegationPublicKeys.map {
+                FallbackSpaceDelegationPublicKeyResolver(primary: $0, fallback: openFederation)
+            }
+            servicePublicKeys = servicePublicKeys.map {
+                FallbackSpaceServicePublicKeyResolver(primary: $0, fallback: openFederation)
+            }
         }
 
         let credentialConfiguration: SwanSpaceCredentialHTTPConfiguration?
@@ -3879,6 +3895,7 @@ extension SwanCommand {
                     throw ValidationError("--enable-notification-delivery requires --notification-config")
                 }
                 let permissionedRuntime: ServePermissionedRuntime
+                var openFederationResolver: SwanDIDDocumentSpaceResolver?
                 do {
                     // Erratum 03: `registerNotify` resolves a subscriber's
                     // `service` identifier through its DID document. Built
@@ -3886,30 +3903,39 @@ extension SwanCommand {
                     // peer-policied one OAuth metadata uses, and it only
                     // fires when a credentialed caller names a service.
                     let notifyServiceResolver: SwanServiceEndpointResolver?
+                    let didDocumentFetcher: SwanPeerPinnedDIDDocumentFetcher?
                     do {
                         let policy = try OAuthRemoteFetchPolicy()
-                        notifyServiceResolver = SwanServiceEndpointResolver(
-                            documents: try SwanPeerPinnedDIDDocumentFetcher(
-                                documents: OAuthRemoteDocumentFetcher(
-                                    policy: policy,
-                                    transport: try NIOPeerPinnedOAuthDocumentTransport(
-                                        maximumTransportTimeout: policy.timeout
-                                    )
-                                ),
-                                plcOrigin: managementDeletionPLCConfiguration?.origin
-                                    ?? PLCClientConfiguration.defaultProductionOrigin
-                            )
+                        let fetcher = try SwanPeerPinnedDIDDocumentFetcher(
+                            documents: OAuthRemoteDocumentFetcher(
+                                policy: policy,
+                                transport: try NIOPeerPinnedOAuthDocumentTransport(
+                                    maximumTransportTimeout: policy.timeout
+                                )
+                            ),
+                            plcOrigin: managementDeletionPLCConfiguration?.origin
+                                ?? PLCClientConfiguration.defaultProductionOrigin
                         )
+                        didDocumentFetcher = fetcher
+                        notifyServiceResolver = SwanServiceEndpointResolver(documents: fetcher)
                     } catch {
+                        didDocumentFetcher = nil
                         notifyServiceResolver = nil
                     }
+                    if enableSpacesOpenInterop, didDocumentFetcher == nil {
+                        throw ValidationError("--enable-spaces-open-interop requires DID document resolution")
+                    }
+                    openFederationResolver = enableSpacesOpenInterop
+                        ? didDocumentFetcher.map { SwanDIDDocumentSpaceResolver(documents: $0) }
+                        : nil
                     permissionedRuntime = try await .compose(
                         local: localSpaceRuntime,
                         notification: notificationRuntime,
                         managingServiceAudience: managingServiceAudience,
                         clientAttestationPolicy: clientAttestationPolicy,
                         serviceEndpointResolver: notifyServiceResolver,
-                        spacesOpenInterop: enableSpacesOpenInterop ? .standard : nil
+                        spacesOpenInterop: enableSpacesOpenInterop ? .standard : nil,
+                        openFederation: openFederationResolver
                     )
                 } catch {
                     throw ValidationError("permissioned runtime key composition is invalid")
@@ -3963,6 +3989,13 @@ extension SwanCommand {
                             throw ValidationError("notification account signing runtime is unavailable")
                         }
                     }
+                    let outboxDestinations: any SwanSpaceAuthorityNotificationDestinationResolving =
+                        openFederationResolver.map {
+                            SwanOpenFederationAuthorityNotificationDestinations(
+                                configured: notificationRuntime.destinations,
+                                resolver: $0
+                            )
+                        } ?? notificationRuntime.destinations
                     let poster: OAuthBoundedJSONPoster
                     do {
                         let pinned = notificationRuntime.peerPinnedTransportConfiguration
@@ -3985,7 +4018,7 @@ extension SwanCommand {
                         directory,
                         makeOutboxTransport: { database in
                             HTTPPermissionedSpaceOutboxTransport(
-                                destinations: notificationRuntime.destinations,
+                                destinations: outboxDestinations,
                                 announcements: .init(database: database),
                                 serviceAuthentication: serviceIssuer,
                                 poster: poster
