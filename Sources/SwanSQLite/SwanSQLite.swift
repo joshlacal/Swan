@@ -6325,6 +6325,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try copyCARSpoolFile(indexHandle, to: bodyHandle)
         try indexHandle.close()
         indexClosed = true
+        let indexBlockByteCount = bodyByteCount
 
         var recordCursor: (length: Int, pathBytes: Data)?
         var visitedCount = 0
@@ -6378,6 +6379,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 indexCID: indexCID,
                 fileHandle: bodyHandle,
                 bodyByteCount: bodyByteCount,
+                indexBlockByteCount: indexBlockByteCount,
                 lease: lease
             )
         )

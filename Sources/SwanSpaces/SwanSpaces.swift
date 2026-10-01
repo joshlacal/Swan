@@ -778,6 +778,10 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
     /// Exact index-plus-record suffix bytes. HTTP can combine this with its
     /// freshly created prefix before constructing response headers.
     public let bodyByteCount: Int
+    /// Byte count of the leading index block (its CAR frame prefix plus the
+    /// index map), when the producer recorded it. `getRepo?excludeValues=true`
+    /// streams only this block, so a spool without it cannot serve that form.
+    public let indexBlockByteCount: Int?
     private let adoptedHandle: FileHandle?
     private let bodyURL: URL?
     private let lease: SpaceCARSpoolLease?
@@ -796,9 +800,11 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
         indexCID: CID,
         bodyURL: URL,
         bodyByteCount: Int? = nil,
+        indexBlockByteCount: Int? = nil,
         lease: SpaceCARSpoolLease? = nil
     ) throws {
         self.indexCID = indexCID
+        self.indexBlockByteCount = indexBlockByteCount
         adoptedHandle = nil
         self.bodyURL = bodyURL
         self.lease = lease
@@ -806,7 +812,9 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
             forKeys: [.fileSizeKey]
         ).fileSize
         let resolvedByteCount = bodyByteCount ?? discovered ?? 0
-        guard resolvedByteCount >= 0 else {
+        guard resolvedByteCount >= 0,
+              indexBlockByteCount.map({ (0 ... resolvedByteCount).contains($0) }) ?? true
+        else {
             throw SpaceCARProductionLimits.limitExceeded()
         }
         self.bodyByteCount = resolvedByteCount
@@ -818,12 +826,16 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
         indexCID: CID,
         fileHandle: FileHandle,
         bodyByteCount: Int,
+        indexBlockByteCount: Int? = nil,
         lease: SpaceCARSpoolLease? = nil
     ) throws {
-        guard bodyByteCount >= 0 else {
+        guard bodyByteCount >= 0,
+              indexBlockByteCount.map({ (0 ... bodyByteCount).contains($0) }) ?? true
+        else {
             throw SpaceCARProductionLimits.limitExceeded()
         }
         self.indexCID = indexCID
+        self.indexBlockByteCount = indexBlockByteCount
         adoptedHandle = fileHandle
         bodyURL = nil
         self.lease = lease
@@ -844,8 +856,13 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
     /// expected to write each chunk directly to a streaming response body.
     /// This method owns cleanup even when the consumer throws or the request
     /// is cancelled.
+    ///
+    /// With `indexBlockOnly`, only the leading index block is streamed (the
+    /// `excludeValues` form of `getRepo`); the descriptor's total length is
+    /// still checked against ``bodyByteCount``.
     public func streamBody(
         maximumChunkBytes: Int = SpaceCARBodySpool.maximumChunkBytes,
+        indexBlockOnly: Bool = false,
         consume: (Data) async throws -> Void
     ) async throws {
         let admitted = cleanupLock.withLock {
@@ -861,6 +878,18 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
         guard (1 ... Self.maximumChunkBytes).contains(maximumChunkBytes) else {
             cleanup()
             throw SwanError.malformed("permissioned CAR chunk size is invalid")
+        }
+        let streamLimit: Int
+        if indexBlockOnly {
+            guard let indexBlockByteCount else {
+                cleanup()
+                throw SwanError.unavailable(
+                    "permissioned CAR spool is unavailable"
+                )
+            }
+            streamLimit = indexBlockByteCount
+        } else {
+            streamLimit = bodyByteCount
         }
         let handle: FileHandle
         if let adoptedHandle {
@@ -888,11 +917,11 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
 
         var streamedByteCount = 0
         var reusableChunk = Data(count: maximumChunkBytes)
-        while streamedByteCount < bodyByteCount {
+        while streamedByteCount < streamLimit {
             try Task.checkCancellation()
             let requestedByteCount = min(
                 maximumChunkBytes,
-                bodyByteCount - streamedByteCount
+                streamLimit - streamedByteCount
             )
             let chunkByteCount = try readPOSIXBytes(
                 fileDescriptor: handle.fileDescriptor,
@@ -907,7 +936,7 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
             }
             let (nextByteCount, overflow) =
                 streamedByteCount.addingReportingOverflow(chunkByteCount)
-            guard !overflow, nextByteCount <= bodyByteCount else {
+            guard !overflow, nextByteCount <= streamLimit else {
                 throw SwanError.unavailable(
                     "permissioned CAR spool is unavailable"
                 )
@@ -925,9 +954,21 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
         // The byte count is part of the authenticated producer handoff. Check
         // that the descriptor has neither truncated nor grown behind it.
         var endProbe = Data(count: 1)
+        if streamLimit < bodyByteCount {
+            guard bodyByteCount > 0, try readPOSIXBytes(
+                fileDescriptor: handle.fileDescriptor,
+                offset: bodyByteCount - 1,
+                maximumBytes: 1,
+                into: &endProbe
+            ) == 1 else {
+                throw SwanError.unavailable(
+                    "permissioned CAR spool is unavailable"
+                )
+            }
+        }
         guard try readPOSIXBytes(
             fileDescriptor: handle.fileDescriptor,
-            offset: streamedByteCount,
+            offset: bodyByteCount,
             maximumBytes: 1,
             into: &endProbe
         ) == 0 else {

@@ -41,6 +41,7 @@ private enum AuthenticatedSpaceRepositorySyncFailure: Error {
     case denied
     case nonceChallenge
     case fullRecoveryRequired
+    case malformedCursor
     case unavailable
 }
 
@@ -59,6 +60,9 @@ private struct AuthenticatedGetRepoHandler:
     struct PreparedResponse: Sendable {
         let prefix: Data
         let spool: SpaceCARBodySpool
+        /// `excludeValues`: stream the [commit, index] roots with no record
+        /// blocks, as the reference `serializeRepo` does.
+        let indexBlockOnly: Bool
     }
 
     func prepare(
@@ -119,12 +123,17 @@ private struct AuthenticatedGetRepoHandler:
             else {
                 throw AuthenticatedSpaceRepositorySyncFailure.unavailable
             }
+            let indexBlockOnly = parameters.excludeValues == true
+            if indexBlockOnly, snapshot.spool.indexBlockByteCount == nil {
+                throw AuthenticatedSpaceRepositorySyncFailure.unavailable
+            }
             return PreparedResponse(
                 prefix: try SpaceCARCodec.recoveryPrefix(
                     commit: envelope,
                     indexCID: snapshot.spool.indexCID
                 ),
-                spool: snapshot.spool
+                spool: snapshot.spool,
+                indexBlockOnly: indexBlockOnly
             )
         } catch {
             snapshot.spool.cleanup()
@@ -210,12 +219,22 @@ private struct AuthenticatedListRepoOpsHandler:
         guard (1 ... 1_000).contains(limit) else {
             throw AuthenticatedSpaceRepositorySyncFailure.invalidRequest
         }
+        // The reference cursor (`${rev}/${idx}`) takes precedence over
+        // `since`. Swan never splits one revision's atomic batch across pages
+        // (see below), so every cursor Swan issues ends a revision and
+        // resuming strictly after that revision is exact.
+        let resumeAfter: String?
+        if let cursor = parameters.cursor {
+            resumeAfter = try parseRepositoryOplogCursor(cursor).revision
+        } else {
+            resumeAfter = parameters.since?.toString()
+        }
         let read: AuthorizedSpaceRepositoryOplogRead
         do {
             read = try await capability.directory.repositoryOplog(
                 space: target.space,
                 author: target.author,
-                since: parameters.since?.toString(),
+                since: resumeAfter,
                 limit: limit,
                 includeValues: parameters.excludeValues != true,
                 maximumAggregateValueBytes: PublicRepositoryJSONReadLimits
@@ -257,9 +276,44 @@ private struct AuthenticatedListRepoOpsHandler:
             } else {
                 commit = nil
             }
-            return .init(ops: operations, commit: commit, cursor: nil)
+            // Like the reference, a cursor accompanies exactly the pages that
+            // carry no commit (more may follow).
+            var cursor: String?
+            if commit == nil, let last = operations.last {
+                let lastRevision = last.rev.toString()
+                let index = operations.reduce(-1) {
+                    $1.rev.toString() == lastRevision ? $0 + 1 : $0
+                }
+                cursor = formatRepositoryOplogCursor(
+                    revision: lastRevision,
+                    index: index
+                )
+            }
+            return .init(ops: operations, commit: commit, cursor: cursor)
         }
     }
+}
+
+/// Parses the reference `listRepoOps` cursor, `${rev}/${idx}`. Anything else
+/// is the lexicon's `MalformedCursor`.
+private func parseRepositoryOplogCursor(
+    _ cursor: String
+) throws -> (revision: String, index: Int) {
+    let parts = cursor.split(separator: "/", omittingEmptySubsequences: false)
+    guard cursor.utf8.count <= 64,
+          parts.count == 2,
+          let revision = try? TID(tidString: String(parts[0])),
+          !parts[1].isEmpty,
+          parts[1].utf8.count <= 9,
+          parts[1].utf8.allSatisfy({ $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }),
+          let index = Int(parts[1]) else {
+        throw AuthenticatedSpaceRepositorySyncFailure.malformedCursor
+    }
+    return (revision.toString(), index)
+}
+
+private func formatRepositoryOplogCursor(revision: String, index: Int) -> String {
+    "\(revision)/\(index)"
 }
 
 private func syncTarget(
@@ -516,6 +570,8 @@ func registerAuthenticatedListRepoOpsEndpoint(
         let parameters: ComAtprotoSpaceListRepoOps.Parameters
         do {
             parameters = try parseAuthenticatedListRepoOpsParameters(request)
+        } catch AuthenticatedSpaceRepositorySyncFailure.malformedCursor {
+            return authenticatedRepositorySyncError(.badRequest, code: "MalformedCursor")
         } catch {
             return authenticatedRepositorySyncError(.badRequest, code: "InvalidRequest")
         }
@@ -565,7 +621,9 @@ func registerAuthenticatedGetRepoEndpoint(
                 body: .init { writer in
                     defer { prepared.spool.cleanup() }
                     try await writer.write(ByteBuffer(data: prepared.prefix))
-                    try await prepared.spool.streamBody { chunk in
+                    try await prepared.spool.streamBody(
+                        indexBlockOnly: prepared.indexBlockOnly
+                    ) { chunk in
                         try await writer.write(ByteBuffer(data: chunk))
                     }
                     try await writer.finish(nil)
@@ -585,10 +643,11 @@ private let spaceGetLatestCommitQuerySchema = StrictQuerySchema(
 )
 private let spaceListRepoOpsQuerySchema = StrictQuerySchema(
     required: ["space", "repo"],
-    optional: ["since", "limit", "excludeValues"]
+    optional: ["since", "limit", "cursor", "excludeValues"]
 )
 private let spaceGetRepoQuerySchema = StrictQuerySchema(
-    required: ["space", "repo"]
+    required: ["space", "repo"],
+    optional: ["excludeValues"]
 )
 
 private func parseAuthenticatedGetLatestCommitParameters(
@@ -627,12 +686,17 @@ private func parseAuthenticatedListRepoOpsParameters(
         return try TID(tidString: value)
     }
     let limit = try query["limit"].map(strictRepositoryOplogLimit)
+    let cursor = try query["cursor"].map { value -> String in
+        _ = try parseRepositoryOplogCursor(value)
+        return value
+    }
     let excludeValues = try query["excludeValues"].map(strictBoolean)
     return .init(
         space: space,
         repo: repo,
         since: since,
         limit: limit,
+        cursor: cursor,
         excludeValues: excludeValues
     )
 }
@@ -651,7 +715,8 @@ private func parseAuthenticatedGetRepoParameters(
         didString: try requiredQueryValue("repo", in: query, maximumBytes: 2_048)
     )
     _ = try syncTarget(space, repo)
-    return .init(space: space, repo: repo)
+    let excludeValues = try query["excludeValues"].map(strictBoolean)
+    return .init(space: space, repo: repo, excludeValues: excludeValues)
 }
 
 private func strictRepositoryOplogLimit(_ value: String) throws -> Int {
@@ -702,6 +767,8 @@ private func authenticatedRepositorySyncResponse(
             .conflict,
             code: "full_repo_recovery_required"
         )
+    case .malformedCursor:
+        authenticatedRepositorySyncError(.badRequest, code: "MalformedCursor")
     case .unavailable:
         authenticatedRepositorySyncError(.serviceUnavailable, code: "temporarily_unavailable")
     }
@@ -733,6 +800,7 @@ private struct GetLatestCommitWireOutput: Encodable {
 private struct RepoOplogWireOutput: Encodable {
     let ops: [RepoOplogWireEntry]
     let commit: SignedCommitWireOutput?
+    let cursor: String?
 }
 
 private struct RepoOplogWireEntry: Encodable {
@@ -805,7 +873,8 @@ private func authenticatedListRepoOpsJSON(
                     value: $0.value
                 )
             },
-            commit: signedCommitWire(output.commit)
+            commit: signedCommitWire(output.commit),
+            cursor: output.cursor
         ),
         maximumBytes: PublicRepositoryJSONReadLimits.maximumListRecordsResponseBytes,
         lease: lease

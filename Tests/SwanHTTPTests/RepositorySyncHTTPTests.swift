@@ -703,6 +703,140 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// SWAN-08: `getRepo?excludeValues=true` returns the two roots
+    /// ([commit, index]) and no record blocks, as the reference
+    /// `serializeRepo` does.
+    func testGetRepoExcludeValuesStreamsOnlyCommitAndIndexBlocks() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let app = try makeServer(fixture, enabled: true).buildApplication(
+                logger: Logger(label: "RepositorySyncHTTPTests.getRepoExcludeValues")
+            )
+            let credential = try await fixture.credential(for: fixture.space)
+            try await app.test(.router) { client in
+                var fullIndexCID: CID?
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.alice, excludeValues: false),
+                    method: .get,
+                    headers: self.credentialHeaders(credential, path: Self.repoPath)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let car = Data(buffer: response.body)
+                    let reader = try CARReader(data: car)
+                    fullIndexCID = reader.roots.last
+                    XCTAssertGreaterThan(try self.carBlockCIDs(car).count, 2)
+                }
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.alice, excludeValues: true),
+                    method: .get,
+                    headers: self.credentialHeaders(credential, path: Self.repoPath)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    self.assertCARNoStore(response)
+                    let car = Data(buffer: response.body)
+                    let reader = try CARReader(data: car)
+                    XCTAssertEqual(reader.roots.count, 2)
+                    let blocks = try self.carBlockCIDs(car)
+                    XCTAssertEqual(blocks, reader.roots)
+                    XCTAssertEqual(reader.roots.last, fullIndexCID)
+                }
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.alice) + "&excludeValues=yes",
+                    method: .get,
+                    headers: self.credentialHeaders(credential, path: Self.repoPath)
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                }
+            }
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    /// SWAN-08: `listRepoOps` accepts the reference `${rev}/${idx}` cursor
+    /// (preferred over `since`) and emits one exactly on pages without a
+    /// commit. Following cursors yields every operation once.
+    func testListRepoOpsCursorPagesEveryOperationOnceAndRejectsMalformedCursor() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let app = try makeServer(fixture, enabled: true).buildApplication(
+                logger: Logger(label: "RepositorySyncHTTPTests.oplogCursor")
+            )
+            let credential = try await fixture.credential(for: fixture.space)
+            try await app.test(.router) { client in
+                var collected: [String] = []
+                var cursor: String?
+                var cursors: [String] = []
+                var sawCommit = false
+                for _ in 0 ..< 10 {
+                    try await client.execute(
+                        uri: self.oplogURI(
+                            space: fixture.space,
+                            repo: Self.alice,
+                            // A stale `since` must lose to the cursor.
+                            since: cursor == nil ? nil : fixture.tids[0],
+                            limit: 2,
+                            cursor: cursor
+                        ),
+                        method: .get,
+                        headers: self.credentialHeaders(credential, path: Self.oplogPath)
+                    ) { response in
+                        XCTAssertEqual(response.status, .ok)
+                        let body = try self.jsonObject(response.body)
+                        let ops = try XCTUnwrap(body["ops"] as? [[String: Any]])
+                        collected += ops.map {
+                            "\($0["rev"] as? String ?? "")/\($0["rkey"] as? String ?? "")"
+                        }
+                        let next = body["cursor"] as? String
+                        if body["commit"] != nil {
+                            XCTAssertNil(next)
+                            sawCommit = true
+                        } else {
+                            XCTAssertNotNil(next)
+                        }
+                        cursor = next
+                        if let next { cursors.append(next) }
+                    }
+                    if sawCommit { break }
+                }
+                XCTAssertTrue(sawCommit)
+                XCTAssertEqual(collected.count, 6)
+                XCTAssertEqual(Set(collected).count, 6)
+                XCTAssertEqual(
+                    collected.map { String($0.split(separator: "/")[0]) },
+                    fixture.tids + [fixture.tids[4]]
+                )
+                XCTAssertEqual(
+                    cursors,
+                    ["\(fixture.tids[1])/0", "\(fixture.tids[3])/0", "\(fixture.tids[4])/1"]
+                )
+
+                for malformed in ["not-a-cursor", "\(fixture.tids[1])/x", "\(fixture.tids[1])/", "garbage/1", "\(fixture.tids[1])/0/1"] {
+                    try await client.execute(
+                        uri: self.oplogURI(
+                            space: fixture.space,
+                            repo: Self.alice,
+                            cursor: malformed
+                        ),
+                        method: .get,
+                        headers: self.credentialHeaders(credential, path: Self.oplogPath)
+                    ) { response in
+                        XCTAssertEqual(response.status, .badRequest, malformed)
+                        XCTAssertEqual(try self.errorCode(response.body), "MalformedCursor", malformed)
+                    }
+                }
+            }
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     func testSyncAuthorizationQueryAndDPoPFailuresRemainOpaqueAndClosed() async throws {
         let fixture = try await Fixture.make()
         defer { fixture.cleanup() }
@@ -1107,8 +1241,10 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         "\(Self.latestPath)?space=\(percentEncode(space.rawValue))&repo=\(repo)"
     }
 
-    private func repoURI(space: SpaceURI, repo: String) -> String {
-        "\(Self.repoPath)?space=\(percentEncode(space.rawValue))&repo=\(repo)"
+    private func repoURI(space: SpaceURI, repo: String, excludeValues: Bool? = nil) -> String {
+        var uri = "\(Self.repoPath)?space=\(percentEncode(space.rawValue))&repo=\(repo)"
+        if let excludeValues { uri += "&excludeValues=\(excludeValues ? "true" : "false")" }
+        return uri
     }
 
     private func wholeSpaceReadScope(for space: SpaceURI) -> String {
@@ -1124,11 +1260,13 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         repo: String,
         since: String? = nil,
         limit: Int? = nil,
+        cursor: String? = nil,
         excludeValues: Bool? = nil
     ) -> String {
         var values = ["space=\(percentEncode(space.rawValue))", "repo=\(repo)"]
         if let since { values.append("since=\(since)") }
         if let limit { values.append("limit=\(limit)") }
+        if let cursor { values.append("cursor=\(percentEncode(cursor))") }
         if let excludeValues { values.append("excludeValues=\(excludeValues ? "true" : "false")") }
         return "\(Self.oplogPath)?\(values.joined(separator: "&"))"
     }
