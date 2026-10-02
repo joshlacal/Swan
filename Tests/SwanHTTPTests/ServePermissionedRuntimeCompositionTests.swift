@@ -90,7 +90,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-09-19.json"
+                        path: "Profiles/permissioned-data-0016-2026-10-01.json"
                     )
                 ),
                 configuration: .init(
@@ -168,7 +168,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(
-                    path: "Profiles/permissioned-data-0016-2026-09-19.json"
+                    path: "Profiles/permissioned-data-0016-2026-10-01.json"
                 )
             )
             let server = composition.makeServer(
@@ -222,11 +222,18 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let profileSet = Set(profile.endpoints)
             let generatedSet = Set(PermissionedData0016.methods.map(\.nsid))
             let matrixSet = Set(cases.map(\.nsid))
-            XCTAssertEqual(profile.endpoints.count, 27)
-            XCTAssertEqual(PermissionedData0016.methods.count, 27)
+            // Profile methods this composition does not serve yet. They stay
+            // in the profile and registry and are routed as method-correct
+            // 503 gates, checked after the semantic matrix below.
+            let gatedPending: Set<String> = [
+                ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier,
+            ]
+            XCTAssertEqual(profile.endpoints.count, 28)
+            XCTAssertEqual(PermissionedData0016.methods.count, 28)
             XCTAssertEqual(cases.count, 27)
             XCTAssertEqual(profileSet, generatedSet)
-            XCTAssertEqual(profileSet, matrixSet)
+            XCTAssertEqual(profileSet, matrixSet.union(gatedPending))
+            XCTAssertTrue(matrixSet.isDisjoint(with: gatedPending))
             XCTAssertEqual(matrixSet.count, cases.count, "matrix contains a duplicate NSID")
 
             let credential = try PermissionedDataJWT.createSpaceCredential(
@@ -355,6 +362,14 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                                 credential: credential
                             )
                         )
+                    }
+                }
+                for nsid in gatedPending.sorted() {
+                    try await client.execute(uri: "/xrpc/\(nsid)", method: .post) { response in
+                        XCTAssertEqual(response.status, .serviceUnavailable, nsid)
+                    }
+                    try await client.execute(uri: "/xrpc/\(nsid)", method: .get) { response in
+                        XCTAssertEqual(response.status, .notFound, nsid)
                     }
                 }
             }
@@ -762,7 +777,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-09-19.json"
+                        path: "Profiles/permissioned-data-0016-2026-10-01.json"
                     )
                 ),
                 configuration: .init(

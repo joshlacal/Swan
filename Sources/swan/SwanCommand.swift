@@ -1927,7 +1927,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Run Swan's Hummingbird server")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-09-19.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-10-01.json"
 
         /// The public route surface is a separate contract family from
         /// `--profile`, and gets a separate flag rather than a widened one.
@@ -5077,7 +5077,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Verify a pinned Swan artifact")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-09-19.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-10-01.json"
 
         @Option(name: .long, help: "Swan package root containing generated wire sources")
         var sourceRoot: String?

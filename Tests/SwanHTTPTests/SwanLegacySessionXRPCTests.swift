@@ -97,7 +97,7 @@ final class SwanLegacySessionXRPCTests: XCTestCase {
         }
 
         let profile = try ProtocolProfile.load(
-            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-09-19.json")
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-01.json")
         )
         let server = SwanHTTPServer(
             profile: profile,

@@ -167,7 +167,7 @@ final class PermissionedBlobPublicReadTests: XCTestCase, @unchecked Sendable {
             let runtime = try SwanOAuthRuntime(controlStore: control, serverKey: Data(repeating: 0x41, count: 32))
             let profile = try ProtocolProfile.load(from: URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-                .appending(path: "Profiles/permissioned-data-0016-2026-09-19.json"))
+                .appending(path: "Profiles/permissioned-data-0016-2026-10-01.json"))
             let server = SwanHTTPServer(
                 profile: profile,
                 configuration: .init(publicURL: URL(string: "https://swan.example")!),

@@ -23,11 +23,18 @@ final class SwanCoreTests: XCTestCase {
 
     func testBootstrapWireRegistryCoversEveryPinnedOperation() {
         let methods = PermissionedData0016.methods
-        XCTAssertEqual(methods.count, 27)
+        XCTAssertEqual(methods.count, 28)
         XCTAssertEqual(Set(methods.map(\.nsid)).count, methods.count)
         XCTAssertTrue(methods.contains { $0.nsid == "com.atproto.space.getRepo" && $0.outputEncoding == "application/vnd.ipld.car" })
         XCTAssertTrue(methods.contains { $0.nsid == "com.atproto.space.getSpaceCredential" })
         XCTAssertTrue(methods.contains { $0.nsid == "com.atproto.simplespace.updateSpace" })
+        XCTAssertTrue(methods.contains {
+            $0.nsid == "com.atproto.space.notifyCredentialRevoked" && $0.kind == .procedure
+                && $0.outputEncoding == nil && $0.declaredErrors.isEmpty
+        })
+        XCTAssertTrue(methods.contains {
+            $0.nsid == "com.atproto.space.notifyWrite" && $0.declaredErrors == ["SpaceNotFound", "FutureRev"]
+        })
     }
 }
 

@@ -26,7 +26,7 @@ public struct XRPCMethodDescriptor: Sendable, Codable, Equatable {
 }
 
 public enum PermissionedData0016 {
-    public static let profileID = "permissioned-data-0016-2026-09-19"
+    public static let profileID = "permissioned-data-0016-2026-10-01"
 
     /// Mechanically transcribed bootstrap registry from the profile's verified
     /// lexicon manifest. Petrel's opt-in server-contract generation replaces
@@ -46,8 +46,9 @@ public enum PermissionedData0016 {
         .init(nsid: "com.atproto.space.listRepoOps", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
         .init(nsid: "com.atproto.space.listRepos", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["SpaceNotFound"]),
         .init(nsid: "com.atproto.space.listSpaces", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: []),
+        .init(nsid: "com.atproto.space.notifyCredentialRevoked", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: []),
         .init(nsid: "com.atproto.space.notifySpaceDeleted", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: []),
-        .init(nsid: "com.atproto.space.notifyWrite", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: []),
+        .init(nsid: "com.atproto.space.notifyWrite", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "FutureRev"]),
         .init(nsid: "com.atproto.space.putRecord", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["SpaceNotFound"]),
         .init(nsid: "com.atproto.space.registerNotify", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "ServiceNotResolvable"]),
         .init(nsid: "com.atproto.space.unregisterNotify", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound"]),

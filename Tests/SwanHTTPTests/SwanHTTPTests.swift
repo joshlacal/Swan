@@ -18,13 +18,13 @@ final class SwanHTTPTests: XCTestCase {
     func testProfileAndGeneratedWireHaveTheSamePermissionedCoverage() throws {
         let profile = try ProtocolProfile.load(
             from: packageRoot().appending(
-                path: "Profiles/permissioned-data-0016-2026-09-19.json"
+                path: "Profiles/permissioned-data-0016-2026-10-01.json"
             )
         )
         let generated = PermissionedData0016.methods
 
         XCTAssertEqual(profile.id, PermissionedData0016.profileID)
-        XCTAssertEqual(profile.endpoints.count, 27)
+        XCTAssertEqual(profile.endpoints.count, 28)
         XCTAssertEqual(profile.endpoints, generated.map(\.nsid))
         XCTAssertEqual(Set(profile.endpoints).count, profile.endpoints.count)
     }
@@ -873,7 +873,7 @@ final class SwanHTTPTests: XCTestCase {
 
     private func loadPinnedProfile() throws -> ProtocolProfile {
         try ProtocolProfile.load(from: packageRoot()
-            .appending(path: "Profiles/permissioned-data-0016-2026-09-19.json"))
+            .appending(path: "Profiles/permissioned-data-0016-2026-10-01.json"))
     }
 
     private func makeServer(profile: ProtocolProfile) async throws -> (SwanHTTPServer, SQLiteControlDatabase, URL) {
