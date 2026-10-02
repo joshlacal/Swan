@@ -379,7 +379,7 @@ Signature-Input: atproto-space=("authorization" "atproto-space-audience")
 Signature: atproto-space=:<base64 64-byte r||s>:
 ```
 
-The audience is the repo owner's DID for repo reads (`getRecord`, `listRecords`, `listBlobs`, `getBlob`, `getRepo`, `getLatestCommit`, `listRepoOps`) and the space authority's bare DID for space-host operations (`listRepos`, `registerNotify`, `unregisterNotify`, `simplespace.getSpace`). The signature is not bound to a method, URL, or nonce, so it may be reused with the same credential and audience. `alg` is optional (`ecdsa-p256-sha256`); `keyid` is optional and must equal `cnf.kid`. Errors: 401 `BadSpaceSignature` (missing, duplicated, or invalid signature or audience field), 401 `BadSpaceAudience` (signed audience does not match the operation). Credentials presented under `Bearer` or the retired `DPoP` scheme are rejected. Credentials remain read-only at repository hosts; writes use the account's OAuth grant.
+The audience is the repo owner's DID for repo reads (`getRecord`, `listRecords`, `listBlobs`, `getBlob`, `getRepo`, `getLatestCommit`, `listRepoOps`) and the space authority's bare DID for space-host operations (`listRepos`, `registerNotify`, `unregisterNotify`, `simplespace.getSpace`). The signature is not bound to a method, URL, or nonce, so it may be reused with the same credential and audience. `alg` is optional (`ecdsa-p256-sha256`); `keyid` is optional and must equal `cnf.kid`. Errors: 401 `BadSpaceSignature` (missing, duplicated, or invalid signature or audience field), 401 `BadSpaceAudience` (signed audience does not match the operation), 401 `CredentialRevoked` (the authority revoked this credential's `jti`; do not retry it, obtain a replacement through a still-authorized session). Credentials presented under `Bearer` or the retired `DPoP` scheme are rejected. Credentials remain read-only at repository hosts; writes use the account's OAuth grant.
 
 ---
 
@@ -484,6 +484,12 @@ The audience is the repo owner's DID for repo reads (`getRecord`, `listRecords`,
 - **Authentication**: Outbox authorization / space owner proof.
 - **Request Body**: JSON object `{ "space": "did:..." }`.
 - **Returns**: 200 OK empty response.
+
+#### `com.atproto.space.notifyCredentialRevoked`
+- **Method**: `POST`
+- **Authentication**: Service auth (`Authorization: Bearer <service-jwt>`) with `iss` = the space authority, `aud` = the bare DID of an account Swan stores, and `lxm` = `com.atproto.space.notifyCredentialRevoked`. By default the JWT must also carry a `req` claim binding the body; under `--enable-spaces-open-interop` an unbound upstream token is accepted once (at most 60 s lifetime, single-use `jti`).
+- **Request Body**: JSON object `{ "space": "<space-ref>", "credentials": ["<jti>", ...] }` with 1 to 100 nonempty JWT IDs (not JWTs).
+- **Returns**: 200 OK empty response. Recording is idempotent. Each `(space, jti)` is retained for 3905 s from receipt (the 3600 s lifetime ceiling plus 5 s of `iat` lead and up to 300 s of expiry skew), and a presentation of a matching credential is refused with 401 `CredentialRevoked`.
 
 ---
 

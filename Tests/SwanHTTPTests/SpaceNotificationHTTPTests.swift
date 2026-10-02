@@ -5,6 +5,7 @@ import HummingbirdTesting
 import HTTPTypes
 import Logging
 import NIOCore
+import Petrel
 import PetrelCrypto
 import XCTest
 @testable import SwanCore
@@ -1278,8 +1279,9 @@ private struct NotificationHTTPFixture {
         return headers
     }
 
-    /// The reference presentation binds the credential and request proof to
-    /// the same holder key, with the credential hash in the proof's ath claim.
+    /// The reference presentation: `Atproto-Space` plus an HTTP message
+    /// signature by the credential's `cnf.kid` key over the authorization and
+    /// audience fields.
     func spaceSchemeCredentialHeaders(for serviceDID: String? = nil) throws -> HTTPFields {
         try registerHeaders(for: serviceDID)
     }
@@ -2202,6 +2204,197 @@ extension SpaceNotificationHTTPTests {
                 }
             let registered = await fixture.directory.registrations()
             XCTAssertTrue(registered.isEmpty)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+}
+
+// MARK: - notifyCredentialRevoked (atproto#5567)
+
+extension SpaceNotificationHTTPTests {
+    private func revocationBody(_ space: SpaceURI, _ credentials: [String]) -> ByteBuffer {
+        let ids = credentials.map { "\"\($0)\"" }.joined(separator: ",")
+        return ByteBuffer(string: "{\"space\":\"\(space.rawValue)\",\"credentials\":[\(ids)]}")
+    }
+
+    private func hostWriterAccount(_ fixture: NotificationHTTPFixture) async throws {
+        _ = try await fixture.control.createAccount(try AccountControlRegistration(
+            did: writer,
+            canonicalHandle: "revocation-writer.example.com",
+            passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+            signingKey: AccountControlKeyReference(purpose: .signing, generation: 1),
+            rotationKey: AccountControlKeyReference(purpose: .rotation, generation: 1),
+            publicGenesisCommitCID: nil,
+            createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+        ))
+    }
+
+    /// The authority revokes one credential at a repo host: the host persists
+    /// it idempotently and refuses that credential with CredentialRevoked,
+    /// while another credential for the same space keeps working.
+    func testRevokedCredentialIsRefusedWithCredentialRevoked() async throws {
+        let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
+        defer { fixture.cleanup() }
+        do {
+            try await hostWriterAccount(fixture)
+            let keys = SignedServiceKeys()
+            let app = try fixture.server(serviceAuthentication: try keys.verifier(authority: authority, writer: writer))
+                .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.revocation"))
+            let revoked = try PermissionedDataJWT.createSpaceCredential(
+                issuer: authority, space: fixture.space, key: fixture.key,
+                confirmationKeyID: try SpaceCredentialSignatureTestSupport.keyID
+            )
+            let kept = try PermissionedDataJWT.createSpaceCredential(
+                issuer: authority, space: fixture.space, key: fixture.key,
+                confirmationKeyID: try SpaceCredentialSignatureTestSupport.keyID
+            )
+            let revokedJTI = try PermissionedDataJWT.inspectSpaceCredential(revoked).claims.jti
+            let listURI = "/xrpc/com.atproto.space.listRepos?space=\(fixture.space.rawValue.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!)"
+            let revokedHeaders = try SpaceCredentialSignatureTestSupport.headers(token: revoked, audience: authority)
+            let keptHeaders = try SpaceCredentialSignatureTestSupport.headers(token: kept, audience: authority)
+            let method = ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier
+            let body = revocationBody(fixture.space, [revokedJTI])
+            let digest = SpaceNotificationRequestDigest.credentialRevocation(
+                space: fixture.space, credentials: [revokedJTI]
+            )
+            @Sendable func revocation(_ jti: String) throws -> HTTPFields {
+                serviceHeaders(try SpaceServiceJWT.create(
+                    issuer: authority, audience: writer, method: method, eventID: jti,
+                    requestBodyDigest: digest, key: keys.authority
+                ))
+            }
+            try await app.test(.router) { client in
+                try await client.execute(uri: listURI, method: .get, headers: revokedHeaders) { response in
+                    XCTAssertEqual(response.status, .ok, "positive control: not yet revoked")
+                }
+                for eventID in ["revoke-1", "revoke-2"] {
+                    try await client.execute(
+                        uri: "/xrpc/\(method)", method: .post,
+                        headers: try revocation(eventID), body: body
+                    ) { response in
+                        XCTAssertEqual(response.status, .ok, eventID)
+                    }
+                }
+                try await client.execute(uri: listURI, method: .get, headers: revokedHeaders) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "CredentialRevoked")
+                }
+                // A revoked credential is refused even when its audience is
+                // also wrong: revocation is checked first, as in the reference.
+                let wrongAudience = try SpaceCredentialSignatureTestSupport.headers(token: revoked, audience: writer)
+                try await client.execute(uri: listURI, method: .get, headers: wrongAudience) { response in
+                    XCTAssertEqual(try notificationErrorCode(response.body), "CredentialRevoked")
+                }
+                try await client.execute(uri: listURI, method: .get, headers: keptHeaders) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                let keptWrongAudience = try SpaceCredentialSignatureTestSupport.headers(token: kept, audience: writer)
+                try await client.execute(uri: listURI, method: .get, headers: keptWrongAudience) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "BadSpaceAudience")
+                }
+            }
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    /// Service auth must come from the space authority, name a repo account
+    /// hosted here as its audience, carry this method's lxm, and (without
+    /// open interop) bind the body with `req`. The body must hold 1...100
+    /// nonempty JWT IDs.
+    func testRevocationRequiresAuthorityIssuerHostedAudienceAndAValidBody() async throws {
+        let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
+        defer { fixture.cleanup() }
+        do {
+            try await hostWriterAccount(fixture)
+            let keys = SignedServiceKeys()
+            let app = try fixture.server(serviceAuthentication: try keys.verifier(authority: authority, writer: writer))
+                .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.revocationAuth"))
+            let method = ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier
+            let body = revocationBody(fixture.space, ["jti-1"])
+            let digest = SpaceNotificationRequestDigest.credentialRevocation(space: fixture.space, credentials: ["jti-1"])
+            @Sendable func token(
+                issuer: String? = nil, audience: String? = nil, lxm: String? = nil,
+                req: String?? = nil, key: P256.Signing.PrivateKey? = nil, jti: String
+            ) throws -> HTTPFields {
+                // nil: bind the real digest; .some(nil): unbound; .some(x): x.
+                let bound: String? = req ?? digest
+                return serviceHeaders(try SpaceServiceJWT.create(
+                    issuer: issuer ?? authority, audience: audience ?? writer,
+                    method: lxm ?? method, eventID: jti,
+                    requestBodyDigest: bound, key: key ?? keys.authority
+                ))
+            }
+            try await app.test(.router) { client in
+                let denied: [(String, HTTPFields)] = [
+                    ("writer as issuer", try token(issuer: writer, key: keys.writer, jti: "a")),
+                    ("authority (not hosted) as audience", try token(audience: authority, jti: "b")),
+                    ("service identifier audience", try token(audience: "\(writer)#atproto_pds", jti: "c")),
+                    ("wrong lxm", try token(lxm: "com.atproto.space.notifyWrite", jti: "d")),
+                    ("unbound without open interop", try token(req: .some(.none), jti: "e")),
+                    ("mismatched req", try token(req: .some(String(repeating: "A", count: 43)), jti: "f")),
+                ]
+                for (name, headers) in denied {
+                    try await client.execute(uri: "/xrpc/\(method)", method: .post, headers: headers, body: body) { response in
+                        XCTAssertEqual(response.status, .unauthorized, name)
+                    }
+                }
+                try await client.execute(uri: "/xrpc/\(method)", method: .post, headers: try token(jti: "ok"), body: body) { response in
+                    XCTAssertEqual(response.status, .ok, "positive control")
+                }
+                for (index, (name, invalid)) in [
+                    ("empty list", revocationBody(fixture.space, [])),
+                    ("101 IDs", revocationBody(fixture.space, (0 ... 100).map { "j\($0)" })),
+                    ("empty ID", revocationBody(fixture.space, [""])),
+                    ("extra key", ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"credentials\":[\"jti-1\"],\"extra\":1}")),
+                    ("missing credentials", ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\"}")),
+                ].enumerated() {
+                    try await client.execute(uri: "/xrpc/\(method)", method: .post, headers: try token(jti: "body-\(index)"), body: invalid) { response in
+                        XCTAssertEqual(response.status, .badRequest, name)
+                    }
+                }
+                try await client.execute(uri: "/xrpc/\(method)", method: .get) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                }
+            }
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    /// Under --enable-spaces-open-interop an upstream authority's unbound
+    /// service JWT is admitted once, as for the other notification routes.
+    func testOpenInteropAdmitsUnboundRevocationOnce() async throws {
+        let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
+        defer { fixture.cleanup() }
+        do {
+            try await hostWriterAccount(fixture)
+            let keys = SignedServiceKeys()
+            let app = try fixture.server(
+                serviceAuthentication: try keys.verifier(authority: authority, writer: writer),
+                spacesOpenInterop: .standard
+            ).buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.revocationInterop"))
+            let method = ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier
+            let unbound = serviceHeaders(try SpaceServiceJWT.create(
+                issuer: authority, audience: writer, method: method,
+                eventID: "upstream-revocation", key: keys.authority
+            ))
+            try await app.test(.router) { client in
+                try await client.execute(uri: "/xrpc/\(method)", method: .post, headers: unbound, body: revocationBody(fixture.space, ["jti-1"])) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                try await client.execute(uri: "/xrpc/\(method)", method: .post, headers: unbound, body: revocationBody(fixture.space, ["jti-1"])) { response in
+                    XCTAssertEqual(response.status, .unauthorized, "an unbound token is single-use")
+                }
+            }
             try await fixture.close()
         } catch {
             try? await fixture.close()

@@ -115,8 +115,11 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
     /// `expectedAudience` is derived by the route from the operation, never
     /// from the request's Host or this server's identity: the repo owner's
     /// DID for repo reads, the space authority's bare DID for space-host
-    /// operations. Throws ``SpaceCredentialPresentationFailure`` for the
-    /// protocol's named errors and the verifier's opaque errors otherwise.
+    /// operations. A credential whose `(space, jti)` the authority revoked is
+    /// refused while the revocation is retained; an unreadable revocation
+    /// list fails closed as unavailable. Throws
+    /// ``SpaceCredentialPresentationFailure`` for the protocol's named errors
+    /// and the verifier's opaque errors otherwise.
     func authorizeSpaceCredential(
         _ token: String,
         verifier: any SpaceCredentialAuthorizationVerifier,
@@ -131,10 +134,45 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
             presentation: Self.spaceCredentialPresentation(from: request.headers),
             now: now
         )
+        // The reference checks revocation before the handler's audience
+        // check; keep that order so a revoked credential always reports
+        // CredentialRevoked.
+        guard try await !runtime.spaceCredentialRevocations.isRevoked(
+            space: presentation.space,
+            credentialID: presentation.credentialID,
+            now: now
+        ) else {
+            throw SpaceCredentialPresentationFailure.revoked
+        }
         guard presentation.audience == expectedAudience else {
             throw SpaceCredentialPresentationFailure.badAudience
         }
         return presentation.authorization
+    }
+
+    /// Records an authority's `notifyCredentialRevoked` for this repo host.
+    func recordSpaceCredentialRevocations(
+        space: SpaceURI,
+        credentialIDs: [String],
+        now: Date = Date()
+    ) async throws {
+        try await runtime.spaceCredentialRevocations.record(
+            space: space,
+            credentialIDs: credentialIDs,
+            now: now
+        )
+    }
+
+    /// Whether `did` names an account this host stores, in any lifecycle
+    /// state (the reference includes deactivated and taken-down accounts):
+    /// the audience test for `notifyCredentialRevoked`. Store failures are
+    /// `SwanError.unavailable`.
+    func hostsAccount(did: String) async throws -> Bool {
+        do {
+            return try await accountControlStore.account(did: did) != nil
+        } catch {
+            throw SwanError.unavailable("account directory unavailable")
+        }
     }
 
     /// Which legacy sessions a space route admits under open interop.

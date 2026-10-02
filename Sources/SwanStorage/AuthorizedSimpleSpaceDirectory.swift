@@ -721,6 +721,12 @@ public enum SpaceNotificationRequestDigest {
         SpaceServiceRequestDigest.deletion(space: space)
     }
 
+    /// The `req` binding for `notifyCredentialRevoked`: the space and its
+    /// revoked credential IDs, in body order.
+    public static func credentialRevocation(space: SpaceURI, credentials: [String]) -> String {
+        SpaceServiceRequestDigest.credentialRevocation(space: space, credentials: credentials)
+    }
+
     public static func write(
         space: SpaceURI,
         repository: String,
@@ -771,6 +777,17 @@ public enum SpaceServiceRequestDigest {
         digestBytes(domain: "swan.space.notify-deleted.v1", parts: [
             Data(space.rawValue.utf8)
         ])
+    }
+
+    public static func credentialRevocation(space: SpaceURI, credentials: [String]) -> String {
+        base64URLEncode(credentialRevocationBytes(space: space, credentials: credentials))
+    }
+
+    public static func credentialRevocationBytes(space: SpaceURI, credentials: [String]) -> Data {
+        digestBytes(
+            domain: "swan.space.notify-credential-revoked.v1",
+            parts: [Data(space.rawValue.utf8)] + credentials.map { Data($0.utf8) }
+        )
     }
 
     public static func writeBytes(

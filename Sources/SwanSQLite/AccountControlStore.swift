@@ -476,6 +476,7 @@ extension SQLiteControlDatabase {
         try await migrateAccountControlHardeningV7()
         try await migrateAccountProgramIntegrationV8()
         try await migrateOAuthLexiconDocumentsSchema()
+        try await migrateSpaceCredentialRevocationsV9()
     }
 
     /// Version 7 is a real in-place migration for databases created before
@@ -3089,6 +3090,7 @@ extension SQLiteControlDatabase {
             "oauth_control_client_assertion_replays",
             "permissioned_space_delegation_replays",
             "permissioned_space_client_attestation_replays",
+            "permissioned_space_credential_revocations",
             "account_emails",
             "account_email_tokens",
             "account_email_delivery_outbox",

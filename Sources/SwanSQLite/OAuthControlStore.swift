@@ -112,6 +112,7 @@ struct OAuthControlStorageLimits: Sendable, Equatable {
     let tokenFamilies: Int
     let accessTokens: Int
     let refreshTokens: Int
+    let spaceCredentialRevocations: Int
 
     static let production = OAuthControlStorageLimits(
         clientMetadata: 4_096,
@@ -125,7 +126,8 @@ struct OAuthControlStorageLimits: Sendable, Equatable {
         authorizationCodes: 32_768,
         tokenFamilies: 65_536,
         accessTokens: 131_072,
-        refreshTokens: 131_072
+        refreshTokens: 131_072,
+        spaceCredentialRevocations: 65_536
     )
 
     init(
@@ -140,7 +142,8 @@ struct OAuthControlStorageLimits: Sendable, Equatable {
         authorizationCodes: Int = 32_768,
         tokenFamilies: Int = 65_536,
         accessTokens: Int = 131_072,
-        refreshTokens: Int = 131_072
+        refreshTokens: Int = 131_072,
+        spaceCredentialRevocations: Int = 65_536
     ) {
         let values = [
             clientMetadata,
@@ -155,6 +158,7 @@ struct OAuthControlStorageLimits: Sendable, Equatable {
             tokenFamilies,
             accessTokens,
             refreshTokens,
+            spaceCredentialRevocations,
         ]
         precondition(values.allSatisfy { $0 > 0 })
         self.clientMetadata = clientMetadata
@@ -171,6 +175,7 @@ struct OAuthControlStorageLimits: Sendable, Equatable {
         self.tokenFamilies = tokenFamilies
         self.accessTokens = accessTokens
         self.refreshTokens = refreshTokens
+        self.spaceCredentialRevocations = spaceCredentialRevocations
     }
 }
 
@@ -187,7 +192,8 @@ public enum SQLiteControlDatabaseOpenMode: Sendable, Equatable {
 /// across independently reopened Swan processes as well.
 public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantStore, AccountControlStore,
     AccountControlKeyRotationStore,
-    SpaceDelegationReplayStore, SpaceClientAttestationReplayStore
+    SpaceDelegationReplayStore, SpaceClientAttestationReplayStore,
+    SpaceCredentialRevocationStore
 {
     private static let microsecondsPerSecond = 1_000_000.0
     /// Cold control connections can contend during WAL configuration or the
@@ -1328,6 +1334,93 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
         }
     }
 
+    // MARK: Space credential revocations
+
+    /// Control schema v9 (atproto#5567): the repo host's revocation list.
+    /// Purely additive; already-applied migrations are untouched. A row is a
+    /// 32-byte digest of `(space, jti)` and the instant (microseconds) until
+    /// which it must be honoured.
+    func migrateSpaceCredentialRevocationsV9() async throws {
+        let marker = try await connection.query(
+            "SELECT 1 FROM control_schema_migrations WHERE version = 9 LIMIT 1"
+        )
+        guard marker.isEmpty else { return }
+        _ = try await connection.query(
+            """
+            CREATE TABLE IF NOT EXISTS permissioned_space_credential_revocations (
+                revocation_digest BLOB PRIMARY KEY
+                    CHECK(length(revocation_digest) = 32),
+                retain_until INTEGER NOT NULL CHECK(retain_until >= 0)
+            ) WITHOUT ROWID
+            """
+        )
+        _ = try await connection.query(
+            """
+            CREATE INDEX IF NOT EXISTS permissioned_space_credential_revocation_cleanup
+            ON permissioned_space_credential_revocations(retain_until, revocation_digest)
+            """
+        )
+        _ = try await connection.query(
+            "INSERT INTO control_schema_migrations(version, applied_at) VALUES (9, unixepoch())"
+        )
+    }
+
+    /// Records a batch of revocations in one `BEGIN IMMEDIATE` transaction.
+    /// Repeats are idempotent and only ever extend retention; a full table
+    /// fails closed as unavailable so the authority retries later rather
+    /// than the host silently dropping a revocation.
+    public func recordSpaceCredentialRevocations(
+        digests: [Data],
+        retainUntil: Date,
+        now: Date = Date()
+    ) async throws {
+        guard !digests.isEmpty, digests.count <= 100 else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        for digest in digests { try validateDigest(digest) }
+        guard retainUntil > now else { throw OAuthControlStoreError.invalidInput }
+        let retain = try timestamp(retainUntil)
+        try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                for digest in Set(digests) {
+                    try await requireInsertionCapacity(
+                        table: "permissioned_space_credential_revocations",
+                        keyColumn: "revocation_digest",
+                        key: blob(digest),
+                        maximumRows: oauthControlStorageLimits.spaceCredentialRevocations
+                    )
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO permissioned_space_credential_revocations(
+                            revocation_digest, retain_until
+                        ) VALUES (?, ?)
+                        ON CONFLICT(revocation_digest) DO UPDATE SET
+                            retain_until = MAX(retain_until, excluded.retain_until)
+                        """,
+                        [blob(digest), .integer(retain)]
+                    )
+                }
+            }
+        }
+    }
+
+    public func isSpaceCredentialRevoked(digest: Data, now: Date = Date()) async throws -> Bool {
+        try validateDigest(digest)
+        let current = try timestamp(now)
+        return try await withConnectionGate {
+            let rows = try await connection.query(
+                """
+                SELECT 1 FROM permissioned_space_credential_revocations
+                WHERE revocation_digest = ? AND retain_until > ?
+                LIMIT 1
+                """,
+                [blob(digest), .integer(current)]
+            )
+            return !rows.isEmpty
+        }
+    }
+
     /// One attestation claim is one `BEGIN IMMEDIATE` transaction containing
     /// only bounded local SQLite work. Metadata/JWKS resolution and signature
     /// verification must already be complete before this method is invoked.
@@ -1952,6 +2045,24 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
                 FROM permissioned_space_delegation_replays
                 WHERE expires_at <= ?
                 ORDER BY expires_at, jti_digest
+                LIMIT ?
+            )
+            """,
+            [
+                .integer(nowTimestamp),
+                .integer(Self.oauthCleanupBatchSize),
+            ]
+        )
+        // Only rows whose retention deadline has passed: a revocation must
+        // stay visible for its whole window (see SpaceCredentialRevocationStore).
+        _ = try await connection.query(
+            """
+            DELETE FROM permissioned_space_credential_revocations
+            WHERE revocation_digest IN (
+                SELECT revocation_digest
+                FROM permissioned_space_credential_revocations
+                WHERE retain_until <= ?
+                ORDER BY retain_until, revocation_digest
                 LIMIT ?
             )
             """,

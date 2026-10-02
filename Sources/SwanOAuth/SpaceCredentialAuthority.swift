@@ -980,11 +980,15 @@ public struct DurableSpaceDelegationVerifier: SpaceDelegationAuthorizationVerifi
 public struct DurableSpaceCredentialVerifier: SpaceCredentialAuthorizationVerifier {
     public struct Configuration: Sendable, Equatable {
         public static let standard = Configuration(uncheckedClockSkew: 60)
+        /// The widest expiry skew a deployment may configure. Revocation
+        /// retention (``DurableSpaceCredentialRevocations/retention``) is
+        /// sized from it.
+        public static let maximumClockSkew: TimeInterval = 5 * 60
 
         public let clockSkew: TimeInterval
 
         public init(clockSkew: TimeInterval = 60) throws {
-            guard (0 ... 5 * 60).contains(clockSkew) else {
+            guard (0 ... Self.maximumClockSkew).contains(clockSkew) else {
                 throw SwanError.malformed("invalid space credential clock skew")
             }
             self.clockSkew = clockSkew

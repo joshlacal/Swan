@@ -966,6 +966,25 @@ public protocol SpaceDelegationReplayStore: Sendable {
     ) async throws -> Bool
 }
 
+/// The repo host's durable list of space credentials a space authority has
+/// revoked (`com.atproto.space.notifyCredentialRevoked`, atproto#5567). The
+/// storage boundary sees only a fixed 32-byte digest of `(space, jti)` and a
+/// retention deadline; credential JWTs are not representable.
+///
+/// Recording is idempotent and never shortens retention: a repeated digest
+/// keeps the later of its stored and requested deadlines. A digest counts as
+/// revoked until its deadline passes, and cleanup may remove a row only after
+/// that, so retention is never undermined.
+public protocol SpaceCredentialRevocationStore: Sendable {
+    func recordSpaceCredentialRevocations(
+        digests: [Data],
+        retainUntil: Date,
+        now: Date
+    ) async throws
+
+    func isSpaceCredentialRevoked(digest: Data, now: Date) async throws -> Bool
+}
+
 /// Durable single-use reservation for a cryptographically verified
 /// proposal-0016 client attestation. The storage boundary accepts only a
 /// keyed 32-byte digest and expiry; raw JWT, JTI, client identity, signature,

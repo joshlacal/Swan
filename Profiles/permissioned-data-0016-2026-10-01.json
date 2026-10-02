@@ -32,6 +32,11 @@
       "swanBehavior": "By default accepts only service JWTs whose req claim binds the request body, with iss equal to body.repo and the exact configured authority service identity as aud, and always sends req on notifications it signs. Unbound upstream-shaped tokens are accepted only under --enable-spaces-open-interop, with exp - iat <= 60 s and a durable single-use jti."
     },
     {
+      "endpoint": "com.atproto.space.notifyCredentialRevoked",
+      "referenceBehavior": "The repo-host receiver accepts service auth whose iss is the space authority and whose aud is the DID of an account it hosts; the token carries no req body-digest claim and no jti replay record is kept. Revocations are retained for 3600 + 2 * 5 s from receipt.",
+      "swanBehavior": "By default accepts only service JWTs whose req claim binds the request body (space and credential IDs), with iss equal to the space authority and aud a bare DID of an account Swan stores. Unbound upstream-shaped tokens are accepted only under --enable-spaces-open-interop, with exp - iat <= 60 s and a durable single-use jti. Revocations are retained for 3600 + 5 + 300 s from receipt, covering Swan's widest configurable credential expiry skew."
+    },
+    {
       "endpoint": "com.atproto.space.registerNotify",
       "referenceBehavior": "Accepts a registration authorized by the space credential alone; the named service is resolved through its DID document.",
       "swanBehavior": "By default also requires an Atproto-Service-Auth header proving ownership of the named service. Credential-only registrations are accepted only under --enable-spaces-open-interop, owned by the named service's DID and capped at 32 per space and 8 per credential subject per hour."

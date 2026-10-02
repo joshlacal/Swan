@@ -506,6 +506,102 @@ private struct AuthenticatedNotifySpaceDeletedHandler:
     }
 }
 
+/// The repo-host receiver for `com.atproto.space.notifyCredentialRevoked`
+/// (atproto#5567): service auth whose `iss` is the space authority, whose
+/// `aud` is the bare DID of an account this host stores, and whose `lxm` is
+/// this method. Like the other notification receivers, it requires a `req`
+/// claim binding the body by default and admits unbound upstream-shaped
+/// tokens only under `--enable-spaces-open-interop` (with a 60 s lifetime and
+/// a durable single-use `jti`). Revocations are persisted idempotently by
+/// `(space, jti)` and honoured for ``DurableSpaceCredentialRevocations/retention``.
+private struct AuthenticatedNotifyCredentialRevokedHandler:
+    ComAtprotoSpaceNotifyCredentialRevoked.ServerHandler
+{
+    typealias Context = Request
+
+    let capability: SwanAuthenticatedSpaceNotificationsCapability
+
+    func handle(
+        parameters: Void,
+        input: ComAtprotoSpaceNotifyCredentialRevoked.Input,
+        context request: Request
+    ) async throws {
+        let space = try notificationSpace(input.space)
+        let expectedDigest = SpaceNotificationRequestDigest.credentialRevocation(
+            space: space,
+            credentials: input.credentials
+        )
+        let service = try await serviceAuthentication(
+            capability,
+            request: request,
+            expectedAudience: nil,
+            expectedMethod: ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier,
+            expectedRequestBodyDigest: capability.openInterop == nil ? expectedDigest : nil
+        )
+        guard service.issuer == space.authority else {
+            throw AuthenticatedSpaceNotificationFailure.denied
+        }
+        if let bound = service.requestBodyDigest {
+            guard bound == expectedDigest else {
+                throw AuthenticatedSpaceNotificationFailure.denied
+            }
+        } else if let openInterop = capability.openInterop {
+            try await openInterop.admitUnbound(service)
+        } else {
+            throw AuthenticatedSpaceNotificationFailure.denied
+        }
+        // The audience is a repo account's bare DID, never a service
+        // identifier or this host's own DID.
+        let audience = service.audience
+        guard (try? DID(didString: audience)) != nil, !audience.contains("#") else {
+            throw AuthenticatedSpaceNotificationFailure.denied
+        }
+        let hosted: Bool
+        do {
+            hosted = try await capability.authorizer.hostsAccount(did: audience)
+        } catch {
+            throw AuthenticatedSpaceNotificationFailure.unavailable
+        }
+        guard hosted else {
+            throw AuthenticatedSpaceNotificationFailure.denied
+        }
+        do {
+            try await capability.authorizer.recordSpaceCredentialRevocations(
+                space: space,
+                credentialIDs: input.credentials
+            )
+        } catch {
+            throw notificationStorageFailure(error)
+        }
+    }
+}
+
+func registerAuthenticatedNotifyCredentialRevokedEndpoint(
+    on router: Router<BasicRequestContext>,
+    capability: SwanAuthenticatedSpaceNotificationsCapability,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) {
+    let handler = AuthenticatedNotifyCredentialRevokedHandler(capability: capability)
+    let path: RouterPath = "/xrpc/com.atproto.space.notifyCredentialRevoked"
+    router.post(path) { request, context async -> Response in
+        do {
+            let input = try await decodeNotifyCredentialRevokedInput(
+                request, context: context, requestBodyAdmission: requestBodyAdmission,
+                decodeObserver: capability.notificationJSONDecodeObserver)
+            try await handler.handle(parameters: (), input: input, context: request)
+            return Response(status: .ok, headers: [.cacheControl: "no-store"])
+        } catch let failure as AuthenticatedSpaceNotificationFailure {
+            return authenticatedSpaceNotificationResponse(for: failure)
+        } catch let failure as SwanRequestBodyCollectionFailure {
+            return authenticatedSpaceNotificationResponse(
+                for: failure == .unavailable ? .unavailable : .invalidRequest
+            )
+        } catch {
+            return authenticatedSpaceNotificationError(.badRequest, code: "InvalidRequest")
+        }
+    }
+    registerAuthenticatedNotificationWrongMethods(on: router, path: path, allowed: .post)
+}
 
 func registerAuthenticatedListSpaceReposEndpoint(
     on router: Router<BasicRequestContext>,
@@ -830,6 +926,46 @@ private func decodeNotifySpaceDeletedInput(
     do {
         let input = try JSONDecoder().decode(ComAtprotoSpaceNotifySpaceDeleted.Input.self, from: data)
         _ = try notificationSpace(input.space)
+        return input
+    } catch {
+        throw AuthenticatedSpaceNotificationFailure.invalidRequest
+    }
+}
+
+/// `{space, credentials}` with 1...100 nonempty JWT IDs, as the lexicon
+/// requires. Anything else, including a JWT-shaped or control-bearing ID, is
+/// `InvalidRequest` before authentication work begins.
+private func decodeNotifyCredentialRevokedInput(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
+    decodeObserver: (@Sendable () async -> Void)?
+) async throws -> ComAtprotoSpaceNotifyCredentialRevoked.Input {
+    let admitted = try await notificationJSONBody(
+        request, context: context, requestBodyAdmission: requestBodyAdmission)
+    defer { withExtendedLifetime(admitted.body) {} }
+    let data = admitted.data
+    await decodeObserver?()
+    try notificationJSONObject(
+        data,
+        allowedKeys: ["space", "credentials"],
+        requiredKeys: ["space", "credentials"]
+    )
+    do {
+        let input = try JSONDecoder().decode(
+            ComAtprotoSpaceNotifyCredentialRevoked.Input.self,
+            from: data
+        )
+        _ = try notificationSpace(input.space)
+        guard (1 ... DurableSpaceCredentialRevocations.maximumCredentialsPerNotification)
+                .contains(input.credentials.count),
+              input.credentials.allSatisfy({
+                  !$0.isEmpty
+                      && $0.utf8.count <= PermissionedDataJWT.maximumOpaqueJTIBytes
+                      && $0.utf8.allSatisfy { $0 >= 0x20 && $0 != 0x7f }
+              }) else {
+            throw AuthenticatedSpaceNotificationFailure.invalidRequest
+        }
         return input
     } catch {
         throw AuthenticatedSpaceNotificationFailure.invalidRequest

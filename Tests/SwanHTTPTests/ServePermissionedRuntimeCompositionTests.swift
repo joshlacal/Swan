@@ -59,6 +59,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         case delegation
         case notifyWrite
         case notifyDeleted
+        case notifyCredentialRevoked
         case checkUserAccess
     }
 
@@ -189,6 +190,13 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let encodedSpace = percentEncode(space.rawValue)
             let encodedLifecycle = percentEncode(lifecycle.rawValue)
             let recordPrefix = "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"collection\":\"app.bsky.feed.post\""
+            let credential = try PermissionedDataJWT.createSpaceCredential(
+                issuer: localDID,
+                space: space,
+                key: fixture.localKey,
+                confirmationKeyID: SpaceCredentialSignatureTestSupport.keyID
+            )
+            let credentialJTI = try PermissionedDataJWT.inspectSpaceCredential(credential).claims.jti
             let cases: [SemanticCase] = [
                 .init(nsid: "com.atproto.simplespace.createSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.createSpace", body: "{\"did\":\"\(localDID)\",\"spaceType\":\"app.bsky.bookmarks\",\"skey\":\"\(lifecycle.skey)\",\"readPolicy\":{\"$type\":\"com.atproto.simplespace.defs#publicPolicy\"},\"writePolicy\":{\"$type\":\"com.atproto.simplespace.defs#publicPolicy\"},\"appAccess\":{\"$type\":\"com.atproto.simplespace.defs#open\"}}", authorization: .oauth, invariant: .jsonString("uri", lifecycle.rawValue)),
                 .init(nsid: "com.atproto.simplespace.updateSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.updateSpace", body: "{\"space\":\"\(lifecycle.rawValue)\",\"readPolicy\":{\"$type\":\"com.atproto.simplespace.defs#publicPolicy\"}}", authorization: .oauth, invariant: .emptyBody),
@@ -217,6 +225,8 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.simplespace.removeMember", method: .post, uri: "/xrpc/com.atproto.simplespace.removeMember", body: "{\"space\":\"\(lifecycle.rawValue)\",\"did\":\"\(remoteDID)\"}", authorization: .oauth, invariant: .emptyBody),
                 .init(nsid: "com.atproto.simplespace.deleteSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.deleteSpace", body: "{\"space\":\"\(lifecycle.rawValue)\"}", authorization: .oauth, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.notifySpaceDeleted", method: .post, uri: "/xrpc/com.atproto.space.notifySpaceDeleted", body: "{\"space\":\"\(lifecycle.rawValue)\"}", authorization: .notifyDeleted, invariant: .emptyBody),
+                // Last: it revokes the matrix credential, checked after the loop.
+                .init(nsid: "com.atproto.space.notifyCredentialRevoked", method: .post, uri: "/xrpc/com.atproto.space.notifyCredentialRevoked", body: "{\"space\":\"\(space.rawValue)\",\"credentials\":[\"\(credentialJTI)\"]}", authorization: .notifyCredentialRevoked, invariant: .emptyBody),
             ]
 
             let profileSet = Set(profile.endpoints)
@@ -225,23 +235,15 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             // Profile methods this composition does not serve yet. They stay
             // in the profile and registry and are routed as method-correct
             // 503 gates, checked after the semantic matrix below.
-            let gatedPending: Set<String> = [
-                ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier,
-            ]
+            let gatedPending: Set<String> = []
             XCTAssertEqual(profile.endpoints.count, 28)
             XCTAssertEqual(PermissionedData0016.methods.count, 28)
-            XCTAssertEqual(cases.count, 27)
+            XCTAssertEqual(cases.count, 28)
             XCTAssertEqual(profileSet, generatedSet)
             XCTAssertEqual(profileSet, matrixSet.union(gatedPending))
             XCTAssertTrue(matrixSet.isDisjoint(with: gatedPending))
             XCTAssertEqual(matrixSet.count, cases.count, "matrix contains a duplicate NSID")
 
-            let credential = try PermissionedDataJWT.createSpaceCredential(
-                issuer: localDID,
-                space: space,
-                key: fixture.localKey,
-                confirmationKeyID: SpaceCredentialSignatureTestSupport.keyID
-            )
             let app = server.buildApplication(
                 logger: Logger(label: "ServePermissionedRuntimeCompositionTests.semantic")
             )
@@ -371,6 +373,21 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                     try await client.execute(uri: "/xrpc/\(nsid)", method: .get) { response in
                         XCTAssertEqual(response.status, .notFound, nsid)
                     }
+                }
+                // The matrix's last case revoked the credential its listRepos
+                // case used: the same signed presentation is now refused.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)",
+                    method: .get,
+                    headers: SpaceCredentialSignatureTestSupport.headers(
+                        token: credential, audience: space.authority
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(
+                        try self.jsonObject(response.body)["error"] as? String,
+                        "CredentialRevoked"
+                    )
                 }
             }
 
@@ -1163,6 +1180,21 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 key: fixture.localKey
             )
             headers = [.authorization: "Bearer \(notifyDeleted)"]
+        case .notifyCredentialRevoked:
+            // Service auth from the space authority, addressed to a repo
+            // account this host stores, binding the body by default.
+            let credentialJTI = try PermissionedDataJWT.inspectSpaceCredential(credential).claims.jti
+            let revocation = try SpaceServiceJWT.create(
+                issuer: space.authority,
+                audience: localDID,
+                method: ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier,
+                eventID: jti,
+                requestBodyDigest: SpaceNotificationRequestDigest.credentialRevocation(
+                    space: space, credentials: [credentialJTI]
+                ),
+                key: fixture.localKey
+            )
+            headers = [.authorization: "Bearer \(revocation)"]
         case .checkUserAccess:
             let checkUserAccess = try SpaceServiceJWT.create(
                 issuer: space.authority,

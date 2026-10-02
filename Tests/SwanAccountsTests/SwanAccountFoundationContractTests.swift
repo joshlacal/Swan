@@ -261,6 +261,7 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         XCTAssertEqual(ControlSchemaMigrationVersion.factors.rawValue, 6)
         XCTAssertEqual(ControlSchemaMigrationVersion.hardening.rawValue, 7)
         XCTAssertEqual(ControlSchemaMigrationVersion.accountProgramIntegration.rawValue, 8)
+        XCTAssertEqual(ControlSchemaMigrationVersion.spaceCredentialRevocations.rawValue, 9)
         let schema = SQLiteLayout.controlMigrations.joined(separator: "\n")
         for table in [
             "control_schema_migrations", "identity_bindings", "did_web_claim_transactions",
@@ -290,7 +291,7 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         let markerRows = try await database.connection.query(
             "SELECT version FROM control_schema_migrations ORDER BY version"
         )
-        XCTAssertEqual(markerRows.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8])
+        XCTAssertEqual(markerRows.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9])
         let tables = try await database.connection.query(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('identity_bindings', 'signup_authorizations', 'legacy_session_tokens', 'management_sessions', 'authentication_factors', 'factor_challenges', 'totp_secret_envelopes', 'recovery_code_digests', 'webauthn_credentials', 'webauthn_challenges')"
         )
@@ -368,8 +369,51 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         try await database.close()
         let reopened = try await SQLiteControlDatabase(dataDirectory: root)
         let reopenedMarkers = try await reopened.connection.query("SELECT version FROM control_schema_migrations ORDER BY version")
-        XCTAssertEqual(reopenedMarkers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8])
+        XCTAssertEqual(reopenedMarkers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9])
         try await reopened.close()
+    }
+
+    /// v9 (atproto#5567) is additive: a database last migrated at v8 gains
+    /// the revocation table and marker on its next open, keeping its data.
+    func testSpaceCredentialRevocationsV9UpgradesAV8Database() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swan-space-revocations-v9-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        try await database.connection.query(
+            "INSERT INTO accounts(did,handle,status,created_at) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa','v8.example','active',1)"
+        )
+        // Rewind to the v8 shape.
+        try await database.connection.query("DROP TABLE permissioned_space_credential_revocations")
+        try await database.connection.query("DELETE FROM control_schema_migrations WHERE version = 9")
+        let rewound = try await database.connection.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='permissioned_space_credential_revocations'"
+        )
+        XCTAssertTrue(rewound.isEmpty, "positive control: the v8 shape has no revocation table")
+        try await database.close()
+
+        let upgraded = try await SQLiteControlDatabase(dataDirectory: root)
+        let markers = try await upgraded.connection.query(
+            "SELECT version FROM control_schema_migrations ORDER BY version"
+        )
+        XCTAssertEqual(markers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        let tables = try await upgraded.connection.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='permissioned_space_credential_revocations'"
+        )
+        XCTAssertEqual(tables.count, 1)
+        let accounts = try await upgraded.connection.query("SELECT did FROM accounts")
+        XCTAssertEqual(accounts.compactMap { $0.column("did")?.string }, ["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"])
+        try await upgraded.recordSpaceCredentialRevocations(
+            digests: [Data(repeating: 7, count: 32)],
+            retainUntil: Date(timeIntervalSince1970: 2_000_000_000),
+            now: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        let revoked = try await upgraded.isSpaceCredentialRevoked(
+            digest: Data(repeating: 7, count: 32),
+            now: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        XCTAssertTrue(revoked)
+        try await upgraded.close()
     }
 
     func testAccountProgramV8InstallsAuxiliaryTablesAndReleasedDidWebCanBeReclaimed() async throws {
@@ -516,7 +560,7 @@ final class SwanAccountFoundationContractTests: XCTestCase {
 
         let upgraded = try await SQLiteControlDatabase(dataDirectory: root)
         let markers = try await upgraded.connection.query("SELECT version FROM control_schema_migrations ORDER BY version")
-        XCTAssertEqual(markers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8])
+        XCTAssertEqual(markers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9])
         for (table, column) in [("did_web_claim_transactions", "reserved_key_id"), ("did_web_claim_transactions", "claim_receipt_digest"), ("legacy_session_families", "reuse_detected_at")] {
             let columns = try await upgraded.connection.query("PRAGMA table_info(\(table))")
             XCTAssertTrue(columns.contains { $0.column("name")?.string == column }, "\(table).\(column)")

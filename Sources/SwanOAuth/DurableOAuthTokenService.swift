@@ -31,6 +31,10 @@ public struct SwanOAuthRuntime: Sendable {
     /// Single-use reservation for unbound (no `req`) upstream service JWTs,
     /// consulted only when spaces open interop is enabled.
     public let spaceServiceJWTReplayStore: DurableSpaceServiceJWTReplayStore
+    /// The repo host's space-credential revocation list (atproto#5567),
+    /// consulted on every credential presentation and written by
+    /// `notifyCredentialRevoked`.
+    public let spaceCredentialRevocations: DurableSpaceCredentialRevocations
     public let browserSessionService: OAuthBrowserSessionService
     /// The nonce MAC key is the injected non-persisted OAuth server key. It
     /// never crosses into `OAuthControlStore`; validators receive this service
@@ -56,7 +60,8 @@ public struct SwanOAuthRuntime: Sendable {
     public let lexiconResolver: (any SwanLexiconResolving)?
 
     public init(
-        controlStore: any OAuthControlStore & SpaceDelegationReplayStore,
+        controlStore: any OAuthControlStore & SpaceDelegationReplayStore
+            & SpaceCredentialRevocationStore,
         serverKey: Data,
         lexiconResolver: (any SwanLexiconResolving)? = nil,
         identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil
@@ -80,6 +85,7 @@ public struct SwanOAuthRuntime: Sendable {
             controlStore: controlStore,
             serverKey: serverKey
         )
+        spaceCredentialRevocations = DurableSpaceCredentialRevocations(store: controlStore)
         browserSessionService = try OAuthBrowserSessionService(serverKey: serverKey)
         dpopNonceService = DPoPNonceService(secret: serverKey)
     }

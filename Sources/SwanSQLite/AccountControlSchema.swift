@@ -11,4 +11,6 @@ public enum ControlSchemaMigrationVersion: Int, CaseIterable, Codable, Sendable 
     case factors = 6
     case hardening = 7
     case accountProgramIntegration = 8
+    /// The repo host's space-credential revocation list (atproto#5567).
+    case spaceCredentialRevocations = 9
 }
