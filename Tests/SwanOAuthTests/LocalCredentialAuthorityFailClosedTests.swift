@@ -550,7 +550,7 @@ final class LocalCredentialAuthorityFailClosedTests: XCTestCase {
                 issuer: fixture.did,
                 space: space,
                 key: fixture.initialKey,
-                dpopKeyThumbprint: String(repeating: "A", count: 43),
+                confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                 now: createdAt
             )
 

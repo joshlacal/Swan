@@ -74,7 +74,7 @@ final class PermissionedResolverCompositionTests: XCTestCase {
             issuer: localDID,
             space: localSpace,
             key: localKey,
-            dpopKeyThumbprint: String(repeating: "A", count: 43),
+            confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
             now: now
         )
         _ = try await DurableSpaceCredentialVerifier(publicKeys: credentialKeys)

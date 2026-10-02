@@ -513,16 +513,20 @@ private extension SpaceBlobHTTPTests {
             let token = try PermissionedDataJWT.createSpaceCredential(
                 issuer: SpaceBlobHTTPTests.author,
                 space: space,
-                key: SpaceCredentialDPoPTestSupport.key,
-                dpopKeyThumbprint: SpaceCredentialDPoPTestSupport.thumbprint
+                key: SpaceCredentialSignatureTestSupport.key,
+                confirmationKeyID: SpaceCredentialSignatureTestSupport.keyID
             )
-            return try SpaceCredentialDPoPTestSupport.headers(token: token, path: SpaceBlobHTTPTests.path)
+            // A blob read signs the repo owner's DID as its audience.
+            return try SpaceCredentialSignatureTestSupport.headers(
+                token: token, audience: SpaceBlobHTTPTests.author
+            )
         }
     }
 }
 
 /// Grants exactly the aggregate space read the route requires. The request
-/// still carries a signed, key-bound credential and a real DPoP presentation;
+/// still carries a signed, key-bound credential and a real HTTP message
+/// signature;
 /// only authority trust resolution is stubbed to isolate admission behavior.
 private struct StubSpaceCredentialVerifier: SpaceCredentialAuthorizationVerifier {
     let space: SpaceURI

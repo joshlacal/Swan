@@ -9178,6 +9178,7 @@ extension SwanCommand {
                     case let .unexpectedStatus(status): return "HTTP\(status)"
                     case .transportFailure: return "TransportFailure"
                     case .fileFailure: return "FileFailure"
+                    case .spaceCredentialRevoked: return "CredentialRevoked"
                     }
                 }
                 if let error = error as? ValidationError {

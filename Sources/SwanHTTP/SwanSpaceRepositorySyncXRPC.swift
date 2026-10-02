@@ -39,6 +39,7 @@ private enum AuthenticatedSpaceRepositorySyncFailure: Error {
     case spaceNotFound
     case repoNotFound
     case denied
+    case credentialPresentation(SpaceCredentialPresentationFailure)
     case nonceChallenge
     case fullRecoveryRequired
     case malformedCursor
@@ -74,6 +75,7 @@ private struct AuthenticatedGetRepoHandler:
             capability,
             request: request,
             expectedSpace: target.space,
+            expectedAudience: target.author,
             fixedPath: "/xrpc/com.atproto.space.getRepo"
         )
         try requireRepositoryReadAuthorization(authorization, author: target.author)
@@ -172,6 +174,7 @@ private struct AuthenticatedGetLatestCommitHandler:
             capability,
             request: request,
             expectedSpace: target.space,
+            expectedAudience: target.author,
             fixedPath: fixedPath
         )
         try requireRepositoryReadAuthorization(authorization, author: target.author)
@@ -211,6 +214,7 @@ private struct AuthenticatedListRepoOpsHandler:
             capability,
             request: request,
             expectedSpace: target.space,
+            expectedAudience: target.author,
             fixedPath: "/xrpc/com.atproto.space.listRepoOps"
         )
         try requireRepositoryReadAuthorization(authorization, author: target.author)
@@ -353,15 +357,20 @@ private func requireRepositoryReadAuthorization(
     }
 }
 
+/// A credential reading a repo signs the repo owner's DID as its audience
+/// (`expectedAudience`); OAuth keeps its DPoP sender constraint.
 private func authorizeRepositorySyncRead(
     _ capability: SwanAuthenticatedSpaceRepositorySyncCapability,
     request: Request,
     expectedSpace: SpaceURI,
+    expectedAudience: String,
     fixedPath: String
 ) async throws -> AuthorizationContext {
     let bearerToken: String?
     do {
         bearerToken = try spaceCredentialSchemeToken(from: request.headers)
+    } catch let failure as SpaceCredentialPresentationFailure {
+        throw AuthenticatedSpaceRepositorySyncFailure.credentialPresentation(failure)
     } catch {
         throw AuthenticatedSpaceRepositorySyncFailure.denied
     }
@@ -375,10 +384,11 @@ private func authorizeRepositorySyncRead(
                 verifier: credentialAuthorizer,
                 request: request,
                 expectedSpace: expectedSpace,
-                method: "GET",
-                fixedPath: fixedPath,
+                expectedAudience: expectedAudience,
                 now: Date()
             )
+        } catch let failure as SpaceCredentialPresentationFailure {
+            throw AuthenticatedSpaceRepositorySyncFailure.credentialPresentation(failure)
         } catch let error as SwanError {
             if case .unavailable = error {
                 throw AuthenticatedSpaceRepositorySyncFailure.unavailable
@@ -758,6 +768,8 @@ private func authenticatedRepositorySyncResponse(
         authenticatedRepositorySyncError(.notFound, code: "RepoNotFound")
     case .denied:
         authenticatedRepositorySyncError(.unauthorized, code: "Unauthorized")
+    case let .credentialPresentation(failure):
+        authenticatedRepositorySyncError(.unauthorized, code: failure.xrpcErrorCode)
     case .nonceChallenge:
         authenticatedGetSpaceNonceChallenge(authorizer: capability.authorizer)
     case .fullRecoveryRequired:

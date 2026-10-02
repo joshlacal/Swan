@@ -365,7 +365,7 @@ final class SwanOAuthTests: XCTestCase {
         ))
 
         let credential = try PermissionedDataJWT.createSpaceCredential(
-            issuer: "did:plc:alice", space: space, key: key, dpopKeyThumbprint: String(repeating: "A", count: 43), now: now
+            issuer: "did:plc:alice", space: space, key: key, confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID, now: now
         )
         let credentialClaims = try PermissionedDataJWT.verifySpaceCredential(credential, publicKey: key.publicKey, now: now)
         XCTAssertEqual(credentialClaims.sub, space.rawValue)
@@ -381,7 +381,7 @@ final class SwanOAuthTests: XCTestCase {
             authority: "did:plc:alice", spaceType: "app.bsky.bookmarks", skey: "shared"
         )
         let token = try PermissionedDataJWT.createSpaceCredential(
-            issuer: "did:plc:alice", space: space, key: key, dpopKeyThumbprint: String(repeating: "A", count: 43), now: now
+            issuer: "did:plc:alice", space: space, key: key, confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID, now: now
         )
         let parts = token.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
         XCTAssertEqual(parts.count, 3)

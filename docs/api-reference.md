@@ -361,11 +361,25 @@ Swan implements the `permissioned-data-0016-2026-10-01` profile for access-contr
 
 #### `com.atproto.space.getSpaceCredential`
 - **Method**: `POST`
-- **Authentication**: `Authorization: Bearer <delegation-token>` plus a `DPoP` proof signed by the key to bind to the resulting credential. This initial proof omits `ath`; space credential proofs do not use server nonces.
+- **Authentication**: `Authorization: Bearer <delegation-token>` plus an RFC 9421 HTTP message signature labelled `atproto-space` that covers exactly `("authorization")` and names the client's fresh P-256 `did:key` as `keyid`:
+  ```
+  Signature-Input: atproto-space=("authorization");keyid="did:key:zDn..."
+  Signature: atproto-space=:<base64 64-byte r||s>:
+  ```
+  A missing or invalid signature returns 401 `BadSpaceSignature`. The delegation token is single-use.
 - **Request Body**: JSON object `{ "space": "<space-ref>", "clientAttestation": "<optional-attestation-jwt>" }`. An attestation is required when the space gates access on client identity.
-- **Returns**: JSON object `{ "credential": "<space-read-credential>" }`; the JWT carries the signing key thumbprint in `cnf.jkt`. Deleted spaces return `SpaceDeleted`.
+- **Returns**: JSON object `{ "credential": "<space-read-credential>" }`; the JWT binds the signing key's `did:key` as `cnf.kid` and has no `aud`. Swan's authority issues 300-second credentials (the protocol ceiling is 3600 s). Deleted spaces return `SpaceDeleted`.
 
-Use the credential with `Authorization: DPoP <credential>` and a fresh `DPoP` proof on every space request. The proof binds the credential through `ath`, the HTTP method through `htm`, and the origin and path (without query or fragment) through `htu`. Bearer space credentials are rejected. Credentials remain read-only at repository hosts; writes use the account's OAuth grant.
+Use the credential with `Authorization: Atproto-Space <credential>`, an `Atproto-Space-Audience` header, and an `atproto-space` signature covering exactly `("authorization" "atproto-space-audience")`, signed by the `cnf.kid` key:
+
+```
+Authorization: Atproto-Space <credential>
+Atproto-Space-Audience: <audience DID>
+Signature-Input: atproto-space=("authorization" "atproto-space-audience")
+Signature: atproto-space=:<base64 64-byte r||s>:
+```
+
+The audience is the repo owner's DID for repo reads (`getRecord`, `listRecords`, `listBlobs`, `getBlob`, `getRepo`, `getLatestCommit`, `listRepoOps`) and the space authority's bare DID for space-host operations (`listRepos`, `registerNotify`, `unregisterNotify`, `simplespace.getSpace`). The signature is not bound to a method, URL, or nonce, so it may be reused with the same credential and audience. `alg` is optional (`ecdsa-p256-sha256`); `keyid` is optional and must equal `cnf.kid`. Errors: 401 `BadSpaceSignature` (missing, duplicated, or invalid signature or audience field), 401 `BadSpaceAudience` (signed audience does not match the operation). Credentials presented under `Bearer` or the retired `DPoP` scheme are rejected. Credentials remain read-only at repository hosts; writes use the account's OAuth grant.
 
 ---
 

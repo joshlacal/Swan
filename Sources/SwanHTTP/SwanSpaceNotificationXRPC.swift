@@ -151,6 +151,7 @@ private enum AuthenticatedSpaceNotificationFailure: Error {
     case invalidRequest
     case spaceNotFound
     case denied
+    case credentialPresentation(SpaceCredentialPresentationFailure)
     case unavailable
     /// The `service` identifier could not be resolved to a DID document with
     /// a usable service endpoint (Erratum 03). The lexicon's one named error
@@ -185,9 +186,7 @@ private struct AuthenticatedListSpaceReposHandler:
         let authorization = try await credentialAuthorization(
             capability,
             request: request,
-            space: space,
-            method: "GET",
-            fixedPath: "/xrpc/com.atproto.space.listRepos"
+            space: space
         )
         let writers: [AuthorizedSpaceWriter]
         do {
@@ -251,9 +250,7 @@ private struct AuthenticatedRegisterSpaceNotifyHandler {
         let authorization = try await credentialAuthorization(
             capability,
             request: request,
-            space: space,
-            method: "POST",
-            fixedPath: "/xrpc/com.atproto.space.registerNotify"
+            space: space
         )
         let ownerDID: String
         if let openInterop = capability.openInterop,
@@ -338,8 +335,7 @@ private struct AuthenticatedUnregisterSpaceNotifyHandler {
     ) async throws {
         let space = try notificationSpace(input.space)
         let authorization = try await credentialAuthorization(
-            capability, request: request, space: space,
-            method: "POST", fixedPath: "/xrpc/com.atproto.space.unregisterNotify"
+            capability, request: request, space: space
         )
         let ownerDID: String
         if capability.openInterop != nil,
@@ -892,12 +888,13 @@ private func notificationSpace(_ value: SpaceRef) throws -> SpaceURI {
     }
 }
 
+/// listRepos, registerNotify, and unregisterNotify are space-host
+/// operations, so the credential's signed audience must be the space
+/// authority's bare DID.
 private func credentialAuthorization(
     _ capability: SwanAuthenticatedSpaceNotificationsCapability,
     request: Request,
-    space: SpaceURI,
-    method: String,
-    fixedPath: String
+    space: SpaceURI
 ) async throws -> AuthorizationContext {
     let token: String
     do {
@@ -910,8 +907,7 @@ private func credentialAuthorization(
             verifier: capability.credentialAuthorizer,
             request: request,
             expectedSpace: space,
-            method: method,
-            fixedPath: fixedPath,
+            expectedAudience: space.authority,
             now: Date()
         )
         guard case let .spaceCredential(grant) = authorization,
@@ -921,6 +917,8 @@ private func credentialAuthorization(
         return authorization
     } catch let failure as AuthenticatedSpaceNotificationFailure {
         throw failure
+    } catch let failure as SpaceCredentialPresentationFailure {
+        throw AuthenticatedSpaceNotificationFailure.credentialPresentation(failure)
     } catch let error as SwanError {
         if case .unavailable = error {
             throw AuthenticatedSpaceNotificationFailure.unavailable
@@ -1097,6 +1095,8 @@ private func authenticatedSpaceNotificationResponse(
         authenticatedSpaceNotificationError(.notFound, code: "SpaceNotFound")
     case .denied:
         authenticatedSpaceNotificationError(.unauthorized, code: "Unauthorized")
+    case let .credentialPresentation(failure):
+        authenticatedSpaceNotificationError(.unauthorized, code: failure.xrpcErrorCode)
     case .unavailable:
         authenticatedSpaceNotificationError(.serviceUnavailable, code: "temporarily_unavailable")
     case .serviceNotResolvable:

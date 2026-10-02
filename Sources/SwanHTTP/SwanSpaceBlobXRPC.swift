@@ -37,6 +37,7 @@ private enum AuthenticatedSpaceBlobFailure: Error {
     case invalidRequest
     case blobNotFound
     case denied
+    case credentialPresentation(SpaceCredentialPresentationFailure)
     case nonceChallenge
     case unavailable
 }
@@ -83,7 +84,8 @@ private struct AuthenticatedGetSpaceBlobHandler:
         let authorization = try await authorizeBlobRead(
             capability,
             request: request,
-            expectedSpace: target.space
+            expectedSpace: target.space,
+            expectedAudience: target.author
         )
         try requireBlobReadAuthorization(authorization, author: target.author)
 
@@ -284,14 +286,19 @@ private func blobTarget(
     }
 }
 
+/// A credential reading a blob signs the repo owner's DID as its audience
+/// (`expectedAudience`); OAuth keeps its DPoP sender constraint.
 private func authorizeBlobRead(
     _ capability: SwanAuthenticatedSpaceBlobCapability,
     request: Request,
-    expectedSpace: SpaceURI
+    expectedSpace: SpaceURI,
+    expectedAudience: String
 ) async throws -> AuthorizationContext {
     let bearer: String?
     do {
         bearer = try spaceCredentialSchemeToken(from: request.headers)
+    } catch let failure as SpaceCredentialPresentationFailure {
+        throw AuthenticatedSpaceBlobFailure.credentialPresentation(failure)
     } catch {
         throw AuthenticatedSpaceBlobFailure.denied
     }
@@ -305,10 +312,11 @@ private func authorizeBlobRead(
                 verifier: verifier,
                 request: request,
                 expectedSpace: expectedSpace,
-                method: "GET",
-                fixedPath: "/xrpc/com.atproto.space.getBlob",
+                expectedAudience: expectedAudience,
                 now: Date()
             )
+        } catch let failure as SpaceCredentialPresentationFailure {
+            throw AuthenticatedSpaceBlobFailure.credentialPresentation(failure)
         } catch let error as SwanError {
             if case .unavailable = error {
                 throw AuthenticatedSpaceBlobFailure.unavailable
@@ -430,6 +438,8 @@ private func authenticatedSpaceBlobResponse(
         authenticatedSpaceBlobError(.notFound, code: "BlobNotFound")
     case .denied:
         authenticatedSpaceBlobError(.unauthorized, code: "Unauthorized")
+    case let .credentialPresentation(failure):
+        authenticatedSpaceBlobError(.unauthorized, code: failure.xrpcErrorCode)
     case .nonceChallenge:
         authenticatedGetSpaceNonceChallenge(authorizer: capability.authorizer)
     case .unavailable:

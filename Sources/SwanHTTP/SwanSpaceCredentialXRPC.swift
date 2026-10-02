@@ -47,7 +47,9 @@ enum SwanSpaceCredentialHTTP {
 private enum SpaceCredentialExchangeFailure: Error {
     case invalidRequest
     case invalidDelegation
-    case invalidProof
+    /// `BadSpaceSignature`: the exchange's `atproto-space` HTTP message
+    /// signature is missing, malformed, or does not verify under its keyid.
+    case invalidSignature
     case invalidClientAttestation
     case spaceNotFound
     case spaceDeleted
@@ -108,20 +110,18 @@ private struct AuthenticatedGetSpaceCredentialHandler:
             throw SpaceCredentialExchangeFailure.invalidDelegation
         }
 
-        let proof: OAuthValidatedDPoPProof
+        // atproto#5569: the client proves possession of a fresh P-256 key by
+        // signing exactly ("authorization") and naming the key as `keyid`.
+        // That key becomes the credential's `cnf.kid`. There is no method,
+        // URL, nonce, or per-request replay binding to check any more; the
+        // delegation's own single-use reservation below is what stops reuse.
+        let confirmationKeyID: String
         do {
-            proof = try await capability.authorizer.validateSpaceCredentialProof(
-                request: request,
-                method: "POST",
-                fixedPath: "/xrpc/com.atproto.space.getSpaceCredential"
+            confirmationKeyID = try capability.authorizer.verifySpaceDelegationSignature(
+                request: request
             )
-        } catch let error as SwanError {
-            if case .unavailable = error {
-                throw SpaceCredentialExchangeFailure.unavailable
-            }
-            throw SpaceCredentialExchangeFailure.invalidProof
         } catch {
-            throw SpaceCredentialExchangeFailure.invalidProof
+            throw SpaceCredentialExchangeFailure.invalidSignature
         }
 
         // Proposal 0016 delegations are single-use. Reserve the verified
@@ -156,7 +156,7 @@ private struct AuthenticatedGetSpaceCredentialHandler:
                 user: user,
                 authorization: delegationGrant.authorization,
                 clientAttestation: input.clientAttestation,
-                dpopKeyThumbprint: proof.keyThumbprint,
+                confirmationKeyID: confirmationKeyID,
                 now: Date()
             )
             return .init(credential: credential)
@@ -291,9 +291,9 @@ private func decodeGetSpaceCredentialInput(
 
 /// Returns a compact Bearer value only when the request has exactly one
 /// authorization field whose scheme is Bearer (case-insensitive per HTTP).
-/// `nil` means another scheme (notably DPoP) and lets the caller use its own
-/// proof policy; a malformed Bearer field is an error and must not fall
-/// through to a different authentication scheme.
+/// `nil` means another scheme and lets the caller use its own policy; a
+/// malformed Bearer field is an error and must not fall through to a
+/// different authentication scheme.
 func exactBearerToken(from headers: HTTPFields) throws -> String? {
     let values = headers[values: .authorization]
     guard values.count <= 1 else {
@@ -321,34 +321,53 @@ func exactBearerToken(from headers: HTTPFields) throws -> String? {
     return nil
 }
 
-/// A compact space-credential candidate presented under the `DPoP` scheme.
-/// A `DPoP`-scheme value is returned ONLY when its (unverified) JOSE header
-/// names the space-credential type — a DPoP OAuth access token stays `nil`
-/// and flows to the caller's own OAuth proof policy exactly as before. The
-/// `typ` peek routes; every security decision still happens in the verifier.
+/// The authorization scheme a space credential is presented under
+/// (atproto#5569), compared case-insensitively.
+let spaceCredentialAuthorizationScheme = "Atproto-Space"
+
+/// A compact space credential presented as `Authorization: Atproto-Space
+/// <credential>`, or `nil` when the request uses another scheme so the caller
+/// falls through to its OAuth policy unchanged.
+///
+/// Throws (an opaque denial) when the presentation is unusable as either:
+/// a duplicated `Authorization` field naming this scheme, a malformed
+/// credential value, or a credential JWT smuggled under `Bearer` or `DPoP`
+/// (the pre-#5569 DPoP-bound presentation). The `typ` peek only routes; the
+/// verifier makes every security decision.
 func spaceCredentialSchemeToken(from headers: HTTPFields) throws -> String? {
+    let values = headers[values: .authorization]
+    let prefix = spaceCredentialAuthorizationScheme + " "
+    let isSpaceScheme: (String) -> Bool = { raw in
+        raw.count >= prefix.count
+            && raw.prefix(prefix.count).caseInsensitiveCompare(prefix) == .orderedSame
+    }
+    if values.contains(where: isSpaceScheme) {
+        guard values.count == 1 else {
+            throw SpaceCredentialPresentationFailure.badSignature
+        }
+        let token = String(values[0].dropFirst(prefix.count))
+        guard !token.isEmpty,
+              token.utf8.count <= PermissionedDataJWT.maximumCompactSpaceCredentialBytes,
+              token.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+            throw SpaceCredentialPresentationFailure.badSignature
+        }
+        return token
+    }
     if let bearer = try exactBearerToken(from: headers) {
         guard unverifiedCompactJOSEType(of: bearer) != PermissionedDataJWT.credentialType else {
-            throw SpaceCredentialExchangeFailure.invalidProof
+            throw SwanError.unauthorized("space credential presented under the wrong scheme")
         }
         return nil
     }
-    let values = headers[values: .authorization]
-    guard let raw = values.first else { return nil }
     let dpopPrefix = "DPoP "
-    guard raw.count >= dpopPrefix.count,
-          raw.prefix(dpopPrefix.count)
-              .caseInsensitiveCompare(dpopPrefix) == .orderedSame else {
-        return nil
+    if let raw = values.first,
+       raw.count >= dpopPrefix.count,
+       raw.prefix(dpopPrefix.count).caseInsensitiveCompare(dpopPrefix) == .orderedSame,
+       unverifiedCompactJOSEType(of: String(raw.dropFirst(dpopPrefix.count)))
+        == PermissionedDataJWT.credentialType {
+        throw SwanError.unauthorized("space credential presented under the wrong scheme")
     }
-    let token = String(raw.dropFirst(dpopPrefix.count))
-    guard !token.isEmpty,
-          token.utf8.count <= PermissionedDataJWT.maximumCompactDelegationBytes,
-          token.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }),
-          unverifiedCompactJOSEType(of: token) == PermissionedDataJWT.credentialType else {
-        return nil
-    }
-    return token
+    return nil
 }
 
 /// The JOSE header `typ` of a compact token, decoded WITHOUT verification —
@@ -375,8 +394,8 @@ private func getSpaceCredentialResponse(
         getSpaceCredentialError(.badRequest, code: "InvalidRequest")
     case .invalidDelegation:
         getSpaceCredentialError(.unauthorized, code: "InvalidDelegationToken")
-    case .invalidProof:
-        getSpaceCredentialError(.unauthorized, code: "InvalidDPoPProof")
+    case .invalidSignature:
+        getSpaceCredentialError(.unauthorized, code: "BadSpaceSignature")
     case .invalidClientAttestation:
         getSpaceCredentialError(.badRequest, code: "InvalidClientAttestation")
     case .spaceNotFound:

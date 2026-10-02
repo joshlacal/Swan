@@ -28,7 +28,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                 space: space,
                 user: member,
                 authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
-                dpopKeyThumbprint: String(repeating: "A", count: 43),
+                confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                 now: now
             )
             let inspection = try PermissionedDataJWT.inspectSpaceCredential(token)
@@ -137,6 +137,20 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(grant.space, space)
         XCTAssertEqual(grant.permissions, [.read])
 
+        // atproto#5569: a validly signed credential in the old DPoP-bound
+        // format (`cnf.jkt`) is refused; its holder must reacquire one.
+        await XCTAssertThrowsErrorAsync(try await credentialVerifier.authorization(
+            for: SpaceCredentialGoldenFixtures.dpopBoundSecp256k1,
+            expectedSpace: space,
+            now: timestamp
+        ))
+        XCTAssertEqual(
+            try PermissionedDataJWT.inspectSpaceCredential(
+                SpaceCredentialGoldenFixtures.boundSecp256k1
+            ).claims.cnf.kid,
+            SpaceCredentialGoldenFixtures.holderKeyID
+        )
+
         // The same independent signer's two-hour credential has a valid
         // signature but exceeds the one-hour ceiling (upstream #5567).
         await XCTAssertThrowsErrorAsync(try await credentialVerifier.authorization(
@@ -158,7 +172,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                 space: space,
                 user: member,
                 authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
-                dpopKeyThumbprint: String(repeating: "A", count: 43),
+                confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                 now: now
             )
             let verifier = DurableSpaceCredentialVerifier(publicKeys: fixture.localPublicKeyResolver)
@@ -227,7 +241,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                 issuer: authority,
                 space: space,
                 key: key,
-                dpopKeyThumbprint: String(repeating: "A", count: 43),
+                confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                 now: now,
                 lifetime: PermissionedDataJWT.spaceCredentialLifetime + 1
             ))
@@ -235,7 +249,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                 issuer: authority,
                 space: space,
                 key: key,
-                dpopKeyThumbprint: String(repeating: "A", count: 43),
+                confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                 now: now,
                 kid: "#atproto"
             ))
@@ -258,7 +272,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             issuer: authority,
             space: space,
             key: newKey,
-            dpopKeyThumbprint: String(repeating: "A", count: 43),
+            confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
             now: now
         )
         let resolver = try PinnedSpaceCredentialPublicKeyResolver(pins: [
@@ -276,7 +290,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             issuer: authority,
             space: space,
             key: oldKey,
-            dpopKeyThumbprint: String(repeating: "A", count: 43),
+            confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
             now: now
         )
         await XCTAssertThrowsErrorAsync(
@@ -407,7 +421,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                 issuer: authority,
                 space: space,
                 key: privateKey,
-                dpopKeyThumbprint: String(repeating: "A", count: 43),
+                confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                 now: now
             )
             let verifier = DurableSpaceCredentialVerifier(publicKeys: resolver)
@@ -440,7 +454,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                 space: memberSpace,
                 user: member,
                 authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
-                dpopKeyThumbprint: String(repeating: "A", count: 43),
+                confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                 now: now
             )
             await XCTAssertThrowsErrorAsync(
@@ -448,7 +462,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                     space: memberSpace,
                     user: outsider,
                     authorization: .accountOAuthForTesting(subject: outsider, scopes: ["atproto"]),
-                    dpopKeyThumbprint: String(repeating: "A", count: 43),
+                    confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                     now: now
                 )
             )
@@ -457,7 +471,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                     space: memberSpace,
                     user: member,
                     authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"]),
-                    dpopKeyThumbprint: String(repeating: "A", count: 43),
+                    confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                     now: now
                 )
             )
@@ -475,7 +489,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                     space: allowListed,
                     user: member,
                     authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
-                    dpopKeyThumbprint: String(repeating: "A", count: 43),
+                    confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                     now: now
                 )
             )
@@ -485,7 +499,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                     user: member,
                     authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
                     clientAttestation: "unverified-attestation",
-                    dpopKeyThumbprint: String(repeating: "A", count: 43),
+                    confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                     now: now
                 )
             )
@@ -500,7 +514,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                 user: member,
                 authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
                 clientAttestation: "test-signed-attestation",
-                dpopKeyThumbprint: String(repeating: "A", count: 43),
+                confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                 now: now
             )
 
@@ -519,7 +533,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                     space: managing,
                     user: member,
                     authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
-                    dpopKeyThumbprint: String(repeating: "A", count: 43),
+                    confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                     now: now
                 )
             )
@@ -549,7 +563,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                             space: space,
                             user: self.member,
                             authorization: .accountOAuthForTesting(subject: self.member, scopes: ["atproto"]),
-                            dpopKeyThumbprint: String(repeating: "A", count: 43),
+                            confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
                             now: self.now
                         )
                     }
@@ -640,7 +654,7 @@ private func signedSpaceCredential(
         options: [.sortedKeys, .withoutEscapingSlashes]
     )
     var claims: [String: Any] = [
-        "cnf": ["jkt": String(repeating: "A", count: 43)],
+        "cnf": ["kid": SpaceCredentialGoldenFixtures.holderKeyID],
         "exp": NSNumber(value: exp),
         "iat": NSNumber(value: iat),
         "iss": issuer,

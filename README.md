@@ -10,6 +10,8 @@ The [October 1 upstream alignment notes](docs/notes/permissioned-data-2026-10-01
 
 Swan is developed for protocol interoperability testing and self-hosted environments; it does not claim to be a general-purpose public production PDS on the open federation today.
 
+**October 1 credential cutover:** Space credentials are bound to a P-256 `did:key` (`cnf.kid`) and every exchange and use carries an `atproto-space` HTTP message signature instead of a Spaces DPoP proof. Credentials minted in the DPoP format (`cnf.jkt`) are rejected; clients reacquire through a new delegation exchange. Ordinary OAuth DPoP is unchanged.
+
 **September 19 credential cutover:** Space credentials require a DPoP key at issuance and a fresh proof on each request. Existing bearer space credentials must be replaced through a new delegation exchange. Account OAuth sessions and repository data are retained.
 
 **September 10 alpha migration:** The current profile uses independent read/write policies, `putMember` flags, and access-specific `checkUserAccess` requests. SQLite v23 copies each legacy policy and managing-app choice to both axes and preserves existing members' read/write access. It does not reset account or session data.

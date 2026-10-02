@@ -62,7 +62,7 @@ final class SpaceCredentialLifetimeTests: XCTestCase {
             issuer: Self.authority,
             space: space,
             key: key,
-            dpopKeyThumbprint: String(repeating: "A", count: 43),
+            confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
             now: now
         )
         let defaultedClaims = try PermissionedDataJWT.verifySpaceCredential(
@@ -77,7 +77,7 @@ final class SpaceCredentialLifetimeTests: XCTestCase {
             issuer: Self.authority,
             space: space,
             key: key,
-            dpopKeyThumbprint: String(repeating: "A", count: 43),
+            confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
             now: now,
             lifetime: PermissionedDataJWT.spaceCredentialLifetime
         )
@@ -93,7 +93,7 @@ final class SpaceCredentialLifetimeTests: XCTestCase {
             issuer: Self.authority,
             space: space,
             key: key,
-            dpopKeyThumbprint: String(repeating: "A", count: 43),
+            confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID,
             now: now,
             lifetime: 2 * 60 * 60
         ), "minting above the one-hour ceiling must fail")

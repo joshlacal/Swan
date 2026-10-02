@@ -76,59 +76,65 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         runtime.dpopNonceService.issue(now: now)
     }
 
-    /// Permissioned credentials use the same canonical route binding as OAuth,
-    /// with their own proof policy: no server nonce at exchange, and an `ath`
-    /// claim over the credential on every use.
-    func validateSpaceCredentialProof(
-        request: Request,
-        method: String,
-        fixedPath: String,
-        credential: String? = nil,
-        now: Date = Date()
-    ) async throws -> OAuthValidatedDPoPProof {
-        guard let proof = Self.dpopProof(from: request.headers) else {
-            throw SwanError.unauthorized("space credential proof is invalid")
-        }
-        let target = try Self.target(publicURL: publicURL, fixedPath: fixedPath)
-        try Self.validateFixedMethod(method)
-        // This bounded parse supplies a candidate key binding to the proof
-        // validator. It grants no authority: the credential verifier below
-        // must still verify the signed claims and repeat the key binding.
-        let thumbprint = try credential.map {
-            try PermissionedDataJWT.inspectSpaceCredential($0).claims.cnf.jkt
-        }
-        return try await SpaceCredentialDPoPValidator(runtime: runtime).validate(
-            proof,
-            method: method,
-            target: target,
-            credential: credential,
-            expectedKeyThumbprint: thumbprint,
-            now: now
+    /// Reads the `atproto-space` presentation fields as complete field-line
+    /// lists. The request URI, Host, and method are deliberately not inputs:
+    /// a space signature binds only the credential and its audience.
+    static func spaceCredentialPresentation(
+        from headers: HTTPFields
+    ) -> SpaceCredentialHTTPPresentation {
+        SpaceCredentialHTTPPresentation(
+            authorization: headers[values: .authorization],
+            audience: headers[values: spaceAudienceField],
+            signatureInput: headers[values: signatureInputField],
+            signature: headers[values: signatureField]
         )
     }
 
+    static let spaceAudienceField = HTTPField.Name(SpaceHTTPSignature.audienceFieldName)!
+    static let signatureInputField = HTTPField.Name(SpaceHTTPSignature.signatureInputFieldName)!
+    static let signatureField = HTTPField.Name(SpaceHTTPSignature.signatureFieldName)!
+
+    /// Verifies the delegation exchange's `atproto-space` signature, which
+    /// covers exactly `("authorization")` and must name the client's fresh
+    /// P-256 `did:key` as `keyid`. Returns that key ID for `cnf.kid`.
+    func verifySpaceDelegationSignature(request: Request) throws -> String {
+        do {
+            return try SpaceHTTPSignature.verify(
+                authorization: request.headers[values: .authorization],
+                audience: nil,
+                signatureInput: request.headers[values: Self.signatureInputField],
+                signature: request.headers[values: Self.signatureField],
+                credentialKeyID: nil
+            )
+        } catch {
+            throw SpaceCredentialPresentationFailure.badSignature
+        }
+    }
+
+    /// Verifies an `Atproto-Space` credential presentation for one operation.
+    /// `expectedAudience` is derived by the route from the operation, never
+    /// from the request's Host or this server's identity: the repo owner's
+    /// DID for repo reads, the space authority's bare DID for space-host
+    /// operations. Throws ``SpaceCredentialPresentationFailure`` for the
+    /// protocol's named errors and the verifier's opaque errors otherwise.
     func authorizeSpaceCredential(
         _ token: String,
         verifier: any SpaceCredentialAuthorizationVerifier,
         request: Request,
         expectedSpace: SpaceURI,
-        method: String,
-        fixedPath: String,
+        expectedAudience: String,
         now: Date = Date()
     ) async throws -> AuthorizationContext {
-        let proof = try await validateSpaceCredentialProof(
-            request: request,
-            method: method,
-            fixedPath: fixedPath,
-            credential: token,
-            now: now
-        )
-        return try await verifier.authorization(
-            for: token,
+        let presentation = try await verifier.verifiedPresentation(
+            token,
             expectedSpace: expectedSpace,
-            dpopProof: proof,
+            presentation: Self.spaceCredentialPresentation(from: request.headers),
             now: now
         )
+        guard presentation.audience == expectedAudience else {
+            throw SpaceCredentialPresentationFailure.badAudience
+        }
+        return presentation.authorization
     }
 
     /// Which legacy sessions a space route admits under open interop.
@@ -533,5 +539,18 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
 
     private enum HeaderError: Error {
         case malformed
+    }
+}
+
+extension SpaceCredentialPresentationFailure {
+    /// The lexicon error name each route renders with HTTP 401, matching the
+    /// reference PDS (`AuthRequiredError(..., 'BadSpaceSignature' |
+    /// 'BadSpaceAudience' | 'CredentialRevoked')`).
+    var xrpcErrorCode: String {
+        switch self {
+        case .badSignature: "BadSpaceSignature"
+        case .badAudience: "BadSpaceAudience"
+        case .revoked: "CredentialRevoked"
+        }
     }
 }

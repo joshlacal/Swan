@@ -278,8 +278,13 @@ public enum PermissionedDataJWT {
     }
 
     public struct SpaceCredentialClaims: Codable, Sendable, Equatable {
+        /// The holder-key binding. Since atproto#5569 it names the P-256
+        /// `did:key` that signs each presentation's HTTP message signature;
+        /// the Spaces-only DPoP thumbprint (`cnf.jkt`) is gone, so a
+        /// credential minted in the old format fails to decode and the
+        /// holder must reacquire one.
         public struct Confirmation: Codable, Sendable, Equatable {
-            public let jkt: String
+            public let kid: String
         }
 
         public let iss: String
@@ -455,13 +460,13 @@ public enum PermissionedDataJWT {
         issuer: String,
         space: SpaceURI,
         key: P256.Signing.PrivateKey,
-        dpopKeyThumbprint: String,
+        confirmationKeyID: String,
         now: Date = Date(),
         lifetime: TimeInterval = spaceCredentialDefaultLifetime,
         kid: String = spaceCredentialIssuedKeyID
     ) throws -> String {
         guard issuer == space.authority,
-              SpaceCredentialDPoPValidator.isValidKeyThumbprint(dpopKeyThumbprint),
+              isValidConfirmationKeyID(confirmationKeyID),
               isSpaceCredentialKeyID(kid),
               lifetime > 0,
               lifetime <= spaceCredentialLifetime,
@@ -475,7 +480,7 @@ public enum PermissionedDataJWT {
             claims: SpaceCredentialClaims(
                 iss: issuer, sub: space.rawValue, iat: issuedAt,
                 exp: issuedAt + Int64(lifetime), jti: UUID().uuidString,
-                cnf: .init(jkt: dpopKeyThumbprint)
+                cnf: .init(kid: confirmationKeyID)
             ),
             key: key
         )
@@ -513,7 +518,7 @@ public enum PermissionedDataJWT {
         let claims = try StrictJSON.decode(SpaceCredentialClaims.self, from: parsed.payload)
         guard let space = try? SpaceURI(claims.sub),
               space.authority == claims.iss,
-              SpaceCredentialDPoPValidator.isValidKeyThumbprint(claims.cnf.jkt),
+              isValidConfirmationKeyID(claims.cnf.kid),
               claims.jti.isValidPermissionedDataJTI,
               expectedSpace.map({ $0 == space }) ?? true else {
             throw SwanError.unauthorized("space credential issuer or subject is invalid")
@@ -550,7 +555,7 @@ public enum PermissionedDataJWT {
         let claims = try StrictJSON.decode(SpaceCredentialClaims.self, from: parsed.payload)
         guard let space = try? SpaceURI(claims.sub),
               space.authority == claims.iss,
-              SpaceCredentialDPoPValidator.isValidKeyThumbprint(claims.cnf.jkt),
+              isValidConfirmationKeyID(claims.cnf.kid),
               claims.jti.isValidPermissionedDataJTI else {
             throw SwanError.unauthorized("space credential issuer or subject is invalid")
         }
@@ -820,6 +825,20 @@ public enum PermissionedDataJWT {
 
     private static func isSpaceCredentialKeyID(_ value: String) -> Bool {
         value == spaceCredentialKeyID || value == spaceCredentialFallbackKeyID
+    }
+
+    /// `cnf.kid` must be a canonical P-256 `did:key`: the only key type an
+    /// `atproto-space` HTTP message signature (`ecdsa-p256-sha256`) can use.
+    public static func isValidConfirmationKeyID(_ value: String) -> Bool {
+        guard value.utf8.count <= 256,
+              let parsed = try? P256DIDKey(value) else { return false }
+        return parsed.value == value
+    }
+
+    /// The generic DID grammar used for JWT issuers, exposed to the
+    /// presentation verifier for the `Atproto-Space-Audience` value.
+    static func isDIDString(_ value: String) -> Bool {
+        isPermissionedDataDID(value)
     }
 
     private static func integerClockSkew(_ skew: TimeInterval) -> Int64? {

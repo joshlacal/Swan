@@ -168,7 +168,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 )
             }
             let delegation = await observedTokens.tokens().delegation
-            let exchangeHeaders = try SpaceCredentialDPoPTestSupport.exchangeHeaders(token: delegation)
+            let exchangeHeaders = try SpaceCredentialSignatureTestSupport.exchangeHeaders(token: delegation)
             let exchangeBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\"}")
             try await client.execute(uri: credentialPath, method: .post, headers: exchangeHeaders, body: exchangeBody) { response in
                 XCTAssertEqual(response.status, .ok)
@@ -177,9 +177,9 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 )
             }
             let credential = await observedTokens.tokens().credential
-            // Reuse the delegation with a fresh proof so this still exercises
-            // delegation replay protection, independent of DPoP replay checks.
-            try await client.execute(uri: credentialPath, method: .post, headers: SpaceCredentialDPoPTestSupport.exchangeHeaders(token: delegation), body: exchangeBody) { response in
+            // Reuse the delegation with a fresh signature so this still exercises
+            // delegation replay protection; a signature itself is not single-use.
+            try await client.execute(uri: credentialPath, method: .post, headers: SpaceCredentialSignatureTestSupport.exchangeHeaders(token: delegation), body: exchangeBody) { response in
                 XCTAssertEqual(response.status, .unauthorized)
                 self.assertRuntimeSecretsAbsent(
                     response.body,
@@ -189,16 +189,16 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     credential: credential
                 )
             }
-            try await client.execute(uri: self.latestURI(space: fixture.space, repo: Self.alice), method: .get, headers: self.credentialHeaders(credential, path: Self.latestPath)) { XCTAssertEqual($0.status, .ok) }
-            try await client.execute(uri: self.oplogURI(space: fixture.space, repo: Self.alice), method: .get, headers: self.credentialHeaders(credential, path: Self.oplogPath)) { XCTAssertEqual($0.status, .ok) }
-            try await client.execute(uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: self.credentialHeaders(credential, path: Self.repoPath)) { response in
+            try await client.execute(uri: self.latestURI(space: fixture.space, repo: Self.alice), method: .get, headers: self.credentialHeaders(credential, audience: Self.alice)) { XCTAssertEqual($0.status, .ok) }
+            try await client.execute(uri: self.oplogURI(space: fixture.space, repo: Self.alice), method: .get, headers: self.credentialHeaders(credential, audience: Self.alice)) { XCTAssertEqual($0.status, .ok) }
+            try await client.execute(uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: self.credentialHeaders(credential, audience: Self.alice)) { response in
                 XCTAssertEqual(response.status, .ok)
                 self.assertCARNoStore(response)
                 _ = try self.assertRecoveryCAR(
                     Data(buffer: response.body), fixture: fixture, author: Self.alice
                 )
             }
-            try await client.execute(uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID), method: .get, headers: self.credentialHeaders(credential, path: Self.blobPath)) { response in
+            try await client.execute(uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID), method: .get, headers: self.credentialHeaders(credential, audience: Self.alice)) { response in
                 XCTAssertEqual(response.status, .unauthorized)
                 self.assertRuntimeSecretsAbsent(
                     response.body,
@@ -261,7 +261,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID),
                     method: .get,
-                    headers: self.credentialHeaders(credential, path: Self.blobPath)
+                    headers: self.credentialHeaders(credential, audience: Self.alice)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertEqual(Data(buffer: response.body), fixture.blobPayload)
@@ -440,7 +440,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: self.repoURI(space: fixture.space, repo: Self.bob),
                     method: .get,
-                    headers: self.credentialHeaders(credential, path: Self.repoPath)
+                    headers: self.credentialHeaders(credential, audience: Self.bob)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     self.assertCARNoStore(response)
@@ -507,11 +507,12 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 }
 
                 // A key-bound space credential may read a different member
-                // repository when its request proof matches the credential.
+                // repository when its request signature matches the credential
+                // and names that member as its audience.
                 try await client.execute(
                     uri: self.latestURI(space: fixture.space, repo: Self.bob),
                     method: .get,
-                    headers: self.credentialHeaders(credential, path: Self.latestPath)
+                    headers: self.credentialHeaders(credential, audience: Self.bob)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     self.assertNoStore(response)
@@ -527,24 +528,26 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                         of: "com.atproto.space.getLatestCommit",
                         with: "com.atproto.space.getRepoState"
                     )
-                // Sharing a handler never makes the two target URLs
-                // interchangeable for proof-of-possession validation.
+                // atproto#5569 signatures bind the credential and its
+                // audience, not the URL, so the same signed headers serve
+                // both names; what they cannot do is read another audience.
                 try await client.execute(
                     uri: aliasURI, method: .get,
-                    headers: self.credentialHeaders(credential, path: Self.latestPath)
+                    headers: self.credentialHeaders(credential, audience: Self.alice)
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try self.errorCode(response.body), "BadSpaceAudience")
                 }
                 try await client.execute(
                     uri: self.latestURI(space: fixture.space, repo: Self.bob), method: .get,
-                    headers: self.credentialHeaders(credential, path: "/xrpc/com.atproto.space.getRepoState")
+                    headers: self.credentialHeaders(credential, audience: Self.bob)
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(response.status, .ok)
                 }
                 try await client.execute(
                     uri: aliasURI,
                     method: .get,
-                    headers: self.credentialHeaders(credential, path: "/xrpc/com.atproto.space.getRepoState")
+                    headers: self.credentialHeaders(credential, audience: Self.bob)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     let commit = try XCTUnwrap((try self.jsonObject(response.body))["commit"] as? [String: Any])
@@ -719,7 +722,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: self.repoURI(space: fixture.space, repo: Self.alice, excludeValues: false),
                     method: .get,
-                    headers: self.credentialHeaders(credential, path: Self.repoPath)
+                    headers: self.credentialHeaders(credential, audience: Self.alice)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     let car = Data(buffer: response.body)
@@ -730,7 +733,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: self.repoURI(space: fixture.space, repo: Self.alice, excludeValues: true),
                     method: .get,
-                    headers: self.credentialHeaders(credential, path: Self.repoPath)
+                    headers: self.credentialHeaders(credential, audience: Self.alice)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     self.assertCARNoStore(response)
@@ -744,7 +747,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: self.repoURI(space: fixture.space, repo: Self.alice) + "&excludeValues=yes",
                     method: .get,
-                    headers: self.credentialHeaders(credential, path: Self.repoPath)
+                    headers: self.credentialHeaders(credential, audience: Self.alice)
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
                 }
@@ -783,7 +786,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                             cursor: cursor
                         ),
                         method: .get,
-                        headers: self.credentialHeaders(credential, path: Self.oplogPath)
+                        headers: self.credentialHeaders(credential, audience: Self.alice)
                     ) { response in
                         XCTAssertEqual(response.status, .ok)
                         let body = try self.jsonObject(response.body)
@@ -823,7 +826,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                             cursor: malformed
                         ),
                         method: .get,
-                        headers: self.credentialHeaders(credential, path: Self.oplogPath)
+                        headers: self.credentialHeaders(credential, audience: Self.alice)
                     ) { response in
                         XCTAssertEqual(response.status, .badRequest, malformed)
                         XCTAssertEqual(try self.errorCode(response.body), "MalformedCursor", malformed)
@@ -932,7 +935,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
 
                 try await client.execute(
                     uri: self.latestURI(space: fixture.space, repo: Self.bob), method: .get,
-                    headers: self.credentialHeaders(wrongCredential, path: Self.latestPath)
+                    headers: self.credentialHeaders(wrongCredential, audience: Self.bob)
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
                     self.assertNoStore(response)
@@ -941,7 +944,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
 
                 try await client.execute(
                     uri: self.repoURI(space: fixture.space, repo: Self.bob), method: .get,
-                    headers: self.credentialHeaders(wrongCredential, path: Self.repoPath)
+                    headers: self.credentialHeaders(wrongCredential, audience: Self.bob)
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
                     self.assertNoStore(response)
@@ -1331,8 +1334,8 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         return fields
     }
 
-    private func credentialHeaders(_ credential: String, path: String) throws -> HTTPFields {
-        try SpaceCredentialDPoPTestSupport.headers(token: credential, path: path)
+    private func credentialHeaders(_ credential: String, audience: String) throws -> HTTPFields {
+        try SpaceCredentialSignatureTestSupport.headers(token: credential, audience: audience)
     }
 
     private func assertCommit(
@@ -1647,7 +1650,7 @@ private struct Fixture: Sendable {
             issuer: RepositorySyncHTTPTests.alice,
             space: space,
             key: try P256.Signing.PrivateKey(rawRepresentation: scalar),
-            dpopKeyThumbprint: try SpaceCredentialDPoPTestSupport.thumbprint
+            confirmationKeyID: try SpaceCredentialSignatureTestSupport.keyID
         )
     }
 

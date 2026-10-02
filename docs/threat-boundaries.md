@@ -11,10 +11,14 @@ preventing accidental public exposure and unauthorized cross-space access.
   repository permission. They resolve exclusively through local or pinned
   `#atproto` keys; unknown issuers never cause DID/PLC/DNS/HTTP lookup.
 - A space credential is read-only at the repo host and bound to its client
-  through `cnf.jkt`. Each use requires a fresh DPoP proof binding the token,
-  request method, and origin/path. A repo host cannot replay a received token
-  against another host without the client’s private key. Writes require a
-  scope covering the authenticated account’s own `(space, repo)`.
+  through `cnf.kid`, a P-256 `did:key`. Each use carries an `atproto-space`
+  HTTP message signature over the credential and the request's audience DID
+  (the repo owner, or the bare authority DID for space-host operations), so
+  a host that receives a credential cannot present it to another audience
+  without the client's private key. A signature is deliberately reusable for
+  the same credential and audience; the credential's short lifetime and the
+  authority's revocations bound that reuse. Writes require a scope covering
+  the authenticated account's own `(space, repo)`.
 - The content-binding MAC is a deniable integrity check, never an author
   signature. `verifyContextSignature` and `verifyContentBinding` remain
   separate APIs.

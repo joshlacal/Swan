@@ -240,7 +240,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 issuer: localDID,
                 space: space,
                 key: fixture.localKey,
-                dpopKeyThumbprint: SpaceCredentialDPoPTestSupport.thumbprint
+                confirmationKeyID: SpaceCredentialSignatureTestSupport.keyID
             )
             let app = server.buildApplication(
                 logger: Logger(label: "ServePermissionedRuntimeCompositionTests.semantic")
@@ -870,7 +870,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 issuer: local,
                 space: localSpace,
                 key: fixture.localKey,
-                dpopKeyThumbprint: SpaceCredentialDPoPTestSupport.thumbprint,
+                confirmationKeyID: SpaceCredentialSignatureTestSupport.keyID,
                 now: now
             )
             _ = try await DurableSpaceCredentialVerifier(
@@ -886,7 +886,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 XCTFail("the retained pre-DPoP credential must be rejected")
             } catch {}
             let boundInspection = try PermissionedDataJWT.inspectSpaceCredential(Self.remoteBoundCredential)
-            XCTAssertEqual(boundInspection.claims.cnf.jkt, try SpaceCredentialDPoPTestSupport.thumbprint)
+            XCTAssertEqual(boundInspection.claims.cnf.kid, try SpaceCredentialSignatureTestSupport.keyID)
             _ = try await remoteVerifier.authorization(
                 for: Self.remoteBoundCredential,
                 expectedSpace: remoteSpace,
@@ -1048,11 +1048,11 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
     private static let remoteCredential =
         "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWNyZWRlbnRpYWwrand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eCIsInN1YiI6ImF0Oi8vZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3gvc3BhY2UvYXBwLmJza3kuYm9va21hcmtzL3RzLWdvbGRlbiIsImlhdCI6MTc1MDAwMDAwMCwiZXhwIjoxNzUwMDA3MjAwLCJqdGkiOiJ0cy1jcmVkZW50aWFsLW5vbmNlXzAxIn0.kgRbwHruWKzbsHZlMjmSFYmz1dKBjpP0eQBvJLRYlzMAClhsOpYnRYpe2fBMGtuciGngcQgEwWYSjHpa9YmIEQ"
     // Independently signed with Node.js crypto, secp256k1 scalar 2, SHA-256,
-    // P1363 signature encoding and low-S normalization. cnf binds the actual
-    // P-256 holder key from SpaceCredentialDPoPTestSupport. Lifetime is the
-    // one-hour #5567 ceiling (exp - iat == 3600).
+    // P1363 signature encoding and low-S normalization. cnf.kid binds the
+    // P-256 holder key from SpaceCredentialSignatureTestSupport. Lifetime is
+    // the one-hour #5567 ceiling (exp - iat == 3600).
     private static let remoteBoundCredential =
-        "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWNyZWRlbnRpYWwrand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eCIsInN1YiI6ImF0Oi8vZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3gvc3BhY2UvYXBwLmJza3kuYm9va21hcmtzL3RzLWdvbGRlbiIsImlhdCI6MTc1MDAwMDAwMCwiZXhwIjoxNzUwMDAzNjAwLCJqdGkiOiJub2RlLWJvdW5kLWh0dHAtY3JlZGVudGlhbC0wMiIsImNuZiI6eyJqa3QiOiJOeTNCZENEUExWeWtNaGZCY3dYZnFJNWk5NVNwZzMyaC0zWDFITkNMZEg0In19.HCtW19zLMDIeFYaPtotVIAYGKFOLlUoQgCWPplQDGMl2kz3xL9ddLiNBX-I-wqRMYG6RLDolxJ2S3fEftybBdw"
+        "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWNyZWRlbnRpYWwrand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eCIsInN1YiI6ImF0Oi8vZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3gvc3BhY2UvYXBwLmJza3kuYm9va21hcmtzL3RzLWdvbGRlbiIsImlhdCI6MTc1MDAwMDAwMCwiZXhwIjoxNzUwMDAzNjAwLCJqdGkiOiJub2RlLWtpZC1odHRwLWNyZWRlbnRpYWwtMDIiLCJjbmYiOnsia2lkIjoiZGlkOmtleTp6RG5hZW5XTHFIOG5kZHZLdllTZ2phVXNDSmt1b3hYaGJYU3FkbWY4ZU05NDZuQlFlIn19.AhKraZIQ9lkfWs0_MCi7MENETyhKWRC_i4Twlcuj75EWo-bEa9Z_A8bVhilge4UWBgDY8BONp-G1NrLaesbMcg"
     private static let remoteService =
         "eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NksifQ.eyJpYXQiOjE3NTAwMDAwMDAsImlzcyI6ImRpZDpwbGM6YmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5IiwiYXVkIjoiZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3giLCJleHAiOjE3NTAwMDAwNjAsImx4bSI6ImNvbS5hdHByb3RvLnNwYWNlLm5vdGlmeVdyaXRlIiwianRpIjoicGlubmVkLXRzLW5vdGlmeS0wMDEifQ.o782N9f1U23FL8bWXqQiNDBjp7c-5Cxj4IIlvqLdEUZFC4K0C-vUz-AN8PuGZINo1K2Y6_DY-qJmgak6Fk-aPA"
 
@@ -1099,8 +1099,9 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 jti: jti
             )
         case .credential:
-            headers = try SpaceCredentialDPoPTestSupport.headers(
-                token: credential, path: path, method: method.rawValue
+            // listRepos: a space-host operation, so the authority's bare DID.
+            headers = try SpaceCredentialSignatureTestSupport.headers(
+                token: credential, audience: space.authority
             )
         case .delegation:
             let delegation = try PermissionedDataJWT.createDelegationToken(
@@ -1109,7 +1110,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 space: space,
                 key: fixture.localKey
             )
-            headers = try SpaceCredentialDPoPTestSupport.exchangeHeaders(token: delegation, path: path)
+            headers = try SpaceCredentialSignatureTestSupport.exchangeHeaders(token: delegation)
         case .registerNotify:
             let registerToken = try SpaceServiceJWT.create(
                 issuer: localDID,
@@ -1118,8 +1119,8 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 eventID: jti,
                 key: fixture.localKey
             )
-            headers = try SpaceCredentialDPoPTestSupport.headers(
-                token: credential, path: path, method: method.rawValue
+            headers = try SpaceCredentialSignatureTestSupport.headers(
+                token: credential, audience: space.authority
             )
             headers[HTTPField.Name("atproto-service-auth")!] = "Bearer \(registerToken)"
         case .unregisterNotify:
@@ -1130,8 +1131,8 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 eventID: jti,
                 key: fixture.localKey
             )
-            headers = try SpaceCredentialDPoPTestSupport.headers(
-                token: credential, path: path, method: method.rawValue
+            headers = try SpaceCredentialSignatureTestSupport.headers(
+                token: credential, audience: space.authority
             )
             headers[HTTPField.Name("atproto-service-auth")!] = "Bearer \(unregisterToken)"
         case .notifyWrite:
@@ -1411,6 +1412,9 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         }
         if let dpop = headers[HTTPField.Name("DPoP")!] {
             values.append(dpop)
+        }
+        if let signature = headers[HTTPField.Name(SpaceHTTPSignature.signatureFieldName)!] {
+            values.append(signature)
         }
         var material = values.map { Data($0.utf8) }
         if let blobPayload = fixture.blobPayload {

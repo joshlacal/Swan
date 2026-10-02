@@ -106,7 +106,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(credentialHeaders, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"),
+                    headers: credentialHeaders,
                     body: registerBody
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -116,7 +116,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(wrongAudienceHeaders, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"),
+                    headers: wrongAudienceHeaders,
                     body: registerBody
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -126,7 +126,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(credentialHeaders, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"),
+                    headers: credentialHeaders,
                     body: registerBody
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -135,7 +135,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(registerHeaders, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"),
+                    headers: registerHeaders,
                     body: registerBody
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -148,7 +148,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(foreignRegisterHeaders, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"),
+                    headers: foreignRegisterHeaders,
                     body: registerBody
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -223,7 +223,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)",
                     method: .get,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(credentialHeaders, path: "/xrpc/com.atproto.space.listRepos", method: "GET")
+                    headers: credentialHeaders
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     let value = try notificationJSONObject(response.body)
@@ -252,7 +252,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(registerHeaders, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"),
+                    headers: registerHeaders,
                     body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/x\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -304,7 +304,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(validHeaders, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"),
+                    headers: validHeaders,
                     body: registerBody("\"service\":\"\(subscriber)#bulleted_events\"")
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -314,7 +314,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(credentialHeaders, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"),
+                    headers: credentialHeaders,
                     body: registerBody("\"service\":\"\(subscriber)#bulleted_events\"")
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -325,7 +325,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(mismatchedHeaders, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"),
+                    headers: mismatchedHeaders,
                     body: registerBody("\"service\":\"\(subscriber)#bulleted_events\"")
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -336,7 +336,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(validHeaders, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"),
+                    headers: validHeaders,
                     body: registerBody(
                         "\"service\":\"\(subscriber)#other\",\"endpoint\":\"https://attacker.example/sink\""
                     )
@@ -347,7 +347,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(validHeaders, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"),
+                    headers: validHeaders,
                     body: registerBody("\"repo\":\"\(self.writer)\"")
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -434,7 +434,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     try await client.execute(
                         uri: "/xrpc/com.atproto.space.registerNotify",
                         method: .post,
-                        headers: try SpaceCredentialDPoPTestSupport.refreshed(validHeaders, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"),
+                        headers: validHeaders,
                         body: body("\"service\":\"\(subscriber)\(fragment)\"")
                     ) { response in
                         XCTAssertEqual(response.status, .ok)
@@ -447,7 +447,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.unregisterNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(credentialHeaders, path: "/xrpc/com.atproto.space.unregisterNotify", method: "POST"),
+                    headers: credentialHeaders,
                     body: body("\"service\":\"\(subscriber)#a\"")
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -459,7 +459,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.unregisterNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(foreignHeaders, path: "/xrpc/com.atproto.space.unregisterNotify", method: "POST"),
+                    headers: foreignHeaders,
                     body: body("\"service\":\"\(subscriber)#a\"")
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -470,7 +470,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.unregisterNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(foreignAudienceHeaders, path: "/xrpc/com.atproto.space.unregisterNotify", method: "POST"),
+                    headers: foreignAudienceHeaders,
                     body: body("\"service\":\"\(subscriber)#a\"")
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -481,7 +481,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.unregisterNotify",
                     method: .post,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(validHeaders, path: "/xrpc/com.atproto.space.unregisterNotify", method: "POST"),
+                    headers: validHeaders,
                     body: body("\"service\":\"\(subscriber)#a\"")
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -498,7 +498,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     try await client.execute(
                         uri: "/xrpc/com.atproto.space.unregisterNotify",
                         method: .post,
-                        headers: try SpaceCredentialDPoPTestSupport.refreshed(targetHeaders, path: "/xrpc/com.atproto.space.unregisterNotify", method: "POST"),
+                        headers: targetHeaders,
                         body: body("\"service\":\"\(target)\"")
                     ) { response in
                         XCTAssertEqual(response.status, .ok, target)
@@ -519,7 +519,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     try await client.execute(
                         uri: "/xrpc/com.atproto.space.unregisterNotify",
                         method: .post,
-                        headers: try SpaceCredentialDPoPTestSupport.refreshed(validHeaders, path: "/xrpc/com.atproto.space.unregisterNotify", method: "POST"),
+                        headers: validHeaders,
                         body: body(bad)
                     ) { response in
                         XCTAssertEqual(response.status, .badRequest, bad)
@@ -540,7 +540,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.unregisterNotify",
                     method: .get,
-                    headers: try SpaceCredentialDPoPTestSupport.refreshed(credentialHeaders, path: "/xrpc/com.atproto.space.unregisterNotify", method: "GET")
+                    headers: credentialHeaders
                 ) { response in
                     XCTAssertEqual(response.status, .notFound)
                     XCTAssertEqual(try notificationErrorCode(response.body), "permissioned_endpoint_unavailable")
@@ -555,9 +555,11 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    /// A credential bound to a holder key registers with its DPoP proof.
-    /// An OAuth-shaped token still routes to OAuth policy and is refused here.
-    func testRegisterNotifyAcceptsTheDPoPSchemeCredentialPresentation() async throws {
+    /// A credential bound to a holder key registers under the
+    /// `Atproto-Space` scheme with its HTTP message signature (atproto#5569).
+    /// An OAuth-shaped token still routes to OAuth policy and is refused
+    /// here, and the retired DPoP-scheme credential presentation is refused.
+    func testRegisterNotifyAcceptsTheAtprotoSpaceCredentialPresentation() async throws {
         let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
         defer { fixture.cleanup() }
         do {
@@ -578,7 +580,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
-                    headers: try fixture.dpopSchemeCredentialHeaders(for: subscriber),
+                    headers: try fixture.spaceSchemeCredentialHeaders(for: subscriber),
                     body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"service\":\"\(subscriber)#events\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -592,6 +594,20 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
                     headers: oauthShaped,
+                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"service\":\"\(subscriber)#events\"}")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+                // The pre-#5569 presentation: the same credential under the
+                // DPoP scheme. It is a credential JWT, so it is not handed to
+                // OAuth either; it is refused outright.
+                var retired = try fixture.spaceSchemeCredentialHeaders(for: subscriber)
+                let credentialToken = try XCTUnwrap(retired[.authorization]?.split(separator: " ").last)
+                retired[.authorization] = "DPoP \(credentialToken)"
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: retired,
                     body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"service\":\"\(subscriber)#events\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -1041,7 +1057,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             try await client.execute(
                 uri: "/xrpc/com.atproto.space.registerNotify",
                 method: .post,
-                headers: try SpaceCredentialDPoPTestSupport.refreshed(wrongAudienceHeaders, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"),
+                headers: wrongAudienceHeaders,
                 body: registerBody
             ) { response in
                 XCTAssertEqual(response.status, .unauthorized)
@@ -1061,7 +1077,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             try await client.execute(
                 uri: "/xrpc/com.atproto.space.unregisterNotify",
                 method: .post,
-                headers: try SpaceCredentialDPoPTestSupport.refreshed(wrongAudienceHeaders, path: "/xrpc/com.atproto.space.unregisterNotify", method: "POST"),
+                headers: wrongAudienceHeaders,
                 body: unregisterBody
             ) { response in
                 XCTAssertEqual(response.status, .unauthorized)
@@ -1229,10 +1245,13 @@ private struct NotificationHTTPFixture {
     func credentialHeaders(serviceAuth: String? = "register-service-token") throws -> HTTPFields {
         let credential = try PermissionedDataJWT.createSpaceCredential(
             issuer: authority, space: space, key: key,
-            dpopKeyThumbprint: try SpaceCredentialDPoPTestSupport.thumbprint
+            confirmationKeyID: try SpaceCredentialSignatureTestSupport.keyID
         )
-        var headers = try SpaceCredentialDPoPTestSupport.headers(
-            token: credential, path: "/xrpc/com.atproto.space.registerNotify", method: "POST"
+        // listRepos, registerNotify, and unregisterNotify are space-host
+        // operations: the signed audience is the authority's bare DID, and
+        // one signature serves all three.
+        var headers = try SpaceCredentialSignatureTestSupport.headers(
+            token: credential, audience: authority
         )
         headers[.contentType] = "application/json"
         if let serviceAuth {
@@ -1261,7 +1280,7 @@ private struct NotificationHTTPFixture {
 
     /// The reference presentation binds the credential and request proof to
     /// the same holder key, with the credential hash in the proof's ath claim.
-    func dpopSchemeCredentialHeaders(for serviceDID: String? = nil) throws -> HTTPFields {
+    func spaceSchemeCredentialHeaders(for serviceDID: String? = nil) throws -> HTTPFields {
         try registerHeaders(for: serviceDID)
     }
 
@@ -2151,7 +2170,7 @@ extension SpaceNotificationHTTPTests {
             try await fixture.server(serviceEndpointResolver: resolver)
                 .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.registerHardened"))
                 .test(.router) { client in
-                    try await client.execute(uri: registerPath, method: .post, headers: try SpaceCredentialDPoPTestSupport.refreshed(credentialOnly, path: registerPath, method: "POST"), body: body) { response in
+                    try await client.execute(uri: registerPath, method: .post, headers: credentialOnly, body: body) { response in
                         XCTAssertEqual(response.status, .unauthorized)
                     }
                 }
@@ -2159,25 +2178,25 @@ extension SpaceNotificationHTTPTests {
                 .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.registerInterop"))
                 .test(.router) { client in
                     for _ in 0 ..< 2 {
-                        try await client.execute(uri: registerPath, method: .post, headers: try SpaceCredentialDPoPTestSupport.refreshed(credentialOnly, path: registerPath, method: "POST"), body: body) { response in
+                        try await client.execute(uri: registerPath, method: .post, headers: credentialOnly, body: body) { response in
                             XCTAssertEqual(response.status, .ok)
                         }
                     }
                     // Third header-less call in the hour exceeds the cap.
-                    try await client.execute(uri: registerPath, method: .post, headers: try SpaceCredentialDPoPTestSupport.refreshed(credentialOnly, path: registerPath, method: "POST"), body: body) { response in
+                    try await client.execute(uri: registerPath, method: .post, headers: credentialOnly, body: body) { response in
                         XCTAssertEqual(response.status, .serviceUnavailable)
                     }
                     // A present header must still prove ownership of `service`.
                     let mismatched = try fixture.registerHeaders(for: "did:web:other.example")
-                    try await client.execute(uri: registerPath, method: .post, headers: try SpaceCredentialDPoPTestSupport.refreshed(mismatched, path: registerPath, method: "POST"), body: body) { response in
+                    try await client.execute(uri: registerPath, method: .post, headers: mismatched, body: body) { response in
                         XCTAssertEqual(response.status, .unauthorized)
                     }
                     // A legacy endpoint-only registration still needs the header.
                     let endpointOnly = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://syncer.example/x\"}")
-                    try await client.execute(uri: registerPath, method: .post, headers: try SpaceCredentialDPoPTestSupport.refreshed(credentialOnly, path: registerPath, method: "POST"), body: endpointOnly) { response in
+                    try await client.execute(uri: registerPath, method: .post, headers: credentialOnly, body: endpointOnly) { response in
                         XCTAssertEqual(response.status, .unauthorized)
                     }
-                    try await client.execute(uri: unregisterPath, method: .post, headers: try SpaceCredentialDPoPTestSupport.refreshed(credentialOnly, path: unregisterPath, method: "POST"), body: body) { response in
+                    try await client.execute(uri: unregisterPath, method: .post, headers: credentialOnly, body: body) { response in
                         XCTAssertEqual(response.status, .ok)
                     }
                 }
