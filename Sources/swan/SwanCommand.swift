@@ -9100,7 +9100,12 @@ extension SwanCommand {
                         }
                         if !writers.contains(did) { writers.append(did) }
                     }
-                    guard let next = output.cursor, !next.isEmpty else { break }
+                    // atproto#5574: every nonempty page returns its last
+                    // spaceRev as the cursor; an empty page (which omits it)
+                    // ends the listing. A repo updated mid-listing can
+                    // reappear, so DIDs are de-duplicated above.
+                    guard !output.repos.isEmpty,
+                          let next = output.cursor, !next.isEmpty else { break }
                     cursor = next
                 }
                 return writers

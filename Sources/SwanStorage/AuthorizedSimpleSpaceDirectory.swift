@@ -317,17 +317,24 @@ public struct AuthorizedSpaceWriter: Sendable, Equatable {
     public let repository: String
     public let wireRevision: String
     public let commitment: Data
+    /// The space revision (a TID allocated by the space host) at which this
+    /// writer state was last accepted. `nil` only for values that never came
+    /// from the authority's writer set, such as a repo host's outbound
+    /// announcement, which carries no space revision.
+    public let spaceRevision: String?
 
     public init(
         space: SpaceURI,
         repository: String,
         wireRevision: String,
-        commitment: Data
+        commitment: Data,
+        spaceRevision: String? = nil
     ) {
         self.space = space
         self.repository = repository
         self.wireRevision = wireRevision
         self.commitment = commitment
+        self.spaceRevision = spaceRevision
     }
 }
 
@@ -434,11 +441,15 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
         authorization: AuthorizationContext
     ) async throws
 
-    /// Records a direct writer-to-authority service-authenticated announcement
-    /// and atomically advances only the authority writer-set state. It does
-    /// not create cross-host write-fanout intents: the pinned receiver
-    /// requires `iss == repo`, which an authority cannot produce for another
-    /// writer. Duplicate or older/reordered events are idempotent no-ops.
+    /// Records a direct writer-to-authority service-authenticated announcement.
+    /// In one transaction it advances the writer's state, allocates the next
+    /// space revision (strictly increasing across all writers in the space),
+    /// and queues authority-signed forwards to registered services carrying
+    /// that `spaceRev` and the preceding one. Duplicate or older/reordered
+    /// events are idempotent no-ops that allocate and forward nothing. An
+    /// unknown or deleted space throws ``AuthorizedSimpleSpaceLifecycleError``;
+    /// a revision too far in the future throws
+    /// ``AuthorizedSpaceWriteNotificationError/futureRevision``.
     func receiveSpaceWriteNotification(
         _ notification: AuthorizedSpaceWriteNotification
     ) async throws
@@ -587,6 +598,18 @@ public enum AuthorizedSimpleSpaceLifecycleError: Error, Sendable, Equatable {
     /// Credential renewal distinguishes a durable tombstone from a missing
     /// space so a syncer can discard retained data after a missed notification.
     case deleted
+}
+
+/// A write notification the space host refuses for a reason the lexicon
+/// names. Unknown and deleted spaces use
+/// ``AuthorizedSimpleSpaceLifecycleError`` (`SpaceNotFound`) instead.
+public enum AuthorizedSpaceWriteNotificationError: Error, Sendable, Equatable {
+    /// `repoRev` is more than ``maximumFutureSkew`` ahead of the receiver's
+    /// clock (`FutureRev`).
+    case futureRevision
+
+    /// The reference receiver's allowance: five minutes.
+    public static let maximumFutureSkew: TimeInterval = 5 * 60
 }
 
 /// Startup-preopened, authenticated projection of a permissioned repository.
@@ -741,6 +764,26 @@ public enum SpaceNotificationRequestDigest {
         )
     }
 
+    /// The `req` binding for a space-host -> syncer `notifyWrite`: the
+    /// repo-host fields plus the space revisions the space host assigned.
+    public static func forwardedWrite(
+        space: SpaceURI,
+        repository: String,
+        wireRevision: String,
+        commitment: Data,
+        spaceRevision: String,
+        previousSpaceRevision: String?
+    ) -> String {
+        SpaceServiceRequestDigest.forwardedWrite(
+            space: space,
+            repository: repository,
+            revision: wireRevision,
+            commitment: commitment,
+            spaceRevision: spaceRevision,
+            previousSpaceRevision: previousSpaceRevision
+        )
+    }
+
     public static func deletionBytes(space: SpaceURI) -> Data {
         SpaceServiceRequestDigest.deletionBytes(space: space)
     }
@@ -803,6 +846,47 @@ public enum SpaceServiceRequestDigest {
                 Data(repository.utf8),
                 Data(revision.utf8),
                 commitment
+            ]
+        )
+    }
+
+    public static func forwardedWrite(
+        space: SpaceURI,
+        repository: String,
+        revision: String,
+        commitment: Data,
+        spaceRevision: String,
+        previousSpaceRevision: String?
+    ) -> String {
+        base64URLEncode(forwardedWriteBytes(
+            space: space,
+            repository: repository,
+            revision: revision,
+            commitment: commitment,
+            spaceRevision: spaceRevision,
+            previousSpaceRevision: previousSpaceRevision
+        ))
+    }
+
+    /// Parts are length-prefixed and a space revision is never empty, so the
+    /// empty final part unambiguously encodes an omitted `prevSpaceRev`.
+    public static func forwardedWriteBytes(
+        space: SpaceURI,
+        repository: String,
+        revision: String,
+        commitment: Data,
+        spaceRevision: String,
+        previousSpaceRevision: String?
+    ) -> Data {
+        digestBytes(
+            domain: "swan.space.notify-write-forwarded.v1",
+            parts: [
+                Data(space.rawValue.utf8),
+                Data(repository.utf8),
+                Data(revision.utf8),
+                commitment,
+                Data(spaceRevision.utf8),
+                Data((previousSpaceRevision ?? "").utf8),
             ]
         )
     }

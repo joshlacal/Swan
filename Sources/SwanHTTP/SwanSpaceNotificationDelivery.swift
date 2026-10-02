@@ -221,14 +221,14 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
     }
 }
 
-/// Delivers authority-created *deletion* fanout rows after confirming their
-/// registration remains current. The pinned TypeScript `notifyWrite` handler
-/// requires `iss == repo`, while an authority cannot sign as an arbitrary
-/// member writer. Therefore write fanout is deliberately not sent across
-/// hosts; an old durable write row is acknowledged as a compatibility no-op.
-/// The configured resolver maps an opaque registered string to an allowlisted
-/// endpoint and exact audience, so a malicious registration can never steer
-/// service traffic or JWT claims.
+/// Delivers authority-created fanout rows after confirming their
+/// registration remains current: deletions, and (Erratum 03 / atproto#5574)
+/// writes forwarded to service-named subscribers as authority-signed
+/// `notifyWrite` calls carrying the space host's `spaceRev` and
+/// `prevSpaceRev`. Forwarding is reasonable-effort; subscribers recover
+/// missed updates through `listRepos`. The configured resolver maps an opaque
+/// registered string to an allowlisted endpoint and exact audience, so a
+/// malicious registration can never steer service traffic or JWT claims.
 public struct HTTPPermissionedSpaceNotificationFanoutTransport:
     PermissionedSpaceNotificationFanoutTransport
 {
@@ -305,24 +305,6 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
         }
         let method: String
         let body: Data
-        switch notification.kind {
-        case .write:
-            guard let repository = notification.repository,
-                  let wireRevision = notification.wireRevision,
-                  let commitment = notification.commitment else {
-                throw SwanError.malformed("write fanout row is incomplete")
-            }
-            method = ComAtprotoSpaceNotifyWrite.typeIdentifier
-            body = try notificationJSON(
-                space: notification.space,
-                repository: repository,
-                wireRevision: wireRevision,
-                commitment: commitment
-            )
-        case .deleted:
-            method = ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
-            body = try deletionJSON(space: notification.space)
-        }
         let reqDigest: String
         switch notification.kind {
         case .write:
@@ -331,13 +313,30 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
                   let commitment = notification.commitment else {
                 throw SwanError.malformed("write fanout row is incomplete")
             }
-            reqDigest = SpaceNotificationRequestDigest.write(
+            // A forward must carry the space revision the space host
+            // assigned. Rows queued before space revisions existed have none
+            // and are retired unsent; the subscriber catches up via listRepos.
+            guard let spaceRevision = notification.spaceRevision else { return }
+            method = ComAtprotoSpaceNotifyWrite.typeIdentifier
+            body = try notificationJSON(
                 space: notification.space,
                 repository: repository,
                 wireRevision: wireRevision,
-                commitment: commitment
+                commitment: commitment,
+                spaceRevision: spaceRevision,
+                previousSpaceRevision: notification.previousSpaceRevision
+            )
+            reqDigest = SpaceNotificationRequestDigest.forwardedWrite(
+                space: notification.space,
+                repository: repository,
+                wireRevision: wireRevision,
+                commitment: commitment,
+                spaceRevision: spaceRevision,
+                previousSpaceRevision: notification.previousSpaceRevision
             )
         case .deleted:
+            method = ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
+            body = try deletionJSON(space: notification.space)
             reqDigest = SpaceNotificationRequestDigest.deletion(space: notification.space)
         }
         let endpoint = try notificationEndpoint(destination.endpoint, method: method)
@@ -396,21 +395,33 @@ private func notificationEndpoint(_ endpoint: URL, method: String) throws -> URL
     return url
 }
 
+/// The repo-host hop is `{space, repo, repoRev, hash}`; a space-host
+/// forward adds `spaceRev` and, except on the space's first update,
+/// `prevSpaceRev`.
 private func notificationJSON(
     space: SpaceURI,
     repository: String,
     wireRevision: String,
-    commitment: Data
+    commitment: Data,
+    spaceRevision: String? = nil,
+    previousSpaceRevision: String? = nil
 ) throws -> Data {
     guard commitment.count == 32,
           let revision = try? TID(tidString: wireRevision) else {
+        throw SwanError.malformed("writer notification is invalid")
+    }
+    let spaceRev = try spaceRevision.map { try TID(tidString: $0) }
+    let prevSpaceRev = try previousSpaceRevision.map { try TID(tidString: $0) }
+    guard spaceRev != nil || prevSpaceRev == nil else {
         throw SwanError.malformed("writer notification is invalid")
     }
     let input = try ComAtprotoSpaceNotifyWrite.Input(
         space: SpaceRef(uriString: space.rawValue),
         repo: DID(didString: repository),
         repoRev: revision,
-        hash: Bytes(data: commitment)
+        hash: Bytes(data: commitment),
+        spaceRev: spaceRev,
+        prevSpaceRev: prevSpaceRev
     )
     return try SwanJSONEncoders.sortedNoEscaping.encode(input)
 }

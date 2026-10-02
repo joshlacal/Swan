@@ -232,9 +232,30 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(repos.count, 1)
                     XCTAssertEqual(repos.first?["did"] as? String, expectedWriter)
                     XCTAssertEqual(repos.first?["repoRev"] as? String, "3l72c4e2y2222")
+                    XCTAssertEqual(repos.first?["spaceRev"] as? String, "3l72c4e2y2222")
+                    XCTAssertEqual(value["cursor"] as? String, "3l72c4e2y2222", "cursor = last spaceRev")
                     let rendered = String(decoding: response.body.readableBytesView, as: UTF8.self)
                     XCTAssertFalse(rendered.contains("record"))
                     XCTAssertFalse(rendered.contains("credential"))
+                }
+                // The cursor is an exclusive checkpoint; the empty page that
+                // follows omits it.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)&cursor=3l72c4e2y2222",
+                    method: .get,
+                    headers: credentialHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let value = try notificationJSONObject(response.body)
+                    XCTAssertEqual(Set(value.keys), ["repos"])
+                }
+                // Not TID-validated: any string is accepted as a checkpoint.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)&cursor=not-a-tid",
+                    method: .get,
+                    headers: credentialHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
                 }
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)",
@@ -728,7 +749,9 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 transport: recordingTransport
             )
         )
-        let writeRow = PersistedSpaceNotificationFanout(
+        // A row queued before space revisions existed has none to forward:
+        // it is retired unsent (the subscriber recovers through listRepos).
+        let unsequencedRow = PersistedSpaceNotificationFanout(
             id: UUID(),
             sourceIssuer: authorityDID,
             sourceEventID: UUID().uuidString.lowercased(),
@@ -739,6 +762,24 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             commitment: Data(repeating: 0x2C, count: 32),
             endpoint: serviceEndpoint,
             attempts: 0
+        )
+        try await transport.deliver(unsequencedRow)
+        let afterUnsequenced = await recordingTransport.posts()
+        XCTAssertTrue(afterUnsequenced.isEmpty, "a forward without spaceRev is never sent")
+
+        let writeRow = PersistedSpaceNotificationFanout(
+            id: UUID(),
+            sourceIssuer: authorityDID,
+            sourceEventID: UUID().uuidString.lowercased(),
+            kind: .write,
+            space: space,
+            repository: writer,
+            wireRevision: "2222222222222",
+            commitment: Data(repeating: 0x2C, count: 32),
+            endpoint: serviceEndpoint,
+            attempts: 0,
+            spaceRevision: "3l72c4e2y2223",
+            previousSpaceRevision: "3l72c4e2y2222"
         )
         try await transport.deliver(writeRow)
 
@@ -757,11 +798,26 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(body["repoRev"] as? String, "2222222222222")
         XCTAssertNil(body["rev"], "notifyWrite carries repoRev, not rev")
         XCTAssertNotNil(body["hash"], "the commit hash closes the listRepos propagation loop")
+        XCTAssertEqual(body["spaceRev"] as? String, "3l72c4e2y2223")
+        XCTAssertEqual(body["prevSpaceRev"] as? String, "3l72c4e2y2222")
+        XCTAssertEqual(Set(body.keys), ["space", "repo", "repoRev", "hash", "spaceRev", "prevSpaceRev"])
         let issued = await recordingIssuer.issued()
         XCTAssertEqual(issued.count, 1)
         XCTAssertEqual(issued.first?.issuer, authorityDID)
         XCTAssertEqual(issued.first?.audience, serviceIdentity)
         XCTAssertEqual(issued.first?.method, "com.atproto.space.notifyWrite")
+        XCTAssertEqual(
+            issued.first?.requestBodyDigest,
+            SpaceNotificationRequestDigest.forwardedWrite(
+                space: space,
+                repository: writer,
+                wireRevision: "2222222222222",
+                commitment: Data(repeating: 0x2C, count: 32),
+                spaceRevision: "3l72c4e2y2223",
+                previousSpaceRevision: "3l72c4e2y2222"
+            ),
+            "req binds the space revisions too"
+        )
 
         // A write row whose registration is LEGACY delivers nothing and does
         // not throw — the lease worker acknowledges it as done.
@@ -803,13 +859,20 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             wireRevision: "2222222222224",
             commitment: Data(repeating: 0x2E, count: 32),
             endpoint: serviceEndpoint,
-            attempts: 0
+            attempts: 0,
+            spaceRevision: "3l72c4e2y2224"
         )
         // Not expired yet — delivers; this is the positive control that the
         // stale probe below refuses for the RIGHT reason.
         try await transport.deliver(staleRow)
         let afterStale = await recordingTransport.posts()
         XCTAssertEqual(afterStale.count, 2)
+        // A space's first update omits prevSpaceRev.
+        let firstBody = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: try XCTUnwrap(afterStale.last).body) as? [String: Any]
+        )
+        XCTAssertEqual(firstBody["spaceRev"] as? String, "3l72c4e2y2224")
+        XCTAssertNil(firstBody["prevSpaceRev"])
 
         // Withdrawn registration: the subscriber unregisters, so the stored row is removed.
         try await database.unregisterSpaceNotification(
@@ -827,7 +890,9 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             wireRevision: "2222222222225",
             commitment: Data(repeating: 0x2F, count: 32),
             endpoint: serviceEndpoint,
-            attempts: 0
+            attempts: 0,
+            spaceRevision: "3l72c4e2y2225",
+            previousSpaceRevision: "3l72c4e2y2224"
         )
         try await transport.deliver(withdrawnRow)
         let afterWithdrawal = await recordingTransport.posts()
@@ -1566,13 +1631,21 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
     func listSpaceWriters(
         space: SpaceURI,
         limit _: Int,
-        cursor _: String?,
+        cursor: String?,
         authorization _: AuthorizationContext
     ) async throws -> [AuthorizedSpaceWriter] {
         guard space.authority == authority else { throw AuthorizedSimpleSpaceLifecycleError.notFound }
-        return notificationsValue.map {
-            .init(space: space, repository: $0.repository, wireRevision: $0.wireRevision, commitment: $0.commitment)
-        }
+        // Stand-in sequencing: each recorded notification's repoRev doubles
+        // as its space revision; the route only projects and pages them.
+        return notificationsValue
+            .filter { cursor == nil || $0.wireRevision > cursor! }
+            .sorted { $0.wireRevision < $1.wireRevision }
+            .map {
+                .init(
+                    space: space, repository: $0.repository, wireRevision: $0.wireRevision,
+                    commitment: $0.commitment, spaceRevision: $0.wireRevision
+                )
+            }
     }
 
     func registerSpaceNotification(
@@ -1752,6 +1825,7 @@ private actor RecordingServiceIssuer: SpaceServiceAuthenticationIssuer {
         let issuer: String
         let audience: String
         let method: String
+        let requestBodyDigest: String?
     }
 
     private var recorded: [Issued] = []
@@ -1764,7 +1838,10 @@ private actor RecordingServiceIssuer: SpaceServiceAuthenticationIssuer {
         requestBodyDigest: String? = nil,
         now _: Date = Date()
     ) async throws -> String {
-        recorded.append(.init(issuer: issuer, audience: audience, method: method))
+        recorded.append(.init(
+            issuer: issuer, audience: audience, method: method,
+            requestBodyDigest: requestBodyDigest
+        ))
         return "recorded-service-token"
     }
 

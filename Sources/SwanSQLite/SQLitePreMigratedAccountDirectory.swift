@@ -775,16 +775,18 @@ public actor SQLitePreMigratedAccountDirectory:
         // The direct writer->authority message is the only notifyWrite shape
         // that this host may apply. Authority->recipient fanout is a delivery
         // hint for a remote synchronizer, not remote operation application;
-        // it deliberately succeeds as a no-op here, matching the pinned PDS
-        // behavior for a host that does not own the space authority.
+        // it deliberately succeeds as a no-op here.
         guard notification.audience == notification.space.authority,
               notification.issuer == notification.repository else {
             return
         }
+        // A space whose authority this host does not serve is unknown here:
+        // `SpaceNotFound`, as the reference's `assertSpaceHost` answers. The
+        // sender's outbox treats that 4xx as permanent and stops retrying.
         guard let database = try await preopenedActiveDatabaseIfHosted(
             notification.space.authority
         ) else {
-            return
+            throw AuthorizedSimpleSpaceLifecycleError.notFound
         }
         do {
             try await database.receiveSpaceWriteNotification(notification)
@@ -794,6 +796,8 @@ public actor SQLitePreMigratedAccountDirectory:
         } catch let error as SwanError {
             throw error
         } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch let error as AuthorizedSpaceWriteNotificationError {
             throw error
         } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")

@@ -529,16 +529,36 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 )
                 let writers = try await evidenceConnection.query(
                     """
-                    SELECT repo_did, wire_revision
+                    SELECT repo_did, wire_revision, space_rev
                     FROM permissioned_space_writers
                     WHERE space_uri = ?
                     """,
                     [.text(space.rawValue)]
                 )
+                XCTAssertEqual(writers.count, 1)
                 XCTAssertEqual(writers.first?.column("repo_did")?.string, localDID)
+                // The authority's own writes are sequenced inside their commit
+                // (atproto#5574), so its writer row holds its latest repoRev.
+                // The matrix's notifyWrite announces the older 222222222222z,
+                // which the space host must ignore rather than regress to.
+                let repositoryState = try await evidenceConnection.query(
+                    """
+                    SELECT wire_revision
+                    FROM permissioned_repository_state
+                    WHERE space_uri = ? AND author_did = ?
+                    """,
+                    [.text(space.rawValue), .text(localDID)]
+                )
+                let currentRevision = try XCTUnwrap(
+                    repositoryState.first?.column("wire_revision")?.string
+                )
                 XCTAssertEqual(
                     writers.first?.column("wire_revision")?.string,
-                    "222222222222z"
+                    currentRevision
+                )
+                XCTAssertGreaterThan(currentRevision, "222222222222z")
+                XCTAssertNotNil(
+                    writers.first?.column("space_rev")?.string.flatMap { try? TID(tidString: $0) }
                 )
                 let lifecycleRows = try await evidenceConnection.query(
                     """

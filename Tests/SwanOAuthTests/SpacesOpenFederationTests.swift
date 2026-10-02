@@ -99,7 +99,9 @@ final class SpacesOpenFederationTests: XCTestCase {
         let (pdsOnly, _) = resolver([authority: document(services: pds)])
         let fallback = try await pdsOnly.notifyDestination(forAuthority: authority)
         XCTAssertEqual(fallback?.endpoint.absoluteString, "https://pds.example")
-        XCTAssertEqual(fallback?.audience, authority)
+        // atproto#5574: the PDS endpoint is only a fallback for reaching the
+        // space host, so the audience still names the space-host role.
+        XCTAssertEqual(fallback?.audience, "\(authority)#atproto_space_host")
 
         let (none, _) = resolver([authority: document()])
         let missing = try await none.notifyDestination(forAuthority: authority)

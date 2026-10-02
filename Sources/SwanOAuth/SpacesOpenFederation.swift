@@ -138,9 +138,10 @@ public actor SwanDIDDocumentSpaceResolver:
 
     /// `#atproto_space_host` (which must be typed `AtprotoSpaceHost`) when
     /// present, else `#atproto_pds`. A present-but-malformed space-host entry
-    /// is an error rather than a fallback. The audience is the service
-    /// identifier for a space-host entry and the bare DID for `#atproto_pds`,
-    /// which is what the reference implementation sends.
+    /// is an error rather than a fallback. The audience is always
+    /// `<authority>#atproto_space_host`, also when the endpoint falls back to
+    /// `#atproto_pds`: the reference sender (atproto#5574) addresses the
+    /// space-host role, not the endpoint it happened to resolve.
     public func notifyDestination(forAuthority authority: String) async throws -> NotifyDestination? {
         guard let document = try await document(for: authority) else { return nil }
         let services = document.service ?? []
@@ -168,7 +169,10 @@ public actor SwanDIDDocumentSpaceResolver:
               let endpoint = entry.serviceEndpoint.flatMap(Self.httpsOrigin) else {
             throw SwanError.malformed("space authority #atproto_pds entry is malformed")
         }
-        return NotifyDestination(endpoint: endpoint, audience: authority)
+        return NotifyDestination(
+            endpoint: endpoint,
+            audience: "\(authority)#atproto_space_host"
+        )
     }
 
     // MARK: Documents

@@ -158,6 +158,8 @@ private enum AuthenticatedSpaceNotificationFailure: Error {
     /// for it; the underlying cause is logged, never returned — a 500 would
     /// implicate the server in what is usually a typo'd DID.
     case serviceNotResolvable
+    /// notifyWrite's `repoRev` is more than five minutes ahead (`FutureRev`).
+    case futureRevision
 }
 
 private enum SwanSpaceNotificationHTTP {
@@ -200,23 +202,22 @@ private struct AuthenticatedListSpaceReposHandler:
             throw notificationStorageFailure(error)
         }
         do {
-            return .init(
-                repos: try writers.map {
-                    let repoRev = try TID(tidString: $0.wireRevision)
-                    // Interim projection: the writer directory does not yet
-                    // allocate space revisions, so the required `spaceRev`
-                    // carries the writer's repo revision and the cursor stays
-                    // the last writer DID. Space-host sequencing (strictly
-                    // increasing spaceRev, spaceRev cursor) replaces both.
-                    return .init(
-                        did: try DID(didString: $0.repository),
-                        repoRev: repoRev,
-                        hash: Bytes(data: $0.commitment),
-                        spaceRev: repoRev
-                    )
-                },
-                cursor: writers.last?.repository
-            )
+            // Latest writer states in ascending spaceRev order. A nonempty
+            // page always returns its last spaceRev as the exclusive
+            // checkpoint, even when short; an empty page omits the cursor so
+            // the caller keeps its previous one.
+            let repos: [ComAtprotoSpaceListRepos.Repo] = try writers.map {
+                guard let spaceRevision = $0.spaceRevision else {
+                    throw AuthenticatedSpaceNotificationFailure.unavailable
+                }
+                return .init(
+                    did: try DID(didString: $0.repository),
+                    repoRev: try TID(tidString: $0.wireRevision),
+                    hash: Bytes(data: $0.commitment),
+                    spaceRev: try TID(tidString: spaceRevision)
+                )
+            }
+            return .init(repos: repos, cursor: repos.last?.spaceRev.toString())
         } catch {
             // The directory must already have validated these identifiers;
             // treating an impossible projection mismatch as unavailable does
@@ -416,15 +417,22 @@ private struct AuthenticatedNotifySpaceWriteHandler:
             }
             verifiedDigest = expectedDigest
         } else {
+            // A repo host addresses `<authority>#atproto_space_host` (the
+            // reference sender always does, even when it falls back to the
+            // authority's PDS endpoint); the bare authority DID is accepted
+            // too. Only the audience form is relaxed here: `req` stays
+            // mandatory in the hardened posture.
             service = try await serviceAuthentication(
                 capability,
                 request: request,
-                expectedAudience: space.authority,
+                expectedAudience: nil,
                 expectedMethod: ComAtprotoSpaceNotifyWrite.typeIdentifier,
                 expectedRequestBodyDigest: expectedDigest
             )
             guard service.issuer == input.repo.didString(),
-                  service.audience == space.authority,
+                  SwanSpacesOpenInteropNotificationPolicy
+                    .acceptedAudiences(for: space.authority)
+                    .contains(service.audience),
                   let bound = service.requestBodyDigest,
                   bound == expectedDigest else {
                 throw AuthenticatedSpaceNotificationFailure.denied
@@ -773,15 +781,14 @@ private func parseListSpaceReposParameters(
     } else {
         limit = nil
     }
-    if let cursor = values["cursor"] {
-        guard (try? DID(didString: cursor)) != nil else {
-            throw AuthenticatedSpaceNotificationFailure.invalidRequest
-        }
-    }
+    // The cursor is an opaque exclusive space-revision checkpoint: plain
+    // string, deliberately not TID-validated (atproto#5574). Empty means
+    // absent, as in the reference. The 4 KiB query bound above caps it.
+    let cursor = values["cursor"].flatMap { $0.isEmpty ? nil : $0 }
     do {
         let space = try SpaceRef(uriString: rawSpace)
         _ = try SpaceURI(space.uriString())
-        return .init(space: space, limit: limit, cursor: values["cursor"])
+        return .init(space: space, limit: limit, cursor: cursor)
     } catch {
         throw AuthenticatedSpaceNotificationFailure.invalidRequest
     }
@@ -1204,6 +1211,11 @@ private func notificationStorageFailure(_ error: Error) -> AuthenticatedSpaceNot
     if error is AuthorizedSimpleSpaceLifecycleError {
         return .spaceNotFound
     }
+    if let error = error as? AuthorizedSpaceWriteNotificationError {
+        return switch error {
+        case .futureRevision: .futureRevision
+        }
+    }
     guard let error = error as? SwanError else {
         return .unavailable
     }
@@ -1237,6 +1249,8 @@ private func authenticatedSpaceNotificationResponse(
         authenticatedSpaceNotificationError(.serviceUnavailable, code: "temporarily_unavailable")
     case .serviceNotResolvable:
         authenticatedSpaceNotificationError(.badRequest, code: "ServiceNotResolvable")
+    case .futureRevision:
+        authenticatedSpaceNotificationError(.badRequest, code: "FutureRev")
     }
 }
 

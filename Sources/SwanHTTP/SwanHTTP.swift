@@ -298,9 +298,10 @@ public struct SwanSpaceRepositorySyncHTTPConfiguration: Sendable {
 ///
 /// - (a) notifyWrite / notifySpaceDeleted admit *unbound* upstream service
 ///   JWTs (no `req` claim) whose `iss`/`aud`/`lxm` check out, whose lifetime
-///   is at most 60 s, and whose `jti` is unused; `aud` may be the bare
-///   authority DID or `<authority>#atproto_space_host`. A token that does
-///   carry `req` must still match the body, and Swan still sends `req`.
+///   is at most 60 s, and whose `jti` is unused. A token that does carry
+///   `req` must still match the body, and Swan still sends `req`. (notifyWrite
+///   accepts `aud` as the bare authority DID or `<authority>#atproto_space_host`
+///   in both postures.)
 /// - (b) registerNotify / unregisterNotify accept the space credential alone;
 ///   `Atproto-Service-Auth`, when present, still proves service ownership.
 ///   Header-less registrations are rate-capped per space and per

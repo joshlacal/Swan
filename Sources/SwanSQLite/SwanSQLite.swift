@@ -2023,6 +2023,12 @@ public struct PersistedSpaceNotificationFanout: Sendable, Equatable {
     public let commitment: Data?
     public let endpoint: String
     public let attempts: Int
+    /// The space revision assigned to a forwarded write, and the space's
+    /// preceding one (`nil` on its first update). Both are `nil` for deletion
+    /// rows and for write rows queued before space revisions existed, which
+    /// the transport retires without sending.
+    public let spaceRevision: String?
+    public let previousSpaceRevision: String?
 
     public init(
         id: UUID,
@@ -2034,7 +2040,9 @@ public struct PersistedSpaceNotificationFanout: Sendable, Equatable {
         wireRevision: String?,
         commitment: Data?,
         endpoint: String,
-        attempts: Int
+        attempts: Int,
+        spaceRevision: String? = nil,
+        previousSpaceRevision: String? = nil
     ) {
         self.id = id
         self.sourceIssuer = sourceIssuer
@@ -2046,6 +2054,8 @@ public struct PersistedSpaceNotificationFanout: Sendable, Equatable {
         self.commitment = commitment
         self.endpoint = endpoint
         self.attempts = attempts
+        self.spaceRevision = spaceRevision
+        self.previousSpaceRevision = previousSpaceRevision
     }
 }
 
@@ -2734,6 +2744,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
             try await migrateSpaceNotificationOwnershipIfNeeded()
             try await migratePermissionedSpaceWriterForeignKeyIfNeeded()
+            try await migrateSpaceWriterSequenceIfNeeded()
         }
         try await migrateSpaceNotificationReceiptScopeIfNeeded()
         try await compactSpaceNotificationReceiptsIfNeeded()
@@ -5081,52 +5092,32 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 ]
             )
 
-            // Erratum 03: when this account IS the space authority, a local
-            // write fans out to the space's service-named subscribers in the
-            // same transaction — the reference's HOP-2 enqueue
-            // (`notify.rs::enqueue_writes`), whose deliveries are
-            // authority-signed (`iss = space authority`, `aud = subscriber
-            // service`). Legacy endpoint-only rows (service_did IS NULL) are
-            // never enqueued: without a service identity the delivery JWT has
-            // no audience its receiver could verify, which is the original
-            // reason cross-host write fanout was withheld. Per-repo rows
-            // filter by this writer, matching `list_recipients`.
-            if space.authority == accountDID {
-                _ = try await connection.query(
-                    """
-                    INSERT INTO permissioned_space_notification_fanout(
-                        id, source_issuer, source_event_id, kind, space_uri,
-                        repo_did, wire_revision, commitment, endpoint,
-                        attempts, created_at, available_at,
-                        lease_token, lease_expires_at
-                    )
-                    SELECT
-                        substr(h,1,8)||'-'||substr(h,9,4)||'-'||substr(h,13,4)
-                            ||'-'||substr(h,17,4)||'-'||substr(h,21,12),
-                        ?, ?, 'write', ?,
-                        ?, ?, ?, endpoint,
-                        0, ?, ?, NULL, NULL
-                    FROM (
-                        SELECT hex(randomblob(16)) AS h, endpoint
-                        FROM permissioned_space_notification_registrations
-                        WHERE space_uri = ?
-                          AND delivery_service_did IS NOT NULL
-                          AND expires_at > ?
-                          AND (repo_did IS NULL OR repo_did = ?)
-                    )
-                    WHERE true
-                    ON CONFLICT(source_issuer, source_event_id, kind, endpoint) DO NOTHING
-                    """,
-                    [
-                        .text(space.authority), .text(eventID.uuidString.lowercased()),
-                        .text(space.rawValue),
-                        .text(author), .text(wireRevision.toString()),
-                        blob(ltHash.commitment),
-                        .integer(createdAt), .integer(createdAt),
-                        .text(space.rawValue),
-                        .integer(createdAt),
-                        .text(author),
-                    ]
+            // Erratum 03 + atproto#5574: when this account IS the space
+            // authority, its own write is a space-host update. The writer
+            // state, the next space revision, and the forwards to the space's
+            // service-named subscribers commit with the repository write (the
+            // reference processes a co-located writer the same way). The
+            // forwards are authority-signed (`iss = space authority`,
+            // `aud = subscriber service`); per-repo rows filter by this
+            // writer. The later self-addressed notifyWrite from the outbox
+            // then carries a repoRev that is no longer newer and is ignored.
+            if space.authority == accountDID,
+               try await isActiveSimpleSpaceWithoutGate(space),
+               let sequence = try await advanceWriterHighWaterWithoutGate(
+                   space: space,
+                   repository: author,
+                   wireRevision: wireRevision.toString(),
+                   commitment: ltHash.commitment,
+                   updatedAt: Int64(createdAt)
+               ) {
+                try await enqueueWriteForwardsWithoutGate(
+                    space: space,
+                    sourceEventID: eventID.uuidString.lowercased(),
+                    repository: author,
+                    wireRevision: wireRevision.toString(),
+                    commitment: ltHash.commitment,
+                    sequence: sequence,
+                    timestamp: createdAt
                 )
             }
 
@@ -8432,19 +8423,30 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// Lists only the authority's durable writer hint after a verified space
     /// credential has bound the request to this exact space. This is not a
     /// member-list read and must never become an OAuth/public discovery path.
+    ///
+    /// Entries are latest writer states in ascending space-revision order.
+    /// `cursor` is an exclusive space-revision checkpoint compared as an
+    /// opaque string, as the reference does: it is not TID-validated. The
+    /// one exception is a DID-shaped cursor, which only Swan's pre-5574
+    /// listing returned; it cannot name a space revision, so it lists from the
+    /// start (a re-bootstrap) instead of silently returning an empty page.
     public func spaceWriters(
         space: SpaceURI,
         limit: Int,
-        cursor: String?,
+        cursor rawCursor: String?,
         authorization: AuthorizationContext
     ) async throws -> [AuthorizedSpaceWriter] {
         guard (1 ... 1_000).contains(limit) else {
             throw SwanError.malformed("invalid writer page limit")
         }
-        if let cursor {
-            guard isValidSimpleSpaceDID(cursor) else {
+        let cursor: String?
+        if let rawCursor, !rawCursor.isEmpty, !rawCursor.hasPrefix("did:") {
+            guard rawCursor.utf8.count <= 4_096 else {
                 throw SwanError.malformed("invalid writer cursor")
             }
+            cursor = rawCursor
+        } else {
+            cursor = nil
         }
         try requireAuthorityAccount(space: space)
         guard case let .spaceCredential(grant) = authorization,
@@ -8459,16 +8461,16 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 var values: [SQLiteData] = [.text(space.rawValue)]
                 var cursorClause = ""
                 if let cursor {
-                    cursorClause = " AND repo_did > ?"
+                    cursorClause = " AND space_rev > ?"
                     values.append(.text(cursor))
                 }
                 values.append(.integer(limit))
                 let rows = try await readConnection.query(
                     """
-                    SELECT repo_did, wire_revision, commitment
+                    SELECT repo_did, wire_revision, commitment, space_rev
                     FROM permissioned_space_writers
                     WHERE space_uri = ?\(cursorClause)
-                    ORDER BY repo_did ASC
+                    ORDER BY space_rev ASC
                     LIMIT ?
                     """,
                     values
@@ -8483,25 +8485,33 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     guard commitment.count == 32 else {
                         throw SQLiteRepositoryError.corruptDatabase("invalid writer commitment")
                     }
+                    let spaceRevision = try requiredTID(row, "space_rev").toString()
                     return AuthorizedSpaceWriter(
                         space: space,
                         repository: repository,
                         wireRevision: wireRevision,
-                        commitment: commitment
+                        commitment: commitment,
+                        spaceRevision: spaceRevision
                     )
                 }
             }
         }
     }
 
+    /// Advances one writer's state and, in the same transaction, allocates
+    /// the space's next revision. Returns `nil` (no allocation) when the
+    /// revision is not newer than the recorded one: such an update is
+    /// ignored, never resequenced. An equal revision with a different
+    /// commitment is an equivocation and fails closed.
     @discardableResult
     func advanceWriterHighWaterWithoutGate(
         space: SpaceURI,
         repository: String,
         wireRevision: String,
         commitment: Data,
-        updatedAt: Int64
-    ) async throws -> Bool {
+        updatedAt: Int64,
+        now: Date = Date()
+    ) async throws -> SpaceWriterSequence? {
         guard commitment.count == 32 else {
             throw SQLiteRepositoryError.corruptDatabase("invalid writer commitment")
         }
@@ -8520,31 +8530,40 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 throw SQLiteRepositoryError.corruptDatabase("invalid writer commitment")
             }
             if wireRevision < currentRevision {
-                return false
+                return nil
             } else if wireRevision == currentRevision {
                 guard currentCommitment == commitment else {
                     throw SwanError.conflict(expected: 0, actual: 1)
                 }
-                return false
+                return nil
             }
         }
+        let previousSpaceRevision = try await latestSpaceRevisionWithoutGate(space: space)
+        let spaceRevision = try SpaceRevisionSequence.next(
+            after: previousSpaceRevision,
+            now: now
+        )
         _ = try await connection.query(
             """
             INSERT INTO permissioned_space_writers(
-                space_uri, repo_did, wire_revision, commitment, updated_at
-            ) VALUES (?, ?, ?, ?, ?)
+                space_uri, repo_did, wire_revision, commitment, updated_at, space_rev
+            ) VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(space_uri, repo_did) DO UPDATE SET
                 wire_revision = excluded.wire_revision,
                 commitment = excluded.commitment,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                space_rev = excluded.space_rev
             """,
             [
                 .text(space.rawValue), .text(repository),
                 .text(wireRevision), blob(commitment),
-                .integer(Int(updatedAt)),
+                .integer(Int(updatedAt)), .text(spaceRevision),
             ]
         )
-        return true
+        return SpaceWriterSequence(
+            spaceRevision: spaceRevision,
+            previousSpaceRevision: previousSpaceRevision
+        )
     }
 
     /// Replaces one endpoint's subscription atomically. A registration is
@@ -8879,8 +8898,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
     /// Accepts a service-authenticated write announcement at the authority.
     /// Duplicate receipt IDs and stale TIDs are successful no-ops; an equal
-    /// TID with a different commitment is a fail-closed conflict. The durable
-    /// writer state and all fanout intents commit before any network delivery.
+    /// TID with a different commitment is a fail-closed conflict. A repo
+    /// revision more than five minutes ahead is refused as `FutureRev`. An
+    /// accepted update allocates the next space revision, and the writer
+    /// state plus every forward intent (carrying `spaceRev`/`prevSpaceRev`)
+    /// commit together before any network delivery.
     public func receiveSpaceWriteNotification(
         _ notification: AuthorizedSpaceWriteNotification,
         now: Date = Date()
@@ -8889,7 +8911,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
               notification.audience == notification.space.authority,
               isValidSimpleSpaceDID(notification.repository),
               isValidSimpleSpaceDID(notification.issuer),
-              (try? TID(tidString: notification.wireRevision)) != nil,
+              let repoRevision = try? TID(tidString: notification.wireRevision),
               notification.commitment.count == 32 else {
             throw SwanError.unauthorized("invalid write notification")
         }
@@ -8905,6 +8927,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let eventID = try validServiceEventID(notification.eventID)
         let timestamp = try simpleSpaceTimestamp(now)
         try requireAuthorityAccount(space: notification.space)
+        // The reference order: the host check above, then the clock, then
+        // the space's existence and the writer's authorization.
+        guard repoRevision.date <= now.addingTimeInterval(
+            AuthorizedSpaceWriteNotificationError.maximumFutureSkew
+        ) else {
+            throw AuthorizedSpaceWriteNotificationError.futureRevision
+        }
         try await withConnectionGate {
             try await transaction {
                 let state = try await requiredSimpleSpace(notification.space)
@@ -8941,14 +8970,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     return
                 }
 
-                let advancesWriter = try await advanceWriterHighWaterWithoutGate(
+                guard let sequence = try await advanceWriterHighWaterWithoutGate(
                     space: notification.space,
                     repository: notification.repository,
                     wireRevision: notification.wireRevision,
                     commitment: notification.commitment,
-                    updatedAt: Int64(timestamp)
-                )
-                guard advancesWriter else { return }
+                    updatedAt: Int64(timestamp),
+                    now: now
+                ) else { return }
 
                 _ = try await connection.query(
                     """
@@ -8964,42 +8993,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     ]
                 )
 
-                _ = try await connection.query(
-                    """
-                    INSERT INTO permissioned_space_notification_fanout(
-                        id, source_issuer, source_event_id, kind, space_uri,
-                        repo_did, wire_revision, commitment, endpoint,
-                        attempts, created_at, available_at,
-                        lease_token, lease_expires_at
-                    )
-                    SELECT
-                        substr(h,1,8)||'-'||substr(h,9,4)||'-'||substr(h,13,4)
-                            ||'-'||substr(h,17,4)||'-'||substr(h,21,12),
-                        ?, ?, 'write', ?,
-                        ?, ?, ?, endpoint,
-                        0, ?, ?, NULL, NULL
-                    FROM (
-                        SELECT hex(randomblob(16)) AS h, endpoint
-                        FROM permissioned_space_notification_registrations
-                        WHERE space_uri = ?
-                          AND delivery_service_did IS NOT NULL
-                          AND expires_at > ?
-                          AND (repo_did IS NULL OR repo_did = ?)
-                    )
-                    WHERE true
-                    ON CONFLICT(source_issuer, source_event_id, kind, endpoint) DO NOTHING
-                    """,
-                    [
-                        .text(notification.space.authority), .text(eventID),
-                        .text(notification.space.rawValue),
-                        .text(notification.repository),
-                        .text(notification.wireRevision),
-                        blob(notification.commitment),
-                        .integer(timestamp), .integer(timestamp),
-                        .text(notification.space.rawValue),
-                        .integer(timestamp),
-                        .text(notification.repository),
-                    ]
+                try await enqueueWriteForwardsWithoutGate(
+                    space: notification.space,
+                    sourceEventID: eventID,
+                    repository: notification.repository,
+                    wireRevision: notification.wireRevision,
+                    commitment: notification.commitment,
+                    sequence: sequence,
+                    timestamp: timestamp
                 )
             }
         }
@@ -10956,7 +10957,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     """
                     SELECT id, source_issuer, source_event_id, kind, space_uri,
                            repo_did, wire_revision, commitment, endpoint, attempts,
-                           lease_token, lease_expires_at
+                           lease_token, lease_expires_at, space_rev, prev_space_rev
                     FROM permissioned_space_notification_fanout
                     WHERE available_at <= ?
                       AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
@@ -10996,7 +10997,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     """
                     SELECT id, source_issuer, source_event_id, kind, space_uri,
                            repo_did, wire_revision, commitment, endpoint, attempts,
-                           lease_token, lease_expires_at
+                           lease_token, lease_expires_at, space_rev, prev_space_rev
                     FROM permissioned_space_notification_fanout WHERE id = ?
                     """,
                     [.text(eventID.uuidString)]
@@ -11030,7 +11031,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     """
                     SELECT id, source_issuer, source_event_id, kind, space_uri,
                            repo_did, wire_revision, commitment, endpoint, attempts,
-                           lease_token, lease_expires_at
+                           lease_token, lease_expires_at, space_rev, prev_space_rev
                     FROM permissioned_space_notification_fanout WHERE id = ?
                     """,
                     [.text(eventID.uuidString)]
@@ -11071,7 +11072,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 """
                 SELECT id, source_issuer, source_event_id, kind, space_uri,
                        repo_did, wire_revision, commitment, endpoint, attempts,
-                       lease_token, lease_expires_at
+                       lease_token, lease_expires_at, space_rev, prev_space_rev
                 FROM permissioned_space_notification_fanout
                 ORDER BY created_at, id LIMIT ?
                 """,
@@ -12357,6 +12358,21 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 throw SQLiteRepositoryError.corruptDatabase("invalid deletion notification fanout")
             }
         }
+        let spaceRevision = row.column("space_rev")?.string
+        let previousSpaceRevision = row.column("prev_space_rev")?.string
+        // A previous revision only exists beside the revision it precedes,
+        // and both are valid TIDs in strictly increasing order.
+        if let spaceRevision {
+            guard kind == .write,
+                  let current = SpaceRevisionSequence.value(of: spaceRevision),
+                  previousSpaceRevision.map({
+                      SpaceRevisionSequence.value(of: $0).map { $0 < current } ?? false
+                  }) ?? true else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid notification fanout space revision")
+            }
+        } else if previousSpaceRevision != nil {
+            throw SQLiteRepositoryError.corruptDatabase("invalid notification fanout space revision")
+        }
         return PersistedSpaceNotificationFanout(
             id: id,
             sourceIssuer: issuer,
@@ -12367,7 +12383,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             wireRevision: wireRevision,
             commitment: commitment,
             endpoint: endpoint,
-            attempts: try requiredNonnegativeInteger(row, "attempts")
+            attempts: try requiredNonnegativeInteger(row, "attempts"),
+            spaceRevision: spaceRevision,
+            previousSpaceRevision: previousSpaceRevision
         )
     }
 
