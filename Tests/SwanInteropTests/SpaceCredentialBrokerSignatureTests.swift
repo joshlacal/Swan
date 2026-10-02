@@ -129,6 +129,49 @@ final class SpaceCredentialBrokerSignatureTests: XCTestCase, @unchecked Sendable
         XCTAssertEqual(reads.count, 1, "the client must not retry a revoked credential")
     }
 
+    func testRevokedCredentialOnStreamedReadIsTerminalAndNotRetried() async throws {
+        let fixture = try SpaceCredentialClientFixture(responseMode: .revokeReads)
+        let member = try client("https://member.example", fixture: fixture)
+        let authority = try client("https://authority.example", fixture: fixture)
+        let repository = try client("https://repository.example", fixture: fixture)
+        let credential = try await SpaceCredentialBroker(member: member, authority: authority)
+            .exchange(space: fixture.space, memberAuthorization: .none)
+        let spool = FileManager.default.temporaryDirectory
+            .appending(path: "swan-revoked-stream-\(UUID().uuidString).car")
+        defer { try? FileManager.default.removeItem(at: spool) }
+        do {
+            _ = try await repository.stream(
+                "com.atproto.space.getRepo",
+                query: ["space": fixture.space.rawValue, "repo": Self.repo],
+                authorization: .spaceCredential(credential),
+                to: spool,
+                maximumResponseBytes: 1_024 * 1_024
+            )
+            XCTFail("a revoked credential on a streamed read must surface as a terminal error")
+        } catch {
+            XCTAssertEqual(error as? InteropHTTPError, .spaceCredentialRevoked)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: spool.path))
+        let reads = await fixture.requests.filter { $0.url.path == "/xrpc/com.atproto.space.getRepo" }
+        XCTAssertEqual(reads.count, 1, "the client must not retry a revoked credential")
+        XCTAssertEqual(reads.first?.audience, Self.repo)
+
+        // Positive control: any other 401 is returned to the caller unchanged,
+        // with its body in the destination file as before.
+        let blobSpool = FileManager.default.temporaryDirectory
+            .appending(path: "swan-unrevoked-stream-\(UUID().uuidString).blob")
+        defer { try? FileManager.default.removeItem(at: blobSpool) }
+        let response = try await repository.stream(
+            "com.atproto.space.getBlob",
+            query: ["space": fixture.space.rawValue, "repo": Self.repo, "cid": "bafkreib"],
+            authorization: .spaceCredential(credential),
+            to: blobSpool,
+            maximumResponseBytes: 1_024 * 1_024
+        )
+        XCTAssertEqual(response.status, 401)
+        XCTAssertEqual(try Data(contentsOf: blobSpool), Data(#"{"error":"BadSpaceAudience"}"#.utf8))
+    }
+
     func testRequestWithoutRepoOrSpaceCannotBeSigned() async throws {
         let fixture = try SpaceCredentialClientFixture()
         let member = try client("https://member.example", fixture: fixture)
@@ -257,9 +300,14 @@ private actor SpaceCredentialClientFixture {
                 credential = parts.joined(separator: ".")
             }
             output = try JSONEncoder().encode(["token": credential])
-        case "/xrpc/com.atproto.space.getRecord" where responseMode == .revokeReads:
+        case "/xrpc/com.atproto.space.getRecord" where responseMode == .revokeReads,
+             "/xrpc/com.atproto.space.getRepo" where responseMode == .revokeReads:
             status = 401
             output = Data(#"{"error":"CredentialRevoked"}"#.utf8)
+        case "/xrpc/com.atproto.space.getBlob" where responseMode == .revokeReads:
+            // A different 401 stays an ordinary response (positive control).
+            status = 401
+            output = Data(#"{"error":"BadSpaceAudience"}"#.utf8)
         default:
             output = Data("{}".utf8)
         }

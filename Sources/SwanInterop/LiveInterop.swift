@@ -334,6 +334,30 @@ public final class InteropHTTPClient: @unchecked Sendable {
             throw SwanError.malformed("interop streaming bound is invalid")
         }
         let url = try makeURL(path)
+        if let executeHandler {
+            // Deterministic test seam: the pinned response body lands in the
+            // caller-owned file exactly as a streamed body would.
+            let response = try await executeHandler(method, url, headers, nil, maximumResponseBytes)
+            guard response.body.count <= maximumResponseBytes else {
+                throw InteropHTTPError.responseTooLarge
+            }
+            guard response.redirectCount == 0 else {
+                throw InteropHTTPError.unexpectedRedirect
+            }
+            guard FileManager.default.createFile(
+                atPath: destination.path, contents: response.body,
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                throw InteropHTTPError.fileFailure
+            }
+            return InteropHTTPResponse(
+                status: response.status,
+                headers: response.headers,
+                body: Data(),
+                finalURL: response.finalURL,
+                redirectCount: 0
+            )
+        }
         var request = HTTPClientRequest(url: url.absoluteString)
         request.method = nioMethod(method)
         request.headers = HTTPHeaders()
@@ -584,13 +608,29 @@ public struct InteropXRPCClient: Sendable {
         let path = try xrpcPath(nsid, query: query)
         var headers = ["Accept": "application/vnd.ipld.car, application/octet-stream, */*"]
         try addAuthorization(authorization, query: query, body: nil, to: &headers)
-        return try await http.executeStreaming(
+        let response = try await http.executeStreaming(
             method: .get,
             path: path,
             headers: headers,
             to: destination,
             maximumResponseBytes: maximumResponseBytes
         )
+        // A streamed error body lands in `destination`; read back only a
+        // small prefix so a revoked credential on a CAR/blob read is as
+        // terminal as on a JSON request.
+        if case .spaceCredential = authorization,
+           response.status == 401,
+           Self.isCredentialRevoked(status: response.status, body: Self.streamedErrorPrefix(at: destination)) {
+            try? FileManager.default.removeItem(at: destination)
+            throw InteropHTTPError.spaceCredentialRevoked
+        }
+        return response
+    }
+
+    private static func streamedErrorPrefix(at url: URL) -> Data {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return Data() }
+        defer { try? handle.close() }
+        return (try? handle.read(upToCount: 16 * 1_024)) ?? Data()
     }
 
     /// Returns the exact path used for an XRPC request. Callers that bind
@@ -620,7 +660,7 @@ public struct InteropXRPCClient: Sendable {
             maximumResponseBytes: maximumResponseBytes
         )
         if case .spaceCredential = authorization,
-           Self.isCredentialRevoked(response) {
+           Self.isCredentialRevoked(status: response.status, body: response.body) {
             throw InteropHTTPError.spaceCredentialRevoked
         }
         return response
@@ -628,9 +668,9 @@ public struct InteropXRPCClient: Sendable {
 
     /// A revoked credential stays revoked: surface it as a terminal error so
     /// no caller treats the 401 as retryable with the same credential.
-    private static func isCredentialRevoked(_ response: InteropHTTPResponse) -> Bool {
-        guard response.status == 401,
-              let object = try? JSONSerialization.jsonObject(with: response.body)
+    private static func isCredentialRevoked(status: Int, body: Data) -> Bool {
+        guard status == 401,
+              let object = try? JSONSerialization.jsonObject(with: body)
                 as? [String: Any] else {
             return false
         }
