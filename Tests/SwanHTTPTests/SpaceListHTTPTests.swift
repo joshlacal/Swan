@@ -84,11 +84,11 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertTrue(spaces.allSatisfy { Set($0.keys) == ["uri"] })
                 }
                 let filtered = try signedHeaders(fixture.token, path: Self.path, runtime: fixture.runtime, jti: "filter")
-                try await client.execute(uri: "\(Self.path)?type=app.example.space&did=\(Self.bob)", method: .get, headers: filtered) { response in
+                try await client.execute(uri: "\(Self.path)?spaceType=app.example.space&did=\(Self.bob)", method: .get, headers: filtered) { response in
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertEqual(((try self.json(response.body))["spaces"] as? [[String: Any]])?.map { $0["uri"] as? String }, [fixture.remote.rawValue])
                 }
-                for query in ["?unknown=x", "?limit=0", "?limit=1&limit=2", "?type=invalid", "?did=not-a-did", "?cursor=not-an-at-uri", "?did=\(Self.bob)&cursor=\(self.percent(fixture.owner.rawValue))"] {
+                for query in ["?unknown=x", "?limit=0", "?limit=1&limit=2", "?spaceType=invalid", "?type=app.example.space", "?type=app.example.space&spaceType=app.example.space", "?did=not-a-did", "?cursor=not-an-at-uri", "?did=\(Self.bob)&cursor=\(self.percent(fixture.owner.rawValue))"] {
                     try await client.execute(uri: "\(Self.path)\(query)", method: .get) { response in
                         XCTAssertEqual(response.status, .badRequest, query)
                     }
@@ -100,8 +100,14 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
                 let narrowScope = "space:app.example.space?authority=\(Self.bob)&skey=*&action=read"
                 let narrow = try await issueToken(fixture.runtime, scopes: [narrowScope])
                 let narrowHeaders = try signedHeaders(narrow, path: Self.path, runtime: fixture.runtime, jti: "narrow-allowed")
-                try await client.execute(uri: "\(Self.path)?type=app.example.space&did=\(Self.bob)", method: .get, headers: narrowHeaders) { response in
+                try await client.execute(uri: "\(Self.path)?spaceType=app.example.space&did=\(Self.bob)", method: .get, headers: narrowHeaders) { response in
                     XCTAssertEqual(response.status, .ok)
+                }
+                // The spaceType filter is what the grant is checked against: a
+                // filter outside the narrow grant is denied, not widened.
+                let otherTypeHeaders = try signedHeaders(narrow, path: Self.path, runtime: fixture.runtime, jti: "narrow-other-type")
+                try await client.execute(uri: "\(Self.path)?spaceType=app.other.space&did=\(Self.bob)", method: .get, headers: otherTypeHeaders) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
                 }
                 let deniedHeaders = try signedHeaders(narrow, path: Self.path, runtime: fixture.runtime, jti: "narrow-denied")
                 try await client.execute(uri: Self.path, method: .get, headers: deniedHeaders) { response in

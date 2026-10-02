@@ -9575,7 +9575,7 @@ private enum LabLiveSupport {
         let createBody = try JSONSerialization.data(
             withJSONObject: [
                 "did": space.authority,
-                "type": space.spaceType,
+                "spaceType": space.spaceType,
                 "skey": space.skey,
                 "readPolicy": ["$type": "com.atproto.simplespace.defs#memberListPolicy"],
                 "writePolicy": ["$type": "com.atproto.simplespace.defs#memberListPolicy"],

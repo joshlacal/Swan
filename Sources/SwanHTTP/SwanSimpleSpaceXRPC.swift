@@ -103,7 +103,7 @@ private enum SimpleSpaceAppAccessWire: Decodable {
 
 private struct SimpleSpaceCreateWireInput: Decodable {
     let did: DID?
-    let type: NSID
+    let spaceType: NSID
     let skey: String?
     let readPolicy: SimpleSpacePolicyWire
     let writePolicy: SimpleSpacePolicyWire
@@ -139,7 +139,7 @@ private struct AuthenticatedSimpleSpaceCreateHandler {
             }
             space = try SpaceURI(
                 authority: input.did?.didString() ?? subject,
-                spaceType: input.type.nsidString(),
+                spaceType: input.spaceType.nsidString(),
                 skey: skey
             )
         } catch {
@@ -349,8 +349,10 @@ private func registerSimpleSpaceCreate(
             context: context,
             as: SimpleSpaceCreateWireInput.self,
             capability: capability,
-            required: ["type", "readPolicy", "writePolicy", "appAccess"],
-            allowed: ["did", "type", "skey", "readPolicy", "writePolicy", "appAccess"]
+            // `spaceType` is the October 1 alpha field name; a body that
+            // still sends the retired `type` fails the key-set check.
+            required: ["spaceType", "readPolicy", "writePolicy", "appAccess"],
+            allowed: ["did", "spaceType", "skey", "readPolicy", "writePolicy", "appAccess"]
         ) { input in
             authenticatedGetSpaceJSON(
                 .ok,
@@ -721,7 +723,7 @@ private func simpleSpaceLifecycleResponse(
 /// decoder sees it. The duplicate-key parser above applies recursively; this
 /// semantic pass rejects unknown/nullable nested configuration fields too.
 private func validateSimpleSpaceJSON(_ root: [String: Any]) throws {
-    for key in ["did", "type", "skey", "space"] {
+    for key in ["did", "spaceType", "skey", "space"] {
         if let value = root[key] {
             guard let string = value as? String,
                   !string.isEmpty,

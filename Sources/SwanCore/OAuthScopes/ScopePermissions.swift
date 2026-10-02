@@ -514,7 +514,7 @@ public extension SwanScopePermissions {
     /// (`SwanCore.swift:290-309`).
     ///
     /// **Upstream HAS an analogue.** `packages/pds/src/api/com/atproto/space/listSpaces.ts:20-25`
-    /// asserts `assertSpace({ type: type ?? '*', authority: authority ?? '*',
+    /// asserts `assertSpace({ type: spaceType ?? '*', authority: authority ?? '*',
     /// skey: '*', action: 'read_self' })` — it makes the *request filters* the
     /// match target and defaults each absent filter to `'*'`. Its comment at
     /// `:16-18` states Swan's own rationale in upstream's words: "No one space
@@ -540,7 +540,7 @@ public extension SwanScopePermissions {
     /// Reads DURABLE provenance (§9-D23): under the new grammar `skey`
     /// *defaults* to `["*"]` and `action` defaults to a list *containing*
     /// `read`, so without the stated-key witness a bare `space:<t>` grant would
-    /// silently start satisfying `listSpaces?type=<t>&authority=<self>`.
+    /// silently start satisfying `listSpaces?spaceType=<t>&did=<self>`.
     /// **§6.1 AMENDED (2026-08-15, Josh: "Amend").** The original fence
     /// additionally required stated `authority`+`skey` with literal `skey=*`,
     /// action exactly `[.read]`, and no stated `collection`/`manage`. That

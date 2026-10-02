@@ -44,10 +44,10 @@ Done:
 
 - Petrel re-pin. Wire members follow the renamed generated types: `notifyWrite` sends and accepts `repoRev`, and `listRepos` entries carry `repoRev` and `spaceRev`.
 - The profile and registry above, set as the active default (`swan serve` / `swan verify --profile`).
+- Request-field renames: `listSpaces?spaceType=` and `createSpace {spaceType}` in the handlers, the listing permission check, and Swan's own `createSpace` caller (`swan lab` space provisioning). The retired `type` key is rejected, not accepted as an alias.
 
 Remaining in this alignment:
 
-- **Request-field renames.** `listSpaces` and `createSpace` still read `type`; the October 1 alpha reads only `spaceType`.
 - **HTTP Message Signatures.** `getSpaceCredential` still binds credentials with DPoP (`cnf.jkt`). The new reference expects an `atproto-space` HTTP signature and `cnf.kid`.
 - **Revocations.** `notifyCredentialRevoked` is routed as a method-correct 503 gate. Swan does not yet receive or enforce revocations.
 - **Space-host sequencing.** Swan does not yet assign space revisions or reject repo revisions more than five minutes in the future (`FutureRev`). Until it does, a `listRepos` entry's `spaceRev` carries the writer's repo revision, the cursor is still the last writer DID, and forwarded notifications carry no `spaceRev`.
@@ -56,4 +56,5 @@ Remaining in this alignment:
 
 - Portable exports and operator account backups embed the profile ID and are accepted only under the same ID. Archives produced by a `2026-09-19` build do not restore on this build. Restore them with the build that produced them, or produce new ones after upgrading.
 - A `notifyWrite` body that uses `rev` is rejected with 400 `InvalidRequest`. This applies both to a Swan peer still on the `2026-09-19` profile and to a reference repo host older than `679724ad`.
+- A `listSpaces` query or `createSpace` body that uses `type` is rejected with 400 `InvalidRequest`. Swan rejects the key outright instead of ignoring it, so an old client fails loudly rather than receiving an unfiltered listing. The OAuth `space:` permission syntax is unchanged.
 - No stored data is migrated by the profile change itself.

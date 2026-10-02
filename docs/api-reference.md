@@ -298,7 +298,7 @@ Swan implements the `permissioned-data-0016-2026-10-01` profile for access-contr
 #### `com.atproto.simplespace.createSpace`
 - **Method**: `POST`
 - **Authentication**: Account OAuth DPoP.
-- **Request Body**: JSON object with required `type` (space-type NSID), `readPolicy`, `writePolicy`, and `appAccess`; optional `skey` (record key). The authenticated account is the authority; do not send a `did` field.
+- **Request Body**: JSON object with required `spaceType` (space-type NSID), `readPolicy`, `writePolicy`, and `appAccess`; optional `skey` (record key). The authenticated account is the authority; do not send a `did` field. The pre-October-1 field name `type` is rejected with 400 `InvalidRequest`.
 - **Returns**: JSON object `{ "uri": "<space-ref>" }`.
 
 #### `com.atproto.simplespace.getSpace`
@@ -350,8 +350,8 @@ Swan implements the `permissioned-data-0016-2026-10-01` profile for access-contr
 #### `com.atproto.space.listSpaces`
 - **Method**: `GET`
 - **Authentication**: Account Auth.
-- **Parameters**: None.
-- **Returns**: JSON object `{ "spaces": [ { "space": "did:...", "name": "...", "role": "..." } ] }`.
+- **Parameters**: Optional query parameters `spaceType` (space-type NSID filter), `did` (authority DID filter), `limit` (integer, 1–100; default 50), and `cursor` (the previous page's last space reference). An unfiltered listing needs a wildcard space grant; a filtered one needs a grant covering the filter. The pre-October-1 filter name `type` is rejected with 400 `InvalidRequest`.
+- **Returns**: JSON object `{ "spaces": [ { "uri": "<space-ref>" } ], "cursor": "<space-ref>" }`.
 
 #### `com.atproto.space.getDelegationToken`
 - **Method**: `GET`
