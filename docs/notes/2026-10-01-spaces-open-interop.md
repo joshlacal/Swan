@@ -19,9 +19,9 @@ Without the flag every route behaves exactly as before.
 
 ### (a) Unbound notify service auth (SWAN-04)
 
-`notifyWrite` and `notifySpaceDeleted` accept an upstream service JWT that has no `req` (body-digest) claim when all of these hold:
+`notifyWrite` and `notifySpaceDeleted` (and, since the October 1 alignment, `notifyCredentialRevoked`) accept an upstream service JWT that has no `req` (body-digest) claim when all of these hold:
 
-- `iss` is the writer repo (`notifyWrite`) or the space authority (`notifySpaceDeleted`);
+- `iss` is the writer repo (`notifyWrite`) or the space authority (`notifySpaceDeleted`, `notifyCredentialRevoked`);
 - `aud` is the bare authority DID or `<authority>#atproto_space_host` (`notifyWrite`);
 - `lxm` is the route;
 - the token has `iat` and `exp - iat <= 60` s;
@@ -38,7 +38,7 @@ A token that does carry `req` must still match the body, and Swan still sends `r
 This overrides the `AGENTS.md` rule that unknown issuers never trigger network lookups, for these lookups only:
 
 - Delegation, space-credential and service-JWT keys for any `did:plc` / `did:web` issuer are read from its DID document after local, PLC-config and pinned sources have no answer. Fetches use the existing peer-pinned, redirect-free, SSRF-policied DID-document fetcher; documents are cached at most 60 s, failures 30 s, and new-issuer lookups are capped at 120 per minute.
-- As a writer, Swan routes `notifyWrite` to an operator-configured destination if one exists, else the authority's `#atproto_space_host` entry (must be typed `AtprotoSpaceHost`; `aud = <did>#atproto_space_host`), else `#atproto_pds` (`aud` = bare DID). A malformed space-host entry is an error, not a fallback. Delivery still needs `--enable-notification-delivery` and `--notification-config`.
+- As a writer, Swan routes `notifyWrite` to an operator-configured destination if one exists, else the authority's `#atproto_space_host` entry (must be typed `AtprotoSpaceHost`; `aud = <did>#atproto_space_host`), else `#atproto_pds` (`aud` = bare DID at the time of this note; since the October 1 alignment it is `<did>#atproto_space_host` here too, as the reference sender does). A malformed space-host entry is an error, not a fallback. Delivery still needs `--enable-notification-delivery` and `--notification-config`.
 
 ### (d) Upstream scope and legacy-session semantics (SWAN-09)
 
