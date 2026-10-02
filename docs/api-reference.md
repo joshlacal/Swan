@@ -457,9 +457,10 @@ The audience is the repo owner's DID for repo reads (`getRecord`, `listRecords`,
 
 #### `com.atproto.space.listRepos`
 - **Method**: `GET`
-- **Authentication**: Space Credential.
-- **Parameters**: Query parameter `space` (required).
-- **Returns**: JSON object `{ "repos": [ "did:..." ] }`.
+- **Authentication**: Space Credential, signed for the authority's bare DID.
+- **Parameters**: Query parameters `space` (required), `limit` (integer, 1–1000; default 100), `cursor` (optional). The cursor is an exclusive space-revision checkpoint: pass a previous response's `cursor` or a `spaceRev` you have already processed, unchanged. It is a plain string and is not TID-validated. A cursor beginning with `did:` (the form this endpoint returned before October 1, 2026) cannot name a space revision and lists from the start.
+- **Returns**: JSON object `{ "repos": [ { "did": "...", "repoRev": "<tid>", "hash": { "$bytes": "..." }, "spaceRev": "<tid>" } ], "cursor": "<tid>" }`. Entries are each writer's latest state in ascending `spaceRev` order, so a repo updated while you paginate can appear again; process entries idempotently. A nonempty page always returns its last `spaceRev` as `cursor`, even when the page is short. Continue until an empty page, which omits `cursor`; keep your previous checkpoint in that case.
+- **Errors**: 404 `SpaceNotFound`.
 
 #### `com.atproto.space.registerNotify`
 - **Method**: `POST`
@@ -475,9 +476,12 @@ The audience is the repo owner's DID for repo reads (`getRecord`, `listRecords`,
 
 #### `com.atproto.space.notifyWrite`
 - **Method**: `POST`
-- **Authentication**: Outbox authorization / writer proof.
-- **Request Body**: JSON object `{ "space": "did:...", "repo": "did:...", "commit": "..." }`.
+- **Authentication**: Service auth (`Authorization: Bearer <service-jwt>`) from the writer: `iss` = `repo`, `lxm` = `com.atproto.space.notifyWrite`, `aud` = `<authority>#atproto_space_host` or the bare authority DID. By default the JWT must also carry a `req` claim binding the body; under `--enable-spaces-open-interop` an unbound upstream token is accepted once (at most 60 s lifetime, single-use `jti`).
+- **Request Body**: JSON object `{ "space": "<space-ref>", "repo": "<did>", "repoRev": "<tid>", "hash": { "$bytes": "<sha256 of the LtHash state>" } }`. Only the space host assigns space revisions, so a repo host never sends `spaceRev`.
+- **Behavior**: The writer must be allowed by the space's write policy. A `repoRev` equal to or older than the one already recorded for that repo is ignored (an equal one with a different `hash` is refused as equivocation). An accepted update records the writer's state and allocates the next `spaceRev` (a TID, strictly increasing across all writers in the space) in one transaction, and queues a forward to each registered service: `{ space, repo, repoRev, hash, spaceRev, prevSpaceRev }`, signed by the authority for the registered service identifier, with `prevSpaceRev` omitted on the space's first update. Forwards are retried with backoff; subscribers that see a `prevSpaceRev` gap recover with `listRepos`.
 - **Returns**: 200 OK empty response.
+- **Errors**: 400 `FutureRev` (`repoRev` more than 5 minutes ahead of the server clock), 404 `SpaceNotFound` (unknown or deleted space, or an authority this server does not host), 401 (authentication, writer not permitted, or equivocation).
+- **Sending**: After each local write to a space, Swan's outbox notifies the space's authority automatically, without registration, and retries until the receiver accepts or permanently refuses (4xx). The body carries the repo's latest state. With `--enable-spaces-open-interop`, the destination is the authority's `#atproto_space_host` endpoint, falling back to its `#atproto_pds` endpoint, and the audience is `<authority>#atproto_space_host` in both cases.
 
 #### `com.atproto.space.notifySpaceDeleted`
 - **Method**: `POST`

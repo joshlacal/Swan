@@ -27,9 +27,14 @@
       "swanBehavior": "Streams proposal-0016 two-root full-recovery CARs from a private bounded-memory spool; the generated handler is retained for typed parameter/context semantics but its Data-returning method is never used by the transport."
     },
     {
+      "endpoint": "com.atproto.space.listRepos",
+      "referenceBehavior": "Compares any cursor string lexically against spaceRev, so a DID-shaped cursor sorts after every TID and returns an empty page.",
+      "swanBehavior": "Compares cursors lexically against spaceRev without TID validation, except that a cursor beginning with did: (the form Swan's listRepos returned before atproto#5574) lists from the start of the space, since it cannot name a space revision. An empty cursor is treated as absent."
+    },
+    {
       "endpoint": "com.atproto.space.notifyWrite",
-      "referenceBehavior": "The receiver accepts a repo-host notification when the service JWT iss equals body.repo and aud is the bare authority DID or <authority>#atproto_space_host; the token carries no req body-digest claim and no jti replay record is kept.",
-      "swanBehavior": "By default accepts only service JWTs whose req claim binds the request body, with iss equal to body.repo and the exact configured authority service identity as aud, and always sends req on notifications it signs. Unbound upstream-shaped tokens are accepted only under --enable-spaces-open-interop, with exp - iat <= 60 s and a durable single-use jti."
+      "referenceBehavior": "The receiver accepts a repo-host notification when the service JWT iss equals body.repo and aud is the bare authority DID or <authority>#atproto_space_host; the token carries no req body-digest claim and no jti replay record is kept. A repoRev equal to or older than the recorded one is ignored whatever its hash. Forwards to registered syncers are attempted once from an in-memory background queue.",
+      "swanBehavior": "By default accepts only service JWTs whose req claim binds the request body, with iss equal to body.repo and aud the bare authority DID or <authority>#atproto_space_host, and always sends req on notifications it signs (a forward's req also binds spaceRev and prevSpaceRev). Unbound upstream-shaped tokens are accepted only under --enable-spaces-open-interop, with exp - iat <= 60 s and a durable single-use jti. An equal repoRev with a different hash is refused as equivocation; an older or identical one is ignored. Forwards are queued durably in the transaction that assigns the space revision and retried with backoff."
     },
     {
       "endpoint": "com.atproto.space.notifyCredentialRevoked",
