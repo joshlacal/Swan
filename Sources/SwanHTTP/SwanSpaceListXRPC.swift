@@ -39,7 +39,7 @@ private struct AuthenticatedListSpacesHandler: ComAtprotoSpaceListSpaces.ServerH
         input: Void,
         context request: Request
     ) async throws -> ComAtprotoSpaceListSpaces.Output {
-        let spaceType = parameters.type?.nsidString()
+        let spaceType = parameters.spaceType?.nsidString()
         let authority = parameters.did?.didString()
         let cursor: SpaceURI?
         do {
@@ -208,7 +208,7 @@ private func parseAuthenticatedListSpacesParameters(
             throw AuthenticatedSpaceListFailure.invalidRequest
         }
     }
-    return .init(type: type, did: did, limit: limit, cursor: cursor)
+    return .init(spaceType: type, did: did, limit: limit, cursor: cursor)
 }
 
 private func authenticatedListSpacesResponse(

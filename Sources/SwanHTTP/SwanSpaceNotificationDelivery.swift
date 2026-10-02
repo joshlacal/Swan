@@ -409,7 +409,7 @@ private func notificationJSON(
     let input = try ComAtprotoSpaceNotifyWrite.Input(
         space: SpaceRef(uriString: space.rawValue),
         repo: DID(didString: repository),
-        rev: revision,
+        repoRev: revision,
         hash: Bytes(data: commitment)
     )
     return try SwanJSONEncoders.sortedNoEscaping.encode(input)

@@ -79,7 +79,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             let expectedWriter = writer
             let registerBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}")
             let commitment = Data(repeating: 0x01, count: 32).base64EncodedString()
-            let writeBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"rev\":\"3l72c4e2y2222\",\"hash\":{\"$bytes\":\"\(commitment)\"}}")
+            let writeBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"repoRev\":\"3l72c4e2y2222\",\"hash\":{\"$bytes\":\"\(commitment)\"}}")
             let serviceHeaders: HTTPFields = {
                 var fields: HTTPFields = [.contentType: "application/json"]
                 fields[.authorization] = "Bearer writer-token"
@@ -156,7 +156,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 }
                 // A notifyWrite request with altered body / mismatched digest is rejected
                 let badCommitment = Data(repeating: 0xCC, count: 32).base64EncodedString()
-                let alteredWriteBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"rev\":\"2222222222222\",\"hash\":{\"$bytes\":\"\(badCommitment)\"}}")
+                let alteredWriteBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"repoRev\":\"2222222222222\",\"hash\":{\"$bytes\":\"\(badCommitment)\"}}")
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.notifyWrite",
                     method: .post,
@@ -230,7 +230,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     let repos = try XCTUnwrap(value["repos"] as? [[String: Any]])
                     XCTAssertEqual(repos.count, 1)
                     XCTAssertEqual(repos.first?["did"] as? String, expectedWriter)
-                    XCTAssertEqual(repos.first?["rev"] as? String, "3l72c4e2y2222")
+                    XCTAssertEqual(repos.first?["repoRev"] as? String, "3l72c4e2y2222")
                     let rendered = String(decoding: response.body.readableBytesView, as: UTF8.self)
                     XCTAssertFalse(rendered.contains("record"))
                     XCTAssertFalse(rendered.contains("credential"))
@@ -737,7 +737,8 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         )
         XCTAssertEqual(body["space"] as? String, space.rawValue)
         XCTAssertEqual(body["repo"] as? String, writer)
-        XCTAssertEqual(body["rev"] as? String, "2222222222222")
+        XCTAssertEqual(body["repoRev"] as? String, "2222222222222")
+        XCTAssertNil(body["rev"], "notifyWrite carries repoRev, not rev")
         XCTAssertNotNil(body["hash"], "the commit hash closes the listRepos propagation loop")
         let issued = await recordingIssuer.issued()
         XCTAssertEqual(issued.count, 1)
@@ -2009,7 +2010,7 @@ extension SpaceNotificationHTTPTests {
             let method = "com.atproto.space.notifyWrite"
             let rev = "3l72c4e2y2222"
             let hash = Data(repeating: 0x02, count: 32)
-            let body = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"rev\":\"\(rev)\",\"hash\":{\"$bytes\":\"\(hash.base64EncodedString())\"}}")
+            let body = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"repoRev\":\"\(rev)\",\"hash\":{\"$bytes\":\"\(hash.base64EncodedString())\"}}")
             let digest = SpaceNotificationRequestDigest.write(
                 space: fixture.space, repository: writer, wireRevision: rev, commitment: hash
             )

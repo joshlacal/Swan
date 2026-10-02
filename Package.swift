@@ -27,12 +27,15 @@ let package = Package(
         // against whatever line the neighbouring working copy happens to be
         // sitting on, which is invisible in this manifest and unreproducible
         // anywhere else: Swan silently built against three different Petrel
-        // lines depending on who had checked out what. This revision adds the
-        // September 10 Spaces alpha on Swan's existing request-body-digest
-        // security baseline, without dropping its service-JWT protections.
+        // lines depending on who had checked out what. This revision is the
+        // October 1 Spaces alpha (atproto 679724ad lexicons: listSpaces /
+        // createSpace `spaceType`, notifyWrite / listRepos `repoRev` and
+        // `spaceRev`, notifyCredentialRevoked) on the same Swan line as the
+        // September 10 pin, keeping Swan's request-body-digest security
+        // baseline and service-JWT protections.
         .package(
             url: "https://github.com/joshlacal/Petrel.git",
-            revision: "35155c926fb7e49e139883feb29308d61aff8db5"
+            revision: "f15887c9975e12af534f3ac7e72bac404142a0e0"
         ),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),

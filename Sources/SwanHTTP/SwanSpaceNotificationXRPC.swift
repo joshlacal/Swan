@@ -202,14 +202,21 @@ private struct AuthenticatedListSpaceReposHandler:
         }
         do {
             return .init(
-                cursor: writers.last?.repository,
                 repos: try writers.map {
-                    .init(
+                    let repoRev = try TID(tidString: $0.wireRevision)
+                    // Interim projection: the writer directory does not yet
+                    // allocate space revisions, so the required `spaceRev`
+                    // carries the writer's repo revision and the cursor stays
+                    // the last writer DID. Space-host sequencing (strictly
+                    // increasing spaceRev, spaceRev cursor) replaces both.
+                    return .init(
                         did: try DID(didString: $0.repository),
-                        rev: try TID(tidString: $0.wireRevision),
-                        hash: Bytes(data: $0.commitment)
+                        repoRev: repoRev,
+                        hash: Bytes(data: $0.commitment),
+                        spaceRev: repoRev
                     )
-                }
+                },
+                cursor: writers.last?.repository
             )
         } catch {
             // The directory must already have validated these identifiers;
@@ -383,7 +390,7 @@ private struct AuthenticatedNotifySpaceWriteHandler:
         let expectedDigest = SpaceNotificationRequestDigest.write(
             space: space,
             repository: input.repo.didString(),
-            wireRevision: input.rev.toString(),
+            wireRevision: input.repoRev.toString(),
             commitment: input.hash.data
         )
         let verifiedDigest: String
@@ -434,7 +441,7 @@ private struct AuthenticatedNotifySpaceWriteHandler:
                     eventID: service.eventID,
                     space: space,
                     repository: input.repo.didString(),
-                    wireRevision: input.rev.toString(),
+                    wireRevision: input.repoRev.toString(),
                     commitment: input.hash.data,
                     issuer: service.issuer,
                     // Both accepted audience forms name this authority.
@@ -794,8 +801,8 @@ private func decodeNotifySpaceWriteInput(
     await decodeObserver?()
     try notificationJSONObject(
         data,
-        allowedKeys: ["space", "repo", "rev", "hash"],
-        requiredKeys: ["space", "repo", "rev", "hash"]
+        allowedKeys: ["space", "repo", "repoRev", "hash"],
+        requiredKeys: ["space", "repo", "repoRev", "hash"]
     )
     do {
         let input = try JSONDecoder().decode(ComAtprotoSpaceNotifyWrite.Input.self, from: data)
