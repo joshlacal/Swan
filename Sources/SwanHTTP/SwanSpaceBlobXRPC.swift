@@ -439,7 +439,7 @@ private func authenticatedSpaceBlobResponse(
     case .denied:
         authenticatedSpaceBlobError(.unauthorized, code: "Unauthorized")
     case let .credentialPresentation(failure):
-        authenticatedSpaceBlobError(.unauthorized, code: failure.xrpcErrorCode)
+        authenticatedSpaceBlobError(failure.httpStatus, code: failure.xrpcErrorCode)
     case .nonceChallenge:
         authenticatedGetSpaceNonceChallenge(authorizer: capability.authorizer)
     case .unavailable:

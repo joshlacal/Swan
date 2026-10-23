@@ -321,7 +321,9 @@ public struct SwanOperatorAccountBackupExporter: Sendable {
         )
         let signingScalar = try await keyReader.key(for: signingReference)
         let rotationScalar = try await keyReader.key(for: rotationReference)
+        let kemScalar = try await keyReader.keyIfPresent(for: AccountKEMKeyProvider.reference(accountDID: account.did))
         let continuityInventory = try await self.continuityInventory()
+        let identityHistory = try await database.publicPLCOperationHistory()
         let secrets = try SwanOperatorAccountSecrets(
             profileID: PermissionedData0016.profileID,
             portableManifestSHA256: "",
@@ -334,6 +336,8 @@ public struct SwanOperatorAccountBackupExporter: Sendable {
             signingPrivateScalar: signingScalar,
             rotationPrivateScalar: rotationScalar,
             plcCredentialKeyContinuity: continuityInventory,
+            kemPrivateScalar: kemScalar,
+            plcIdentityHistory: identityHistory,
             allowDeferredDigest: true
         )
 
@@ -725,6 +729,20 @@ public enum SwanOperatorAccountBackupVerifier {
         let rotationKey = try P256.Signing.PrivateKey(
             rawRepresentation: secrets.rotationPrivateScalar
         )
+        var publishedKEM = plc.kemDIDKey
+        if let first = secrets.plcIdentityHistory.first, let last = secrets.plcIdentityHistory.last {
+            guard first.cid == plc.operationCID else { throw SwanOperatorAccountBackupError.failed }
+            let terminal = try PLCOperationCodec.decodeSignedJSON(last.canonicalJSON)
+            guard terminal.regular?.verificationMethods["atproto"] == plc.signingDIDKey,
+                  terminal.regular?.rotationKeys == [plc.rotationDIDKey] else { throw SwanOperatorAccountBackupError.failed }
+            publishedKEM = terminal.regular?.verificationMethods["atproto_kem"]
+        }
+        if let publishedKEM {
+            guard let scalar = secrets.kemPrivateScalar,
+                  try AccountKEMKeyProvider.didKey(P256.KeyAgreement.PrivateKey(rawRepresentation: scalar).publicKey) == publishedKEM else {
+                throw SwanOperatorAccountBackupError.failed
+            }
+        }
         guard signingKey.publicKey.compressedRepresentation
                 == portable.signingPublicKey.compressedRepresentation,
               plc.signingDIDKey == P256DIDKey(publicKey: signingKey.publicKey).value,
@@ -753,6 +771,8 @@ struct SwanOperatorAccountSecrets: Sendable {
     let rotationKeyReference: AccountControlKeyReference
     let signingPrivateScalar: Data
     let rotationPrivateScalar: Data
+    let kemPrivateScalar: Data?
+    let plcIdentityHistory: [PublicPLCOperationHistoryEntry]
     let plcCredentialKeyContinuity: PLCCredentialKeyContinuityInventory
 
     init(
@@ -767,6 +787,8 @@ struct SwanOperatorAccountSecrets: Sendable {
         signingPrivateScalar: Data,
         rotationPrivateScalar: Data,
         plcCredentialKeyContinuity: PLCCredentialKeyContinuityInventory,
+        kemPrivateScalar: Data? = nil,
+        plcIdentityHistory: [PublicPLCOperationHistoryEntry] = [],
         allowDeferredDigest: Bool = false
     ) throws {
         guard profileID == PermissionedData0016.profileID,
@@ -791,6 +813,22 @@ struct SwanOperatorAccountSecrets: Sendable {
             verifier: passwordVerifier,
             updatedAt: Date(timeIntervalSince1970: 0)
         )
+        if let kemPrivateScalar {
+            _ = try P256.KeyAgreement.PrivateKey(rawRepresentation: kemPrivateScalar)
+            guard kemPrivateScalar != signingPrivateScalar, kemPrivateScalar != rotationPrivateScalar else {
+                throw SwanOperatorAccountBackupError.failed
+            }
+        }
+        guard plcIdentityHistory.count <= 256 else { throw SwanOperatorAccountBackupError.failed }
+        if !plcIdentityHistory.isEmpty {
+            let identity = try SwanPublicPLCGenesisVerifier().verifyIdentityHistory(plcIdentityHistory, expectedDID: did)
+            guard identity.keyGeneration == signingKeyReference.generation,
+                  plcIdentityHistory.allSatisfy({ $0.signingKeyGeneration == Self.supportedKeyGeneration }) else {
+                throw SwanOperatorAccountBackupError.failed
+            }
+        }
+        self.plcIdentityHistory = plcIdentityHistory
+        self.kemPrivateScalar = kemPrivateScalar
         self.profileID = profileID
         self.portableManifestSHA256 = portableManifestSHA256
         self.did = did
@@ -816,17 +854,20 @@ struct SwanOperatorAccountSecrets: Sendable {
             rotationKeyReference: rotationKeyReference,
             signingPrivateScalar: signingPrivateScalar,
             rotationPrivateScalar: rotationPrivateScalar,
-            plcCredentialKeyContinuity: plcCredentialKeyContinuity
+            plcCredentialKeyContinuity: plcCredentialKeyContinuity,
+            kemPrivateScalar: kemPrivateScalar,
+            plcIdentityHistory: plcIdentityHistory
         )
     }
 }
 
 private enum SwanOperatorAccountSecretsCodec {
-    static let formatValue = "swan-operator-account-secrets-v2"
+    static let formatValue = "swan-operator-account-secrets-v3"
+    static let previousFormatValue = "swan-operator-account-secrets-v2"
     static let legacyFormatValue = "swan-operator-account-secrets-v1"
     static let maximumEncodedBytes =
         PLCCredentialKeyContinuityInventory.maximumCheckpointBytes
-            + 16 * 1_024
+            + 2 * 1_024 * 1_024
     private static let rootKeys = Set([
         "canonicalHandle", "did", "format", "passwordVerifier",
         "plcCredentialKeyContinuity",
@@ -838,10 +879,10 @@ private enum SwanOperatorAccountSecretsCodec {
     private static let continuityKeys = Set(["issuer", "terminalCID"])
 
     static func encode(_ secrets: SwanOperatorAccountSecrets) throws -> Data {
-        let object: [String: Any] = [
+        var object: [String: Any] = [
             "canonicalHandle": secrets.canonicalHandle,
             "did": secrets.did,
-            "format": formatValue,
+            "format": secrets.kemPrivateScalar == nil && secrets.plcIdentityHistory.isEmpty ? previousFormatValue : formatValue,
             "passwordVerifier": secrets.passwordVerifier,
             "plcCredentialKeyContinuity":
                 try continuityObject(secrets.plcCredentialKeyContinuity),
@@ -857,6 +898,11 @@ private enum SwanOperatorAccountSecretsCodec {
                 secrets.signingPrivateScalar
             ),
         ]
+        if secrets.kemPrivateScalar != nil || !secrets.plcIdentityHistory.isEmpty {
+            if let kem = secrets.kemPrivateScalar { object["kemPrivateScalar"] = SwanOperatorBackupBase64URL.encode(kem) }
+            else { object["kemPrivateScalar"] = NSNull() }
+            object["plcIdentityHistory"] = try historyObject(secrets.plcIdentityHistory)
+        }
         do {
             let data = try JSONSerialization.data(
                 withJSONObject: object,
@@ -884,8 +930,8 @@ private enum SwanOperatorAccountSecretsCodec {
                 .unsupportedEncryptedPayloadVersion
         }
         guard
-              Set(object.keys) == rootKeys,
-              encodedFormat == formatValue,
+              Set(object.keys) == (encodedFormat == formatValue ? rootKeys.union(["kemPrivateScalar", "plcIdentityHistory"]) : rootKeys),
+              encodedFormat == formatValue || encodedFormat == previousFormatValue,
               let canonicalHandle = object["canonicalHandle"] as? String,
               let did = object["did"] as? String,
               let passwordVerifier = object["passwordVerifier"] as? String,
@@ -914,6 +960,19 @@ private enum SwanOperatorAccountSecretsCodec {
               SwanOperatorBackupBase64URL.encode(rotation) == rotationScalarText else {
             throw SwanOperatorAccountBackupError.failed
         }
+        let kem: Data?
+        let identityHistory: [PublicPLCOperationHistoryEntry]
+        if encodedFormat == formatValue {
+            if object["kemPrivateScalar"] is NSNull { kem = nil }
+            else {
+                guard let text = object["kemPrivateScalar"] as? String,
+                      let decoded = SwanOperatorBackupBase64URL.decode(text),
+                      SwanOperatorBackupBase64URL.encode(decoded) == text else { throw SwanOperatorAccountBackupError.failed }
+                kem = decoded
+            }
+            guard let rows = object["plcIdentityHistory"] as? [[String: Any]] else { throw SwanOperatorAccountBackupError.failed }
+            identityHistory = try decodeHistory(rows)
+        } else { kem = nil; identityHistory = [] }
         let signingReference = try decodeReference(signingReferenceObject)
         let rotationReference = try decodeReference(rotationReferenceObject)
         let continuity = try decodeContinuity(continuityRows)
@@ -928,12 +987,41 @@ private enum SwanOperatorAccountSecretsCodec {
             rotationKeyReference: rotationReference,
             signingPrivateScalar: signing,
             rotationPrivateScalar: rotation,
-            plcCredentialKeyContinuity: continuity
+            plcCredentialKeyContinuity: continuity,
+            kemPrivateScalar: kem,
+            plcIdentityHistory: identityHistory
         )
         guard try encode(secrets) == data else {
             throw SwanOperatorAccountBackupError.failed
         }
         return secrets
+    }
+
+    private static func historyObject(_ entries: [PublicPLCOperationHistoryEntry]) throws -> [[String: Any]] {
+        try entries.map { entry in
+            let timestamp = entry.createdAt.timeIntervalSince1970 * 1_000_000
+            guard timestamp.isFinite, timestamp >= 0, timestamp < Double(UInt64.max) else { throw SwanOperatorAccountBackupError.failed }
+            return ["operation": SwanOperatorBackupBase64URL.encode(entry.canonicalJSON),
+                    "createdAtMicroseconds": UInt64(timestamp.rounded()), "generation": entry.signingKeyGeneration]
+        }
+    }
+
+    private static func decodeHistory(_ rows: [[String: Any]]) throws -> [PublicPLCOperationHistoryEntry] {
+        guard rows.count <= 256 else { throw SwanOperatorAccountBackupError.failed }
+        return try rows.map { row in
+            guard Set(row.keys) == ["operation", "createdAtMicroseconds", "generation"],
+                  let encoded = row["operation"] as? String,
+                  let data = SwanOperatorBackupBase64URL.decode(encoded),
+                  SwanOperatorBackupBase64URL.encode(data) == encoded,
+                  let timestamp = row["createdAtMicroseconds"] as? NSNumber,
+                  let micros = UInt64(timestamp.stringValue),
+                  let generationNumber = row["generation"] as? NSNumber,
+                  let generation = UInt64(generationNumber.stringValue) else { throw SwanOperatorAccountBackupError.failed }
+            let operation = try PLCOperationCodec.decodeSignedJSON(data)
+            return try PublicPLCOperationHistoryEntry(cid: operation.cid.string, previousCID: operation.prev,
+                canonicalJSON: data, createdAt: Date(timeIntervalSince1970: Double(micros) / 1_000_000),
+                signingKeyGeneration: generation, rotationKeyGeneration: generation)
+        }
     }
 
     private static func continuityObject(
@@ -1032,10 +1120,12 @@ private enum SwanOperatorAccountSecretsCodec {
 }
 
 private struct SwanOperatorPortablePLC {
+    let operationCID: String
     let did: String
     let publicGenesisCommitCID: String
     let signingDIDKey: String
     let rotationDIDKey: String
+    let kemDIDKey: String?
 
     static func read(from portableRoot: Int32) throws -> Self {
         let data = try SwanPortableExportFilesystem.read(
@@ -1061,10 +1151,12 @@ private struct SwanOperatorPortablePLC {
             throw SwanOperatorAccountBackupError.failed
         }
         return Self(
+            operationCID: try operation.cid.string,
             did: did,
             publicGenesisCommitCID: publicGenesisCommitCID,
             signingDIDKey: signingDIDKey,
-            rotationDIDKey: regular.rotationKeys[0]
+            rotationDIDKey: regular.rotationKeys[0],
+            kemDIDKey: regular.verificationMethods["atproto_kem"]
         )
     }
 }

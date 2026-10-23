@@ -744,6 +744,94 @@ extension SQLiteAccountDatabase:
         }
     }
 
+    public func markPermissionedRemoteReplicaSTARImportVerified(
+        sessionID: String,
+        verification: VerifiedStreamingSpaceSTARRecovery,
+        now: Int64
+    ) async throws {
+        let metadata = try SpaceSTARCodec.encodeMetadata(verification.commit)
+        let commitCID = CID.fromDAGCBOR(metadata)
+        // STAR has no index block. Compute the existing durable projection's
+        // canonical digest from bounded SQLite pages after stream validation.
+        let projection: (index: CID, uniqueCount: Int, logicalBytes: Int) = try await withConnectionGate {
+            try await writerReadTransaction {
+                let session = try await requireActiveRemoteReplicaSession(
+                    id: sessionID, now: now, allowed: [.receiving]
+                )
+                guard verification.commit.repo == session.binding.target.repositoryDID,
+                      verification.commit.space == session.binding.target.space,
+                      verification.recordCount <= session.binding.limits.maximumIndexEntries else {
+                    throw PermissionedRemoteReplicaRecoveryError.corruptStaging
+                }
+                var hasher = SHA256()
+                hasher.update(data: try SpaceCARCodec.streamingIndexPrefix(recordCount: verification.recordCount))
+                var previousLength = -1
+                var previousPath = Data()
+                var seen = 0
+                while seen < verification.recordCount {
+                    let rows = try await connection.query(
+                        """
+                        SELECT path, cid, consumed FROM permissioned_remote_replica_import_index
+                        WHERE session_id = ? AND (length(path) > ? OR (length(path) = ? AND path > ?))
+                        ORDER BY length(path), path LIMIT ?
+                        """,
+                        [.text(sessionID), .integer(previousLength), .integer(previousLength),
+                         previousPath.sqliteData!, .integer(PermissionedRemoteReplicaRecoveryBudgets.maximumRowsPerPass)]
+                    )
+                    guard !rows.isEmpty else { throw PermissionedRemoteReplicaRecoveryError.corruptStaging }
+                    for row in rows {
+                        guard let pathBytes = remoteReplicaData(row, "path"),
+                              let path = String(data: pathBytes, encoding: .utf8),
+                              remoteReplicaInteger(row, "consumed") == 1,
+                              let cid = try? CID.parse(remoteReplicaText(row, "cid")) else {
+                            throw PermissionedRemoteReplicaRecoveryError.corruptStaging
+                        }
+                        hasher.update(data: try SpaceCARCodec.streamingIndexEntry(path: path, cid: cid))
+                        previousLength = pathBytes.count
+                        previousPath = pathBytes
+                        seen += 1
+                    }
+                }
+                let counts = try await connection.query(
+                    """
+                    SELECT COUNT(*) AS record_count, COALESCE(SUM(blocks.byte_count), 0) AS logical_bytes,
+                           COUNT(DISTINCT idx.cid) AS unique_count
+                    FROM permissioned_remote_replica_import_index AS idx
+                    JOIN permissioned_remote_replica_import_blocks AS blocks
+                      ON blocks.session_id = idx.session_id AND blocks.cid = idx.cid AND blocks.complete = 1
+                    WHERE idx.session_id = ?
+                    """, [.text(sessionID)]
+                )
+                let logical = remoteReplicaInteger(counts.first, "logical_bytes")
+                let unique = remoteReplicaInteger(counts.first, "unique_count")
+                guard seen == verification.recordCount,
+                      remoteReplicaInteger(counts.first, "record_count") == verification.recordCount,
+                      unique <= session.binding.limits.maximumUniqueBlocks,
+                      logical <= session.binding.limits.maximumLogicalRestoredBytes else {
+                    throw PermissionedRemoteReplicaRecoveryError.corruptStaging
+                }
+                return (CID(codec: .dagCBOR, multihash: .init(
+                    algorithm: Multihash.sha256Code, length: Multihash.sha256Length,
+                    digest: Data(hasher.finalize())
+                )), unique, logical)
+            }
+        }
+        try await stagePermissionedRemoteReplicaRoots(sessionID: sessionID, commit: commitCID, index: projection.index, now: now)
+        try await stagePermissionedRemoteReplicaCommit(sessionID: sessionID, cid: commitCID, body: metadata, now: now)
+        // Reuse the existing network-free publication receipt validation. Its
+        // root-named fields identify local immutable projections for STAR;
+        // no CAR bytes, signature, or synthetic signed envelope are created.
+        let receipt = VerifiedStreamingSpaceCARRecovery(
+            commitRootCID: commitCID, indexRootCID: projection.index,
+            wireRevision: try TID(tidString: verification.commit.rev),
+            recordCount: verification.recordCount, uniqueBlockCount: projection.uniqueCount,
+            verifiedExpectedWitnessCount: 0, ltHash: verification.ltHash,
+            commitment: verification.commit.data, commitBodyDigest: Data(SHA256.hash(data: metadata)),
+            receivedByteCount: verification.receivedByteCount, logicalRestoredByteCount: projection.logicalBytes
+        )
+        try await markPermissionedRemoteReplicaImportVerified(sessionID: sessionID, verification: receipt, now: now)
+    }
+
     public func markPermissionedRemoteReplicaImportVerified(
         sessionID: String,
         verification: VerifiedStreamingSpaceCARRecovery,
@@ -953,7 +1041,12 @@ extension SQLiteAccountDatabase:
                 throw PermissionedRemoteReplicaRecoveryError.staleRecovery
             }
 
-            let generation = (current?.generation ?? 0) + 1
+            let generationFloor = try await remoteReplicaGenerationFloor(space: session.binding.target.space)
+            let previousGeneration = max(current?.generation ?? 0, generationFloor)
+            guard previousGeneration < UInt64(Int.max) else {
+                throw PermissionedRemoteReplicaRecoveryError.targetCASConflict
+            }
+            let generation = previousGeneration + 1
             guard generation > 0, generation <= UInt64(Int.max) else {
                 throw PermissionedRemoteReplicaRecoveryError
                     .targetCASConflict
@@ -3109,19 +3202,23 @@ extension SQLiteAccountDatabase:
         ) else {
             throw PermissionedRemoteReplicaRecoveryError.corruptStaging
         }
-        let envelope: SpaceCommitEnvelope
-        do {
-            envelope = try SpaceCARCodec.structurallyValidateRecoveryCommit(
-                commitBody,
-                space: binding.target.space,
-                author: binding.target.repositoryDID
-            )
-        } catch {
-            throw PermissionedRemoteReplicaRecoveryError.corruptStaging
-        }
         let wireRevision: TID
+        let expectedCommitment: Data
         do {
-            wireRevision = try TID(tidString: envelope.context.rev)
+            if let commit = try? SpaceSTARCodec.decodeMetadata(
+                commitBody, space: binding.target.space, author: binding.target.repositoryDID
+            ) {
+                wireRevision = try TID(tidString: commit.rev)
+                expectedCommitment = commit.data
+            } else {
+                // Historical locally retained CAR recovery sessions remain
+                // readable; current network sessions only enter through STAR.
+                let envelope = try SpaceCARCodec.structurallyValidateRecoveryCommit(
+                    commitBody, space: binding.target.space, author: binding.target.repositoryDID
+                )
+                wireRevision = try TID(tidString: envelope.context.rev)
+                expectedCommitment = envelope.commitment
+            }
         } catch {
             throw PermissionedRemoteReplicaRecoveryError.corruptStaging
         }
@@ -3237,7 +3334,7 @@ extension SQLiteAccountDatabase:
             )
         )
         guard calculatedIndex == indexRoot,
-              ltHash.commitment == envelope.commitment else {
+              ltHash.commitment == expectedCommitment else {
             throw PermissionedRemoteReplicaRecoveryError.corruptStaging
         }
 

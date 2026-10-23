@@ -584,8 +584,11 @@ extension SpaceCredentialPresentationFailure {
     /// The lexicon error name each route renders with HTTP 401, matching the
     /// reference PDS (`AuthRequiredError(..., 'BadSpaceSignature' |
     /// 'BadSpaceAudience' | 'CredentialRevoked')`).
+    var httpStatus: HTTPResponse.Status { self == .unsupportedAuthorization ? .badRequest : .unauthorized }
+
     var xrpcErrorCode: String {
         switch self {
+        case .unsupportedAuthorization: "InvalidToken"
         case .badSignature: "BadSpaceSignature"
         case .badAudience: "BadSpaceAudience"
         case .revoked: "CredentialRevoked"

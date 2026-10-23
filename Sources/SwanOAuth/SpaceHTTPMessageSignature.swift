@@ -2,31 +2,13 @@ import Crypto
 import Foundation
 import PetrelCrypto
 
-/// HTTP Message Signatures (RFC 9421) as profiled by atproto spaces
-/// (atproto#5569, proposal 0016 at 0c9c2e88). They replace the Spaces-only
-/// DPoP binding that the earlier alphas used for the delegation exchange and
-/// for every space-credential presentation. Ordinary OAuth DPoP is unrelated
-/// and lives in ``OAuthDPoPProofValidator``.
-///
-/// Two shapes exist, both labelled `atproto-space`:
-///
-/// - Delegation exchange (`getSpaceCredential`): covers exactly
-///   `("authorization")` and must name the client's fresh P-256 `did:key` in
-///   a `keyid` parameter. The authority binds the credential to that key as
-///   `cnf.kid`.
-/// - Credential use: covers exactly `("authorization" "atproto-space-audience")`
-///   and is verified against the credential's `cnf.kid`. `keyid` is optional
-///   and must equal `cnf.kid` when present.
-///
-/// `alg` is optional and must be `ecdsa-p256-sha256` when present. Signatures
-/// are exactly 64 raw `r || s` bytes; DER is rejected and, unlike AT Protocol
-/// commit signatures, high-S values are accepted (the reference verifies
-/// with `allowMalleableSig`). There is deliberately no method/URL binding,
-/// access-token hash, per-request JTI, nonce, or freshness window: a
-/// signature may be reused for the same credential and audience while the
-/// credential itself is valid.
+/// October 22 credential presentation profile of HTTP Message Signatures.
+/// Covers the exact Authorization and Atproto-Space-Audience field bytes,
+/// requires tag=atproto-space-credential, and verifies the credential's P-256
+/// cnf.kid. Credential exchange carries its key identifier in the JSON body.
+/// Ordinary OAuth DPoP is separate.
 public enum SpaceHTTPSignature {
-    public static let label = "atproto-space"
+    public static let label = "atproto-space-credential"
     public static let algorithm = "ecdsa-p256-sha256"
     public static let authorizationComponent = "authorization"
     public static let audienceComponent = "atproto-space-audience"
@@ -58,10 +40,11 @@ public enum SpaceHTTPSignature {
         audience: String? = nil,
         key: P256.Signing.PrivateKey
     ) throws -> Headers {
-        let keyID = keyID(for: key)
-        let signatureParams = audience == nil
-            ? "(\"\(authorizationComponent)\");keyid=\"\(keyID)\""
-            : "(\"\(authorizationComponent)\" \"\(audienceComponent)\")"
+        guard audience != nil,
+              authorization.lowercased().hasPrefix("atproto-space-credential ") else {
+            throw SpaceHTTPSignatureError.wrongCoveredComponents
+        }
+        let signatureParams = "(\"\(authorizationComponent)\" \"\(audienceComponent)\");tag=\"\(label)\""
         let base = signatureBase(
             authorization: authorization,
             audience: audience,
@@ -90,11 +73,11 @@ public enum SpaceHTTPSignature {
         signature: [String],
         credentialKeyID: String?
     ) throws -> String {
-        guard authorization.count == 1 else {
+        guard credentialKeyID != nil, authorization.count == 1 else {
             throw SpaceHTTPSignatureError.duplicateOrMissingField
         }
         let authorizationValue = trimmedFieldValue(authorization[0])
-        guard !authorizationValue.isEmpty else {
+        guard authorizationValue.lowercased().hasPrefix("atproto-space-credential ") else {
             throw SpaceHTTPSignatureError.duplicateOrMissingField
         }
         var audienceValue: String?
@@ -134,9 +117,7 @@ public enum SpaceHTTPSignature {
             throw SpaceHTTPSignatureError.malformedSignature
         }
 
-        let expectedComponents = credentialKeyID == nil
-            ? [authorizationComponent]
-            : [authorizationComponent, audienceComponent]
+        let expectedComponents = [authorizationComponent, audienceComponent]
         let components: [String?] = input.items.map { item in
             guard item.parameters.isEmpty, case let .string(name) = item.value else {
                 return nil
@@ -145,6 +126,9 @@ public enum SpaceHTTPSignature {
         }
         guard components == expectedComponents.map(Optional.some) else {
             throw SpaceHTTPSignatureError.wrongCoveredComponents
+        }
+        guard input.parameters["tag"] == .string(label) else {
+            throw SpaceHTTPSignatureError.malformedSignature
         }
         if let alg = input.parameters["alg"] {
             guard alg == .string(algorithm) else {

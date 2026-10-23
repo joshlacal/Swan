@@ -654,7 +654,7 @@ public actor SQLitePreMigratedAccountDirectory:
     /// policy transaction commits.
     public func authorizeSimpleSpaceCredentialRead(
         space: SpaceURI,
-        user: String,
+        user: String?,
         clientID: String?,
         authorization: AuthorizationContext
     ) async throws {
@@ -1084,6 +1084,43 @@ public actor SQLitePreMigratedAccountDirectory:
     /// that was opened at startup. The durable repository applies aggregate
     /// read policy before it can read any record, and this facade rechecks
     /// account lifecycle/path validity before returning the opaque spool.
+    public func repositorySTARSnapshot(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositorySTARSnapshot? {
+        let database = try await preopenedRepositoryDatabase(
+            for: author,
+            authorization: authorization
+        )
+        guard let database else {
+            throw SwanError.unauthorized("account repository is unavailable")
+        }
+        do {
+            let repository = try DurableSpaceRepository(
+                database: database,
+                space: space,
+                author: author
+            )
+            let snapshot = try await repository.prepareSTARSnapshot(
+                authorization: authorization
+            )
+            guard try await isActiveAccount(author) else {
+                snapshot?.spool.cleanup()
+                throw SwanError.unauthorized("account repository is unavailable")
+            }
+            guard !isClosed else {
+                snapshot?.spool.cleanup()
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return snapshot
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
     public func repositoryCARSnapshot(
         space: SpaceURI,
         author: String,

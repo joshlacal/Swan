@@ -33,10 +33,7 @@ let package = Package(
         // `spaceRev`, notifyCredentialRevoked) on the same Swan line as the
         // September 10 pin, keeping Swan's request-body-digest security
         // baseline and service-JWT protections.
-        .package(
-            url: "https://github.com/joshlacal/Petrel.git",
-            revision: "f15887c9975e12af534f3ac7e72bac404142a0e0"
-        ),
+        .package(path: "../Petrel"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.36.0"),

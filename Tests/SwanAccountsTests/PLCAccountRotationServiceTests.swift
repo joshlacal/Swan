@@ -11,6 +11,41 @@ import XCTest
 @testable import SwanAccounts
 
 final class PLCAccountRotationServiceTests: XCTestCase {
+    func testKEMBackfillIsIdempotentAndSigningRotationPreservesKEM() async throws {
+        let recorder = RecordingLifecycleEmitter()
+        let fixture = try await makeFixture(lifecycleEmitter: recorder)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let first = try await fixture.service.backfillKEM(did: fixture.did, expectedPDSOrigin: URL(string: "https://swan.example")!, now: fixture.now)
+        XCTAssertTrue(first.publishedNewOperation)
+        XCTAssertEqual(first.generation, 1)
+        let original = try await AccountKEMKeyProvider(keyStore: fixture.keyStore).privateKey(accountDID: fixture.did)
+        let second = try await fixture.service.backfillKEM(did: fixture.did, expectedPDSOrigin: URL(string: "https://swan.example")!, now: fixture.now)
+        XCTAssertFalse(second.publishedNewOperation)
+        XCTAssertEqual(first.operationCID, second.operationCID)
+        let rotated = try await fixture.service.rotate(did: fixture.did, now: fixture.now)
+        XCTAssertEqual(rotated.generation, 2)
+        XCTAssertEqual(rotated.operation.regular?.verificationMethods["atproto_kem"], try AccountKEMKeyProvider.didKey(original.publicKey))
+        let reloaded = try await AccountKEMKeyProvider(keyStore: fixture.keyStore).privateKey(accountDID: fixture.did)
+        XCTAssertEqual(original.rawRepresentation, reloaded.rawRepresentation)
+        let emissions = await recorder.snapshot()
+        XCTAssertEqual(emissions.first?.plcOperationCID, first.operationCID)
+        try await fixture.opener.close()
+        try await fixture.control.close()
+    }
+
+    func testKEMBackfillRejectsDifferentPDSBeforeCreatingLocalKey() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            _ = try await fixture.service.backfillKEM(did: fixture.did, expectedPDSOrigin: URL(string: "https://other.example")!, now: fixture.now)
+            XCTFail("backfill accepted a different host")
+        } catch { XCTAssertEqual(error as? PLCAccountRotationError, .conflict) }
+        let key = try await fixture.keyStore.keyIfPresent(for: AccountKEMKeyProvider.reference(accountDID: fixture.did))
+        XCTAssertNil(key)
+        try await fixture.opener.close()
+        try await fixture.control.close()
+    }
+
     func testRotationPersistsPendingHistoryAndPromotesControlGeneration() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }

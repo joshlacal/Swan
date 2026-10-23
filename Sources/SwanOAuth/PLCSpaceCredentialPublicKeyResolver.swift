@@ -648,13 +648,6 @@ public actor PLCSpaceCredentialPublicKeyResolver:
     }
 
     private static func methodNames(for keyID: String) -> [String]? {
-        switch keyID {
-        case PermissionedDataJWT.spaceCredentialKeyID:
-            ["atproto_space", "atproto"]
-        case PermissionedDataJWT.spaceCredentialFallbackKeyID:
-            ["atproto"]
-        default:
-            nil
-        }
+        keyID == "#atproto" ? ["atproto"] : nil
     }
 }

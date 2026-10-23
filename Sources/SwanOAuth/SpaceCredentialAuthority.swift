@@ -77,7 +77,7 @@ public protocol SpaceCredentialPublicKeyResolver: Sendable {
 public protocol SpaceCredentialAuthoritySigner: Sendable {
     func issueSpaceCredential(
         space: SpaceURI,
-        user: String,
+        user: String?,
         authorization: AuthorizationContext,
         clientAttestation: String?,
         confirmationKeyID: String,
@@ -133,6 +133,7 @@ public struct VerifiedSpaceCredentialPresentation: Sendable {
 /// The presentation failures the protocol names on the wire. Every other
 /// credential failure keeps Swan's existing opaque denial.
 public enum SpaceCredentialPresentationFailure: Error, Sendable, Equatable {
+    case unsupportedAuthorization
     /// `BadSpaceSignature`: missing, duplicated, malformed, or invalid HTTP
     /// message signature or audience field.
     case badSignature
@@ -837,7 +838,7 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
 
     public func issueSpaceCredential(
         space: SpaceURI,
-        user: String,
+        user: String?,
         authorization: AuthorizationContext,
         clientAttestation: String? = nil,
         confirmationKeyID: String,
@@ -854,12 +855,14 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
             requesterMatches = subject == user
         case let .spaceDelegation(subject, delegatedSpace):
             requesterMatches = subject == user && delegatedSpace == space
+        case .public:
+            requesterMatches = user == nil
         default:
             requesterMatches = false
         }
         guard requesterMatches,
               PermissionedDataJWT.isValidConfirmationKeyID(confirmationKeyID),
-              (try? AccountIdentifiers.validateDID(user)) != nil else {
+              user == nil || (try? AccountIdentifiers.validateDID(user!)) != nil else {
             throw SwanError.unauthorized("credential requester does not match the requested user")
         }
         let clientID: String?
@@ -937,7 +940,7 @@ public struct DurableSpaceDelegationVerifier: SpaceDelegationAuthorizationVerifi
         now: Date = Date()
     ) async throws -> VerifiedSpaceDelegation {
         let inspection = try PermissionedDataJWT.inspectDelegationToken(token)
-        let expectedAudience = "\(expectedSpace.authority)#atproto_space_host"
+        let expectedAudience = "\(expectedSpace.authority)#atproto_pds"
         guard inspection.claims.aud == expectedAudience,
               inspection.claims.sub == expectedSpace.rawValue else {
             throw SwanError.unauthorized("delegation token does not match the requested authority or space")

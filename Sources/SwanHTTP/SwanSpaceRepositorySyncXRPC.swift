@@ -60,90 +60,33 @@ private struct AuthenticatedGetRepoHandler:
 
     struct PreparedResponse: Sendable {
         let prefix: Data
-        let spool: SpaceCARBodySpool
-        /// `excludeValues`: stream the [commit, index] roots with no record
-        /// blocks, as the reference `serializeRepo` does.
-        let indexBlockOnly: Bool
+        let spool: SpaceSTARBodySpool
+        let mac: Data?
     }
 
-    func prepare(
-        parameters: ComAtprotoSpaceGetRepo.Parameters,
-        context request: Request
-    ) async throws -> PreparedResponse {
+    func prepare(parameters: ComAtprotoSpaceGetRepo.Parameters, context request: Request) async throws -> PreparedResponse {
         let target = try syncTarget(parameters.space, parameters.repo)
         let authorization = try await authorizeRepositorySyncRead(
-            capability,
-            request: request,
-            expectedSpace: target.space,
-            expectedAudience: target.author,
-            fixedPath: "/xrpc/com.atproto.space.getRepo"
+            capability, request: request, expectedSpace: target.space,
+            expectedAudience: target.author, fixedPath: "/xrpc/com.atproto.space.getRepo"
         )
         try requireRepositoryReadAuthorization(authorization, author: target.author)
-        let snapshot: AuthorizedSpaceRepositoryCARSnapshot?
+        let secret = try await spaceResponseMACSecret(
+            request: request, author: target.author, type: .repository, provider: capability.commitSigner
+        )
+        guard let snapshot = try await capability.directory.repositorySTARSnapshot(
+            space: target.space, author: target.author, authorization: authorization
+        ) else { throw AuthenticatedSpaceRepositorySyncFailure.repoNotFound }
         do {
-            snapshot = try await capability.directory.repositoryCARSnapshot(
-                space: target.space,
-                author: target.author,
-                authorization: authorization
-            )
-        } catch let error as SwanError {
-            if case .unauthorized = error {
-                throw AuthenticatedSpaceRepositorySyncFailure.denied
-            }
-            if case .malformed = error {
-                throw AuthenticatedSpaceRepositorySyncFailure.invalidRequest
-            }
-            throw AuthenticatedSpaceRepositorySyncFailure.unavailable
-        } catch {
-            throw AuthenticatedSpaceRepositorySyncFailure.unavailable
-        }
-        guard let snapshot else {
-            throw AuthenticatedSpaceRepositorySyncFailure.repoNotFound
-        }
-
-        do {
-            guard snapshot.state.space == target.space,
-                  snapshot.state.author == target.author,
-                  snapshot.state.commitment.count == 32,
-                  let revision = snapshot.state.wireRevision
-            else {
+            guard snapshot.state.space == target.space, snapshot.state.author == target.author,
+                  let revision = snapshot.state.wireRevision else {
                 throw AuthenticatedSpaceRepositorySyncFailure.unavailable
             }
-            _ = try TID(tidString: revision)
-            let envelope = try await capability.commitSigner.signRepositoryCommit(
-                space: target.space,
-                author: target.author,
-                wireRevision: revision,
-                commitment: snapshot.state.commitment
-            )
-            guard envelope.ver == 1,
-                  envelope.context.space == target.space,
-                  envelope.context.author == target.author,
-                  envelope.context.rev == revision,
-                  envelope.commitment == snapshot.state.commitment,
-                  SpaceCommitCodec.verifyContentBinding(envelope)
-            else {
-                throw AuthenticatedSpaceRepositorySyncFailure.unavailable
-            }
-            let indexBlockOnly = parameters.excludeValues == true
-            if indexBlockOnly, snapshot.spool.indexBlockByteCount == nil {
-                throw AuthenticatedSpaceRepositorySyncFailure.unavailable
-            }
-            return PreparedResponse(
-                prefix: try SpaceCARCodec.recoveryPrefix(
-                    commit: envelope,
-                    indexCID: snapshot.spool.indexCID
-                ),
-                spool: snapshot.spool,
-                indexBlockOnly: indexBlockOnly
-            )
-        } catch {
-            snapshot.spool.cleanup()
-            if let failure = error as? AuthenticatedSpaceRepositorySyncFailure {
-                throw failure
-            }
-            throw AuthenticatedSpaceRepositorySyncFailure.unavailable
-        }
+            let commit = try SpaceRepositoryCommit(repo: target.author, space: target.space,
+                                                   rev: revision, data: snapshot.state.commitment)
+            return PreparedResponse(prefix: try SpaceSTARCodec.prefix(commit: commit),
+                                    spool: snapshot.spool, mac: try secret.map { try commit.mac(sharedSecret: $0) })
+        } catch { snapshot.spool.cleanup(); throw error }
     }
 
     func handle(
@@ -262,7 +205,7 @@ private struct AuthenticatedListRepoOpsHandler:
             throw AuthenticatedSpaceRepositorySyncFailure.fullRecoveryRequired
         case let .incremental(state, entries):
             let operations = try entries.map(syncWireOperation)
-            let commit: ComAtprotoSpaceDefs.SignedCommit?
+            let commit: ComAtprotoSpaceDefs.Commit?
             // This is deliberately the reference condition, not `ops.isEmpty`:
             // an exactly-full final page does not bind a head commit until the
             // caller asks again and receives the short/empty page. Storage can
@@ -452,34 +395,16 @@ private func signedCommit(
     expectedSpace: SpaceURI,
     expectedAuthor: String,
     capability: SwanAuthenticatedSpaceRepositorySyncCapability
-) async throws -> ComAtprotoSpaceDefs.SignedCommit? {
+) async throws -> ComAtprotoSpaceDefs.Commit? {
     guard let revision = state.wireRevision else { return nil }
-    let envelope: SpaceCommitEnvelope
-    do {
-        envelope = try await capability.commitSigner.signRepositoryCommit(
-            space: expectedSpace,
-            author: expectedAuthor,
-            wireRevision: revision,
-            commitment: state.commitment
-        )
-    } catch {
-        throw AuthenticatedSpaceRepositorySyncFailure.unavailable
-    }
-    guard envelope.ver == 1,
-          envelope.context.space == expectedSpace,
-          envelope.context.author == expectedAuthor,
-          envelope.context.rev == revision,
-          envelope.commitment == state.commitment,
-          SpaceCommitCodec.verifyContentBinding(envelope) else {
+    guard state.space == expectedSpace, state.author == expectedAuthor,
+          state.commitment.count == 32 else {
         throw AuthenticatedSpaceRepositorySyncFailure.unavailable
     }
     return .init(
-        ver: envelope.ver,
-        hash: Bytes(data: envelope.commitment),
-        ikm: Bytes(data: envelope.context.ikm),
-        sig: Bytes(data: envelope.contextSignature),
-        mac: Bytes(data: envelope.contentBinding),
-        rev: try TID(tidString: envelope.context.rev)
+        ver: 1, repo: try DID(didString: expectedAuthor),
+        space: try SpaceRef(uriString: expectedSpace.rawValue),
+        rev: try TID(tidString: revision), data: Bytes(data: state.commitment)
     )
 }
 
@@ -559,7 +484,14 @@ func registerAuthenticatedGetLatestCommitEndpoint(
             }
             do {
                 let output = try await handler.handle(parameters: parameters, input: (), context: request)
-                return authenticatedGetLatestCommitJSON(.ok, output)
+                let secret = try await spaceResponseMACSecret(
+                    request: request, author: parameters.repo.didString(), type: .repository,
+                    provider: capability.commitSigner
+                )
+                let mac = try secret.map { try responseCommit(output.commit).mac(sharedSecret: $0) }
+                return try withSpaceResponseMAC(authenticatedGetLatestCommitJSON(.ok, output), mac: mac, type: .repository)
+            } catch is SpaceMACHeaders.HeaderError {
+                return authenticatedRepositorySyncError(.badRequest, code: "BadSpaceMac")
             } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
                 return authenticatedRepositorySyncResponse(for: failure, capability: capability)
             } catch {
@@ -593,7 +525,17 @@ func registerAuthenticatedListRepoOpsEndpoint(
         }
         do {
             let output = try await handler.handle(parameters: parameters, input: (), context: request)
-            return authenticatedListRepoOpsJSON(.ok, output, lease: lease)
+            let secret = try await spaceResponseMACSecret(
+                request: request, author: parameters.repo.didString(), type: .repository,
+                provider: capability.commitSigner
+            )
+            let mac: Data?
+            if let secret, let commit = output.commit { mac = try responseCommit(commit).mac(sharedSecret: secret) }
+            else { mac = nil }
+            return try withSpaceResponseMAC(authenticatedListRepoOpsJSON(.ok, output, lease: lease), mac: mac, type: .repository)
+        } catch is SpaceMACHeaders.HeaderError {
+            lease.release()
+            return authenticatedRepositorySyncError(.badRequest, code: "BadSpaceMac")
         } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
             lease.release()
             return authenticatedRepositorySyncResponse(for: failure, capability: capability)
@@ -622,23 +564,23 @@ func registerAuthenticatedGetRepoEndpoint(
             let prepared = try await handler.prepare(parameters: parameters, context: request)
             // No content length is supplied: writing directly from the private
             // spool is the deliberate bounded-memory transport contract.
-            return Response(
+            return try withSpaceResponseMAC(Response(
                 status: .ok,
                 headers: [
-                    .contentType: "application/vnd.ipld.car",
+                    .contentType: SpaceSTARCodec.mediaType,
                     .cacheControl: "no-store",
                 ],
                 body: .init { writer in
                     defer { prepared.spool.cleanup() }
                     try await writer.write(ByteBuffer(data: prepared.prefix))
-                    try await prepared.spool.streamBody(
-                        indexBlockOnly: prepared.indexBlockOnly
-                    ) { chunk in
+                    try await prepared.spool.streamBody { chunk in
                         try await writer.write(ByteBuffer(data: chunk))
                     }
                     try await writer.finish(nil)
                 }
-            )
+            ), mac: prepared.mac, type: .repository)
+        } catch is SpaceMACHeaders.HeaderError {
+            return authenticatedRepositorySyncError(.badRequest, code: "BadSpaceMac")
         } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
             return authenticatedRepositorySyncResponse(for: failure, capability: capability)
         } catch {
@@ -655,10 +597,7 @@ private let spaceListRepoOpsQuerySchema = StrictQuerySchema(
     required: ["space", "repo"],
     optional: ["since", "limit", "cursor", "excludeValues"]
 )
-private let spaceGetRepoQuerySchema = StrictQuerySchema(
-    required: ["space", "repo"],
-    optional: ["excludeValues"]
-)
+private let spaceGetRepoQuerySchema = StrictQuerySchema(required: ["space", "repo"])
 
 private func parseAuthenticatedGetLatestCommitParameters(
     _ request: Request
@@ -725,8 +664,7 @@ private func parseAuthenticatedGetRepoParameters(
         didString: try requiredQueryValue("repo", in: query, maximumBytes: 2_048)
     )
     _ = try syncTarget(space, repo)
-    let excludeValues = try query["excludeValues"].map(strictBoolean)
-    return .init(space: space, repo: repo, excludeValues: excludeValues)
+    return .init(space: space, repo: repo)
 }
 
 private func strictRepositoryOplogLimit(_ value: String) throws -> Int {
@@ -769,7 +707,7 @@ private func authenticatedRepositorySyncResponse(
     case .denied:
         authenticatedRepositorySyncError(.unauthorized, code: "Unauthorized")
     case let .credentialPresentation(failure):
-        authenticatedRepositorySyncError(.unauthorized, code: failure.xrpcErrorCode)
+        authenticatedRepositorySyncError(failure.httpStatus, code: failure.xrpcErrorCode)
     case .nonceChallenge:
         authenticatedGetSpaceNonceChallenge(authorizer: capability.authorizer)
     case .fullRecoveryRequired:
@@ -798,10 +736,9 @@ private func authenticatedRepositorySyncError(
 /// wire projection after the generated handler has performed typed work.
 private struct SignedCommitWireOutput: Encodable {
     let ver: Int
-    let hash: Bytes
-    let ikm: Bytes
-    let sig: Bytes
-    let mac: Bytes
+    let repo: String
+    let space: String
+    let data: Bytes
     let rev: String
 }
 
@@ -843,15 +780,14 @@ private struct RepoOplogWireEntry: Encodable {
 }
 
 private func signedCommitWire(
-    _ commit: ComAtprotoSpaceDefs.SignedCommit?
+    _ commit: ComAtprotoSpaceDefs.Commit?
 ) -> SignedCommitWireOutput? {
     commit.map {
         SignedCommitWireOutput(
             ver: $0.ver,
-            hash: $0.hash,
-            ikm: $0.ikm,
-            sig: $0.sig,
-            mac: $0.mac,
+            repo: $0.repo.didString(),
+            space: $0.space.uriString(),
+            data: $0.data,
             rev: $0.rev.toString()
         )
     }
@@ -891,4 +827,9 @@ private func authenticatedListRepoOpsJSON(
         maximumBytes: PublicRepositoryJSONReadLimits.maximumListRecordsResponseBytes,
         lease: lease
     )
+}
+
+private func responseCommit(_ commit: ComAtprotoSpaceDefs.Commit) throws -> SpaceRepositoryCommit {
+    try SpaceRepositoryCommit(ver: commit.ver, repo: commit.repo.didString(),
+                              space: SpaceURI(commit.space.uriString()), rev: commit.rev.toString(), data: commit.data.data)
 }

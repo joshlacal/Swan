@@ -114,6 +114,16 @@ public enum SQLiteLayout {
 
     public static let controlMigrations = controlConnectionPragmas + [
         "CREATE TABLE IF NOT EXISTS accounts (did TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL)",
+        """
+        CREATE TABLE IF NOT EXISTS account_kem_backfill (
+            account_did TEXT PRIMARY KEY REFERENCES accounts(did) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK(status IN ('pending', 'published', 'manual')),
+            lease_token TEXT,
+            lease_until INTEGER,
+            next_attempt_at INTEGER NOT NULL DEFAULT 0,
+            completed_at INTEGER
+        )
+        """,
         // Dedicated additive marker. Version 1 records the pre-account
         // program control schema; versions 2-7 are reserved in dependency
         // order and must never be reordered by a later lane.
@@ -124,6 +134,7 @@ public enum SQLiteLayout {
         "INSERT OR IGNORE INTO control_schema_migrations(version, applied_at) VALUES (4, unixepoch())",
         "INSERT OR IGNORE INTO control_schema_migrations(version, applied_at) VALUES (5, unixepoch())",
         "INSERT OR IGNORE INTO control_schema_migrations(version, applied_at) VALUES (6, unixepoch())",
+        "INSERT OR IGNORE INTO control_schema_migrations(version, applied_at) VALUES (10, unixepoch())",
         """
         CREATE TABLE IF NOT EXISTS identity_bindings (
             account_did TEXT PRIMARY KEY REFERENCES accounts(did) ON DELETE CASCADE,
@@ -776,6 +787,15 @@ public enum SQLiteLayout {
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS permissioned_remote_replica_lifecycles (
+            space_uri TEXT PRIMARY KEY,
+            generation_floor INTEGER NOT NULL CHECK(generation_floor >= 0),
+            retired_event_id TEXT NOT NULL,
+            adopted_at INTEGER,
+            credential_digest BLOB CHECK(credential_digest IS NULL OR length(credential_digest) = 32)
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS permissioned_space_recipient_tombstones (
             space_uri TEXT PRIMARY KEY,
             authority_did TEXT NOT NULL,
@@ -1374,6 +1394,7 @@ public enum SQLiteLayout {
             operation_signing_did_key TEXT NOT NULL,
             operation_rotation_did_key TEXT NOT NULL,
             operation_signature TEXT NOT NULL,
+            operation_kem_did_key TEXT,
             signing_key_reference TEXT NOT NULL,
             rotation_key_reference TEXT NOT NULL,
             public_genesis_commit_cid TEXT,
@@ -2709,6 +2730,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             ) {
                 _ = try await connection.query(statement)
             }
+            try await migratePLCAccountKEMIdentityIfNeeded()
             try await migratePermissionedRepositoryStorageIfNeeded()
             try await migratePermissionedOutboxLeasesIfNeeded()
             try await migrateFileBackedBlobSchemaIfNeeded()
@@ -2755,6 +2777,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             _ = try? await garbageCollectPublicRepositoryBlocksWithoutGate(state: state)
         }
     }
+    /// Additive public identity projection. Legacy genesis operations retain NULL.
+    private func migratePLCAccountKEMIdentityIfNeeded() async throws {
+        let columns = try await connection.query("PRAGMA table_info(plc_account_preparation_journal)")
+        if !columns.contains(where: { $0.column("name")?.string == "operation_kem_did_key" }) {
+            _ = try await connection.query("ALTER TABLE plc_account_preparation_journal ADD COLUMN operation_kem_did_key TEXT")
+        }
+    }
+
     private func migratePermissionedSpaceWriterForeignKeyIfNeeded() async throws {
         let version = Self.permissionedSpaceWriterForeignKeyMigrationVersion
         let applied = try await connection.query(
@@ -6146,6 +6176,80 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// files are written. It is released before Hummingbird can write a byte
     /// to a client, so a slow/disconnected client cannot hold a database
     /// transaction open.
+    /// Produces a validated STAR record suffix from one read snapshot. Only
+    /// one row of path metadata and fixed-size value chunks are resident;
+    /// the private unlinked spool releases the transaction before HTTP starts.
+    public func prepareRepositorySTARSnapshot(
+        space: SpaceURI, author: String, authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositorySTARSnapshot? {
+        try requireAccount(author)
+        let admission = testingHooks.permissionedCARSpoolAdmission ?? sqlitePermissionedCARSpoolAdmission
+        return try await withConnectionGate {
+            try await writerReadTransaction {
+                try await requireLocalRepositorySpaceOpen(space, authorization: authorization)
+                guard let state = try await loadState(space: space, author: author) else { return nil }
+                let metrics = try await requireRepositoryCARProductionAdmission(space: space, author: author)
+                guard let lease = admission?.reserve(
+                    accountDID: author,
+                    maximumBytes: metrics.totalValueBytes + 2 * metrics.logicalMetadataBytes + 65_536
+                ) else { throw SpaceCARProductionLimits.limitExceeded() }
+                var transferred = false
+                var handle: FileHandle?
+                defer {
+                    if !transferred { try? handle?.close(); lease.release() }
+                }
+                let body = try SQLiteProtectedPaths.makeUnlinkedPermissionedCARSpool(in: dataDirectory)
+                handle = body
+                await testingHooks.afterSnapshotStateRead?()
+                var cursor = Data()
+                var totalBytes = 0
+                var count = 0
+                var setHash = LtHash()
+                while true {
+                    try Task.checkCancellation()
+                    let rows = try await connection.query(
+                        """
+                        SELECT collection, rkey, cid, revision, length(value) AS value_byte_count
+                        FROM permissioned_space_records
+                        WHERE space_uri = ? AND author_did = ?
+                          AND CAST(collection || '/' || rkey AS BLOB) > ?
+                        ORDER BY CAST(collection || '/' || rkey AS BLOB)
+                        LIMIT 1
+                        """,
+                        [.text(space.rawValue), .text(author), cursor.sqliteData!]
+                    )
+                    guard let row = rows.first else { break }
+                    let record = try decodeRepositoryCARRecordMetadata(row, space: space, author: author)
+                    let path = "\(record.uri.collection)/\(record.uri.rkey)"
+                    let pathBytes = Data(path.utf8)
+                    guard cursor.lexicographicallyPrecedes(pathBytes) else {
+                        throw SQLiteRepositoryError.corruptDatabase("STAR record order is invalid")
+                    }
+                    let cid = try repositoryCARCID(for: record)
+                    let prefix = try SpaceSTARCodec.framePrefix(path: path, valueByteCount: record.valueByteCount)
+                    try reserveRepositoryCARBodyBytes(prefix.count + record.valueByteCount, currentByteCount: &totalBytes)
+                    try writeCARSpoolData(prefix, to: body)
+                    try await streamAndValidateRepositoryCARValue(for: record, expectedCID: cid, to: body)
+                    setHash.add(element: "\(path)/\(cid.string)")
+                    cursor = pathBytes
+                    count += 1
+                }
+                guard count == metrics.recordCount, setHash.commitment == state.commitment else {
+                    throw SQLiteRepositoryError.corruptDatabase("STAR snapshot digest is invalid")
+                }
+                try body.synchronize()
+                let spool = try SpaceSTARBodySpool(fileHandle: body, bodyByteCount: totalBytes, lease: lease)
+                transferred = true
+                return AuthorizedSpaceRepositorySTARSnapshot(
+                    state: AuthorizedSpaceRepositoryCommitState(
+                        space: space, author: author, wireRevision: state.wireRevision.toString(),
+                        commitment: state.commitment
+                    ), spool: spool
+                )
+            }
+        }
+    }
+
     public func prepareRepositoryCARSnapshot(
         space: SpaceURI,
         author: String,
@@ -9026,6 +9130,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let timestamp = try simpleSpaceTimestamp(now)
         try await withConnectionGate {
             try await transaction {
+                let retired = try await connection.query(
+                    "SELECT 1 FROM permissioned_remote_replica_lifecycles WHERE space_uri = ? AND retired_event_id = ? AND adopted_at IS NOT NULL",
+                    [.text(space.rawValue), .text(eventID)]
+                )
+                guard retired.isEmpty else { return }
                 // The deletion service JWT binds the space URI via `req`
                 // (requestBodyDigest) and the event ID is consumed transactionally.
                 // The pinned receiver bounds this by no-oping unless the
@@ -9116,6 +9225,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         .integer(timestamp),
                     ]
                 )
+                try await retainRemoteReplicaGenerationFloor(space: space, eventID: eventID)
                 // Records must precede blocks because their FK deliberately
                 // has no cascade. Block chunks and import staging cascade from
                 // their exact-space parent rows. Repeat notices also clean up
@@ -9160,11 +9270,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// mutates membership or carries policy state in memory across a restart.
     public func authorizeSimpleSpaceRead(
         space: SpaceURI,
-        user: String,
+        user: String?,
         clientID: String?,
         authorization: AuthorizationContext
     ) async throws {
-        guard isValidSimpleSpaceDID(user) else {
+        if let user, !isValidSimpleSpaceDID(user) {
             throw SwanError.invalidIdentifier(user)
         }
         if let clientID { try validateSimpleSpaceAppIdentifier(clientID) }
@@ -9180,6 +9290,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 guard !stored.state.space.isDeleted else {
                     throw AuthorizedSimpleSpaceLifecycleError.deleted
                 }
+                if user == nil, stored.state.space.configuration.readPolicy != .public {
+                    throw AuthorizedSimpleSpaceLifecycleError.notFound
+                }
                 switch stored.state.space.configuration.appAccess {
                 case .open:
                     break
@@ -9193,11 +9306,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     case .public:
                         break
                     case .memberList:
-                        guard stored.state.space.members[user]?.read == true else {
+                        guard user.flatMap { stored.state.space.members[$0] }?.read == true else {
                             throw SwanError.unauthorized("user is not a space member")
                         }
                     case .managingApp:
-                        guard stored.managingAppReadAllowedUsers.contains(user) else {
+                        guard user.map { stored.managingAppReadAllowedUsers.contains($0) } == true else {
                             throw SwanError.unauthorized("managing app denied user access")
                         }
                     }
@@ -11258,7 +11371,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// the separately modeled managing-app decision endpoint.
     private func requireSimpleSpaceCredentialRequester(
         space: SpaceURI,
-        user: String,
+        user: String?,
         authorization: AuthorizationContext
     ) throws {
         switch authorization {
@@ -11300,7 +11413,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             throw SwanError.unauthorized(
                 "account session cannot mint permissioned-space credentials"
             )
-        case .public, .service:
+        case .public:
+            guard user == nil else { throw SwanError.unauthorized("anonymous requester has a user") }
+        case .service:
             throw SwanError.unauthorized(
                 "credential issuance requires a user OAuth or delegated grant"
             )
@@ -13606,6 +13721,12 @@ public actor DurableSpaceRepository {
     /// same aggregate read policy used by the repository endpoints. In
     /// particular, a collection-qualified OAuth scope cannot downgrade this
     /// into a partial repository export.
+    public func prepareSTARSnapshot(authorization: AuthorizationContext)
+        async throws -> AuthorizedSpaceRepositorySTARSnapshot? {
+        try requireRead(uri: nil, authorization: authorization)
+        return try await database.prepareRepositorySTARSnapshot(space: space, author: author, authorization: authorization)
+    }
+
     public func prepareCARSnapshot(
         authorization: AuthorizationContext
     ) async throws -> AuthorizedSpaceRepositoryCARSnapshot? {

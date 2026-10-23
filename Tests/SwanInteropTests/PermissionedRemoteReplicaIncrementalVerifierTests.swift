@@ -1,6 +1,7 @@
 import Crypto
 import Foundation
 import Petrel
+import PetrelCrypto
 @testable import SwanInterop
 import SwanOAuth
 import SwanSpaces
@@ -15,7 +16,7 @@ final class PermissionedRemoteReplicaIncrementalVerifierTests: XCTestCase {
             commit: fixture.commit,
             base: fixture.base,
             target: fixture.target,
-            verificationKey: .p256(fixture.key.publicKey)
+            sharedSecret: fixture.sharedSecret, mac: fixture.mac
         )
 
         XCTAssertEqual(verified.operations.count, 2)
@@ -30,7 +31,7 @@ final class PermissionedRemoteReplicaIncrementalVerifierTests: XCTestCase {
         )
         XCTAssertEqual(
             verified.terminalHead.commitment,
-            fixture.commit.hash.data
+            fixture.commit.data.data
         )
     }
 
@@ -41,7 +42,7 @@ final class PermissionedRemoteReplicaIncrementalVerifierTests: XCTestCase {
             commit: fixture.commit,
             base: fixture.base,
             target: fixture.target,
-            verificationKey: .p256(fixture.key.publicKey)
+            sharedSecret: fixture.sharedSecret, mac: fixture.mac
         )) { error in
             XCTAssertEqual(
                 error as? PermissionedRemoteReplicaIncrementalVerificationError,
@@ -66,7 +67,7 @@ final class PermissionedRemoteReplicaIncrementalVerifierTests: XCTestCase {
             commit: fixture.commit,
             base: fixture.base,
             target: fixture.target,
-            verificationKey: .p256(fixture.key.publicKey)
+            sharedSecret: fixture.sharedSecret, mac: fixture.mac
         )) { error in
             XCTAssertEqual(
                 error as? PermissionedRemoteReplicaIncrementalVerificationError,
@@ -79,11 +80,11 @@ final class PermissionedRemoteReplicaIncrementalVerifierTests: XCTestCase {
         let fixture = try Fixture()
         let page = try PermissionedRemoteReplicaFreshnessWitness(
             wireRevision: fixture.secondRevision,
-            commitment: fixture.commit.hash.data
+            commitment: fixture.commit.data.data
         )
         let latest = try PermissionedRemoteReplicaFreshnessWitness(
             wireRevision: try TID(tidString: "222222222222d"),
-            commitment: fixture.commit.hash.data
+            commitment: fixture.commit.data.data
         )
         XCTAssertThrowsError(
             try PermissionedRemoteReplicaIncrementalVerifier.requireSameHead(
@@ -102,8 +103,9 @@ private struct Fixture {
     let target: PermissionedRemoteReplicaTarget
     let base: PermissionedRemoteReplicaIncrementalBaseState
     let operations: [ComAtprotoSpaceListRepoOps.OpEntry]
-    let commit: ComAtprotoSpaceDefs.SignedCommit
-    let key: P256.Signing.PrivateKey
+    let commit: ComAtprotoSpaceDefs.Commit
+    let sharedSecret = Data(repeating: 0x42, count: 32)
+    let mac: Data
     let firstRevision: TID
     let secondRevision: TID
 
@@ -169,24 +171,13 @@ private struct Fixture {
         var finalHash = LtHash()
         finalHash.add(element: "app.bsky.feed.post/one/\(firstCID.string)")
         finalHash.add(element: "app.bsky.feed.post/two/\(secondCID.string)")
-        key = P256.Signing.PrivateKey()
-        let envelope = try SpaceCommitCodec.sign(
-            context: try SpaceCommitContext(
-                space: space,
-                author: repository,
-                rev: secondRevision.toString(),
-                ikm: Data(repeating: 0x42, count: 32)
-            ),
-            commitment: finalHash.commitment,
-            key: key
-        )
         commit = .init(
-            ver: envelope.ver,
-            hash: Bytes(data: envelope.commitment),
-            ikm: Bytes(data: envelope.context.ikm),
-            sig: Bytes(data: envelope.contextSignature),
-            mac: Bytes(data: envelope.contentBinding),
-            rev: try TID(tidString: envelope.context.rev)
+            ver: 1, repo: try DID(didString: repository), space: try SpaceRef(uriString: space.rawValue),
+            rev: secondRevision, data: Bytes(data: finalHash.commitment)
+        )
+        mac = try SpaceMAC.commit(
+            sharedSecret: sharedSecret, space: space.rawValue, repo: repository,
+            rev: secondRevision.toString(), data: finalHash.commitment
         )
     }
 }

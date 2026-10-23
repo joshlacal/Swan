@@ -91,7 +91,7 @@ public struct StaticSwanSpaceNotificationDestinations:
 
 /// `--enable-spaces-open-interop` (decision B(c)): an operator-configured
 /// destination wins; otherwise the authority's DID document decides —
-/// `#atproto_space_host` (type `AtprotoSpaceHost`), else `#atproto_pds`.
+/// `#atproto_pds` (type `AtprotoSpaceHost`), else `#atproto_pds`.
 /// A present-but-malformed entry is an error, so the outbox row retries
 /// rather than silently routing elsewhere.
 public struct SwanOpenFederationAuthorityNotificationDestinations:
@@ -419,7 +419,7 @@ private func notificationJSON(
         space: SpaceRef(uriString: space.rawValue),
         repo: DID(didString: repository),
         repoRev: revision,
-        hash: Bytes(data: commitment),
+        data: Bytes(data: commitment),
         spaceRev: spaceRev,
         prevSpaceRev: prevSpaceRev
     )

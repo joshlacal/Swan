@@ -72,7 +72,7 @@ struct SwanSpacesOpenInteropNotificationPolicy: Sendable {
     /// (what the reference sends to `#atproto_pds`) or the space-host
     /// service identifier.
     static func acceptedAudiences(for authority: String) -> Set<String> {
-        [authority, "\(authority)#atproto_space_host"]
+        [authority, "\(authority)#atproto_pds"]
     }
 
     /// Admits a verified service JWT that carries no `req`: it must carry an
@@ -213,7 +213,7 @@ private struct AuthenticatedListSpaceReposHandler:
                 return .init(
                     did: try DID(didString: $0.repository),
                     repoRev: try TID(tidString: $0.wireRevision),
-                    hash: Bytes(data: $0.commitment),
+                    data: Bytes(data: $0.commitment),
                     spaceRev: try TID(tidString: spaceRevision)
                 )
             }
@@ -381,14 +381,14 @@ private struct AuthenticatedNotifySpaceWriteHandler:
         context request: Request
     ) async throws {
         let space = try notificationSpace(input.space)
-        guard input.hash.data.count == 32 else {
+        guard input.data.data.count == 32 else {
             throw AuthenticatedSpaceNotificationFailure.invalidRequest
         }
         let expectedDigest = SpaceNotificationRequestDigest.write(
             space: space,
             repository: input.repo.didString(),
             wireRevision: input.repoRev.toString(),
-            commitment: input.hash.data
+            commitment: input.data.data
         )
         let verifiedDigest: String
         let service: VerifiedSpaceServiceAuthentication
@@ -417,7 +417,7 @@ private struct AuthenticatedNotifySpaceWriteHandler:
             }
             verifiedDigest = expectedDigest
         } else {
-            // A repo host addresses `<authority>#atproto_space_host` (the
+            // A repo host addresses `<authority>#atproto_pds` (the
             // reference sender always does, even when it falls back to the
             // authority's PDS endpoint); the bare authority DID is accepted
             // too. Only the audience form is relaxed here: `req` stays
@@ -446,7 +446,7 @@ private struct AuthenticatedNotifySpaceWriteHandler:
                     space: space,
                     repository: input.repo.didString(),
                     wireRevision: input.repoRev.toString(),
-                    commitment: input.hash.data,
+                    commitment: input.data.data,
                     issuer: service.issuer,
                     // Both accepted audience forms name this authority.
                     audience: space.authority,
@@ -900,14 +900,14 @@ private func decodeNotifySpaceWriteInput(
     await decodeObserver?()
     try notificationJSONObject(
         data,
-        allowedKeys: ["space", "repo", "repoRev", "hash"],
-        requiredKeys: ["space", "repo", "repoRev", "hash"]
+        allowedKeys: ["space", "repo", "repoRev", "data"],
+        requiredKeys: ["space", "repo", "repoRev", "data"]
     )
     do {
         let input = try JSONDecoder().decode(ComAtprotoSpaceNotifyWrite.Input.self, from: data)
         _ = try notificationSpace(input.space)
         _ = try DID(didString: input.repo.didString())
-        guard input.hash.data.count == 32 else {
+        guard input.data.data.count == 32 else {
             throw AuthenticatedSpaceNotificationFailure.invalidRequest
         }
         return input
@@ -1244,7 +1244,7 @@ private func authenticatedSpaceNotificationResponse(
     case .denied:
         authenticatedSpaceNotificationError(.unauthorized, code: "Unauthorized")
     case let .credentialPresentation(failure):
-        authenticatedSpaceNotificationError(.unauthorized, code: failure.xrpcErrorCode)
+        authenticatedSpaceNotificationError(failure.httpStatus, code: failure.xrpcErrorCode)
     case .unavailable:
         authenticatedSpaceNotificationError(.serviceUnavailable, code: "temporarily_unavailable")
     case .serviceNotResolvable:

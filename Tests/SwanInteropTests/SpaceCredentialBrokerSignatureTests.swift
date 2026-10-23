@@ -8,8 +8,8 @@ import SwanSpaces
 import XCTest
 
 /// Swan as a space-credential client (atproto#5569): a fresh P-256 key per
-/// credential, a signed delegation exchange naming that key, and an
-/// `Atproto-Space` presentation signed for the operation's audience.
+/// credential, a JSON delegation exchange naming that key, and an
+/// `Atproto-Space-Credential` presentation signed for the operation's audience.
 final class SpaceCredentialBrokerSignatureTests: XCTestCase, @unchecked Sendable {
     private static let repo = "did:plc:bcdefghijklmnopqrstuvwxy"
 
@@ -46,24 +46,23 @@ final class SpaceCredentialBrokerSignatureTests: XCTestCase, @unchecked Sendable
         XCTAssertEqual(requests[0].authorization, "DPoP member-oauth")
 
         let exchange = requests[1]
-        XCTAssertEqual(exchange.authorization, "Bearer delegation-token")
+        XCTAssertNil(exchange.authorization)
         XCTAssertNil(exchange.audience)
-        XCTAssertNil(exchange.dpop, "the exchange no longer carries a Spaces DPoP proof")
-        let keyID = try SpaceHTTPSignature.verify(
-            authorization: [try XCTUnwrap(exchange.authorization)],
-            audience: nil,
-            signatureInput: [try XCTUnwrap(exchange.signatureInput)],
-            signature: [try XCTUnwrap(exchange.signature)],
-            credentialKeyID: nil
-        )
-        XCTAssertEqual(exchange.signatureInput, "atproto-space=(\"authorization\");keyid=\"\(keyID)\"")
+        XCTAssertNil(exchange.dpop)
+        XCTAssertNil(exchange.signatureInput)
+        XCTAssertNil(exchange.signature)
+        let exchangeBody = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(exchange.body)) as? [String: String])
+        XCTAssertEqual(exchangeBody["space"], fixture.space.rawValue)
+        XCTAssertEqual(exchangeBody["delegationToken"], "delegation-token")
+        let keyID = try XCTUnwrap(exchangeBody["credentialKid"])
+        _ = try P256DIDKey(keyID)
 
         let expectedAudiences = [Self.repo, fixture.space.authority, fixture.space.authority]
         for (request, audience) in zip(requests.dropFirst(2), expectedAudiences) {
             let authorizationValue = try XCTUnwrap(request.authorization)
-            XCTAssertTrue(authorizationValue.hasPrefix("Atproto-Space "))
+            XCTAssertTrue(authorizationValue.hasPrefix("Atproto-Space-Credential "))
             XCTAssertNil(request.dpop)
-            let token = String(authorizationValue.dropFirst("Atproto-Space ".count))
+            let token = String(authorizationValue.dropFirst("Atproto-Space-Credential ".count))
             XCTAssertEqual(try PermissionedDataJWT.inspectSpaceCredential(token).claims.cnf.kid, keyID)
             XCTAssertEqual(request.audience, audience, request.url.path)
             XCTAssertEqual(
@@ -82,7 +81,7 @@ final class SpaceCredentialBrokerSignatureTests: XCTestCase, @unchecked Sendable
         let events = await recorder.snapshot()
         let artifact = String(decoding: try JSONEncoder().encode(events), as: UTF8.self)
         XCTAssertFalse(artifact.contains("delegation-token"))
-        XCTAssertFalse(artifact.contains(try XCTUnwrap(exchange.signature)))
+        XCTAssertFalse(artifact.contains(try XCTUnwrap(requests[2].signature)))
         XCTAssertFalse(artifact.contains(try XCTUnwrap(requests[2].authorization)))
     }
 
@@ -96,13 +95,8 @@ final class SpaceCredentialBrokerSignatureTests: XCTestCase, @unchecked Sendable
         let keyIDs = try await fixture.requests.filter {
             $0.url.path == "/xrpc/com.atproto.space.getSpaceCredential"
         }.map {
-            try SpaceHTTPSignature.verify(
-                authorization: [try XCTUnwrap($0.authorization)],
-                audience: nil,
-                signatureInput: [try XCTUnwrap($0.signatureInput)],
-                signature: [try XCTUnwrap($0.signature)],
-                credentialKeyID: nil
-            )
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap($0.body)) as? [String: String])
+            return try XCTUnwrap(body["credentialKid"])
         }
         XCTAssertEqual(keyIDs.count, 2)
         XCTAssertNotEqual(keyIDs[0], keyIDs[1])
@@ -243,6 +237,7 @@ private actor SpaceCredentialClientFixture {
         let signatureInput: String?
         let signature: String?
         let dpop: String?
+        let body: Data?
     }
 
     let space: SpaceURI
@@ -266,7 +261,8 @@ private actor SpaceCredentialClientFixture {
             audience: headers[SpaceHTTPSignature.audienceFieldName],
             signatureInput: headers[SpaceHTTPSignature.signatureInputFieldName],
             signature: headers[SpaceHTTPSignature.signatureFieldName],
-            dpop: headers["DPoP"]
+            dpop: headers["DPoP"],
+            body: body
         ))
         var status = 200
         let output: Data
@@ -274,13 +270,13 @@ private actor SpaceCredentialClientFixture {
         case "/xrpc/com.atproto.space.getDelegationToken":
             output = Data(#"{"token":"delegation-token"}"#.utf8)
         case "/xrpc/com.atproto.space.getSpaceCredential":
-            let keyID = try SpaceHTTPSignature.verify(
-                authorization: [try XCTUnwrap(headers["Authorization"])],
-                audience: nil,
-                signatureInput: [try XCTUnwrap(headers[SpaceHTTPSignature.signatureInputFieldName])],
-                signature: [try XCTUnwrap(headers[SpaceHTTPSignature.signatureFieldName])],
-                credentialKeyID: nil
-            )
+            XCTAssertNil(headers["Authorization"])
+            XCTAssertNil(headers[SpaceHTTPSignature.signatureInputFieldName])
+            XCTAssertNil(headers[SpaceHTTPSignature.signatureFieldName])
+            let input = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(body)) as? [String: String])
+            XCTAssertEqual(input["delegationToken"], "delegation-token")
+            let keyID = try XCTUnwrap(input["credentialKid"])
+            _ = try P256DIDKey(keyID)
             let issuedSpace = responseMode == .wrongSpace
                 ? try SpaceURI(authority: space.authority, spaceType: space.spaceType, skey: "other")
                 : space

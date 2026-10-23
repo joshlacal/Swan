@@ -3,6 +3,7 @@ import Hummingbird
 import HTTPTypes
 import NIOCore
 import Petrel
+import PetrelCrypto
 import SwanCore
 import SwanOAuth
 import SwanSpaces
@@ -259,7 +260,7 @@ private func authenticatedGetSpaceResponse(
     case .denied:
         authenticatedGetSpaceError(.unauthorized, code: "Unauthorized")
     case let .credentialPresentation(failure):
-        authenticatedGetSpaceError(.unauthorized, code: failure.xrpcErrorCode)
+        authenticatedGetSpaceError(failure.httpStatus, code: failure.xrpcErrorCode)
     case .nonceChallenge:
         authenticatedGetSpaceNonceChallenge(authorizer: capability.authorizer)
     case .unavailable:
@@ -398,6 +399,7 @@ func authenticatedGetSpaceJSON(
 /// OAuth runtime to its configured public URL and confirming that the supplied
 /// startup directory exposes the intentionally narrow repository projection.
 public struct SwanAuthenticatedSpaceRecordsCapability: Sendable {
+    let macProvider: (any SpaceRepositoryCommitSigner)?
     let authorizer: SwanOAuthResourceAuthorizer
     let directory: any AuthorizedSpaceRepositoryDirectory
     /// Nil means only the established OAuth/DPoP route is enabled. A present
@@ -415,10 +417,12 @@ public struct SwanAuthenticatedSpaceRecordsCapability: Sendable {
         authorizer: SwanOAuthResourceAuthorizer,
         directory: any AuthorizedSpaceRepositoryDirectory,
         credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)? = nil,
+        macProvider: (any SpaceRepositoryCommitSigner)? = nil,
         jsonReadAdmission: PublicRepositoryJSONReadAdmission = .processShared,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .processShared,
         jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy = .productionDefault
     ) {
+        self.macProvider = macProvider
         self.authorizer = authorizer
         self.directory = directory
         self.credentialAuthorizer = credentialAuthorizer
@@ -787,7 +791,17 @@ func registerAuthenticatedGetRecordEndpoint(
         }
         do {
             let output = try await handler.handle(parameters: parameters, input: (), context: request)
-            return authenticatedGetRecordJSON(.ok, output, lease: lease)
+            let secret = try await spaceResponseMACSecret(
+                request: request, author: parameters.repo.didString(), type: .record,
+                provider: capability.macProvider
+            )
+            let mac = try secret.map {
+                try SpaceMAC.record(sharedSecret: $0, uri: output.uri.uriString(), cid: output.cid.bytes)
+            }
+            return try withSpaceResponseMAC(authenticatedGetRecordJSON(.ok, output, lease: lease), mac: mac, type: .record)
+        } catch is SpaceMACHeaders.HeaderError {
+            lease.release()
+            return authenticatedSpaceRecordError(.badRequest, code: "BadSpaceMac")
         } catch let failure as AuthenticatedSpaceRecordFailure {
             lease.release()
             return authenticatedSpaceRecordResponse(for: failure, capability: capability)
@@ -1701,7 +1715,7 @@ private func authenticatedSpaceRecordResponse(
     case .denied:
         authenticatedSpaceRecordError(.unauthorized, code: "Unauthorized")
     case let .credentialPresentation(failure):
-        authenticatedSpaceRecordError(.unauthorized, code: failure.xrpcErrorCode)
+        authenticatedSpaceRecordError(failure.httpStatus, code: failure.xrpcErrorCode)
     case .nonceChallenge:
         authenticatedGetSpaceNonceChallenge(authorizer: capability.authorizer)
     case .unavailable:

@@ -770,6 +770,7 @@ public actor DurableAccountDirectory {
         let purpose: AccountControlKeyReference.Purpose = switch reference.purpose {
         case .signing: .signing
         case .rotation: .rotation
+        case .kem: throw SwanError.malformed("KEM key is not an account signing reference")
         }
         return try AccountControlKeyReference(
             purpose: purpose,

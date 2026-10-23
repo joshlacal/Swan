@@ -138,6 +138,15 @@ public final class ExistingFileAccountKeyReader: AccountKeyMaterialReader, @unch
         _ = close(directoryDescriptor)
     }
 
+    public func keyIfPresent(for reference: AccountKeyReference) async throws -> Data? {
+        var status = stat()
+        if fstatat(directoryDescriptor, Self.filename(for: reference), &status, AT_SYMLINK_NOFOLLOW) != 0 {
+            guard errno == ENOENT else { throw SwanError.unavailable("account key-store entry is unavailable") }
+            return nil
+        }
+        return try await key(for: reference)
+    }
+
     public func key(for reference: AccountKeyReference) async throws -> Data {
         let encoded = try readProtected(named: Self.filename(for: reference))
         let envelope: Envelope

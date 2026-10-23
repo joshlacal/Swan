@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import PetrelCrypto
 import PetrelPLC
 import SwanAccounts
 import SwanCore
@@ -10,6 +11,10 @@ import SwanSpaces
 /// general account signing interface: callers cannot select a payload, key
 /// purpose, audience, or signature format.
 public protocol SpaceRepositoryCommitSigner: Sendable {
+    /// Decapsulates only an account's dedicated KEM key after its lifecycle
+    /// check. It never falls back to a signing key.
+    func sharedSecret(author: String, keyShare: String) async throws -> Data
+
     func signRepositoryCommit(
         space: SpaceURI,
         author: String,
@@ -37,6 +42,16 @@ public struct LocalAccountSpaceRepositoryCommitSigner:
     ) {
         self.accounts = accounts
         self.keyStore = keyStore
+    }
+
+    public func sharedSecret(author: String, keyShare: String) async throws -> Data {
+        let author = try AccountIdentifiers.validateDID(author)
+        guard let authorizing = try await accounts.authorizingAccount(did: author) else {
+            throw SwanError.unauthorized("account KEM key is unavailable")
+        }
+        let key = try await AccountKEMKeyProvider(keyStore: keyStore).privateKey(accountDID: author)
+        try await accounts.requireUnchangedAuthorizingAccount(did: author, expected: authorizing)
+        return try SpaceMAC.decapsulate(privateKey: key, keyShare: keyShare)
     }
 
     public func signRepositoryCommit(
@@ -76,5 +91,11 @@ public struct LocalAccountSpaceRepositoryCommitSigner:
             commitment: commitment,
             key: privateKey
         )
+    }
+}
+
+public extension SpaceRepositoryCommitSigner {
+    func sharedSecret(author: String, keyShare: String) async throws -> Data {
+        throw SwanError.unavailable("account KEM key is unavailable")
     }
 }

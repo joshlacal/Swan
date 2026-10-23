@@ -163,7 +163,7 @@ public struct InteropSpaceCredential: @unchecked Sendable, Equatable {
     ) throws {
         let audience = try Self.audience(query: query, body: body)
         let signed = try SpaceHTTPSignature.sign(
-            authorization: "Atproto-Space " + token,
+            authorization: "Atproto-Space-Credential " + token,
             audience: audience,
             key: key
         )
@@ -517,7 +517,8 @@ public struct InteropXRPCClient: Sendable {
         _ nsid: String,
         query: [String: String] = [:],
         authorization: InteropAuthorization = .none,
-        maximumResponseBytes: Int? = nil
+        maximumResponseBytes: Int? = nil,
+        spaceWantMAC: String? = nil
     ) async throws -> InteropHTTPResponse {
         try await request(
             method: .get,
@@ -525,7 +526,8 @@ public struct InteropXRPCClient: Sendable {
             query: query,
             body: nil,
             authorization: authorization,
-            maximumResponseBytes: maximumResponseBytes
+            maximumResponseBytes: maximumResponseBytes,
+            spaceWantMAC: spaceWantMAC
         )
     }
 
@@ -603,10 +605,12 @@ public struct InteropXRPCClient: Sendable {
         query: [String: String] = [:],
         authorization: InteropAuthorization = .none,
         to destination: URL,
-        maximumResponseBytes: Int
+        maximumResponseBytes: Int,
+        spaceWantMAC: String? = nil
     ) async throws -> InteropHTTPResponse {
         let path = try xrpcPath(nsid, query: query)
         var headers = ["Accept": "application/vnd.ipld.car, application/octet-stream, */*"]
+        if let spaceWantMAC { headers[SpaceMACHeaders.requestHeader] = spaceWantMAC }
         try addAuthorization(authorization, query: query, body: nil, to: &headers)
         let response = try await http.executeStreaming(
             method: .get,
@@ -646,10 +650,12 @@ public struct InteropXRPCClient: Sendable {
         query: [String: String],
         body: Data?,
         authorization: InteropAuthorization,
-        maximumResponseBytes: Int?
+        maximumResponseBytes: Int?,
+        spaceWantMAC: String? = nil
     ) async throws -> InteropHTTPResponse {
         let path = try makeXRPCPath(nsid, query: query)
         var headers = ["Accept": "application/json"]
+        if let spaceWantMAC { headers[SpaceMACHeaders.requestHeader] = spaceWantMAC }
         if body != nil { headers["Content-Type"] = "application/json" }
         try addAuthorization(authorization, query: query, body: body, to: &headers)
         let response = try await http.execute(
@@ -862,19 +868,27 @@ public struct LiveInteropHost: Sendable {
     /// commits returned by this host. A missing key is an intentional
     /// fail-closed condition when an incremental sync assertion is requested.
     public let permissionedCommitVerificationKey: PermissionedDataJWTVerificationKey?
+    /// Dedicated author #atproto_kem did:key. It is never inferred from the
+    /// signing key. Dynamic resolvers must bypass their cache on forceRefresh.
+    public let permissionedKEMKey: String?
+    public let permissionedKEMKeyProvider: (@Sendable (_ repositoryDID: String, _ forceRefresh: Bool) async throws -> String)?
 
     public init(
         label: String,
         client: InteropXRPCClient,
         authorization: InteropAuthorization = .none,
         authorizationProvider: InteropAuthorizationProvider? = nil,
-        permissionedCommitVerificationKey: PermissionedDataJWTVerificationKey? = nil
+        permissionedCommitVerificationKey: PermissionedDataJWTVerificationKey? = nil,
+        permissionedKEMKey: String? = nil,
+        permissionedKEMKeyProvider: (@Sendable (_ repositoryDID: String, _ forceRefresh: Bool) async throws -> String)? = nil
     ) {
         self.label = label
         self.client = client
         self.authorization = authorization
         self.authorizationProvider = authorizationProvider
         self.permissionedCommitVerificationKey = permissionedCommitVerificationKey
+        self.permissionedKEMKey = permissionedKEMKey
+        self.permissionedKEMKeyProvider = permissionedKEMKeyProvider
     }
 }
 
@@ -2297,7 +2311,7 @@ public enum LiveInteropRunner {
             let read = try await repositoryHost.client.query(
                 "com.atproto.space.getRecord",
                 query: readQuery,
-                authorization: credentialAuthorization
+                authorization: .none
             )
             readStatus = read.status
             readDigest = responseDigest(read)
@@ -2491,10 +2505,13 @@ public enum LiveInteropRunner {
             let authorization = try await authorization(
                 for: member, method: .get, path: path, body: nil
             )
-            let response = try await member.client.query(
-                "com.atproto.space.listRepoOps", query: query,
-                authorization: authorization
+            let authenticated = try await PermissionedSpaceMACHTTP.query(
+                host: member, nsid: "com.atproto.space.listRepoOps", query: query,
+                space: space, author: repository,
+                authorization: { authorization },
+                commit: { try StrictJSON.decode(ComAtprotoSpaceListRepoOps.Output.self, from: $0).commit }
             )
+            let response = authenticated.response
             await recorder.record(
                 host: member.label, method: "GET",
                 path: "/xrpc/com.atproto.space.listRepoOps", response: response
@@ -2515,10 +2532,7 @@ public enum LiveInteropRunner {
                   commit.ver == 1,
                   commit.rev == output.ops.last?.rev,
                   canonicalInteropTID(commit.rev.toString()) != nil,
-                  commit.hash.data.count == 32,
-                  commit.ikm.data.count == 32,
-                  commit.sig.data.count == 64,
-                  commit.mac.data.count == 32 else {
+                  commit.data.data.count == 32 else {
                 return TerminalApplyWritesWitness(
                     status: response.status, revision: nil, verified: false,
                     errorCode: "InvalidCommit"
@@ -2535,39 +2549,7 @@ public enum LiveInteropRunner {
                     errorCode: "OperationMismatch"
                 )
             }
-            let context = try SpaceCommitContext(
-                space: space, author: repository, rev: commit.rev.toString(), ikm: commit.ikm.data
-            )
-            let envelope = SpaceCommitEnvelope(
-                ver: commit.ver, context: context, contextSignature: commit.sig.data,
-                contentBinding: commit.mac.data, commitment: commit.hash.data
-            )
-            guard SpaceCommitCodec.verifyContentBinding(envelope) else {
-                return TerminalApplyWritesWitness(
-                    status: response.status, revision: commit.rev.toString(), verified: false,
-                    errorCode: "ContentBindingMismatch"
-                )
-            }
-            guard let key = member.permissionedCommitVerificationKey else {
-                return TerminalApplyWritesWitness(
-                    status: response.status, revision: commit.rev.toString(), verified: false,
-                    errorCode: "MissingCommitKey"
-                )
-            }
-            let algorithm: String = switch key {
-            case .p256: "ES256"
-            case .secp256k1PublicKey: "ES256K"
-            }
-            guard try key.verify(
-                signature: commit.sig.data,
-                signingInput: try SpaceCommitCodec.contextSigningBytes(context),
-                algorithm: algorithm
-            ) else {
-                return TerminalApplyWritesWitness(
-                    status: response.status, revision: commit.rev.toString(), verified: false,
-                    errorCode: "ContextSignatureMismatch"
-                )
-            }
+            guard authenticated.commit != nil else { throw SpaceSTARError.badMAC }
             return TerminalApplyWritesWitness(
                 status: response.status, revision: commit.rev.toString(), verified: true,
                 errorCode: nil
@@ -2694,11 +2676,13 @@ public enum LiveInteropRunner {
             query["excludeValues"] = "true"
         }
         do {
-            let response = try await repositoryHost.client.query(
-                "com.atproto.space.listRepoOps",
-                query: query,
-                authorization: authorization
+            let authenticated = try await PermissionedSpaceMACHTTP.query(
+                host: repositoryHost, nsid: "com.atproto.space.listRepoOps", query: query,
+                space: space, author: author,
+                authorization: { authorization },
+                commit: { try StrictJSON.decode(ComAtprotoSpaceListRepoOps.Output.self, from: $0).commit }
             )
+            let response = authenticated.response
             await recorder.record(
                 host: repositoryHost.label,
                 method: "GET",
@@ -2755,10 +2739,7 @@ public enum LiveInteropRunner {
             }
             guard commit.ver == 1,
                   commit.rev == output.ops.last?.rev,
-                  commit.hash.data.count == 32,
-                  commit.ikm.data.count == 32,
-                  commit.sig.data.count == 64,
-                  commit.mac.data.count == 32 else {
+                  commit.data.data.count == 32 else {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
@@ -2822,72 +2803,22 @@ public enum LiveInteropRunner {
                 }
                 lthash.add(element: "\(entry.collection)/\(entry.rkey)/\(cid)")
             }
-            guard lthash.commitment == commit.hash.data else {
+            guard lthash.commitment == commit.data.data else {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
                     operationRevision: operation.rev.toString(),
-                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
+                    commitment: Hex.encode(commit.data.data), commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "CommitmentMismatch"
                 )
             }
-            let context = try SpaceCommitContext(
-                space: space,
-                author: author,
-                rev: commit.rev.toString(),
-                ikm: commit.ikm.data
-            )
-            let envelope = SpaceCommitEnvelope(
-                ver: commit.ver,
-                context: context,
-                contextSignature: commit.sig.data,
-                contentBinding: commit.mac.data,
-                commitment: commit.hash.data
-            )
-            guard SpaceCommitCodec.verifyContentBinding(envelope) else {
-                return PermissionedSyncResult(
-                    status: response.status, opsCount: output.ops.count,
-                    operationCID: operation.cid?.string,
-                    operationRevision: operation.rev.toString(),
-                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
-                    commitVerified: false, valuesIncluded: includeValues,
-                    errorCode: "ContentBindingMismatch"
-                )
-            }
-            guard let key = repositoryHost.permissionedCommitVerificationKey else {
-                return PermissionedSyncResult(
-                    status: response.status, opsCount: output.ops.count,
-                    operationCID: operation.cid?.string,
-                    operationRevision: operation.rev.toString(),
-                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
-                    commitVerified: false, valuesIncluded: includeValues,
-                    errorCode: "MissingCommitKey"
-                )
-            }
-            let algorithm: String = switch key {
-            case .p256: "ES256"
-            case .secp256k1PublicKey: "ES256K"
-            }
-            guard try key.verify(
-                signature: commit.sig.data,
-                signingInput: try SpaceCommitCodec.contextSigningBytes(context),
-                algorithm: algorithm
-            ) else {
-                return PermissionedSyncResult(
-                    status: response.status, opsCount: output.ops.count,
-                    operationCID: operation.cid?.string,
-                    operationRevision: operation.rev.toString(),
-                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
-                    commitVerified: false, valuesIncluded: includeValues,
-                    errorCode: "ContextSignatureMismatch"
-                )
-            }
+            guard authenticated.commit != nil else { throw SpaceSTARError.badMAC }
             return PermissionedSyncResult(
                 status: response.status, opsCount: output.ops.count,
                 operationCID: operation.cid?.string,
                 operationRevision: operation.rev.toString(),
-                commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
+                commitment: Hex.encode(commit.data.data), commitRevision: commit.rev.toString(),
                 commitVerified: true, valuesIncluded: includeValues, errorCode: nil
             )
         } catch {
@@ -2931,24 +2862,17 @@ public enum LiveInteropRunner {
             path: "\(recordURI.collection)/\(recordURI.rkey)",
             cid: parsedCID
         )
-        guard let key = repositoryHost.permissionedCommitVerificationKey else {
-            return PermissionedCARResult(
-                status: nil, recordCount: nil, commitment: nil,
-                wireRevision: nil, expectedRecordVerified: false,
-                verified: false, errorCode: "MissingCommitKey"
-            )
-        }
         let spoolURL = FileManager.default.temporaryDirectory
-            .appending(path: "swan-permissioned-recovery-\(UUID().uuidString).car")
+            .appending(path: "swan-permissioned-recovery-\(UUID().uuidString).star")
         defer { try? FileManager.default.removeItem(at: spoolURL) }
         do {
-            let response = try await repositoryHost.client.stream(
-                "com.atproto.space.getRepo",
-                query: ["space": space.rawValue, "repo": author],
-                authorization: authorization,
-                to: spoolURL,
-                maximumResponseBytes: 256 * 1024 * 1024
+            let authenticated = try await PermissionedSpaceMACHTTP.streamSTAR(
+                host: repositoryHost, query: ["space": space.rawValue, "repo": author],
+                space: space, author: author, destination: spoolURL,
+                maximumBytes: SpaceSTARLimits.standard.maximumArchiveBytes,
+                authorization: { authorization }
             )
+            let response = authenticated.response
             await recorder.record(
                 host: repositoryHost.label,
                 method: "GET",
@@ -2962,26 +2886,17 @@ public enum LiveInteropRunner {
                     verified: false, errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
                 )
             }
-            guard response.header("content-type")?.lowercased()
-                .contains("application/vnd.ipld.car") == true else {
-                return PermissionedCARResult(
-                    status: response.status, recordCount: nil, commitment: nil,
-                    wireRevision: nil, expectedRecordVerified: false,
-                    verified: false, errorCode: "UnexpectedContentType"
-                )
-            }
-            let recovery = try await SwanCARConsumer().verifyStreaming(
-                fileURL: spoolURL,
-                space: space,
-                author: author,
-                verificationKey: key,
+            let recovery = try await SwanSTARConsumer().verifyStreaming(
+                fileURL: spoolURL, space: space, author: author,
+                sharedSecret: authenticated.request.sharedSecret,
+                mac: SpaceMACHeaders.parseMAC(response.header(SpaceMACHeaders.responseHeader), type: .repository),
                 expectedEntries: [expectedEntry]
             )
             return PermissionedCARResult(
                 status: response.status,
-                recordCount: recovery.recordCount,
-                commitment: Hex.encode(recovery.commitment),
-                wireRevision: recovery.wireRevision.toString(),
+                recordCount: recovery.verification.recordCount,
+                commitment: Hex.encode(recovery.verification.commit.data),
+                wireRevision: recovery.verification.commit.rev,
                 expectedRecordVerified:
                     recovery.verifiedExpectedWitnessCount == 1,
                 verified: true,
@@ -3496,7 +3411,8 @@ public struct IncrementalSynchronizer: Sendable {
     }
 }
 
-/// Consumes a Swan two-root CAR. Live interop uses the asynchronous streaming
+/// Consumes historical Swan two-root CAR backups. Current Spaces networking
+/// uses SwanSTARConsumer. Offline compatibility uses the asynchronous streaming
 /// methods, which retain at most one one-MiB record value and a 64-KiB source
 /// chunk while the DRISL map lives in an owner-only disposable SQLite index.
 /// The synchronous methods remain for small/offline fixtures that need record
@@ -3789,16 +3705,15 @@ public struct SpaceCredentialBroker: Sendable {
         )
         try requireJSONSuccess(delegation)
         let delegationObject = try StrictJSON.decode(TokenResponse.self, from: delegation.body)
-        // A fresh ephemeral P-256 key per credential; the authority binds the
-        // credential to its did:key (cnf.kid) from the exchange signature.
+        // Credential binding is independent of the per-request KEM share.
+        // The October 22 exchange carries both binding and delegation in JSON.
         let credentialKey = P256.Signing.PrivateKey()
-        let credentialAuthorization = InteropAuthorization.spaceDelegation(
-            try SpaceHTTPSignature.sign(
-                authorization: "Bearer " + delegationObject.token,
-                key: credentialKey
-            )
+        let input = CredentialRequest(
+            space: space.rawValue,
+            credentialKid: SpaceHTTPSignature.keyID(for: credentialKey),
+            delegationToken: delegationObject.token,
+            clientAttestation: clientAttestation
         )
-        let input = CredentialRequest(space: space.rawValue, clientAttestation: clientAttestation)
         let inputBody = try encode(input)
         let credential = try await authority.procedure(
             "com.atproto.space.getSpaceCredential",
@@ -3838,6 +3753,8 @@ public struct SpaceCredentialBroker: Sendable {
 
     private struct CredentialRequest: Encodable {
         let space: String
+        let credentialKid: String
+        let delegationToken: String
         let clientAttestation: String?
     }
 

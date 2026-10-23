@@ -786,7 +786,7 @@ final class SwanAccountsTests: XCTestCase {
             accountDID: Self.aliceDID
         )
         XCTAssertEqual(retried, resumed)
-        XCTAssertEqual(try keyFiles(in: root).count, 2)
+        XCTAssertEqual(try keyFiles(in: root).count, 3)
         XCTAssertFalse(
             FileManager.default.fileExists(
                 atPath: root.appending(path: ".swan-key-provisioning-journal-v1").path

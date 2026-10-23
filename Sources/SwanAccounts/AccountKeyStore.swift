@@ -13,6 +13,7 @@ import SwanStorage
 public enum AccountKeyPurpose: String, Codable, Sendable, CaseIterable {
     case signing = "account-signing"
     case rotation = "account-rotation"
+    case kem = "account-kem"
 }
 
 public struct AccountKeyReference: Codable, Sendable, Hashable {
@@ -127,6 +128,14 @@ public struct AccountKeyMigrationReport: Sendable, Equatable {
 
 public protocol AccountKeyMaterialReader: Sendable {
     func key(for reference: AccountKeyReference) async throws -> Data
+    /// A missing key is distinct from a corrupt or inaccessible envelope.
+    func keyIfPresent(for reference: AccountKeyReference) async throws -> Data?
+}
+
+public extension AccountKeyMaterialReader {
+    func keyIfPresent(for reference: AccountKeyReference) async throws -> Data? {
+        try await key(for: reference)
+    }
 }
 
 public protocol AccountKeyStore: AccountKeyMaterialReader {
@@ -219,6 +228,7 @@ public struct StagedPLCAccountIdentity: Sendable {
     public let operation: PLCSignedOperation
     let signingKey: P256.Signing.PrivateKey
     let rotationKey: P256.Signing.PrivateKey
+    let kemKey: P256.KeyAgreement.PrivateKey?
 
     public var operationCID: String {
         get throws { try operation.cid.string }
@@ -295,6 +305,7 @@ public actor FileAccountKeyStore:
     private struct PLCStagingPayload: Codable {
         let signingKey: Data
         let rotationKey: Data
+        let kemKey: Data?
         let did: String
         let operationJSON: Data
     }
@@ -525,15 +536,25 @@ public actor FileAccountKeyStore:
             }
             let signingKey = P256.Signing.PrivateKey()
             let rotationKey = P256.Signing.PrivateKey()
-            guard signingKey.rawRepresentation != rotationKey.rawRepresentation else {
+            let kemKey = P256.KeyAgreement.PrivateKey()
+            guard signingKey.rawRepresentation != kemKey.rawRepresentation,
+                  rotationKey.rawRepresentation != kemKey.rawRepresentation,
+                  signingKey.rawRepresentation != rotationKey.rawRepresentation else {
                 throw SwanError.unavailable("P-256 key generation returned duplicate account keys")
             }
-            let unsigned = try PLCATProfile.regularOperation(
+            let base = try PLCATProfile.regularOperation(
                 handle: canonicalHandle,
                 signingPublicKey: signingKey.publicKey,
                 rotationPublicKeys: [rotationKey.publicKey],
                 pdsOrigin: pdsOrigin,
                 prev: nil
+            )
+            let unsigned = try PLCUnsignedRegularOperation(
+                rotationKeys: base.rotationKeys,
+                verificationMethods: base.verificationMethods.merging([
+                    "atproto_kem": try AccountKEMKeyProvider.didKey(kemKey.publicKey),
+                ]) { _, new in new },
+                alsoKnownAs: base.alsoKnownAs, services: base.services, prev: nil
             )
             let operation = try PLCOperationCodec.sign(.regular(unsigned), using: rotationKey)
             let did = try PLCOperationCodec.genesisDID(for: operation)
@@ -543,6 +564,7 @@ public actor FileAccountKeyStore:
             let payload = PLCStagingPayload(
                 signingKey: signingKey.rawRepresentation,
                 rotationKey: rotationKey.rawRepresentation,
+                kemKey: kemKey.rawRepresentation,
                 did: did,
                 operationJSON: try operation.canonicalJSON
             )
@@ -598,7 +620,8 @@ public actor FileAccountKeyStore:
                 repositoryRevision: repositoryRevision,
                 operation: operation,
                 signingKey: signingKey,
-                rotationKey: rotationKey
+                rotationKey: rotationKey,
+                kemKey: kemKey
             )
         }
     }
@@ -668,6 +691,13 @@ public actor FileAccountKeyStore:
                     == staged.rotationKey.rawRepresentation else {
                 throw SwanError.unauthorized("PLC account staging promotion is invalid")
             }
+            if let kemKey = staged.kemKey {
+                let reference = try AccountKEMKeyProvider.reference(accountDID: expectedDID)
+                let envelope = try loadEnvelope(named: Self.filename(for: reference), expectedReference: reference)
+                guard try decrypt(envelope.envelope, reference: reference) == kemKey.rawRepresentation else {
+                    throw SwanError.unauthorized("PLC account staging KEM promotion is invalid")
+                }
+            }
             try Self.remove(named: filename, directoryDescriptor: directoryDescriptor)
         }
     }
@@ -731,7 +761,8 @@ public actor FileAccountKeyStore:
         }
         let signingKey = try P256.Signing.PrivateKey(rawRepresentation: payload.signingKey)
         let rotationKey = try P256.Signing.PrivateKey(rawRepresentation: payload.rotationKey)
-        guard payload.signingKey != payload.rotationKey else {
+        let kemKey = try payload.kemKey.map { try P256.KeyAgreement.PrivateKey(rawRepresentation: $0) }
+        guard payload.kemKey != payload.signingKey, payload.kemKey != payload.rotationKey, payload.signingKey != payload.rotationKey else {
             throw SwanError.malformed("PLC account staging keys are not distinct")
         }
         let operation = try PLCOperationCodec.decodeSignedJSON(payload.operationJSON)
@@ -739,6 +770,7 @@ public actor FileAccountKeyStore:
         guard let regular = operation.regular,
               regular.verificationMethods["atproto"]
                 == P256DIDKey(publicKey: signingKey.publicKey).value,
+              regular.verificationMethods["atproto_kem"] == (try kemKey.map { try AccountKEMKeyProvider.didKey($0.publicKey) }),
               regular.rotationKeys == [P256DIDKey(publicKey: rotationKey.publicKey).value],
               regular.alsoKnownAs == ["at://\(canonicalHandle)"],
               regular.services["atproto_pds"]?.endpoint == canonical else {
@@ -752,7 +784,8 @@ public actor FileAccountKeyStore:
             repositoryRevision: repositoryRevision,
             operation: operation,
             signingKey: signingKey,
-            rotationKey: rotationKey
+            rotationKey: rotationKey,
+            kemKey: kemKey
         )
     }
 
@@ -803,6 +836,15 @@ public actor FileAccountKeyStore:
             named: Self.journalFilename,
             directoryDescriptor: directoryDescriptor
         )
+    }
+
+    public func keyIfPresent(for reference: AccountKeyReference) throws -> Data? {
+        try withExclusiveLock {
+            let filename = Self.filename(for: reference)
+            guard try Self.entryExists(named: filename, directoryDescriptor: directoryDescriptor) else { return nil }
+            let loaded = try loadEnvelope(named: filename, expectedReference: reference)
+            return try decrypt(loaded.envelope, reference: reference)
+        }
     }
 
     public func key(for reference: AccountKeyReference) throws -> Data {
@@ -986,9 +1028,12 @@ public actor FileAccountKeyStore:
         guard let combined = sealed.combined else {
             throw SwanError.unavailable("could not serialize encrypted account key")
         }
-        let publicKey = try? P256.Signing.PrivateKey(rawRepresentation: key)
-            .publicKey
-            .x963Representation
+        let publicKey: Data?
+        if reference.purpose == .kem {
+            publicKey = try? P256.KeyAgreement.PrivateKey(rawRepresentation: key).publicKey.x963Representation
+        } else {
+            publicKey = try? P256.Signing.PrivateKey(rawRepresentation: key).publicKey.x963Representation
+        }
         let publicKeyAuthentication = publicKey.map {
             Self.publicKeyAuthentication(
                 keyID: keyID,
