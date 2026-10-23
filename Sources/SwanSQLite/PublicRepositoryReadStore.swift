@@ -277,7 +277,7 @@ extension SQLiteAccountDatabase {
                     """
                     SELECT canonical_handle, pds_origin,
                            request_id, operation_signing_did_key,
-                           operation_rotation_did_key, operation_signature,
+                           operation_rotation_did_key, operation_signature, operation_kem_did_key,
                            signing_key_reference, rotation_key_reference,
                            public_genesis_commit_cid, stage
                     FROM plc_account_preparation_journal
@@ -352,7 +352,8 @@ extension SQLiteAccountDatabase {
                     signature: try publicReadRequiredText(
                         identityRow, "operation_signature",
                         reason: .identityFactsMalformed
-                    )
+                    ),
+                    kemDIDKey: identityRow.column("operation_kem_did_key")?.string
                     ),
                     expectedDID: account.did
                 )

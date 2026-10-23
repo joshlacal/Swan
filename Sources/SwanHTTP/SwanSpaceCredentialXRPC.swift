@@ -77,84 +77,37 @@ private struct AuthenticatedGetSpaceCredentialHandler:
             throw SpaceCredentialExchangeFailure.invalidRequest
         }
 
-        let delegation: String
-        do {
-            guard let token = try exactBearerToken(from: request.headers) else {
+        let confirmationKeyID = input.credentialKid
+        guard PermissionedDataJWT.isValidConfirmationKeyID(confirmationKeyID) else {
+            throw SpaceCredentialExchangeFailure.invalidRequest
+        }
+        var user: String?
+        var authorization: AuthorizationContext = .public
+        if let delegation = input.delegationToken {
+            do {
+                let grant = try await capability.delegationAuthorizer.verifiedDelegation(
+                    for: delegation, expectedSpace: space, now: Date()
+                )
+                guard case let .spaceDelegation(subject, delegatedSpace) = grant.authorization,
+                      delegatedSpace == space, grant.issuer == subject, grant.space == space,
+                      try await capability.delegationReplayStore.claim(
+                        issuer: grant.issuer, audience: grant.audience, space: grant.space,
+                        jti: grant.jti, expiresAt: grant.expiresAt.addingTimeInterval(60), now: Date()
+                      ) else {
+                    throw SpaceCredentialExchangeFailure.invalidDelegation
+                }
+                user = subject
+                authorization = grant.authorization
+            } catch {
                 throw SpaceCredentialExchangeFailure.invalidDelegation
             }
-            delegation = token
-        } catch let failure as SpaceCredentialExchangeFailure {
-            throw failure
-        } catch {
-            throw SpaceCredentialExchangeFailure.invalidDelegation
-        }
-
-        let delegationGrant: VerifiedSpaceDelegation
-        do {
-            delegationGrant = try await capability.delegationAuthorizer.verifiedDelegation(
-                for: delegation,
-                expectedSpace: space,
-                now: Date()
-            )
-        } catch {
-            // The public exchange surface never distinguishes an unknown
-            // issuer/pin/key from malformed, expired, wrong-audience, or bad
-            // signature delegation material. None of these paths may enter a
-            // durable policy transaction or invoke the signing resolver.
-            throw SpaceCredentialExchangeFailure.invalidDelegation
-        }
-        guard case let .spaceDelegation(user, delegatedSpace) = delegationGrant.authorization,
-              delegatedSpace == space,
-              delegationGrant.issuer == user,
-              delegationGrant.space == space else {
-            throw SpaceCredentialExchangeFailure.invalidDelegation
-        }
-
-        // atproto#5569: the client proves possession of a fresh P-256 key by
-        // signing exactly ("authorization") and naming the key as `keyid`.
-        // That key becomes the credential's `cnf.kid`. There is no method,
-        // URL, nonce, or per-request replay binding to check any more; the
-        // delegation's own single-use reservation below is what stops reuse.
-        let confirmationKeyID: String
-        do {
-            confirmationKeyID = try capability.authorizer.verifySpaceDelegationSignature(
-                request: request
-            )
-        } catch {
-            throw SpaceCredentialExchangeFailure.invalidSignature
-        }
-
-        // Proposal 0016 delegations are single-use. Reserve the verified
-        // opaque JTI before attestation/policy/signing so a duplicate request
-        // cannot create another credential, and so the authority never
-        // evaluates policy or decrypts a signing key for a rejected replay.
-        let replayNow = Date()
-        do {
-            let replayExpiry = delegationGrant.expiresAt.addingTimeInterval(60)
-            guard try await capability.delegationReplayStore.claim(
-                issuer: delegationGrant.issuer,
-                audience: delegationGrant.audience,
-                space: delegationGrant.space,
-                jti: delegationGrant.jti,
-                expiresAt: replayExpiry,
-                now: replayNow
-            ) else {
-                throw SpaceCredentialExchangeFailure.invalidDelegation
-            }
-        } catch let failure as SpaceCredentialExchangeFailure {
-            throw failure
-        } catch {
-            // Retain the same opaque delegation error for a duplicate or an
-            // unavailable replay store; the exchange must not continue into
-            // durable policy/signing without its single-use reservation.
-            throw SpaceCredentialExchangeFailure.invalidDelegation
         }
 
         do {
             let credential = try await capability.credentialIssuer.issueSpaceCredential(
                 space: space,
                 user: user,
-                authorization: delegationGrant.authorization,
+                authorization: authorization,
                 clientAttestation: input.clientAttestation,
                 confirmationKeyID: confirmationKeyID,
                 now: Date()
@@ -263,15 +216,17 @@ private func decodeGetSpaceCredentialInput(
     guard let root = try? JSONSerialization.jsonObject(with: data)
         as? [String: Any],
         !root.isEmpty,
-        Set(root.keys).isSubset(of: ["space", "clientAttestation"]),
+        Set(root.keys).isSubset(of: ["space", "credentialKid", "delegationToken", "clientAttestation"]),
         root.keys.filter({ $0 == "space" }).count == 1,
         let rawSpace = root["space"] as? String,
         !rawSpace.isEmpty,
-        rawSpace.utf8.count <= 2_048 else {
+        rawSpace.utf8.count <= 2_048,
+        let credentialKid = root["credentialKid"] as? String,
+        PermissionedDataJWT.isValidConfirmationKeyID(credentialKid) else {
         throw SpaceCredentialExchangeFailure.invalidRequest
     }
-    if let attestation = root["clientAttestation"] {
-        guard let text = attestation as? String,
+    for field in ["clientAttestation", "delegationToken"] where root[field] != nil {
+        guard let text = root[field] as? String,
               !text.isEmpty,
               text.utf8.count <= PermissionedDataJWT.maximumCompactDelegationBytes else {
             throw SpaceCredentialExchangeFailure.invalidRequest
@@ -323,7 +278,7 @@ func exactBearerToken(from headers: HTTPFields) throws -> String? {
 
 /// The authorization scheme a space credential is presented under
 /// (atproto#5569), compared case-insensitively.
-let spaceCredentialAuthorizationScheme = "Atproto-Space"
+let spaceCredentialAuthorizationScheme = "Atproto-Space-Credential"
 
 /// A compact space credential presented as `Authorization: Atproto-Space
 /// <credential>`, or `nil` when the request uses another scheme so the caller
@@ -352,6 +307,9 @@ func spaceCredentialSchemeToken(from headers: HTTPFields) throws -> String? {
             throw SpaceCredentialPresentationFailure.badSignature
         }
         return token
+    }
+    if values.contains(where: { $0.lowercased().hasPrefix("atproto-space ") }) {
+        throw SpaceCredentialPresentationFailure.unsupportedAuthorization
     }
     if let bearer = try exactBearerToken(from: headers) {
         guard unverifiedCompactJOSEType(of: bearer) != PermissionedDataJWT.credentialType else {
@@ -393,7 +351,7 @@ private func getSpaceCredentialResponse(
     case .invalidRequest:
         getSpaceCredentialError(.badRequest, code: "InvalidRequest")
     case .invalidDelegation:
-        getSpaceCredentialError(.unauthorized, code: "InvalidDelegationToken")
+        getSpaceCredentialError(.badRequest, code: "InvalidDelegationToken")
     case .invalidSignature:
         getSpaceCredentialError(.unauthorized, code: "BadSpaceSignature")
     case .invalidClientAttestation:

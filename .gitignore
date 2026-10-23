@@ -28,3 +28,7 @@ artifacts/
 # SwanTV experiment build outputs
 AppleTV/swan-vault/target/
 AppleTV/SwanTV/**/xcuserdata/
+
+# Python verification helpers
+__pycache__/
+*.pyc

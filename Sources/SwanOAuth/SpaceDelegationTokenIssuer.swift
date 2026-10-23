@@ -61,7 +61,7 @@ public struct LocalAccountSpaceDelegationTokenIssuer: SpaceDelegationTokenIssuer
         }
         return try PermissionedDataJWT.createDelegationToken(
             issuer: issuer,
-            audience: "\(space.authority)#atproto_space_host",
+            audience: "\(space.authority)#atproto_pds",
             space: space,
             key: privateKey,
             now: now,

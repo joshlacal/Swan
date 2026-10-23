@@ -300,7 +300,7 @@ public struct SwanSpaceRepositorySyncHTTPConfiguration: Sendable {
 ///   JWTs (no `req` claim) whose `iss`/`aud`/`lxm` check out, whose lifetime
 ///   is at most 60 s, and whose `jti` is unused. A token that does carry
 ///   `req` must still match the body, and Swan still sends `req`. (notifyWrite
-///   accepts `aud` as the bare authority DID or `<authority>#atproto_space_host`
+///   accepts `aud` as the bare authority DID or `<authority>#atproto_pds`
 ///   in both postures.)
 /// - (b) registerNotify / unregisterNotify accept the space credential alone;
 ///   `Atproto-Service-Auth`, when present, still proves service ownership.
@@ -724,6 +724,7 @@ public struct SwanHTTPServer: Sendable {
                     authorizer: authorizer,
                     directory: repositoryDirectory,
                     credentialAuthorizer: credentialVerifier,
+                    macProvider: spaceRepositorySyncConfiguration?.commitSigner,
                     jsonReadAdmission: resolvedJSONReadAdmission,
                     jsonWriteAdmission: resolvedJSONWriteAdmission,
                     jsonWriteBodyPolicy: resolvedJSONWriteBodyPolicy
@@ -1642,7 +1643,7 @@ func oauthAPICORSHeaders(_ headers: inout HTTPFields) {
     headers[HTTPField.Name("Access-Control-Allow-Origin")!] = "*"
     headers[HTTPField.Name("Access-Control-Allow-Methods")!] = "POST, OPTIONS"
     headers[HTTPField.Name("Access-Control-Allow-Headers")!] = "Content-Type, DPoP"
-    headers[HTTPField.Name("Access-Control-Expose-Headers")!] = "DPoP-Nonce, WWW-Authenticate"
+    headers[HTTPField.Name("Access-Control-Expose-Headers")!] = "DPoP-Nonce, WWW-Authenticate, Atproto-Space-Mac"
 }
 
 func oauthMetadataCORSPreflightResponse() -> Response {

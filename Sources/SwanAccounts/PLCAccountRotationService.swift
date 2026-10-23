@@ -24,6 +24,13 @@ public struct RotatedPLCAccountIdentity: Sendable, Equatable {
     }
 }
 
+public struct AccountKEMBackfillResult: Sendable, Equatable {
+    public let did: String
+    public let operationCID: String
+    public let generation: UInt64
+    public let publishedNewOperation: Bool
+}
+
 public enum PLCAccountRotationError: Error, Sendable, Equatable {
     case conflict
     case unavailable
@@ -55,10 +62,73 @@ public actor PLCAccountRotationService {
         self.lifecycleEmitter = lifecycleEmitter
     }
 
-    public func rotate(
-        did rawDID: String,
-        now: Date = Date()
-    ) async throws -> RotatedPLCAccountIdentity {
+    /// Explicitly backfills only an active account still hosted at the expected
+    /// PDS. It leaves repository signing and PLC rotation keys unchanged.
+    public func backfillKEM(did rawDID: String, expectedPDSOrigin: URL, now: Date = Date()) async throws -> AccountKEMBackfillResult {
+        let did = try AccountIdentifiers.validateDID(rawDID)
+        let origin = try PLCATProfile.canonicalPDSOrigin(expectedPDSOrigin)
+        guard did.hasPrefix("did:plc:"), let account = try await controlStore.account(did: did),
+              account.status == .active, let generation = account.signingKey?.generation,
+              account.rotationKey?.generation == generation else { throw PLCAccountRotationError.conflict }
+        let store = try await accountStoreOpener.openPLCAccountPreparationStore(did: did)
+        guard let historyStore = store as? any PublicPLCIdentityHistoryStore else { throw PLCAccountRotationError.unavailable }
+        let history = try await ensureHistory(store: store, historyStore: historyStore, account: account, now: now)
+        guard let terminal = history.last, terminal.signingKeyGeneration == generation else {
+            // Resolve a pending signing-key rotation through rotate() first.
+            throw PLCAccountRotationError.conflict
+        }
+        let operation = try PLCOperationCodec.decodeSignedJSON(terminal.canonicalJSON)
+        guard let regular = operation.regular, regular.services["atproto_pds"]?.endpoint == origin else {
+            throw PLCAccountRotationError.conflict
+        }
+        let state = try await plcClient.fetchState(did: did)
+        guard state.did == did, state.services["atproto_pds"]?.endpoint == origin else {
+            throw PLCAccountRotationError.conflict
+        }
+        if let published = regular.verificationMethods["atproto_kem"] {
+            let key = try await AccountKEMKeyProvider(keyStore: keyStore).privateKey(accountDID: did)
+            guard try AccountKEMKeyProvider.didKey(key.publicKey) == published else { throw PLCAccountRotationError.conflict }
+            // A persisted KEM operation may be pending after an interrupted
+            // submit. Replaying that exact operation is safe and does not
+            // allocate a second key or a second history entry.
+            let matches = state.verificationMethods == regular.verificationMethods
+                && state.rotationKeys == regular.rotationKeys && state.services == regular.services
+                && state.alsoKnownAs == regular.alsoKnownAs
+            if !matches {
+                guard operation.prev != nil else { throw PLCAccountRotationError.conflict }
+                try await submitAndVerify(operation: operation, did: did, expectedPrevious: operation.prev)
+            } else {
+                let audit = try await plcClient.fetchAudit(did: did)
+                guard let latest = audit.last, !latest.nullified, latest.cid == terminal.cid,
+                      latest.operation == operation else { throw PLCAccountRotationError.conflict }
+            }
+            if operation.prev != nil {
+                try await lifecycleEmitter?.emitRotationIdentity(did: did, plcOperationCID: terminal.cid,
+                    handle: nil, materialTime: terminal.createdAt, now: now)
+            }
+            return AccountKEMBackfillResult(did: did, operationCID: terminal.cid, generation: generation, publishedNewOperation: !matches)
+        }
+        guard state.verificationMethods == regular.verificationMethods,
+              state.rotationKeys == regular.rotationKeys, state.services == regular.services,
+              state.alsoKnownAs == regular.alsoKnownAs else { throw PLCAccountRotationError.conflict }
+        let key = try await AccountKeyProvisioner(keyStore: keyStore).provisionKEM(accountDID: did)
+        var methods = regular.verificationMethods
+        methods["atproto_kem"] = try AccountKEMKeyProvider.didKey(key.publicKey)
+        let rotationKey = try P256.Signing.PrivateKey(rawRepresentation: await keyStore.key(for:
+            AccountKeyReference(accountDID: did, purpose: .rotation, generation: generation)))
+        let unsigned = try PLCUnsignedRegularOperation(rotationKeys: regular.rotationKeys,
+            verificationMethods: methods, alsoKnownAs: regular.alsoKnownAs, services: regular.services, prev: terminal.cid)
+        let updated = try PLCOperationCodec.sign(.regular(unsigned), using: rotationKey)
+        let proposed = try PublicPLCOperationHistoryEntry(cid: updated.cid.string, previousCID: terminal.cid,
+            canonicalJSON: updated.canonicalJSON, createdAt: now, signingKeyGeneration: generation, rotationKeyGeneration: generation)
+        let persisted = try await historyStore.installPublicPLCOperation(proposed)
+        try await submitAndVerify(operation: updated, did: did, expectedPrevious: terminal.cid)
+        try await lifecycleEmitter?.emitRotationIdentity(did: did, plcOperationCID: persisted.cid,
+            handle: nil, materialTime: persisted.createdAt, now: now)
+        return AccountKEMBackfillResult(did: did, operationCID: persisted.cid, generation: generation, publishedNewOperation: true)
+    }
+
+    public func rotate(did rawDID: String, now: Date = Date()) async throws -> RotatedPLCAccountIdentity {
         let did: String
         do {
             did = try AccountIdentifiers.validateDID(rawDID)
@@ -164,10 +234,12 @@ public actor PLCAccountRotationService {
         } catch {
             throw PLCAccountRotationError.unavailable
         }
+        let methods = terminalOperation.regular?.verificationMethods ?? [:]
         let rotatedOperation: PLCSignedOperation
         do {
             rotatedOperation = try makeRotation(
                 previous: terminalOperation,
+                verificationMethods: methods,
                 signingPublicKey: try P256.Signing.PublicKey(
                     x963Representation: nextKeys.signingPublicKey
                 ),
@@ -258,12 +330,13 @@ public actor PLCAccountRotationService {
               journal.publicGenesisCommitCID == account.publicGenesisCommitCID else {
             throw PLCAccountRotationError.conflict
         }
-        let operation = try PLCOperationCodec.reconstructGenesis(
+        let operation = try SwanPLCGenesisCodec.reconstructGenesis(
             signingDIDKey: journal.operation.signingDIDKey,
             rotationDIDKey: journal.operation.rotationDIDKey,
             canonicalHandle: journal.canonicalHandle,
             pdsOrigin: journal.pdsOrigin,
-            signature: journal.operation.signature
+            signature: journal.operation.signature,
+                kemDIDKey: journal.operation.kemDIDKey
         )
         try PLCOperationCodec.verifyGenesis(operation, expectedDID: account.did)
         let entry = try PublicPLCOperationHistoryEntry(
@@ -323,6 +396,7 @@ public actor PLCAccountRotationService {
 
     private func makeRotation(
         previous: PLCSignedOperation,
+        verificationMethods: [String: String],
         signingPublicKey: P256.Signing.PublicKey,
         rotationPublicKey: P256.Signing.PublicKey,
         using rotationKey: P256.Signing.PrivateKey
@@ -333,9 +407,9 @@ public actor PLCAccountRotationService {
         }
         let unsigned = try PLCUnsignedRegularOperation(
             rotationKeys: [P256DIDKey(publicKey: rotationPublicKey).value],
-            verificationMethods: [
+            verificationMethods: verificationMethods.merging([
                 "atproto": P256DIDKey(publicKey: signingPublicKey).value,
-            ],
+            ]) { _, current in current },
             alsoKnownAs: prior.alsoKnownAs,
             services: prior.services,
             prev: previousCID

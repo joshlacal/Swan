@@ -27,9 +27,12 @@ public struct AccountKeyProvisioner: Sendable {
     public func installInitial(
         accountDID: String,
         signingKey: P256.Signing.PrivateKey,
-        rotationKey: P256.Signing.PrivateKey
+        rotationKey: P256.Signing.PrivateKey,
+        kemKey: P256.KeyAgreement.PrivateKey? = nil
     ) async throws -> ProvisionedAccountKeys {
-        guard signingKey.rawRepresentation != rotationKey.rawRepresentation else {
+        guard kemKey?.rawRepresentation != signingKey.rawRepresentation,
+              kemKey?.rawRepresentation != rotationKey.rawRepresentation,
+              signingKey.rawRepresentation != rotationKey.rawRepresentation else {
             throw SwanError.malformed("account provisioning keys are not distinct")
         }
         let signingReference = try AccountKeyReference(
@@ -43,7 +46,7 @@ public struct AccountKeyProvisioner: Sendable {
             generation: 1
         )
         do {
-            try await keyStore.createBatch([
+            var materials = [
                 try AccountKeyMaterial(
                     reference: signingReference,
                     key: signingKey.rawRepresentation
@@ -52,9 +55,17 @@ public struct AccountKeyProvisioner: Sendable {
                     reference: rotationReference,
                     key: rotationKey.rawRepresentation
                 ),
-            ])
+            ]
+            if let kemKey {
+                materials.append(try AccountKeyMaterial(reference: AccountKEMKeyProvider.reference(accountDID: accountDID), key: kemKey.rawRepresentation))
+            }
+            try await keyStore.createBatch(materials)
         } catch let error as SwanError where error == .conflict(expected: 0, actual: 1) {
             let resumed = try await resumeProvisioning(accountDID: accountDID, generation: 1)
+            if let kemKey {
+                let stored = try await AccountKEMKeyProvider(keyStore: keyStore).privateKey(accountDID: accountDID)
+                guard stored.rawRepresentation == kemKey.rawRepresentation else { throw SwanError.conflict(expected: 0, actual: 1) }
+            }
             guard resumed.signingPublicKey == signingKey.publicKey.x963Representation,
                   resumed.rotationPublicKey == rotationKey.publicKey.x963Representation else {
                 throw SwanError.conflict(expected: 0, actual: 1)
@@ -67,6 +78,20 @@ public struct AccountKeyProvisioner: Sendable {
             signingPublicKey: signingKey.publicKey.x963Representation,
             rotationPublicKey: rotationKey.publicKey.x963Representation
         )
+    }
+
+    /// Creates or resumes a local KEM envelope. It does not publish identity changes.
+    public func provisionKEM(accountDID: String) async throws -> P256.KeyAgreement.PrivateKey {
+        let reference = try AccountKEMKeyProvider.reference(accountDID: accountDID)
+        if let stored = try await keyStore.keyIfPresent(for: reference) {
+            return try P256.KeyAgreement.PrivateKey(rawRepresentation: stored)
+        }
+        let key = P256.KeyAgreement.PrivateKey()
+        do { try await keyStore.create(key.rawRepresentation, for: reference) }
+        catch let error as SwanError where error == .conflict(expected: 0, actual: 1) {
+            return try await AccountKEMKeyProvider(keyStore: keyStore).privateKey(accountDID: accountDID)
+        }
+        return key
     }
 
     public func provisionRotation(
@@ -135,7 +160,7 @@ public struct AccountKeyProvisioner: Sendable {
             generation: generation
         )
         do {
-            try await keyStore.createBatch([
+            var materials = [
                 try AccountKeyMaterial(
                     reference: signingReference,
                     key: signingKey.rawRepresentation
@@ -144,7 +169,16 @@ public struct AccountKeyProvisioner: Sendable {
                     reference: rotationReference,
                     key: rotationKey.rawRepresentation
                 ),
-            ])
+            ]
+            if generation == 1 {
+                let kem = P256.KeyAgreement.PrivateKey()
+                guard kem.rawRepresentation != signingKey.rawRepresentation,
+                      kem.rawRepresentation != rotationKey.rawRepresentation else {
+                    throw SwanError.unavailable("P-256 key generation returned duplicate account keys")
+                }
+                materials.append(try AccountKeyMaterial(reference: AccountKEMKeyProvider.reference(accountDID: accountDID), key: kem.rawRepresentation))
+            }
+            try await keyStore.createBatch(materials)
         } catch let error as SwanError where error == .conflict(expected: 0, actual: 1) {
             return try await resumeProvisioning(
                 accountDID: accountDID,

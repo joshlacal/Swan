@@ -43,16 +43,22 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
         XCTAssertEqual(journal.signingKey.generation, 1)
         XCTAssertEqual(journal.rotationKey.generation, 1)
 
-        let operation = try PLCOperationCodec.reconstructGenesis(
+        let operation = try SwanPLCGenesisCodec.reconstructGenesis(
             signingDIDKey: journal.operation.signingDIDKey,
             rotationDIDKey: journal.operation.rotationDIDKey,
             canonicalHandle: journal.canonicalHandle,
             pdsOrigin: journal.pdsOrigin,
-            signature: journal.operation.signature
+            signature: journal.operation.signature,
+            kemDIDKey: journal.operation.kemDIDKey
         )
         try PLCOperationCodec.verifyGenesis(operation, expectedDID: identity.did)
         XCTAssertEqual(try operation.cid.string, identity.plcOperationCID)
+        let kem = try await AccountKEMKeyProvider(keyStore: fixture.keyStore).privateKey(accountDID: identity.did)
+        XCTAssertEqual(try AccountKEMKeyProvider.didKey(kem.publicKey), journal.operation.kemDIDKey)
+        let rotationData = try await fixture.keyStore.key(for: identity.rotationReference)
+        XCTAssertNotEqual(kem.rawRepresentation, rotationData)
         let signingData = try await fixture.keyStore.key(for: identity.signingReference)
+        XCTAssertNotEqual(kem.rawRepresentation, signingData)
         let signingKey = try P256.Signing.PrivateKey(rawRepresentation: signingData)
         let loadedGenesis = try await account.loadPublicRepositoryGenesis(
             did: identity.did,
@@ -102,10 +108,10 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
             repositoryRevision: "3lqby3xuo4k2b"
         )
         XCTAssertEqual(first, second)
-        XCTAssertEqual(inventoryBefore.totalEnvelopeCount, 2)
+        XCTAssertEqual(inventoryBefore.totalEnvelopeCount, 3)
         let reloadedInventory = try await reloaded.inventory()
         let submissionCount = await fixture.plc.submitCount()
-        XCTAssertEqual(reloadedInventory.totalEnvelopeCount, 2)
+        XCTAssertEqual(reloadedInventory.totalEnvelopeCount, 3)
         XCTAssertEqual(first.signingReference.generation, 1)
         XCTAssertEqual(first.rotationReference.generation, 1)
         XCTAssertEqual(submissionCount, 1)
@@ -255,7 +261,7 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
             case .promoted:
                 XCTAssertEqual(interruptedIntent?.stage, .keysStored)
                 XCTAssertNotNil(retainedStage)
-                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 3)
                 XCTAssertNil(interruptedJournalStage)
                 let account = try await fixture.opener.openPLCAccountPreparationStore(
                     did: try XCTUnwrap(interruptedIntent?.did)
@@ -265,33 +271,33 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
             case .journalInstalled:
                 XCTAssertEqual(interruptedIntent?.stage, .keysStored)
                 XCTAssertNotNil(retainedStage)
-                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 3)
                 XCTAssertEqual(interruptedJournalStage, .keysStored)
             case .reclaimed, .repository:
                 XCTAssertEqual(interruptedIntent?.stage, .keysStored)
                 XCTAssertNil(retainedStage)
-                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 3)
                 XCTAssertEqual(interruptedJournalStage, .keysStored)
             case .journalRepositoryInstalled:
                 XCTAssertEqual(interruptedIntent?.stage, .keysStored)
                 XCTAssertNil(retainedStage)
-                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 3)
                 XCTAssertEqual(interruptedJournalStage, .repositoryInstalled)
             case .journalSubmissionPending:
                 XCTAssertEqual(interruptedIntent?.stage, .repositoryInstalled)
                 XCTAssertNil(retainedStage)
-                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 3)
                 XCTAssertEqual(interruptedJournalStage, .submissionPending)
             case .plcSubmitted, .remoteVerified:
                 XCTAssertEqual(interruptedIntent?.stage, .submissionPending)
                 XCTAssertNil(retainedStage)
-                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 3)
                 XCTAssertEqual(interruptedJournalStage, .submissionPending)
             case .journalSubmitted:
                 XCTAssertEqual(interruptedIntent?.stage, .submissionPending)
                 XCTAssertNotNil(interruptedIntent)
                 XCTAssertNil(retainedStage)
-                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 3)
                 XCTAssertEqual(interruptedJournalStage, .submitted)
             }
             let reloadedKeyStore = try FileAccountKeyStore(
@@ -323,12 +329,13 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
             let loadedRecoveredJournal = try await recoveredStore
                 .plcAccountPreparationJournal()
             let recoveredJournal = try XCTUnwrap(loadedRecoveredJournal)
-            let recoveredOperation = try PLCOperationCodec.reconstructGenesis(
+            let recoveredOperation = try SwanPLCGenesisCodec.reconstructGenesis(
                 signingDIDKey: recoveredJournal.operation.signingDIDKey,
                 rotationDIDKey: recoveredJournal.operation.rotationDIDKey,
                 canonicalHandle: recoveredJournal.canonicalHandle,
                 pdsOrigin: recoveredJournal.pdsOrigin,
-                signature: recoveredJournal.operation.signature
+                signature: recoveredJournal.operation.signature,
+                kemDIDKey: recoveredJournal.operation.kemDIDKey
             )
             XCTAssertEqual(try recoveredOperation.canonicalJSON, expected.operationJSON)
             let inventory = try await reloadedKeyStore.inventory()
@@ -341,7 +348,7 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
                 pdsOrigin: URL(string: "https://pds.example.com")!,
                 repositoryRevision: "3lqby3xuo4k2e"
             )
-            XCTAssertEqual(inventory.totalEnvelopeCount, 2)
+            XCTAssertEqual(inventory.totalEnvelopeCount, 3)
             XCTAssertEqual(submissionCount, 1)
             XCTAssertEqual(recoveredIntent?.stage, .submitted)
             XCTAssertNil(remainingStage)
@@ -645,8 +652,8 @@ final class PLCAccountActivationServiceTests: XCTestCase {
         XCTAssertEqual(first.account.status, .active)
         XCTAssertEqual(first.account.publicGenesisCommitCID, fixture.identity.publicGenesisCommitCID)
         let inventoryAfter = try await fixture.preparation.keyStore.inventory()
-        XCTAssertEqual(inventoryBefore.totalEnvelopeCount, 2)
-        XCTAssertEqual(inventoryAfter.totalEnvelopeCount, 2)
+        XCTAssertEqual(inventoryBefore.totalEnvelopeCount, 3)
+        XCTAssertEqual(inventoryAfter.totalEnvelopeCount, 3)
         XCTAssertEqual(fixture.identity.signingReference.generation, 1)
         XCTAssertEqual(fixture.identity.rotationReference.generation, 1)
         let verifierCalls = await fixture.verifier.callCount()

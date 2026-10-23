@@ -1161,12 +1161,13 @@ public struct SwanPortableAccountExporter: Sendable {
               journal.publicGenesisCommitCID == expectedGenesisCID else {
             throw SwanPortableExportError.missingSource
         }
-        let operation = try PLCOperationCodec.reconstructGenesis(
+        let operation = try SwanPLCGenesisCodec.reconstructGenesis(
             signingDIDKey: journal.operation.signingDIDKey,
             rotationDIDKey: journal.operation.rotationDIDKey,
             canonicalHandle: journal.canonicalHandle,
             pdsOrigin: journal.pdsOrigin,
-            signature: journal.operation.signature
+            signature: journal.operation.signature,
+                kemDIDKey: journal.operation.kemDIDKey
         )
         try PLCOperationCodec.verifyGenesis(operation, expectedDID: did)
         guard operation.regular?.verificationMethods["atproto"]

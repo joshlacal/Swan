@@ -13,7 +13,7 @@ import SwanStorage
 /// - delegation, space-credential, and service-JWT issuer keys for any
 ///   `did:plc` or `did:web` issuer, read from the issuer's DID document;
 /// - the `notifyWrite` destination of a space authority, read from its
-///   `#atproto_space_host` (type `AtprotoSpaceHost`) entry, else `#atproto_pds`.
+///   `#atproto_pds` (type `AtprotoSpaceHost`) entry, else `#atproto_pds`.
 ///
 /// Every fetch goes through the caller-supplied ``SwanDIDDocumentFetching``,
 /// which in `serve` is ``SwanPeerPinnedDIDDocumentFetcher`` (peer-pinned, no
@@ -108,15 +108,8 @@ public actor SwanDIDDocumentSpaceResolver:
         for issuer: String,
         keyID: String
     ) async throws -> PermissionedDataJWTVerificationKey? {
-        let fragments: [String]
-        switch keyID {
-        case PermissionedDataJWT.spaceCredentialKeyID:
-            fragments = ["atproto_space", "atproto"]
-        case PermissionedDataJWT.spaceCredentialFallbackKeyID:
-            fragments = ["atproto"]
-        default:
-            return nil
-        }
+        guard keyID == "#atproto" else { return nil }
+        let fragments = ["atproto"]
         guard let document = try await document(for: issuer) else { return nil }
         for fragment in fragments {
             if let key = try Self.verificationKey(in: document, did: issuer, fragment: fragment) {
@@ -136,30 +129,15 @@ public actor SwanDIDDocumentSpaceResolver:
 
     // MARK: notifyWrite routing
 
-    /// `#atproto_space_host` (which must be typed `AtprotoSpaceHost`) when
+    /// `#atproto_pds` (which must be typed `AtprotoSpaceHost`) when
     /// present, else `#atproto_pds`. A present-but-malformed space-host entry
     /// is an error rather than a fallback. The audience is always
-    /// `<authority>#atproto_space_host`, also when the endpoint falls back to
+    /// `<authority>#atproto_pds`, also when the endpoint falls back to
     /// `#atproto_pds`: the reference sender (atproto#5574) addresses the
     /// space-host role, not the endpoint it happened to resolve.
     public func notifyDestination(forAuthority authority: String) async throws -> NotifyDestination? {
         guard let document = try await document(for: authority) else { return nil }
         let services = document.service ?? []
-        let spaceHosts = services.filter {
-            Self.matches(did: authority, fragment: "atproto_space_host", candidate: $0.id)
-        }
-        if !spaceHosts.isEmpty {
-            guard spaceHosts.count == 1,
-                  let entry = spaceHosts.first,
-                  entry.type == "AtprotoSpaceHost",
-                  let endpoint = entry.serviceEndpoint.flatMap(Self.httpsOrigin) else {
-                throw SwanError.malformed("space authority #atproto_space_host entry is malformed")
-            }
-            return NotifyDestination(
-                endpoint: endpoint,
-                audience: "\(authority)#atproto_space_host"
-            )
-        }
         let pds = services.filter {
             Self.matches(did: authority, fragment: "atproto_pds", candidate: $0.id)
         }
@@ -171,7 +149,7 @@ public actor SwanDIDDocumentSpaceResolver:
         }
         return NotifyDestination(
             endpoint: endpoint,
-            audience: "\(authority)#atproto_space_host"
+            audience: "\(authority)#atproto_pds"
         )
     }
 

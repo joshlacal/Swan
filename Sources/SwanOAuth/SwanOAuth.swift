@@ -224,7 +224,7 @@ public enum PermissionedDataJWT {
     /// verification still accepts it (resolving the dedicated method first
     /// and the ordinary `#atproto` method only when the dedicated one is
     /// absent) for peers that do publish one.
-    public static let spaceCredentialKeyID = "#atproto_space"
+    public static let spaceCredentialKeyID = "#atproto"
     /// The authority's ordinary AT Protocol verification method. Proposal
     /// 0016 permits it when no dedicated `#atproto_space` method is
     /// published, and the reference implementation has minted exactly this
@@ -363,7 +363,7 @@ public enum PermissionedDataJWT {
         lifetime: TimeInterval = 60
     ) throws -> String {
         guard isPermissionedDataDID(issuer),
-              audience == "\(space.authority)#atproto_space_host",
+              audience == "\(space.authority)#atproto_pds",
               lifetime > 0,
               lifetime <= delegationLifetime,
               lifetime.rounded(.towardZero) == lifetime else {
@@ -418,7 +418,7 @@ public enum PermissionedDataJWT {
         guard claims.aud == audience,
               isPermissionedDataDID(claims.iss),
               let space = try? SpaceURI(claims.sub),
-              claims.aud == "\(space.authority)#atproto_space_host",
+              claims.aud == "\(space.authority)#atproto_pds",
               expectedSpace.map({ $0 == space }) ?? true,
               claims.jti.isValidPermissionedDataJTI else {
             throw SwanError.unauthorized("delegation token audience or space is invalid")
@@ -449,7 +449,7 @@ public enum PermissionedDataJWT {
         let claims = try decode(DelegationClaims.self, from: parsed.payload)
         guard isPermissionedDataDID(claims.iss),
               let space = try? SpaceURI(claims.sub),
-              claims.aud == "\(space.authority)#atproto_space_host",
+              claims.aud == "\(space.authority)#atproto_pds",
               claims.jti.isValidPermissionedDataJTI else {
             throw SwanError.unauthorized("delegation token issuer, audience, or subject is invalid")
         }
@@ -605,7 +605,7 @@ public enum PermissionedDataJWT {
         }
         try StrictJSON.validateTopLevelIntegerMembers(["iat", "exp"], in: payload)
         let claims = try StrictJSON.decode(ClientAttestationClaims.self, from: payload)
-        let expectedAudience = "\(authority)#atproto_space_host"
+        let expectedAudience = "\(authority)#atproto_pds"
         guard claims.iss == claims.sub,
               claims.aud == expectedAudience,
               claims.jti.isValidPermissionedDataJTI,

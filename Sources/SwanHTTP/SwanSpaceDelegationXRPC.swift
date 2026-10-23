@@ -134,7 +134,7 @@ private struct AuthenticatedGetSpaceDelegationTokenHandler:
             guard inspection.header.alg == "ES256",
                   inspection.header.kid == PermissionedDataJWT.delegationKeyID,
                   inspection.claims.iss == subject,
-                  inspection.claims.aud == "\(space.authority)#atproto_space_host",
+                  inspection.claims.aud == "\(space.authority)#atproto_pds",
                   inspection.claims.sub == space.rawValue,
                   !duration.overflow,
                   duration.partialValue == Int64(PermissionedDataJWT.delegationLifetime) else {

@@ -51,7 +51,7 @@ struct SwanCORSMiddleware<Context: RequestContext>: RouterMiddleware {
     /// (`oauthAPICORSHeaders`); hoisting it here extends the same decision to
     /// the XRPC surface rather than making a new one.
     private static var exposedHeaders: String {
-        "DPoP-Nonce, WWW-Authenticate"
+        "DPoP-Nonce, WWW-Authenticate, Atproto-Space-Mac"
     }
 
     /// One day, matching upstream's `maxAge: DAY / SECOND`.

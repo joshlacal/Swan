@@ -15,6 +15,21 @@ import SwanSpaces
 import SwanStorage
 import XCTest
 
+private struct October22MACProvider: SpaceRepositoryCommitSigner {
+    static var key: P256.KeyAgreement.PrivateKey {
+        try! P256.KeyAgreement.PrivateKey(rawRepresentation: Data(repeating: 0x51, count: 32))
+    }
+    static var publicKey: String {
+        P256DIDKey(publicKey: try! P256.Signing.PublicKey(x963Representation: key.publicKey.x963Representation)).value
+    }
+    func sharedSecret(author: String, keyShare: String) async throws -> Data {
+        try SpaceMAC.decapsulate(privateKey: Self.key, keyShare: keyShare)
+    }
+    func signRepositoryCommit(space: SpaceURI, author: String, wireRevision: String, commitment: Data) async throws -> SpaceCommitEnvelope {
+        throw SwanError.unavailable("legacy signatures are not used on October 22 wire")
+    }
+}
+
 final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
     static let authority = "did:plc:abcdefghijklmnopqrstuvwx"
     static let member = "did:plc:bcdefghijklmnopqrstuvwxy"
@@ -23,6 +38,123 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
     private static let credentialPath = "/xrpc/com.atproto.space.getSpaceCredential"
     private static let getPath = "/xrpc/com.atproto.space.getRecord"
     private static let listPath = "/xrpc/com.atproto.space.listRecords"
+
+    func testOctober22CredentialBodyPublicPrivateDeletedAndReplay() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let app = try makeServer(fixture).buildApplication(logger: Logger(label: "spaces.oct22.exchange"))
+            try await app.test(.router) { client in
+                func body(_ space: SpaceURI, delegation: String? = nil, kid: String? = nil) throws -> ByteBuffer {
+                    var object: [String: String] = ["space": space.rawValue,
+                                                  "credentialKid": try kid ?? SpaceCredentialSignatureTestSupport.keyID]
+                    object["delegationToken"] = delegation
+                    return ByteBuffer(bytes: try JSONSerialization.data(withJSONObject: object))
+                }
+                let headers: HTTPFields = [.contentType: "application/json"]
+                try await client.execute(uri: Self.credentialPath, method: .post, headers: headers,
+                                         body: body(fixture.publicSpace)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let token = try XCTUnwrap(self.jsonObject(response.body)["credential"] as? String)
+                    let inspection = try PermissionedDataJWT.inspectSpaceCredential(token)
+                    XCTAssertEqual(inspection.header.kid, "#atproto")
+                    XCTAssertEqual(inspection.claims.cnf.kid, try SpaceCredentialSignatureTestSupport.keyID)
+                }
+                try await client.execute(uri: Self.credentialPath, method: .post, headers: headers,
+                                         body: body(fixture.memberSpace)) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
+                }
+                for bad in ["not-a-key", "did:key:z6Mkinvalid"] {
+                    try await client.execute(uri: Self.credentialPath, method: .post, headers: headers,
+                                             body: body(fixture.publicSpace, kid: bad)) { response in
+                        XCTAssertEqual(response.status, .badRequest)
+                        XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                    }
+                }
+                let delegation = try self.delegation(fixture, user: Self.member, space: fixture.memberSpace)
+                for expected in [HTTPResponse.Status.ok, .badRequest] {
+                    try await client.execute(uri: Self.credentialPath, method: .post, headers: headers,
+                                             body: body(fixture.memberSpace, delegation: delegation)) { response in
+                        XCTAssertEqual(response.status, expected)
+                        if expected == .badRequest { XCTAssertEqual(try self.errorCode(response.body), "InvalidDelegationToken") }
+                    }
+                }
+                try await client.execute(uri: Self.credentialPath, method: .post, headers: headers,
+                                         body: body(fixture.publicSpace, delegation: "bad")) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidDelegationToken")
+                }
+                try await fixture.directory.deleteSimpleSpace(fixture.publicSpace,
+                    authorization: .accountOAuthForTesting(subject: Self.authority, scopes: ["atproto"]))
+                try await client.execute(uri: Self.credentialPath, method: .post, headers: headers,
+                                         body: body(fixture.publicSpace)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "SpaceDeleted")
+                }
+            }
+            try await fixture.close()
+        } catch { try? await fixture.close(); throw error }
+    }
+
+    func testOctober22ResponseMACAndSTARAreBoundToAuthenticatedBody() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let app = try makeServer(fixture).buildApplication(logger: Logger(label: "spaces.oct22.mac"))
+            let credential = try PermissionedDataJWT.createSpaceCredential(
+                issuer: Self.authority, space: fixture.publicSpace, key: fixture.authorityKey,
+                confirmationKeyID: SpaceCredentialSignatureTestSupport.keyID)
+            try await app.test(.router) { client in
+                for method in ["getLatestCommit", "listRepoOps", "getRepo"] {
+                    let uri = "/xrpc/com.atproto.space.\(method)?space=\(fixture.publicSpace.rawValue)&repo=\(Self.member)"
+                    let signed = try self.credentialHeaders(credential)
+                    try await client.execute(uri: uri, method: .get, headers: signed) { response in
+                        XCTAssertEqual(response.status, .badRequest)
+                        XCTAssertEqual(try self.errorCode(response.body), "BadSpaceMac")
+                    }
+                    let exchange = try SpaceMAC.encapsulate(authorKey: October22MACProvider.publicKey)
+                    var headers = signed
+                    headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!] = try SpaceMACHeaders.formatWantMAC(keyShare: exchange.keyShare, type: .repository)
+                    try await client.execute(uri: uri, method: .get, headers: headers) { response in
+                        XCTAssertEqual(response.status, .ok)
+                        XCTAssertTrue(response.headers[HTTPField.Name("Vary")!]?.contains(SpaceMACHeaders.requestHeader) == true)
+                        XCTAssertTrue(response.headers[.accessControlExposeHeaders]?.contains(SpaceMACHeaders.responseHeader) == true)
+                        let mac = try SpaceMACHeaders.parseMAC(response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!], type: .repository)
+                        if method == "getRepo" {
+                            XCTAssertEqual(response.headers[.contentType], "application/octet-stream")
+                            let archive = try SpaceSTARCodec.decode(Data(response.body.readableBytesView), space: fixture.publicSpace, author: Self.member) { commit in
+                                try commit.mac(sharedSecret: exchange.sharedSecret) == mac
+                            }
+                            XCTAssertEqual(archive.records.count, 1)
+                        } else {
+                            let object = try self.jsonObject(response.body)
+                            let commit = try XCTUnwrap(object["commit"] as? [String: Any])
+                            XCTAssertEqual(Set(commit.keys), ["ver", "repo", "space", "rev", "data"])
+                            let dataObject = try XCTUnwrap(commit["data"] as? [String: String])
+                            let data = try XCTUnwrap(Data(base64Encoded: XCTUnwrap(dataObject["$bytes"])))
+                            let expected = try SpaceMAC.commit(sharedSecret: exchange.sharedSecret,
+                                space: fixture.publicSpace.rawValue, repo: Self.member,
+                                rev: XCTUnwrap(commit["rev"] as? String), data: data)
+                            XCTAssertEqual(mac, expected)
+                        }
+                    }
+                }
+                let uri = self.getURI(space: fixture.publicSpace, repo: Self.member, rkey: "public")
+                let exchange = try SpaceMAC.encapsulate(authorKey: October22MACProvider.publicKey)
+                var headers = try self.credentialHeaders(credential)
+                headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!] = try SpaceMACHeaders.formatWantMAC(keyShare: exchange.keyShare, type: .record)
+                try await client.execute(uri: uri, method: .get, headers: headers) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let object = try self.jsonObject(response.body)
+                    let cid = try CID.parse(XCTUnwrap(object["cid"] as? String))
+                    let mac = try SpaceMACHeaders.parseMAC(response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!], type: .record)
+                    XCTAssertEqual(mac, try SpaceMAC.record(sharedSecret: exchange.sharedSecret, uri: fixture.publicRecord.rawValue, cid: Data(cid.bytes)))
+                }
+            }
+            try await fixture.close()
+        } catch { try? await fixture.close(); throw error }
+    }
 
     func testCredentialRenewalReportsSpaceDeletedOnlyAfterValidDelegationAndProof() async throws {
         let fixture = try await Fixture.make()
@@ -1014,46 +1146,46 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             let wrongSpace = try delegation(fixture, user: Self.member, space: otherSpace)
             let wrongAudience = try signedDelegation(
                 issuer: Self.member,
-                audience: "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz#atproto_space_host",
+                audience: "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz#atproto_pds",
                 space: fixture.publicSpace,
                 key: fixture.memberKey
             )
             let wrongKey = try signedDelegation(
                 issuer: Self.member,
-                audience: "\(Self.authority)#atproto_space_host",
+                audience: "\(Self.authority)#atproto_pds",
                 space: fixture.publicSpace,
                 key: P256.Signing.PrivateKey()
             )
             let unknownIssuer = try signedDelegation(
                 issuer: "did:plc:defghijklmnopqrstuvwxyz2",
-                audience: "\(Self.authority)#atproto_space_host",
+                audience: "\(Self.authority)#atproto_pds",
                 space: fixture.publicSpace,
                 key: fixture.memberKey
             )
             let excessiveLifetime = try signedDelegation(
                 issuer: Self.member,
-                audience: "\(Self.authority)#atproto_space_host",
+                audience: "\(Self.authority)#atproto_pds",
                 space: fixture.publicSpace,
                 key: fixture.memberKey,
                 lifetime: 61
             )
             let futureIssued = try signedDelegation(
                 issuer: Self.member,
-                audience: "\(Self.authority)#atproto_space_host",
+                audience: "\(Self.authority)#atproto_pds",
                 space: fixture.publicSpace,
                 key: fixture.memberKey,
                 issuedAt: Int64(Date().timeIntervalSince1970) + 120
             )
             let opaqueJTI = try signedDelegation(
                 issuer: Self.member,
-                audience: "\(Self.authority)#atproto_space_host",
+                audience: "\(Self.authority)#atproto_pds",
                 space: fixture.publicSpace,
                 key: fixture.memberKey,
                 jti: "ts-nonce_01"
             )
             let expired = try PermissionedDataJWT.createDelegationToken(
                 issuer: Self.member,
-                audience: "\(Self.authority)#atproto_space_host",
+                audience: "\(Self.authority)#atproto_pds",
                 space: fixture.publicSpace,
                 key: fixture.memberKey,
                 now: Date(timeIntervalSinceNow: -180)
@@ -1263,7 +1395,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 delegationPublicKeys: delegationKeys,
                 credentialPublicKeys: credentialKeys,
                 clientAttestationPolicy: clientAttestationPolicy
-            )
+            ),
+            spaceRepositorySyncConfiguration: .init(commitSigner: October22MACProvider())
         )
     }
 
@@ -1277,7 +1410,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             : fixture.outsiderKey
         return try PermissionedDataJWT.createDelegationToken(
             issuer: user,
-            audience: "\(space.authority)#atproto_space_host",
+            audience: "\(space.authority)#atproto_pds",
             space: space,
             key: key
         )
@@ -1525,7 +1658,7 @@ private func signedClientAttestation(
         withJSONObject: [
             "iss": clientID,
             "sub": clientID,
-            "aud": "\(authority)#atproto_space_host",
+            "aud": "\(authority)#atproto_pds",
             "iat": issuedAt,
             "exp": issuedAt + 60,
             "jti": jti,

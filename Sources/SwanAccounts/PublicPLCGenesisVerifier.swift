@@ -13,12 +13,13 @@ public struct SwanPublicPLCGenesisVerifier: PublicPLCGenesisVerifying {
         facts: PublicPLCGenesisFacts,
         expectedDID: String
     ) throws -> String {
-        let operation = try PLCOperationCodec.reconstructGenesis(
+        let operation = try SwanPLCGenesisCodec.reconstructGenesis(
             signingDIDKey: facts.signingDIDKey,
             rotationDIDKey: facts.rotationDIDKey,
             canonicalHandle: facts.canonicalHandle,
             pdsOrigin: facts.pdsOrigin,
-            signature: facts.signature
+            signature: facts.signature,
+            kemDIDKey: facts.kemDIDKey
         )
         try PLCOperationCodec.verifyGenesis(operation, expectedDID: expectedDID)
         return try operation.cid.string
@@ -70,17 +71,22 @@ extension SwanPublicPLCGenesisVerifier: PublicPLCIdentityVerifying {
                 }
                 try PLCOperationCodec.verifyGenesis(operation, expectedDID: expectedDID)
             } else {
-                guard let previousOperation,
-                      let previousCID,
-                      entry.previousCID == previousCID,
+                guard let previousOperation, let previousCID, entry.previousCID == previousCID,
                       entry.signingKeyGeneration == entry.rotationKeyGeneration,
-                      history[index - 1].signingKeyGeneration < UInt64.max,
-                      entry.signingKeyGeneration
-                        == history[index - 1].signingKeyGeneration + 1 else {
-                    throw SwanError.unauthorized("PLC rotation generation is invalid")
-                }
-                guard let parent = previousOperation.regular else {
+                      let parent = previousOperation.regular else {
                     throw SwanError.unauthorized("PLC rotation parent is invalid")
+                }
+                let previousGeneration = history[index - 1].signingKeyGeneration
+                if entry.signingKeyGeneration == previousGeneration {
+                    guard regular.verificationMethods["atproto"] == parent.verificationMethods["atproto"],
+                          regular.rotationKeys == parent.rotationKeys else {
+                        throw SwanError.unauthorized("PLC identity update changed keys without advancing generation")
+                    }
+                } else {
+                    guard previousGeneration < UInt64.max,
+                          entry.signingKeyGeneration == previousGeneration + 1 else {
+                        throw SwanError.unauthorized("PLC rotation generation is invalid")
+                    }
                 }
                 _ = try PLCOperationCodec.verify(
                     operation,
@@ -88,7 +94,7 @@ extension SwanPublicPLCGenesisVerifier: PublicPLCIdentityVerifying {
                 )
             }
 
-            guard regular.verificationMethods.count == 1,
+            guard regular.verificationMethods.values.allSatisfy(PLCDIDKeyCodec.isCanonical),
                   regular.verificationMethods["atproto"].map(PLCDIDKeyCodec.isCanonical) == true,
                   regular.rotationKeys.count >= 1,
                   regular.rotationKeys.allSatisfy({ PLCDIDKeyCodec.isCanonical($0) }) else {

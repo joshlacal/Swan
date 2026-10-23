@@ -292,6 +292,10 @@ public actor PLCAccountActivationService {
                   journal.rotationKey == (try controlReference(keys.rotationReference)) else {
                 throw PLCAccountActivationError.conflict
             }
+            if let expectedKEM = journal.operation.kemDIDKey {
+                let kem = try await AccountKEMKeyProvider(keyStore: keyStore).privateKey(accountDID: intent.did)
+                guard try AccountKEMKeyProvider.didKey(kem.publicKey) == expectedKEM else { throw PLCAccountActivationError.conflict }
+            }
             return keys
         } catch let error as PLCAccountActivationError {
             throw error
@@ -306,21 +310,21 @@ public actor PLCAccountActivationService {
         keys: ProvisionedAccountKeys
     ) throws -> PLCSignedOperation {
         do {
-            let operation = try PLCOperationCodec.reconstructGenesis(
+            let operation = try SwanPLCGenesisCodec.reconstructGenesis(
                 signingDIDKey: journal.operation.signingDIDKey,
                 rotationDIDKey: journal.operation.rotationDIDKey,
                 canonicalHandle: journal.canonicalHandle,
                 pdsOrigin: journal.pdsOrigin,
-                signature: journal.operation.signature
+                signature: journal.operation.signature,
+                kemDIDKey: journal.operation.kemDIDKey
             )
             try PLCOperationCodec.verifyGenesis(operation, expectedDID: intent.did)
             guard try operation.cid.string == intent.operationCID,
                   let regular = operation.regular,
-                  regular.verificationMethods == [
-                      "atproto": P256DIDKey(publicKey: try P256.Signing.PublicKey(
+                  regular.verificationMethods["atproto"] == P256DIDKey(publicKey: try P256.Signing.PublicKey(
                           x963Representation: keys.signingPublicKey
                       )).value,
-                  ],
+                  regular.verificationMethods["atproto_kem"] == journal.operation.kemDIDKey,
                   regular.rotationKeys == [
                       P256DIDKey(publicKey: try P256.Signing.PublicKey(
                           x963Representation: keys.rotationPublicKey

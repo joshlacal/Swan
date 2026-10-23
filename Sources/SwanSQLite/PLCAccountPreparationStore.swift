@@ -166,10 +166,10 @@ extension SQLiteAccountDatabase:
                         INSERT INTO plc_account_preparation_journal(
                             singleton, request_id, canonical_handle, pds_origin,
                             repository_revision, operation_signing_did_key,
-                            operation_rotation_did_key, operation_signature,
+                            operation_rotation_did_key, operation_signature, operation_kem_did_key,
                             signing_key_reference, rotation_key_reference,
                             public_genesis_commit_cid, stage
-                        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         [
                             .text(journal.requestID), .text(journal.canonicalHandle),
@@ -177,6 +177,7 @@ extension SQLiteAccountDatabase:
                             .text(journal.operation.signingDIDKey),
                             .text(journal.operation.rotationDIDKey),
                             .text(journal.operation.signature),
+                            journal.operation.kemDIDKey.map(SQLiteData.text) ?? .null,
                             .text(journal.signingKey.reference),
                             .text(journal.rotationKey.reference),
                             journal.publicGenesisCommitCID.map { SQLiteData.text($0) } ?? .null,
@@ -255,7 +256,7 @@ extension SQLiteAccountDatabase:
             """
             SELECT request_id, canonical_handle, pds_origin,
                    repository_revision, operation_signing_did_key,
-                   operation_rotation_did_key, operation_signature,
+                   operation_rotation_did_key, operation_signature, operation_kem_did_key,
                    signing_key_reference, rotation_key_reference,
                    public_genesis_commit_cid, stage
             FROM plc_account_preparation_journal
@@ -274,7 +275,8 @@ extension SQLiteAccountDatabase:
                 operation: try PLCAccountPreparationOperationFacts(
                     signingDIDKey: try requiredText(row, "operation_signing_did_key"),
                     rotationDIDKey: try requiredText(row, "operation_rotation_did_key"),
-                    signature: try requiredText(row, "operation_signature")
+                    signature: try requiredText(row, "operation_signature"),
+                    kemDIDKey: try optionalText(row, "operation_kem_did_key")
                 ),
                 signingKey: try AccountControlKeyReference(
                     purpose: .signing,

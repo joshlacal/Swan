@@ -18,7 +18,7 @@ enum SpaceCredentialSignatureTestSupport {
         get throws { SpaceHTTPSignature.keyID(for: try key) }
     }
 
-    /// `Authorization: Atproto-Space <token>` signed for `audience`: the repo
+    /// `Authorization: Atproto-Space-Credential <token>` signed for `audience`: the repo
     /// owner's DID for repo reads, the authority's bare DID for space-host
     /// operations.
     static func headers(
@@ -27,7 +27,7 @@ enum SpaceCredentialSignatureTestSupport {
         key: P256.Signing.PrivateKey? = nil
     ) throws -> HTTPFields {
         let signed = try SpaceHTTPSignature.sign(
-            authorization: "Atproto-Space \(token)",
+            authorization: "Atproto-Space-Credential \(token)",
             audience: audience,
             key: key ?? self.key
         )

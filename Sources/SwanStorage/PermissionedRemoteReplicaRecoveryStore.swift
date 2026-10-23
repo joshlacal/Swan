@@ -424,6 +424,14 @@ public protocol PermissionedRemoteReplicaRecoveryStore: Sendable {
         now: Int64
     ) async throws
 
+    /// Stores a verified STAR commit and a bounded local path/CID projection.
+    /// The projection digest is a persistence witness, not a wire CAR root.
+    func markPermissionedRemoteReplicaSTARImportVerified(
+        sessionID: String,
+        verification: VerifiedStreamingSpaceSTARRecovery,
+        now: Int64
+    ) async throws
+
     func markPermissionedRemoteReplicaImportVerified(
         sessionID: String,
         verification: VerifiedStreamingSpaceCARRecovery,
@@ -452,3 +460,14 @@ public protocol PermissionedRemoteReplicaRecoveryStore: Sendable {
 public protocol PermissionedRemoteReplicaPublicationAuthorizingStore:
     PermissionedRemoteReplicaRecoveryStore
 {}
+
+public extension PermissionedRemoteReplicaRecoveryStore {
+    /// Legacy/custom CAR-only stores fail closed until they implement native STAR.
+    func markPermissionedRemoteReplicaSTARImportVerified(
+        sessionID: String,
+        verification: VerifiedStreamingSpaceSTARRecovery,
+        now: Int64
+    ) async throws {
+        throw PermissionedRemoteReplicaRecoveryError.verificationRequired
+    }
+}

@@ -554,7 +554,7 @@ public protocol AuthorizedSimpleSpaceLifecycleDirectory: Sendable {
 public protocol AuthorizedSimpleSpaceCredentialDirectory: Sendable {
     func authorizeSimpleSpaceCredentialRead(
         space: SpaceURI,
-        user: String,
+        user: String?,
         clientID: String?,
         authorization: AuthorizationContext
     ) async throws
@@ -695,6 +695,12 @@ public protocol AuthorizedSpaceRepositoryDirectory: Sendable {
     /// snapshot for the streaming full-CAR recovery endpoint. Implementations
     /// may return `nil` only when this account has no repository state; they
     /// must never open or migrate a database in response to this call.
+    func repositorySTARSnapshot(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositorySTARSnapshot?
+
     func repositoryCARSnapshot(
         space: SpaceURI,
         author: String,
@@ -905,5 +911,21 @@ public enum SpaceServiceRequestDigest {
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
+    }
+}
+
+public struct AuthorizedSpaceRepositorySTARSnapshot: Sendable {
+    public let state: AuthorizedSpaceRepositoryCommitState
+    public let spool: SpaceSTARBodySpool
+    public init(state: AuthorizedSpaceRepositoryCommitState, spool: SpaceSTARBodySpool) {
+        self.state = state
+        self.spool = spool
+    }
+}
+
+public extension AuthorizedSpaceRepositoryDirectory {
+    func repositorySTARSnapshot(space: SpaceURI, author: String, authorization: AuthorizationContext)
+        async throws -> AuthorizedSpaceRepositorySTARSnapshot? {
+        throw SwanError.unavailable("STAR repository snapshot is unavailable")
     }
 }

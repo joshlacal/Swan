@@ -77,6 +77,19 @@ struct ServeNotificationRuntime {
         let delegationKeyPLC: DelegationKeyPLC?
     }
 
+    static func kemBackfillPLCConfiguration(_ material: ValidatedStartupMaterial?) throws -> PLCClientConfiguration {
+        guard let material else { return try .production() }
+        let configuration = try JSONDecoder().decode(Configuration.self, from: material.rawData)
+        let selection = configuration.credentialKeyPLC.map { ($0.origin, $0.laboratory, $0.allowlistedHost) }
+            ?? configuration.delegationKeyPLC.map { ($0.origin, $0.laboratory, $0.allowlistedHost) }
+        guard let selection, let origin = URL(string: selection.0) else { return try .production() }
+        if selection.1 {
+            guard let hostname = selection.2 else { throw ValidationError("KEM backfill laboratory PLC host is missing") }
+            return try .laboratory(origin: origin, allowlistedHost: hostname)
+        }
+        return try .production(origin: origin)
+    }
+
     private struct CredentialKeyPLC: Decodable {
         let origin: String
         let laboratory: Bool
@@ -767,6 +780,7 @@ private struct ServeUnavailableCredentialSigningKeyResolver:
 /// In particular, this type never hands a database, scalar, or general signing
 /// closure to the HTTP layer.
 struct ServeLocalSpaceRuntime {
+    let accountKeyStore: any AccountKeyStore
     let credentialSigningKeys: any SpaceCredentialSigningKeyResolver
     let credentialPublicKeys: any SpaceCredentialPublicKeyResolver
     let delegationPublicKeys: any SpaceDelegationPublicKeyResolver
@@ -838,6 +852,7 @@ struct ServeLocalSpaceRuntime {
             keyStore: keyStore
         )
         return .init(
+            accountKeyStore: keyStore,
             credentialSigningKeys: credentialSigningKeys,
             credentialPublicKeys: credentialPublicKeys,
             delegationPublicKeys: delegationPublicKeys,
@@ -3553,6 +3568,8 @@ extension SwanCommand {
                 publicURL: baseURL
             )
             let dataURL = URL(fileURLWithPath: dataDirectory)
+            let serviceDirectoryLease = try SwanServiceDirectoryLease(dataDirectory: dataURL)
+            defer { withExtendedLifetime(serviceDirectoryLease) {} }
             // Legacy bearer credentials are the one serve surface whose
             // mounted secrets must be validated as a single authority before
             // any SQLite or repository path is opened.  Keep the validated
@@ -5003,6 +5020,21 @@ extension SwanCommand {
                     "address": .string("\(host):\(port)"),
                 ])
                 var services: [any ServiceLifecycle.Service] = [publicApplication]
+                if let localSpaceRuntime {
+                    let backfillPLC = try managementDeletionPLCConfiguration
+                        ?? ServeNotificationRuntime.kemBackfillPLCConfiguration(notificationStartupMaterial)
+                    services.append(SwanAccountKEMBackfillService(
+                        control: controlDatabase,
+                        keys: localSpaceRuntime.accountKeyStore,
+                        rotation: PLCAccountRotationService(
+                            controlStore: controlDatabase,
+                            accountStoreOpener: SQLitePLCAccountPreparationStoreOpener(dataDirectory: dataURL),
+                            keyStore: localSpaceRuntime.accountKeyStore,
+                            plcClient: try PLCDirectoryClient(configuration: backfillPLC),
+                            lifecycleEmitter: lifecycleEmitter),
+                        pdsOrigin: baseURL))
+                    logger.info("durable account KEM backfill enabled")
+                }
                 if permissionedRuntime.notificationConfiguration != nil {
                     logger.info("space notification receiver routes enabled")
                 }
