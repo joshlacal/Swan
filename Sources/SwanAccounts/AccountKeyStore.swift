@@ -838,7 +838,7 @@ public actor FileAccountKeyStore:
         )
     }
 
-    public func keyIfPresent(for reference: AccountKeyReference) throws -> Data? {
+    public func keyIfPresent(for reference: AccountKeyReference) async throws -> Data? {
         try withExclusiveLock {
             let filename = Self.filename(for: reference)
             guard try Self.entryExists(named: filename, directoryDescriptor: directoryDescriptor) else { return nil }

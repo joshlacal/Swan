@@ -357,13 +357,7 @@ public actor PLCSpaceCredentialPublicKeyResolver:
             return nil
         }
 
-        // Current authorities (the reference implementation since
-        // d7849741, and Swan) mint `kid: #atproto`, which resolves exactly.
-        // Proposal 0016 also permits `kid: #atproto_space` with an
-        // ordinary-account-key fallback, so for that kid try `#atproto` only
-        // when the dedicated method is genuinely absent. A
-        // present-but-malformed dedicated method remains fail-closed and
-        // never silently downgrades to another key.
+        // October 22 credentials resolve only the authority's exact atproto method.
         for methodName in methodNames {
             guard let encodedKey = state.verificationMethods[methodName] else {
                 continue

@@ -3,15 +3,15 @@ set -euo pipefail
 
 readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly profile_root="${root}/Profiles"
-readonly profile="${profile_root}/permissioned-data-0016-2026-10-01.json"
-readonly manifest="${profile_root}/permissioned-data-0016-2026-10-01.lexicons.sha256"
-readonly generated_manifest="${profile_root}/permissioned-data-0016-2026-10-01.generated-wire.sha256"
+readonly profile="${profile_root}/permissioned-data-0016-2026-10-22.json"
+readonly manifest="${profile_root}/permissioned-data-0016-2026-10-22.lexicons.sha256"
+readonly generated_manifest="${profile_root}/permissioned-data-0016-2026-10-22.generated-wire.sha256"
 readonly petrel_manifest="${root}/PetrelManifest.json"
-readonly expected_profile_sha256="c86bdc739a1bb2a1e5666b5ff8c8d90eb0127ca5eb61ab059a416116c83c987e"
-readonly expected_manifest_sha256="ac22656717c8ac860927cce5f29ecbcb27696ef91e98e84775b4eeba45b34c14"
-readonly expected_generated_manifest_sha256="b8986afecc053a41bde27fc3e8f65e6461b9d56b7efd6615a0debf11c73b17ae"
-readonly expected_petrel_manifest_sha256="ceef2e1b1f8d4c4cdb5e11cad3f08b27be26fcc74a77e65552249cf18f76ffca"
-readonly reference_root="${1:-${root}/.interop-cache/atproto-679724ad62eb9a02f7f40429c3c4fdd65d3e4c79}"
+readonly expected_profile_sha256="a08e54b8c920237768c8ab45b996cdfda9f517fb22c23b6997113035e6a98eb0"
+readonly expected_manifest_sha256="fbbf6e9b89507d24d8bffd3df78cd9c5a8d4aa8190f5bf8870bb53281d972bc3"
+readonly expected_generated_manifest_sha256="1bd8bd00ee6c7beb620d0b72e4c6e25d99e1c0563f9958724512ec002606be9a"
+readonly expected_petrel_manifest_sha256="59cbe0fde6241a32cc819ebd833edc6fe428a37cde7821a1adf1cc857dd139f9"
+readonly reference_root="${1:-${root}/.interop-cache/atproto-ac0c9f15392f6f0298d71dc52aa88c05036150be}"
 readonly sha256="${root}/Scripts/sha256.sh"
 readonly legacy_profile_sha256="30a696e78f62b11f22dd669f6ebb9f7e08d6c1d3346ebd71ad5cf0cd49b3f4d0"
 readonly legacy_lexicons_sha256="9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f"
@@ -40,21 +40,21 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
     profile = json.load(source)
-if profile.get("id") != "permissioned-data-0016-2026-10-01":
+if profile.get("id") != "permissioned-data-0016-2026-10-22":
     raise SystemExit("successor profile ID mismatch")
-if profile.get("petrelGeneratorCommit") != "710ecb0af23f07737c5c9b60eeed24092cb3aa3c":
+if profile.get("petrelGeneratorCommit") != "e115236537041a900ec971be05185a70cca73e8a":
     raise SystemExit("successor profile generator pin mismatch")
 if profile.get("petrelManifest") != "PetrelManifest.json":
     raise SystemExit("successor profile Petrel manifest name mismatch")
-if profile.get("petrelManifestSHA256") != "ceef2e1b1f8d4c4cdb5e11cad3f08b27be26fcc74a77e65552249cf18f76ffca":
+if profile.get("petrelManifestSHA256") != "59cbe0fde6241a32cc819ebd833edc6fe428a37cde7821a1adf1cc857dd139f9":
     raise SystemExit("successor profile Petrel manifest pin mismatch")
-if profile.get("lexiconManifest") != "permissioned-data-0016-2026-10-01.lexicons.sha256":
+if profile.get("lexiconManifest") != "permissioned-data-0016-2026-10-22.lexicons.sha256":
     raise SystemExit("successor profile lexicon manifest name mismatch")
-if profile.get("lexiconManifestSHA256") != "ac22656717c8ac860927cce5f29ecbcb27696ef91e98e84775b4eeba45b34c14":
+if profile.get("lexiconManifestSHA256") != "fbbf6e9b89507d24d8bffd3df78cd9c5a8d4aa8190f5bf8870bb53281d972bc3":
     raise SystemExit("successor profile lexicon manifest pin mismatch")
-if profile.get("generatedWireManifest") != "permissioned-data-0016-2026-10-01.generated-wire.sha256":
+if profile.get("generatedWireManifest") != "permissioned-data-0016-2026-10-22.generated-wire.sha256":
     raise SystemExit("successor profile generated-wire manifest name mismatch")
-if profile.get("generatedWireManifestSHA256") != "b8986afecc053a41bde27fc3e8f65e6461b9d56b7efd6615a0debf11c73b17ae":
+if profile.get("generatedWireManifestSHA256") != "1bd8bd00ee6c7beb620d0b72e4c6e25d99e1c0563f9958724512ec002606be9a":
     raise SystemExit("successor profile generated-wire manifest pin mismatch")
 PY
 

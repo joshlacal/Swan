@@ -4,6 +4,7 @@ import Foundation
 import NIOCore
 import NIOFoundationCompat
 import NIOHTTP1
+import NIOPosix
 import NIOSSL
 import Petrel
 import PetrelCrypto
@@ -94,9 +95,6 @@ public enum InteropHTTPError: Error, Sendable, Equatable, LocalizedError {
 public enum InteropAuthorization: Sendable, Equatable {
     case none
     case dpop(accessToken: String, proof: String)
-    /// `Authorization: Bearer <delegation>` plus its `atproto-space` HTTP
-    /// message signature over `("authorization")` with the fresh key's keyid.
-    case spaceDelegation(SpaceHTTPSignature.Headers)
     case spaceCredential(InteropSpaceCredential)
     case bearer(token: String)
     case service(token: String)
@@ -244,7 +242,14 @@ public final class InteropHTTPClient: @unchecked Sendable {
             tls.additionalTrustRoots = [.file(path)]
             configuration.tlsConfiguration = tls
         }
-        client = HTTPClient(configuration: configuration)
+        // The Network.framework event loop uses system trust rather than
+        // NIOSSL's additionalTrustRoots. Explicit laboratory roots therefore
+        // select the POSIX/NIOSSL transport while keeping hostname validation.
+        if additionalTrustRootFile != nil {
+            client = HTTPClient(eventLoopGroupProvider: .shared(MultiThreadedEventLoopGroup.singleton), configuration: configuration)
+        } else {
+            client = HTTPClient(configuration: configuration)
+        }
     }
 
     deinit {
@@ -713,11 +718,6 @@ public struct InteropXRPCClient: Sendable {
             try requireCredentialSafeTransport(http.baseURL)
             headers["Authorization"] = "DPoP " + accessToken
             headers["DPoP"] = proof
-        case let .spaceDelegation(signed):
-            try requireCredentialSafeTransport(http.baseURL)
-            headers["Authorization"] = signed.authorization
-            headers[SpaceHTTPSignature.signatureInputFieldName] = signed.signatureInput
-            headers[SpaceHTTPSignature.signatureFieldName] = signed.signature
         case let .spaceCredential(credential):
             try requireCredentialSafeTransport(http.baseURL)
             try credential.authorize(query: query, body: body, headers: &headers)
@@ -1042,7 +1042,7 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
     public let syncOperationRevision: String?
     /// Hex-encoded LtHash commitment reconstructed from the terminal page.
     public let syncCommitment: String?
-    /// Revision bound into the verified signed terminal commitment.
+    /// Revision bound into the verified MAC-authenticated terminal commitment.
     public let syncCommitRevision: String?
     public let syncCommitVerified: Bool?
     /// Whether the incremental-sync response included record values.  The
@@ -1054,11 +1054,11 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
     public let fullCARStatus: Int?
     public let fullCARRecordCount: Int?
     public let fullCARCommitment: String?
-    /// Canonical TID from the signed full-CAR commit context. This is retained
+    /// Canonical TID from the MAC-authenticated STAR metadata. This is retained
     /// so a commitment that recurs at a later state cannot make an older CAR
     /// look current.
     public let fullCARWireRevision: String?
-    /// True only when the fully verified CAR index contains the exact
+    /// True only when the fully verified STAR record set contains the exact
     /// collection/rkey -> CID produced and read by this round trip. The path
     /// itself is intentionally not persisted in the artifact.
     public let fullCARExpectedRecordVerified: Bool?
@@ -1300,7 +1300,7 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
 
 /// The deliberately narrow artifact for a member-authorized, write-only
 /// `space.applyWrites` advancement.  It contains no record material or peer
-/// identity: the signed terminal revision is the only durable witness needed
+/// identity: the MAC-authenticated terminal revision is the only durable witness needed
 /// by the recovery acceptance harness.
 public struct PermissionedWriteOnlyApplyWritesArtifact: Codable, Sendable, Equatable {
     public let scenario: String
@@ -1326,7 +1326,7 @@ public struct PermissionedWriteOnlyApplyWritesArtifact: Codable, Sendable, Equat
     ) {
         self.scenario = FixtureSanitizer.safeIdentifier(scenario)
         self.profileID = OfflineProtocolProfileVerifier.stableProfileID
-        self.fixturePolicy = "summary-only-digests-and-signed-terminal-revision"
+        self.fixturePolicy = "summary-only-digests-and-mac-authenticated-terminal-revision"
         self.applyStatus = applyStatus.flatMap { (100 ... 599).contains($0) ? $0 : nil }
         self.witnessStatus = witnessStatus.flatMap { (100 ... 599).contains($0) ? $0 : nil }
         self.terminalRevision = canonicalInteropTID(terminalRevision)
@@ -1469,6 +1469,23 @@ public enum PermissionedRecoveryFailureCode {
             case .equivocation: return "RecoveryEquivocation"
             case .freshnessMismatch: return "RecoveryFreshnessMismatch"
             }
+        case let star as SpaceSTARError:
+            switch star {
+            case .invalidMagic: return "STARInvalidMagic"
+            case .invalidCommit: return "STARInvalidCommit"
+            case .invalidMetadata: return "STARInvalidMetadata"
+            case .invalidVarint: return "STARInvalidVarint"
+            case .truncated: return "STARTruncated"
+            case .limitExceeded: return "STARLimitExceeded"
+            case .invalidRecord: return "STARInvalidRecord"
+            case .invalidOrder: return "STARInvalidOrder"
+            case .wrongRepository: return "STARWrongRepository"
+            case .badMAC: return "SpaceMACMismatch"
+            case .digestMismatch: return "STARDigestMismatch"
+            case .invalidSource: return "STARInvalidSource"
+            }
+        case is SpaceMAC.Failure, is SpaceMACHeaders.HeaderError:
+            return "SpaceMACMismatch"
         case let streaming as SpaceCARStreamingError:
             return spaceCARStreamingErrorCode(streaming)
         case is InteropHTTPError:
@@ -1479,14 +1496,14 @@ public enum PermissionedRecoveryFailureCode {
     }
 
     /// The acceptance command injects exactly one mutation after a complete
-    /// download: it flips the final payload byte. Only a local block-CID
-    /// mismatch proves that this mutation reached the verifier. Transport,
+    /// download: it flips the final payload byte. A STAR digest mismatch
+    /// (or a legacy CAR block-CID mismatch) shows local content rejection. Transport,
     /// authentication, timeout, and unrelated storage errors must not be
     /// counted as corruption rejection evidence.
     public static func isInjectedFinalByteCorruptionRejection(
         _ error: Error
     ) -> Bool {
-        code(for: error) == "CARBlockCIDMismatch"
+        ["CARBlockCIDMismatch", "STARDigestMismatch"].contains(code(for: error))
     }
 }
 
@@ -2061,7 +2078,7 @@ public enum LiveInteropRunner {
     /// request shape. This intentionally does not construct an authority host,
     /// mint a space credential, or read a record: recovery needs a source-side
     /// advancement while the receiver remains stale. A metadata-only query uses
-    /// the same member OAuth/DPoP session for a signed terminal witness.
+    /// the same member OAuth/DPoP session for a MAC-authenticated terminal witness.
     public static func permissionedWriteOnlyApplyWrites(
         scenario: String,
         member: LiveInteropHost,
@@ -2308,10 +2325,14 @@ public enum LiveInteropRunner {
             // Swan-issued credential rather than accidentally reading a
             // second local copy from the authority.
             let repositoryHost = readHost ?? authority
-            let read = try await repositoryHost.client.query(
-                "com.atproto.space.getRecord",
-                query: readQuery,
-                authorization: .none
+            guard let repositoryDID = readQuery["repo"],
+                  let collection = readQuery["collection"], let rkey = readQuery["rkey"] else {
+                throw InteropHTTPError.invalidURL
+            }
+            let read = try await PermissionedSpaceMACHTTP.record(
+                host: repositoryHost, query: readQuery,
+                expectedURI: SpaceRecordURI(space: space, author: repositoryDID, collection: collection, rkey: rkey),
+                authorization: { credentialAuthorization }
             )
             readStatus = read.status
             readDigest = responseDigest(read)
@@ -2667,7 +2688,7 @@ public enum LiveInteropRunner {
         var query: [String: String] = [
             "space": space.rawValue,
             "repo": author,
-            // The pinned TypeScript implementation emits its signed commit
+            // The pinned TypeScript implementation emits its MAC-authenticated commit
             // on a short terminal page. A fresh disposable repo is below this
             // bound, so the response is also a complete hash witness.
             "limit": "100",
@@ -3144,6 +3165,9 @@ private func canonicalInteropTID(_ rawValue: String?) -> String? {
 }
 
 private func liveErrorCode(_ error: Error) -> String {
+    if error is SpaceSTARError || error is SpaceMAC.Failure || error is SpaceMACHeaders.HeaderError {
+        return PermissionedRecoveryFailureCode.code(for: error)
+    }
     if let error = error as? SpaceCARStreamingError {
         // Keep CAR failures actionable in sanitized lab artifacts without
         // exposing the response body, record values, or peer-selected paths.
@@ -3528,33 +3552,6 @@ public struct SwanCARConsumer: Sendable {
         )
     }
 
-    public func streamAndVerify(
-        client: InteropXRPCClient,
-        query: [String: String],
-        authorization: InteropAuthorization,
-        space: SpaceURI,
-        author: String,
-        publicKey: P256.Signing.PublicKey,
-        spoolURL: URL,
-        expectedEntries: [SpaceCARRecoveryIndexEntry] = []
-    ) async throws -> VerifiedStreamingSpaceCARRecovery {
-        defer { try? FileManager.default.removeItem(at: spoolURL) }
-        _ = try await client.stream(
-            "com.atproto.space.getRepo",
-            query: query,
-            authorization: authorization,
-            to: spoolURL,
-            maximumResponseBytes: maximumBytes
-        )
-        return try await verifyStreaming(
-            fileURL: spoolURL,
-            space: space,
-            author: author,
-            publicKey: publicKey,
-            expectedEntries: expectedEntries
-        )
-    }
-
     private func verifyStreaming(
         fileURL: URL,
         space: SpaceURI,
@@ -3718,7 +3715,7 @@ public struct SpaceCredentialBroker: Sendable {
         let credential = try await authority.procedure(
             "com.atproto.space.getSpaceCredential",
             body: inputBody,
-            authorization: credentialAuthorization
+            authorization: .none
         )
         await recorder?.record(
             host: authorityLabel,

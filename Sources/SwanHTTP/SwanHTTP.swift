@@ -586,7 +586,11 @@ public struct SwanHTTPServer: Sendable {
         /// Resolves handles this host does not hold, for
         /// `com.atproto.identity.resolveHandle`. Absent keeps that anonymous
         /// route off the network entirely.
-        foreignHandleResolution: (any SwanForeignHandleResolving)? = nil
+        foreignHandleResolution: (any SwanForeignHandleResolving)? = nil,
+        spaceCredentialPolicyDirectory: (any AuthorizedSimpleSpaceCredentialDirectory)? = nil,
+        simpleSpaceLifecycleDirectory: (any AuthorizedSimpleSpaceLifecycleDirectory)? = nil,
+        spaceNotificationDirectory: (any AuthorizedSpaceNotificationDirectory)? = nil,
+        spaceCredentialIssuance: DurableSpaceCredentialAuthority.Configuration = .standard
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -741,8 +745,8 @@ public struct SwanHTTPServer: Sendable {
             } else {
                 authenticatedSpaceList = nil
             }
-            if let lifecycleDirectory = authenticatedGetSpaceDirectory
-                as? any AuthorizedSimpleSpaceLifecycleDirectory {
+            if let lifecycleDirectory = simpleSpaceLifecycleDirectory ?? (authenticatedGetSpaceDirectory
+                as? any AuthorizedSimpleSpaceLifecycleDirectory) {
                 authenticatedSimpleSpaceLifecycle = SwanAuthenticatedSimpleSpaceLifecycleCapability(
                     authorizer: authorizer,
                     directory: lifecycleDirectory,
@@ -768,9 +772,10 @@ public struct SwanHTTPServer: Sendable {
                     ),
                     delegationReplayStore: oauthRuntime.spaceDelegationReplayStore,
                     credentialIssuer: DurableSpaceCredentialAuthority(
-                        policyDirectory: credentialDirectory,
+                        policyDirectory: spaceCredentialPolicyDirectory ?? credentialDirectory,
                         signingKeys: exchangeCredentialConfiguration.authoritySigningKeys,
-                        clientAttestationPolicy: exchangeCredentialConfiguration.clientAttestationPolicy
+                        clientAttestationPolicy: exchangeCredentialConfiguration.clientAttestationPolicy,
+                        configuration: spaceCredentialIssuance
                     )
                 )
             } else {
@@ -831,8 +836,8 @@ public struct SwanHTTPServer: Sendable {
             } else {
                 authenticatedSpaceBlobs = nil
             }
-            if let notificationDirectory = authenticatedGetSpaceDirectory
-                as? any AuthorizedSpaceNotificationDirectory,
+            if let notificationDirectory = spaceNotificationDirectory ?? (authenticatedGetSpaceDirectory
+                as? any AuthorizedSpaceNotificationDirectory),
                let spaceCredentialConfiguration,
                let spaceNotificationConfiguration {
                 authenticatedSpaceNotifications = SwanAuthenticatedSpaceNotificationsCapability(

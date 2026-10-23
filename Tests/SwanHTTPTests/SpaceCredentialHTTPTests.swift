@@ -108,7 +108,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             try await app.test(.router) { client in
                 for method in ["getLatestCommit", "listRepoOps", "getRepo"] {
                     let uri = "/xrpc/com.atproto.space.\(method)?space=\(fixture.publicSpace.rawValue)&repo=\(Self.member)"
-                    let signed = try self.credentialHeaders(credential)
+                    var signed = try self.credentialHeaders(credential)
+                    signed[HTTPField.Name(SpaceMACHeaders.requestHeader)!] = nil
                     try await client.execute(uri: uri, method: .get, headers: signed) { response in
                         XCTAssertEqual(response.status, .badRequest)
                         XCTAssertEqual(try self.errorCode(response.body), "BadSpaceMac")
@@ -141,22 +142,22 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     }
                 }
                 let uri = self.getURI(space: fixture.publicSpace, repo: Self.member, rkey: "public")
-                let exchange = try SpaceMAC.encapsulate(authorKey: October22MACProvider.publicKey)
-                var headers = try self.credentialHeaders(credential)
-                headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!] = try SpaceMACHeaders.formatWantMAC(keyShare: exchange.keyShare, type: .record)
+                let headers = try self.credentialHeaders(credential)
                 try await client.execute(uri: uri, method: .get, headers: headers) { response in
                     XCTAssertEqual(response.status, .ok)
-                    let object = try self.jsonObject(response.body)
-                    let cid = try CID.parse(XCTUnwrap(object["cid"] as? String))
-                    let mac = try SpaceMACHeaders.parseMAC(response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!], type: .record)
-                    XCTAssertEqual(mac, try SpaceMAC.record(sharedSecret: exchange.sharedSecret, uri: fixture.publicRecord.rawValue, cid: Data(cid.bytes)))
+                    try self.assertRecordMAC(
+                        response,
+                        requestHeaders: headers,
+                        expectedURI: fixture.publicRecord.rawValue,
+                        expectedRecord: self.recordCBOR("public")
+                    )
                 }
             }
             try await fixture.close()
         } catch { try? await fixture.close(); throw error }
     }
 
-    func testCredentialRenewalReportsSpaceDeletedOnlyAfterValidDelegationAndProof() async throws {
+    func testCredentialRenewalReportsSpaceDeletedOnlyAfterValidDelegationAndCredentialKey() async throws {
         let fixture = try await Fixture.make()
         defer { fixture.cleanup() }
         do {
@@ -174,8 +175,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 )
                 try await client.execute(
                     uri: Self.credentialPath, method: .post,
-                    headers: try self.exchangeHeaders(initialDelegation),
-                    body: self.exchangeBody(space: fixture.publicSpace)
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: initialDelegation, space: fixture.publicSpace)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertNotNil(try self.jsonObject(response.body)["credential"] as? String)
@@ -193,8 +194,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     let renewalDelegation = try self.delegation(fixture, user: Self.member, space: space)
                     try await client.execute(
                         uri: Self.credentialPath, method: .post,
-                        headers: try self.exchangeHeaders(renewalDelegation),
-                        body: self.exchangeBody(space: space)
+                        headers: self.exchangeHeaders(),
+                        body: self.exchangeBody(delegationToken: renewalDelegation, space: space)
                     ) { response in
                         XCTAssertEqual(response.status, expectedStatus)
                         XCTAssertEqual(try self.errorCode(response.body), expectedError)
@@ -206,21 +207,20 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 let validDelegation = try self.delegation(
                     fixture, user: Self.member, space: fixture.publicSpace
                 )
-                var missingSignature = try self.exchangeHeaders(validDelegation)
-                missingSignature[HTTPField.Name(SpaceHTTPSignature.signatureFieldName)!] = nil
+                let malformedKeyHeaders = self.exchangeHeaders()
                 try await client.execute(
-                    uri: Self.credentialPath, method: .post, headers: missingSignature,
-                    body: self.exchangeBody(space: fixture.publicSpace)
+                    uri: Self.credentialPath, method: .post, headers: malformedKeyHeaders,
+                    body: self.exchangeBody(delegationToken: validDelegation, space: fixture.publicSpace, credentialKid: "not-a-did-key")
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
-                    XCTAssertEqual(try self.errorCode(response.body), "BadSpaceSignature")
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
                 }
                 try await client.execute(
                     uri: Self.credentialPath, method: .post,
-                    headers: try self.exchangeHeaders("invalid-delegation"),
-                    body: self.exchangeBody(space: fixture.publicSpace)
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: "invalid-delegation", space: fixture.publicSpace)
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "InvalidDelegationToken")
                 }
             }
@@ -243,10 +243,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 user: Self.outsider,
                 space: fixture.publicSpace
             )
-            let caseInsensitivePublicHeaders = try exchangeHeaders(
-                publicDelegation,
-                authorizationScheme: "bearer"
-            )
+            let publicExchangeHeaders = exchangeHeaders()
             let memberDelegation = try delegation(
                 fixture,
                 user: Self.member,
@@ -259,8 +256,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: caseInsensitivePublicHeaders,
-                    body: exchangeBody(space: fixture.publicSpace)
+                    headers: publicExchangeHeaders,
+                    body: exchangeBody(delegationToken: publicDelegation, space: fixture.publicSpace)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     self.assertNoStore(response)
@@ -271,8 +268,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: exchangeHeaders(memberDelegation),
-                    body: exchangeBody(space: fixture.memberSpace)
+                    headers: exchangeHeaders(),
+                    body: exchangeBody(delegationToken: memberDelegation, space: fixture.memberSpace)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     self.assertNoStore(response)
@@ -290,18 +287,40 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     self.assertNoStore(response)
-                    XCTAssertEqual(
-                        (try self.jsonObject(response.body))["uri"] as? String,
-                        fixture.publicRecord.rawValue
+                    try self.assertRecordMAC(
+                        response,
+                        requestHeaders: publicReadHeaders,
+                        expectedURI: fixture.publicRecord.rawValue,
+                        expectedRecord: self.recordCBOR("public")
                     )
                 }
                 try await client.execute(
-                    uri: self.listURI(space: fixture.memberSpace, repo: Self.member),
+                    uri: self.getURI(space: fixture.memberSpace, repo: Self.member, rkey: "member"),
                     method: .get,
                     headers: memberReadHeaders
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     self.assertNoStore(response)
+                    try self.assertRecordMAC(
+                        response,
+                        requestHeaders: memberReadHeaders,
+                        expectedURI: SpaceRecordURI(
+                            space: fixture.memberSpace,
+                            author: Self.member,
+                            collection: "app.bsky.feed.post",
+                            rkey: "member"
+                        ).rawValue,
+                        expectedRecord: self.recordCBOR("member")
+                    )
+                }
+                try await client.execute(
+                    uri: self.listURI(space: fixture.memberSpace, repo: Self.member),
+                    method: .get,
+                    headers: self.credentialHeaders(memberToken)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    self.assertNoStore(response)
+                    XCTAssertNil(response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!])
                     let records = try XCTUnwrap(
                         (try self.jsonObject(response.body))["records"] as? [[String: Any]]
                     )
@@ -345,8 +364,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     try await client.execute(
                         uri: Self.credentialPath,
                         method: .post,
-                        headers: self.exchangeHeaders(delegation),
-                        body: self.exchangeBody(space: space)
+                        headers: self.exchangeHeaders(),
+                        body: self.exchangeBody(delegationToken: delegation, space: space)
                     ) { response in
                         XCTAssertEqual(response.status, .unauthorized)
                         self.assertNoStore(response)
@@ -356,8 +375,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(outsiderAllow),
-                    body: self.exchangeBody(space: fixture.allowListSpace)
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: outsiderAllow, space: fixture.allowListSpace)
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
                     self.assertNoStore(response)
@@ -366,8 +385,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(outsiderAllowWithAttestation),
-                    body: self.exchangeBody(
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: outsiderAllowWithAttestation,
                         space: fixture.allowListSpace,
                         clientAttestation: "not-a-verified-attestation"
                     )
@@ -403,8 +422,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(delegation),
-                    body: self.exchangeBody(
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: delegation,
                         space: fixture.publicSpace,
                         clientAttestation: "opaque-sensitive-attestation"
                     )
@@ -473,13 +492,13 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders("malformed-delegation"),
-                    body: self.exchangeBody(
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: "malformed-delegation",
                         space: fixture.allowListSpace,
                         clientAttestation: attestation
                     )
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(
                         try self.errorCode(response.body),
                         "InvalidDelegationToken"
@@ -496,8 +515,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(consumedWithoutAttestation),
-                    body: self.exchangeBody(space: fixture.allowListSpace)
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: consumedWithoutAttestation, space: fixture.allowListSpace)
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
                     XCTAssertEqual(
@@ -508,13 +527,13 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(consumedWithoutAttestation),
-                    body: self.exchangeBody(
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: consumedWithoutAttestation,
                         space: fixture.allowListSpace,
                         clientAttestation: attestation
                     )
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(
                         try self.errorCode(response.body),
                         "InvalidDelegationToken"
@@ -527,13 +546,13 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(wrongSpaceDelegation),
-                    body: self.exchangeBody(
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: wrongSpaceDelegation,
                         space: fixture.allowListSpace,
                         clientAttestation: attestation
                     )
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(
                         try self.errorCode(response.body),
                         "InvalidDelegationToken"
@@ -550,8 +569,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(acceptedDelegation),
-                    body: self.exchangeBody(
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: acceptedDelegation,
                         space: fixture.allowListSpace,
                         clientAttestation: attestation
                     )
@@ -572,8 +591,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(replayDelegation),
-                    body: self.exchangeBody(
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: replayDelegation,
                         space: fixture.allowListSpace,
                         clientAttestation: attestation
                     )
@@ -593,8 +612,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(consumedDelegation),
-                    body: self.exchangeBody(
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: consumedDelegation,
                         space: fixture.allowListSpace,
                         clientAttestation: "malformed"
                     )
@@ -608,10 +627,10 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(consumedDelegation),
-                    body: self.exchangeBody(space: fixture.allowListSpace)
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: consumedDelegation, space: fixture.allowListSpace)
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(
                         try self.errorCode(response.body),
                         "InvalidDelegationToken"
@@ -672,14 +691,12 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(
-                        try self.delegation(
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: try self.delegation(
                             fixture,
                             user: Self.outsider,
                             space: fixture.allowListSpace
-                        )
-                    ),
-                    body: self.exchangeBody(
+                        ),
                         space: fixture.allowListSpace,
                         clientAttestation: attestation
                     )
@@ -747,14 +764,12 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     try await client.execute(
                         uri: Self.credentialPath,
                         method: .post,
-                        headers: self.exchangeHeaders(
-                            try self.delegation(
+                        headers: self.exchangeHeaders(),
+                        body: self.exchangeBody(delegationToken: try self.delegation(
                                 fixture,
                                 user: Self.outsider,
                                 space: fixture.allowListSpace
-                            )
-                        ),
-                        body: self.exchangeBody(
+                            ),
                             space: fixture.allowListSpace,
                             clientAttestation: token
                         )
@@ -793,14 +808,12 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(
-                        try self.delegation(
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: try self.delegation(
                             fixture,
                             user: Self.outsider,
                             space: fixture.publicSpace
-                        )
-                    ),
-                    body: self.exchangeBody(
+                        ),
                         space: fixture.publicSpace,
                         clientAttestation: outageToken
                     )
@@ -850,14 +863,12 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(
-                        try self.delegation(
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: try self.delegation(
                             fixture,
                             user: Self.outsider,
                             space: fixture.publicSpace
-                        )
-                    ),
-                    body: self.exchangeBody(
+                        ),
                         space: fixture.publicSpace,
                         clientAttestation: replayOutageToken
                     )
@@ -903,14 +914,12 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(
-                        try self.delegation(
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: try self.delegation(
                             fixture,
                             user: Self.outsider,
                             space: fixture.publicSpace
-                        )
-                    ),
-                    body: self.exchangeBody(
+                        ),
                         space: fixture.publicSpace,
                         clientAttestation: token
                     )
@@ -965,14 +974,12 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             try await client.execute(
                 uri: Self.credentialPath,
                 method: .post,
-                headers: self.exchangeHeaders(
-                    try self.delegation(
+                headers: self.exchangeHeaders(),
+                body: self.exchangeBody(delegationToken: try self.delegation(
                         fixture,
                         user: Self.outsider,
                         space: fixture.allowListSpace
-                    )
-                ),
-                body: self.exchangeBody(
+                    ),
                     space: fixture.allowListSpace,
                     clientAttestation: token
                 )
@@ -999,14 +1006,12 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(
-                        try self.delegation(
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: try self.delegation(
                             reopened,
                             user: Self.outsider,
                             space: reopened.allowListSpace
-                        )
-                    ),
-                    body: self.exchangeBody(
+                        ),
                         space: reopened.allowListSpace,
                         clientAttestation: token
                     )
@@ -1072,8 +1077,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             try await client.execute(
                 uri: Self.credentialPath,
                 method: .post,
-                headers: self.exchangeHeaders(delegation),
-                body: self.exchangeBody(
+                headers: self.exchangeHeaders(),
+                body: self.exchangeBody(delegationToken: delegation,
                     space: fixture.allowListSpace,
                     clientAttestation: attestation
                 )
@@ -1201,10 +1206,10 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     try await client.execute(
                         uri: Self.credentialPath,
                         method: .post,
-                        headers: self.exchangeHeaders(delegation),
-                        body: self.exchangeBody(space: fixture.publicSpace)
+                        headers: self.exchangeHeaders(),
+                        body: self.exchangeBody(delegationToken: delegation, space: fixture.publicSpace)
                     ) { response in
-                        XCTAssertEqual(response.status, .unauthorized)
+                        XCTAssertEqual(response.status, .badRequest)
                         self.assertNoStore(response)
                         XCTAssertEqual(try self.errorCode(response.body), "InvalidDelegationToken")
                     }
@@ -1213,8 +1218,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(opaqueJTI),
-                    body: self.exchangeBody(space: fixture.publicSpace)
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: opaqueJTI, space: fixture.publicSpace)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertNotNil(try self.jsonObject(response.body)["credential"] as? String)
@@ -1223,8 +1228,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(valid),
-                    body: self.exchangeBody(space: fixture.publicSpace)
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: valid, space: fixture.publicSpace)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertNotNil(try self.jsonObject(response.body)["credential"] as? String)
@@ -1232,10 +1237,10 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(valid),
-                    body: self.exchangeBody(space: fixture.publicSpace)
+                    headers: self.exchangeHeaders(),
+                    body: self.exchangeBody(delegationToken: valid, space: fixture.publicSpace)
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(response.status, .badRequest)
                     self.assertNoStore(response)
                     XCTAssertEqual(try self.errorCode(response.body), "InvalidDelegationToken")
                 }
@@ -1317,7 +1322,6 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             let app = try makeServer(fixture).buildApplication(
                 logger: Logger(label: "SpaceCredentialHTTPTests.bounds")
             )
-            let delegation = try delegation(fixture, user: Self.outsider, space: fixture.publicSpace)
             let credential = try PermissionedDataJWT.createSpaceCredential(
                 issuer: Self.authority,
                 space: fixture.publicSpace,
@@ -1331,7 +1335,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     try await client.execute(
                         uri: Self.credentialPath,
                         method: .post,
-                        headers: self.exchangeHeaders(delegation),
+                        headers: self.exchangeHeaders(),
                         body: ByteBuffer(string: body)
                     ) { response in
                         XCTAssertEqual(response.status, .badRequest)
@@ -1371,7 +1375,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             UnavailableSpaceCredentialClientAttestationPolicy()
     ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
-            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-22.json")
         )
         let signing = StaticSigningKeyResolver(
             authority: Self.authority,
@@ -1458,37 +1462,95 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         return "\(input).\(signature)"
     }
 
-    private func exchangeHeaders(
-        _ token: String,
-        authorizationScheme: String = "Bearer"
-    ) throws -> HTTPFields {
-        try SpaceCredentialSignatureTestSupport.exchangeHeaders(
-            token: token,
-            authorizationScheme: authorizationScheme
-        )
+    private func exchangeHeaders() -> HTTPFields {
+        SpaceCredentialSignatureTestSupport.exchangeHeaders()
     }
 
     /// Every credential read here targets the member's repo, so the signed
-    /// audience defaults to that repo owner's DID.
+    /// audience defaults to that repo owner's DID. Each request receives a fresh
+    /// key exchange for the October 22 record response MAC.
     private func credentialHeaders(
         _ token: String,
         audience: String = SpaceCredentialHTTPTests.member,
         contentType: Bool = false
     ) throws -> HTTPFields {
         var headers = try SpaceCredentialSignatureTestSupport.headers(token: token, audience: audience)
+        let exchange = try SpaceMAC.encapsulate(authorKey: October22MACProvider.publicKey)
+        headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!] = try SpaceMACHeaders.formatWantMAC(
+            keyShare: exchange.keyShare,
+            type: .record
+        )
         if contentType { headers[.contentType] = "application/json" }
         return headers
     }
 
+    private func assertRecordMAC(
+        _ response: TestResponse,
+        requestHeaders: HTTPFields,
+        expectedURI: String,
+        expectedRecord: Data,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let output = try JSONDecoder().decode(
+            ComAtprotoSpaceGetRecord.Output.self,
+            from: Data(buffer: response.body)
+        )
+        let uri = output.uri.uriString()
+        let canonicalRecord = try DAGCBOR.encodeValue(output.value.toCBORValue())
+        XCTAssertEqual(uri, expectedURI, file: file, line: line)
+        XCTAssertEqual(canonicalRecord, expectedRecord, file: file, line: line)
+        XCTAssertEqual(output.cid, CID.fromDAGCBOR(canonicalRecord), file: file, line: line)
+
+        let request = try SpaceMACHeaders.parseWantMAC(
+            requestHeaders[HTTPField.Name(SpaceMACHeaders.requestHeader)!],
+            type: .record
+        )
+        let sharedSecret = try SpaceMAC.decapsulate(
+            privateKey: October22MACProvider.key,
+            keyShare: request.keyShare
+        )
+        let mac = try SpaceMACHeaders.parseMAC(
+            response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!],
+            type: .record
+        )
+        XCTAssertEqual(
+            mac,
+            try SpaceMAC.record(sharedSecret: sharedSecret, uri: uri, cid: Data(output.cid.bytes)),
+            file: file,
+            line: line
+        )
+        XCTAssertNotEqual(
+            mac,
+            try SpaceMAC.record(sharedSecret: sharedSecret, uri: uri + "-changed", cid: Data(output.cid.bytes)),
+            file: file,
+            line: line
+        )
+        XCTAssertNotEqual(
+            mac,
+            try SpaceMAC.record(
+                sharedSecret: sharedSecret,
+                uri: uri,
+                cid: Data(CID.fromDAGCBOR(recordCBOR("changed")).bytes)
+            ),
+            file: file,
+            line: line
+        )
+    }
+
     private func exchangeBody(
+        delegationToken: String? = nil,
         space: SpaceURI,
-        clientAttestation: String? = nil
-    ) -> ByteBuffer {
-        let fields = [
-            "\"space\":\"\(space.rawValue)\"",
-            clientAttestation.map { "\"clientAttestation\":\"\($0)\"" },
-        ].compactMap { $0 }
-        return ByteBuffer(string: "{\(fields.joined(separator: ","))}")
+        clientAttestation: String? = nil,
+        credentialKid: String? = nil
+    ) throws -> ByteBuffer {
+        var fields: [String: String] = [
+            "space": space.rawValue,
+            "credentialKid": try credentialKid ?? SpaceCredentialSignatureTestSupport.keyID,
+        ]
+        fields["delegationToken"] = delegationToken
+        fields["clientAttestation"] = clientAttestation
+        return ByteBuffer(data: try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]))
     }
 
     private func getURI(space: SpaceURI, repo: String, rkey: String) -> String {

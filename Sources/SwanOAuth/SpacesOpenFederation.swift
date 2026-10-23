@@ -101,9 +101,8 @@ public actor SwanDIDDocumentSpaceResolver:
 
     // MARK: Keys
 
-    /// Space credentials: `#atproto_space` prefers the dedicated method and
-    /// falls back to `#atproto` only when it is absent; `#atproto` resolves
-    /// exactly. A present-but-malformed method is an error, never a fallback.
+    /// October 22 space credentials resolve only the account `#atproto`
+    /// signing method. KEM material has a separate purpose and resolver.
     public func publicKey(
         for issuer: String,
         keyID: String

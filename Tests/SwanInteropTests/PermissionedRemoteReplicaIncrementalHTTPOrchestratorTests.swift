@@ -152,7 +152,7 @@ final class PermissionedRemoteReplicaIncrementalHTTPOrchestratorTests:
             ComAtprotoSpaceListRepoOps.Output(
                 ops: Array(repeating: fixture.operation, count: 1_000),
                 commit: nil,
-                cursor: nil
+                cursor: "\(fixture.revision.toString())/999"
             )
         )
         let transport = IncrementalTransport(
@@ -178,6 +178,69 @@ final class PermissionedRemoteReplicaIncrementalHTTPOrchestratorTests:
         XCTAssertNil(capturedBatch)
         let paths = await transport.paths()
         XCTAssertEqual(paths, ["/xrpc/com.atproto.space.listRepoOps"])
+    }
+
+    func testExtendedAtomicCommitlessPageSelectsFullRecovery() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        let output = ComAtprotoSpaceListRepoOps.Output(
+            ops: Array(repeating: fixture.operation, count: 1_500), commit: nil,
+            cursor: "\(fixture.revision.toString())/1499"
+        )
+        let transport = IncrementalTransport(listStatus: 200, listBody: try JSONEncoder().encode(output), latestBody: Data())
+        let store = CapturingIncrementalStore(base: fixture.base)
+        let orchestrator = try fixture.orchestrator(transport: transport, store: store)
+        let result = try await orchestrator.synchronize(target: fixture.target, requestID: "extended-page", requestSequence: 1, appliedAt: 1)
+        XCTAssertEqual(result, .fullCARRecoveryRequired)
+        let batch = await store.capturedBatch()
+        XCTAssertNil(batch)
+    }
+
+    func testAuthenticatedIntervalOverAggregateValueBudgetSelectsFullRecovery() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        var hash = LtHash()
+        let operations = try ["a", "b"].map { suffix in
+            let value = ATProtocolValueContainer.object(["text": .string(String(repeating: suffix, count: 600 * 1_024))])
+            let cid = try CID.fromDAGCBOR(DAGCBOR.encodeValue(value.toCBORValue()))
+            let rkey = "large-\(suffix)"
+            hash.add(element: "app.bsky.feed.post/\(rkey)/\(cid.string)")
+            return ComAtprotoSpaceListRepoOps.OpEntry(rev: fixture.revision, collection: fixture.operation.collection,
+                rkey: try RecordKey(keyString: rkey), cid: cid, prev: nil, value: value)
+        }
+        let commit = ComAtprotoSpaceDefs.Commit(ver: 1, repo: fixture.commit.repo, space: fixture.commit.space,
+            rev: fixture.revision, data: Bytes(data: hash.commitment))
+        let body = try JSONEncoder().encode(ComAtprotoSpaceListRepoOps.Output(ops: operations, commit: commit, cursor: nil))
+        XCTAssertGreaterThan(body.count, 1_024 * 1_024)
+        XCTAssertLessThan(body.count, 2 * 1_024 * 1_024)
+        let transport = IncrementalTransport(listStatus: 200, listBody: body, latestBody: try fixture.latestBody(commit: commit))
+        let store = CapturingIncrementalStore(base: fixture.base)
+        let orchestrator = try fixture.orchestrator(transport: transport, store: store)
+        let result = try await orchestrator.synchronize(target: fixture.target, requestID: "large-verified-interval", requestSequence: 1, appliedAt: 1)
+        XCTAssertEqual(result, .fullCARRecoveryRequired)
+        let batch = await store.capturedBatch()
+        XCTAssertNil(batch)
+        let paths = await transport.paths()
+        XCTAssertEqual(paths, ["/xrpc/com.atproto.space.listRepoOps", "/xrpc/com.atproto.space.getLatestCommit"])
+    }
+
+    func testMalformedContinuationAndTerminalCursorFailBeforePublication() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        for (cursor, terminal) in [("malformed", false), ("\(fixture.revision.toString())/-1", false), ("222222222222a/999", false), ("\(fixture.revision.toString())/0", true)] {
+            let output = ComAtprotoSpaceListRepoOps.Output(
+                ops: Array(repeating: fixture.operation, count: terminal ? 1 : 1_000),
+                commit: terminal ? fixture.commit : nil, cursor: cursor
+            )
+            let transport = IncrementalTransport(listStatus: 200, listBody: try JSONEncoder().encode(output), latestBody: Data())
+            let store = CapturingIncrementalStore(base: fixture.base)
+            let orchestrator = try fixture.orchestrator(transport: transport, store: store)
+            do {
+                _ = try await orchestrator.synchronize(target: fixture.target, requestID: "bad-cursor", requestSequence: 1, appliedAt: 1)
+                XCTFail("invalid cursor accepted")
+            } catch {
+                XCTAssertEqual(error as? PermissionedRemoteReplicaIncrementalVerificationError, terminal ? .invalidOperation : .invalidCommit)
+            }
+            let batch = await store.capturedBatch()
+            XCTAssertNil(batch)
+        }
     }
 
     func testValidIncrementalPageBeyondJSONClientLimitSelectsFullCARRecovery() async throws {

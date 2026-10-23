@@ -1,0 +1,110 @@
+{
+  "id": "permissioned-data-0016-2026-10-22",
+  "proposalCommit": "b89d0b04495a62e0e22f1ab04c665a9c4e1c655d",
+  "referenceImplementationCommit": "ac0c9f15392f6f0298d71dc52aa88c05036150be",
+  "petrelGeneratorCommit": "e115236537041a900ec971be05185a70cca73e8a",
+  "petrelCommit": "e115236537041a900ec971be05185a70cca73e8a",
+  "migrationCompatibility": "additiveWithProducingBuildRestore",
+  "crypto": {
+    "lthashBytes": 2048,
+    "lthashHash": "BLAKE3-XOF",
+    "commitmentHash": "SHA-256",
+    "contentBinding": "DHKEM(P-256,HKDF-SHA256)/HMAC-SHA256"
+  },
+  "permissionedDataIsEncrypted": false,
+  "oplogRetention": 10000,
+  "referenceArchiveSHA256": "eae029a70a3adf0f7d6241814d5a91d55bf6768e8f4cd00196870c911df57eb5",
+  "petrelManifest": "PetrelManifest.json",
+  "petrelManifestSHA256": "59cbe0fde6241a32cc819ebd833edc6fe428a37cde7821a1adf1cc857dd139f9",
+  "lexiconManifest": "permissioned-data-0016-2026-10-22.lexicons.sha256",
+  "lexiconManifestSHA256": "fbbf6e9b89507d24d8bffd3df78cd9c5a8d4aa8190f5bf8870bb53281d972bc3",
+  "generatedWireManifest": "permissioned-data-0016-2026-10-22.generated-wire.sha256",
+  "generatedWireManifestSHA256": "1bd8bd00ee6c7beb620d0b72e4c6e25d99e1c0563f9958724512ec002606be9a",
+  "intentionalDivergences": [
+    {
+      "endpoint": "com.atproto.space.listRepos",
+      "referenceBehavior": "Compares any cursor string lexically against spaceRev, so a DID-shaped cursor sorts after every TID and returns an empty page.",
+      "swanBehavior": "Compares cursors lexically against spaceRev without TID validation, except that a cursor beginning with did: (the form Swan's listRepos returned before atproto#5574) lists from the start of the space, since it cannot name a space revision. An empty cursor is treated as absent."
+    },
+    {
+      "endpoint": "com.atproto.space.notifyWrite",
+      "referenceBehavior": "The receiver accepts a repo-host notification when the service JWT iss equals body.repo and aud is the bare authority DID or <authority>#atproto_pds; the token carries no req body-digest claim and no jti replay record is kept. A repoRev equal to or older than the recorded one is ignored whatever its data. Forwards to registered syncers are attempted once from an in-memory background queue.",
+      "swanBehavior": "By default accepts only service JWTs whose req claim binds the request body, with iss equal to body.repo and aud the bare authority DID or <authority>#atproto_pds, and always sends req on notifications it signs (a forward's req also binds spaceRev and prevSpaceRev). Unbound upstream-shaped tokens are accepted only under --enable-spaces-open-interop, with exp - iat <= 60 s and a durable single-use jti. An equal repoRev with a different data is refused as equivocation; an older or identical one is ignored. Forwards are queued durably in the transaction that assigns the space revision and retried with backoff."
+    },
+    {
+      "endpoint": "com.atproto.space.notifyCredentialRevoked",
+      "referenceBehavior": "The repo-host receiver accepts service auth whose iss is the space authority and whose aud is the DID of an account it hosts; the token carries no req body-digest claim and no jti replay record is kept. Revocations are retained for 3600 + 2 * 5 s from receipt.",
+      "swanBehavior": "By default accepts only service JWTs whose req claim binds the request body (space and credential IDs), with iss equal to the space authority and aud a bare DID of an account Swan stores. Unbound upstream-shaped tokens are accepted only under --enable-spaces-open-interop, with exp - iat <= 60 s and a durable single-use jti. Revocations are retained for 3600 + 5 + 300 s from receipt, covering Swan's widest configurable credential expiry skew."
+    },
+    {
+      "endpoint": "com.atproto.space.registerNotify",
+      "referenceBehavior": "Accepts a registration authorized by the space credential alone; the named service is resolved through its DID document.",
+      "swanBehavior": "By default also requires an Atproto-Service-Auth header proving ownership of the named service. Credential-only registrations are accepted only under --enable-spaces-open-interop, owned by the named service's DID and capped at 32 per space and 8 per credential subject per hour."
+    },
+    {
+      "endpoint": "com.atproto.space.getSpaceCredential",
+      "referenceBehavior": "Issues space credentials with a 600 s default lifetime under the 3600 s ceiling.",
+      "swanBehavior": "Swan's simple-space authority issues 300 s credentials. An enabled conversation policy runtime uses 60 s credentials. Minting and verification enforce the same 3600 s ceiling, finite iat/exp, exp after iat, a required jti, and at most 5 s of future iat."
+    },
+    {
+      "endpoint": "com.atproto.simplespace.createSpace",
+      "referenceBehavior": "Stores a managingAppPolicy read or write policy and defers access decisions to the managing app's checkUserAccess.",
+      "swanBehavior": "Rejects a managingAppPolicy read or write policy with 400 UnsupportedPolicy because Swan has no outbound checkUserAccess client; public and member-list policies are unchanged."
+    },
+    {
+      "endpoint": "com.atproto.simplespace.updateSpace",
+      "referenceBehavior": "Stores a managingAppPolicy read or write policy and defers access decisions to the managing app's checkUserAccess.",
+      "swanBehavior": "Rejects a managingAppPolicy read or write policy with 400 UnsupportedPolicy; already-stored spaces are not rewritten."
+    }
+  ],
+  "compatibilityExceptions": [
+    {
+      "id": "did-plc-server-0.0.1-submit-status",
+      "pinnedComponent": "@did-plc/server@0.0.1 from reference implementation ac0c9f15392f6f0298d71dc52aa88c05036150be",
+      "referenceBehavior": "POST /:did ends in Express res.sendStatus(200), producing status 200, Content-Type text/plain; charset=utf-8, and the two ASCII bytes OK.",
+      "swanBehavior": "Only explicit laboratory policy did-plc-server-0.0.1 accepts that exact no-redirect response at the requested URL; production and all PLC JSON reads retain strict validation."
+    },
+    {
+      "id": "typescript-space-oplog-retention-gap",
+      "pinnedComponent": "packages/pds/src/api/com/atproto/space/listRepoOps.ts from reference implementation ac0c9f15392f6f0298d71dc52aa88c05036150be",
+      "referenceBehavior": "An old since cursor is filtered with rev > since and returns HTTP 200; the live handler does not emit full_repo_recovery_required for a retention gap.",
+      "swanBehavior": "Emits HTTP 409 full_repo_recovery_required when its retained range is exceeded. The recovery CLI remains strict by default and exposes an explicit --allow-full-car-fallback only for qualified reference-host full-STAR testing; fallback artifacts are excluded from retention-gap validation."
+    }
+  ],
+  "retiredCompatibilityExceptions": [
+    {
+      "id": "typescript-space-list-repo-ops-values-ambiguous-space",
+      "retiredBecause": "Fixed upstream: at bddc99fb the listRepoOps reader qualifies every space selector (space_record_oplog.space) and joins record values on uri AND cid, so value-bearing pages no longer 500. Swan's behavior is now conformant, not an exception."
+    }
+  ],
+  "endpoints": [
+    "com.atproto.space.applyWrites",
+    "com.atproto.space.createRecord",
+    "com.atproto.space.deleteRecord",
+    "com.atproto.space.getBlob",
+    "com.atproto.space.getDelegationToken",
+    "com.atproto.space.getLatestCommit",
+    "com.atproto.space.getRecord",
+    "com.atproto.space.getRepo",
+    "com.atproto.space.getSpaceCredential",
+    "com.atproto.space.listBlobs",
+    "com.atproto.space.listRecords",
+    "com.atproto.space.listRepoOps",
+    "com.atproto.space.listRepos",
+    "com.atproto.space.listSpaces",
+    "com.atproto.space.notifyCredentialRevoked",
+    "com.atproto.space.notifySpaceDeleted",
+    "com.atproto.space.notifyWrite",
+    "com.atproto.space.putRecord",
+    "com.atproto.space.registerNotify",
+    "com.atproto.space.unregisterNotify",
+    "com.atproto.simplespace.putMember",
+    "com.atproto.simplespace.checkUserAccess",
+    "com.atproto.simplespace.createSpace",
+    "com.atproto.simplespace.deleteSpace",
+    "com.atproto.simplespace.getSpace",
+    "com.atproto.simplespace.listMembers",
+    "com.atproto.simplespace.removeMember",
+    "com.atproto.simplespace.updateSpace"
+  ]
+}

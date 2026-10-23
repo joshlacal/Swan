@@ -41,6 +41,10 @@ public struct SwanAccountKEMBackfillService: Service {
     }
 
     public func run() async throws {
+        try await cancelWhenGracefulShutdown { try await self.runLoop() }
+    }
+
+    private func runLoop() async throws {
         while !Task.isCancelled {
             do {
                 if try await runOnce() { continue }

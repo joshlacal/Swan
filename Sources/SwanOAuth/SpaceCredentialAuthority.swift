@@ -195,8 +195,7 @@ public extension SpaceCredentialAuthorizationVerifier {
 /// delegation. This is a separate protocol from
 /// ``SpaceCredentialPublicKeyResolver`` because delegations are signed by the
 /// user's `#atproto` key while space credentials are signed by the space
-/// authority's key (`#atproto`, or a dedicated `#atproto_space` method where
-/// a peer publishes one). Implementations may be local,
+/// authority's exact `#atproto` key. Implementations may be local,
 /// operator-pinned, or explicitly startup-bound to a PLC. Any remote
 /// implementation must keep its issuer allowlist, transport policy,
 /// continuity checks, and cache bounds outside request input; the protocol
@@ -623,18 +622,7 @@ public struct PinnedSpaceCredentialPublicKeyResolver:
     ) async throws -> PermissionedDataJWTVerificationKey? {
         let exact = PinnedKey(authority: issuer, keyID: keyID)
         if let key = keys[exact] { return key }
-        // Proposal 0016 permits the ordinary account key when no dedicated
-        // `#atproto_space` method is published, so a `#atproto_space` header
-        // may fall back to an `#atproto` pin. The reverse never happens: the
-        // reference implementation and Swan both mint `#atproto`, which
-        // resolves exactly.
-        guard keyID == PermissionedDataJWT.spaceCredentialKeyID else {
-            return nil
-        }
-        return keys[PinnedKey(
-            authority: issuer,
-            keyID: PermissionedDataJWT.spaceCredentialFallbackKeyID
-        )]
+        return nil
     }
 
     private struct PinnedKey: Hashable, Sendable {
@@ -889,7 +877,10 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
                 || signingKey.keyID == PermissionedDataJWT.spaceCredentialFallbackKeyID else {
             throw SwanError.unavailable("space credential signing key is unavailable")
         }
-        return try PermissionedDataJWT.createSpaceCredential(
+        // Mint immediately after the key resolver's generation fence. The
+        // token remains transient and is never returned unless final policy
+        // still authorizes it after the custody suspension.
+        let credential = try PermissionedDataJWT.createSpaceCredential(
             issuer: space.authority,
             space: space,
             key: signingKey.privateKey,
@@ -898,6 +889,13 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
             lifetime: configuration.lifetime,
             kid: signingKey.keyID
         )
+        // This may suspend for a current membership check. A key rotation
+        // here can invalidate an already-minted token through normal key
+        // verification; it cannot cause us to mint with an old key afterward.
+        try await policyDirectory.authorizeSimpleSpaceCredentialRead(
+            space: space, user: user, clientID: clientID, authorization: authorization
+        )
+        return credential
     }
 }
 

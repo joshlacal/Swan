@@ -753,6 +753,28 @@ public enum SQLiteLayout {
     /// writer discovery is explicitly not an access-control list.
     static let spaceNotificationSchemaStatements = [
         """
+        CREATE TABLE IF NOT EXISTS conversation_space_authorities (
+            space_uri TEXT PRIMARY KEY, authority_did TEXT NOT NULL, generation TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('active', 'deleting', 'deleted')),
+            deletion_event_id TEXT, deletion_started_at INTEGER CHECK(deletion_started_at >= 0),
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+            CHECK((state = 'active' AND deletion_event_id IS NULL) OR (state != 'active' AND deletion_event_id IS NOT NULL))
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS conversation_space_pending_deletions
+            ON conversation_space_authorities(authority_did, updated_at, space_uri)
+            WHERE state = 'deleting'
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS conversation_space_deletion_recipients (
+            space_uri TEXT NOT NULL REFERENCES conversation_space_authorities(space_uri) ON DELETE CASCADE,
+            deletion_event_id TEXT NOT NULL, endpoint TEXT NOT NULL, owner_service_did TEXT NOT NULL,
+            delivery_service_did TEXT, registration_expires_at INTEGER NOT NULL CHECK(registration_expires_at >= 0),
+            PRIMARY KEY(space_uri, endpoint), CHECK(length(endpoint) > 0))
+        """,
+        """
         CREATE TABLE IF NOT EXISTS permissioned_space_writers (
             space_uri TEXT NOT NULL,
             repo_did TEXT NOT NULL,
@@ -793,6 +815,14 @@ public enum SQLiteLayout {
             retired_event_id TEXT NOT NULL,
             adopted_at INTEGER,
             credential_digest BLOB CHECK(credential_digest IS NULL OR length(credential_digest) = 32)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_remote_replica_retired_events (
+            space_uri TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            adopted_at INTEGER NOT NULL CHECK(adopted_at >= 0),
+            PRIMARY KEY(space_uri, event_id)
         )
         """,
         """
@@ -2765,6 +2795,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 _ = try await connection.query(statement)
             }
             try await migrateSpaceNotificationOwnershipIfNeeded()
+            try await migrateConversationNotificationRegistrationForeignKeyIfNeeded()
+            try await migrateConversationDeletionRecipientsIfNeeded()
             try await migratePermissionedSpaceWriterForeignKeyIfNeeded()
             try await migrateSpaceWriterSequenceIfNeeded()
         }
@@ -5746,6 +5778,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     "permissioned_space_requests",
                     "permissioned_space_outbox",
                     "permissioned_simple_space_authorities",
+                    "conversation_space_authorities",
+                    "conversation_space_deletion_recipients",
                     "permissioned_simple_space_members",
                     "permissioned_simple_space_clients",
                     "permissioned_simple_space_managing_app_decisions",
@@ -5983,6 +6017,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     "permissioned_space_requests",
                     "permissioned_space_outbox",
                     "permissioned_simple_space_authorities",
+                    "conversation_space_authorities",
+                    "conversation_space_deletion_recipients",
                     "permissioned_simple_space_members",
                     "permissioned_simple_space_clients",
                     "permissioned_simple_space_managing_app_decisions",
@@ -6853,6 +6889,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         WHERE a.owner_did = ?
                           AND a.is_deleted = 0
                         UNION
+                        SELECT c.space_uri AS space_uri, 1 AS is_local_authority
+                        FROM conversation_space_authorities AS c
+                        WHERE c.authority_did = ? AND c.state = 'active'
+                        UNION
                         SELECT r.space_uri AS space_uri, 0 AS is_local_authority
                         FROM permissioned_repository_state AS r
                         WHERE r.author_did = ?
@@ -6860,6 +6900,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                               SELECT 1
                               FROM permissioned_simple_space_authorities AS a
                               WHERE a.space_uri = r.space_uri AND a.is_deleted != 0
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM conversation_space_authorities AS c
+                              WHERE c.space_uri = r.space_uri AND c.state != 'active'
                           )
                           AND NOT EXISTS (
                               SELECT 1
@@ -6877,6 +6921,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     LIMIT ?
                     """,
                     [
+                        .text(accountDID),
                         .text(accountDID),
                         .text(accountDID),
                         spaceType.map { "at://*/space/\($0)/*" }.map(SQLiteData.text) ?? .null,
@@ -8418,30 +8463,54 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// Preserve the registration facts needed by pending deletion deliveries,
     /// and reclaim them once their exact endpoint has no deletion intent left.
     /// A live/recreated authority never loses a current registration here.
-    private func pruneCompletedDeletionRegistrationsWithoutGate(space: SpaceURI) async throws {
+    func pruneCompletedDeletionRegistrationsWithoutGate(space: SpaceURI) async throws {
         _ = try await connection.query(
             """
             DELETE FROM permissioned_space_notification_registrations
             WHERE space_uri = ?
-              AND EXISTS (
+              AND (EXISTS (
                   SELECT 1 FROM permissioned_simple_space_authorities AS authority
                   WHERE authority.space_uri = permissioned_space_notification_registrations.space_uri
                     AND authority.is_deleted != 0
-              )
+              ) OR EXISTS (
+                  SELECT 1 FROM conversation_space_authorities AS authority
+                  WHERE authority.space_uri = permissioned_space_notification_registrations.space_uri
+                    AND authority.state = 'deleted'
+              ))
               AND NOT EXISTS (
                   SELECT 1 FROM permissioned_space_notification_fanout AS pending
                   WHERE pending.space_uri = permissioned_space_notification_registrations.space_uri
                     AND pending.endpoint = permissioned_space_notification_registrations.endpoint
                     AND pending.kind = 'deleted'
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM conversation_space_authorities AS authority
+                  JOIN permissioned_space_notification_fanout AS pending
+                    ON pending.space_uri = authority.space_uri AND pending.source_event_id = authority.deletion_event_id
+                  WHERE authority.space_uri = permissioned_space_notification_registrations.space_uri
+                    AND authority.state = 'deleted' AND pending.kind = 'deleted'
+              )
             """,
             [.text(space.rawValue)]
         )
+        _ = try await connection.query(
+            """
+            DELETE FROM conversation_space_deletion_recipients
+            WHERE space_uri = ?
+              AND EXISTS (SELECT 1 FROM conversation_space_authorities AS authority
+                  WHERE authority.space_uri = conversation_space_deletion_recipients.space_uri
+                    AND authority.state = 'deleted'
+                    AND authority.deletion_event_id = conversation_space_deletion_recipients.deletion_event_id)
+              AND NOT EXISTS (SELECT 1 FROM permissioned_space_notification_fanout AS pending
+                  WHERE pending.space_uri = conversation_space_deletion_recipients.space_uri
+                    AND pending.source_event_id = conversation_space_deletion_recipients.deletion_event_id
+                    AND pending.kind = 'deleted')
+            """, [.text(space.rawValue)])
     }
 
     /// Deletes only the authority's own repository in this account database.
     /// Other members own their repositories and are never visited here.
-    private func deleteAuthorityRepositoryWithoutGate(space: SpaceURI) async throws {
+    func deleteAuthorityRepositoryWithoutGate(space: SpaceURI) async throws {
         let repositoryValues: [SQLiteData] = [
             .text(space.rawValue), .text(accountDID),
         ]
@@ -8560,8 +8629,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try grant.allows(.read)
         return try await withReadConnectionGate {
             try await readTransaction {
-                let state = try await requiredSimpleSpace(space, connection: readConnection)
-                try requireActiveSimpleSpace(state.state)
+                try await requireNotificationAuthorityActive(space, connection: readConnection)
                 var values: [SQLiteData] = [.text(space.rawValue)]
                 var cursorClause = ""
                 if let cursor {
@@ -8699,8 +8767,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try grant.allows(.read)
         try await withConnectionGate {
             try await transaction {
-                let state = try await requiredSimpleSpace(space)
-                try requireActiveSimpleSpace(state.state)
+                try await requireNotificationAuthorityActive(space, connection: connection)
                 let baseDID = serviceIssuerDID(owner) ?? owner
                 let requested = deliveryServiceDID ?? (ownerServiceDID != nil ? nil : (service ?? serviceDID))
                 if let requested {
@@ -8781,8 +8848,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try grant.allows(.read)
         try await withConnectionGate {
             try await transaction {
-                let state = try await requiredSimpleSpace(registration.space)
-                try requireActiveSimpleSpace(state.state)
+                try await requireNotificationAuthorityActive(registration.space, connection: connection)
                 // Expired registrations are no longer recipients. Prune them
                 // before admission so expiry immediately returns capacity and
                 // the count below is part of the same write transaction.
@@ -8883,6 +8949,26 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let timestamp = try simpleSpaceTimestamp(now)
         return try await withReadConnectionGate {
             try await readTransaction {
+                if notification.space.spaceType == "blue.catbird.labyrinth.conversation" {
+                    let owed = try await readConnection.query(
+                        """
+                        SELECT recipient.delivery_service_did
+                        FROM conversation_space_deletion_recipients AS recipient
+                        JOIN conversation_space_authorities AS authority ON authority.space_uri = recipient.space_uri
+                          AND authority.deletion_event_id = recipient.deletion_event_id AND authority.state = 'deleted'
+                        JOIN permissioned_space_notification_fanout AS pending ON pending.space_uri = recipient.space_uri
+                          AND pending.source_event_id = recipient.deletion_event_id AND pending.endpoint = recipient.endpoint
+                        WHERE pending.id = ? AND pending.source_issuer = ? AND pending.source_event_id = ?
+                          AND pending.kind = 'deleted' AND pending.space_uri = ? AND pending.endpoint = ?
+                        """, [.text(notification.id.uuidString), .text(notification.sourceIssuer),
+                               .text(notification.sourceEventID), .text(notification.space.rawValue), .text(notification.endpoint)])
+                    guard let row = owed.first else { return nil }
+                    let service = row.column("delivery_service_did")?.string
+                    if let service, !Self.isValidNotificationServiceIdentity(service) {
+                        throw SwanError.unavailable("registered notification destination is unavailable")
+                    }
+                    return PersistedSpaceDeletionDeliveryRegistration(serviceIdentity: service)
+                }
                 let rows = try await readConnection.query(
                     """
                     SELECT registration.delivery_service_did
@@ -8932,6 +9018,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try requireAuthorityAccount(space: space)
         return try await withConnectionGate {
             try await readTransaction {
+                if repository != nil {
+                    do { try await requireNotificationAuthorityActive(space, connection: connection) }
+                    catch is AuthorizedSimpleSpaceLifecycleError { return nil }
+                }
                 let rows = try await connection.query(
                     """
                     SELECT repo_did, expires_at, delivery_service_did
@@ -8978,6 +9068,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try requireAuthorityAccount(space: space)
         return try await withReadConnectionGate {
             try await readTransaction {
+                if repository != nil {
+                    do { try await requireNotificationAuthorityActive(space, connection: readConnection) }
+                    catch is AuthorizedSimpleSpaceLifecycleError { return false }
+                }
                 let rows = try await readConnection.query(
                     """
                     SELECT repo_did, expires_at
@@ -9000,6 +9094,18 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
+    private func requireNotificationAuthorityActive(_ space: SpaceURI, connection: SQLiteConnection) async throws {
+        if space.spaceType == "blue.catbird.labyrinth.conversation" {
+            try validateConversationAuthority(space)
+            let rows = try await connection.query("SELECT state FROM conversation_space_authorities WHERE space_uri = ?", [.text(space.rawValue)])
+            guard let row = rows.first else { throw AuthorizedSimpleSpaceLifecycleError.notFound }
+            guard row.column("state")?.string == "active" else { throw AuthorizedSimpleSpaceLifecycleError.deleted }
+        } else {
+            let state = try await requiredSimpleSpace(space, connection: connection)
+            try requireActiveSimpleSpace(state.state)
+        }
+    }
+
     /// Accepts a service-authenticated write announcement at the authority.
     /// Duplicate receipt IDs and stale TIDs are successful no-ops; an equal
     /// TID with a different commitment is a fail-closed conflict. A repo
@@ -9010,6 +9116,19 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     public func receiveSpaceWriteNotification(
         _ notification: AuthorizedSpaceWriteNotification,
         now: Date = Date()
+    ) async throws {
+        try await receiveSpaceWriteNotification(notification, now: now, liveConversationMembershipConfirmed: false)
+    }
+
+    public func receiveMembershipVerifiedConversationSpaceWriteNotification(
+        _ notification: AuthorizedSpaceWriteNotification, now: Date
+    ) async throws {
+        try validateConversationAuthority(notification.space)
+        try await receiveSpaceWriteNotification(notification, now: now, liveConversationMembershipConfirmed: true)
+    }
+
+    private func receiveSpaceWriteNotification(
+        _ notification: AuthorizedSpaceWriteNotification, now: Date, liveConversationMembershipConfirmed: Bool
     ) async throws {
         guard notification.issuer == notification.repository,
               notification.audience == notification.space.authority,
@@ -9040,19 +9159,26 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
         try await withConnectionGate {
             try await transaction {
-                let state = try await requiredSimpleSpace(notification.space)
-                try requireActiveSimpleSpace(state.state)
-                if notification.repository != state.state.space.owner {
-                    switch state.state.space.configuration.writePolicy {
-                    case .public:
-                        break
-                    case .memberList:
-                        guard state.state.space.members[notification.repository]?.write == true else {
-                            throw SwanError.unauthorized("writer is not a space member")
-                        }
-                    case .managingApp:
-                        guard state.managingAppWriteAllowedUsers.contains(notification.repository) else {
-                            throw SwanError.unauthorized("managing app denied write access")
+                if notification.space.spaceType == "blue.catbird.labyrinth.conversation" {
+                    guard liveConversationMembershipConfirmed else {
+                        throw SwanError.unauthorized("live conversation membership check is required")
+                    }
+                    try await requireConversationSpaceActiveWithoutGate(notification.space)
+                } else {
+                    let state = try await requiredSimpleSpace(notification.space)
+                    try requireActiveSimpleSpace(state.state)
+                    if notification.repository != state.state.space.owner {
+                        switch state.state.space.configuration.writePolicy {
+                        case .public:
+                            break
+                        case .memberList:
+                            guard state.state.space.members[notification.repository]?.write == true else {
+                                throw SwanError.unauthorized("writer is not a space member")
+                            }
+                        case .managingApp:
+                            guard state.managingAppWriteAllowedUsers.contains(notification.repository) else {
+                                throw SwanError.unauthorized("managing app denied write access")
+                            }
                         }
                     }
                 }
@@ -9131,7 +9257,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try await withConnectionGate {
             try await transaction {
                 let retired = try await connection.query(
-                    "SELECT 1 FROM permissioned_remote_replica_lifecycles WHERE space_uri = ? AND retired_event_id = ? AND adopted_at IS NOT NULL",
+                    "SELECT 1 FROM permissioned_remote_replica_retired_events WHERE space_uri = ? AND event_id = ?",
                     [.text(space.rawValue), .text(eventID)]
                 )
                 guard retired.isEmpty else { return }
@@ -10375,7 +10501,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    private func recoverPrivateBlobLifecycle() async throws {
+    func recoverPrivateBlobLifecycle() async throws {
         let candidates = try await withConnectionGate {
             let rows = try await connection.query(
                 """
@@ -11482,7 +11608,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )) != nil
     }
 
-    private func simpleSpaceTimestamp(_ date: Date) throws -> Int {
+    func simpleSpaceTimestamp(_ date: Date) throws -> Int {
         let microseconds = date.timeIntervalSince1970 * 1_000_000
         guard microseconds.isFinite,
               microseconds >= 0,
@@ -11932,9 +12058,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 """
                 SELECT 1 FROM permissioned_simple_space_authorities
                 WHERE space_uri = ? AND owner_did = ? AND is_deleted != 0
+                UNION ALL
+                SELECT 1 FROM conversation_space_authorities
+                WHERE space_uri = ? AND authority_did = ? AND state != 'active'
                 LIMIT 1
                 """,
-                [.text(space.rawValue), .text(accountDID)]
+                [.text(space.rawValue), .text(accountDID), .text(space.rawValue), .text(accountDID)]
             )
             guard authorityTombstones.isEmpty else {
                 throw SwanError.unauthorized("permissioned space is closed")
@@ -11995,6 +12124,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                   WHERE authority.space_uri = repository.space_uri
                     AND authority.is_deleted != 0
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM conversation_space_authorities AS authority
+                  WHERE authority.space_uri = repository.space_uri AND authority.state != 'active'
+              )
             LIMIT 1
             """,
             [.text(space.rawValue), .text(accountDID)]
@@ -12035,6 +12168,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                   FROM permissioned_simple_space_authorities AS authority
                   WHERE authority.space_uri = repository.space_uri
                     AND authority.is_deleted != 0
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM conversation_space_authorities AS authority
+                  WHERE authority.space_uri = repository.space_uri AND authority.state != 'active'
               )
             LIMIT 1
             """,

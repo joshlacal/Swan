@@ -290,6 +290,13 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
         XCTAssertEqual(artifact.errorCode, "<redacted>")
     }
 
+    func testNativeCorruptionClassificationRequiresSTARContentFailure() {
+        XCTAssertTrue(PermissionedRecoveryFailureCode.isInjectedFinalByteCorruptionRejection(SpaceSTARError.digestMismatch))
+        for error in [SpaceSTARError.badMAC, SpaceSTARError.wrongRepository, SpaceMAC.Failure.mismatch, InteropHTTPError.transportFailure] as [any Error] {
+            XCTAssertFalse(PermissionedRecoveryFailureCode.isInjectedFinalByteCorruptionRejection(error))
+        }
+    }
+
     func testRecoveryFailureCodesDoNotReflectArbitraryErrors() {
         XCTAssertEqual(
             PermissionedRecoveryFailureCode.code(

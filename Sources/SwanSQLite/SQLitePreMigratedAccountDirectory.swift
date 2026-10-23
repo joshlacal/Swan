@@ -18,6 +18,7 @@ public actor SQLitePreMigratedAccountDirectory:
     AuthorizedPreopenedAccountDirectory,
     AuthorizedSimpleSpaceLifecycleDirectory,
     AuthorizedSimpleSpaceCredentialDirectory,
+    ConversationSpaceAuthorityLifecycle,
     AuthorizedSpaceRepositoryDirectory,
     AuthorizedSpaceBlobDirectory,
     AuthorizedSpaceNotificationDirectory,
@@ -703,6 +704,83 @@ public actor SQLitePreMigratedAccountDirectory:
         } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
+    }
+
+    public func registerKnownConversationSpace(space: SpaceURI, now: Date) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        do {
+            try await database.registerKnownConversationSpace(space: space, now: now)
+            try await requireCredentialAuthorityStillAvailable(space.authority)
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
+    }
+
+    public func requireConversationSpaceActive(space: SpaceURI) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        do {
+            try await database.requireConversationSpaceActive(space: space)
+            try await requireCredentialAuthorityStillAvailable(space.authority)
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
+    }
+
+    public func beginConversationSpaceDeletion(space: SpaceURI, authorization: AuthorizationContext, now: Date) async throws -> ConversationSpaceDeletion {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        do {
+            let result = try await database.beginConversationSpaceDeletion(space: space, authorization: authorization, now: now)
+            try await requireCredentialAuthorityStillAvailable(space.authority)
+            return result
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
+    }
+
+    public func deferConversationSpaceDeletion(_ deletion: ConversationSpaceDeletion, now: Date) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: deletion.space)
+        do {
+            try await database.deferConversationSpaceDeletion(deletion, now: now)
+            try await requireCredentialAuthorityStillAvailable(deletion.space.authority)
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
+    }
+
+    public func finishConversationSpaceDeletion(_ deletion: ConversationSpaceDeletion, now: Date) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: deletion.space)
+        do {
+            try await database.finishConversationSpaceDeletion(deletion, now: now)
+            try await requireCredentialAuthorityStillAvailable(deletion.space.authority)
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
+    }
+
+    public func receiveMembershipVerifiedConversationSpaceWriteNotification(
+        _ notification: AuthorizedSpaceWriteNotification, now: Date
+    ) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: notification.space)
+        do {
+            try await database.receiveMembershipVerifiedConversationSpaceWriteNotification(notification, now: now)
+            try await requireCredentialAuthorityStillAvailable(notification.space.authority)
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch let error as AuthorizedSpaceWriteNotificationError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
+    }
+
+    public func pendingConversationSpaceDeletions(authority: String) async throws -> [ConversationSpaceDeletion] {
+        guard let database = try await preopenedActiveDatabaseIfHosted(authority) else {
+            throw SwanError.unauthorized("authority account is unavailable")
+        }
+        do {
+            let result = try await database.pendingConversationSpaceDeletions(authority: authority)
+            try await requireCredentialAuthorityStillAvailable(authority)
+            return result
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
     }
 
     public func unregisterSpaceNotification(
