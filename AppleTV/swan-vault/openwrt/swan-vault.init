@@ -1,0 +1,24 @@
+#!/bin/sh /etc/rc.common
+# OpenWrt procd service for swan-vault.
+# Install: scp swan-vault root@router:/usr/bin/ ; scp this file root@router:/etc/init.d/swan-vault
+#          chmod +x /etc/init.d/swan-vault; /etc/init.d/swan-vault enable; /etc/init.d/swan-vault start
+# Token:   head -c 48 /dev/urandom | base64 | tr -d '\n=/+' > /etc/swan-vault.token; chmod 600 /etc/swan-vault.token
+# Disk:    the USB volume must be mounted at $ROOT's parent before start (block-mount / fstab).
+START=95
+STOP=10
+USE_PROCD=1
+
+ROOT="${SWAN_VAULT_ROOT:-/mnt/swan/vault}"
+LISTEN="${SWAN_VAULT_LISTEN:-192.168.1.1:7180}"   # LAN address only; never the WAN interface
+TOKEN="/etc/swan-vault.token"
+
+start_service() {
+	[ -d "$(dirname "$ROOT")" ] || { echo "swan-vault: $(dirname "$ROOT") not mounted; refusing to start on the overlay" >&2; return 1; }
+	mkdir -p "$ROOT"
+	procd_open_instance
+	procd_set_param command /usr/bin/swan-vault --root "$ROOT" --listen "$LISTEN" --token-file "$TOKEN"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_set_param limits nofile="1024 1024"
+	procd_close_instance
+}
