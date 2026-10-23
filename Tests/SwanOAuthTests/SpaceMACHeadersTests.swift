@@ -21,7 +21,7 @@ final class SpaceMACHeadersTests: XCTestCase {
         let header = try SpaceMACHeaders.formatMAC(mac, type: .record)
         XCTAssertTrue(header.hasSuffix("=:"))
         XCTAssertEqual(try SpaceMACHeaders.parseMAC(header, type: .record), mac)
-        XCTAssertEqual(try SpaceMACHeaders.parseMAC(header.replacingOccurrences(of: "=:", with: ":"), type: .record), mac)
+        XCTAssertEqual(try SpaceMACHeaders.parseMAC(header.replacingOccurrences(of: mac.base64EncodedString(), with: mac.base64EncodedString().replacingOccurrences(of: "=", with: "")), type: .record), mac)
         XCTAssertThrowsError(try SpaceMACHeaders.parseMAC(header, type: .repository))
         XCTAssertThrowsError(try SpaceMACHeaders.formatMAC(Data(repeating: 0, count: 31), type: .record))
         XCTAssertThrowsError(try SpaceMACHeaders.parseMAC("type=\"atproto-space-record\", ver=1, mac=:AA==:", type: .record))

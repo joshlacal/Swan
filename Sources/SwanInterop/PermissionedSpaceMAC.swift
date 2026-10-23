@@ -59,8 +59,8 @@ struct PermissionedSpaceMACRequest: Sendable {
     }
 }
 
-struct PermissionedSpaceMACResponse: Sendable {
-    let response: InteropHTTPResponse
+package struct PermissionedSpaceMACResponse: Sendable {
+    package let response: InteropHTTPResponse
     let request: PermissionedSpaceMACRequest
     let commit: SpaceRepositoryCommit?
 }
@@ -68,7 +68,43 @@ struct PermissionedSpaceMACResponse: Sendable {
 /// Authentication-only network seam. It retries a failed MAC once after a
 /// cache-bypassing KEM lookup, using a new ephemeral key for that retry.
 /// Error responses are returned for the endpoint's normal status handling.
-enum PermissionedSpaceMACHTTP {
+package enum PermissionedSpaceMACHTTP {
+    static func record(
+        host: LiveInteropHost, query: [String: String], expectedURI: SpaceRecordURI,
+        authorization: @Sendable () async throws -> InteropAuthorization
+    ) async throws -> InteropHTTPResponse {
+        for attempt in 0..<2 {
+            let request = try await PermissionedSpaceMACRequest.prepare(
+                host: host, repositoryDID: expectedURI.author, forceRefresh: attempt > 0
+            )
+            let response = try await host.client.query(
+                "com.atproto.space.getRecord", query: query, authorization: authorization(),
+                spaceWantMAC: SpaceMACHeaders.formatWantMAC(keyShare: request.keyShare, type: .record)
+            )
+            guard (200...299).contains(response.status) else { return response }
+            guard response.header("content-type")?.lowercased().contains("json") == true else {
+                throw InteropHTTPError.unexpectedContentType
+            }
+            let record = try StrictJSON.decode(ComAtprotoSpaceGetRecord.Output.self, from: response.body)
+            guard record.uri.uriString() == expectedURI.rawValue else { throw SpaceSTARError.wrongRepository }
+            // Authentication binds the URI and CID. Recompute that CID from
+            // canonical record bytes before accepting the response value.
+            _ = try PermissionedRemoteReplicaIncrementalVerifier.canonicalValue(record.value, cid: record.cid)
+            do {
+                try SpaceMAC.verify(
+                    mac: SpaceMACHeaders.parseMAC(response.header(SpaceMACHeaders.responseHeader), type: .record),
+                    expected: SpaceMAC.record(sharedSecret: request.sharedSecret, uri: record.uri.uriString(), cid: record.cid.bytes)
+                )
+                return response
+            } catch SpaceMAC.Failure.mismatch where attempt == 0 {
+                continue
+            } catch is SpaceMACHeaders.HeaderError where attempt == 0 {
+                continue
+            }
+        }
+        throw SpaceMAC.Failure.mismatch
+    }
+
     static func streamSTAR(
         host: LiveInteropHost, query: [String: String], space: SpaceURI, author: String,
         destination: URL, maximumBytes: Int,
@@ -111,7 +147,7 @@ enum PermissionedSpaceMACHTTP {
         throw SpaceMAC.Failure.mismatch
     }
 
-    static func query(
+    package static func query(
         host: LiveInteropHost, nsid: String, query: [String: String],
         space: SpaceURI, author: String,
         authorization: @Sendable () async throws -> InteropAuthorization,

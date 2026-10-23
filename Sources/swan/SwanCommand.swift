@@ -1058,7 +1058,11 @@ struct ServePermissionedRuntime {
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil,
         identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil,
-        foreignHandleResolution: (any SwanForeignHandleResolving)? = nil
+        foreignHandleResolution: (any SwanForeignHandleResolving)? = nil,
+        spaceCredentialPolicyDirectory: (any AuthorizedSimpleSpaceCredentialDirectory)? = nil,
+        simpleSpaceLifecycleDirectory: (any AuthorizedSimpleSpaceLifecycleDirectory)? = nil,
+        spaceNotificationDirectory: (any AuthorizedSpaceNotificationDirectory)? = nil,
+        spaceCredentialIssuance: DurableSpaceCredentialAuthority.Configuration = .standard
     ) -> SwanHTTPServer {
         SwanHTTPServer(
             profile: profile,
@@ -1096,7 +1100,11 @@ struct ServePermissionedRuntime {
             loginClientIdentityPolicy: loginClientIdentityPolicy,
             publicFirehoseStreaming: publicFirehoseStreaming,
             identityAdmission: identityAdmission,
-            foreignHandleResolution: foreignHandleResolution
+            foreignHandleResolution: foreignHandleResolution,
+            spaceCredentialPolicyDirectory: spaceCredentialPolicyDirectory,
+            simpleSpaceLifecycleDirectory: simpleSpaceLifecycleDirectory,
+            spaceNotificationDirectory: spaceNotificationDirectory,
+            spaceCredentialIssuance: spaceCredentialIssuance
         )
     }
 }
@@ -1548,6 +1556,7 @@ extension SwanCommand {
                         expectedOfflineCommitCount: input.expectedOfflineCommitCount
                     )
 
+                    let acceptedHeads = InMemoryRelayAcceptedHeadStorage()
                     var relayState: RelayRepositoryVerificationState?
                     for event in events {
                         switch event {
@@ -1555,12 +1564,14 @@ extension SwanCommand {
                             if let current = relayState {
                                 relayState = try await current.synchronizing(
                                     sync,
-                                    verifier: commitVerifier
+                                    verifier: commitVerifier,
+                                    storage: acceptedHeads
                                 )
                             } else {
                                 relayState = try await .activationSync(
                                     sync,
-                                    verifier: commitVerifier
+                                    verifier: commitVerifier,
+                                    storage: acceptedHeads
                                 )
                             }
                         case let .commit(commit):
@@ -1569,7 +1580,8 @@ extension SwanCommand {
                             }
                             relayState = try await current.applying(
                                 commit: commit,
-                                verifier: commitVerifier
+                                verifier: commitVerifier,
+                                    storage: acceptedHeads
                             )
                         case .identity, .account, .info:
                             break
@@ -1592,7 +1604,8 @@ extension SwanCommand {
                     let swanFinal = try await RelayFullRepositoryVerifier.verify(
                         car: finalCAR,
                         expected: finalHead,
-                        verifier: commitVerifier
+                        verifier: commitVerifier,
+                                    storage: acceptedHeads
                     )
                     try RelayFinalStateVerifier.verify(
                         relay: relayState.snapshot,
@@ -1942,7 +1955,18 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Run Swan's Hummingbird server")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-10-01.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-10-22.json"
+
+        @Option(name: .long, help: "Local authority DID for committed Labyrinth conversation membership policy")
+        var conversationSpaceAuthority: String?
+        @Option(name: .long, help: "Exact HTTPS MLS policy service origin; no automatic discovery")
+        var conversationSpacePolicyURL: String?
+        @Option(name: .long, help: "Service JWT audience of the MLS policy service")
+        var conversationSpacePolicyAudience: String?
+        @Option(name: .long, help: "Literal IP pin of the MLS policy service")
+        var conversationSpacePolicyPeerIP: String?
+        @Flag(name: .long, help: "Permit the configured localhost MLS policy origin for a disposable lab")
+        var conversationSpacePolicyLaboratory = false
 
         /// The public route surface is a separate contract family from
         /// `--profile`, and gets a separate flag rather than a widened one.
@@ -4903,6 +4927,43 @@ extension SwanCommand {
                 } else {
                     foreignHandleResolution = nil
                 }
+                let conversationLifecycle: SwanConversationSpaceLifecycle?
+                let conversationDeletionService: SwanConversationSpaceDeletionService?
+                let conversationPolicy: (any AuthorizedSimpleSpaceCredentialDirectory)?
+                let conversationOptions = [conversationSpaceAuthority, conversationSpacePolicyURL,
+                                           conversationSpacePolicyAudience, conversationSpacePolicyPeerIP]
+                if conversationOptions.contains(where: { $0 != nil }) || conversationSpacePolicyLaboratory {
+                    guard let authority = conversationSpaceAuthority,
+                          let rawOrigin = conversationSpacePolicyURL, let origin = URL(string: rawOrigin),
+                          let audience = conversationSpacePolicyAudience,
+                          let rawPeer = conversationSpacePolicyPeerIP, let peer = OAuthIPAddress(literal: rawPeer),
+                          let localSpaceRuntime, enableNotificationDelivery, notificationRuntime != nil else {
+                        throw ValidationError("conversation Space policy requires all policy options, local account custody, and notification delivery")
+                    }
+                    _ = try AccountIdentifiers.validateDID(authority)
+                    try await directory.requireActivePreopenedAccount(authority)
+                    if conversationSpacePolicyLaboratory {
+                        guard origin.host == "localhost", peer.isLoopback,
+                              !Self.isPubliclyReachableHTTPSOrigin(baseURL),
+                              OAuthIPAddress(literal: host)?.isLoopback == true else {
+                            throw ValidationError("conversation policy laboratory mode requires localhost, a loopback peer/listener, and a non-public server origin")
+                        }
+                    }
+                    let policy = try OAuthRemoteFetchPolicy(
+                        allowLocalhostDevelopment: conversationSpacePolicyLaboratory,
+                        networkAllowlist: .init(addresses: conversationSpacePolicyLaboratory ? [peer] : []),
+                        maximumBodyBytes: 8192, timeout: 5)
+                    let checker = try RemoteConversationSpaceMembershipChecker(
+                        origin: origin, audience: audience, signer: localSpaceRuntime.notificationServiceIssuer,
+                        policy: policy, transport: NIOPeerPinnedOAuthPostTransport(configuration: try .init(
+                            endpointPeers: [origin.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")): peer])))
+                    conversationPolicy = ConversationSpaceCredentialDirectory(local: directory,
+                        accounts: directory, authority: authority, membership: checker, lifecycle: directory)
+                    conversationLifecycle = SwanConversationSpaceLifecycle(local: directory, lifecycle: directory, remote: checker, membership: checker, notifications: directory, authority: authority)
+                    conversationDeletionService = SwanConversationSpaceDeletionService(lifecycle: directory, remote: checker, authority: authority)
+                } else {
+                    conversationPolicy = nil; conversationLifecycle = nil; conversationDeletionService = nil
+                }
                 let server = permissionedRuntime.makeServer(
                     profile: loadedProfile,
                     configuration: .init(
@@ -4939,7 +5000,11 @@ extension SwanCommand {
                     loginClientIdentityPolicy: loginClientIdentityPolicy,
                     publicFirehoseStreaming: publicFirehoseStreamingRuntime,
                     identityAdmission: identityAdmission,
-                    foreignHandleResolution: foreignHandleResolution
+                    foreignHandleResolution: foreignHandleResolution,
+                    spaceCredentialPolicyDirectory: conversationPolicy,
+                    simpleSpaceLifecycleDirectory: conversationLifecycle,
+                    spaceNotificationDirectory: conversationLifecycle,
+                    spaceCredentialIssuance: try .init(lifetime: conversationPolicy == nil ? 300 : 60)
                 )
                 guard server.authenticatedGetSpace != nil else {
                     throw ValidationError(
@@ -5020,6 +5085,7 @@ extension SwanCommand {
                     "address": .string("\(host):\(port)"),
                 ])
                 var services: [any ServiceLifecycle.Service] = [publicApplication]
+                if let conversationDeletionService { services.append(conversationDeletionService) }
                 if let localSpaceRuntime {
                     let backfillPLC = try managementDeletionPLCConfiguration
                         ?? ServeNotificationRuntime.kemBackfillPLCConfiguration(notificationStartupMaterial)
@@ -5109,7 +5175,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Verify a pinned Swan artifact")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-10-01.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-10-22.json"
 
         @Option(name: .long, help: "Swan package root containing generated wire sources")
         var sourceRoot: String?
@@ -5154,10 +5220,45 @@ extension SwanCommand {
             abstract: "Inspect or manage a provisioned Swan account",
             subcommands: [
                 InstallLocal.self, PreparePLC.self, ActivatePLC.self, RotatePLC.self, Show.self,
-                RecoveryCommitKey.self, Deactivate.self, Reactivate.self, DeclareExport.self,
+                RecoveryCommitKey.self, KEMMethod.self, Deactivate.self, Reactivate.self, DeclareExport.self,
                 Delete.self,
             ]
         )
+
+        /// Emits only the public method for owner-controlled DID documents.
+        /// Automatic publication remains confined to the leased PLC backfill.
+        struct KEMMethod: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(commandName: "kem-method",
+                abstract: "Print the public #atproto_kem method for manual DID document publication")
+            @Option(name: .long) var dataDirectory: String
+            @Option(name: .long) var did: String
+            @Option(name: .long) var identityDID: String?
+            @Option(name: .long) var operatorSecretFile: String?
+            @Option(name: .long) var accountKEKFile: String
+            @Option(name: .customLong("account-kek-id")) var accountKEKID: String = "primary"
+            @Option(name: .long) var accountKeyDirectory: String?
+
+            func run() async throws {
+                _ = try AccountCommandSupport.authorization(secretFilePath: operatorSecretFile)
+                let root = URL(fileURLWithPath: dataDirectory)
+                let control = try await SQLiteControlDatabase(dataDirectory: root)
+                do {
+                    guard let account = try await control.account(did: did), account.status == .active else {
+                        throw ValidationError("active hosted account required")
+                    }
+                    let configuration = try AccountProvisioningSecrets.requiredMountedAccountKeyConfiguration(
+                        activeKeyID: accountKEKID, secretFile: URL(fileURLWithPath: accountKEKFile))
+                    let keys = try FileAccountKeyStore(root: accountKeyDirectory.map { URL(fileURLWithPath: $0) }
+                        ?? root.appending(path: "keys"), configuration: configuration)
+                    let method = try await AccountKEMKeyProvider(keyStore: keys).verificationMethod(accountDID: did, identityDID: identityDID)
+                    try await control.close()
+                    try AccountCommandSupport.write(method)
+                } catch {
+                    try? await control.close()
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+            }
+        }
 
         /// Installs the local, durable half of a Swan account. It deliberately
         /// does not claim PLC registration or remote handle verification: the
@@ -6174,7 +6275,7 @@ extension SwanCommand {
             var sourceRedirectURI: String = ""
             @Option(name: .long, parsing: .upToNextOption)
             var scope: [String] = ["atproto"]
-            @Option(name: .customLong("permissioned-commit-key-env"))
+            @Option(name: .customLong("permissioned-commit-key-env"), help: "Compatibility option only; native reads use SWAN_LAB_KEM_KEYS_FILE or SWAN_LAB_KEM_PUBLIC_KEY")
             var permissionedCommitKeyEnvironment =
                 "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
             @Option(name: .customLong("request-id"))
@@ -6189,7 +6290,7 @@ extension SwanCommand {
             @Flag(
                 name: .customLong("full-car-recovery"),
                 inversion: .prefixedNo,
-                help: "Perform verified full-CAR replacement when incremental history is unavailable"
+                help: "Compatibility flag name; perform verified full-STAR replacement when incremental history is unavailable"
             )
             var fullCARRecovery = true
             @Option(name: .long)
@@ -6228,9 +6329,8 @@ extension SwanCommand {
                     did: receiver,
                     dataDirectory: dataURL
                 )
-                let key = try LabLiveSupport.permissionedCommitVerificationKey(
-                    environment: permissionedCommitKeyEnvironment
-                )
+                // Native reads authenticate with the dedicated per-request KEM exchange.
+                let key: PermissionedDataJWTVerificationKey? = nil
                 let sourceEndpoint = try LabLiveSupport.url(
                     explicit: sourceURL,
                     environment: "SWAN_LAB_PRODUCER_URL",
@@ -6271,7 +6371,8 @@ extension SwanCommand {
                 let source = LiveInteropHost(
                     label: "source", client: member.client,
                     authorization: .spaceCredential(credential),
-                    permissionedCommitVerificationKey: key
+                    permissionedCommitVerificationKey: key,
+                    permissionedKEMKeyProvider: try LabLiveSupport.kemKeyProvider()
                 )
                 let database = try await SQLiteAccountDatabase(
                     dataDirectory: dataURL,
@@ -6518,7 +6619,7 @@ extension SwanCommand {
         struct RecoverPermissioned: AsyncParsableCommand {
             static let configuration = CommandConfiguration(
                 commandName: "recover-permissioned",
-                abstract: "Stream, verify, and durably install a permissioned repository recovery CAR"
+                abstract: "Stream, verify, and durably install a permissioned repository STAR snapshot"
             )
 
             @Option(name: .customLong("receiver-did"), help: "Managed receiver account DID")
@@ -6568,13 +6669,13 @@ extension SwanCommand {
 
             @Flag(
                 name: .customLong("allow-full-car-fallback"),
-                help: "Allow an explicitly requested full-CAR install when the source returns a successful listRepoOps response without a retention-gap error"
+                help: "Compatibility flag name; allow an explicitly requested full-STAR install when listRepoOps succeeds without a retention-gap error"
             )
             var allowFullCARFallback = false
 
             @Option(
                 name: .customLong("permissioned-commit-key-env"),
-                help: "Environment variable containing ES256:<base64url-x963> or ES256K:<base64url> repository-author public key"
+                help: "Compatibility option only; native reads use SWAN_LAB_KEM_KEYS_FILE or SWAN_LAB_KEM_PUBLIC_KEY"
             )
             var permissionedCommitKeyEnvironment =
                 "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
@@ -6666,10 +6767,7 @@ extension SwanCommand {
                         "--source-auth must be bearer or oauth"
                     )
                 }
-                let verificationKey = try LabLiveSupport
-                    .permissionedCommitVerificationKey(
-                        environment: permissionedCommitKeyEnvironment
-                    )
+                let verificationKey: PermissionedDataJWTVerificationKey? = nil
                 let requestPrefix: String
                 if requestID.isEmpty {
                     requestPrefix = "recover-\(UUID().uuidString.lowercased())"
@@ -6753,7 +6851,7 @@ extension SwanCommand {
                     did: canonicalReceiver,
                     openMode: .existingManaged
                 )
-                // The remote CAR is staged and verified before this closure is
+                // The remote STAR is staged and verified before this closure is
                 // invoked. It opens the control plane only for the final,
                 // network-free publication transaction, so deactivation
                 // cannot race the authorization decision used by recovery.
@@ -6827,18 +6925,21 @@ extension SwanCommand {
                         label: "source",
                         client: sourceMember.client,
                         authorization: .spaceCredential(credential),
-                        permissionedCommitVerificationKey: verificationKey
+                        permissionedCommitVerificationKey: verificationKey,
+                        permissionedKEMKeyProvider: try LabLiveSupport.kemKeyProvider()
                     )
-                    let gap = try await source.client.query(
-                        "com.atproto.space.listRepoOps",
+                    let gap = try await PermissionedSpaceMACHTTP.query(
+                        host: source, nsid: "com.atproto.space.listRepoOps",
                         query: [
                             "space": parsedSpace.rawValue,
                             "repo": canonicalRepository,
                             "since": sinceRevision.toString(),
                             "limit": "1",
                         ],
-                        authorization: source.authorization
-                    )
+                        space: parsedSpace, author: canonicalRepository,
+                        authorization: { source.authorization },
+                        commit: { try StrictJSON.decode(ComAtprotoSpaceListRepoOps.Output.self, from: $0).commit }
+                    ).response
                     gapStatus = gap.status
                     gapErrorCode = Self.responseError(gap)
                     let explicitRetentionGap = gap.status == 409
@@ -6906,7 +7007,7 @@ extension SwanCommand {
                             .code(for: error)
                         // A transport, OAuth, timeout, or unrelated storage
                         // failure is not evidence that the corrupted archive
-                        // reached and was rejected by the CAR verifier. The
+                        // reached and was rejected by the STAR verifier. The
                         // injected final-byte mutation deterministically
                         // invalidates the containing block's CID.
                         corruptionRejected = PermissionedRecoveryFailureCode
@@ -7754,31 +7855,31 @@ extension SwanCommand {
 
             @Flag(
                 name: .customLong("permissioned-list-ops-exclude-values"),
-                help: "Request the metadata-only listRepoOps form (required by the pinned TypeScript branch until its joined-query bug is fixed)"
+                help: "Request the metadata-only listRepoOps form"
             )
             var permissionedListOpsExcludeValues = false
 
             @Flag(
                 name: .customLong("permissioned-get-repo"),
-                help: "Fetch and cryptographically verify the repository host's full two-root permissioned CAR"
+                help: "Fetch and verify the repository host's full STAR snapshot and response MAC"
             )
             var permissionedGetRepo = false
 
             @Flag(
                 name: .customLong("permissioned-stateful-matrix"),
-                help: "Require create/read CID convergence plus verified listRepoOps revision/commitment and full-CAR recovery evidence"
+                help: "Require create/read CID convergence plus verified listRepoOps revision/commitment and full-STAR recovery evidence"
             )
             var permissionedStatefulMatrix = false
 
             @Flag(
                 name: .customLong("permissioned-write-only-apply-writes"),
-                help: "Opt in to one member OAuth/DPoP applyWrites batch plus a metadata-only signed terminal-revision witness"
+                help: "Opt in to one member OAuth/DPoP applyWrites batch plus a metadata-only MAC-authenticated terminal-revision witness"
             )
             var permissionedWriteOnlyApplyWrites = false
 
             @Option(
                 name: .customLong("permissioned-commit-key-env"),
-                help: "Environment variable containing a canonical did:key or ES256:<base64url-x963>/ES256K:<base64url> repository-author public key (untagged is legacy ES256K)"
+                help: "Compatibility option only; native reads use SWAN_LAB_KEM_KEYS_FILE or SWAN_LAB_KEM_PUBLIC_KEY"
             )
             var permissionedCommitKeyEnvironment = "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
 
@@ -7868,10 +7969,7 @@ extension SwanCommand {
                         environment: "SWAN_LAB_PRODUCER_URL",
                         fallback: "https://swan.test"
                     )
-                    let permissionedCommitKey = try LabLiveSupport
-                        .permissionedCommitVerificationKey(
-                            environment: permissionedCommitKeyEnvironment
-                        )
+                    let permissionedCommitKey: PermissionedDataJWTVerificationKey? = nil
                     let producer = try await LabLiveSupport.host(
                         label: "member",
                         url: producerURL,
@@ -7919,9 +8017,7 @@ extension SwanCommand {
                     environment: "SWAN_LAB_CONSUMER_URL",
                     fallback: "https://pds.test"
                 )
-                let permissionedCommitKey = try (permissionedListOps || permissionedGetRepo || permissionedStatefulMatrix)
-                    ? LabLiveSupport.permissionedCommitVerificationKey(environment: permissionedCommitKeyEnvironment)
-                    : nil
+                let permissionedCommitKey: PermissionedDataJWTVerificationKey? = nil
                 let producer = try await LabLiveSupport.host(
                     label: normalizedMode == "permissioned" ? "member" : "producer",
                     url: producerURL,
@@ -8443,7 +8539,7 @@ extension SwanCommand {
                 @Option(name: .long, parsing: .upToNextOption, help: "OAuth scope to request; repeatable (default: atproto plus the derived space read scope)")
                 var scope: [String] = []
 
-                @Option(name: .customLong("permissioned-commit-key-env"), help: "Environment variable containing the repository author public key (base64url secp256k1)")
+                @Option(name: .customLong("permissioned-commit-key-env"), help: "Compatibility option only; native reads use SWAN_LAB_KEM_KEYS_FILE or SWAN_LAB_KEM_PUBLIC_KEY")
                 var permissionedCommitKeyEnvironment = "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
 
                 @Option(name: .customLong("plc-origin"), help: "PLC directory origin used to discover each writer's repo host (default: https://plc.directory)")
@@ -8455,13 +8551,13 @@ extension SwanCommand {
                 @Option(name: .customLong("plc-laboratory-allowlisted-host"), help: "Explicit Docker/service DNS host allowed for --plc-laboratory")
                 var plcLaboratoryAllowlistedHost: String?
 
-                @Option(name: .customLong("writer-host"), parsing: .upToNextOption, help: "Explicit writer repo host as did=url, optionally did=url:did:key:z... with a per-writer commit key; repeatable (overrides PLC discovery)")
+                @Option(name: .customLong("writer-host"), parsing: .upToNextOption, help: "Explicit writer repo host as did=url; repeatable (overrides PLC discovery). Legacy commit-key suffixes are accepted for compatibility and ignored by native reads")
                 var writerHost: [String] = []
 
                 @Flag(
                     name: .customLong("full-car-recovery"),
                     inversion: .prefixedNo,
-                    help: "Perform verified full-CAR replacement when incremental history is unavailable"
+                    help: "Compatibility flag name; perform verified full-STAR replacement when incremental history is unavailable"
                 )
                 var fullCARRecovery = true
 
@@ -8498,10 +8594,6 @@ extension SwanCommand {
                         dataDirectory: dataURL
                     )
                     Forum.log("forum thread: receiver account is active")
-                    let globalKey = try LabLiveSupport
-                        .optionalPermissionedCommitVerificationKey(
-                            environment: permissionedCommitKeyEnvironment
-                        )
                     let consumer = try await Forum.oauthAwareHost(
                         label: "consumer",
                         url: LabLiveSupport.url(
@@ -8598,23 +8690,8 @@ extension SwanCommand {
                                 ))
                                 continue
                             }
-                            let writerKey: PermissionedDataJWTVerificationKey
-                            if let overrideKey = writerHosts[writer]?.commitVerificationKey {
-                                writerKey = try LabLiveSupport.decodeCommitVerificationKey(overrideKey)
-                            } else if let globalKey {
-                                writerKey = globalKey
-                            } else {
-                                failedWriters.append(writer)
-                                writerStatuses.append(ForumWriterStatus(
-                                    did: writer,
-                                    host: writerURL.host ?? writerURL.absoluteString,
-                                    outcome: "commit_key_missing",
-                                    revision: nil,
-                                    commitment: nil,
-                                    recordCount: 0
-                                ))
-                                continue
-                            }
+                            // Every writer is authenticated by its dedicated KEM key.
+                            let writerKey: PermissionedDataJWTVerificationKey? = nil
                             let source = LiveInteropHost(
                                 label: "writer-\(writer)",
                                 client: try InteropXRPCClient(
@@ -8625,7 +8702,8 @@ extension SwanCommand {
                                         .map { URL(fileURLWithPath: $0) }
                                 ),
                                 authorization: credentialAuthorization,
-                                permissionedCommitVerificationKey: writerKey
+                                permissionedCommitVerificationKey: writerKey,
+                                permissionedKEMKeyProvider: try LabLiveSupport.kemKeyProvider()
                             )
                             let target = try PermissionedRemoteReplicaTarget(
                                 receiverDID: receiver,
@@ -8959,16 +9037,16 @@ extension SwanCommand {
             }
 
             /// One explicit `--writer-host` override: the writer repo host URL
-            /// and an optional per-writer commit verification key.
+            /// and an optional legacy commit key retained only for compatibility.
             private struct WriterHostOverride: Sendable, Equatable {
                 let url: URL
                 let commitVerificationKey: String?
             }
 
             /// Parses repeatable `did=url` writer-host overrides. Each value
-            /// may optionally carry a per-writer repository commit
-            /// verification key as a `:did:key:z...` suffix, which overrides
-            /// the global SWAN_LAB_PERMISSIONED_COMMIT_KEY for that writer.
+            /// may retain a legacy `:did:key:z...` commit-key suffix. Parsing
+            /// still validates that historical syntax; current reads authenticate
+            /// with the dedicated KEM provider and do not consume this key.
             private static func writerHostMap(
                 _ values: [String]
             ) throws -> [String: WriterHostOverride] {
@@ -9409,6 +9487,7 @@ private enum LabLiveSupport {
         redirectURI: String,
         scopes: [String],
         timeout: Double,
+        permissionedKEMKeyProvider: (@Sendable (String, Bool) async throws -> String)? = nil,
         permissionedCommitVerificationKey: PermissionedDataJWTVerificationKey? = nil
     ) async throws -> LiveInteropHost {
         guard timeout > 0, timeout <= 120, timeout.isFinite else {
@@ -9427,7 +9506,8 @@ private enum LabLiveSupport {
             return LiveInteropHost(
                 label: label,
                 client: client,
-                permissionedCommitVerificationKey: permissionedCommitVerificationKey
+                permissionedCommitVerificationKey: permissionedCommitVerificationKey,
+                permissionedKEMKeyProvider: try permissionedKEMKeyProvider ?? LabLiveSupport.kemKeyProvider()
             )
         case "bearer":
             try requireCredentialSafeTransport(url)
@@ -9442,7 +9522,8 @@ private enum LabLiveSupport {
                 label: label,
                 client: client,
                 authorization: .bearer(token: token),
-                permissionedCommitVerificationKey: permissionedCommitVerificationKey
+                permissionedCommitVerificationKey: permissionedCommitVerificationKey,
+                permissionedKEMKeyProvider: try permissionedKEMKeyProvider ?? LabLiveSupport.kemKeyProvider()
             )
         case "oauth":
             try requireCredentialSafeTransport(url)
@@ -9487,10 +9568,36 @@ private enum LabLiveSupport {
                 label: label,
                 client: client,
                 authorizationProvider: provider,
-                permissionedCommitVerificationKey: permissionedCommitVerificationKey
+                permissionedCommitVerificationKey: permissionedCommitVerificationKey,
+                permissionedKEMKeyProvider: try permissionedKEMKeyProvider ?? LabLiveSupport.kemKeyProvider()
             )
         default:
             throw ValidationError("live auth must be none, bearer, or oauth")
+        }
+    }
+
+    /// Dedicated public KEM pins for the disposable lab. The JSON file maps
+    /// repository DIDs to did:key values and is re-read on every resolution,
+    /// including the forced refresh after a MAC mismatch. Signing pins are
+    /// deliberately not a fallback.
+    static func kemKeyProvider() throws -> (@Sendable (String, Bool) async throws -> String)? {
+        let env = ProcessInfo.processInfo.environment
+        let file = env["SWAN_LAB_KEM_KEYS_FILE"]
+        let single = env["SWAN_LAB_KEM_PUBLIC_KEY"]
+        guard file != nil || single != nil else { return nil }
+        return { did, _ in
+            let value: String
+            if let file {
+                let bytes = try Data(contentsOf: URL(fileURLWithPath: file))
+                guard bytes.count <= 64 * 1024,
+                      let selected = try JSONDecoder().decode([String: String].self, from: bytes)[did] else {
+                    throw SwanError.unavailable("laboratory KEM key pin is unavailable")
+                }
+                value = selected
+            } else if let single { value = single }
+            else { throw SwanError.unavailable("laboratory KEM key pin is unavailable") }
+            _ = try P256DIDKey(value)
+            return value
         }
     }
 

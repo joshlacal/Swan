@@ -24,6 +24,7 @@ class ServiceSnapshotTests(unittest.TestCase):
             target = self.source / relative
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             with sqlite3.connect(target) as db:
+                db.execute("PRAGMA journal_mode=WAL")
                 db.executescript("""
                     CREATE TABLE authority_policy(space TEXT PRIMARY KEY, policy TEXT);
                     CREATE TABLE members(space TEXT, did TEXT);
@@ -70,6 +71,37 @@ class ServiceSnapshotTests(unittest.TestCase):
                 self.assertEqual(after.execute("SELECT attempts, retry_at FROM outbox").fetchone(), (2, 42))
         self.assertEqual(restored.stat().st_mode & 0o777, 0o700)
         self.assertEqual((restored / "keys/account-kem").stat().st_mode & 0o777, 0o600)
+
+    def test_committed_wal_survives_offline_crash_snapshot_without_extra_inventory_files(self):
+        database = self.source / "control.sqlite"
+        # A real abrupt process exit leaves a committed record in WAL. The
+        # snapshot must include it without exporting transient WAL/SHM files.
+        subprocess.run(["python3", "-c", "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"INSERT INTO outbox VALUES('wal-only','deleted',3,99)\"); c.commit(); os._exit(0)", str(database)], check=True)
+        self.assertTrue(Path(str(database) + "-wal").exists())
+        archive, restored = self.root / "wal-archive", self.root / "wal-restored"
+        result = self.run_tool("snapshot", self.source, archive)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((archive / "manifest.json").read_text())
+        actual = {str(p.relative_to(archive / "data")) for p in (archive / "data").rglob("*") if p.is_file()}
+        self.assertEqual(actual, {entry["path"] for entry in manifest["files"]})
+        result = self.run_tool("restore", archive, restored)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with sqlite3.connect(restored / "control.sqlite") as db:
+            self.assertEqual(db.execute("SELECT attempts, retry_at FROM outbox WHERE id='wal-only'").fetchone(), (3, 99))
+        db.close()
+
+    def test_source_directory_with_uri_reserved_characters(self):
+        renamed = self.root / "source #? with spaces"
+        self.source.rename(renamed)
+        self.source = renamed
+        archive, restored = self.root / "uri-archive", self.root / "uri-restored"
+        result = self.run_tool("snapshot", self.source, archive)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_tool("restore", archive, restored)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with sqlite3.connect(restored / "control.sqlite") as db:
+            self.assertEqual(db.execute("SELECT attempts FROM outbox WHERE id='pending-delete'").fetchone(), (2,))
+        db.close()
 
     def test_refuses_active_source(self):
         with sqlite3.connect(self.source / "control.sqlite") as live:

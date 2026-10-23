@@ -5,7 +5,7 @@ import SwanOAuth
 import SwanSpaces
 
 /// A fixed test-only holder key keeps credential construction independent of
-/// account-signing keys. Presentations carry atproto#5569 HTTP message
+/// account-signing keys. Presentations carry October 22 HTTP message
 /// signatures: one signature covers a credential and its audience and may be
 /// reused for every request with that pair.
 enum SpaceCredentialSignatureTestSupport {
@@ -54,24 +54,14 @@ enum SpaceCredentialSignatureTestSupport {
         return try SpaceURI(space).authority
     }
 
-    /// `Authorization: <scheme> <delegation>` signed over `("authorization")`
-    /// with the holder key named as `keyid`.
-    static func exchangeHeaders(
-        token: String,
-        authorizationScheme: String = "Bearer",
-        key: P256.Signing.PrivateKey? = nil
-    ) throws -> HTTPFields {
-        let signed = try SpaceHTTPSignature.sign(
-            authorization: "\(authorizationScheme) \(token)",
-            key: key ?? self.key
-        )
+    /// October 22 exchanges carry credentialKid and optional delegationToken
+    /// in JSON; exchange headers contain no bearer credential or signature.
+    static func exchangeHeaders() -> HTTPFields {
         var headers = HTTPFields()
-        headers[.authorization] = signed.authorization
         headers[.contentType] = "application/json"
-        headers[HTTPField.Name(SpaceHTTPSignature.signatureInputFieldName)!] = signed.signatureInput
-        headers[HTTPField.Name(SpaceHTTPSignature.signatureFieldName)!] = signed.signature
         return headers
     }
+
 }
 
 enum SpaceCredentialSignatureTestSupportError: Error {

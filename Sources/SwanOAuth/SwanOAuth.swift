@@ -219,23 +219,11 @@ public enum PermissionedDataJWT {
     /// space authority's key (see ``spaceCredentialIssuedKeyID``).
     public static let delegationKeyID = "#atproto"
     public static let delegationLifetime: TimeInterval = 60
-    /// Proposal 0016 names an optional dedicated DID verification method for
-    /// space credentials. Swan never publishes it, so Swan never mints it;
-    /// verification still accepts it (resolving the dedicated method first
-    /// and the ordinary `#atproto` method only when the dedicated one is
-    /// absent) for peers that do publish one.
+    /// October 22 requires the authority's exact `#atproto` signing method.
     public static let spaceCredentialKeyID = "#atproto"
-    /// The authority's ordinary AT Protocol verification method. Proposal
-    /// 0016 permits it when no dedicated `#atproto_space` method is
-    /// published, and the reference implementation has minted exactly this
-    /// kid (resolving it with no fallback) since d7849741 (2026-07-30).
-    public static let spaceCredentialFallbackKeyID = "#atproto"
-    /// The kid Swan writes into credentials it mints. A kid must name a
-    /// verification method the authority's DID document actually publishes:
-    /// the reference repo host rejects an unpublished `#atproto_space` with
-    /// 401 BadJwtIss. Swan-hosted did:plc and did:web authorities publish
-    /// only `#atproto`, and the signing key is that method's key.
-    public static let spaceCredentialIssuedKeyID = spaceCredentialFallbackKeyID
+    /// Source-compatible alias; it does not permit an alternate method.
+    public static let spaceCredentialFallbackKeyID = spaceCredentialKeyID
+    public static let spaceCredentialIssuedKeyID = spaceCredentialKeyID
     /// The hard ceiling on a space credential's `exp - iat`, enforced both
     /// when Swan mints and when it verifies (upstream #5567,
     /// `SPACE_CREDENTIAL_MAX_AGE_SEC`). A longer credential is rejected even

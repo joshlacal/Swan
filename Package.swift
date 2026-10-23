@@ -22,18 +22,9 @@ let package = Package(
         .executable(name: "swan", targets: ["swan"]),
     ],
     dependencies: [
-        // Petrel comes from its published repository, pinned to an exact
-        // revision, not from a sibling checkout. A `path:` dependency compiles
-        // against whatever line the neighbouring working copy happens to be
-        // sitting on, which is invisible in this manifest and unreproducible
-        // anywhere else: Swan silently built against three different Petrel
-        // lines depending on who had checked out what. This revision is the
-        // October 1 Spaces alpha (atproto 679724ad lexicons: listSpaces /
-        // createSpace `spaceType`, notifyWrite / listRepos `repoRev` and
-        // `spaceRev`, notifyCredentialRevoked) on the same Swan line as the
-        // September 10 pin, keeping Swan's request-body-digest security
-        // baseline and service-JWT protections.
-        .package(path: "../Petrel"),
+        // Immutable October 22 SDK, generated from the matching pinned corpus.
+        .package(url: "https://github.com/joshlacal/Petrel.git",
+                 revision: "e115236537041a900ec971be05185a70cca73e8a"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.36.0"),
@@ -201,6 +192,7 @@ let package = Package(
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOFoundationCompat", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOSSL", package: "swift-nio-ssl"),

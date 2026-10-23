@@ -105,7 +105,10 @@ def offline_lock(root):
 
 
 def sqlite_check(path):
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+    # Validate the completed, closed backup image without creating WAL/SHM
+    # sidecars outside its authenticated inventory. SQLite backup() has already
+    # materialized all committed source WAL pages into this standalone file.
+    with contextlib.closing(sqlite3.connect(path.absolute().as_uri() + "?mode=ro&immutable=1", uri=True)) as db:
         if db.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
             raise ValueError("SQLite integrity check failed")
         if db.execute("PRAGMA foreign_key_check").fetchone() is not None:
@@ -147,7 +150,7 @@ def snapshot(source, destination, integrity_key, build_id, profile_id):
                 origin, target = source / name, data / name
                 target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 if name in databases:
-                    read = sqlite3.connect(f"file:{origin}?mode=ro", uri=True)
+                    read = sqlite3.connect(origin.absolute().as_uri() + "?mode=ro", uri=True)
                     write = sqlite3.connect(target)
                     try:
                         read.backup(write, pages=128)

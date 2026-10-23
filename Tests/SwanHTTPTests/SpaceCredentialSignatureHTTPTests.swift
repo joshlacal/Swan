@@ -12,7 +12,7 @@ import SwanSpaces
 import XCTest
 
 /// Credential presentation at the resource authorizer after atproto#5569:
-/// `Authorization: Atproto-Space <credential>` plus an `atproto-space` HTTP
+/// `Authorization: Atproto-Space-Credential <credential>` plus an `atproto-space` HTTP
 /// message signature over `authorization` and `atproto-space-audience`,
 /// verified against `cnf.kid`. There is no URL/method binding, no per-request
 /// replay reservation, and no nonce.
@@ -87,7 +87,7 @@ final class SpaceCredentialSignatureHTTPTests: XCTestCase, @unchecked Sendable {
 
             var duplicateAuthorization = valid
             duplicateAuthorization[values: .authorization] = [
-                "Atproto-Space \(fixture.credential)", "Atproto-Space \(fixture.credential)",
+                "Atproto-Space-Credential \(fixture.credential)", "Atproto-Space-Credential \(fixture.credential)",
             ]
             await assertFailure(.badSignature, fixture, headers: duplicateAuthorization)
 
@@ -120,7 +120,7 @@ final class SpaceCredentialSignatureHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    func testOnlyTheAtprotoSpaceSchemeSelectsTheCredentialVerifier() async throws {
+    func testOnlyTheAtprotoSpaceCredentialSchemeSelectsTheCredentialVerifier() async throws {
         let fixture = try await Fixture.make()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         do {
@@ -129,12 +129,12 @@ final class SpaceCredentialSignatureHTTPTests: XCTestCase, @unchecked Sendable {
             )
             // Scheme names are case-insensitive.
             var lowercase = valid
-            lowercase[.authorization] = "atproto-space \(fixture.credential)"
+            lowercase[.authorization] = "atproto-space-credential \(fixture.credential)"
             XCTAssertEqual(try spaceCredentialSchemeToken(from: lowercase), fixture.credential)
 
             // A credential smuggled under Bearer or the retired DPoP scheme is
             // refused rather than handed to OAuth or legacy-session policy.
-            for scheme in ["Bearer", "DPoP"] {
+            for scheme in ["Atproto-Space", "Bearer", "DPoP"] {
                 var smuggled = valid
                 smuggled[.authorization] = "\(scheme) \(fixture.credential)"
                 XCTAssertThrowsError(try spaceCredentialSchemeToken(from: smuggled), scheme)
@@ -144,7 +144,7 @@ final class SpaceCredentialSignatureHTTPTests: XCTestCase, @unchecked Sendable {
             oauth[.authorization] = "DPoP opaque-access-token"
             XCTAssertNil(try spaceCredentialSchemeToken(from: oauth))
             var duplicate = valid
-            duplicate[values: .authorization] = ["Atproto-Space \(fixture.credential)", "DPoP other"]
+            duplicate[values: .authorization] = ["Atproto-Space-Credential \(fixture.credential)", "DPoP other"]
             XCTAssertThrowsError(try spaceCredentialSchemeToken(from: duplicate)) {
                 XCTAssertEqual($0 as? SpaceCredentialPresentationFailure, .badSignature)
             }
@@ -155,32 +155,18 @@ final class SpaceCredentialSignatureHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    func testDelegationExchangeSignatureYieldsTheConfirmationKey() async throws {
-        let fixture = try await Fixture.make()
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-        do {
-            let headers = try SpaceCredentialSignatureTestSupport.exchangeHeaders(token: "delegation")
-            XCTAssertEqual(
-                try fixture.authorizer.verifySpaceDelegationSignature(request: request(headers: headers)),
-                try SpaceCredentialSignatureTestSupport.keyID
-            )
-            var missingKeyID = headers
-            missingKeyID[HTTPField.Name(SpaceHTTPSignature.signatureInputFieldName)!] = "atproto-space=(\"authorization\")"
-            for invalid in [
-                HTTPFields(),
-                missingKeyID,
-                try SpaceCredentialSignatureTestSupport.headers(token: "delegation", audience: Self.repo),
-            ] {
-                XCTAssertThrowsError(
-                    try fixture.authorizer.verifySpaceDelegationSignature(request: request(headers: invalid))
-                ) {
-                    XCTAssertEqual($0 as? SpaceCredentialPresentationFailure, .badSignature)
-                }
+    func testExchangeHeadersContainNoProofAndRetiredExchangeSignatureIsRejected() throws {
+        let headers = SpaceCredentialSignatureTestSupport.exchangeHeaders()
+        XCTAssertEqual(headers[.contentType], "application/json")
+        XCTAssertNil(headers[.authorization])
+        XCTAssertNil(headers[HTTPField.Name(SpaceHTTPSignature.signatureInputFieldName)!])
+        XCTAssertNil(headers[HTTPField.Name(SpaceHTTPSignature.signatureFieldName)!])
+        for authorization in ["Bearer delegation", "Atproto-Space-Credential credential"] {
+            XCTAssertThrowsError(try SpaceHTTPSignature.sign(
+                authorization: authorization, audience: nil, key: SpaceCredentialSignatureTestSupport.key
+            )) {
+                XCTAssertEqual($0 as? SpaceHTTPSignatureError, .wrongCoveredComponents)
             }
-            try await fixture.control.close()
-        } catch {
-            try? await fixture.control.close()
-            throw error
         }
     }
 

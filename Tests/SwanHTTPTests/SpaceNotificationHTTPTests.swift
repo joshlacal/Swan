@@ -80,7 +80,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             let expectedWriter = writer
             let registerBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}")
             let commitment = Data(repeating: 0x01, count: 32).base64EncodedString()
-            let writeBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"repoRev\":\"3l72c4e2y2222\",\"hash\":{\"$bytes\":\"\(commitment)\"}}")
+            let writeBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"repoRev\":\"3l72c4e2y2222\",\"data\":{\"$bytes\":\"\(commitment)\"}}")
             let serviceHeaders: HTTPFields = {
                 var fields: HTTPFields = [.contentType: "application/json"]
                 fields[.authorization] = "Bearer writer-token"
@@ -157,7 +157,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 }
                 // A notifyWrite request with altered body / mismatched digest is rejected
                 let badCommitment = Data(repeating: 0xCC, count: 32).base64EncodedString()
-                let alteredWriteBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"repoRev\":\"2222222222222\",\"hash\":{\"$bytes\":\"\(badCommitment)\"}}")
+                let alteredWriteBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"repoRev\":\"2222222222222\",\"data\":{\"$bytes\":\"\(badCommitment)\"}}")
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.notifyWrite",
                     method: .post,
@@ -797,10 +797,10 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(body["repo"] as? String, writer)
         XCTAssertEqual(body["repoRev"] as? String, "2222222222222")
         XCTAssertNil(body["rev"], "notifyWrite carries repoRev, not rev")
-        XCTAssertNotNil(body["hash"], "the commit hash closes the listRepos propagation loop")
+        XCTAssertNotNil(body["data"], "the repository commitment closes the listRepos propagation loop")
         XCTAssertEqual(body["spaceRev"] as? String, "3l72c4e2y2223")
         XCTAssertEqual(body["prevSpaceRev"] as? String, "3l72c4e2y2222")
-        XCTAssertEqual(Set(body.keys), ["space", "repo", "repoRev", "hash", "spaceRev", "prevSpaceRev"])
+        XCTAssertEqual(Set(body.keys), ["space", "repo", "repoRev", "data", "spaceRev", "prevSpaceRev"])
         let issued = await recordingIssuer.issued()
         XCTAssertEqual(issued.count, 1)
         XCTAssertEqual(issued.first?.issuer, authorityDID)
@@ -900,6 +900,49 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             afterWithdrawal.count, 2,
             "a withdrawn registration must be a silent no-op"
         )
+    }
+
+    func testDeletionFanoutRetainsItsDurableIntentThroughHTTP408And429() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "SwanNotifyStatusRetry-\(UUID().uuidString)")
+        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: authority)
+        do {
+            let now = Date()
+            let space = try SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "status-retry")
+            let owner = AuthorizationContext.accountOAuthForTesting(subject: authority, scopes: ["atproto"])
+            _ = try await database.createSimpleSpace(space: space, owner: authority, configuration: .init(), authorization: owner, now: now)
+            try await database.registerSpaceNotification(.init(space: space, endpoint: "https://events.example", repository: nil,
+                expiresAt: now.addingTimeInterval(3600), ownerServiceDID: "did:web:events.example", deliveryServiceDID: "did:web:events.example#notifications"),
+                authorization: .spaceCredential(.init(subject: writer, space: space, permissions: [.read], expiresAt: now.addingTimeInterval(3600))), now: now)
+            _ = try await database.deleteSimpleSpace(space: space, authorization: owner, now: now)
+            let before = try await database.pendingNotificationFanout()
+            let event = try XCTUnwrap(before.first)
+            let posts = RecordingPostTransport(responseStatuses: [408, 429, 200])
+            let transport = HTTPPermissionedSpaceNotificationFanoutTransport(
+                database: database, destinations: try StaticSwanSpaceNotificationDestinations(),
+                serviceAuthentication: SigningNotificationServiceIssuer(),
+                poster: OAuthBoundedJSONPoster(policy: try OAuthRemoteFetchPolicy(maximumBodyBytes: 4096, timeout: 2),
+                    resolver: FixedHostnameResolver(answer: try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))), transport: posts))
+            let worker = PermissionedSpaceNotificationFanoutDeliveryWorker(database: database, transport: transport)
+            let timeout = try await worker.deliverNext(now: now)
+            XCTAssertEqual(timeout, .failed(eventID: event.id, attempts: 1))
+            let cooldown = try await worker.deliverNext(now: now)
+            XCTAssertEqual(cooldown, .idle)
+            let rateLimited = try await worker.deliverNext(now: now.addingTimeInterval(2))
+            XCTAssertEqual(rateLimited, .failed(eventID: event.id, attempts: 2))
+            let retained = try await database.pendingNotificationFanout()
+            XCTAssertEqual(retained.map(\.id), [event.id])
+            XCTAssertEqual(retained.first?.attempts, 2)
+            let registration = try await database.currentSpaceDeletionDeliveryRegistration(for: event, now: now)
+            XCTAssertNotNil(registration)
+            let success = try await worker.deliverNext(now: now.addingTimeInterval(5))
+            XCTAssertEqual(success, .delivered(eventID: event.id))
+            let drained = try await database.pendingNotificationFanout()
+            let captured = await posts.posts()
+            XCTAssertTrue(drained.isEmpty)
+            XCTAssertEqual(captured.count, 3)
+            XCTAssertTrue(captured.allSatisfy { $0.body == captured.first?.body })
+            try await database.close()
+        } catch { try? await database.close(); throw error }
     }
 
     func testDeletedSpaceFanoutRetainsDestinationsUntilDeliveryAndCancelsOldLeasesOnRecreate() async throws {
@@ -1188,6 +1231,50 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         _ = await running.value
     }
 
+    func testNotificationRecoveryServiceExitsAfterServiceGroupGracefulShutdown() async throws {
+        let fixture = try NotificationRecoveryFixture()
+        defer { fixture.cleanup() }
+        let database = try await fixture.open()
+        do {
+            try await fixture.prepareCommittedQueues(on: database)
+            let transport = NotificationRecoveryTransport()
+            let service = SwanNotificationRecoveryService(
+                databases: [database],
+                makeOutboxTransport: { _ in transport },
+                makeFanoutTransport: { _ in transport },
+                configuration: try notificationRecoveryConfiguration()
+            )
+            let serviceGroup = SwanHTTPServiceLifecycle.makeServiceGroup(
+                services: [service],
+                logger: Logger(label: "SpaceNotificationHTTPTests.graceful-shutdown")
+            )
+            let finished = expectation(description: "Notification service exits on graceful shutdown")
+            let running = Task {
+                defer { finished.fulfill() }
+                try await serviceGroup.run()
+            }
+            for _ in 0 ..< 100 {
+                let counts = await transport.counts()
+                if counts.outbox == 1 && counts.fanout == 1 { break }
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            let counts = await transport.counts()
+            XCTAssertEqual(counts.outbox, 1)
+            XCTAssertEqual(counts.fanout, 1)
+
+            await serviceGroup.triggerGracefulShutdown()
+            await fulfillment(of: [finished], timeout: 2)
+            // Cancellation is cleanup after the assertion. It must not be what
+            // allows the service group to complete the expectation above.
+            running.cancel()
+            try await running.value
+            try await database.close()
+        } catch {
+            try? await database.close()
+            throw error
+        }
+    }
+
     func testCommittedWriteSurvivesStopAndRecoversIdempotentlyFromPreopenedDirectory() async throws {
         let fixture = try PreopenedRecoveryFixture()
         defer { fixture.cleanup() }
@@ -1281,7 +1368,7 @@ private struct NotificationHTTPFixture {
             try .init(authority: authority, generation: 1, publicKey: key.publicKey),
         ])
         return SwanHTTPServer(
-            profile: try ProtocolProfile.load(from: notificationPackageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-01.json")),
+            profile: try ProtocolProfile.load(from: notificationPackageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-22.json")),
             configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: URL(string: "https://swan.example")!),
             oauthRuntime: runtime,
             authenticatedGetSpaceDirectory: directory,
@@ -1772,9 +1859,11 @@ private actor RecordingPostTransport: OAuthRemotePostTransport {
 
     private var recorded: [RecordedPost] = []
     private var failuresRemaining: Int
+    private var responseStatuses: [Int]
 
-    init(failuresRemaining: Int = 0) {
+    init(failuresRemaining: Int = 0, responseStatuses: [Int] = []) {
         self.failuresRemaining = failuresRemaining
+        self.responseStatuses = responseStatuses
     }
 
     func post(
@@ -1791,7 +1880,7 @@ private actor RecordingPostTransport: OAuthRemotePostTransport {
             throw SwanError.unavailable("notification delivery failed")
         }
         return .init(
-            status: 200,
+            status: responseStatuses.isEmpty ? 200 : responseStatuses.removeFirst(),
             headers: ["content-length": ["0"]],
             body: Data(),
             responseURL: url,
@@ -2108,7 +2197,7 @@ extension SpaceNotificationHTTPTests {
             let method = "com.atproto.space.notifyWrite"
             let rev = "3l72c4e2y2222"
             let hash = Data(repeating: 0x02, count: 32)
-            let body = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"repoRev\":\"\(rev)\",\"hash\":{\"$bytes\":\"\(hash.base64EncodedString())\"}}")
+            let body = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"repoRev\":\"\(rev)\",\"data\":{\"$bytes\":\"\(hash.base64EncodedString())\"}}")
             let digest = SpaceNotificationRequestDigest.write(
                 space: fixture.space, repository: writer, wireRevision: rev, commitment: hash
             )
@@ -2133,9 +2222,13 @@ extension SpaceNotificationHTTPTests {
                 try await client.execute(uri: "/xrpc/\(method)", method: .post, headers: self.serviceHeaders(upstream), body: body) { response in
                     XCTAssertEqual(response.status, .unauthorized)
                 }
-                // The `#atproto_space_host` audience form is accepted too.
-                try await client.execute(uri: "/xrpc/\(method)", method: .post, headers: self.serviceHeaders(try unbound("upstream-2", audience: "\(self.authority)#atproto_space_host")), body: body) { response in
+                // The current `#atproto_pds` audience form is accepted too.
+                try await client.execute(uri: "/xrpc/\(method)", method: .post, headers: self.serviceHeaders(try unbound("upstream-2", audience: "\(self.authority)#atproto_pds")), body: body) { response in
                     XCTAssertEqual(response.status, .ok)
+                }
+                // The retired service fragment must not regain authority.
+                try await client.execute(uri: "/xrpc/\(method)", method: .post, headers: self.serviceHeaders(try unbound("upstream-retired", audience: "\(self.authority)#atproto_space_host")), body: body) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
                 }
                 // Any other audience, or an issuer other than the repo, is not.
                 try await client.execute(uri: "/xrpc/\(method)", method: .post, headers: self.serviceHeaders(try unbound("upstream-3", audience: "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz")), body: body) { response in

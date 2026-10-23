@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Historical Compose overlay verifier. Current-profile host proofs use
+# verify-reference-oct22.sh and the isolated spaces-release laboratory.
+
 readonly COMMIT="3f6c96d5d2d25438bd40fa89d6ecc37865f8e354"
 readonly ARCHIVE_SHA256="1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea"
 cache_dir=".interop-cache"

@@ -44,10 +44,13 @@ Monitor the following indicators on your production host:
 
 ## Taking and restoring backups
 
-Swan supports two backup workflows:
+Swan supports three backup workflows:
+
 - **Encrypted operator backup (`swan backup` / `swan restore`)**: Creates an authenticated, encrypted snapshot of an individual account's state, metadata, and key envelopes.
 - **Portable logical export (`swan export` / `swan restore`)**: Generates a checksummed, unencrypted CAR and JSON archive for cross-implementation migration.
-- **Full SQLite hot-backup**: Uses SQLite `VACUUM INTO` for zero-downtime node-level snapshots.
+- **Offline full-service snapshot (`Scripts/service-snapshot.py`)**: Retains all local databases, authority policies, durable queues, account key envelopes, and blobs while the service is stopped.
+
+Account backups and portable exports transfer account content; their restore rules do not recreate complete authority policy or operational queues. Use Procedure 5 for a full-service recovery. The [October 22 Spaces migration guide](migrations/2026-10-22-spaces.md#backup-and-restore) records backup compatibility, external dependencies, and the checks required before switching a restored service into use.
 
 ### Procedure 1: Create an encrypted account backup (`swan backup`)
 
@@ -157,51 +160,58 @@ swan restore \
 #### Verification
 Confirm the staged account state using `swan account show`.
 
-### Procedure 5: Hot SQLite backup using `VACUUM INTO`
+### Procedure 5: Create and restore an offline full-service snapshot
 
-To create atomic, zero-downtime filesystem copies of all databases while Swan is actively running:
+Stop Swan through its configured supervisor and wait for the process to exit before taking the snapshot. The tool acquires the service-directory lease, checks open files, holds every SQLite writer lock, and copies all nested databases through SQLite's backup API. Committed WAL data is included in the completed database images; transient WAL/SHM files are not exported. The authenticated inventory covers the database images, key envelopes, blobs, and other retained files in the data directory.
 
 #### Prerequisites
-- `sqlite3` CLI utility installed.
-- Sufficient disk space on the backup destination mount.
+
+- Python 3 with SQLite support, `lsof`, OpenSSL for key generation, and this build's `Scripts/service-snapshot.py`.
+- Run as the owner of the Swan data directory. Source directories must be owner-only (`0700`) and files owner-only (`0600`); symlinks are refused.
+- Sufficient space in an existing private destination parent. Snapshot and restore destinations must not already exist, and the snapshot must be outside the source directory.
+- A separate, owner-only integrity key containing exactly 32 raw bytes, retained outside the data directory and snapshot. This is a different format from the base64-encoded account backup key used above.
+- The producing executable and profile files, original account wrapping key, OAuth/server/operator secrets, TLS material, and notification and policy configuration retained separately. A conversation authority also requires a separate backup of its delivery-service database.
+
+The snapshot adds authentication but no encryption. Store it on encrypted, owner-controlled storage.
 
 #### Steps
+
+1. Once, generate an integrity key at an absent path. Keep this key for all snapshots authenticated with it:
+
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
+(
+  set -e
+  umask 077
+  test ! -e /etc/swan/secrets/service-snapshot-integrity-key
+  openssl rand -out /etc/swan/secrets/service-snapshot-integrity-key 32
+)
+```
 
-DATA_DIR="/var/lib/swan/data"
-BACKUP_DEST="/var/backups/swan_node_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "${BACKUP_DEST}"
+2. After shutdown, run the snapshot command from the retained source checkout. Replace the quoted build identifier with the SHA-256 of the retained executable and use the profile actually deployed:
 
-# 1. Safely backup control plane database
-sqlite3 "${DATA_DIR}/control.sqlite" "VACUUM INTO '${BACKUP_DEST}/control.sqlite';"
+```bash
+python3 Scripts/service-snapshot.py snapshot \
+  --source /var/lib/swan/data \
+  --destination /var/backups/swan/full-service-20261023 \
+  --integrity-key-file /etc/swan/secrets/service-snapshot-integrity-key \
+  --build-id "REPLACE_WITH_SAVED_EXECUTABLE_SHA256" \
+  --profile-id permissioned-data-0016-2026-10-22
+```
 
-# 2. Safely backup firehose database if present
-if [ -f "${DATA_DIR}/firehose.sqlite" ]; then
-  sqlite3 "${DATA_DIR}/firehose.sqlite" "VACUUM INTO '${BACKUP_DEST}/firehose.sqlite';"
-fi
+3. Rehearse restoration into a new directory using the same integrity key:
 
-# 3. Safely backup all per-account databases
-for db in "${DATA_DIR}"/did:*.sqlite; do
-  [ -f "$db" ] || continue
-  filename="$(basename "$db")"
-  sqlite3 "$db" "VACUUM INTO '${BACKUP_DEST}/${filename}';"
-done
-
-# 4. Copy key envelopes and blobs
-if [ -d "${DATA_DIR}/keys" ]; then
-  cp -a "${DATA_DIR}/keys" "${BACKUP_DEST}/keys"
-fi
-if [ -d "${DATA_DIR}/blobs" ]; then
-  cp -a "${DATA_DIR}/blobs" "${BACKUP_DEST}/blobs"
-fi
-
-echo "Full node hot-backup completed at ${BACKUP_DEST}."
+```bash
+python3 Scripts/service-snapshot.py restore \
+  --source /var/backups/swan/full-service-20261023 \
+  --destination /var/lib/swan/restored-data-20261023 \
+  --integrity-key-file /etc/swan/secrets/service-snapshot-integrity-key
 ```
 
 #### Verification
-Verify the backup databases with `sqlite3 "${BACKUP_DEST}/control.sqlite" "PRAGMA integrity_check;"`. The command must return `ok`.
+
+Both commands must exit successfully. Restore verifies manifest authentication, the exact inventory, every file digest, and SQLite `quick_check` and foreign keys before publishing the destination. A failed attempt preserves its partial directory for diagnosis; use a new absent destination when retrying.
+
+Start the retained producing build against the restored directory with its retained external secrets and configuration. Verify login, authority policies and members, authenticated record and repository reads, writer inventory, registration ownership, durable delivery retries, and deletion state before switching any service. Upgrade the restored copy separately and repeat those checks. Leave the original source directory intact. See the [migration guide](migrations/2026-10-22-spaces.md#backup-and-restore) for the scope and compatibility boundaries.
 
 ## Rotating cryptographic keys
 

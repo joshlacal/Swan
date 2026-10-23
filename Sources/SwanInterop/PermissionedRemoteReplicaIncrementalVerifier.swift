@@ -205,7 +205,7 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
         }
     }
 
-    private static func canonicalValue(
+    static func canonicalValue(
         _ value: ATProtocolValueContainer?,
         cid: CID
     ) throws -> Data {

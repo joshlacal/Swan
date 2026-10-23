@@ -18,8 +18,7 @@ public enum SpaceHTTPSignature {
     /// Bounds each combined signature field before structured-field parsing.
     public static let maximumFieldBytes = 8 * 1_024
 
-    /// The four header values a client sends. `audience` is `nil` for the
-    /// delegation exchange.
+    /// The four header values used for credential presentation.
     public struct Headers: Sendable, Equatable {
         public let authorization: String
         public let audience: String?
@@ -32,7 +31,7 @@ public enum SpaceHTTPSignature {
         P256DIDKey(publicKey: key.publicKey).value
     }
 
-    /// Signs a delegation exchange (`audience == nil`) or a credential use.
+    /// Signs a credential presentation. A non-nil audience is required.
     /// The emitted signature input is the reference's minimal form; a
     /// verifier accepts any additional parameters a client chooses to add.
     public static func sign(
@@ -59,12 +58,12 @@ public enum SpaceHTTPSignature {
         )
     }
 
-    /// Verifies an `atproto-space` signature and returns the P-256 `did:key`
+    /// Verifies an `atproto-space-credential` signature and returns the P-256 `did:key`
     /// that produced it.
     ///
     /// Every argument is the complete list of field lines received for that
     /// header, so duplicates are visible. `credentialKeyID == nil` selects the
-    /// delegation-exchange shape (keyid required); a non-nil value selects
+    /// unsupported legacy shape; a non-nil value selects
     /// credential use, where `audience` must hold exactly one line.
     public static func verify(
         authorization: [String],
@@ -195,7 +194,7 @@ public enum SpaceHTTPSignature {
     }
 }
 
-/// Fixed diagnostic vocabulary for a rejected `atproto-space` signature. All
+/// Fixed diagnostic vocabulary for a rejected `atproto-space-credential` signature. All
 /// cases surface on the wire as `BadSpaceSignature`; none carries request
 /// material.
 public enum SpaceHTTPSignatureError: Error, Sendable, Equatable {

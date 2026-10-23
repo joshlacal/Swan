@@ -15,78 +15,40 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         "did:key:zQ3shqwJEJyMBsBXCWyCBpUBMqxcon9oHB7mCvx4sSpMdLJwc"
     private let auditSigningKey = P256.Signing.PrivateKey()
 
-    func testResolvesDedicatedP256AndFallbackSecp256k1Keys() async throws {
-        let privateKey = P256.Signing.PrivateKey()
-        let p256 = privateKey.publicKey
+    func testCredentialKidResolvesExactlyTheOrdinaryP256Key() async throws {
+        let key = P256.Signing.PrivateKey()
+        let other = P256.Signing.PrivateKey()
         let plc = ResolverPLCFixture(snapshots: [
             issuer: try snapshot(methods: [
-                "atproto_space": P256DIDKey(publicKey: p256).value,
-                "atproto": referenceSecp256k1Key,
+                "atproto": P256DIDKey(publicKey: key.publicKey).value,
+                "atproto_space": P256DIDKey(publicKey: other.publicKey).value,
             ]),
         ])
-        let resolver = try PLCSpaceCredentialPublicKeyResolver(
-            plc: plc,
-            continuityStore: ResolverCheckpointStore()
-        )
-
-        let dedicatedKey = try await resolver.publicKey(
-            for: issuer,
-            keyID: PermissionedDataJWT.spaceCredentialKeyID
-        )
-        let dedicated = try XCTUnwrap(dedicatedKey)
-        let fallbackKey = try await resolver.publicKey(
-            for: issuer,
-            keyID: PermissionedDataJWT.spaceCredentialFallbackKeyID
-        )
-        let fallback = try XCTUnwrap(fallbackKey)
-
-        XCTAssertEqual(
-            dedicated.deterministicIdentity,
-            PermissionedDataJWTVerificationKey.p256(p256).deterministicIdentity
-        )
-        XCTAssertTrue(try dedicated.verify(
-            signature: P256WireSignature.sign(
-                Data("credential".utf8),
-                using: privateKey
-            ),
-            signingInput: Data("credential".utf8),
-            algorithm: "ES256"
-        ))
-        switch fallback {
-        case let .secp256k1PublicKey(actual):
-            guard case let .secp256k1(expected) =
-                try PLCDIDKeyCodec.decode(referenceSecp256k1Key) else {
-                return XCTFail("fixture key must be secp256k1")
-            }
-            XCTAssertEqual(actual, expected)
-        case .p256:
-            XCTFail("expected PLC secp256k1 fallback key")
-        }
-        let fetchCount = await plc.fetchCount()
-        XCTAssertEqual(fetchCount, 1, "one PLC state serves both key IDs")
-    }
-
-    func testDedicatedCredentialKeyFallsBackToOrdinaryPLCKeyWhenAbsent() async throws {
-        let plc = ResolverPLCFixture(snapshots: [
-            issuer: try snapshot(methods: ["atproto": referenceSecp256k1Key]),
-        ])
-        let resolver = try PLCSpaceCredentialPublicKeyResolver(
-            plc: plc,
-            continuityStore: ResolverCheckpointStore()
-        )
-
-        let resolved = try await resolver.publicKey(
-            for: issuer,
-            keyID: PermissionedDataJWT.spaceCredentialKeyID
-        )
-        guard case let .secp256k1PublicKey(actual) = try XCTUnwrap(resolved),
-              case let .secp256k1(expected) = try PLCDIDKeyCodec.decode(referenceSecp256k1Key)
-        else {
-            return XCTFail("expected ordinary PLC key fallback")
-        }
-        XCTAssertEqual(actual, expected)
+        let resolver = try PLCSpaceCredentialPublicKeyResolver(plc: plc, continuityStore: ResolverCheckpointStore())
+        let resolved = try await resolver.publicKey(for: issuer, keyID: "#atproto")
+        XCTAssertEqual(resolved?.deterministicIdentity, PermissionedDataJWTVerificationKey.p256(key.publicKey).deterministicIdentity)
+        let retired = try await resolver.publicKey(for: issuer, keyID: "#atproto_space")
+        XCTAssertNil(retired)
         let fetchCount = await plc.fetchCount()
         XCTAssertEqual(fetchCount, 1)
+    }
+
+    func testCredentialKidResolvesOrdinarySecp256k1Key() async throws {
+        let plc = ResolverPLCFixture(snapshots: [issuer: try snapshot(methods: ["atproto": referenceSecp256k1Key])])
+        let resolver = try PLCSpaceCredentialPublicKeyResolver(plc: plc, continuityStore: ResolverCheckpointStore())
+        let resolved = try await resolver.publicKey(for: issuer, keyID: "#atproto")
+        guard case let .secp256k1PublicKey(actual) = try XCTUnwrap(resolved),
+              case let .secp256k1(expected) = try PLCDIDKeyCodec.decode(referenceSecp256k1Key) else {
+            return XCTFail("expected ordinary PLC secp256k1 key")
+        }
+        XCTAssertEqual(actual, expected)
+    }
+
+    func testCredentialKidNeverFallsBackToRetiredDedicatedKey() async throws {
+        let plc = ResolverPLCFixture(snapshots: [issuer: try snapshot(methods: ["atproto_space": referenceSecp256k1Key])])
+        let resolver = try PLCSpaceCredentialPublicKeyResolver(plc: plc, continuityStore: ResolverCheckpointStore())
+        let resolved = try await resolver.publicKey(for: issuer, keyID: "#atproto")
+        XCTAssertNil(resolved)
     }
 
     func testUnknownIssuerAndKeyFailClosedWithoutUnsafeFallback() async throws {
@@ -140,7 +102,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         let key = P256.Signing.PrivateKey().publicKey
         let plc = ResolverPLCFixture(snapshots: [
             issuer: try snapshot(methods: [
-                "atproto_space": P256DIDKey(publicKey: key).value,
+                "atproto": P256DIDKey(publicKey: key).value,
             ]),
         ])
         let resolver = try PLCSpaceCredentialPublicKeyResolver(
@@ -154,19 +116,19 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
             clock: { clock.now() }
         )
 
-        let initial = try await resolver.publicKey(for: issuer, keyID: "#atproto_space")
+        let initial = try await resolver.publicKey(for: issuer, keyID: "#atproto")
         XCTAssertNotNil(initial)
         clock.advance(by: 11)
         await plc.failNextFetch()
         await XCTAssertThrowsErrorAsync(
-            try await resolver.publicKey(for: issuer, keyID: "#atproto_space")
+            try await resolver.publicKey(for: issuer, keyID: "#atproto")
         )
         let failedRefreshCount = await plc.fetchCount()
         XCTAssertEqual(failedRefreshCount, 2)
 
         // A short negative entry damps retries without reviving stale material.
         await XCTAssertThrowsErrorAsync(
-            try await resolver.publicKey(for: issuer, keyID: "#atproto_space")
+            try await resolver.publicKey(for: issuer, keyID: "#atproto")
         )
         let dampedFetchCount = await plc.fetchCount()
         XCTAssertEqual(dampedFetchCount, 2)
@@ -174,11 +136,11 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
 
         // A request after the negative-cache interval fetches again and only
         // then repopulates the positive cache.
-        let recovered = try await resolver.publicKey(for: issuer, keyID: "#atproto_space")
+        let recovered = try await resolver.publicKey(for: issuer, keyID: "#atproto")
         XCTAssertNotNil(recovered)
         let recoveredFetchCount = await plc.fetchCount()
         XCTAssertEqual(recoveredFetchCount, 3)
-        let cached = try await resolver.publicKey(for: issuer, keyID: "#atproto_space")
+        let cached = try await resolver.publicKey(for: issuer, keyID: "#atproto")
         XCTAssertNotNil(cached)
         let cachedFetchCount = await plc.fetchCount()
         XCTAssertEqual(cachedFetchCount, 3)
@@ -190,11 +152,11 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         let key = P256.Signing.PrivateKey().publicKey
         let plc = ResolverPLCFixture(snapshots: [
             issuer: try snapshot(
-                methods: ["atproto_space": P256DIDKey(publicKey: key).value]
+                methods: ["atproto": P256DIDKey(publicKey: key).value]
             ),
             secondIssuer: try snapshot(
                 issuer: secondIssuer,
-                methods: ["atproto_space": P256DIDKey(publicKey: key).value]
+                methods: ["atproto": P256DIDKey(publicKey: key).value]
             ),
         ])
         let resolver = try PLCSpaceCredentialPublicKeyResolver(
@@ -227,7 +189,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         let plc = ResolverPLCFixture(
             snapshots: [
                 issuer: try snapshot(methods: [
-                    "atproto_space": P256DIDKey(publicKey: key).value,
+                    "atproto": P256DIDKey(publicKey: key).value,
                 ]),
             ],
             fetchDelayNanoseconds: 100_000_000
@@ -242,7 +204,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
                 group.addTask {
                     let maybeResolved = try await resolver.publicKey(
                         for: self.issuer,
-                        keyID: "#atproto_space"
+                        keyID: "#atproto"
                     )
                     let resolved = try XCTUnwrap(maybeResolved)
                     return resolved.deterministicIdentity
@@ -275,7 +237,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         for issuer in issuers {
             snapshots[issuer] = try snapshot(
                 issuer: issuer,
-                methods: ["atproto_space": P256DIDKey(publicKey: key).value]
+                methods: ["atproto": P256DIDKey(publicKey: key).value]
             )
         }
         let plc = ResolverPLCFixture(
@@ -294,7 +256,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
                     do {
                         return try await resolver.publicKey(
                             for: issuer,
-                            keyID: "#atproto_space"
+                            keyID: "#atproto"
                         ) != nil
                     } catch {
                         return false
@@ -327,17 +289,17 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         )
 
         await XCTAssertThrowsErrorAsync(
-            try await resolver.publicKey(for: missingIssuer, keyID: "#atproto_space")
+            try await resolver.publicKey(for: missingIssuer, keyID: "#atproto")
         )
         await XCTAssertThrowsErrorAsync(
-            try await resolver.publicKey(for: missingIssuer, keyID: "#atproto_space")
+            try await resolver.publicKey(for: missingIssuer, keyID: "#atproto")
         )
         let cachedFailureFetchCount = await plc.fetchCount()
         XCTAssertEqual(cachedFailureFetchCount, 1)
 
         clock.advance(by: 11)
         await XCTAssertThrowsErrorAsync(
-            try await resolver.publicKey(for: missingIssuer, keyID: "#atproto_space")
+            try await resolver.publicKey(for: missingIssuer, keyID: "#atproto")
         )
         let expiredFailureFetchCount = await plc.fetchCount()
         XCTAssertEqual(expiredFailureFetchCount, 2)
@@ -355,7 +317,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         for issuer in issuers {
             snapshots[issuer] = try snapshot(
                 issuer: issuer,
-                methods: ["atproto_space": P256DIDKey(publicKey: key).value]
+                methods: ["atproto": P256DIDKey(publicKey: key).value]
             )
         }
         let plc = ResolverPLCFixture(snapshots: snapshots)
@@ -369,12 +331,12 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         for issuer in issuers.prefix(2) {
             let resolved = try await resolver.publicKey(
                 for: issuer,
-                keyID: "#atproto_space"
+                keyID: "#atproto"
             )
             XCTAssertNotNil(resolved)
         }
         await XCTAssertThrowsErrorAsync(
-            try await resolver.publicKey(for: issuers[2], keyID: "#atproto_space")
+            try await resolver.publicKey(for: issuers[2], keyID: "#atproto")
         )
         let boundedFetchCount = await plc.fetchCount()
         XCTAssertEqual(boundedFetchCount, 2)
@@ -382,7 +344,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         clock.advance(by: 61)
         let afterWindow = try await resolver.publicKey(
             for: issuers[2],
-            keyID: "#atproto_space"
+            keyID: "#atproto"
         )
         XCTAssertNotNil(afterWindow)
         let resetWindowFetchCount = await plc.fetchCount()
@@ -394,10 +356,10 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         let oldKey = P256.Signing.PrivateKey().publicKey
         let newKey = P256.Signing.PrivateKey().publicKey
         let initial = try snapshot(methods: [
-            "atproto_space": P256DIDKey(publicKey: oldKey).value,
+            "atproto": P256DIDKey(publicKey: oldKey).value,
         ])
         let rotated = try snapshot(
-            methods: ["atproto_space": P256DIDKey(publicKey: newKey).value],
+            methods: ["atproto": P256DIDKey(publicKey: newKey).value],
             extending: initial
         )
         let plc = ResolverPLCFixture(snapshots: [issuer: initial])
@@ -414,7 +376,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
 
         let maybeFirst = try await resolver.publicKey(
             for: issuer,
-            keyID: "#atproto_space"
+            keyID: "#atproto"
         )
         let first = try XCTUnwrap(maybeFirst)
         XCTAssertEqual(
@@ -426,7 +388,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         clock.advance(by: 11)
         let maybeRefreshed = try await resolver.publicKey(
             for: issuer,
-            keyID: "#atproto_space"
+            keyID: "#atproto"
         )
         let refreshed = try XCTUnwrap(maybeRefreshed)
         XCTAssertEqual(
@@ -440,7 +402,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         await XCTAssertThrowsErrorAsync(
             try await resolver.publicKey(
                 for: unrelatedIssuer,
-                keyID: "#atproto_space"
+                keyID: "#atproto"
             )
         )
         let afterChurnFetchCount = await plc.fetchCount()
@@ -451,7 +413,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         await plc.setSnapshot(initial, for: issuer)
         clock.advance(by: 11)
         await XCTAssertThrowsErrorAsync(
-            try await resolver.publicKey(for: issuer, keyID: "#atproto_space")
+            try await resolver.publicKey(for: issuer, keyID: "#atproto")
         )
         let rollbackFetchCount = await plc.fetchCount()
         XCTAssertEqual(rollbackFetchCount, 3)
@@ -469,13 +431,13 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         defer { try? FileManager.default.removeItem(at: root) }
 
         let initial = try snapshot(methods: [
-            "atproto_space": P256DIDKey(
+            "atproto": P256DIDKey(
                 publicKey: P256.Signing.PrivateKey().publicKey
             ).value,
         ])
         let rotated = try snapshot(
             methods: [
-                "atproto_space": P256DIDKey(
+                "atproto": P256DIDKey(
                     publicKey: P256.Signing.PrivateKey().publicKey
                 ).value,
             ],
@@ -493,7 +455,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
                 )
                 let resolved = try await resolver.publicKey(
                     for: issuer,
-                    keyID: "#atproto_space"
+                    keyID: "#atproto"
                 )
                 XCTAssertNotNil(resolved)
             }
@@ -519,7 +481,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
             await XCTAssertThrowsErrorAsync(
                 try await restartedResolver.publicKey(
                     for: issuer,
-                    keyID: "#atproto_space"
+                    keyID: "#atproto"
                 )
             )
             let retainedCheckpoint =
@@ -543,10 +505,10 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
     func testResolverRejectsCheckpointConfirmationForDifferentTerminal() async throws {
         let verificationKey = P256.Signing.PrivateKey().publicKey
         let current = try snapshot(methods: [
-            "atproto_space": P256DIDKey(publicKey: verificationKey).value,
+            "atproto": P256DIDKey(publicKey: verificationKey).value,
         ])
         let unrelated = try snapshot(methods: [
-            "atproto_space": P256DIDKey(
+            "atproto": P256DIDKey(
                 publicKey: P256.Signing.PrivateKey().publicKey
             ).value,
         ])
@@ -565,7 +527,7 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         do {
             let key = try await resolver.publicKey(
                 for: issuer,
-                keyID: "#atproto_space"
+                keyID: "#atproto"
             )
             XCTFail(
                 "resolver returned \(String(describing: key)) before the exact terminal checkpoint was confirmed"

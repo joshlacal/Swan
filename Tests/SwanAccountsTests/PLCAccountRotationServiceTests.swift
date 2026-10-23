@@ -37,6 +37,7 @@ final class PLCAccountRotationServiceTests: XCTestCase {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         do {
+        do {
             _ = try await fixture.service.backfillKEM(did: fixture.did, expectedPDSOrigin: URL(string: "https://other.example")!, now: fixture.now)
             XCTFail("backfill accepted a different host")
         } catch { XCTAssertEqual(error as? PLCAccountRotationError, .conflict) }
@@ -44,6 +45,11 @@ final class PLCAccountRotationServiceTests: XCTestCase {
         XCTAssertNil(key)
         try await fixture.opener.close()
         try await fixture.control.close()
+        } catch {
+            try? await fixture.opener.close()
+            try? await fixture.control.close()
+            throw error
+        }
     }
 
     func testRotationPersistsPendingHistoryAndPromotesControlGeneration() async throws {

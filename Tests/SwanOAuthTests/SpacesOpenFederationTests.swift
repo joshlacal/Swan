@@ -5,9 +5,8 @@ import SwanCore
 import XCTest
 @testable import SwanOAuth
 
-/// `--enable-spaces-open-interop` decision B(c): DID-document key resolution
-/// for any did:plc / did:web issuer and `#atproto_space_host` / `#atproto_pds`
-/// notifyWrite routing, with present-but-malformed entries as errors.
+/// Current DID-document credential-key and PDS service resolution for
+/// did:plc / did:web issuers, with malformed entries rejected.
 final class SpacesOpenFederationTests: XCTestCase {
     private let authority = "did:web:authority.example"
     private let key = P256.Signing.PrivateKey()
@@ -42,10 +41,10 @@ final class SpacesOpenFederationTests: XCTestCase {
         let credential: PermissionedDataJWTVerificationKey? =
             try await resolver.publicKey(for: authority, keyID: "#atproto")
         XCTAssertEqual(credential?.deterministicIdentity, expected)
-        // `#atproto_space` falls back to `#atproto` only because it is absent.
+        // The retired dedicated signing-key identifier is never an alias.
         let dedicated: PermissionedDataJWTVerificationKey? =
             try await resolver.publicKey(for: authority, keyID: "#atproto_space")
-        XCTAssertEqual(dedicated?.deterministicIdentity, expected)
+        XCTAssertNil(dedicated)
         let service: PermissionedDataJWTVerificationKey? =
             try await resolver.publicKey(for: "\(authority)#atproto_pds")
         XCTAssertEqual(service?.deterministicIdentity, expected)
@@ -57,18 +56,25 @@ final class SpacesOpenFederationTests: XCTestCase {
         XCTAssertEqual(fetches, 1)
     }
 
-    func testMalformedDedicatedSpaceKeyIsAnErrorNotAFallback() async throws {
-        let malformed = ##"{"id":"#atproto_space","type":"Multikey","publicKeyMultibase":"zNotAKey"}"##
-        let (resolver, _) = resolver([authority: document(methods: "\(malformed),\(atprotoMethod)")])
-        do {
-            let _: PermissionedDataJWTVerificationKey? =
-                try await resolver.publicKey(for: authority, keyID: "#atproto_space")
-            XCTFail("a present-but-malformed #atproto_space must not fall back")
-        } catch {}
-        // Positive control: the same document's #atproto still resolves.
+    func testCredentialKeyNeverFallsBackToDedicatedSpaceKey() async throws {
+        let dedicated = ##"{"id":"#atproto_space","type":"Multikey","controller":"\##(authority)","publicKeyMultibase":"\##(multikey)"}"##
+        let (resolver, _) = resolver([authority: document(methods: dedicated)])
         let ordinary: PermissionedDataJWTVerificationKey? =
             try await resolver.publicKey(for: authority, keyID: "#atproto")
-        XCTAssertNotNil(ordinary)
+        XCTAssertNil(ordinary)
+        let retired: PermissionedDataJWTVerificationKey? =
+            try await resolver.publicKey(for: authority, keyID: "#atproto_space")
+        XCTAssertNil(retired)
+    }
+
+    func testMalformedAtprotoKeyFailsWithoutDedicatedFallback() async throws {
+        let malformed = ##"{"id":"#atproto","type":"Multikey","controller":"\##(authority)","publicKeyMultibase":"zNotAKey"}"##
+        let dedicated = ##"{"id":"#atproto_space","type":"Multikey","controller":"\##(authority)","publicKeyMultibase":"\##(multikey)"}"##
+        let (resolver, _) = resolver([authority: document(methods: "\(malformed),\(dedicated)")])
+        do {
+            let _: PermissionedDataJWTVerificationKey? = try await resolver.publicKey(for: authority, keyID: "#atproto")
+            XCTFail("malformed #atproto must not resolve through another key")
+        } catch {}
     }
 
     func testUnsupportedMethodsAndForeignDocumentsResolveNothing() async throws {
@@ -88,37 +94,29 @@ final class SpacesOpenFederationTests: XCTestCase {
         } catch {}
     }
 
-    func testNotifyDestinationPrefersTypedSpaceHostThenPDS() async throws {
-        let spaceHost = ##"{"id":"#atproto_space_host","type":"AtprotoSpaceHost","serviceEndpoint":"https://space.example"}"##
+    func testNotifyDestinationUsesPDSOnly() async throws {
+        let retired = ##"{"id":"#atproto_space_host","type":"AtprotoSpaceHost","serviceEndpoint":"https://retired.example"}"##
         let pds = ##"{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example"}"##
-        let (both, _) = resolver([authority: document(services: "\(pds),\(spaceHost)")])
-        let hosted = try await both.notifyDestination(forAuthority: authority)
-        XCTAssertEqual(hosted?.endpoint.absoluteString, "https://space.example")
-        XCTAssertEqual(hosted?.audience, "\(authority)#atproto_space_host")
-
-        let (pdsOnly, _) = resolver([authority: document(services: pds)])
-        let fallback = try await pdsOnly.notifyDestination(forAuthority: authority)
-        XCTAssertEqual(fallback?.endpoint.absoluteString, "https://pds.example")
-        // atproto#5574: the PDS endpoint is only a fallback for reaching the
-        // space host, so the audience still names the space-host role.
-        XCTAssertEqual(fallback?.audience, "\(authority)#atproto_space_host")
-
-        let (none, _) = resolver([authority: document()])
-        let missing = try await none.notifyDestination(forAuthority: authority)
+        let (both, _) = resolver([authority: document(services: "\(pds),\(retired)")])
+        let destination = try await both.notifyDestination(forAuthority: authority)
+        XCTAssertEqual(destination?.endpoint.absoluteString, "https://pds.example")
+        XCTAssertEqual(destination?.audience, "\(authority)#atproto_pds")
+        let (retiredOnly, _) = resolver([authority: document(services: retired)])
+        let missing = try await retiredOnly.notifyDestination(forAuthority: authority)
         XCTAssertNil(missing)
     }
 
-    func testMalformedSpaceHostEntryIsAnErrorNotAFallback() async throws {
-        let pds = ##"{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://pds.example"}"##
-        for badHost in [
-            ##"{"id":"#atproto_space_host","type":"AtprotoPersonalDataServer","serviceEndpoint":"https://space.example"}"##,
-            ##"{"id":"#atproto_space_host","type":"AtprotoSpaceHost","serviceEndpoint":"http://space.example"}"##,
-            ##"{"id":"#atproto_space_host","type":"AtprotoSpaceHost"}"##,
+    func testMalformedPDSIsAnErrorWithoutRetiredServiceFallback() async throws {
+        let retired = ##"{"id":"#atproto_space_host","type":"AtprotoSpaceHost","serviceEndpoint":"https://retired.example"}"##
+        for badPDS in [
+            ##"{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":"http://pds.example"}"##,
+            ##"{"id":"#atproto_pds","type":"AtprotoPersonalDataServer"}"##,
+            ##"{"id":"#atproto_pds","serviceEndpoint":"https://first.example"},{"id":"#atproto_pds","serviceEndpoint":"https://second.example"}"##,
         ] {
-            let (resolver, _) = resolver([authority: document(services: "\(pds),\(badHost)")])
+            let (resolver, _) = resolver([authority: document(services: "\(retired),\(badPDS)")])
             do {
                 _ = try await resolver.notifyDestination(forAuthority: authority)
-                XCTFail("malformed #atproto_space_host must not fall back: \(badHost)")
+                XCTFail("malformed or duplicate #atproto_pds must be rejected")
             } catch {}
         }
     }

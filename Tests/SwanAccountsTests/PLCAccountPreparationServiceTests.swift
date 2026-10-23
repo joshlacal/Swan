@@ -466,7 +466,7 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
         let activeAccount = try await fixture.control.account(did: recovered.did)
         XCTAssertNil(activeAccount)
         let migration = try await rotatingStore.migrateAllEnvelopesToActiveKey()
-        XCTAssertEqual(migration.migratedEnvelopeCount, 2)
+        XCTAssertEqual(migration.migratedEnvelopeCount, 3)
         XCTAssertTrue(migration.inventory.isMigrationComplete)
         try await fixture.close()
     }

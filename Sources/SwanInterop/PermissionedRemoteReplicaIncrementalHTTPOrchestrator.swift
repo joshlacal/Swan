@@ -76,22 +76,19 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
             pageRequest = request
             pageMAC = mac
         }
-        guard output.cursor == nil else {
-            throw PermissionedRemoteReplicaIncrementalVerificationError
-                .invalidOperation
-        }
         guard let terminalCommit = output.commit, let pageMAC else {
-            // The pinned handler omits the commit only when exactly `limit`
-            // operations were returned. Its continuation key is only `rev`,
-            // while every operation in one atomic applyWrites batch shares a
-            // revision. Advancing `since` can therefore skip the remainder of
-            // a revision split by the wire limit. Select full STAR instead of
-            // attempting a lossy revision-only continuation.
-            if output.ops.count == Self.maximumWirePageOperations {
+            // The current reference uses a rev/index cursor for a full page.
+            // This client deliberately falls back to complete STAR recovery
+            // rather than publishing any unauthenticated intermediate page.
+            if (Self.maximumWirePageOperations...SpaceWriteLimits.maximumOperations).contains(output.ops.count),
+               let cursor = output.cursor, let last = output.ops.last,
+               Self.validContinuation(cursor, lastRevision: last.rev.toString()) {
                 return .fullCARRecoveryRequired
             }
-            throw PermissionedRemoteReplicaIncrementalVerificationError
-                .invalidCommit
+            throw PermissionedRemoteReplicaIncrementalVerificationError.invalidCommit
+        }
+        guard output.cursor == nil else {
+            throw PermissionedRemoteReplicaIncrementalVerificationError.invalidOperation
         }
         let operations = output.ops
         // The pinned PDS omits values for mutations superseded by a later
@@ -106,52 +103,54 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
             return .fullCARRecoveryRequired
         }
 
-            let latest = try await getLatestCommit(
-                target: target
-            )
-            Self.stageLog("getLatestCommit verified")
+        let latest = try await getLatestCommit(
+            target: target
+        )
+        Self.stageLog("getLatestCommit verified")
 
-            if operations.isEmpty {
-                let page = try PermissionedRemoteReplicaIncrementalVerifier
-                    .verifyCommit(
-                        terminalCommit,
-                        target: target,
-                        sharedSecret: pageRequest.sharedSecret,
-                        mac: pageMAC
-                    )
-                try PermissionedRemoteReplicaIncrementalVerifier.requireSameHead(
-                    page, latest
-                )
-                guard page.wireRevision == base.head.wireRevision,
-                      page.commitment == base.head.commitment else {
-                    throw PermissionedRemoteReplicaIncrementalVerificationError
-                        .mixedHead
-                }
-                return .unchanged(base.head)
-            }
-
-            let verified = try PermissionedRemoteReplicaIncrementalVerifier
-                .verify(
-                    operations: operations,
-                    commit: terminalCommit,
-                    base: base,
+        if operations.isEmpty {
+            let page = try PermissionedRemoteReplicaIncrementalVerifier
+                .verifyCommit(
+                    terminalCommit,
                     target: target,
                     sharedSecret: pageRequest.sharedSecret,
                     mac: pageMAC
                 )
-            Self.stageLog("incremental interval verified (\(verified.operations.count) operations)")
             try PermissionedRemoteReplicaIncrementalVerifier.requireSameHead(
-                verified.freshnessWitness, latest
+                page, latest
             )
-            let digest = PermissionedRemoteReplicaIncrementalBatch
-                .canonicalDigest(
-                    target: target,
-                    expectedHead: base.head,
-                    terminalHead: verified.terminalHead,
-                    operations: verified.operations,
-                    requestSequence: requestSequence
-                )
-            let batch = try PermissionedRemoteReplicaIncrementalBatch(
+            guard page.wireRevision == base.head.wireRevision,
+                  page.commitment == base.head.commitment else {
+                throw PermissionedRemoteReplicaIncrementalVerificationError
+                    .mixedHead
+            }
+            return .unchanged(base.head)
+        }
+
+        let verified = try PermissionedRemoteReplicaIncrementalVerifier
+            .verify(
+                operations: operations,
+                commit: terminalCommit,
+                base: base,
+                target: target,
+                sharedSecret: pageRequest.sharedSecret,
+                mac: pageMAC
+            )
+        Self.stageLog("incremental interval verified (\(verified.operations.count) operations)")
+        try PermissionedRemoteReplicaIncrementalVerifier.requireSameHead(
+            verified.freshnessWitness, latest
+        )
+        let digest = PermissionedRemoteReplicaIncrementalBatch
+            .canonicalDigest(
+                target: target,
+                expectedHead: base.head,
+                terminalHead: verified.terminalHead,
+                operations: verified.operations,
+                requestSequence: requestSequence
+            )
+        let batch: PermissionedRemoteReplicaIncrementalBatch
+        do {
+            batch = try PermissionedRemoteReplicaIncrementalBatch(
                 target: target,
                 expectedHead: base.head,
                 terminalHead: verified.terminalHead,
@@ -160,15 +159,29 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                 requestSequence: requestSequence,
                 requestDigest: digest
             )
-            return map(try await publicationAuthorization {
-                Self.stageLog("durable apply starting")
-                let outcome = try await store.applyVerifiedPermissionedRemoteReplicaBatch(
-                    batch,
-                    appliedAt: appliedAt
-                )
-                Self.stageLog("durable apply completed")
-                return outcome
-            })
+        } catch PermissionedRemoteReplicaIncrementalInputError.invalidOperationBudget {
+            // The authenticated interval can fit the HTTP cap while exceeding
+            // the durable batch's aggregate value budget. Recover via bounded
+            // STAR staging without partially applying this interval.
+            return .fullCARRecoveryRequired
+        }
+        return map(try await publicationAuthorization {
+            Self.stageLog("durable apply starting")
+            let outcome = try await store.applyVerifiedPermissionedRemoteReplicaBatch(
+                batch,
+                appliedAt: appliedAt
+            )
+            Self.stageLog("durable apply completed")
+            return outcome
+        })
+    }
+
+    private static func validContinuation(_ cursor: String, lastRevision: String) -> Bool {
+        let pieces = cursor.split(separator: "/", omittingEmptySubsequences: false)
+        guard pieces.count == 2, pieces[0] == lastRevision,
+              let index = UInt64(pieces[1]), index <= 9_007_199_254_740_991,
+              String(index) == pieces[1] else { return false }
+        return true
     }
 
     private enum ListResult {

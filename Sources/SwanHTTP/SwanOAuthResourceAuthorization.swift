@@ -76,7 +76,7 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         runtime.dpopNonceService.issue(now: now)
     }
 
-    /// Reads the `atproto-space` presentation fields as complete field-line
+    /// Reads the `atproto-space-credential` presentation fields as complete field-line
     /// lists. The request URI, Host, and method are deliberately not inputs:
     /// a space signature binds only the credential and its audience.
     static func spaceCredentialPresentation(
@@ -94,24 +94,7 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
     static let signatureInputField = HTTPField.Name(SpaceHTTPSignature.signatureInputFieldName)!
     static let signatureField = HTTPField.Name(SpaceHTTPSignature.signatureFieldName)!
 
-    /// Verifies the delegation exchange's `atproto-space` signature, which
-    /// covers exactly `("authorization")` and must name the client's fresh
-    /// P-256 `did:key` as `keyid`. Returns that key ID for `cnf.kid`.
-    func verifySpaceDelegationSignature(request: Request) throws -> String {
-        do {
-            return try SpaceHTTPSignature.verify(
-                authorization: request.headers[values: .authorization],
-                audience: nil,
-                signatureInput: request.headers[values: Self.signatureInputField],
-                signature: request.headers[values: Self.signatureField],
-                credentialKeyID: nil
-            )
-        } catch {
-            throw SpaceCredentialPresentationFailure.badSignature
-        }
-    }
-
-    /// Verifies an `Atproto-Space` credential presentation for one operation.
+    /// Verifies an `Atproto-Space-Credential` credential presentation for one operation.
     /// `expectedAudience` is derived by the route from the operation, never
     /// from the request's Host or this server's identity: the repo owner's
     /// DID for repo reads, the space authority's bare DID for space-host

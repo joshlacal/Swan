@@ -11,7 +11,7 @@ Swan exposes four distinct HTTP surfaces across two network listeners:
 
 ## Public XRPC surface
 
-All XRPC endpoints are mounted under `/xrpc/`. Responses use JSON encoding with `Cache-Control: no-store` unless explicitly noted as binary CAR or blob streams.
+All XRPC endpoints are mounted under `/xrpc/`. Responses use JSON encoding with `Cache-Control: no-store` unless explicitly noted as binary CAR, STAR or blob streams.
 
 ### Server discovery and metadata
 
@@ -19,7 +19,7 @@ All XRPC endpoints are mounted under `/xrpc/`. Responses use JSON encoding with 
 - **Method**: `GET`
 - **Authentication**: None
 - **Parameters**: None
-- **Returns**: JSON object containing `did` (service DID, e.g. `did:web:example.com`), `availableUserDomains` (array of supported domain suffixes), `inviteCodeRequired` (boolean, always `false` in standard Swan builds), and `swanProfile` (active permissioned profile ID, e.g. `permissioned-data-0016-2026-10-01`).
+- **Returns**: JSON object containing `did` (service DID, e.g. `did:web:example.com`), `availableUserDomains` (array of supported domain suffixes), `inviteCodeRequired` (boolean, always `false` in standard Swan builds), and `swanProfile` (active permissioned profile ID, e.g. `permissioned-data-0016-2026-10-22`).
 
 #### `community.lexicon.service.describe`
 - **Method**: `GET`
@@ -291,7 +291,7 @@ When an inbound request under `/xrpc/**` matches no exact local route, Swan eval
 
 ## Permissioned spaces plane
 
-Swan implements the `permissioned-data-0016-2026-10-01` profile for access-controlled collaborative data spaces. All endpoints are mounted under `/xrpc/`. Space references are `at://` URIs, not bare DIDs. Policy and app-access values are tagged union objects with a lexicon `$type`, not strings.
+Swan implements the `permissioned-data-0016-2026-10-22` profile for access-controlled collaborative data spaces. All endpoints are mounted under `/xrpc/`. Space references are `at://` URIs, not bare DIDs. Policy and app-access values are tagged union objects with a lexicon `$type`, not strings.
 
 ### Space lifecycle and membership (`com.atproto.simplespace.*`)
 
@@ -361,25 +361,30 @@ Swan implements the `permissioned-data-0016-2026-10-01` profile for access-contr
 
 #### `com.atproto.space.getSpaceCredential`
 - **Method**: `POST`
-- **Authentication**: `Authorization: Bearer <delegation-token>` plus an RFC 9421 HTTP message signature labelled `atproto-space` that covers exactly `("authorization")` and names the client's fresh P-256 `did:key` as `keyid`:
-  ```
-  Signature-Input: atproto-space=("authorization");keyid="did:key:zDn..."
-  Signature: atproto-space=:<base64 64-byte r||s>:
-  ```
-  A missing or invalid signature returns 401 `BadSpaceSignature`. The delegation token is single-use.
-- **Request Body**: JSON object `{ "space": "<space-ref>", "clientAttestation": "<optional-attestation-jwt>" }`. An attestation is required when the space gates access on client identity.
-- **Returns**: JSON object `{ "credential": "<space-read-credential>" }`; the JWT binds the signing key's `did:key` as `cnf.kid` and has no `aud`. Swan's authority issues 300-second credentials (the protocol ceiling is 3600 s). Deleted spaces return `SpaceDeleted`.
+- **Authentication**: The JSON body supplies any required delegation and client attestation; exchange Authorization and HTTP signature headers are unnecessary. Omitting `delegationToken` selects anonymous public-read policy. A private Space remains hidden as 404 `SpaceNotFound` without an authorized delegation.
+- **Request Body**: JSON object `{ "space": "<space-ref>", "credentialKid": "<P-256 did:key>", "delegationToken": "<optional-delegation-jwt>", "clientAttestation": "<optional-attestation-jwt>" }`. `space` and `credentialKid` are required. User-gated policy requires delegation; app-gated policy requires attestation. A supplied delegation is single-use and must bind the exact Space, its issuer and the authority's `#atproto_pds` audience. Ordinary `#atproto` keys sign these JWTs.
+- **Returns**: JSON object `{ "credential": "<space-read-credential>" }`; the JWT binds `credentialKid` as `cnf.kid` and has no `aud`. Swan issues 300-second credentials (the protocol ceiling is 3600 s).
+- **Errors**: 400 `InvalidRequest` for an invalid binding key or body, 400 `InvalidDelegationToken`, 400 `InvalidClientAttestation`, 400 `SpaceDeleted` after authorized lookup, 404 `SpaceNotFound`, or a policy-specific authorization error.
 
-Use the credential with `Authorization: Atproto-Space <credential>`, an `Atproto-Space-Audience` header, and an `atproto-space` signature covering exactly `("authorization" "atproto-space-audience")`, signed by the `cnf.kid` key:
+Present the credential with `Authorization: Atproto-Space-Credential <credential>`, an `Atproto-Space-Audience` header, and a P-256 HTTP message signature from the `cnf.kid` key. Both the signature label and its required `tag` are `atproto-space-credential`; the signature covers exactly `("authorization" "atproto-space-audience")`:
 
 ```
-Authorization: Atproto-Space <credential>
+Authorization: Atproto-Space-Credential <credential>
 Atproto-Space-Audience: <audience DID>
-Signature-Input: atproto-space=("authorization" "atproto-space-audience")
-Signature: atproto-space=:<base64 64-byte r||s>:
+Signature-Input: atproto-space-credential=("authorization" "atproto-space-audience");tag="atproto-space-credential"
+Signature: atproto-space-credential=:<base64 64-byte r||s>:
 ```
 
-The audience is the repo owner's DID for repo reads (`getRecord`, `listRecords`, `listBlobs`, `getBlob`, `getRepo`, `getLatestCommit`, `listRepoOps`) and the space authority's bare DID for space-host operations (`listRepos`, `registerNotify`, `unregisterNotify`, `simplespace.getSpace`). The signature is not bound to a method, URL, or nonce, so it may be reused with the same credential and audience. `alg` is optional (`ecdsa-p256-sha256`); `keyid` is optional and must equal `cnf.kid`. Errors: 401 `BadSpaceSignature` (missing, duplicated, or invalid signature or audience field), 401 `BadSpaceAudience` (signed audience does not match the operation), 401 `CredentialRevoked` (the authority revoked this credential's `jti`; do not retry it, obtain a replacement through a still-authorized session). Credentials presented under `Bearer` or the retired `DPoP` scheme are rejected. Credentials remain read-only at repository hosts; writes use the account's OAuth grant.
+The audience is the repo owner's DID for repo reads (`getRecord`, `listRecords`, `listBlobs`, `getBlob`, `getRepo`, `getLatestCommit`, `listRepoOps`) and the authority's bare DID for space-host operations (`listRepos`, `registerNotify`, `unregisterNotify`, `simplespace.getSpace`). This signature binds the credential and audience, so it may be reused for that pair. `alg` is optional (`ecdsa-p256-sha256`); `keyid` is optional and must equal `cnf.kid`. Errors include 401 `BadSpaceSignature`, 401 `BadSpaceAudience`, and 401 `CredentialRevoked`. A revoked credential must be replaced through a still-authorized session. The retired `Atproto-Space` scheme and credential presentations under `Bearer` or `DPoP` are rejected. Credentials provide repository reads; writes require the owner's account OAuth grant.
+
+Credential-authenticated `getRecord`, `getLatestCommit`, `listRepoOps` and `getRepo` also require a fresh response-MAC exchange on every request, page and retry. Resolve the repository author's dedicated `#atproto_kem` P-256 key, encapsulate with a new ephemeral key, and send one Structured Field header:
+
+```
+Atproto-Space-Want-Mac: type="atproto-space-repo", ver=1, key_share="did:key:<ephemeral P-256 key>"
+Atproto-Space-Mac: type="atproto-space-repo", ver=1, mac=:<base64 32-byte MAC>:
+```
+
+The second line is the response header. Use `atproto-space-record` for `getRecord`; the other three endpoints use `atproto-space-repo`. Owner OAuth reads may opt in. Validate the response MAC against the requested repository/Space and returned commit, or the exact record URI and CID; also recompute the record CID from canonical bytes. A nonterminal `listRepoOps` page has no commit or response MAC. Missing, duplicated, malformed or wrong-type request headers return 400 `BadSpaceMac`. Responses vary on `Atproto-Space-Want-Mac` and expose `Atproto-Space-Mac` through CORS. A MAC failure permits one refreshed KEM lookup and retry with a new ephemeral key. JSON commits contain stable `{ver, repo, space, rev, data}` fields; per-reader IKM and embedded signatures are retired. OAuth DPoP nonce rules remain independent.
 
 ---
 
@@ -387,38 +392,38 @@ The audience is the repo owner's DID for repo reads (`getRecord`, `listRecords`,
 
 #### `com.atproto.space.getRecord`
 - **Method**: `GET`
-- **Authentication**: Space Credential.
-- **Parameters**: Query parameters `space` (required), `repo` (required), `collection` (required), `rkey` (required), `cid` (optional).
+- **Authentication**: Space Credential or owner Account OAuth, when that capability is enabled.
+- **Parameters**: Query parameters `space` (required), `repo` (required), `collection` (required), `rkey` (required).
 - **Returns**: JSON object `{ "uri": "at://...", "cid": "...", "value": { ... } }`.
 
 #### `com.atproto.space.listRecords`
 - **Method**: `GET`
-- **Authentication**: Space Credential.
-- **Parameters**: Query parameters `space` (required), `repo` (required), `collection` (required), `limit` (optional), `cursor` (optional), `reverse` (optional).
+- **Authentication**: Space Credential or owner Account OAuth, when that capability is enabled.
+- **Parameters**: Query parameters `space` (required), `repo` (required), `collection` (optional), `limit` (optional), `cursor` (optional), `reverse` (optional), and `excludeValues` (optional boolean).
 - **Returns**: JSON object `{ "records": [ ... ], "cursor": "..." }`.
 
 #### `com.atproto.space.createRecord`
 - **Method**: `POST`
-- **Authentication**: Space OAuth or Writer Credential.
-- **Request Body**: JSON object `{ "space": "did:...", "repo": "did:...", "collection": "nsid", "record": { ... } }`.
+- **Authentication**: Owner Account OAuth with the matching write grant.
+- **Request Body**: JSON object `{ "space": "<space-ref>", "repo": "did:...", "collection": "nsid", "record": { ... } }`.
 - **Returns**: JSON object `{ "uri": "at://...", "cid": "...", "commit": { ... } }`.
 
 #### `com.atproto.space.putRecord`
 - **Method**: `POST`
-- **Authentication**: Space OAuth or Writer Credential.
-- **Request Body**: JSON object `{ "space": "did:...", "repo": "did:...", "collection": "nsid", "rkey": "...", "record": { ... } }`.
+- **Authentication**: Owner Account OAuth with the matching write grant.
+- **Request Body**: JSON object `{ "space": "<space-ref>", "repo": "did:...", "collection": "nsid", "rkey": "...", "record": { ... } }`.
 - **Returns**: JSON object `{ "uri": "at://...", "cid": "...", "commit": { ... } }`.
 
 #### `com.atproto.space.deleteRecord`
 - **Method**: `POST`
-- **Authentication**: Space OAuth or Writer Credential.
-- **Request Body**: JSON object `{ "space": "did:...", "repo": "did:...", "collection": "nsid", "rkey": "..." }`.
+- **Authentication**: Owner Account OAuth with the matching write grant.
+- **Request Body**: JSON object `{ "space": "<space-ref>", "repo": "did:...", "collection": "nsid", "rkey": "..." }`.
 - **Returns**: JSON object `{ "commit": { ... } }`.
 
 #### `com.atproto.space.applyWrites`
 - **Method**: `POST`
-- **Authentication**: Space OAuth or Writer Credential.
-- **Request Body**: JSON object `{ "space": "did:...", "repo": "did:...", "writes": [ ... ] }`.
+- **Authentication**: Owner Account OAuth with the matching write grant.
+- **Request Body**: JSON object `{ "space": "<space-ref>", "repo": "did:...", "writes": [ ... ] }`.
 - **Returns**: JSON object `{ "commit": { ... }, "results": [ ... ] }`.
 
 ---
@@ -427,66 +432,67 @@ The audience is the repo owner's DID for repo reads (`getRecord`, `listRecords`,
 
 #### `com.atproto.space.getBlob`
 - **Method**: `GET`
-- **Authentication**: Space Credential.
-- **Parameters**: Query parameters `space` (required), `did` (required), `cid` (required).
+- **Authentication**: Space Credential or owner Account OAuth, when that capability is enabled.
+- **Parameters**: Query parameters `space` (required), `repo` (required), `cid` (required).
 - **Returns**: Private blob binary bytes.
 
 #### `com.atproto.space.listBlobs`
 - **Method**: `GET`
-- **Authentication**: Space Credential.
-- **Parameters**: Query parameters `space` (required), `did` (required), `cursor` (optional), `limit` (optional).
-- **Returns**: JSON object `{ "blobs": [ "<cid>" ], "cursor": "..." }`.
+- **Authentication**: Space Credential or owner Account OAuth, when that capability is enabled.
+- **Parameters**: Query parameters `space` (required), `repo` (required), `since` (optional TID), `cursor` (optional), and `limit` (1–1000; default 500).
+- **Returns**: JSON object `{ "cids": [ "<cid>" ], "cursor": "..." }`.
 
 #### `com.atproto.space.getLatestCommit`
 - **Method**: `GET` (also served under alias `com.atproto.space.getRepoState`)
-- **Authentication**: Space Credential.
-- **Parameters**: Query parameters `space` (required), `did` (required).
-- **Returns**: JSON object `{ "cid": "...", "rev": "...", "lthash": "..." }`.
+- **Authentication**: Space Credential or owner Account OAuth, when that capability is enabled.
+- **Parameters**: Query parameters `space` (required), `repo` (required).
+- **Returns**: JSON object `{ "commit": { "ver": 1, "repo": "<did>", "space": "<space-ref>", "rev": "<tid>", "data": { "$bytes": "<base64 LtHash commitment>" } } }`. The response MAC authenticates these exact commit fields.
 
 #### `com.atproto.space.listRepoOps`
 - **Method**: `GET`
-- **Authentication**: Space Credential.
-- **Parameters**: Query parameters `space` (required), `did` (required), `since` (optional rev string).
-- **Returns**: JSON object `{ "ops": [ ... ] }`.
+- **Authentication**: Space Credential or owner Account OAuth, when that capability is enabled.
+- **Parameters**: Query parameters `space` (required), `repo` (required), `since` (optional TID), `cursor` (optional `rev/index`, preferred over `since`), `limit` (1–1000; default 100), and `excludeValues` (boolean; default false).
+- **Returns**: JSON object `{ "ops": [ ... ], "commit": { ... }, "cursor": "<rev/index>" }`, with `commit` present only on a terminal page and `cursor` only on a nonterminal page. Operations contain `rev`, `collection`, `rkey`, nullable `cid`/`prev`, and an optional current `value`. An atomic revision can extend a page past its requested limit. Nonterminal pages require eventual authenticated completion before publication.
+- **Recovery**: A retained-history gap returns 409 `full_repo_recovery_required` in Swan; recover with a complete `getRepo` snapshot. The oplog is a transport optimization, not retained history.
 
 #### `com.atproto.space.getRepo`
 - **Method**: `GET`
-- **Authentication**: Space Credential.
-- **Parameters**: Query parameters `space` (required), `did` (required), `since` (optional).
-- **Returns**: CAR v1 binary stream of private space repository.
+- **Authentication**: Space Credential or owner Account OAuth, when that capability is enabled.
+- **Parameters**: Query parameters `space` (required) and `repo` (required). `since` and `excludeValues` are rejected.
+- **Returns**: Complete STAR archive as `application/octet-stream`. The metadata contains the native commit; its response MAC, canonical framing, strictly bytewise-ordered unique record paths, canonical record bytes and complete LtHash commitment must all verify before replacing visible state. The standard receiver bounds are 256 MiB per archive, 100,000 records, 64 KiB metadata and 1 MiB per record. Public `com.atproto.sync.getRepo` continues to use CAR.
 
 #### `com.atproto.space.listRepos`
 - **Method**: `GET`
 - **Authentication**: Space Credential, signed for the authority's bare DID.
 - **Parameters**: Query parameters `space` (required), `limit` (integer, 1–1000; default 100), `cursor` (optional). The cursor is an exclusive space-revision checkpoint: pass a previous response's `cursor` or a `spaceRev` you have already processed, unchanged. It is a plain string and is not TID-validated. A cursor beginning with `did:` (the form this endpoint returned before October 1, 2026) cannot name a space revision and lists from the start.
-- **Returns**: JSON object `{ "repos": [ { "did": "...", "repoRev": "<tid>", "hash": { "$bytes": "..." }, "spaceRev": "<tid>" } ], "cursor": "<tid>" }`. Entries are each writer's latest state in ascending `spaceRev` order, so a repo updated while you paginate can appear again; process entries idempotently. A nonempty page always returns its last `spaceRev` as `cursor`, even when the page is short. Continue until an empty page, which omits `cursor`; keep your previous checkpoint in that case.
+- **Returns**: JSON object `{ "repos": [ { "did": "...", "repoRev": "<tid>", "data": { "$bytes": "..." }, "spaceRev": "<tid>" } ], "cursor": "<tid>" }`. Entries are each writer's latest state in ascending `spaceRev` order, so a repo updated while you paginate can appear again; process entries idempotently. A nonempty page always returns its last `spaceRev` as `cursor`, even when the page is short. Continue until an empty page, which omits `cursor`; keep your previous checkpoint in that case.
 - **Errors**: 404 `SpaceNotFound`.
 
 #### `com.atproto.space.registerNotify`
 - **Method**: `POST`
-- **Authentication**: Space Credential.
-- **Request Body**: JSON object `{ "space": "did:...", "endpoint": "https://..." }`.
-- **Returns**: 200 OK empty response.
+- **Authentication**: Space Credential signed for the authority, plus `Atproto-Service-Auth` proving the subscriber identity in the default hardened posture. Open interop permits the credential-only upstream form.
+- **Request Body**: JSON object `{ "space": "<space-ref>", "service": "<subscriber DID with optional service fragment>" }`. The destination is resolved from the subscriber identity.
+- **Returns**: JSON object `{ "expiresAt": "<datetime>" }`. Renew before this expiry.
 
 #### `com.atproto.space.unregisterNotify`
 - **Method**: `POST`
-- **Authentication**: Space Credential.
-- **Request Body**: JSON object `{ "space": "did:...", "endpoint": "https://..." }`.
-- **Returns**: 200 OK empty response.
+- **Authentication**: Space Credential signed for the authority, plus `Atproto-Service-Auth` proving the subscriber identity in the default hardened posture. Open interop permits the credential-only upstream form.
+- **Request Body**: JSON object `{ "space": "<space-ref>", "service": "<registered service identifier>" }`.
+- **Returns**: 200 OK empty response; withdrawing an absent registration is idempotent.
 
 #### `com.atproto.space.notifyWrite`
 - **Method**: `POST`
-- **Authentication**: Service auth (`Authorization: Bearer <service-jwt>`) from the writer: `iss` = `repo`, `lxm` = `com.atproto.space.notifyWrite`, `aud` = `<authority>#atproto_space_host` or the bare authority DID. By default the JWT must also carry a `req` claim binding the body; under `--enable-spaces-open-interop` an unbound upstream token is accepted once (at most 60 s lifetime, single-use `jti`).
-- **Request Body**: JSON object `{ "space": "<space-ref>", "repo": "<did>", "repoRev": "<tid>", "hash": { "$bytes": "<sha256 of the LtHash state>" } }`. Only the space host assigns space revisions, so a repo host never sends `spaceRev`.
-- **Behavior**: The writer must be allowed by the space's write policy. A `repoRev` equal to or older than the one already recorded for that repo is ignored (an equal one with a different `hash` is refused as equivocation). An accepted update records the writer's state and allocates the next `spaceRev` (a TID, strictly increasing across all writers in the space) in one transaction, and queues a forward to each registered service: `{ space, repo, repoRev, hash, spaceRev, prevSpaceRev }`, signed by the authority for the registered service identifier, with `prevSpaceRev` omitted on the space's first update. Forwards are retried with backoff; subscribers that see a `prevSpaceRev` gap recover with `listRepos`.
+- **Authentication**: Service auth (`Authorization: Bearer <service-jwt>`) from the writer: `iss` = `repo`, `lxm` = `com.atproto.space.notifyWrite`, `aud` = `<authority>#atproto_pds` or the bare authority DID. By default the JWT must also carry a `req` claim binding the body; under `--enable-spaces-open-interop` an unbound upstream token is accepted once (at most 60 s lifetime, single-use `jti`).
+- **Request Body**: JSON object `{ "space": "<space-ref>", "repo": "<did>", "repoRev": "<tid>", "data": { "$bytes": "<sha256 of the LtHash state>" } }`. Only the space host assigns space revisions, so a repo host never sends `spaceRev`.
+- **Behavior**: The writer must be allowed by the space's write policy. A `repoRev` equal to or older than the one already recorded for that repo is ignored (an equal one with a different `data` is refused as equivocation). An accepted update records the writer's state and allocates the next `spaceRev` (a TID, strictly increasing across all writers in the space) in one transaction, and queues a forward to each registered service: `{ space, repo, repoRev, data, spaceRev, prevSpaceRev }`, signed by the authority for the registered service identifier, with `prevSpaceRev` omitted on the space's first update. Forwards are retried with backoff; subscribers that see a `prevSpaceRev` gap recover with `listRepos`.
 - **Returns**: 200 OK empty response.
 - **Errors**: 400 `FutureRev` (`repoRev` more than 5 minutes ahead of the server clock), 404 `SpaceNotFound` (unknown or deleted space, or an authority this server does not host), 401 (authentication, writer not permitted, or equivocation).
-- **Sending**: After each local write to a space, Swan's outbox notifies the space's authority automatically, without registration, and retries until the receiver accepts or permanently refuses (4xx). The body carries the repo's latest state. With `--enable-spaces-open-interop`, the destination is the authority's `#atproto_space_host` endpoint, falling back to its `#atproto_pds` endpoint, and the audience is `<authority>#atproto_space_host` in both cases.
+- **Sending**: After each local write to a space, Swan's outbox notifies the space's authority automatically, without registration, and retries until the receiver accepts or permanently refuses (4xx other than retryable 408 and 429). The body carries the repo's latest state. With `--enable-spaces-open-interop`, the destination is the authority's exact `#atproto_pds` HTTPS endpoint and the audience is `<authority>#atproto_pds`. The retired space-host fragment is not a fallback.
 
 #### `com.atproto.space.notifySpaceDeleted`
 - **Method**: `POST`
-- **Authentication**: Outbox authorization / space owner proof.
-- **Request Body**: JSON object `{ "space": "did:..." }`.
+- **Authentication**: Authority-signed service JWT with `iss` equal to the Space authority, `aud` naming a configured recipient service/account, and `lxm` equal to this method. A matching body-digest claim is required by default; open interop permits short-lived unbound tokens with durable single-use event identity.
+- **Request Body**: JSON object `{ "space": "<space-ref>" }`.
 - **Returns**: 200 OK empty response.
 
 #### `com.atproto.space.notifyCredentialRevoked`

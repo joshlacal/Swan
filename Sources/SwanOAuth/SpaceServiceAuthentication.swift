@@ -413,7 +413,9 @@ private func validServiceAudience(_ value: String) -> Bool {
 }
 
 private func validServiceMethod(_ value: String) -> Bool {
-    value.hasPrefix("com.atproto.") && value.utf8.count <= 317 && value.utf8.allSatisfy {
+    (value.hasPrefix("com.atproto.") || value == "blue.catbird.labyrinth.getSpaceMembership"
+        || value == "blue.catbird.labyrinth.deleteSpaceGeneration")
+        && value.utf8.count <= 317 && value.utf8.allSatisfy {
         ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "z"))
             || ($0 >= UInt8(ascii: "A") && $0 <= UInt8(ascii: "Z"))
             || ($0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9"))

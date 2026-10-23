@@ -6,12 +6,11 @@ import SwanSpaces
 import XCTest
 @testable import SwanOAuth
 
-/// atproto#5569 HTTP Message Signatures. The cases mirror the reference's
-/// `packages/space/src/http-signature.test.ts` at 679724ad, plus signatures
+/// October 22 credential presentation signatures, with signatures
 /// produced independently by Node.js `crypto.sign(..., { dsaEncoding:
 /// 'ieee-p1363' })` so Swan is not only checked against itself.
 final class SpaceHTTPMessageSignatureTests: XCTestCase {
-    private static let authorization = "Atproto-Space credential"
+    private static let authorization = "Atproto-Space-Credential credential"
     private static let audience = "did:example:repo"
 
     private var key: P256.Signing.PrivateKey {
@@ -40,11 +39,11 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
         let fields = try signed()
         XCTAssertEqual(
             fields.signatureInput,
-            ["atproto-space=(\"authorization\" \"atproto-space-audience\")"]
+            ["atproto-space-credential=(\"authorization\" \"atproto-space-audience\");tag=\"atproto-space-credential\""]
         )
         let base = "\"authorization\": \(Self.authorization)\n"
             + "\"atproto-space-audience\": \(Self.audience)\n"
-            + "\"@signature-params\": (\"authorization\" \"atproto-space-audience\")"
+            + "\"@signature-params\": (\"authorization\" \"atproto-space-audience\");tag=\"atproto-space-credential\""
         let raw = try XCTUnwrap(fields.signatureBytes)
         XCTAssertEqual(raw.count, 64)
         XCTAssertTrue(try key.publicKey.isValidSignature(
@@ -54,24 +53,25 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
         XCTAssertEqual(try fields.verify(keyID: keyID), keyID)
     }
 
-    func testDelegationSignatureNamesItsKeyAndHasNoAudience() throws {
-        let fields = try signed(authorization: "Bearer delegation", audience: nil)
-        XCTAssertEqual(fields.signatureInput, ["atproto-space=(\"authorization\");keyid=\"\(keyID)\""])
-        XCTAssertNil(fields.audience)
-        XCTAssertEqual(try fields.verify(keyID: nil), keyID)
-        XCTAssertThrowsError(try fields.verify(keyID: keyID)) {
-            XCTAssertEqual($0 as? SpaceHTTPSignatureError, .duplicateOrMissingField)
+    func testSigningRejectsMissingAudienceAndLegacyAuthorization() throws {
+        XCTAssertThrowsError(try signed(audience: nil)) {
+            XCTAssertEqual($0 as? SpaceHTTPSignatureError, .wrongCoveredComponents)
+        }
+        for authorization in ["Bearer delegation", "Atproto-Space legacy"] {
+            XCTAssertThrowsError(try signed(authorization: authorization)) {
+                XCTAssertEqual($0 as? SpaceHTTPSignatureError, .wrongCoveredComponents)
+            }
         }
     }
 
     func testIndependentNodeSignaturesVerifyIncludingHighS() throws {
-        let input = "(\"authorization\" \"atproto-space-audience\");alg=\"ecdsa-p256-sha256\";keyid=\"\(keyID)\""
+        let input = "(\"authorization\" \"atproto-space-audience\");tag=\"atproto-space-credential\";alg=\"ecdsa-p256-sha256\";keyid=\"\(keyID)\""
         for signature in [NodeGoldens.credentialLowS, NodeGoldens.credentialHighS] {
             let fields = Fields(
                 authorization: [Self.authorization],
                 audience: [Self.audience],
-                signatureInput: ["atproto-space=\(input)"],
-                signature: ["atproto-space=:\(signature):"]
+                signatureInput: ["atproto-space-credential=\(input)"],
+                signature: ["atproto-space-credential=:\(signature):"]
             )
             XCTAssertEqual(try fields.verify(keyID: keyID), keyID)
         }
@@ -85,10 +85,12 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
         let delegation = Fields(
             authorization: ["Bearer delegation"],
             audience: nil,
-            signatureInput: ["atproto-space=(\"authorization\");keyid=\"\(keyID)\""],
-            signature: ["atproto-space=:\(NodeGoldens.delegation):"]
+            signatureInput: ["atproto-space-credential=(\"authorization\");keyid=\"\(keyID)\""],
+            signature: ["atproto-space-credential=:\(NodeGoldens.delegation):"]
         )
-        XCTAssertEqual(try delegation.verify(keyID: nil), keyID)
+        XCTAssertThrowsError(try delegation.verify(keyID: nil)) {
+            XCTAssertEqual($0 as? SpaceHTTPSignatureError, .duplicateOrMissingField)
+        }
     }
 
     func testSwanAcceptsHighSFromItsOwnSigner() throws {
@@ -97,25 +99,23 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
         XCTAssertTrue(P256WireSignature.isCanonicalLowS(raw))
         let high = raw.prefix(32) + NodeGoldens.negate(Data(raw.suffix(32)))
         XCTAssertFalse(P256WireSignature.isCanonicalLowS(high))
-        fields.signature = ["atproto-space=:\(high.base64EncodedString()):"]
+        fields.signature = ["atproto-space-credential=:\(high.base64EncodedString()):"]
         XCTAssertEqual(try fields.verify(keyID: keyID), keyID)
     }
 
-    func testDelegationAcceptsOptionalAlg() throws {
-        let input = "(\"authorization\");keyid=\"\(keyID)\";alg=\"ecdsa-p256-sha256\""
-        let base = "\"authorization\": Bearer delegation\n\"@signature-params\": \(input)"
-        let signature = try P256WireSignature.sign(Data(base.utf8), using: try key)
-        let fields = Fields(
-            authorization: ["Bearer delegation"],
-            audience: nil,
-            signatureInput: ["atproto-space=\(input)"],
-            signature: ["atproto-space=:\(signature.base64EncodedString()):"]
-        )
-        XCTAssertEqual(try fields.verify(keyID: nil), keyID)
+    func testTagMustBePresentAndExactlyMatchCredentialProfile() throws {
+        let original = try signed()
+        for tag in ["", ";tag=\"atproto-space\"", ";tag=atproto-space-credential", ";tag=1"] {
+            var fields = original
+            fields.signatureInput = ["atproto-space-credential=(\"authorization\" \"atproto-space-audience\")\(tag)"]
+            XCTAssertThrowsError(try fields.verify(keyID: keyID)) {
+                XCTAssertEqual($0 as? SpaceHTTPSignatureError, .malformedSignature)
+            }
+        }
     }
 
     func testOptionalCredentialParametersAndOtherLabelsAreAccepted() throws {
-        let input = "(\"authorization\" \"atproto-space-audience\");alg=\"ecdsa-p256-sha256\";keyid=\"\(keyID)\""
+        let input = "(\"authorization\" \"atproto-space-audience\");tag=\"atproto-space-credential\";alg=\"ecdsa-p256-sha256\";keyid=\"\(keyID)\""
         let base = "\"authorization\": \(Self.authorization)\n"
             + "\"atproto-space-audience\": \(Self.audience)\n"
             + "\"@signature-params\": \(input)"
@@ -123,8 +123,8 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
         let combined = Fields(
             authorization: [Self.authorization],
             audience: [Self.audience],
-            signatureInput: ["other=(\"authorization\");keyid=\"other\", atproto-space=\(input)"],
-            signature: ["other=:YWJj:, atproto-space=:\(signature.base64EncodedString()):"]
+            signatureInput: ["other=(\"authorization\");keyid=\"other\", atproto-space-credential=\(input)"],
+            signature: ["other=:YWJj:, atproto-space-credential=:\(signature.base64EncodedString()):"]
         )
         XCTAssertEqual(try combined.verify(keyID: keyID), keyID)
         // The same members split across repeated field lines combine per
@@ -132,8 +132,8 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
         let split = Fields(
             authorization: [Self.authorization],
             audience: [Self.audience],
-            signatureInput: ["other=(\"authorization\");keyid=\"other\"", "atproto-space=\(input)"],
-            signature: ["other=:YWJj:", "atproto-space=:\(signature.base64EncodedString()):"]
+            signatureInput: ["other=(\"authorization\");keyid=\"other\"", "atproto-space-credential=\(input)"],
+            signature: ["other=:YWJj:", "atproto-space-credential=:\(signature.base64EncodedString()):"]
         )
         XCTAssertEqual(try split.verify(keyID: keyID), keyID)
     }
@@ -181,8 +181,8 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
     }
 
     func testAudienceMustBeCovered() throws {
-        var fields = try signed(audience: nil)
-        fields.audience = [Self.audience]
+        var fields = try signed()
+        fields.signatureInput = ["atproto-space-credential=(\"authorization\");tag=\"atproto-space-credential\""]
         XCTAssertThrowsError(try fields.verify(keyID: keyID)) {
             XCTAssertEqual($0 as? SpaceHTTPSignatureError, .wrongCoveredComponents)
         }
@@ -209,41 +209,40 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
         }
     }
 
-    func testMissingOrInvalidDelegationKeyIDIsRejected() throws {
-        for parameters in ["", ";keyid", ";keyid=123", ";keyid=\"not-a-key\""] {
-            var fields = try signed(authorization: "Bearer delegation", audience: nil)
-            fields.signatureInput = ["atproto-space=(\"authorization\")\(parameters)"]
-            XCTAssertThrowsError(try fields.verify(keyID: nil), parameters) {
-                XCTAssertEqual($0 as? SpaceHTTPSignatureError, .invalidKey, parameters)
-            }
+    func testCredentialConfirmationKeyIsRequired() throws {
+        let fields = try signed()
+        XCTAssertThrowsError(try fields.verify(keyID: nil)) {
+            XCTAssertEqual($0 as? SpaceHTTPSignatureError, .duplicateOrMissingField)
         }
     }
 
     func testCoveredComponentsMustBeExactlyTheProfiledList() throws {
         for components in [
-            "(\"atproto-space-audience\")",
+            "(\"atproto-space-audience\");tag=\"atproto-space-credential\"",
             "(\"atproto-space-audience\" \"authorization\")",
             "(\"authorization\" \"atproto-space-audience\" \"content-type\")",
-            "(\"authorization\" \"authorization\" \"atproto-space-audience\")",
-            "(\"authorization\";sf \"atproto-space-audience\")",
-            "(authorization \"atproto-space-audience\")",
+            "(\"authorization\" \"authorization\" \"atproto-space-audience\");tag=\"atproto-space-credential\"",
+            "(\"authorization\";sf \"atproto-space-audience\");tag=\"atproto-space-credential\"",
+            "(authorization \"atproto-space-audience\");tag=\"atproto-space-credential\"",
         ] {
             var fields = try signed()
-            fields.signatureInput = ["atproto-space=\(components)"]
+            fields.signatureInput = ["atproto-space-credential=\(components)"]
             XCTAssertThrowsError(try fields.verify(keyID: keyID), components) {
                 XCTAssertEqual($0 as? SpaceHTTPSignatureError, .wrongCoveredComponents, components)
             }
         }
         var malformed = try signed()
-        malformed.signatureInput = ["atproto-space=not-a-list"]
+        malformed.signatureInput = ["atproto-space-credential=not-a-list"]
         XCTAssertThrowsError(try malformed.verify(keyID: keyID)) {
             XCTAssertEqual($0 as? SpaceHTTPSignatureError, .malformedSignature)
         }
     }
 
-    func testCredentialSignaturesAreRejectedOnTheDelegationExchange() throws {
-        XCTAssertThrowsError(try signed().verify(keyID: nil)) {
-            XCTAssertEqual($0 as? SpaceHTTPSignatureError, .wrongCoveredComponents)
+    func testLegacyAuthorizationIsRejectedByVerifier() throws {
+        var fields = try signed()
+        fields.authorization = ["Atproto-Space credential"]
+        XCTAssertThrowsError(try fields.verify(keyID: keyID)) {
+            XCTAssertEqual($0 as? SpaceHTTPSignatureError, .duplicateOrMissingField)
         }
     }
 
@@ -256,29 +255,18 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
     }
 
     func testOtherAlgorithmsAreRejected() throws {
-        for audience in [nil, Self.audience] {
-            var fields = try signed(audience: audience)
-            fields.signatureInput = [fields.signatureInput[0] + ";alg=\"ecdsa-p384-sha384\""]
-            XCTAssertThrowsError(try fields.verify(keyID: audience == nil ? nil : keyID)) {
+        for algorithm in ["\"ecdsa-p384-sha384\"", "ecdsa-p256-sha256"] {
+            var fields = try signed()
+            fields.signatureInput = [fields.signatureInput[0] + ";alg=\(algorithm)"]
+            XCTAssertThrowsError(try fields.verify(keyID: keyID)) {
                 XCTAssertEqual($0 as? SpaceHTTPSignatureError, .unsupportedAlgorithm)
             }
-        }
-        var token = try signed()
-        token.signatureInput = [token.signatureInput[0] + ";alg=ecdsa-p256-sha256"]
-        XCTAssertThrowsError(try token.verify(keyID: keyID)) {
-            XCTAssertEqual($0 as? SpaceHTTPSignatureError, .unsupportedAlgorithm)
         }
     }
 
     func testOtherKeyTypesAreRejected() throws {
-        // secp256k1 did:key for scalar 2 (the ES256K credential goldens' key).
         let secp256k1 = "did:key:zQ3shajmTb29MxR6htjD79Hdo6vneJLvyKCzZSRcawNWks9JC"
         XCTAssertThrowsError(try signed().verify(keyID: secp256k1)) {
-            XCTAssertEqual($0 as? SpaceHTTPSignatureError, .invalidKey)
-        }
-        var fields = try signed(authorization: "Bearer delegation", audience: nil)
-        fields.signatureInput = ["atproto-space=(\"authorization\");keyid=\"\(secp256k1)\""]
-        XCTAssertThrowsError(try fields.verify(keyID: nil)) {
             XCTAssertEqual($0 as? SpaceHTTPSignatureError, .invalidKey)
         }
     }
@@ -286,7 +274,7 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
     func testInvalidSignatureEncodingsAreRejected() throws {
         for signature in ["not-a-byte-sequence", ":YWJj:", ":!!!:", ":YWJj:;p=1"] {
             var fields = try signed()
-            fields.signature = ["atproto-space=\(signature)"]
+            fields.signature = ["atproto-space-credential=\(signature)"]
             XCTAssertThrowsError(try fields.verify(keyID: keyID), signature)
         }
     }
@@ -300,10 +288,10 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
             for: SpaceHTTPSignature.signatureBase(
                 authorization: Self.authorization,
                 audience: Self.audience,
-                signatureParams: "(\"authorization\" \"atproto-space-audience\")"
+                signatureParams: "(\"authorization\" \"atproto-space-audience\");tag=\"atproto-space-credential\""
             )
         ), "positive control: the DER form is the same valid signature")
-        fields.signature = ["atproto-space=:\(der.base64EncodedString()):"]
+        fields.signature = ["atproto-space-credential=:\(der.base64EncodedString()):"]
         XCTAssertThrowsError(try fields.verify(keyID: keyID)) {
             XCTAssertEqual($0 as? SpaceHTTPSignatureError, .invalidSignature)
         }
@@ -319,7 +307,7 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
     func testStructuredFieldCanonicalizationFeedsTheSignatureBase() throws {
         // Extra inner-list whitespace and a non-canonical decimal parse to the
         // same RFC 8941 value; the base uses the canonical serialization.
-        let canonical = "(\"authorization\" \"atproto-space-audience\");created=1;tag=1.5"
+        let canonical = "(\"authorization\" \"atproto-space-audience\");tag=\"atproto-space-credential\";created=1;custom=1.5"
         let base = "\"authorization\": \(Self.authorization)\n"
             + "\"atproto-space-audience\": \(Self.audience)\n"
             + "\"@signature-params\": \(canonical)"
@@ -327,8 +315,8 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
         let fields = Fields(
             authorization: [Self.authorization],
             audience: [Self.audience],
-            signatureInput: ["atproto-space=(  \"authorization\"   \"atproto-space-audience\" );created=001;tag=1.500"],
-            signature: ["atproto-space=:\(signature.base64EncodedString()):"]
+            signatureInput: ["atproto-space-credential=(  \"authorization\"   \"atproto-space-audience\" );tag=\"atproto-space-credential\";created=001;custom=1.500"],
+            signature: ["atproto-space-credential=:\(signature.base64EncodedString()):"]
         )
         XCTAssertEqual(try fields.verify(keyID: keyID), keyID)
     }
@@ -354,7 +342,7 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
                 try .init(authority: space.authority, generation: 1, publicKey: authorityKey.publicKey),
             ])
         )
-        let authorization = "Atproto-Space \(token)"
+        let authorization = "Atproto-Space-Credential \(token)"
         let good = try signed(authorization: authorization, audience: "did:plc:repoowner")
         let verified = try await verifier.verifiedPresentation(
             token, expectedSpace: space, presentation: good.presentation, now: now
@@ -381,7 +369,7 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
             )
         }
         // A signed Authorization value that is not this credential.
-        let otherToken = try signed(authorization: "Atproto-Space other", audience: "did:plc:repoowner")
+        let otherToken = try signed(authorization: "Atproto-Space-Credential other", audience: "did:plc:repoowner")
         await assertPresentationFailure(.badSignature) {
             try await verifier.verifiedPresentation(
                 token, expectedSpace: space, presentation: otherToken.presentation, now: now
@@ -433,8 +421,8 @@ private struct Fields {
 
     var signatureBytes: Data? {
         guard let value = signature.first,
-              value.hasPrefix("atproto-space=:"), value.hasSuffix(":") else { return nil }
-        return Data(base64Encoded: String(value.dropFirst("atproto-space=:".count).dropLast()))
+              value.hasPrefix("atproto-space-credential=:"), value.hasSuffix(":") else { return nil }
+        return Data(base64Encoded: String(value.dropFirst("atproto-space-credential=:".count).dropLast()))
     }
 
     var presentation: SpaceCredentialHTTPPresentation {
@@ -458,15 +446,15 @@ private struct Fields {
 }
 
 /// Signatures over ``SpaceHTTPMessageSignatureTests`` bases produced by
-/// Node.js v22 `crypto.sign('sha256', base, { key, dsaEncoding:
+/// Node.js v22.23.1 `crypto.sign('sha256', base, { key, dsaEncoding:
 /// 'ieee-p1363' })` with the P-256 scalar `0x3c` repeated, and confirmed with
 /// `crypto.verify` (which, like the reference, accepts both S forms).
 private enum NodeGoldens {
-    /// Credential use with `;alg="ecdsa-p256-sha256";keyid="<holder>"`.
+    /// Credential use with required tag and `;alg="ecdsa-p256-sha256";keyid="<holder>"`.
     static let credentialLowS =
-        "4jA67cZT0OUNrEC1yBckd6VwFDDk55koukqW2/gjg0ZDRA6gJ9XMALoAedFLueBJG56XAstR+EAYMJQv5qBWkQ=="
+        "4NTn7fhXH3YbrazQPIQLOn1GEYGwg/cYCCVjskTPsiYjKCly72lFtHWK1TboGfDKgk7vWLHr5KP7pjWXxaDgeQ=="
     static let credentialHighS =
-        "4jA67cZT0OUNrEC1yBckd6VwFDDk55koukqW2/gjg0a8u/Fe2Co0AEX/hi60Rh+2oUhjqtvFpkTbiTaTFcLOwA=="
+        "4NTn7fhXH3YbrazQPIQLOn1GEYGwg/cYCCVjskTPsibc19aMEJa6TIp1KskX5g81OpgLVPUrueD4E5UrNsJE2A=="
     /// Delegation exchange, minimal `("authorization");keyid="<holder>"`.
     static let delegation =
         "Mi+Dvgl44u9gYcZ+a2P5ppu5nHKyuvOzcu9e6ShvyDRAQTouF8Np0fAmB4+35oshNlkS1V3X7UNDOl94cWO/NA=="

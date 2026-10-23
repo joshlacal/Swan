@@ -39,7 +39,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         case jsonEmptyObject
         case emptyBody
         case blob(Data)
-        case car
+        case star
     }
 
     private struct SemanticCase: Sendable {
@@ -91,7 +91,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-10-01.json"
+                        path: "Profiles/permissioned-data-0016-2026-10-22.json"
                     )
                 ),
                 configuration: .init(
@@ -169,7 +169,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(
-                    path: "Profiles/permissioned-data-0016-2026-10-01.json"
+                    path: "Profiles/permissioned-data-0016-2026-10-22.json"
                 )
             )
             let server = composition.makeServer(
@@ -197,6 +197,20 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 confirmationKeyID: SpaceCredentialSignatureTestSupport.keyID
             )
             let credentialJTI = try PermissionedDataJWT.inspectSpaceCredential(credential).claims.jti
+            let exchangeDelegation = try PermissionedDataJWT.createDelegationToken(
+                issuer: localDID,
+                audience: "\(space.authority)#atproto_pds",
+                space: space,
+                key: fixture.localKey
+            )
+            let credentialExchangeBody = String(
+                decoding: try JSONSerialization.data(withJSONObject: [
+                    "space": space.rawValue,
+                    "credentialKid": try SpaceCredentialSignatureTestSupport.keyID,
+                    "delegationToken": exchangeDelegation,
+                ], options: [.sortedKeys]),
+                as: UTF8.self
+            )
             let cases: [SemanticCase] = [
                 .init(nsid: "com.atproto.simplespace.createSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.createSpace", body: "{\"did\":\"\(localDID)\",\"spaceType\":\"app.bsky.bookmarks\",\"skey\":\"\(lifecycle.skey)\",\"readPolicy\":{\"$type\":\"com.atproto.simplespace.defs#publicPolicy\"},\"writePolicy\":{\"$type\":\"com.atproto.simplespace.defs#publicPolicy\"},\"appAccess\":{\"$type\":\"com.atproto.simplespace.defs#open\"}}", authorization: .oauth, invariant: .jsonString("uri", lifecycle.rawValue)),
                 .init(nsid: "com.atproto.simplespace.updateSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.updateSpace", body: "{\"space\":\"\(lifecycle.rawValue)\",\"readPolicy\":{\"$type\":\"com.atproto.simplespace.defs#publicPolicy\"}}", authorization: .oauth, invariant: .emptyBody),
@@ -205,7 +219,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.simplespace.getSpace", method: .get, uri: "/xrpc/com.atproto.simplespace.getSpace?space=\(encodedSpace)", body: nil, authorization: .oauth, invariant: .jsonString("uri", space.rawValue)),
                 .init(nsid: "com.atproto.space.listSpaces", method: .get, uri: "/xrpc/com.atproto.space.listSpaces", body: nil, authorization: .oauth, invariant: .jsonArrayContains("spaces", field: "uri", value: lifecycle.rawValue)),
                 .init(nsid: "com.atproto.space.getDelegationToken", method: .get, uri: "/xrpc/com.atproto.space.getDelegationToken?space=\(encodedSpace)", body: nil, authorization: .oauth, invariant: .jsonNonEmptyString("token")),
-                .init(nsid: "com.atproto.space.getSpaceCredential", method: .post, uri: "/xrpc/com.atproto.space.getSpaceCredential", body: "{\"space\":\"\(space.rawValue)\"}", authorization: .delegation, invariant: .jsonNonEmptyString("credential")),
+                .init(nsid: "com.atproto.space.getSpaceCredential", method: .post, uri: "/xrpc/com.atproto.space.getSpaceCredential", body: credentialExchangeBody, authorization: .delegation, invariant: .jsonNonEmptyString("credential")),
                 .init(nsid: "com.atproto.space.createRecord", method: .post, uri: "/xrpc/com.atproto.space.createRecord", body: recordPrefix + ",\"rkey\":\"matrix-created\",\"record\":{\"$type\":\"app.bsky.feed.post\",\"text\":\"matrix-create\"}}", authorization: .oauth, invariant: .jsonNonEmptyString("cid")),
                 .init(nsid: "com.atproto.space.putRecord", method: .post, uri: "/xrpc/com.atproto.space.putRecord", body: recordPrefix + ",\"rkey\":\"seed\",\"record\":{\"$type\":\"app.bsky.feed.post\",\"text\":\"matrix-put\"}}", authorization: .oauth, invariant: .jsonNonEmptyString("cid")),
                 .init(nsid: "com.atproto.space.applyWrites", method: .post, uri: "/xrpc/com.atproto.space.applyWrites", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"writes\":[{\"$type\":\"com.atproto.space.applyWrites#create\",\"collection\":\"app.bsky.feed.post\",\"rkey\":\"matrix-batch\",\"value\":{\"$type\":\"app.bsky.feed.post\",\"text\":\"matrix-batch\"}}]}", authorization: .oauth, invariant: .jsonArrayContains("results", field: "uri", value: "\(space.rawValue)/\(localDID)/app.bsky.feed.post/matrix-batch")),
@@ -214,11 +228,11 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.space.listBlobs", method: .get, uri: "/xrpc/com.atproto.space.listBlobs?space=\(encodedSpace)&repo=\(localDID)", body: nil, authorization: .oauth, invariant: .jsonKey("cids")),
                 .init(nsid: "com.atproto.space.getLatestCommit", method: .get, uri: "/xrpc/com.atproto.space.getLatestCommit?space=\(encodedSpace)&repo=\(localDID)", body: nil, authorization: .oauth, invariant: .jsonKey("commit")),
                 .init(nsid: "com.atproto.space.listRepoOps", method: .get, uri: "/xrpc/com.atproto.space.listRepoOps?space=\(encodedSpace)&repo=\(localDID)&excludeValues=true", body: nil, authorization: .oauth, invariant: .jsonArray("ops", minimumCount: 1)),
-                .init(nsid: "com.atproto.space.getRepo", method: .get, uri: "/xrpc/com.atproto.space.getRepo?space=\(encodedSpace)&repo=\(localDID)", body: nil, authorization: .oauth, invariant: .car),
+                .init(nsid: "com.atproto.space.getRepo", method: .get, uri: "/xrpc/com.atproto.space.getRepo?space=\(encodedSpace)&repo=\(localDID)", body: nil, authorization: .oauth, invariant: .star),
                 .init(nsid: "com.atproto.space.getBlob", method: .get, uri: "/xrpc/com.atproto.space.getBlob?space=\(encodedSpace)&repo=\(localDID)&cid=\(blobCID)", body: nil, authorization: .oauth, invariant: .blob(blobPayload)),
                 .init(nsid: "com.atproto.space.registerNotify", method: .post, uri: "/xrpc/com.atproto.space.registerNotify", body: "{\"space\":\"\(space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}", authorization: .registerNotify, invariant: .jsonNonEmptyString("expiresAt")),
                 .init(nsid: "com.atproto.space.unregisterNotify", method: .post, uri: "/xrpc/com.atproto.space.unregisterNotify", body: "{\"space\":\"\(space.rawValue)\",\"service\":\"\(remoteDID)#notify\"}", authorization: .unregisterNotify, invariant: .emptyBody),
-                .init(nsid: "com.atproto.space.notifyWrite", method: .post, uri: "/xrpc/com.atproto.space.notifyWrite", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"repoRev\":\"222222222222z\",\"hash\":{\"$bytes\":\"\(Data(repeating: 0x31, count: 32).base64EncodedString())\"}}", authorization: .notifyWrite, invariant: .emptyBody),
+                .init(nsid: "com.atproto.space.notifyWrite", method: .post, uri: "/xrpc/com.atproto.space.notifyWrite", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"repoRev\":\"222222222222z\",\"data\":{\"$bytes\":\"\(Data(repeating: 0x31, count: 32).base64EncodedString())\"}}", authorization: .notifyWrite, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.listRepos", method: .get, uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)", body: nil, authorization: .credential, invariant: .jsonArrayContains("repos", field: "did", value: localDID)),
                 .init(nsid: "com.atproto.simplespace.checkUserAccess", method: .get, uri: "/xrpc/com.atproto.simplespace.checkUserAccess?space=\(encodedSpace)&user=\(remoteDID)&access=read", body: nil, authorization: .checkUserAccess, invariant: .jsonBoolean("authorized", false)),
                 .init(nsid: "com.atproto.space.deleteRecord", method: .post, uri: "/xrpc/com.atproto.space.deleteRecord", body: recordPrefix + ",\"rkey\":\"delete-me\"}", authorization: .oauth, invariant: .jsonEmptyObject),
@@ -271,6 +285,13 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                             print(">>> FAILED NSID \(testCase.nsid) status=\(response.status) body=\(String(decoding: response.body.readableBytesView, as: UTF8.self))")
                         }
                         XCTAssertEqual(response.status, .ok, testCase.nsid)
+                        let recovery = try self.verifySemanticMAC(
+                            response,
+                            requestHeaders: headers,
+                            fixture: fixture,
+                            space: space,
+                            path: path
+                        )
                         try self.assertSemanticInvariant(
                             testCase.invariant,
                             response: response,
@@ -299,7 +320,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                                 try ops.map { try XCTUnwrap($0["rev"] as? String) }
                             )
                         } else if testCase.nsid == ComAtprotoSpaceGetRepo.typeIdentifier {
-                            await tokenCapture.setRecoveryCAR(Data(buffer: response.body))
+                            await tokenCapture.setRecoverySTAR(try XCTUnwrap(recovery))
                         }
                     }
 
@@ -408,7 +429,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             XCTAssertEqual(verifiedDelegation.issuer, localDID)
             XCTAssertEqual(
                 verifiedDelegation.audience,
-                "\(localDID)#atproto_space_host"
+                "\(localDID)#atproto_pds"
             )
             let credentialToken = try XCTUnwrap(issued.credential)
             let credentialAuthorization = try await DurableSpaceCredentialVerifier(
@@ -432,13 +453,8 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 _ = try TID(tidString: revision)
             }
             XCTAssertEqual(issued.oplogRevisions.last, latestRevision)
-            let verifiedRecovery = try SpaceCARCodec.verifyRecovery(
-                try XCTUnwrap(issued.recoveryCAR),
-                space: space,
-                author: localDID,
-                publicKey: fixture.localKey.publicKey
-            )
-            XCTAssertEqual(verifiedRecovery.wireRevision.toString(), latestRevision)
+            let verifiedRecovery = try XCTUnwrap(issued.recoverySTAR)
+            XCTAssertEqual(verifiedRecovery.commit.rev, latestRevision)
             let recoveryKeys = Set(
                 verifiedRecovery.records.map {
                     "\($0.uri.collection)/\($0.uri.rkey)"
@@ -814,7 +830,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-10-01.json"
+                        path: "Profiles/permissioned-data-0016-2026-10-22.json"
                     )
                 ),
                 configuration: .init(
@@ -932,7 +948,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
 
             let localDelegation = try PermissionedDataJWT.createDelegationToken(
                 issuer: local,
-                audience: "\(local)#atproto_space_host",
+                audience: "\(local)#atproto_pds",
                 space: localSpace,
                 key: fixture.localKey,
                 now: now
@@ -940,6 +956,16 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             _ = try await DurableSpaceDelegationVerifier(
                 publicKeys: credentials.delegationPublicKeys
             ).verifiedDelegation(for: localDelegation, expectedSpace: localSpace, now: now)
+            do {
+                _ = try await DurableSpaceDelegationVerifier(
+                    publicKeys: credentials.delegationPublicKeys
+                ).verifiedDelegation(
+                    for: Self.legacyRemoteDelegation,
+                    expectedSpace: remoteSpace,
+                    now: now
+                )
+                XCTFail("the retained legacy delegation audience must be rejected")
+            } catch {}
             _ = try await DurableSpaceDelegationVerifier(
                 publicKeys: credentials.delegationPublicKeys
             ).verifiedDelegation(
@@ -1080,7 +1106,11 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         )
     }
 
+    // Independently signed with Node.js crypto using the pinned secp256k1
+    // scalar 1, SHA-256, P1363 encoding, and low-S normalization.
     private static let remoteDelegation =
+        "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWRlbGVnYXRpb24rand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eSIsImF1ZCI6ImRpZDpwbGM6YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4I2F0cHJvdG9fcGRzIiwic3ViIjoiYXQ6Ly9kaWQ6cGxjOmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eC9zcGFjZS9hcHAuYnNreS5ib29rbWFya3MvdHMtZ29sZGVuIiwiaWF0IjoxNzUwMDAwMDAwLCJleHAiOjE3NTAwMDAwNjAsImp0aSI6InRzLW5vbmNlXzAxIn0.Y32xdkaFii7kb-tCKp5m0FZwXYtBcFIaaKnvd8lO6KM4JlH7oodpA_hiLXbi0uF-XSqdGO3-1OECGeoetsvjvQ"
+    private static let legacyRemoteDelegation =
         "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWRlbGVnYXRpb24rand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eSIsImF1ZCI6ImRpZDpwbGM6YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4I2F0cHJvdG9fc3BhY2VfaG9zdCIsInN1YiI6ImF0Oi8vZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3gvc3BhY2UvYXBwLmJza3kuYm9va21hcmtzL3RzLWdvbGRlbiIsImlhdCI6MTc1MDAwMDAwMCwiZXhwIjoxNzUwMDAwMDYwLCJqdGkiOiJ0cy1ub25jZV8wMSJ9.CiWW_bplyq9ZtybzoUL9f7J_lqlcFKkmAbY2YsVlf5Bly4Ufue7e9QN6_8PioonLWqKnmm6T-RW3Mq2C_JTC6A"
     private static let remoteCredential =
         "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWNyZWRlbnRpYWwrand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eCIsInN1YiI6ImF0Oi8vZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3gvc3BhY2UvYXBwLmJza3kuYm9va21hcmtzL3RzLWdvbGRlbiIsImlhdCI6MTc1MDAwMDAwMCwiZXhwIjoxNzUwMDA3MjAwLCJqdGkiOiJ0cy1jcmVkZW50aWFsLW5vbmNlXzAxIn0.kgRbwHruWKzbsHZlMjmSFYmz1dKBjpP0eQBvJLRYlzMAClhsOpYnRYpe2fBMGtuciGngcQgEwWYSjHpa9YmIEQ"
@@ -1141,13 +1171,9 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 token: credential, audience: space.authority
             )
         case .delegation:
-            let delegation = try PermissionedDataJWT.createDelegationToken(
-                issuer: space.authority,
-                audience: "\(space.authority)#atproto_space_host",
-                space: space,
-                key: fixture.localKey
-            )
-            headers = try SpaceCredentialSignatureTestSupport.exchangeHeaders(token: delegation)
+            // Delegation tokens and credential keys belong in the JSON body;
+            // valid and malformed exchanges use the same content-type header.
+            headers = SpaceCredentialSignatureTestSupport.exchangeHeaders()
         case .registerNotify:
             let registerToken = try SpaceServiceJWT.create(
                 issuer: localDID,
@@ -1225,8 +1251,80 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             headers = [.authorization: "Bearer \(checkUserAccess)"]
         }
+        if method == .get, let type = semanticMACType(for: path) {
+            let exchange = try SpaceMAC.encapsulate(
+                authorKey: AccountKEMKeyProvider.didKey(fixture.localKEMKey.publicKey)
+            )
+            headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!] = try SpaceMACHeaders.formatWantMAC(
+                keyShare: exchange.keyShare,
+                type: type
+            )
+        }
         if hasBody { headers[.contentType] = "application/json" }
         return headers
+    }
+
+    private func semanticMACType(for path: String) -> SpaceMACHeaders.MACType? {
+        switch path {
+        case "/xrpc/com.atproto.space.getRecord": .record
+        case "/xrpc/com.atproto.space.getLatestCommit",
+             "/xrpc/com.atproto.space.listRepoOps",
+             "/xrpc/com.atproto.space.getRepo": .repository
+        default: nil
+        }
+    }
+
+    private func verifySemanticMAC(
+        _ response: TestResponse,
+        requestHeaders: HTTPFields,
+        fixture: Fixture,
+        space: SpaceURI,
+        path: String
+    ) throws -> VerifiedSpaceSTARRecovery? {
+        guard let type = semanticMACType(for: path) else { return nil }
+        let wanted = try SpaceMACHeaders.parseWantMAC(
+            requestHeaders[HTTPField.Name(SpaceMACHeaders.requestHeader)!],
+            type: type
+        )
+        let sharedSecret = try SpaceMAC.decapsulate(
+            privateKey: fixture.localKEMKey,
+            keyShare: wanted.keyShare
+        )
+        let mac = try SpaceMACHeaders.parseMAC(
+            response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!],
+            type: type
+        )
+        if path == "/xrpc/com.atproto.space.getRepo" {
+            return try SpaceSTARCodec.decode(
+                Data(buffer: response.body), space: space, author: localDID
+            ) { commit in
+                try SpaceMAC.verify(mac: mac, expected: commit.mac(sharedSecret: sharedSecret))
+                return true
+            }
+        }
+        if type == .record {
+            let output = try JSONDecoder().decode(
+                ComAtprotoSpaceGetRecord.Output.self, from: Data(buffer: response.body)
+            )
+            let canonicalRecord = try DAGCBOR.encodeValue(output.value.toCBORValue())
+            XCTAssertEqual(output.cid, CID.fromDAGCBOR(canonicalRecord))
+            XCTAssertEqual(output.uri.uriString(), try SpaceRecordURI(
+                space: space, author: localDID, collection: "app.bsky.feed.post", rkey: "seed"
+            ).rawValue)
+            try SpaceMAC.verify(mac: mac, expected: SpaceMAC.record(
+                sharedSecret: sharedSecret, uri: output.uri.uriString(), cid: Data(output.cid.bytes)
+            ))
+        } else {
+            let object = try XCTUnwrap(jsonObject(response.body)["commit"] as? [String: Any])
+            let commit = try JSONDecoder().decode(
+                SpaceRepositoryCommit.self,
+                from: JSONSerialization.data(withJSONObject: object)
+            )
+            XCTAssertEqual(commit.space, space)
+            XCTAssertEqual(commit.repo, localDID)
+            try SpaceMAC.verify(mac: mac, expected: commit.mac(sharedSecret: sharedSecret))
+        }
+        return nil
     }
 
     private func signedHeaders(
@@ -1339,15 +1437,9 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         case let .blob(expected):
             XCTAssertEqual(response.headers[.contentType], "application/octet-stream", nsid, file: file, line: line)
             XCTAssertEqual(Data(buffer: response.body), expected, nsid, file: file, line: line)
-        case .car:
-            XCTAssertEqual(response.headers[.contentType], "application/vnd.ipld.car", nsid, file: file, line: line)
-            XCTAssertEqual(
-                try CARReader(data: Data(buffer: response.body)).roots.count,
-                2,
-                nsid,
-                file: file,
-                line: line
-            )
+        case .star:
+            XCTAssertEqual(response.headers[.contentType], SpaceSTARCodec.mediaType, nsid, file: file, line: line)
+            XCTAssertTrue(Data(buffer: response.body).starts(with: SpaceSTARCodec.magic), nsid, file: file, line: line)
         }
         XCTAssertEqual(response.headers[.cacheControl], "no-store", nsid, file: file, line: line)
     }
@@ -1405,9 +1497,9 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             return body.isEmpty
         case let .blob(expected):
             return contentType == "application/octet-stream" && body == expected
-        case .car:
-            return contentType == "application/vnd.ipld.car"
-                && (try? CARReader(data: body).roots.count) == 2
+        case .star:
+            return contentType == SpaceSTARCodec.mediaType
+                && body.starts(with: SpaceSTARCodec.magic)
         }
     }
 
@@ -1544,7 +1636,7 @@ private actor SemanticTokenCapture {
     private var credential: String?
     private var latestRevision: String?
     private var oplogRevisions: [String] = []
-    private var recoveryCAR: Data?
+    private var recoverySTAR: VerifiedSpaceSTARRecovery?
 
     func setDelegation(_ value: String) {
         delegation = value
@@ -1562,8 +1654,8 @@ private actor SemanticTokenCapture {
         oplogRevisions = value
     }
 
-    func setRecoveryCAR(_ value: Data) {
-        recoveryCAR = value
+    func setRecoverySTAR(_ value: VerifiedSpaceSTARRecovery) {
+        recoverySTAR = value
     }
 
     func values() -> (
@@ -1571,9 +1663,9 @@ private actor SemanticTokenCapture {
         credential: String?,
         latestRevision: String?,
         oplogRevisions: [String],
-        recoveryCAR: Data?
+        recoverySTAR: VerifiedSpaceSTARRecovery?
     ) {
-        (delegation, credential, latestRevision, oplogRevisions, recoveryCAR)
+        (delegation, credential, latestRevision, oplogRevisions, recoverySTAR)
     }
 }
 
@@ -1584,6 +1676,7 @@ private struct Fixture {
     let oauthRuntime: SwanOAuthRuntime
     let localRuntime: ServeLocalSpaceRuntime
     let localKey: P256.Signing.PrivateKey
+    let localKEMKey: P256.KeyAgreement.PrivateKey
     let semanticSpace: SpaceURI?
     let lifecycleSpace: SpaceURI?
     let semanticScopes: Set<String>
@@ -1616,6 +1709,9 @@ private struct Fixture {
             let localKey = try P256.Signing.PrivateKey(
                 rawRepresentation: try await keyStore.key(for: keys.signingReference)
             )
+            let localKEMKey = try await AccountKEMKeyProvider(keyStore: keyStore)
+                .privateKey(accountDID: localDID)
+            XCTAssertNotEqual(localKEMKey.rawRepresentation, localKey.rawRepresentation)
             _ = try await control.createAccount(try .init(
                 did: localDID,
                 canonicalHandle: "composition.example.com",
@@ -1757,6 +1853,7 @@ private struct Fixture {
                 oauthRuntime: oauthRuntime,
                 localRuntime: localRuntime,
                 localKey: localKey,
+                localKEMKey: localKEMKey,
                 semanticSpace: semanticSpace,
                 lifecycleSpace: lifecycleSpace,
                 semanticScopes: semanticScopes,

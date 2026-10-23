@@ -45,22 +45,24 @@ public struct SwanNotificationRecoveryService: Service {
     }
 
     public func run() async throws {
-        await withTaskGroup(of: Void.self) { group in
-            for database in databases {
-                let outbox = PermissionedSpaceOutboxDeliveryWorker(
-                    database: database,
-                    transport: makeOutboxTransport(database),
-                    configuration: configuration
-                )
-                let fanout = PermissionedSpaceNotificationFanoutDeliveryWorker(
-                    database: database,
-                    transport: makeFanoutTransport(database),
-                    configuration: configuration
-                )
-                group.addTask { await outbox.runUntilCancelled() }
-                group.addTask { await fanout.runUntilCancelled() }
+        await cancelWhenGracefulShutdown {
+            await withTaskGroup(of: Void.self) { group in
+                for database in databases {
+                    let outbox = PermissionedSpaceOutboxDeliveryWorker(
+                        database: database,
+                        transport: makeOutboxTransport(database),
+                        configuration: configuration
+                    )
+                    let fanout = PermissionedSpaceNotificationFanoutDeliveryWorker(
+                        database: database,
+                        transport: makeFanoutTransport(database),
+                        configuration: configuration
+                    )
+                    group.addTask { await outbox.runUntilCancelled() }
+                    group.addTask { await fanout.runUntilCancelled() }
+                }
+                await group.waitForAll()
             }
-            await group.waitForAll()
         }
     }
 }

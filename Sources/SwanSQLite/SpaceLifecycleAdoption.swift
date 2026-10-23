@@ -25,7 +25,7 @@ extension SQLiteAccountDatabase {
                 guard let row = rows.first,
                       row.column("deletion_event_id")?.string == expectedDeletionEventID,
                       let closedAt = row.column("closed_at")?.integer,
-                      credentialIssuedAt.timeIntervalSince1970 > Double(closedAt) else {
+                      credentialIssuedAt.timeIntervalSince1970 * 1_000_000 > Double(closedAt) else {
                     throw SwanError.unauthorized("space lifecycle changed or credential predates deletion")
                 }
                 try await retainRemoteReplicaGenerationFloor(space: space, eventID: expectedDeletionEventID)
@@ -40,6 +40,10 @@ extension SQLiteAccountDatabase {
                 _ = try await connection.query("""
                     UPDATE permissioned_remote_replica_lifecycles SET adopted_at = ?, credential_digest = ? WHERE space_uri = ?
                     """, [.integer(Int(now.timeIntervalSince1970)), credentialDigest.sqliteData!, .text(space.rawValue)])
+                _ = try await connection.query("""
+                    INSERT OR IGNORE INTO permissioned_remote_replica_retired_events(space_uri, event_id, adopted_at)
+                    VALUES (?, ?, ?)
+                    """, [.text(space.rawValue), .text(expectedDeletionEventID), .integer(Int(now.timeIntervalSince1970))])
                 _ = try await connection.query("DELETE FROM permissioned_space_recipient_tombstones WHERE space_uri = ?", [.text(space.rawValue)])
             }
         }
