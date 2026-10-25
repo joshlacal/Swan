@@ -1029,12 +1029,12 @@ if proxy != {
     raise SystemExit("Toxiproxy reference-pds proxy is not the pinned topology")
 PY
 
-rg -qx 'FROM swift:6\.1-jammy@sha256:12be34a341945adb64914405ed7b568fcb2d35edbd63a3755007e47dce59456e AS build' Dockerfile
+rg -qx 'FROM swift:6\.4\.1-jammy@sha256:51729e0f6ed2f477490cd1e1132e5eddbf011b81092f4998fc8d88e5435e33cb AS build' Dockerfile
 rg -q 'libsodium-dev pkg-config' Dockerfile
-# The runtime keeps the Swift 6.1 standard-library surface alongside the
+# The runtime keeps the Swift 6.4.1 standard-library surface alongside the
 # release executable. A minimal Ubuntu runtime would omit those libraries and
 # fail only after the container passes image build.
-rg -qx 'FROM swift:6\.1-jammy@sha256:12be34a341945adb64914405ed7b568fcb2d35edbd63a3755007e47dce59456e AS runtime' Dockerfile
+rg -qx 'FROM swift:6\.4\.1-jammy@sha256:51729e0f6ed2f477490cd1e1132e5eddbf011b81092f4998fc8d88e5435e33cb AS runtime' Dockerfile
 rg -q 'libsodium23' Dockerfile
 # The laboratory notification configuration lives in a stage of its own and the
 # default (last) stage is the clean runtime, so `docker build` with no
@@ -1077,8 +1077,8 @@ rg -q 'COPY Swan/interop/prepare-interop-secrets\.sh /usr/local/bin/swan-interop
 rg -q 'COPY Swan/interop/prepare-caddy-trust\.sh /usr/local/bin/swan-interop-caddy-trust' Dockerfile
 rg -q 'COPY Swan/interop/run-reference-pds\.sh /usr/local/bin/reference-pds-with-file-secrets' "$reference_pds_dockerfile"
 rg -q '^CMD \["/usr/local/bin/reference-pds-with-file-secrets",' "$reference_pds_dockerfile"
-node_image='node:24.15-alpine3.23@sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f'
-pnpm_sha512='71c631e382066efc25625d5cf029075de07b61b37f6e27350fbd84b1bda5864c8c1967adc280776b45c30a715c0359a3be08fef42d5bb09e2b99029979692916'
+node_image='node:24.22.1-alpine3.23@sha256:0468540aa58203ff9e40c2aab3907c52644ab818af6176b1c70a026137dc92a2'
+pnpm_sha512='b3951d6d6ff4a9f13dc7cf56cd28d2b8eb37dbcc9c68e52e1e1191873ea9f82a017287ab50baadc5ccc494f036c67c0e47eb13608c2fa36f47711b61ea128e61'
 for reference_dockerfile in \
   "$reference_pds_dockerfile" \
   "$reference_plc_dockerfile" \

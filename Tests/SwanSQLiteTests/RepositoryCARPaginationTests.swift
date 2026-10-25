@@ -161,6 +161,10 @@ final class RepositoryCARPaginationTests: XCTestCase {
       """
     )
     XCTAssertTrue(remainingTempTables.isEmpty)
+    // Cancellation must roll back before releasing the same connection. A
+    // fresh transaction fails here if cleanup inherited the cancelled task.
+    _ = try await database.connection.query("BEGIN")
+    _ = try await database.connection.query("ROLLBACK")
   }
 
   func testRepositoryCARValidationFailureDropsCanonicalMetadata() async throws {

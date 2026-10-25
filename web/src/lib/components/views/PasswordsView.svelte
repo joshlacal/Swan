@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { portal, activePasswords } from '$lib/stores/portal';
-  import { modals } from '$lib/stores/modals';
-  import { toasts } from '$lib/stores/toasts';
-  import { api } from '$lib/api';
+  import { portal, activePasswords } from '#lib/stores/portal.ts';
+  import { modals } from '#lib/stores/modals.ts';
+  import { toasts } from '#lib/stores/toasts.ts';
+  import { api } from '#lib/api.ts';
 
   let revokingName = $state<string | null>(null);
 

@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS account-web-build
+FROM node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS account-web-build
 # Use the refreshed system store for npm downloads; Node otherwise uses its
 # bundled roots even after update-ca-certificates removes a system root.
 RUN apt-get update \
@@ -10,14 +10,15 @@ RUN apt-get update \
     && update-ca-certificates --fresh \
     && rm -rf /var/lib/apt/lists/*
 ENV NODE_OPTIONS=--use-openssl-ca
+RUN npm install --global npm@12.2.1 && test "$(npm --version)" = "12.2.1"
 WORKDIR /workspace/Swan/web
 COPY Swan/web/package.json Swan/web/package-lock.json ./
 RUN npm ci --ignore-scripts
 COPY Swan/web/ ./
 RUN npm run prepare && npm run check && npm run build
 
-FROM swift:6.1-jammy@sha256:12be34a341945adb64914405ed7b568fcb2d35edbd63a3755007e47dce59456e AS build
-# Keep the Swift 6.1/Jammy build baseline explicit and install the same
+FROM swift:6.4.1-jammy@sha256:51729e0f6ed2f477490cd1e1132e5eddbf011b81092f4998fc8d88e5435e33cb AS build
+# Keep the Swift 6.4.1/Jammy build baseline explicit and install the same
 # system-library development surface SwiftPM uses on a clean Linux builder.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -35,7 +36,7 @@ COPY Swan /workspace/Swan
 WORKDIR /workspace/Swan
 RUN swift build -c release --product swan
 
-FROM swift:6.1-jammy@sha256:12be34a341945adb64914405ed7b568fcb2d35edbd63a3755007e47dce59456e AS runtime
+FROM swift:6.4.1-jammy@sha256:51729e0f6ed2f477490cd1e1132e5eddbf011b81092f4998fc8d88e5435e33cb AS runtime
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl libsodium23 libsecret-1-0 \
     && sed -i \

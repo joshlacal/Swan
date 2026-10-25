@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { modals } from '$lib/stores/modals';
-  import { currentAccount } from '$lib/stores/portal';
+  import { modals } from '#lib/stores/modals.ts';
+  import { currentAccount } from '#lib/stores/portal.ts';
 </script>
 
 <div class="flex flex-col gap-6">

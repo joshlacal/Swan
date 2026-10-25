@@ -1,11 +1,11 @@
 <script lang="ts">
-  import Modal from '$lib/components/ui/Modal.svelte';
-  import QrCode from '$lib/components/ui/QrCode.svelte';
-  import CopyButton from '$lib/components/ui/CopyButton.svelte';
-  import { api } from '$lib/api';
-  import { toasts } from '$lib/stores/toasts';
-  import { portal, currentAccount } from '$lib/stores/portal';
-  import { generateOtpauthUri, generateBase32Secret } from '$lib/qrcode';
+  import Modal from '#lib/components/ui/Modal.svelte';
+  import QrCode from '#lib/components/ui/QrCode.svelte';
+  import CopyButton from '#lib/components/ui/CopyButton.svelte';
+  import { api } from '#lib/api.ts';
+  import { toasts } from '#lib/stores/toasts.ts';
+  import { portal, currentAccount } from '#lib/stores/portal.ts';
+  import { generateOtpauthUri, generateBase32Secret } from '#lib/qrcode.ts';
 
   interface Props {
     isOpen?: boolean;

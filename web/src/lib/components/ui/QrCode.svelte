@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { generateQrSvgPath } from '$lib/qrcode';
+  import { generateQrSvgPath } from '#lib/qrcode.ts';
 
   interface Props {
     value: string;

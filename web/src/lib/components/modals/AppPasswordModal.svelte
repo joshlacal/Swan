@@ -1,10 +1,10 @@
 <script lang="ts">
-  import Modal from '$lib/components/ui/Modal.svelte';
-  import CopyButton from '$lib/components/ui/CopyButton.svelte';
-  import { api } from '$lib/api';
-  import { toasts } from '$lib/stores/toasts';
-  import { portal } from '$lib/stores/portal';
-  import { APP_PASSWORD_SCOPES, type AppPasswordScope } from '$lib/types';
+  import Modal from '#lib/components/ui/Modal.svelte';
+  import CopyButton from '#lib/components/ui/CopyButton.svelte';
+  import { api } from '#lib/api.ts';
+  import { toasts } from '#lib/stores/toasts.ts';
+  import { portal } from '#lib/stores/portal.ts';
+  import { APP_PASSWORD_SCOPES, type AppPasswordScope } from '#lib/types.ts';
 
   interface Props {
     isOpen?: boolean;

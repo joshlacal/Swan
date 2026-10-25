@@ -1,10 +1,10 @@
 <script lang="ts">
   import { tick } from 'svelte';
-  import { api } from '$lib/api';
-  import { stepup, type StepUpFactorKind } from '$lib/stores/stepup';
-  import { activeFactors } from '$lib/stores/portal';
-  import { performPasskeyAssertion, formatWebAuthnError } from '$lib/webauthn';
-  import Modal from '$lib/components/ui/Modal.svelte';
+  import { api } from '#lib/api.ts';
+  import { stepup, type StepUpFactorKind } from '#lib/stores/stepup.ts';
+  import { activeFactors } from '#lib/stores/portal.ts';
+  import { performPasskeyAssertion, formatWebAuthnError } from '#lib/webauthn.ts';
+  import Modal from '#lib/components/ui/Modal.svelte';
 
   let password = $state('');
   let totpCode = $state('');

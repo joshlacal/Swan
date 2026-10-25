@@ -114,7 +114,7 @@ public actor SQLiteFirehoseDatabase {
         databaseName: "firehose.sqlite"
       )
     } catch {
-      try? await openedConnection.close()
+      try? await openedConnection.closeForCleanup()
       SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
       SQLiteProtectedPaths.closeDirectory(rootDescriptor)
       throw error
@@ -131,7 +131,7 @@ public actor SQLiteFirehoseDatabase {
       SQLiteProtectedPaths.closeDirectory(databaseDescriptor)
       SQLiteProtectedPaths.closeDirectory(descriptor)
     }
-    try await connection.close()
+    try await connection.closeForCleanup()
   }
 
   // MARK: - Append
@@ -812,7 +812,7 @@ public actor SQLiteFirehoseDatabase {
       if let commitBarrier { try await commitBarrier() }
       return result
     } catch {
-      _ = try? await connection.query("ROLLBACK")
+      try? await connection.executeCleanupQuery("ROLLBACK")
       throw error
     }
   }

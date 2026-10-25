@@ -1030,17 +1030,17 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 "DROP TABLE temp.swan_public_verified_index"
             )
         } catch is CancellationError {
-            _ = try? await connection.query(
+            try? await connection.executeCleanupQuery(
                 "DROP TABLE IF EXISTS temp.swan_public_verified_index"
             )
             throw CancellationError()
         } catch let error as PublicRepositoryReadError {
-            _ = try? await connection.query(
+            try? await connection.executeCleanupQuery(
                 "DROP TABLE IF EXISTS temp.swan_public_verified_index"
             )
             throw error
         } catch let error as PublicRepositoryMutationStoreError {
-            _ = try? await connection.query(
+            try? await connection.executeCleanupQuery(
                 "DROP TABLE IF EXISTS temp.swan_public_verified_index"
             )
             // Reached only through the block source during the projection walk.
@@ -1049,7 +1049,7 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 reason: .blockMaterializationFailed
             )
         } catch RepositoryMSTValidationError.recordLimitExceeded {
-            _ = try? await connection.query(
+            try? await connection.executeCleanupQuery(
                 "DROP TABLE IF EXISTS temp.swan_public_verified_index"
             )
             // The MST carries more records than the read surface admits. Only
@@ -1059,7 +1059,7 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
             // storage fault the generic branch below would report.
             throw PublicRepositoryReadError.resourceLimitExceeded
         } catch {
-            _ = try? await connection.query(
+            try? await connection.executeCleanupQuery(
                 "DROP TABLE IF EXISTS temp.swan_public_verified_index"
             )
             throw PublicRepositoryReadError.unavailable(

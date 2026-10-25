@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { modals } from '$lib/stores/modals';
-  import { currentAccount } from '$lib/stores/portal';
+  import { modals } from '#lib/stores/modals.ts';
+  import { currentAccount } from '#lib/stores/portal.ts';
 
   const isActive = $derived($currentAccount?.lifecycle === 'active');
   const lifecycleStatus = $derived($currentAccount?.lifecycle?.toUpperCase() || 'ACTIVE');

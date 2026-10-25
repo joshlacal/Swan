@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { toasts } from '$lib/stores/toasts';
+  import { toasts } from '#lib/stores/toasts.ts';
 
   interface Props {
     position?: 'top-right' | 'top-center' | 'bottom-right' | 'bottom-center';

@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import Modal from '$lib/components/ui/Modal.svelte';
-  import { accountFetch, api } from '$lib/api';
-  import { toasts } from '$lib/stores/toasts';
+  import Modal from '#lib/components/ui/Modal.svelte';
+  import { accountFetch, api } from '#lib/api.ts';
+  import { toasts } from '#lib/stores/toasts.ts';
 
   interface Props {
     isOpen?: boolean;

@@ -2558,7 +2558,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 storage: .file(path: readConnectionPath)
             )
         } catch {
-            try? await openedConnection.close()
+            try? await openedConnection.closeForCleanup()
             SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
             SQLiteProtectedPaths.closeAccountLifecycleLock(
                 lifecycleLockDescriptor
@@ -2596,8 +2596,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     )
                 }
             } catch {
-                try? await openedReadConnection.close()
-                try? await openedConnection.close()
+                try? await openedReadConnection.closeForCleanup()
+                try? await openedConnection.closeForCleanup()
                 SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
                 SQLiteProtectedPaths.closeAccountLifecycleLock(
                     lifecycleLockDescriptor
@@ -2614,8 +2614,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     _ = try await openedReadConnection.query(statement)
                 }
             } catch {
-                try? await openedReadConnection.close()
-                try? await openedConnection.close()
+                try? await openedReadConnection.closeForCleanup()
+                try? await openedConnection.closeForCleanup()
                 SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
                 SQLiteProtectedPaths.closeAccountLifecycleLock(
                     lifecycleLockDescriptor
@@ -2646,7 +2646,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         if let hook = testingHooks.onReaderClose {
                             try await hook()
                         }
-                        try await readConnection.close()
+                        try await readConnection.closeForCleanup()
                         isReaderClosed = true
                     } catch {
                         readerError = error
@@ -2655,7 +2655,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 var writerError: Error?
                 if !isWriterClosed {
                     do {
-                        try await connection.close()
+                        try await connection.closeForCleanup()
                         isWriterClosed = true
                     } catch {
                         writerError = error
@@ -4384,7 +4384,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
             _ = try await connection.query("PRAGMA foreign_keys = ON")
         } catch {
-            _ = try? await connection.query("PRAGMA foreign_keys = ON")
+            try? await connection.executeCleanupQuery("PRAGMA foreign_keys = ON")
             throw error
         }
     }
@@ -11361,7 +11361,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             if let commitBarrier { try await commitBarrier() }
             return result
         } catch {
-            _ = try? await connection.query("ROLLBACK")
+            try? await connection.executeCleanupQuery("ROLLBACK")
             activeWriteTransactions -= 1
             throw error
         }
@@ -11401,7 +11401,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             _ = try await readConnection.query("COMMIT")
             return result
         } catch {
-            _ = try? await readConnection.query("ROLLBACK")
+            try? await readConnection.executeCleanupQuery("ROLLBACK")
             throw error
         }
     }
@@ -11415,7 +11415,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             _ = try await connection.query("COMMIT")
             return result
         } catch {
-            _ = try? await connection.query("ROLLBACK")
+            try? await connection.executeCleanupQuery("ROLLBACK")
             throw error
         }
     }
@@ -11451,7 +11451,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try Task.checkCancellation()
             return result
         } catch {
-            _ = try? await connection.query(
+            try? await connection.executeCleanupQuery(
                 "DROP TABLE IF EXISTS temp.swan_repository_car_index"
             )
             throw error

@@ -1,9 +1,9 @@
 <script lang="ts">
-  import Modal from '$lib/components/ui/Modal.svelte';
-  import { api } from '$lib/api';
-  import { toasts } from '$lib/stores/toasts';
-  import { portal, currentAccount } from '$lib/stores/portal';
-  import { isWebAuthnSupported, formatWebAuthnError, performPasskeyRegistration } from '$lib/webauthn';
+  import Modal from '#lib/components/ui/Modal.svelte';
+  import { api } from '#lib/api.ts';
+  import { toasts } from '#lib/stores/toasts.ts';
+  import { portal, currentAccount } from '#lib/stores/portal.ts';
+  import { isWebAuthnSupported, formatWebAuthnError, performPasskeyRegistration } from '#lib/webauthn.ts';
 
   interface Props {
     isOpen?: boolean;

@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { portal, activeSessions } from '$lib/stores/portal';
-  import { toasts } from '$lib/stores/toasts';
-  import { api } from '$lib/api';
+  import { portal, activeSessions } from '#lib/stores/portal.ts';
+  import { toasts } from '#lib/stores/toasts.ts';
+  import { api } from '#lib/api.ts';
 
   let revokingId = $state<string | null>(null);
   let revokingOthers = $state(false);

@@ -1,5 +1,12 @@
-// swift-tools-version: 6.1
+// swift-tools-version: 6.2
+import Foundation
 import PackageDescription
+
+// A local SDK override is explicit and is never evidence of a published graph.
+let petrelDependency: Package.Dependency = ProcessInfo.processInfo.environment["PETREL_PACKAGE_PATH"]
+    .map { .package(path: $0) }
+    ?? .package(url: "https://github.com/joshlacal/Petrel.git",
+                revision: "cc2999e1f4746a7c246d76dce09f4176ec0768a1")
 
 let package = Package(
     name: "Swan",
@@ -22,28 +29,30 @@ let package = Package(
         .executable(name: "swan", targets: ["swan"]),
     ],
     dependencies: [
-        // Immutable October 22 SDK, generated from the matching pinned corpus.
-        .package(url: "https://github.com/joshlacal/Petrel.git",
-                 revision: "e115236537041a900ec971be05185a70cca73e8a"),
-        .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
-        .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),
-        .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.36.0"),
-        .package(url: "https://github.com/vapor/sqlite-nio.git", exact: "1.12.10"),
-        .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", exact: "2.11.0"),
-        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
-        .package(url: "https://github.com/apple/swift-crypto.git", exact: "3.15.1"),
+        // Immutable SDK by default; local development can select a coordinated checkout.
+        petrelDependency,
+        .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.28.0"),
+        .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.8.1"),
+        .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.36.2"),
+        .package(url: "https://github.com/vapor/sqlite-nio.git", exact: "1.13.2"),
+        .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", exact: "2.13.0"),
+        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.8.2"),
+        .package(url: "https://github.com/apple/swift-crypto.git", exact: "5.0.3"),
         // The notification connector owns the TCP/TLS connection so it can
         // pin and report the actual peer. Keep these direct pins aligned with
         // Hummingbird's resolved NIO line instead of relying on a transitive
         // import from the HTTP server.
-        .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.3"),
-        .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.37.2"),
-        .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
+        .package(url: "https://github.com/apple/swift-nio.git", exact: "2.104.0"),
+        .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.37.5"),
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.16.2"),
         // Direct dependency for the SwanCLITests composition tests (Task 1):
         // the credential-isolation assertions steer `atproto-proxy` headers,
         // which requires `HTTPField.Name` from HTTPTypes. Pinned to the
         // version Hummingbird already resolves.
-        .package(url: "https://github.com/apple/swift-http-types.git", exact: "1.6.0"),
+        .package(url: "https://github.com/apple/swift-http-types.git", exact: "1.8.0"),
+        // Tracing 1.7 moved ServiceContextModule; its compatibility package must
+        // be 1.5.1+ to avoid duplicate target names in existing Xcode lockfiles.
+        .package(url: "https://github.com/apple/swift-service-context.git", from: "1.5.1"),
     ],
     targets: [
         .systemLibrary(

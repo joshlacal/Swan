@@ -1,9 +1,9 @@
 <script lang="ts">
-  import Modal from '$lib/components/ui/Modal.svelte';
-  import CopyButton from '$lib/components/ui/CopyButton.svelte';
-  import { api } from '$lib/api';
-  import { toasts } from '$lib/stores/toasts';
-  import { portal, currentAccount } from '$lib/stores/portal';
+  import Modal from '#lib/components/ui/Modal.svelte';
+  import CopyButton from '#lib/components/ui/CopyButton.svelte';
+  import { api } from '#lib/api.ts';
+  import { toasts } from '#lib/stores/toasts.ts';
+  import { portal, currentAccount } from '#lib/stores/portal.ts';
 
   interface Props {
     isOpen?: boolean;

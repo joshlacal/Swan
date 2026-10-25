@@ -713,15 +713,15 @@ mutate_file_and_require_rejection \
 mutate_file_and_require_rejection \
   mutable-reference-node-image \
   interop/Dockerfile.reference-pds \
-  'FROM node:24.15-alpine3.23@sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f AS build' \
-  'FROM node:24.15-alpine3.23 AS build' \
+  'FROM node:24.22.1-alpine3.23@sha256:0468540aa58203ff9e40c2aab3907c52644ab818af6176b1c70a026137dc92a2 AS build' \
+  'FROM node:24.22.1-alpine3.23 AS build' \
   SWAN_INTEROP_REFERENCE_PDS_DOCKERFILE \
   'reference image Dockerfiles must use the exact pinned Node digest in both stages'
 
 mutate_file_and_require_rejection \
   altered-pnpm-bootstrap-digest \
   interop/Dockerfile.reference-pds \
-  '71c631e382066efc25625d5cf029075de07b61b37f6e27350fbd84b1bda5864c8c1967adc280776b45c30a715c0359a3be08fef42d5bb09e2b99029979692916' \
+  'b3951d6d6ff4a9f13dc7cf56cd28d2b8eb37dbcc9c68e52e1e1191873ea9f82a017287ab50baadc5ccc494f036c67c0e47eb13608c2fa36f47711b61ea128e61' \
   '81c631e382066efc25625d5cf029075de07b61b37f6e27350fbd84b1bda5864c8c1967adc280776b45c30a715c0359a3be08fef42d5bb09e2b99029979692916' \
   SWAN_INTEROP_REFERENCE_PDS_DOCKERFILE \
   'reference image Dockerfiles must verify the pinned pnpm bootstrap'

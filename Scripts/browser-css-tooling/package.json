@@ -5,7 +5,12 @@
   "description": "Pinned dependencies for browser CSS generation",
   "dependencies": {
     "@tailwindcss/cli": "4.3.3",
-    "daisyui": "5.7.19",
+    "daisyui": "5.7.50",
     "tailwindcss": "4.3.3"
-  }
+  },
+  "engines": {
+    "node": ">=24.22.1 <25",
+    "npm": ">=12.2.1 <13"
+  },
+  "packageManager": "npm@12.2.1"
 }

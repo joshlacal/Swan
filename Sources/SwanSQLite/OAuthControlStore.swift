@@ -339,7 +339,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
                     )
                 }
             } catch {
-                try? await openedConnection.close()
+                try? await openedConnection.closeForCleanup()
                 SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
                 SQLiteProtectedPaths.closeDirectory(rootDescriptor)
                 throw error
@@ -348,7 +348,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
             do {
                 _ = try await openedConnection.query("PRAGMA query_only=ON")
             } catch {
-                try? await openedConnection.close()
+                try? await openedConnection.closeForCleanup()
                 SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
                 SQLiteProtectedPaths.closeDirectory(rootDescriptor)
                 throw error
@@ -368,7 +368,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
                 SQLiteProtectedPaths.closeDirectory(databaseDescriptor)
                 SQLiteProtectedPaths.closeDirectory(descriptor)
             }
-            try await connection.close()
+            try await connection.closeForCleanup()
         }
     }
 
@@ -1820,7 +1820,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, OAuthAuthorizationGrantSt
             if let commitBarrier { try await commitBarrier() }
             return result
         } catch {
-            _ = try? await connection.query("ROLLBACK")
+            try? await connection.executeCleanupQuery("ROLLBACK")
             activeWriteTransactions -= 1
             throw error
         }

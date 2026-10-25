@@ -6,8 +6,8 @@
     activeSessions,
     activeApps,
     activeFactors
-  } from '$lib/stores/portal';
-  import { modals } from '$lib/stores/modals';
+  } from '#lib/stores/portal.ts';
+  import { modals } from '#lib/stores/modals.ts';
 </script>
 
 <div class="flex flex-col gap-6">

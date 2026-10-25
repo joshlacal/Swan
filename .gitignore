@@ -32,3 +32,6 @@ AppleTV/SwanTV/**/xcuserdata/
 # Python verification helpers
 __pycache__/
 *.pyc
+
+# Installed tooling dependencies are generated, including Scripts packages.
+**/node_modules/

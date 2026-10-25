@@ -511,9 +511,9 @@ public actor SQLiteSpaceCARRecoveryIndex: SpaceCARRecoveryIndex {
         guard !cleanedUp else { return }
         cleanupStarted = true
         if !connectionClosed {
-            _ = try? await connection.query("ROLLBACK")
+            try? await connection.executeCleanupQuery("ROLLBACK")
             do {
-                try await connection.close()
+                try await connection.closeForCleanup()
                 connectionClosed = true
             } catch {}
         }

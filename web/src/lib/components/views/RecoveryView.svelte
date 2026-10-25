@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { modals } from '$lib/stores/modals';
-  import { activeFactors, currentAccount } from '$lib/stores/portal';
+  import { modals } from '#lib/stores/modals.ts';
+  import { activeFactors, currentAccount } from '#lib/stores/portal.ts';
 
   const hasRecoveryFactor = $derived(
     $activeFactors.some((f) => f.kind === 'recoveryCode')

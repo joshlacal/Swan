@@ -5,7 +5,12 @@
   "description": "Pinned dependencies for upstream scope golden vector verification",
   "dependencies": {
     "iso-datestring-validator": "2.2.2",
-    "multiformats": "13.4.2",
-    "zod": "3.24.2"
-  }
+    "multiformats": "14.0.5",
+    "zod": "4.6.7"
+  },
+  "engines": {
+    "node": ">=24.22.1 <25",
+    "npm": ">=12.2.1 <13"
+  },
+  "packageManager": "npm@12.2.1"
 }

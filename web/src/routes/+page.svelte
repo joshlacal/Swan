@@ -3,41 +3,41 @@
   import { fade } from 'svelte/transition';
 
   // API Client & Stores
-  import { api, bootstrap } from '$lib/api';
+  import { api, bootstrap } from '#lib/api.ts';
   import {
     portal,
     SECTIONS,
     currentAccount,
     type NavigationSection
-  } from '$lib/stores/portal';
-  import { modals, activeModal } from '$lib/stores/modals';
-  import { toasts } from '$lib/stores/toasts';
-  import { stepup } from '$lib/stores/stepup';
+  } from '#lib/stores/portal.ts';
+  import { modals, activeModal } from '#lib/stores/modals.ts';
+  import { toasts } from '#lib/stores/toasts.ts';
+  import { stepup } from '#lib/stores/stepup.ts';
 
   // Section Views
-  import OverviewView from '$lib/components/views/OverviewView.svelte';
-  import ProfileView from '$lib/components/views/ProfileView.svelte';
-  import SecurityView from '$lib/components/views/SecurityView.svelte';
-  import RecoveryView from '$lib/components/views/RecoveryView.svelte';
-  import SessionsView from '$lib/components/views/SessionsView.svelte';
-  import AppsView from '$lib/components/views/AppsView.svelte';
-  import PasswordsView from '$lib/components/views/PasswordsView.svelte';
-  import ExportView from '$lib/components/views/ExportView.svelte';
-  import LifecycleView from '$lib/components/views/LifecycleView.svelte';
+  import OverviewView from '#lib/components/views/OverviewView.svelte';
+  import ProfileView from '#lib/components/views/ProfileView.svelte';
+  import SecurityView from '#lib/components/views/SecurityView.svelte';
+  import RecoveryView from '#lib/components/views/RecoveryView.svelte';
+  import SessionsView from '#lib/components/views/SessionsView.svelte';
+  import AppsView from '#lib/components/views/AppsView.svelte';
+  import PasswordsView from '#lib/components/views/PasswordsView.svelte';
+  import ExportView from '#lib/components/views/ExportView.svelte';
+  import LifecycleView from '#lib/components/views/LifecycleView.svelte';
 
   // Modal Dialogs
-  import StepUpModal from '$lib/components/modals/StepUpModal.svelte';
-  import AppPasswordModal from '$lib/components/modals/AppPasswordModal.svelte';
-  import PasskeyEnrollModal from '$lib/components/modals/PasskeyEnrollModal.svelte';
-  import TotpEnrollModal from '$lib/components/modals/TotpEnrollModal.svelte';
-  import RecoveryRotateModal from '$lib/components/modals/RecoveryRotateModal.svelte';
-  import DidWebModal from '$lib/components/modals/DidWebModal.svelte';
-  import ExportModal from '$lib/components/modals/ExportModal.svelte';
-  import LifecycleModal from '$lib/components/modals/LifecycleModal.svelte';
+  import StepUpModal from '#lib/components/modals/StepUpModal.svelte';
+  import AppPasswordModal from '#lib/components/modals/AppPasswordModal.svelte';
+  import PasskeyEnrollModal from '#lib/components/modals/PasskeyEnrollModal.svelte';
+  import TotpEnrollModal from '#lib/components/modals/TotpEnrollModal.svelte';
+  import RecoveryRotateModal from '#lib/components/modals/RecoveryRotateModal.svelte';
+  import DidWebModal from '#lib/components/modals/DidWebModal.svelte';
+  import ExportModal from '#lib/components/modals/ExportModal.svelte';
+  import LifecycleModal from '#lib/components/modals/LifecycleModal.svelte';
 
   // UI Primitives
-  import ToastContainer from '$lib/components/ui/ToastContainer.svelte';
-  import Spinner from '$lib/components/ui/Spinner.svelte';
+  import ToastContainer from '#lib/components/ui/ToastContainer.svelte';
+  import Spinner from '#lib/components/ui/Spinner.svelte';
 
   // Component Reactive State
   let handle = $state('');
