@@ -27,13 +27,13 @@ final class SwanDisposableNativeRecoveryTests: XCTestCase, @unchecked Sendable {
         let session = try JSONDecoder().decode(Session.self, from: login.body)
         let proof = try JSONDecoder().decode(Proof.self, from: Data(contentsOf: root.appendingPathComponent("evidence/mixed-host-proof.json")))
         let referenceAuthority = try XCTUnwrap(accounts.first { $0.name == "authority" })
-        let plc = try InteropHTTPClient(baseURL: URL(string: "http://localhost:16580")!)
+        let plc = try InteropHTTPClient(baseURL: URL(string: ProcessInfo.processInfo.environment["SWAN_DISPOSABLE_PLC_URL"] ?? "http://localhost:16580")!)
         var evidence: [[String: Any]] = []
         for receipt in proof.receipts {
             let swanAuthority = receipt.direction.hasPrefix("swan-authority")
             let space = try SpaceURI(receipt.space)
-            let authorityURL = URL(string: swanAuthority ? "https://localhost:16586" : referenceAuthority.service)!
-            let repositoryURL = URL(string: swanAuthority ? alice.service : "https://localhost:16586")!
+            let authorityURL = URL(string: swanAuthority ? (ProcessInfo.processInfo.environment["SWAN_DISPOSABLE_SERVER_URL"] ?? "https://localhost:16586") : referenceAuthority.service)!
+            let repositoryURL = URL(string: swanAuthority ? alice.service : (ProcessInfo.processInfo.environment["SWAN_DISPOSABLE_SERVER_URL"] ?? "https://localhost:16586"))!
             let ca = root.appendingPathComponent("tls/ca.pem")
             let authority = try InteropXRPCClient(baseURL: authorityURL, additionalTrustRootFile: ca)
             let credential = try await SpaceCredentialBroker(member: member, authority: authority).exchange(

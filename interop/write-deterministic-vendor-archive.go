@@ -85,7 +85,7 @@ func main() {
 	// Pin every exposed header field instead of inheriting source metadata.
 	gzipWriter.Header = gzip.Header{OS: 255}
 	// Default compression plus this header yields FLG=0, MTIME=0, XFL=0,
-	// OS=255 in the digest-pinned Go 1.26.4 implementation.
+	// OS=255 in the digest-pinned Go 1.27.3 implementation.
 	tarWriter := tar.NewWriter(gzipWriter)
 	for _, candidate := range entries {
 		header := &tar.Header{

@@ -20,7 +20,7 @@ final class SwanDisposableConversationDeletionTests: XCTestCase, @unchecked Send
         var clientID = URLComponents(string: "http://localhost")!
         clientID.queryItems = [URLQueryItem(name: "redirect_uri", value: redirect.absoluteString),
                               URLQueryItem(name: "scope", value: scopes.sorted().joined(separator: " "))]
-        let wire = try InteropHTTPClient(baseURL: URL(string: "https://localhost:16586")!,
+        let wire = try InteropHTTPClient(baseURL: URL(string: ProcessInfo.processInfo.environment["SWAN_DISPOSABLE_SERVER_URL"] ?? "https://localhost:16586")!,
             additionalTrustRootFile: root.appendingPathComponent("tls/ca.pem"))
         let oauth = try SwanOAuthLabClient(issuer: issuer, clientID: clientID.url!, redirectURI: redirect,
             executeHandler: { method, target, headers, body, limit in

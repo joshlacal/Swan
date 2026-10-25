@@ -92,15 +92,15 @@ if set(metadata) != task4_keys or metadata.get("schemaVersion") != 1:
 immutable_pin = {
     "indigoCommit": commit,
     "sourceArchiveSHA256": "bc6f57e6211560220ac49dc7d6b55c5a43291f1e1193113ce413ffe4478fdd0b",
-    "toolchainImage": "docker.io/library/golang@sha256:727cfc3c40be55cd1bc9a4a059406b28a059857e3be752aa9d09531e12c20c56",
-    "toolchainImageDigest": "sha256:727cfc3c40be55cd1bc9a4a059406b28a059857e3be752aa9d09531e12c20c56",
+    "toolchainImage": "docker.io/library/golang@sha256:754d5200fc3edae76d3b6598a9a3fac7e74981ee6a5413ab955025f185753ef2",
+    "toolchainImageDigest": "sha256:754d5200fc3edae76d3b6598a9a3fac7e74981ee6a5413ab955025f185753ef2",
     "toolchainPlatform": "linux/arm64/v8",
-    "goVersion": "go1.26.4",
-    "relayBuilderImage": "docker.io/library/golang@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b",
-    "relayBuilderImageDigest": "sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b",
-    "relayBuilderManifestDigest": "sha256:b58a2431884c6dfc5ddcea953c7f426ad72c2ff9e94b4b8495fefa74e4dabcc0",
+    "goVersion": "go1.27.3",
+    "relayBuilderImage": "docker.io/library/golang@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5",
+    "relayBuilderImageDigest": "sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5",
+    "relayBuilderManifestDigest": "sha256:d3f61539a5743b1f1815ba8dd3627202f55262fb09380feda1d585ccf5a9850e",
     "relayBuilderPlatform": "linux/arm64/v8",
-    "relayBuilderGoVersion": "go1.26.4",
+    "relayBuilderGoVersion": "go1.27.3",
 }
 immutable_diagnostics = {
     "indigoCommit": "Indigo commit mismatch",

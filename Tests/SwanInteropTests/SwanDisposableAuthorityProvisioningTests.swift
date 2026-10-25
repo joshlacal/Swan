@@ -17,7 +17,7 @@ final class SwanDisposableAuthorityProvisioningTests: XCTestCase, @unchecked Sen
         var clientID = URLComponents(string: "http://localhost")!
         clientID.queryItems = [URLQueryItem(name: "redirect_uri", value: redirect.absoluteString),
                               URLQueryItem(name: "scope", value: scopes.sorted().joined(separator: " "))]
-        let wire = try InteropHTTPClient(baseURL: URL(string: "https://localhost:16586")!,
+        let wire = try InteropHTTPClient(baseURL: URL(string: ProcessInfo.processInfo.environment["SWAN_DISPOSABLE_SERVER_URL"] ?? "https://localhost:16586")!,
             additionalTrustRootFile: root.appendingPathComponent("tls/ca.pem"))
         let oauth = try SwanOAuthLabClient(issuer: issuer, clientID: clientID.url!, redirectURI: redirect,
             executeHandler: { method, target, headers, body, limit in
@@ -40,7 +40,7 @@ final class SwanDisposableAuthorityProvisioningTests: XCTestCase, @unchecked Sen
         XCTAssertEqual(response.status, 200, String(decoding: response.body, as: UTF8.self))
         let created = try XCTUnwrap(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
         XCTAssertEqual(created["uri"] as? String, expectedSpace)
-        let member = "did:plc:xx5pwgo7a7k3sjz4xzoau2bq"
+        let member = ProcessInfo.processInfo.environment["SWAN_DISPOSABLE_MEMBER_DID"] ?? "did:plc:xx5pwgo7a7k3sjz4xzoau2bq"
         let memberResponse = try await oauth.executeResource(token: token, method: .post,
             path: "/xrpc/com.atproto.simplespace.putMember", body: JSONSerialization.data(withJSONObject: [
                 "space": expectedSpace, "did": member, "read": true, "write": true]))

@@ -655,12 +655,12 @@ if rg -n '^[[:space:]]*RUN .*(curl|wget|git clone|git fetch|go mod download)' "$
   echo "reference relay Dockerfile must not fetch source from the network" >&2
   exit 1
 fi
-if ! rg -Fq 'FROM docker.io/library/golang@sha256:727cfc3c40be55cd1bc9a4a059406b28a059857e3be752aa9d09531e12c20c56' "$relay_dockerfile"; then
+if ! rg -Fq 'FROM docker.io/library/golang@sha256:754d5200fc3edae76d3b6598a9a3fac7e74981ee6a5413ab955025f185753ef2' "$relay_dockerfile"; then
   echo "reference relay Dockerfile must use the pinned Alpine runtime image" >&2
   exit 1
 fi
 for required_relay_docker_line in \
-  'FROM docker.io/library/golang@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b AS build' \
+  'FROM docker.io/library/golang@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5 AS build' \
   'COPY .interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz /tmp/indigo.tar.gz' \
   'COPY .interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.vendor.tar.gz /tmp/indigo.vendor.tar.gz' \
   'COPY interop/reference-relay-overlay/reference-relay-private-upstream.patch /tmp/reference-relay-private-upstream.patch' \
@@ -979,8 +979,8 @@ reject_contains "$runner_block" 'https://' "planned runner must not name a live 
 reject_contains "$runner_block" 'toxiproxy' "planned runner must not mutate Toxiproxy"
 reject_contains "$runner_block" 'privileged:' "scenario runner must not be privileged"
 
-rg -q 'permissioned-data-0016-2026-10-01' Sources/SwanInterop/SwanInterop.swift
-rg -q '0c9c2e88ba385809fc9ecba92f362389d9338e16' Sources/SwanInterop/SwanInterop.swift
+rg -q 'permissioned-data-0016-2026-10-22' Sources/SwanInterop/SwanInterop.swift
+rg -q 'e115236537041a900ec971be05185a70cca73e8a' Sources/SwanInterop/SwanInterop.swift
 rg -q '3f6c96d5d2d25438bd40fa89d6ecc37865f8e354' "$reference_pds_dockerfile"
 rg -q '1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea' "$reference_pds_dockerfile"
 rg -q 'tls internal' "$caddyfile"
@@ -1000,9 +1000,9 @@ if [[ "${set_client_header_count:-0}" -ne 1 ]]; then
   echo "Caddy must set the login client identity from its direct peer exactly once" >&2
   exit 1
 fi
-rg -q '^FROM caddy:2\.10\.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d$' interop/Dockerfile.caddy
+rg -q '^FROM caddy:2\.11\.7-alpine@sha256:504a44d7d74bd2bc28a66afc4774912fc21223ca8a67734af1c54ab2f999b489$' interop/Dockerfile.caddy
 rg -q '^COPY Swan/interop/Caddyfile /etc/caddy/Caddyfile$' interop/Dockerfile.caddy
-rg -q '^FROM ghcr\.io/shopify/toxiproxy:2\.12\.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e$' "$toxiproxy_dockerfile"
+rg -q '^FROM ghcr\.io/shopify/toxiproxy:2\.13\.0@sha256:5d3dae09bc185dcc5ff6cf43abf6062a4a720aff0c4306a471e773acdcd107aa$' "$toxiproxy_dockerfile"
 rg -q '^COPY Swan/interop/toxiproxy\.json /etc/toxiproxy/config\.json$' "$toxiproxy_dockerfile"
 if rg -n '^[[:space:]]*RUN .*(curl|wget|git clone|git fetch)' "$toxiproxy_dockerfile"; then
   echo "Toxiproxy image Dockerfile must not fetch source from the network" >&2
@@ -1092,9 +1092,9 @@ for reference_dockerfile in \
     echo "reference image Dockerfiles must pin Node by digest" >&2
     exit 1
   fi
-  if ! rg -q "${pnpm_sha512}  /tmp/pnpm-11\\.5\\.2\\.tgz" "$reference_dockerfile" \
-      || ! rg -q 'npm install --global /tmp/pnpm-11\.5\.2\.tgz' "$reference_dockerfile" \
-      || ! rg -q 'test "\$\(pnpm --version\)" = "11\.5\.2"' "$reference_dockerfile"; then
+  if ! rg -q "${pnpm_sha512}  /tmp/pnpm-12\\.15\\.0\\.tgz" "$reference_dockerfile" \
+      || ! rg -q 'npm install --global /tmp/pnpm-12\.15\.0\.tgz' "$reference_dockerfile" \
+      || ! rg -q 'test "\$\(pnpm --version\)" = "12\.15\.0"' "$reference_dockerfile"; then
     echo "reference image Dockerfiles must verify the pinned pnpm bootstrap" >&2
     exit 1
   fi

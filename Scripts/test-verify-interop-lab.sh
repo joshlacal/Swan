@@ -100,15 +100,17 @@ if any(line.startswith("+") and not line[1:].strip() for line in lines if not li
   raise SystemExit("reference relay overlay patch contains a whitespace-only addition")
 PY
 
-branch_base="a9bbd311b3f3d59e0b8fba851eecb949052e1ade"
+# Callers validating a later change set may name its recorded source baseline.
+# The historical Task 7 default remains available for the original branch audit.
+branch_base="${SWAN_INTEROP_DIFF_BASE:-a9bbd311b3f3d59e0b8fba851eecb949052e1ade}"
 branch_head="$(jj log -r '@' --no-graph -T 'commit_id')"
 branch_whitespace="${temporary_directory}/branch-whitespace.log"
 if ! git --git-dir="$(jj git root)" diff --check "${branch_base}..${branch_head}" \
   >"$branch_whitespace" 2>&1; then
   cat "$branch_whitespace" >&2
-  fail "Task 7 branch diff contains whitespace errors"
+  fail "selected branch diff contains whitespace errors"
 fi
-[[ ! -s "$branch_whitespace" ]] || fail "Task 7 branch diff emitted whitespace diagnostics"
+[[ ! -s "$branch_whitespace" ]] || fail "selected branch diff emitted whitespace diagnostics"
 
 # Break caught: reducing hunks to zero context must not change either Indigo
 # source file produced by the already-reviewed private-upstream overlay.
@@ -123,7 +125,7 @@ docker run --rm --network none --user "$(id -u):$(id -g)" \
   --mount "type=bind,src=${root},dst=/workspace,readonly" \
   --mount "type=bind,src=${custom_overlay},dst=/overlay" \
   --entrypoint /usr/local/go/bin/go \
-  'docker.io/library/golang@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b' \
+  'docker.io/library/golang@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5' \
   run /workspace/interop/apply-reference-relay-overlay.go /overlay \
     /workspace/interop/reference-relay-overlay/reference-relay-private-upstream.patch
 cmp "$overlay_subscription_probe/cmd/relay/relay/host_checker.go" \
@@ -262,7 +264,7 @@ mutate_relay_file_and_require_rejection \
 mutate_relay_file_and_require_rejection \
   relay-builder-digest-mismatch \
   "$relay_dockerfile" \
-  'FROM docker.io/library/golang@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b AS build' \
+  'FROM docker.io/library/golang@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5 AS build' \
   'FROM docker.io/library/golang@sha256:0000000000000000000000000000000000000000000000000000000000000000 AS build' \
   SWAN_INTEROP_REFERENCE_RELAY_DOCKERFILE \
   'reference relay Dockerfile must use the checksum-pinned Bookworm builder and static offline CGO recipe'
@@ -278,7 +280,7 @@ mutate_relay_file_and_require_rejection \
 mutate_relay_file_and_require_rejection \
   relay-runtime-image-drift \
   "$relay_dockerfile" \
-  'FROM docker.io/library/golang@sha256:727cfc3c40be55cd1bc9a4a059406b28a059857e3be752aa9d09531e12c20c56' \
+  'FROM docker.io/library/golang@sha256:754d5200fc3edae76d3b6598a9a3fac7e74981ee6a5413ab955025f185753ef2' \
   'FROM docker.io/library/golang@sha256:0000000000000000000000000000000000000000000000000000000000000000' \
   SWAN_INTEROP_REFERENCE_RELAY_DOCKERFILE \
   'reference relay Dockerfile must use the pinned Alpine runtime image'

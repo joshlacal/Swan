@@ -51,6 +51,10 @@ Swan/artifacts
 Swan/artifacts/**
 Swan/.interop-live
 Swan/.interop-live/**
+Swan/**/node_modules
+Swan/**/node_modules/**
+Swan/AppleTV/swan-vault/target
+Swan/AppleTV/swan-vault/target/**
 Swan/web/node_modules
 Swan/web/node_modules/**
 Swan/web/.svelte-kit

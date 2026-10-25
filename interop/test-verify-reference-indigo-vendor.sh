@@ -96,11 +96,11 @@ import sys
 source, destination, field, value = sys.argv[1:]
 document = json.loads(pathlib.Path(source).read_text(encoding="utf-8"))
 document.update({
-    "relayBuilderImage": "docker.io/library/golang@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b",
-    "relayBuilderImageDigest": "sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b",
-    "relayBuilderManifestDigest": "sha256:b58a2431884c6dfc5ddcea953c7f426ad72c2ff9e94b4b8495fefa74e4dabcc0",
+    "relayBuilderImage": "docker.io/library/golang@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5",
+    "relayBuilderImageDigest": "sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5",
+    "relayBuilderManifestDigest": "sha256:d3f61539a5743b1f1815ba8dd3627202f55262fb09380feda1d585ccf5a9850e",
     "relayBuilderPlatform": "linux/arm64/v8",
-    "relayBuilderGoVersion": "go1.26.4",
+    "relayBuilderGoVersion": "go1.27.3",
 })
 if field == "__missing__":
     del document[value]

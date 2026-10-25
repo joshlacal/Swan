@@ -785,7 +785,7 @@ activation_sync_count=sum(1 for index,kind in enumerate(event_kinds) if index ==
 manual_sync_count=sum(1 for index,kind in enumerate(event_kinds) if index == len(event_kinds) - 1 and kind == "sync")
 artifact={
  "schemaVersion":2,"scenario":"swan-reference-relay-phase5","status":"passed","swanHead":swan_head,
- "indigo":{"commit":"8b43a326dbbb394f63b6d68761553cdfe25532de","sourceSHA256":"bc6f57e6211560220ac49dc7d6b55c5a43291f1e1193113ce413ffe4478fdd0b","vendorSHA256":"8dc18074f7833f610c622fc698bed545511a32dd633c348825560ee9b2878b4e","imageID":image_id},
+ "indigo":{"commit":"8b43a326dbbb394f63b6d68761553cdfe25532de","sourceSHA256":"bc6f57e6211560220ac49dc7d6b55c5a43291f1e1193113ce413ffe4478fdd0b","vendorSHA256":"ee11abd21e9ba70aabc013e92f877b248fdd381ea7de35a3c76f85857217c8c1","imageID":image_id},
  "freshState":{"volume":"swan-interop-alpha_reference-relay-data","removed":True,"listHostsCount":0},
  "orderedSteps":["fresh_state","crawl","subscription_open","admission_sync","public_host_entry","account_activation","activation_lifecycle","first_commit","offline_five_commit_recovery","manual_sync"],
  "admission":{"syncEmissionCount":int(admission_count_raw),"publicHostObserved":host_observed_raw=="1"},

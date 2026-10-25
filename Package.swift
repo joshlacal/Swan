@@ -6,7 +6,7 @@ import PackageDescription
 let petrelDependency: Package.Dependency = ProcessInfo.processInfo.environment["PETREL_PACKAGE_PATH"]
     .map { .package(path: $0) }
     ?? .package(url: "https://github.com/joshlacal/Petrel.git",
-                revision: "cc2999e1f4746a7c246d76dce09f4176ec0768a1")
+                revision: "819e6fc3363e4b0973b191a593af6b0f25b63bf3")
 
 let package = Package(
     name: "Swan",
