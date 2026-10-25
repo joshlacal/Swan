@@ -11,7 +11,10 @@ once.
 
 ## Use the right tree, and prove it before you trust the output
 
-The procedure below works **only** against a full checkout of `bddc99fb`. Against
+The generator runs **only** against committed source at `bddc99fb`. The
+verification script accepts any local Git repository containing that exact
+commit and exports its package trees read-only, without using or changing the
+working copy. Against
 that tree it runs with no source patching at all. Against Swan's *other* pinned
 upstream commit — `3f6c96d5…`, the one in `.interop-cache/` that
 `interop/fetch-reference.sh` and `THIRD_PARTY_NOTICES.md` name — it needs 80

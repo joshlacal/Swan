@@ -13,14 +13,9 @@
 #   SWAN_UPSTREAM_ATPROTO=/path/to/atproto-at-bddc99fb \
 #     Scripts/upstream-scope-goldens/verify-corpus-zero-diff.sh
 #
-# The upstream tree must be a FULL checkout of the pinned commit — a subtree
-# export is what produced five invented "no upstream source exists" open
-# questions in the first draft of the spec. It must contain
-# packages/oauth/oauth-scopes/src/scopes/space-permission.ts; a tree without it
-# is not bddc99fb and this script refuses it.
-#
-# The upstream tree is COPIED to a scratch directory before any mutation, so the
-# caller's checkout is never modified.
+# The repository must contain the exact pinned commit and its complete package
+# trees. Only committed objects are exported; the current branch and working
+# copy are never used or modified.
 
 set -euo pipefail
 
@@ -37,26 +32,16 @@ fail() { printf 'verify-corpus-zero-diff: %s\n' "$1" >&2; exit 1; }
 upstream="${SWAN_UPSTREAM_ATPROTO:-}"
 [ -n "$upstream" ] || fail \
   "set SWAN_UPSTREAM_ATPROTO to a full checkout of bluesky-social/atproto at $REFERENCE_COMMIT"
-[ -d "$upstream/packages/oauth/oauth-scopes/src" ] || fail \
-  "$upstream is not an atproto checkout (packages/oauth/oauth-scopes/src missing)"
-
-# Positive control for "this is the pinned tree, not an older export". The space
-# plane lands with the scopes work; a tree lacking it predates the pin, and every
-# `space:` vector generated from it would be silently wrong rather than absent.
-[ -f "$upstream/packages/oauth/oauth-scopes/src/scopes/space-permission.ts" ] || fail \
-  "$upstream lacks scopes/space-permission.ts — that tree is NOT $REFERENCE_COMMIT"
-
 command -v git  >/dev/null || fail "git not on PATH"
 command -v node >/dev/null || fail "node not on PATH"
 command -v npm  >/dev/null || fail "npm not on PATH"
 
-status_output="$(git -C "$upstream" status --porcelain -uall 2>/dev/null || true)"
-[ -z "$status_output" ] || fail \
-  "$upstream working tree is not clean (porcelain status non-empty)"
-
-actual_commit="$(git -C "$upstream" rev-parse HEAD 2>/dev/null || true)"
+actual_commit="$(git -C "$upstream" rev-parse "${REFERENCE_COMMIT}^{commit}" 2>/dev/null || true)"
 [ "$actual_commit" = "$REFERENCE_COMMIT" ] || fail \
-  "$upstream HEAD ($actual_commit) does not match reference commit $REFERENCE_COMMIT"
+  "$upstream does not contain exact reference commit $REFERENCE_COMMIT"
+git -C "$upstream" cat-file -e \
+  "${REFERENCE_COMMIT}:packages/oauth/oauth-scopes/src/scopes/space-permission.ts" \
+  || fail "pinned tree lacks scopes/space-permission.ts"
 node_major="$(node -p 'process.versions.node.split(".")[0]')"
 [ "$node_major" -ge 22 ] || fail "node >= 22 required for --experimental-transform-types (found $(node -v))"
 
@@ -67,12 +52,12 @@ up="$scratch/atproto"
 gen="$scratch/gen"
 mkdir -p "$gen"
 
-printf 'verify-corpus-zero-diff: extracting tracked upstream tree at HEAD ...\n' >&2
+printf 'verify-corpus-zero-diff: extracting exact pinned upstream commit ...\n' >&2
 # Extract only the packages the generator's import graph reaches directly from git
-# at HEAD. This guarantees gitignored residue or untracked modifications in the
+# at the pinned commit. This guarantees gitignored residue or modifications in the
 # upstream working tree cannot enter the generation tree.
 mkdir -p "$up"
-git -C "$upstream" archive HEAD \
+git -C "$upstream" archive "$REFERENCE_COMMIT" \
   packages/did \
   packages/syntax \
   packages/lex/lex-document \
