@@ -569,7 +569,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         )
     }
 
-    func testRecipientDeletionPreservesAuthoredRepositoryAndClearsOnlyItsStaleOutbox() async throws {
+    func testRecipientDeletionLeavesAuthoredRepositoryOpenAndClearsOnlyItsStaleOutbox() async throws {
         let fixture = try NotificationFixture()
         let writerDatabase = try await SQLiteAccountDatabase(
             dataDirectory: fixture.root,
@@ -651,9 +651,11 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         )
         XCTAssertEqual(receiptRows.first?.column("row_count")?.integer, 1)
 
-        // The notice withdraws shared access even while the issued credential
-        // is otherwise unexpired. Every facade must carry the request context
-        // into its SQLite read snapshot, including metadata-only methods.
+        // SWAN-SYNC-1: the recipient tombstone closes replicated and derived
+        // state only. The member's own repository stays readable through
+        // every shared facade, as upstream leaves member repositories
+        // untouched and a recreated space must be able to read them again
+        // (October 22 section 6).
         for authorization in [
             sharedCredential,
             AuthorizationContext.service(subject: fixture.reader, audience: fixture.authority),
@@ -684,9 +686,8 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             for (name, read) in sharedReads {
                 do {
                     try await read()
-                    XCTFail("\(name) exposed member data through shared authorization after deletion")
-                } catch let error as SwanError {
-                    XCTAssertEqual(error, .unauthorized("permissioned space is closed"), name)
+                } catch {
+                    XCTFail("\(name) closed the member's own repository after a recipient deletion: \(error)")
                 }
             }
         }
@@ -704,8 +705,11 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         XCTAssertEqual(updated?.value, postDeletionValue)
         let sibling = try await writerDatabase.repositoryState(space: fixture.secondarySpace, author: fixture.writer)
         XCTAssertEqual(sibling?.revision, 1)
+        // A post-deletion write still announces itself to the authority, so
+        // a recreated space learns of the member's new state.
         let outboxAfterWrite = try await writerDatabase.pendingOutbox()
-        XCTAssertEqual(outboxAfterWrite.map(\.space), [fixture.secondarySpace])
+        XCTAssertEqual(Set(outboxAfterWrite.map(\.space)), [fixture.space, fixture.secondarySpace])
+        XCTAssertEqual(outboxAfterWrite.filter { $0.space == fixture.space }.map(\.revision), [2])
 
         try await writerDatabase.close()
         let reopened = try await SQLiteAccountDatabase(dataDirectory: fixture.root, did: fixture.writer)

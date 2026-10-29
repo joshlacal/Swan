@@ -3,10 +3,41 @@ import SQLiteNIO
 import SwanCore
 import SwanSpaces
 
+/// The retained recipient deletion for one remote space: the authority's
+/// deletion event and when this account recorded it.
+public struct RecipientSpaceDeletionTombstone: Sendable, Equatable {
+    public let deletionEventID: String
+    public let closedAt: Date
+}
+
 extension SQLiteAccountDatabase {
+    /// The recipient tombstone that closes replicated state for `space`, or
+    /// `nil` when none is retained. Operators read it before adopting a
+    /// recreated space (`swan account adopt-recreated-space`).
+    public func recipientSpaceDeletionTombstone(
+        _ space: SpaceURI
+    ) async throws -> RecipientSpaceDeletionTombstone? {
+        try await withReadConnectionGate {
+            let rows = try await readConnection.query("""
+                SELECT deletion_event_id, closed_at FROM permissioned_space_recipient_tombstones WHERE space_uri = ?
+                """, [.text(space.rawValue)])
+            guard let row = rows.first else { return nil }
+            guard let eventID = row.column("deletion_event_id")?.string,
+                  let closedAt = row.column("closed_at")?.integer, closedAt >= 0 else {
+                throw SQLiteRepositoryError.corruptDatabase("recipient tombstone is invalid")
+            }
+            return RecipientSpaceDeletionTombstone(
+                deletionEventID: eventID,
+                closedAt: Date(timeIntervalSince1970: Double(closedAt) / 1_000_000)
+            )
+        }
+    }
+
     /// Explicit owner-selected lifecycle transition. `authorization` and the
     /// issue time must come from the same freshly verified authority JWT.
-    /// A read or retry must never call this method automatically.
+    /// A read or retry must never call this method automatically; the
+    /// production caller is the operator command
+    /// `swan account adopt-recreated-space`.
     public func adoptRecreatedRemoteSpace(
         _ space: SpaceURI, expectedDeletionEventID: String,
         authorization: AuthorizationContext, credentialIssuedAt: Date,
