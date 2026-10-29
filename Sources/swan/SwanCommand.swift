@@ -1166,7 +1166,7 @@ private func decodeBase64URLOAuthServerKey(_ value: Data) throws -> Data {
     return key
 }
 
-private func readBoundedRegularFileNoFollow(
+func readBoundedRegularFileNoFollow(
     _ url: URL,
     maximumBytes: Int,
     requireOwnerOnly: Bool = false,
@@ -5221,7 +5221,7 @@ extension SwanCommand {
             subcommands: [
                 InstallLocal.self, PreparePLC.self, ActivatePLC.self, RotatePLC.self, Show.self,
                 RecoveryCommitKey.self, KEMMethod.self, Deactivate.self, Reactivate.self, DeclareExport.self,
-                Delete.self,
+                Delete.self, AdoptRecreatedSpace.self,
             ]
         )
 
@@ -10000,7 +10000,7 @@ private func makePermanentDeletionPLCConfiguration(
     }
 }
 
-private enum AccountCommandSupport {
+enum AccountCommandSupport {
     static func authorization(secretFilePath: String?) throws -> AccountOperatorAuthorization {
         do {
             return try OperatorSecretResolver.authorize(

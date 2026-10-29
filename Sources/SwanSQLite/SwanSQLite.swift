@@ -5133,6 +5133,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 ]
             )
 
+            // A recipient deletion tombstone does not suppress this row: the
+            // account's own writes into a recreated space must still reach
+            // the authority (October 1 section 3, October 22 section 6).
             let notificationPayload = opaqueNotificationPayload(eventID: eventID)
             _ = try await connection.query(
                 """
@@ -5140,17 +5143,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     id, space_uri, author_did, revision,
                     payload, attempts, created_at, available_at,
                     lease_token, lease_expires_at
-                ) SELECT ?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM permissioned_space_recipient_tombstones
-                    WHERE space_uri = ?
-                )
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL)
                 """,
                 [
                     .text(eventID.uuidString), .text(space.rawValue),
                     .text(author), .integer(storedFinalRevision),
                     blob(notificationPayload), .integer(createdAt),
-                    .integer(createdAt), .text(space.rawValue),
+                    .integer(createdAt),
                 ]
             )
 
@@ -9335,10 +9334,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         ]
                     )
                 }
-                // Durable notice revokes synchronized access and prevents a
-                // delayed import from reinstalling replicas. It does not erase
-                // the recipient account's own authored repository or blob
-                // namespace; explicit self-read remains available after deletion.
+                // Durable notice purges replicated and derived state and
+                // prevents a delayed import from reinstalling replicas until
+                // an operator adopts a recreated space. It never closes the
+                // recipient account's own authored repository or blob
+                // namespace: credentialed reads and later writes (with their
+                // notifyWrite outbox rows) continue, as upstream leaves member
+                // repositories untouched (October 22 section 6).
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_recipient_tombstones(
@@ -12035,12 +12037,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    /// A verified authority deletion closes any local recipient repository
-    /// without manufacturing remote authority state or applying remote
-    /// operations. This helper is used only while an existing SQLite
-    /// transaction is held, so it cannot race a deletion into a stale read or
-    /// write. It intentionally does not reveal whether the receiver retained
-    /// records before the closure.
+    /// Closes this account's own repository only for this account's authority
+    /// tombstones and restored closures. A recipient deletion tombstone
+    /// (`permissioned_space_recipient_tombstones`) closes replicated and
+    /// derived state only: upstream leaves a member's own repository untouched
+    /// when a remote authority deletes the space, and members' records become
+    /// readable again under a recreated space's policy (October 22 section 6).
+    /// This helper is used only while an existing SQLite transaction is held,
+    /// so it cannot race a deletion into a stale read or write.
     private func requireLocalRepositorySpaceOpen(
         _ space: SpaceURI,
         authorization: AuthorizationContext? = nil,
@@ -12069,10 +12073,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 throw SwanError.unauthorized("permissioned space is closed")
             }
         }
-        let rows = try await conn.query(
-            "SELECT 1 FROM permissioned_space_recipient_tombstones WHERE space_uri = ?",
-            [.text(space.rawValue)]
-        )
         let restoredClosures = try await conn.query(
             """
             SELECT 1
@@ -12083,24 +12083,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
         guard restoredClosures.isEmpty else {
             throw SwanError.unauthorized("permissioned space is closed")
-        }
-        // Low-level operations without a request context are already confined
-        // to this account's own database (writes, restore, and offline export).
-        // Request reads carry the full verified context into this snapshot;
-        // known deletion revokes shared access while preserving own self reads.
-        if !rows.isEmpty, let authorization {
-            switch authorization {
-            case let .accountOAuth(subject, _):
-                guard subject == accountDID else {
-                    throw SwanError.unauthorized("permissioned space is closed")
-                }
-            case let .spaceSelfRead(subject, grantSpace):
-                guard subject == accountDID, grantSpace == space else {
-                    throw SwanError.unauthorized("permissioned space is closed")
-                }
-            default:
-                throw SwanError.unauthorized("permissioned space is closed")
-            }
         }
     }
 
