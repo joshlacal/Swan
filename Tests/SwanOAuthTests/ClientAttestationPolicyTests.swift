@@ -17,7 +17,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let token = try clientAttestation(
             key: key,
             clientID: clientID,
-            audience: "\(authority)#atproto_space_host",
+            audience: "\(authority)#atproto_pds",
             now: now
         )
 
@@ -70,19 +70,19 @@ final class ClientAttestationPolicyTests: XCTestCase {
         for claims in [
             [
                 "iss": clientID, "sub": clientID,
-                "aud": "\(authority)#atproto_space_host",
+                "aud": "\(authority)#atproto_pds",
                 "iat": issuedAt + 60, "exp": issuedAt + 300,
                 "jti": "future-skew-boundary",
             ] as [String: Any],
             [
                 "iss": clientID, "sub": clientID,
-                "aud": "\(authority)#atproto_space_host",
+                "aud": "\(authority)#atproto_pds",
                 "iat": issuedAt - 120, "exp": issuedAt - 60,
                 "jti": "expiry-skew-boundary",
             ] as [String: Any],
             [
                 "iss": clientID, "sub": clientID,
-                "aud": "\(authority)#atproto_space_host",
+                "aud": "\(authority)#atproto_pds",
                 "iat": issuedAt, "exp": issuedAt + 300,
                 "jti": "maximum-lifetime-boundary",
             ] as [String: Any],
@@ -149,7 +149,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let token = try clientAttestation(
             key: key,
             clientID: clientID,
-            audience: "\(authority)#atproto_space_host",
+            audience: "\(authority)#atproto_pds",
             now: now
         )
         let inlineClientID = try await inlinePolicy.verifiedClientID(
@@ -193,7 +193,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let remoteToken = try clientAttestation(
             key: key,
             clientID: remoteClientID,
-            audience: "\(authority)#atproto_space_host",
+            audience: "\(authority)#atproto_pds",
             now: now,
             jti: "remote-jwks-nonce"
         )
@@ -235,7 +235,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let primingToken = try clientAttestation(
             key: oldKey,
             clientID: clientID,
-            audience: "\(authority)#atproto_space_host",
+            audience: "\(authority)#atproto_pds",
             now: now,
             jti: "old-key-prime"
         )
@@ -248,7 +248,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let rotatedToken = try clientAttestation(
             key: newKey,
             clientID: clientID,
-            audience: "\(authority)#atproto_space_host",
+            audience: "\(authority)#atproto_pds",
             now: now,
             jti: "new-key-after-rotation"
         )
@@ -285,7 +285,24 @@ final class ClientAttestationPolicyTests: XCTestCase {
         )
         // Frozen JSON insertion order and IEEE-P1363 low-S signature match
         // proposal-0016's TypeScript `createClientAttestation` shape.
-        let vector = "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0cHJvdG8tY2xpZW50LWF0dGVzdGF0aW9uK2p3dCIsImtpZCI6ImtleS0xIn0.eyJpc3MiOiJodHRwczovL2NsaWVudC5leGFtcGxlL2NsaWVudC1tZXRhZGF0YS5qc29uIiwic3ViIjoiaHR0cHM6Ly9jbGllbnQuZXhhbXBsZS9jbGllbnQtbWV0YWRhdGEuanNvbiIsImF1ZCI6ImRpZDpwbGM6YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4I2F0cHJvdG9fc3BhY2VfaG9zdCIsImlhdCI6MTczODM2ODAwMCwiZXhwIjoxNzM4MzY4MDYwLCJqdGkiOiJ0eXBlc2NyaXB0LXNoYXBlZC1ub25jZS0wMDEifQ.LqTJF5x2Kh8XL-KRxpfJNh9d1CRjDa9KD8C0OFljQt5UtwsXUnu9dpsd2hOSzU4KrJHmX4a_JtB-QWOqlQpE4A"
+        // October 22 (atproto ac0c9f15, guide section 3) moved the audience
+        // to `<authority>#atproto_pds`. This vector is the legacy one below
+        // with only `aud` changed, re-signed by upstream's `P256Keypair.sign`
+        // path: `Scripts/space-token-goldens/sign-client-attestation.mjs`.
+        let vector = "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0cHJvdG8tY2xpZW50LWF0dGVzdGF0aW9uK2p3dCIsImtpZCI6ImtleS0xIn0.eyJpc3MiOiJodHRwczovL2NsaWVudC5leGFtcGxlL2NsaWVudC1tZXRhZGF0YS5qc29uIiwic3ViIjoiaHR0cHM6Ly9jbGllbnQuZXhhbXBsZS9jbGllbnQtbWV0YWRhdGEuanNvbiIsImF1ZCI6ImRpZDpwbGM6YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4I2F0cHJvdG9fcGRzIiwiaWF0IjoxNzM4MzY4MDAwLCJleHAiOjE3MzgzNjgwNjAsImp0aSI6InR5cGVzY3JpcHQtc2hhcGVkLW5vbmNlLTAwMSJ9.4m7YneWWEfaBmGs1QMYwupgyD021rUsue59a2ti712x8ojZwXEw_BmDlkL8irp1hU7UYcnBw5W87Rz096pzvfQ"
+        // The original vector: validly signed by the same key, but with the
+        // retired `#atproto_space_host` audience. It is refused at inspection,
+        // before the client metadata is fetched.
+        let legacyAudienceVector = "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0cHJvdG8tY2xpZW50LWF0dGVzdGF0aW9uK2p3dCIsImtpZCI6ImtleS0xIn0.eyJpc3MiOiJodHRwczovL2NsaWVudC5leGFtcGxlL2NsaWVudC1tZXRhZGF0YS5qc29uIiwic3ViIjoiaHR0cHM6Ly9jbGllbnQuZXhhbXBsZS9jbGllbnQtbWV0YWRhdGEuanNvbiIsImF1ZCI6ImRpZDpwbGM6YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4I2F0cHJvdG9fc3BhY2VfaG9zdCIsImlhdCI6MTczODM2ODAwMCwiZXhwIjoxNzM4MzY4MDYwLCJqdGkiOiJ0eXBlc2NyaXB0LXNoYXBlZC1ub25jZS0wMDEifQ.LqTJF5x2Kh8XL-KRxpfJNh9d1CRjDa9KD8C0OFljQt5UtwsXUnu9dpsd2hOSzU4KrJHmX4a_JtB-QWOqlQpE4A"
+        await assertAttestationFailure(.invalid) {
+            _ = try await policy.verifiedClientID(
+                for: legacyAudienceVector,
+                authority: self.authority,
+                now: self.now
+            )
+        }
+        let requestsBeforeVerification = await transport.requestCount()
+        XCTAssertEqual(requestsBeforeVerification, 0)
         let verified = try await policy.verifiedClientID(
             for: vector,
             authority: authority,
@@ -316,7 +333,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let valid = try clientAttestation(
             key: key,
             clientID: clientID,
-            audience: "\(authority)#atproto_space_host",
+            audience: "\(authority)#atproto_pds",
             now: now
         )
         let parts = valid.split(separator: ".").map(String.init)
@@ -327,7 +344,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let unknownKey = try clientAttestation(
             key: key,
             clientID: clientID,
-            audience: "\(authority)#atproto_space_host",
+            audience: "\(authority)#atproto_pds",
             now: now,
             jti: "unknown-key-nonce",
             keyID: "unknown-key"
@@ -363,7 +380,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         )
         let expiresAt = now.addingTimeInterval(120)
         let replayClientID = clientID
-        let replayAudience = "\(authority)#atproto_space_host"
+        let replayAudience = "\(authority)#atproto_pds"
         let replayNow = now
         let results = try await withThrowingTaskGroup(of: Bool.self) { group in
             for index in 0 ..< 16 {
@@ -395,7 +412,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         )
         let duplicateAfterReopen = try await reopenedReplay.claim(
             clientID: clientID,
-            audience: "\(authority)#atproto_space_host",
+            audience: "\(authority)#atproto_pds",
             jti: "never-persist-this-raw-jti",
             expiresAt: expiresAt,
             now: now.addingTimeInterval(1)
@@ -403,7 +420,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         XCTAssertFalse(duplicateAfterReopen)
         let differentlyScopedClaim = try await reopenedReplay.claim(
             clientID: clientID,
-            audience: "did:plc:zyxwvutsrqponmlkjihgfedc#atproto_space_host",
+            audience: "did:plc:zyxwvutsrqponmlkjihgfedc#atproto_pds",
             jti: "never-persist-this-raw-jti",
             expiresAt: expiresAt,
             now: now.addingTimeInterval(1)
@@ -411,7 +428,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         XCTAssertTrue(differentlyScopedClaim)
         let duplicateAtFinalAcceptedFraction = try await reopenedReplay.claim(
             clientID: clientID,
-            audience: "\(authority)#atproto_space_host",
+            audience: "\(authority)#atproto_pds",
             jti: "never-persist-this-raw-jti",
             expiresAt: now.addingTimeInterval(240),
             now: now.addingTimeInterval(120.999)
@@ -419,7 +436,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         XCTAssertFalse(duplicateAtFinalAcceptedFraction)
         let reclaimedAfterCleanup = try await reopenedReplay.claim(
             clientID: clientID,
-            audience: "\(authority)#atproto_space_host",
+            audience: "\(authority)#atproto_pds",
             jti: "never-persist-this-raw-jti",
             expiresAt: now.addingTimeInterval(240),
             now: now.addingTimeInterval(121)
@@ -453,7 +470,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let token = try clientAttestation(
             key: try fixedPrivateKey(),
             clientID: "http://localhost",
-            audience: "\(authority)#atproto_space_host",
+            audience: "\(authority)#atproto_pds",
             now: now,
             jti: "localhost-must-never-fetch"
         )
@@ -485,7 +502,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let token = try clientAttestation(
             key: key,
             clientID: clientID,
-            audience: "\(authority)#atproto_space_host",
+            audience: "\(authority)#atproto_pds",
             now: now,
             jti: "outage-safe-description"
         )
@@ -539,7 +556,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
     private func invalidLocalTokens(
         key: P256.Signing.PrivateKey
     ) throws -> [String] {
-        let audience = "\(authority)#atproto_space_host"
+        let audience = "\(authority)#atproto_pds"
         let issuedAt = Int64(now.timeIntervalSince1970)
         let validClaims: [String: Any] = [
             "iss": clientID,
@@ -606,6 +623,12 @@ final class ClientAttestationPolicyTests: XCTestCase {
         values.append(try rawClientAttestation(header: validHeader, claims: claims, key: key))
         claims = validClaims
         claims["aud"] = [audience]
+        values.append(try rawClientAttestation(header: validHeader, claims: claims, key: key))
+        // October 22 (atproto ac0c9f15, guide section 3) moved the audience
+        // from `#atproto_space_host` to `#atproto_pds`. The retired audience
+        // is otherwise a valid attestation and must now be refused.
+        claims = validClaims
+        claims["aud"] = "\(authority)#atproto_space_host"
         values.append(try rawClientAttestation(header: validHeader, claims: claims, key: key))
         for invalidIssuer in [
             "http://client.example/client-metadata.json",
