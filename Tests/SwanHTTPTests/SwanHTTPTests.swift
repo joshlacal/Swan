@@ -16,9 +16,11 @@ import XCTest
 
 final class SwanHTTPTests: XCTestCase {
     func testProfileAndGeneratedWireHaveTheSamePermissionedCoverage() throws {
+        // The active profile, whose lexicon corpus
+        // Scripts/generate-space-descriptors.py turns into SwanSpacesWire.
         let profile = try ProtocolProfile.load(
             from: packageRoot().appending(
-                path: "Profiles/permissioned-data-0016-2026-10-01.json"
+                path: "Profiles/permissioned-data-0016-2026-10-22.json"
             )
         )
         let generated = PermissionedData0016.methods
