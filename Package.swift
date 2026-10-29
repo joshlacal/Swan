@@ -22,9 +22,12 @@ let package = Package(
         .executable(name: "swan", targets: ["swan"]),
     ],
     dependencies: [
-        // Immutable October 22 SDK, generated from the matching pinned corpus.
+        // Immutable October 22 SDK. Its generated sources are unchanged from
+        // generator revision e1152365, which matches the pinned corpus; this
+        // revision adds only runtime fixes (credential refresh margin, precise
+        // exchange errors, getRepo archive cap, per-task download limit).
         .package(url: "https://github.com/joshlacal/Petrel.git",
-                 revision: "e115236537041a900ec971be05185a70cca73e8a"),
+                 revision: "4037e7760e2d1bb71db9a6cfdd0cd4134d4dd3bc"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.36.0"),
