@@ -2781,6 +2781,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePublicRepositoryRequestReceiptRetentionIfNeeded()
             try await backfillPublicRepositoryBlockUsageIfNeeded()
             try await migratePermissionedOutboxCoalescingIfNeeded()
+            try await migratePermissionedSpaceRecordPathIndexIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -6249,14 +6250,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 while true {
                     try Task.checkCancellation()
                     let rows = try await connection.query(
-                        """
-                        SELECT collection, rkey, cid, revision, length(value) AS value_byte_count
-                        FROM permissioned_space_records
-                        WHERE space_uri = ? AND author_did = ?
-                          AND CAST(collection || '/' || rkey AS BLOB) > ?
-                        ORDER BY CAST(collection || '/' || rkey AS BLOB)
-                        LIMIT 1
-                        """,
+                        Self.repositorySTARNextRecordSQL,
                         [.text(space.rawValue), .text(author), cursor.sqliteData!]
                     )
                     guard let row = rows.first else { break }
