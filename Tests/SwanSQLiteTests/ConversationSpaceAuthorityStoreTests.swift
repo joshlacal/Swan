@@ -113,11 +113,15 @@ final class ConversationSpaceAuthorityStoreTests: XCTestCase {
         } catch { try? await reopened.close(); throw error }
     }
 
-    func testOwedRecipientsSurviveExpiryOutageRestartAndPartialDrainWithoutRenewal() async throws {
+    /// SWAN-SYNC-3: owed recipients survive a delivery-service outage,
+    /// restart and partial drain, but only until their own registration
+    /// expires (October 22 section 6), mirroring simple spaces.
+    func testOwedRecipientsSurviveOutageRestartAndPartialDrainUntilRegistrationExpiry() async throws {
         let fixture = try ConversationAuthorityFixture()
         let start = Date(timeIntervalSince1970: 100)
-        let expiry = Date(timeIntervalSince1970: 101)
+        let expiry = Date(timeIntervalSince1970: 300)
         let delayed = Date(timeIntervalSince1970: 200)
+        let lapsed = Date(timeIntervalSince1970: 301)
         let database = try await fixture.open()
         let deletion: ConversationSpaceDeletion
         do {
@@ -131,7 +135,7 @@ final class ConversationSpaceAuthorityStoreTests: XCTestCase {
             deletion = try await database.beginConversationSpaceDeletion(space: fixture.space, authorization: fixture.ownerAuthorization, now: start)
             let owed = try await database.connection.query("SELECT endpoint, registration_expires_at FROM conversation_space_deletion_recipients WHERE space_uri = ?", [.text(fixture.space.rawValue)])
             XCTAssertEqual(owed.count, 2, "only recipients authenticated and active at deletion begin are owed the terminal signal")
-            XCTAssertTrue(owed.allSatisfy { $0.column("registration_expires_at")?.integer == 101_000_000 })
+            XCTAssertTrue(owed.allSatisfy { $0.column("registration_expires_at")?.integer == 300_000_000 })
             try await database.deferConversationSpaceDeletion(deletion, now: Date(timeIntervalSince1970: 150))
             try await database.close()
         } catch { try? await database.close(); throw error }
@@ -145,7 +149,7 @@ final class ConversationSpaceAuthorityStoreTests: XCTestCase {
                 XCTAssertEqual(destination?.serviceIdentity, fixture.service)
             }
             let originalExpiry = try await reopened.connection.query("SELECT expires_at FROM permissioned_space_notification_registrations WHERE space_uri = ? AND endpoint = ?", [.text(fixture.space.rawValue), .text(fixture.endpoint)])
-            XCTAssertEqual(originalExpiry.first?.column("expires_at")?.integer, 101_000_000, "a terminal obligation must never synthesize a renewed registration")
+            XCTAssertEqual(originalExpiry.first?.column("expires_at")?.integer, 300_000_000, "a terminal obligation must never synthesize a renewed registration")
             let firstLease = try await reopened.leaseNextNotificationFanout(now: delayed, leaseDuration: 30)
             let first = try XCTUnwrap(firstLease)
             let failed = try await reopened.failNotificationFanoutLease(eventID: first.event.id, token: first.token, retryAt: delayed.addingTimeInterval(1))
@@ -158,9 +162,13 @@ final class ConversationSpaceAuthorityStoreTests: XCTestCase {
             XCTAssertTrue(firstAcknowledged)
             let retained = try await reopened.connection.query("SELECT 1 FROM conversation_space_deletion_recipients WHERE space_uri = ?", [.text(fixture.space.rawValue)])
             XCTAssertEqual(retained.count, 2, "partial completion retains the immutable recipient snapshot")
-            let retriedLease = try await reopened.leaseNextNotificationFanout(now: delayed.addingTimeInterval(1), leaseDuration: 30)
+            // Retries stop once that recipient's registration has expired:
+            // the transport treats a nil registration as a delivered no-op.
+            let retriedLease = try await reopened.leaseNextNotificationFanout(now: lapsed, leaseDuration: 30)
             let retried = try XCTUnwrap(retriedLease)
             XCTAssertEqual(retried.event.id, first.event.id)
+            let expiredDestination = try await reopened.currentSpaceDeletionDeliveryRegistration(for: retried.event, now: lapsed)
+            XCTAssertNil(expiredDestination, "an expired registration is no longer owed the deletion")
             let finalAcknowledged = try await reopened.completeNotificationFanoutLease(eventID: retried.event.id, token: retried.token)
             XCTAssertTrue(finalAcknowledged)
             let drained = try await reopened.connection.query("SELECT 1 FROM conversation_space_deletion_recipients WHERE space_uri = ?", [.text(fixture.space.rawValue)])

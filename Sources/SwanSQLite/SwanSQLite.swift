@@ -8955,6 +8955,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return try await withReadConnectionGate {
             try await readTransaction {
                 if notification.space.spaceType == "blue.catbird.labyrinth.conversation" {
+                    // SWAN-SYNC-3: like the simple-space branch below, a
+                    // recipient is owed the deletion only until its
+                    // registration expires (October 22 section 6). An expired
+                    // recipient renews its credential and is answered
+                    // SpaceDeleted; its row is acknowledged and pruned.
                     let owed = try await readConnection.query(
                         """
                         SELECT recipient.delivery_service_did
@@ -8965,8 +8970,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                           AND pending.source_event_id = recipient.deletion_event_id AND pending.endpoint = recipient.endpoint
                         WHERE pending.id = ? AND pending.source_issuer = ? AND pending.source_event_id = ?
                           AND pending.kind = 'deleted' AND pending.space_uri = ? AND pending.endpoint = ?
+                          AND recipient.registration_expires_at > ?
                         """, [.text(notification.id.uuidString), .text(notification.sourceIssuer),
-                               .text(notification.sourceEventID), .text(notification.space.rawValue), .text(notification.endpoint)])
+                               .text(notification.sourceEventID), .text(notification.space.rawValue), .text(notification.endpoint),
+                               .integer(timestamp)])
                     guard let row = owed.first else { return nil }
                     let service = row.column("delivery_service_did")?.string
                     if let service, !Self.isValidNotificationServiceIdentity(service) {
