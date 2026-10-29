@@ -384,6 +384,54 @@ public actor FileAccountKeyStore:
         failDirectoryIterationAfterEntryCount = nil
     }
 
+    /// Startup-only, read-only twin of
+    /// `init(existingRootDirectoryDescriptor:configuration:)` for a key root
+    /// already opened and validated with `O_NOFOLLOW`. It applies the same
+    /// checks to the root's contents (writer lock, active-KEK marker,
+    /// interrupted provisioning journal) and throws where that initializer
+    /// would, but it creates, repairs, installs and removes nothing: an
+    /// existing writer lock is opened read-only and held shared while the
+    /// marker and journal are read, a missing lock or marker is left
+    /// missing, and a journal is authenticated without being recovered.
+    /// `serve` calls this before its service-directory lease, so bad key-root
+    /// contents are refused before the data directory exists. It does not
+    /// replace the initializer, which still runs under the lease and can
+    /// still fail on I/O.
+    @_spi(ServeStartup)
+    public static func preflightExistingRoot(
+        directoryDescriptor descriptor: Int32,
+        configuration: AccountKeyEncryptionConfiguration
+    ) throws {
+        let readOnlyLock = try openExistingLockFileReadOnly(
+            directoryDescriptor: descriptor
+        )
+        defer { if let readOnlyLock { _ = close(readOnlyLock) } }
+        let checkContents = {
+            if try entryExists(
+                named: activeKeyMarkerFilename,
+                directoryDescriptor: descriptor
+            ) {
+                _ = try readActiveKeyMarker(directoryDescriptor: descriptor)
+            }
+            if let journal = try readProvisioningJournal(
+                directoryDescriptor: descriptor
+            ) {
+                for entry in journal.entries {
+                    _ = try checkJournalEntry(
+                        entry,
+                        configuration: configuration,
+                        directoryDescriptor: descriptor
+                    )
+                }
+            }
+        }
+        if let readOnlyLock {
+            try withSharedLock(readOnlyLock, checkContents)
+        } else {
+            try checkContents()
+        }
+    }
+
     init(
         root: URL,
         configuration: AccountKeyEncryptionConfiguration,
@@ -1388,6 +1436,52 @@ public actor FileAccountKeyStore:
         return try body()
     }
 
+    /// The preflight's view of the writer lock: `nil` when it does not
+    /// exist yet (the initializer would create it), otherwise a read-only
+    /// descriptor that passed the checks `openLockFile` applies after
+    /// opening. Its mode is not checked because `openLockFile` repairs it.
+    /// `O_NONBLOCK` keeps a FIFO planted at the lock path from blocking the
+    /// open; it does not affect `flock`.
+    private static func openExistingLockFileReadOnly(
+        directoryDescriptor: Int32
+    ) throws -> Int32? {
+        let descriptor = openat(
+            directoryDescriptor,
+            lockFilename,
+            O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        )
+        if descriptor < 0 {
+            guard errno == ENOENT else {
+                throw SwanError.unavailable("could not open account key-store writer lock")
+            }
+            return nil
+        }
+        var status = stat()
+        guard fstat(descriptor, &status) == 0,
+              (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              status.st_uid == geteuid(),
+              status.st_nlink == 1 else {
+            _ = close(descriptor)
+            throw SwanError.unavailable("account key-store writer lock failed validation")
+        }
+        return descriptor
+    }
+
+    private static func withSharedLock<Result>(
+        _ descriptor: Int32,
+        _ body: () throws -> Result
+    ) throws -> Result {
+        while flock(descriptor, LOCK_SH) != 0 {
+            guard errno == EINTR else {
+                throw SwanError.unavailable("could not acquire account key-store writer lock")
+            }
+        }
+        defer {
+            while flock(descriptor, LOCK_UN) != 0, errno == EINTR {}
+        }
+        return try body()
+    }
+
     private static func initializeActiveKeyMarkerIfNeeded(
         directoryDescriptor: Int32,
         activeKeyID: String
@@ -1423,15 +1517,45 @@ public actor FileAccountKeyStore:
         return keyID
     }
 
+    /// Finishes an interrupted provisioning batch. Each entry is checked
+    /// (read-only) and, when not yet installed, installed before the next
+    /// entry is checked; the journal is removed last.
     private static func recoverProvisioningJournal(
         directoryDescriptor: Int32,
         configuration: AccountKeyEncryptionConfiguration
     ) throws {
+        guard let journal = try readProvisioningJournal(
+            directoryDescriptor: directoryDescriptor
+        ) else {
+            return
+        }
+        for entry in journal.entries {
+            let installed = try checkJournalEntry(
+                entry,
+                configuration: configuration,
+                directoryDescriptor: directoryDescriptor
+            )
+            if !installed {
+                try installCreateOnly(
+                    entry.envelope,
+                    named: entry.filename,
+                    directoryDescriptor: directoryDescriptor
+                )
+            }
+        }
+        try remove(named: journalFilename, directoryDescriptor: directoryDescriptor)
+    }
+
+    /// Reads and structurally validates the provisioning journal without
+    /// acting on it; `nil` when there is none.
+    private static func readProvisioningJournal(
+        directoryDescriptor: Int32
+    ) throws -> ProvisioningJournal? {
         guard try entryExists(
             named: journalFilename,
             directoryDescriptor: directoryDescriptor
         ) else {
-            return
+            return nil
         }
         let encoded = try readProtected(
             named: journalFilename,
@@ -1455,29 +1579,35 @@ public actor FileAccountKeyStore:
               }) else {
             throw SwanError.malformed("invalid account key provisioning journal")
         }
+        return journal
+    }
 
-        for entry in journal.entries {
-            try validateJournalEntry(entry, configuration: configuration)
-            if try entryExists(
-                named: entry.filename,
-                directoryDescriptor: directoryDescriptor
-            ) {
-                guard try readProtected(
-                    named: entry.filename,
-                    maximumBytes: maximumEnvelopeBytes,
-                    directoryDescriptor: directoryDescriptor
-                ) == entry.envelope else {
-                    throw SwanError.conflict(expected: 0, actual: 1)
-                }
-            } else {
-                try installCreateOnly(
-                    entry.envelope,
-                    named: entry.filename,
-                    directoryDescriptor: directoryDescriptor
-                )
-            }
+    /// Authenticates one journal entry against `configuration` and compares
+    /// it with any envelope already installed under its name. Returns
+    /// whether that envelope is installed; never installs it. Entry names
+    /// are unique, so installing one entry cannot change another's verdict,
+    /// and a read-only pass over all entries reaches the verdict recovery
+    /// would.
+    private static func checkJournalEntry(
+        _ entry: JournalEntry,
+        configuration: AccountKeyEncryptionConfiguration,
+        directoryDescriptor: Int32
+    ) throws -> Bool {
+        try validateJournalEntry(entry, configuration: configuration)
+        guard try entryExists(
+            named: entry.filename,
+            directoryDescriptor: directoryDescriptor
+        ) else {
+            return false
         }
-        try remove(named: journalFilename, directoryDescriptor: directoryDescriptor)
+        guard try readProtected(
+            named: entry.filename,
+            maximumBytes: maximumEnvelopeBytes,
+            directoryDescriptor: directoryDescriptor
+        ) == entry.envelope else {
+            throw SwanError.conflict(expected: 0, actual: 1)
+        }
+        return true
     }
 
     private static func validateJournalEntry(
