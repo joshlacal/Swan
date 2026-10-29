@@ -1585,7 +1585,7 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
         for artifact in artifacts {
             XCTAssertFalse(
                 FileManager.default.fileExists(atPath: artifact.path),
-                "(label): unexpected startup artifact (artifact.lastPathComponent)"
+                "\(label): unexpected startup artifact \(artifact.lastPathComponent)"
             )
         }
     }
