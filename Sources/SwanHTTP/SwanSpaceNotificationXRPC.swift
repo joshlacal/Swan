@@ -506,7 +506,8 @@ private struct AuthenticatedNotifySpaceDeletedHandler:
                 issuer: service.issuer,
                 audience: recipientAccount,
                 eventID: service.eventID,
-                requestBodyDigest: verifiedDigest
+                requestBodyDigest: verifiedDigest,
+                issuedAt: service.issuedAt
             )
         } catch {
             throw notificationStorageFailure(error)

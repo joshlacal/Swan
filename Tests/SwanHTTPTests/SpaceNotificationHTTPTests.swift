@@ -1233,7 +1233,9 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                         issuer: authority,
                         audience: writer,
                         eventID: "service-event-5",
-                        requestBodyDigest: expectedDelDigest
+                        requestBodyDigest: expectedDelDigest,
+                        // SW-A: the route hands the token's iat to the receiver.
+                        issuedAt: NotificationServiceVerifier.boundDeletionIssuedAt
                     ),
                 ]
             )
@@ -1894,8 +1896,25 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
         eventID: String,
         requestBodyDigest: String
     ) async throws {
+        try await receiveSpaceDeletionNotification(
+            space: space, issuer: issuer, audience: audience, eventID: eventID,
+            requestBodyDigest: requestBodyDigest, issuedAt: nil
+        )
+    }
+
+    func receiveSpaceDeletionNotification(
+        space: SpaceURI,
+        issuer: String,
+        audience: String,
+        eventID: String,
+        requestBodyDigest: String,
+        issuedAt: Date?
+    ) async throws {
         deletionsValue.append(
-            .init(space: space, issuer: issuer, audience: audience, eventID: eventID, requestBodyDigest: requestBodyDigest)
+            .init(
+                space: space, issuer: issuer, audience: audience, eventID: eventID,
+                requestBodyDigest: requestBodyDigest, issuedAt: issuedAt
+            )
         )
     }
 
@@ -1912,6 +1931,7 @@ struct RecordedSpaceDeletion: Sendable, Equatable {
     let audience: String
     let eventID: String
     let requestBodyDigest: String
+    var issuedAt: Date? = nil
 }
 
 private struct NotificationNoSigningKeyResolver: SpaceCredentialSigningKeyResolver {
@@ -2031,7 +2051,12 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
         let audience: String
         let eventID: String
         let requestBodyDigest: String?
+        var issuedAt: Date? = nil
     }
+
+    /// The `iat` the bound deletion token carries, so the route test can see
+    /// it reach the durable receiver (SW-A).
+    static let boundDeletionIssuedAt = Date(timeIntervalSince1970: 1_800_000_000)
 
     /// The pinned reference PDS registers a raw endpoint as the recipient
     /// service identity, so the binding key is not a DID.
@@ -2167,7 +2192,8 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
                     issuer: authority,
                     audience: NotificationServiceVerifier.boundRecipientIdentity,
                     eventID: "service-event-5",
-                    requestBodyDigest: digest
+                    requestBodyDigest: digest,
+                    issuedAt: NotificationServiceVerifier.boundDeletionIssuedAt
                 )
             default:
                 throw SwanError.unauthorized("service authentication is invalid")
@@ -2190,7 +2216,8 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
             method: expectedMethod,
             eventID: meta.eventID,
             requestBodyDigest: meta.requestBodyDigest,
-            expiresAt: Date(timeIntervalSinceNow: 60)
+            expiresAt: Date(timeIntervalSinceNow: 60),
+            issuedAt: meta.issuedAt
         )
     }
 }

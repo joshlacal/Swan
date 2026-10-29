@@ -73,6 +73,9 @@ public struct SwanConversationSpaceLifecycle: AuthorizedSimpleSpaceLifecycleDire
     public func receiveSpaceDeletionNotification(space: SpaceURI, issuer: String, audience: String, eventID: String, requestBodyDigest: String) async throws {
         try await notifications.receiveSpaceDeletionNotification(space: space, issuer: issuer, audience: audience, eventID: eventID, requestBodyDigest: requestBodyDigest)
     }
+    public func receiveSpaceDeletionNotification(space: SpaceURI, issuer: String, audience: String, eventID: String, requestBodyDigest: String, issuedAt: Date?) async throws {
+        try await notifications.receiveSpaceDeletionNotification(space: space, issuer: issuer, audience: audience, eventID: eventID, requestBodyDigest: requestBodyDigest, issuedAt: issuedAt)
+    }
     private func isConversation(_ space: SpaceURI) -> Bool { space.spaceType == "blue.catbird.labyrinth.conversation" }
     private func requireLocalPolicy(_ space: SpaceURI) throws {
         guard !isConversation(space) else { throw SwanError.unauthorized("conversation membership is owned by its delivery service") }

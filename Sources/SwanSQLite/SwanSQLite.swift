@@ -2802,6 +2802,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePermissionedSpaceWriterForeignKeyIfNeeded()
             try await migrateSpaceWriterSequenceIfNeeded()
             try await migrateSpaceNotificationServiceKeysIfNeeded()
+            try await migrateRemoteReplicaLifecycleFenceIfNeeded()
         }
         try await migrateSpaceNotificationReceiptScopeIfNeeded()
         try await compactSpaceNotificationReceiptsIfNeeded()
@@ -9266,12 +9267,19 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
+    /// `issuedAt` is the notice's service-JWT `iat`. Senders mint a fresh
+    /// `jti` per attempt (upstream `createServiceJwt`, and Swan since X2), so
+    /// the event ID cannot tell a retry from a new deletion. The `iat` can:
+    /// a notice signed before the authority issued the credential that
+    /// adopted a recreated space concerns an older lifecycle and is ignored.
+    /// Without an `iat` the notice is honoured.
     public func receiveSpaceDeletionNotification(
         space: SpaceURI,
         issuer: String,
         audience: String,
         eventID: String,
         requestBodyDigest: String,
+        issuedAt: Date? = nil,
         now: Date = Date()
     ) async throws {
         guard issuer == space.authority, audience == accountDID,
@@ -9284,6 +9292,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
         let eventID = try validServiceEventID(eventID)
         let timestamp = try simpleSpaceTimestamp(now)
+        let noticeIssuedAt = Self.authoritySeconds(issuedAt)
         try await withConnectionGate {
             try await transaction {
                 let retired = try await connection.query(
@@ -9291,6 +9300,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     [.text(space.rawValue), .text(eventID)]
                 )
                 guard retired.isEmpty else { return }
+                // SW-A: a notice signed before the newest lifecycle fact this
+                // receiver holds (the adopting credential, or a newer notice)
+                // is a stale retry. It must not re-close an adopted space.
+                if let noticeIssuedAt,
+                   let fence = try await remoteReplicaAuthorityFence(space: space),
+                   noticeIssuedAt < fence {
+                    return
+                }
                 // The deletion service JWT binds the space URI via `req`
                 // (requestBodyDigest) and the event ID is consumed transactionally.
                 // The pinned receiver bounds this by no-oping unless the
@@ -9329,12 +9346,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 guard !participation.isEmpty else { return }
                 let tombstones = try await connection.query(
                     """
-                    SELECT 1
+                    SELECT deletion_event_id
                     FROM permissioned_space_recipient_tombstones
                     WHERE space_uri = ?
                     """,
                     [.text(space.rawValue)]
                 )
+                // A repeat (retried or duplicate) notice finds the tombstone
+                // the first one wrote. It must not touch state created since.
+                let retainedEventID = tombstones.first?.column("deletion_event_id")?.string
                 let duplicate = try await connection.query(
                     """
                     SELECT action, space_uri, request_digest
@@ -9384,7 +9404,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         .integer(timestamp),
                     ]
                 )
-                try await retainRemoteReplicaGenerationFloor(space: space, eventID: eventID)
+                try await retainRemoteReplicaGenerationFloor(
+                    space: space,
+                    eventID: retainedEventID ?? eventID
+                )
+                if let noticeIssuedAt {
+                    try await raiseRemoteReplicaAuthorityFence(space: space, to: noticeIssuedAt)
+                }
                 // Records must precede blocks because their FK deliberately
                 // has no cascade. Block chunks and import staging cascade from
                 // their exact-space parent rows. Repeat notices also clean up
@@ -9404,10 +9430,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         [.text(space.rawValue)]
                     )
                 }
-                _ = try await connection.query(
-                    "DELETE FROM permissioned_space_outbox WHERE space_uri = ?",
-                    [.text(space.rawValue)]
-                )
+                // Only the first notice drops the account's queued notifyWrite
+                // rows for the deleted lifecycle. A repeat must keep rows the
+                // account's own later writes queued (SW-A).
+                if retainedEventID == nil {
+                    _ = try await connection.query(
+                        "DELETE FROM permissioned_space_outbox WHERE space_uri = ?",
+                        [.text(space.rawValue)]
+                    )
+                }
                 _ = try await connection.query(
                     """
                     UPDATE permissioned_space_notification_fanout

@@ -465,8 +465,37 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
         eventID: String,
         requestBodyDigest: String
     ) async throws
+
+    /// The same notice with its service JWT's `iat`, which lets the receiver
+    /// recognize a retry of a deletion older than an adopted recreation. A
+    /// directory that does not implement it drops the `iat`.
+    func receiveSpaceDeletionNotification(
+        space: SpaceURI,
+        issuer: String,
+        audience: String,
+        eventID: String,
+        requestBodyDigest: String,
+        issuedAt: Date?
+    ) async throws
 }
 public extension AuthorizedSpaceNotificationDirectory {
+    func receiveSpaceDeletionNotification(
+        space: SpaceURI,
+        issuer: String,
+        audience: String,
+        eventID: String,
+        requestBodyDigest: String,
+        issuedAt _: Date?
+    ) async throws {
+        try await receiveSpaceDeletionNotification(
+            space: space,
+            issuer: issuer,
+            audience: audience,
+            eventID: eventID,
+            requestBodyDigest: requestBodyDigest
+        )
+    }
+
     func registerSpaceNotification(
         _ registration: AuthorizedSpaceNotificationRegistration,
         authorization: AuthorizationContext

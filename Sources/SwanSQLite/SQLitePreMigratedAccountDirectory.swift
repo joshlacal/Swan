@@ -889,6 +889,24 @@ public actor SQLitePreMigratedAccountDirectory:
         eventID: String,
         requestBodyDigest: String
     ) async throws {
+        try await receiveSpaceDeletionNotification(
+            space: space,
+            issuer: issuer,
+            audience: audience,
+            eventID: eventID,
+            requestBodyDigest: requestBodyDigest,
+            issuedAt: nil
+        )
+    }
+
+    public func receiveSpaceDeletionNotification(
+        space: SpaceURI,
+        issuer: String,
+        audience: String,
+        eventID: String,
+        requestBodyDigest: String,
+        issuedAt: Date?
+    ) async throws {
         guard let database = try await preopenedActiveDatabaseIfHosted(audience) else {
             return
         }
@@ -898,7 +916,8 @@ public actor SQLitePreMigratedAccountDirectory:
                 issuer: issuer,
                 audience: audience,
                 eventID: eventID,
-                requestBodyDigest: requestBodyDigest
+                requestBodyDigest: requestBodyDigest,
+                issuedAt: issuedAt
             )
             guard try await isActiveAccount(audience), !isClosed else {
                 throw SwanError.unavailable("authenticated space directory is unavailable")

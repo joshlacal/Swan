@@ -59,6 +59,16 @@ extension SQLiteAccountDatabase {
                       credentialIssuedAt.timeIntervalSince1970 * 1_000_000 > Double(closedAt) else {
                     throw SwanError.unauthorized("space lifecycle changed or credential predates deletion")
                 }
+                // SW-A: the credential must also postdate the newest deletion
+                // notice the authority signed. A later notice means the space
+                // was deleted again after this credential, or is still being
+                // retried; adopting would reopen a deleted space.
+                let credentialSeconds = Self.authoritySeconds(credentialIssuedAt)
+                if let fence = try await remoteReplicaAuthorityFence(space: space) {
+                    guard let credentialSeconds, credentialSeconds > fence else {
+                        throw SwanError.unauthorized("space lifecycle changed or credential predates deletion")
+                    }
+                }
                 try await retainRemoteReplicaGenerationFloor(space: space, eventID: expectedDeletionEventID)
                 // This also invalidates staged and preverified work by deleting
                 // its session/result identities in the same transaction.
@@ -71,6 +81,12 @@ extension SQLiteAccountDatabase {
                 _ = try await connection.query("""
                     UPDATE permissioned_remote_replica_lifecycles SET adopted_at = ?, credential_digest = ? WHERE space_uri = ?
                     """, [.integer(Int(now.timeIntervalSince1970)), credentialDigest.sqliteData!, .text(space.rawValue)])
+                // Deletion notices signed before this credential are now stale
+                // retries of the retired lifecycle (see
+                // receiveSpaceDeletionNotification).
+                if let credentialSeconds {
+                    try await raiseRemoteReplicaAuthorityFence(space: space, to: credentialSeconds)
+                }
                 _ = try await connection.query("""
                     INSERT OR IGNORE INTO permissioned_remote_replica_retired_events(space_uri, event_id, adopted_at)
                     VALUES (?, ?, ?)
