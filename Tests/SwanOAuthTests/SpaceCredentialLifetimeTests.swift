@@ -2,6 +2,7 @@ import Crypto
 import Foundation
 import SwanCore
 import SwanSpaces
+import SwanStorage
 import XCTest
 @testable import SwanOAuth
 
@@ -43,6 +44,38 @@ final class SpaceCredentialLifetimeTests: XCTestCase {
             )
         )
         XCTAssertThrowsError(try DurableSpaceCredentialAuthority.Configuration(lifetime: 0))
+    }
+
+    /// SWAN-AUTH-5: a per-space-type lifetime applies to that type only. The
+    /// conversation policy's 60 s credentials must not shorten other spaces.
+    func testSpaceTypeLifetimeAppliesOnlyToThatSpaceType() async throws {
+        let conversation = try SpaceURI(
+            authority: Self.authority,
+            spaceType: "blue.catbird.labyrinth.conversation",
+            skey: UUID().uuidString.lowercased()
+        )
+        let bookmarks = try SpaceURI(authority: Self.authority, spaceType: "app.bsky.bookmarks", skey: "saved")
+        let key = P256.Signing.PrivateKey()
+        let issuer = DurableSpaceCredentialAuthority(
+            policyDirectory: PermitAllCredentialDirectory(),
+            signingKeys: FixedSigningKey(authority: Self.authority, key: key),
+            configuration: try .init(spaceTypeLifetimes: ["blue.catbird.labyrinth.conversation": 60])
+        )
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        for (space, expected) in [(conversation, Int64(60)), (bookmarks, Int64(300))] {
+            let credential = try await issuer.issueSpaceCredential(
+                space: space, user: nil, authorization: .public,
+                confirmationKeyID: SpaceCredentialGoldenFixtures.holderKeyID, now: now
+            )
+            let claims = try PermissionedDataJWT.verifySpaceCredential(
+                credential, publicKey: key.publicKey, expectedSpace: space, now: now
+            )
+            XCTAssertEqual(claims.exp - claims.iat, expected, space.spaceType)
+        }
+        XCTAssertThrowsError(try DurableSpaceCredentialAuthority.Configuration(spaceTypeLifetimes: ["x.y.z": 0]))
+        XCTAssertThrowsError(try DurableSpaceCredentialAuthority.Configuration(
+            spaceTypeLifetimes: ["x.y.z": PermissionedDataJWT.spaceCredentialLifetime + 1]
+        ))
     }
 
     /// The ceiling is one hour on both sides (upstream #5567), and the mint
@@ -97,5 +130,19 @@ final class SpaceCredentialLifetimeTests: XCTestCase {
             now: now,
             lifetime: 2 * 60 * 60
         ), "minting above the one-hour ceiling must fail")
+    }
+}
+
+private struct PermitAllCredentialDirectory: AuthorizedSimpleSpaceCredentialDirectory {
+    func authorizeSimpleSpaceCredentialRead(
+        space: SpaceURI, user: String?, clientID: String?, authorization: AuthorizationContext
+    ) async throws {}
+}
+
+private struct FixedSigningKey: SpaceCredentialSigningKeyResolver {
+    let authority: String
+    let key: P256.Signing.PrivateKey
+    func signingKey(for authority: String) async throws -> SpaceCredentialAuthoritySigningKey? {
+        SpaceCredentialAuthoritySigningKey(authority: authority, privateKey: key)
     }
 }
