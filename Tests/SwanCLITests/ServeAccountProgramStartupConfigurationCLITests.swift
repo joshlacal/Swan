@@ -1152,6 +1152,85 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
         }
     }
 
+    /// The other half of the legacy-session ordering: the read-only secret
+    /// checks run before the service-directory lease, but the key store,
+    /// which writes its lock, marker and journal recovery into the key root,
+    /// is opened only under the lease. The default key root lies inside the
+    /// data directory, so while an offline snapshot holds the exclusive lease
+    /// a refused `serve` must leave that key root untouched.
+    func testLegacySessionKeyStoreIsNotOpenedWhileOfflineSnapshotHoldsLease() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+        let keyDirectory = data.appending(path: "keys")
+        for directory in [data, keyDirectory] {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+        let signingKey = root.appending(path: "legacy-signing-key")
+        try protectedWrite(
+            Data(base64URLEncoded(Data(repeating: 0x53, count: 32)).utf8),
+            to: signingKey
+        )
+        let kekFile = root.appending(path: "account-kek")
+        try protectedWrite(
+            Data(base64URLEncoded(Data(repeating: 0xA5, count: 32)).utf8),
+            to: kekFile
+        )
+
+        // Hold the lease exactly as Scripts/service-snapshot.py does.
+        let lockPath = data.appending(path: ".swan-service.lock").path
+        let lock = open(lockPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+        XCTAssertGreaterThanOrEqual(lock, 0)
+        defer { _ = close(lock) }
+        XCTAssertEqual(flock(lock, LOCK_EX | LOCK_NB), 0)
+
+        let result = try runServe(data: data, arguments: [
+            "--enable-legacy-sessions",
+            "--legacy-session-signing-key-file", signingKey.path,
+            "--legacy-session-account-kek-file", kekFile.path,
+        ])
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.isEmpty)
+        XCTAssertTrue(result.error.contains("offline snapshot"), result.error)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: keyDirectory.path),
+            []
+        )
+        assertNoStartupStorageArtifacts(in: data, label: "snapshot-lease")
+
+        // Positive control: opening the store on this same key root does
+        // write into it, so the empty listing above is not vacuous.
+        XCTAssertEqual(flock(lock, LOCK_UN), 0)
+        let source = try XCTUnwrap(
+            try SwanCommand.Serve.resolveLegacySessionAccountKeySource(
+                enableLegacySessions: true,
+                legacySessionAccountKEKFile: kekFile.path,
+                legacySessionAccountKEKID: nil,
+                legacySessionAccountKeyDirectory: nil,
+                appViewProxyAccountKEKFile: nil,
+                appViewProxyAccountKEKID: nil,
+                appViewProxyAccountKeyDirectory: nil
+            )
+        )
+        let opened = try XCTUnwrap(
+            try SwanCommand.Serve.preflightLegacySessionStartupMaterial(
+                enableLegacySessions: true,
+                legacySessionSigningKeyFile: signingKey.path,
+                accountKeySource: source,
+                dataDirectory: data
+            )
+        )
+        XCTAssertEqual(opened.accountKeyDirectory.path, keyDirectory.path)
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: keyDirectory.path)
+                .isEmpty
+        )
+    }
+
     // MARK: - Helpers
 
     private func runServe(
