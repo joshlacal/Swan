@@ -63,7 +63,11 @@ public struct RemoteConversationSpaceMembershipChecker: ConversationSpaceMembers
         struct Request: Encodable { let space: String; let generation: String }
         let body = try JSONEncoder().encode(Request(space: space.rawValue, generation: space.skey))
         let response = try await request(space: space, method: Self.deletionMethod, body: body, now: now)
-        guard !(400...499).contains(response.status) else {
+        // 408 and 429 (RateLimited, with Retry-After) are transient, like
+        // 5xx and 503 below: the owner sees a retryable unavailable error,
+        // not a denial. As for outbound notifications, every other 4xx is a
+        // denial. The pending intent is retried in the background either way.
+        guard !(400...499).contains(response.status) || response.status == 408 || response.status == 429 else {
             throw SwanError.unauthorized("conversation generation deletion denied")
         }
         guard response.status == 200 else {
