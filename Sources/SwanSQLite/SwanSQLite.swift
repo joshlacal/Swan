@@ -2780,6 +2780,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await backfillPermissionedSpaceRecordBlobIndexIfNeeded()
             try await migratePublicRepositoryRequestReceiptRetentionIfNeeded()
             try await backfillPublicRepositoryBlockUsageIfNeeded()
+            try await migratePermissionedOutboxCoalescingIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -5136,6 +5137,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             // A recipient deletion tombstone does not suppress this row: the
             // account's own writes into a recreated space must still reach
             // the authority (October 1 section 3, October 22 section 6).
+            // SWAN-SYNC-2: one pending row per (space, author) carries the
+            // latest state; older unleased rows are superseded here.
+            try await coalesceSupersededOutboxRowsWithoutGate(
+                space: space, author: author, now: createdAt
+            )
             let notificationPayload = opaqueNotificationPayload(eventID: eventID)
             _ = try await connection.query(
                 """
@@ -10997,6 +11003,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         blob(operation), blob(commitment),
                     ]
                 )
+                try await coalesceSupersededOutboxRowsWithoutGate(
+                    space: space, author: space.authority, now: createdAt
+                )
                 _ = try await connection.query(
                     """
                 INSERT INTO permissioned_space_outbox(
@@ -11028,9 +11037,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// An expired lease is eligible again after a process crash. This method
     /// contains only SQLite work: callers must invoke a transport only after it
     /// returns and complete or fail the lease with the exact token below.
+    /// Rows whose newest state is older than `retryWindow` are dropped first
+    /// (SWAN-SYNC-2), so an unreachable authority cannot grow retry work
+    /// without bound.
     public func leaseNextOutbox(
         now: Date = Date(),
-        leaseDuration: TimeInterval
+        leaseDuration: TimeInterval,
+        retryWindow: TimeInterval = SQLiteAccountDatabase.permissionedOutboxRetryWindow
     ) async throws -> PersistedOutboxLease? {
         let nowTimestamp = try outboxTimestamp(now)
         let leaseExpiry = try outboxTimestamp(
@@ -11038,6 +11051,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
         return try await withConnectionGate {
             try await transaction {
+                try await expireOutboxRowsWithoutGate(
+                    now: nowTimestamp, retryWindow: retryWindow
+                )
                 let token = UUID()
                 let rows = try await connection.query(
                     """

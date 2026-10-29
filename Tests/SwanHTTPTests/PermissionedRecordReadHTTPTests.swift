@@ -1209,8 +1209,10 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                 return XCTFail("recent HTTP writes unexpectedly require full recovery")
             }
             XCTAssertEqual(entries.map(\.action), [.create, .update, .create, .delete, .create])
+            // SWAN-SYNC-2: the outbox coalesces to one pending row per
+            // (space, author), carrying the latest committed revision.
             let outbox = try await database.pendingOutbox(limit: 20)
-            XCTAssertEqual(outbox.filter { $0.revision > 3 }.count, 5)
+            XCTAssertEqual(outbox.filter { $0.revision > 3 }.map(\.revision), [8])
             XCTAssertTrue(outbox.allSatisfy { !$0.payload.contains(Data("scoped".utf8)) })
             try await database.close()
 
