@@ -28,11 +28,30 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
             let bobRev = Self.tid(at: Date().addingTimeInterval(-20))
             let danRev = Self.tid(at: Date().addingTimeInterval(-10))
             try await app.test(.router) { client in
+                // October 22 (atproto ac0c9f15, guide sections 3 and 4a):
+                // the retired `#atproto_space_host` audience and the
+                // pre-rename `hash` body are refused before anything is
+                // sequenced.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
+                    headers: Self.serviceHeaders(issuer: self.bob, audience: "\(self.authority)#atproto_space_host", jti: "bob-retired-audience"),
+                    body: fixture.writeBody(repo: self.bob, repoRev: bobRev)
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
+                    headers: Self.serviceHeaders(issuer: self.bob, audience: "\(self.authority)#atproto_pds", jti: "bob-legacy-hash"),
+                    body: fixture.legacyHashWriteBody(repo: self.bob, repoRev: bobRev)
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try Self.json(response.body)["error"] as? String, "InvalidRequest")
+                }
                 // The reference sender's audience, then the bare DID: both
                 // name this space host in the hardened posture.
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
-                    headers: Self.serviceHeaders(issuer: self.bob, audience: "\(self.authority)#atproto_space_host", jti: "bob-1"),
+                    headers: Self.serviceHeaders(issuer: self.bob, audience: "\(self.authority)#atproto_pds", jti: "bob-1"),
                     body: fixture.writeBody(repo: self.bob, repoRev: bobRev)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -47,7 +66,7 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                 // Another authority's space-host identifier is not this one.
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
-                    headers: Self.serviceHeaders(issuer: self.bob, audience: "did:plc:zyxwvutsrqponmlkjihgfedc#atproto_space_host", jti: "bob-foreign"),
+                    headers: Self.serviceHeaders(issuer: self.bob, audience: "did:plc:zyxwvutsrqponmlkjihgfedc#atproto_pds", jti: "bob-foreign"),
                     body: fixture.writeBody(repo: self.bob, repoRev: Self.tid(at: Date()))
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -64,13 +83,18 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(repos.compactMap { $0["repoRev"] as? String }, [bobRev, danRev])
                     let revisions = repos.compactMap { $0["spaceRev"] as? String }
                     XCTAssertEqual(revisions.count, 2)
-                    XCTAssertLessThan(revisions[0], revisions[1])
+                    // Indexing an empty page would trap and take every later
+                    // SwanHTTPTests class down with it.
+                    if revisions.count == 2 {
+                        XCTAssertLessThan(revisions[0], revisions[1])
+                    }
                     for repo in repos {
                         // The generated encoder also writes the object's
-                        // `$type`, which Lexicon permits on a ref.
+                        // `$type`, which Lexicon permits on a ref. October 22
+                        // renamed the entry's `hash` to `data`.
                         XCTAssertEqual(
                             Set(repo.keys).subtracting(["$type"]),
-                            ["did", "repoRev", "hash", "spaceRev"]
+                            ["did", "repoRev", "data", "spaceRev"]
                         )
                         XCTAssertNil(repo["rev"])
                     }
@@ -289,10 +313,20 @@ private struct SpaceRevisionHTTPFixture {
         return try SpaceCredentialSignatureTestSupport.headers(token: credential, audience: authority)
     }
 
+    /// The October 22 notifyWrite body: the set-hash digest is `data`.
     func writeBody(repo: String, repoRev: String, space: SpaceURI? = nil) -> ByteBuffer {
-        let hash = Data(repeating: 0x5C, count: 32).base64EncodedString()
+        writeBody(repo: repo, repoRev: repoRev, space: space, digestKey: "data")
+    }
+
+    /// The pre-October 22 body, which named the same digest `hash`.
+    func legacyHashWriteBody(repo: String, repoRev: String) -> ByteBuffer {
+        writeBody(repo: repo, repoRev: repoRev, space: nil, digestKey: "hash")
+    }
+
+    private func writeBody(repo: String, repoRev: String, space: SpaceURI?, digestKey: String) -> ByteBuffer {
+        let digest = Data(repeating: 0x5C, count: 32).base64EncodedString()
         let target = (space ?? self.space).rawValue
-        return ByteBuffer(string: #"{"space":"\#(target)","repo":"\#(repo)","repoRev":"\#(repoRev)","hash":{"$bytes":"\#(hash)"}}"#)
+        return ByteBuffer(string: #"{"space":"\#(target)","repo":"\#(repo)","repoRev":"\#(repoRev)","\#(digestKey)":{"$bytes":"\#(digest)"}}"#)
     }
 
     func close() async throws {
