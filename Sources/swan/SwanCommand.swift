@@ -2543,6 +2543,16 @@ extension SwanCommand {
             }
         }
 
+        /// Conversation spaces get 60-second credentials, because a removed
+        /// MLS member keeps reading until its credential expires. Every other
+        /// space keeps the authority's default lifetime.
+        static func spaceCredentialIssuance(
+            conversationPolicyEnabled: Bool
+        ) throws -> DurableSpaceCredentialAuthority.Configuration {
+            try .init(spaceTypeLifetimes: conversationPolicyEnabled
+                ? ["blue.catbird.labyrinth.conversation": 60] : [:])
+        }
+
         /// Whether a resolved `--public-url` names an origin the public
         /// Internet can actually reach.
         ///
@@ -5004,7 +5014,9 @@ extension SwanCommand {
                     spaceCredentialPolicyDirectory: conversationPolicy,
                     simpleSpaceLifecycleDirectory: conversationLifecycle,
                     spaceNotificationDirectory: conversationLifecycle,
-                    spaceCredentialIssuance: try .init(lifetime: conversationPolicy == nil ? 300 : 60)
+                    spaceCredentialIssuance: try Self.spaceCredentialIssuance(
+                        conversationPolicyEnabled: conversationPolicy != nil
+                    )
                 )
                 guard server.authenticatedGetSpace != nil else {
                     throw ValidationError(

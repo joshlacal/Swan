@@ -792,18 +792,36 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
         public static let standard = Configuration(uncheckedLifetime: defaultLifetime)
 
         public let lifetime: TimeInterval
+        /// Lifetimes that replace ``lifetime`` for the named space types only,
+        /// so a policy that wants shorter credentials (the conversation policy)
+        /// does not shorten every other space on the authority.
+        public let spaceTypeLifetimes: [String: TimeInterval]
 
-        public init(lifetime: TimeInterval = defaultLifetime) throws {
-            guard lifetime > 0,
-                  lifetime <= PermissionedDataJWT.spaceCredentialLifetime,
-                  lifetime.rounded(.towardZero) == lifetime else {
+        public init(
+            lifetime: TimeInterval = defaultLifetime,
+            spaceTypeLifetimes: [String: TimeInterval] = [:]
+        ) throws {
+            guard Self.isValidLifetime(lifetime),
+                  spaceTypeLifetimes.values.allSatisfy(Self.isValidLifetime) else {
                 throw SwanError.malformed("invalid space credential lifetime")
             }
             self.lifetime = lifetime
+            self.spaceTypeLifetimes = spaceTypeLifetimes
+        }
+
+        public func lifetime(for space: SpaceURI) -> TimeInterval {
+            spaceTypeLifetimes[space.spaceType] ?? lifetime
         }
 
         private init(uncheckedLifetime: TimeInterval) {
             lifetime = uncheckedLifetime
+            spaceTypeLifetimes = [:]
+        }
+
+        private static func isValidLifetime(_ lifetime: TimeInterval) -> Bool {
+            lifetime > 0
+                && lifetime <= PermissionedDataJWT.spaceCredentialLifetime
+                && lifetime.rounded(.towardZero) == lifetime
         }
     }
 
@@ -886,7 +904,7 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
             key: signingKey.privateKey,
             confirmationKeyID: confirmationKeyID,
             now: now,
-            lifetime: configuration.lifetime,
+            lifetime: configuration.lifetime(for: space),
             kid: signingKey.keyID
         )
         // This may suspend for a current membership check. A key rotation
