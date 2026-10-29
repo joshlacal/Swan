@@ -1014,6 +1014,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     PinnedSpaceServicePublicKey(issuer: authority, generation: 1, publicKey: signer.key.publicKey),
                 ])
             )
+            var attemptJTIs: [String] = []
             for post in captured {
                 XCTAssertEqual(post.url.absoluteString, "\(endpoint)/xrpc/com.atproto.space.notifySpaceDeleted")
                 let body = try XCTUnwrap(try JSONSerialization.jsonObject(with: post.body) as? [String: String])
@@ -1029,8 +1030,12 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 )
                 XCTAssertEqual(verified.issuer, authority)
                 XCTAssertEqual(verified.audience, service)
-                XCTAssertEqual(verified.eventID, event.id.uuidString)
+                attemptJTIs.append(verified.eventID)
             }
+            // X2: each attempt carries a fresh jti, so a receiver with a
+            // single-use jti store accepts the retry; the row id stays local.
+            XCTAssertEqual(Set(attemptJTIs).count, captured.count, "a retry must not reuse the failed attempt's jti")
+            XCTAssertFalse(attemptJTIs.contains { $0.lowercased() == event.id.uuidString.lowercased() })
             let remaining = try await database.pendingNotificationFanout()
             XCTAssertTrue(remaining.isEmpty)
             let retired = try await database.isSpaceNotificationRegistrationActive(
