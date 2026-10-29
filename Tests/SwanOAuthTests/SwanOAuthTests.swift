@@ -345,9 +345,12 @@ final class SwanOAuthTests: XCTestCase {
         let space = try SpaceURI(
             authority: "did:plc:alice", spaceType: "app.bsky.bookmarks", skey: "shared"
         )
+        // October 22 (atproto ac0c9f15, guide section 3): a delegation's
+        // audience is `<authority>#atproto_pds`, previously
+        // `#atproto_space_host`.
         let delegation = try PermissionedDataJWT.createDelegationToken(
             issuer: "did:plc:bob",
-            audience: "did:plc:alice#atproto_space_host",
+            audience: "did:plc:alice#atproto_pds",
             space: space,
             key: key,
             now: now
@@ -355,13 +358,67 @@ final class SwanOAuthTests: XCTestCase {
         let delegationClaims = try PermissionedDataJWT.verifyDelegationToken(
             delegation,
             publicKey: key.publicKey,
-            audience: "did:plc:alice#atproto_space_host",
+            audience: "did:plc:alice#atproto_pds",
             now: now
         )
         XCTAssertEqual(delegationClaims.iss, "did:plc:bob")
+        XCTAssertEqual(delegationClaims.aud, "did:plc:alice#atproto_pds")
         XCTAssertEqual(delegationClaims.sub, space.rawValue)
         XCTAssertThrowsError(try PermissionedDataJWT.verifyDelegationToken(
-            delegation, publicKey: key.publicKey, audience: "did:plc:mallory#atproto_space_host", now: now
+            delegation, publicKey: key.publicKey, audience: "did:plc:mallory#atproto_pds", now: now
+        ))
+        XCTAssertThrowsError(try PermissionedDataJWT.verifyDelegationToken(
+            delegation, publicKey: key.publicKey, audience: "did:plc:alice#atproto_space_host", now: now
+        ))
+
+        // The retired audience can be neither minted nor accepted. The legacy
+        // token is validly signed by the same key, and the identical
+        // construction with the current audience verifies, so the rejection
+        // is the audience rule rather than the signature or the encoding.
+        XCTAssertThrowsError(try PermissionedDataJWT.createDelegationToken(
+            issuer: "did:plc:bob",
+            audience: "did:plc:alice#atproto_space_host",
+            space: space,
+            key: key,
+            now: now
+        ))
+        func handSignedDelegation(audience: String) throws -> String {
+            try testCompactJWT(
+                header: PermissionedDataJWT.Header(
+                    alg: "ES256",
+                    typ: PermissionedDataJWT.delegationType,
+                    kid: PermissionedDataJWT.delegationKeyID
+                ),
+                claims: PermissionedDataJWT.DelegationClaims(
+                    iss: "did:plc:bob",
+                    aud: audience,
+                    sub: space.rawValue,
+                    iat: Int64(now.timeIntervalSince1970),
+                    exp: Int64(now.timeIntervalSince1970) + 60,
+                    jti: UUID().uuidString
+                ),
+                key: key
+            )
+        }
+        let currentAudienceDelegation = try handSignedDelegation(
+            audience: "did:plc:alice#atproto_pds"
+        )
+        XCTAssertNoThrow(try PermissionedDataJWT.inspectDelegationToken(currentAudienceDelegation))
+        XCTAssertNoThrow(try PermissionedDataJWT.verifyDelegationToken(
+            currentAudienceDelegation,
+            publicKey: key.publicKey,
+            audience: "did:plc:alice#atproto_pds",
+            now: now
+        ))
+        let legacyAudienceDelegation = try handSignedDelegation(
+            audience: "did:plc:alice#atproto_space_host"
+        )
+        XCTAssertThrowsError(try PermissionedDataJWT.inspectDelegationToken(legacyAudienceDelegation))
+        XCTAssertThrowsError(try PermissionedDataJWT.verifyDelegationToken(
+            legacyAudienceDelegation,
+            publicKey: key.publicKey,
+            audience: "did:plc:alice#atproto_space_host",
+            now: now
         ))
 
         let credential = try PermissionedDataJWT.createSpaceCredential(
