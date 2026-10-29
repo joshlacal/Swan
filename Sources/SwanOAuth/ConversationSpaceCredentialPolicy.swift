@@ -146,8 +146,19 @@ public struct ConversationSpaceCredentialDirectory: AuthorizedSimpleSpaceCredent
             return try await local.authorizeSimpleSpaceCredentialRead(space: space, user: user,
                 clientID: clientID, authorization: authorization)
         }
-        guard space.authority == authority, let user,
-              case let .spaceDelegation(subject, delegatedSpace) = authorization,
+        guard space.authority == authority else {
+            throw SwanError.unauthorized("verified conversation delegation required")
+        }
+        // Oct 22 §1 and §6: the local deletion record answers SpaceDeleted
+        // before any policy check, with or without a delegation token. A
+        // generation this authority has not registered yet is not deleted.
+        do {
+            try await lifecycle.requireConversationSpaceActive(space: space)
+        } catch AuthorizedSimpleSpaceLifecycleError.notFound {}
+        // A conversation space is never public: without a delegation it is
+        // hidden as SpaceNotFound, like any non-public space.
+        guard let user else { throw AuthorizedSimpleSpaceLifecycleError.notFound }
+        guard case let .spaceDelegation(subject, delegatedSpace) = authorization,
               subject == user, delegatedSpace == space else {
             throw SwanError.unauthorized("verified conversation delegation required")
         }
