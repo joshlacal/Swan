@@ -2800,19 +2800,100 @@ extension SwanCommand {
             )
         }
 
-        /// Validate every owner-only input needed by the legacy-session
-        /// surface before a control database, migration, account directory,
-        /// or repository bootstrap can create state.  The key-store
-        /// constructor also validates the protected directory contents
-        /// (marker/journal) and pins its descriptor; the resulting store is
-        /// handed to composition so neither the KEK file nor directory path
-        /// is opened a second time.
+        /// Legacy-session material that passed the read-only half of the
+        /// startup interlock: both mounted secrets are decoded and the key
+        /// root is opened with `O_NOFOLLOW` and validated as an existing
+        /// owner-only directory.  Producing this creates and writes nothing,
+        /// so `serve` obtains it before the service-directory lease creates
+        /// the data directory.  The validated key-root descriptor stays open
+        /// until `openAccountKeyStore()` hands it to `FileAccountKeyStore`,
+        /// so the store is built from the exact directory that passed
+        /// validation and the pathname is never reopened.
+        final class PinnedLegacySessionStartupMaterial {
+            let signingKey: Data
+            let accountKeyConfiguration: AccountKeyEncryptionConfiguration
+            let accountKeyDirectory: URL
+            let reusesAppViewProxyConfiguration: Bool
+            private let accountKeyDirectoryDescriptor: Int32
+
+            fileprivate init(
+                signingKey: Data,
+                accountKeyConfiguration: AccountKeyEncryptionConfiguration,
+                accountKeyDirectory: URL,
+                accountKeyDirectoryDescriptor: Int32,
+                reusesAppViewProxyConfiguration: Bool
+            ) {
+                self.signingKey = signingKey
+                self.accountKeyConfiguration = accountKeyConfiguration
+                self.accountKeyDirectory = accountKeyDirectory
+                self.accountKeyDirectoryDescriptor = accountKeyDirectoryDescriptor
+                self.reusesAppViewProxyConfiguration = reusesAppViewProxyConfiguration
+            }
+
+            deinit { _ = close(accountKeyDirectoryDescriptor) }
+
+            /// The writing half of the interlock.  Opening the store creates
+            /// its writer lock and active-key marker and finishes any
+            /// interrupted provisioning journal inside the key root, so
+            /// `serve` calls this only while it holds the service-directory
+            /// lease: the default key root is `<data-directory>/keys`, which
+            /// an offline snapshot copies under the exclusive lease.
+            func openAccountKeyStore() throws -> ValidatedLegacySessionStartupMaterial {
+                let accountKeyStore: FileAccountKeyStore
+                do {
+                    // The store duplicates the validated descriptor, so a
+                    // concurrent rename or replacement of the pathname
+                    // cannot redirect initialization.
+                    accountKeyStore = try FileAccountKeyStore(
+                        existingRootDirectoryDescriptor: accountKeyDirectoryDescriptor,
+                        configuration: accountKeyConfiguration
+                    )
+                } catch {
+                    throw ValidationError(
+                        "legacy-session account-key-backed service-token issuer is unavailable"
+                    )
+                }
+                return ValidatedLegacySessionStartupMaterial(
+                    signingKey: signingKey,
+                    accountKeyConfiguration: accountKeyConfiguration,
+                    accountKeyDirectory: accountKeyDirectory,
+                    accountKeyStore: accountKeyStore,
+                    reusesAppViewProxyConfiguration: reusesAppViewProxyConfiguration
+                )
+            }
+        }
+
+        /// Both halves of the legacy-session interlock in one call, for
+        /// callers that hold no service-directory lease (focused tests and
+        /// offline composition).  `serve` calls the halves separately: the
+        /// read-only validation before the lease, the key-store writes
+        /// under it.
         static func preflightLegacySessionStartupMaterial(
             enableLegacySessions: Bool,
             legacySessionSigningKeyFile: String?,
             accountKeySource: LegacySessionAccountKeySource?,
             dataDirectory: URL
         ) throws -> ValidatedLegacySessionStartupMaterial? {
+            try validateLegacySessionMountedSecrets(
+                enableLegacySessions: enableLegacySessions,
+                legacySessionSigningKeyFile: legacySessionSigningKeyFile,
+                accountKeySource: accountKeySource,
+                dataDirectory: dataDirectory
+            )?.openAccountKeyStore()
+        }
+
+        /// Validate every owner-only input needed by the legacy-session
+        /// surface (HMAC signing key, account KEK, existing owner-only key
+        /// root) without creating or writing anything.  `serve` runs this
+        /// before the service-directory lease, control database, migration,
+        /// account directory, or repository bootstrap can create state, so a
+        /// refusal leaves no data directory behind.
+        static func validateLegacySessionMountedSecrets(
+            enableLegacySessions: Bool,
+            legacySessionSigningKeyFile: String?,
+            accountKeySource: LegacySessionAccountKeySource?,
+            dataDirectory: URL
+        ) throws -> PinnedLegacySessionStartupMaterial? {
             guard enableLegacySessions else { return nil }
 
             guard let signingKeyFile = legacySessionSigningKeyFile,
@@ -2856,32 +2937,25 @@ extension SwanCommand {
 
             let accountKeyDirectory = accountKeySource.keyDirectory
                 ?? dataDirectory.appending(path: "keys")
-            let accountKeyStore: FileAccountKeyStore
+            let accountKeyDirectoryDescriptor: Int32
             do {
                 // The normal pathname constructor is allowed to create a
                 // missing root for provisioning commands. `serve` instead
-                // opens and validates the mounted root once, then gives the
-                // store only a duplicated descriptor, so a concurrent rename
-                // or replacement cannot redirect initialization.
-                accountKeyStore = try withExistingOwnerOnlyKeyDirectory(
-                    accountKeyDirectory
-                ) { descriptor in
-                    try FileAccountKeyStore(
-                        existingRootDirectoryDescriptor: descriptor,
-                        configuration: accountKeyConfiguration
-                    )
-                }
+                // opens and validates the mounted root once and pins this
+                // descriptor; the store is later built from it alone.
+                accountKeyDirectoryDescriptor =
+                    try requireExistingOwnerOnlyKeyDirectory(accountKeyDirectory)
             } catch {
                 throw ValidationError(
                     "legacy-session account-key-backed service-token issuer is unavailable"
                 )
             }
 
-            return ValidatedLegacySessionStartupMaterial(
+            return PinnedLegacySessionStartupMaterial(
                 signingKey: signingKey,
                 accountKeyConfiguration: accountKeyConfiguration,
                 accountKeyDirectory: accountKeyDirectory,
-                accountKeyStore: accountKeyStore,
+                accountKeyDirectoryDescriptor: accountKeyDirectoryDescriptor,
                 reusesAppViewProxyConfiguration:
                     accountKeySource.reusesAppViewProxyConfiguration
             )
@@ -3602,20 +3676,30 @@ extension SwanCommand {
                 publicURL: baseURL
             )
             let dataURL = URL(fileURLWithPath: dataDirectory)
-            let serviceDirectoryLease = try SwanServiceDirectoryLease(dataDirectory: dataURL)
-            defer { withExtendedLifetime(serviceDirectoryLease) {} }
             // Legacy bearer credentials are the one serve surface whose
             // mounted secrets must be validated as a single authority before
-            // any SQLite or repository path is opened.  Keep the validated
+            // any state exists.  The read-only half runs before the service
+            // lease, because the lease creates the data directory and a
+            // refused configuration must leave none behind.  The pinned key
+            // root becomes a store only under the lease, because the store
+            // writes into it and the default root lies inside the data
+            // directory that offline snapshots copy.  Keep the validated
             // bytes/configuration/store and pass them into composition below;
             // do not re-read these pathnames after bootstrap.
-            let validatedLegacySessionStartup = try Self
-                .preflightLegacySessionStartupMaterial(
+            var pinnedLegacySessionStartup = try Self
+                .validateLegacySessionMountedSecrets(
                     enableLegacySessions: enableLegacySessions,
                     legacySessionSigningKeyFile: legacySessionSigningKeyFile,
                     accountKeySource: legacySessionAccountKeySource,
                     dataDirectory: dataURL
                 )
+            let serviceDirectoryLease = try SwanServiceDirectoryLease(dataDirectory: dataURL)
+            defer { withExtendedLifetime(serviceDirectoryLease) {} }
+            let validatedLegacySessionStartup = try pinnedLegacySessionStartup?
+                .openAccountKeyStore()
+            // The store holds its own duplicate; close the validated
+            // key-root descriptor now rather than when `run()` returns.
+            pinnedLegacySessionStartup = nil
             let serverKey = try loadOAuthServerKey(fromFile: oauthServerKeyFile)
             let controlDatabase = try await SQLiteControlDatabase(dataDirectory: dataURL)
             var preopenedAccountDirectory: SQLitePreMigratedAccountDirectory?
