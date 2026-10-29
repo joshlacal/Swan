@@ -379,8 +379,9 @@ public struct AuthorizedSpaceNotificationRegistration: Sendable, Equatable {
 }
 
 /// A signed service announcement after its HTTP/JWT boundary has completed.
-/// `eventID` is a stable opaque service-JWT JTI and is consumed transactionally
-/// by the authority. It is never an authorization credential.
+/// `eventID` is the opaque service-JWT JTI, recorded transactionally by the
+/// authority. Senders mint a fresh one per attempt, so a repeat is recognized
+/// by its revision, not its JTI. It is never an authorization credential.
 public struct AuthorizedSpaceWriteNotification: Sendable, Equatable {
     public let eventID: String
     public let space: SpaceURI

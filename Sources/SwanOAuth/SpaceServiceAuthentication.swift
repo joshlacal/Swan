@@ -75,8 +75,9 @@ public protocol SpaceServiceAuthenticationVerifier: Sendable {
 
 /// A small authority-scoped signer used only by durable notification
 /// transports. It cannot sign arbitrary HTTP requests or arbitrary JWT
-/// claims, and binds the caller's event ID as the service JTI. The
-/// authority fanout passes a fresh ID for every delivery attempt.
+/// claims, and binds the caller's event ID as the service JTI. Both the
+/// writer outbox and the authority fanout pass a fresh ID for every delivery
+/// attempt.
 public protocol SpaceServiceAuthenticationIssuer: Sendable {
     func issue(
         issuer: String,

@@ -1083,6 +1083,89 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// SW-C: a writer's own notifyWrite to the space authority signs every
+    /// delivery attempt with a fresh jti. With the outbox row id as the jti, a
+    /// receiver with a single-use jti store consumed it on the failed attempt
+    /// and answered the retry with 401, which the transport acknowledges as
+    /// permanent, dropping the row.
+    func testWriterOutboxRetryCarriesAFreshJTI() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanWriterOutboxJTI-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: writer)
+        do {
+            let space = try SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "outbox-jti")
+            let uri = try SpaceRecordURI(space: space, author: writer, collection: "app.bsky.feed.post", rkey: "jti")
+            let value = Data([0xA1, 0x61, 0x61, 0x01])
+            _ = try await database.apply(
+                space: space, author: writer, expectedRevision: 0, requestID: UUID(),
+                wireRevision: try TID(tidString: "2222222222222"),
+                writes: [.put(uri: uri, value: value, cid: CID.fromDAGCBOR(value).string)]
+            )
+            let pending = try await database.pendingOutbox()
+            let row = try XCTUnwrap(pending.first)
+            XCTAssertEqual(pending.count, 1)
+
+            let signer = SigningNotificationServiceIssuer()
+            let posts = RecordingPostTransport(failuresRemaining: 1)
+            let endpoint = "https://authority.example"
+            let audience = "\(authority)#atproto_pds"
+            let transport = HTTPPermissionedSpaceOutboxTransport(
+                destinations: try StaticSwanSpaceNotificationDestinations(authorityDestinations: [
+                    authority: try SwanSpaceNotificationDestination(
+                        endpoint: try XCTUnwrap(URL(string: endpoint)), audience: audience
+                    ),
+                ]),
+                announcements: SQLiteSpaceWriteAnnouncementSource(database: database),
+                serviceAuthentication: signer,
+                poster: OAuthBoundedJSONPoster(
+                    policy: try OAuthRemoteFetchPolicy(maximumBodyBytes: 4_096, timeout: 2),
+                    resolver: FixedHostnameResolver(answer: try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))),
+                    transport: posts
+                )
+            )
+            let worker = PermissionedSpaceOutboxDeliveryWorker(
+                database: database, transport: transport,
+                configuration: try .init(initialFailureBackoff: 1, maximumFailureBackoff: 1)
+            )
+            let now = Date()
+            let failed = try await worker.deliverNext(now: now)
+            XCTAssertEqual(failed, .failed(eventID: row.id, attempts: 1))
+            let delivered = try await worker.deliverNext(now: now.addingTimeInterval(2))
+            XCTAssertEqual(delivered, .delivered(eventID: row.id))
+
+            let captured = await posts.posts()
+            XCTAssertEqual(captured.count, 2)
+            let verifier = DurableSpaceServiceAuthenticationVerifier(
+                publicKeys: try PinnedSpaceServicePublicKeyResolver(pins: [
+                    PinnedSpaceServicePublicKey(issuer: writer, generation: 1, publicKey: signer.key.publicKey),
+                ])
+            )
+            var attemptJTIs: [String] = []
+            for post in captured {
+                XCTAssertEqual(post.url.absoluteString, "\(endpoint)/xrpc/com.atproto.space.notifyWrite")
+                XCTAssertEqual(post.body, captured[0].body, "both attempts announce the same revision")
+                let authorization = try XCTUnwrap(post.headers["authorization"])
+                let verified = try await verifier.authenticate(
+                    String(authorization.dropFirst("Bearer ".count)),
+                    expectedAudience: audience,
+                    expectedMethod: "com.atproto.space.notifyWrite",
+                    now: Date()
+                )
+                XCTAssertEqual(verified.issuer, writer)
+                attemptJTIs.append(verified.eventID)
+            }
+            XCTAssertEqual(Set(attemptJTIs).count, captured.count, "a retry must not reuse the failed attempt's jti")
+            XCTAssertFalse(attemptJTIs.contains { $0.lowercased() == row.id.uuidString.lowercased() })
+            let remaining = try await database.pendingOutbox()
+            XCTAssertTrue(remaining.isEmpty)
+            try await database.close()
+        } catch {
+            try? await database.close()
+            throw error
+        }
+    }
+
     /// The route passes only the authenticated space deletion signal to its
     /// sync recipient. Repository ownership and retained member data are
     /// handled by the durable receiver, not changed by service authentication.

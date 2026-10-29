@@ -25,9 +25,11 @@ public struct PermissionedSpaceOutboxNotification: Sendable, Equatable {
 }
 
 /// An injected, asynchronous boundary for best-effort notification delivery.
-/// Implementations should use `notification.id` as their idempotency key: a
-/// successful remote delivery followed by a process crash is intentionally
-/// retried after the durable lease expires (at-least-once semantics).
+/// A successful remote delivery followed by a process crash is intentionally
+/// retried after the durable lease expires (at-least-once semantics), so a
+/// repeat must be harmless at the receiver. `notification.id` is the local
+/// idempotency key; the HTTP transport does not reuse it as a service-JWT
+/// `jti`, because receivers dedupe a repeated `notifyWrite` by revision.
 public protocol PermissionedSpaceOutboxTransport: Sendable {
     func deliver(_ notification: PermissionedSpaceOutboxNotification) async throws
 }

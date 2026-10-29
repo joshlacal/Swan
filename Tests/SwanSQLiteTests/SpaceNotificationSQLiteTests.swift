@@ -197,6 +197,38 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         XCTAssertEqual(afterConflict.first?.commitment, Data(repeating: 1, count: 32))
     }
 
+    /// SW-C: a writer signs each notifyWrite attempt with a fresh jti, so a
+    /// retry after a lost acknowledgement arrives under a new event ID. The
+    /// authority must recognize it by revision: no second receipt, no second
+    /// forward to a service-named subscriber, and no space revision bump.
+    func testRetriedWriterNotificationUnderAFreshEventIDIsANoOp() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+        let now = Date()
+        try await fixture.register(on: database, now: now)
+
+        for (eventID, offset) in [("first-attempt", 0.0), ("retry-attempt", 1.0)] {
+            try await database.receiveSpaceWriteNotification(
+                fixture.writeNotification(eventID: eventID, revision: try fixture.tid(1), commitmentByte: 4),
+                now: now.addingTimeInterval(offset)
+            )
+        }
+        let fanout = try await database.pendingNotificationFanout()
+        XCTAssertEqual(fanout.count, 1)
+        XCTAssertEqual(fanout.first?.sourceEventID, "first-attempt")
+        let receipts = try await database.connection.query(
+            "SELECT event_id FROM permissioned_space_notification_receipts WHERE space_uri = ?",
+            [.text(fixture.space.rawValue)]
+        )
+        XCTAssertEqual(receipts.map { $0.column("event_id")?.string }, ["first-attempt"])
+        let writers = try await database.spaceWriters(
+            space: fixture.space, limit: 10, cursor: nil, authorization: fixture.readCredential()
+        )
+        XCTAssertEqual(writers.map(\.wireRevision), [try fixture.tid(1).toString()])
+    }
+
     /// Erratum 03: write fanout fires for SERVICE-NAMED registrations only,
     /// from both write paths — a member's announced write and a local apply —
     /// carrying the writer/revision/commitment the `notifyWrite` body needs.

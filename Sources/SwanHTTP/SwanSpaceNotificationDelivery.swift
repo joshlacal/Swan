@@ -198,11 +198,17 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
             wireRevision: announcement.wireRevision,
             commitment: announcement.commitment
         )
+        // Every attempt gets a fresh random jti, as upstream createServiceJwt
+        // mints one per call. A receiver with a single-use jti store consumes
+        // it on the first attempt and would refuse the retry with a 4xx, which
+        // is acknowledged below as permanent. Receivers dedupe a repeat by the
+        // writer's revision, not by jti: Swan's authority and the reference
+        // ignore a notifyWrite whose `repoRev` is not newer.
         let token = try await serviceAuthentication.issue(
             issuer: notification.author,
             audience: destination.audience,
             method: ComAtprotoSpaceNotifyWrite.typeIdentifier,
-            eventID: notification.id.uuidString,
+            eventID: UUID().uuidString.lowercased(),
             requestBodyDigest: reqDigest,
             now: Date()
         )
