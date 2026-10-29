@@ -2346,7 +2346,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// A read credential may register notification recipients, but it must
     /// not be able to turn the later deletion fanout into an unbounded
     /// transaction. Keep the limit per space so one noisy space cannot grow
-    /// another space's delivery work; re-registering an existing endpoint is
+    /// another space's delivery work; re-registering an existing service is
     /// still allowed when the limit has been reached.
     static let maximumNotificationRegistrationsPerSpace = 1_024
 
@@ -2801,6 +2801,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migrateConversationDeletionRecipientsIfNeeded()
             try await migratePermissionedSpaceWriterForeignKeyIfNeeded()
             try await migrateSpaceWriterSequenceIfNeeded()
+            try await migrateSpaceNotificationServiceKeysIfNeeded()
         }
         try await migrateSpaceNotificationReceiptScopeIfNeeded()
         try await compactSpaceNotificationReceiptsIfNeeded()
@@ -8416,11 +8417,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 // later through the lease worker; endpoint strings stay
                 // opaque here and no record/CAR data enters the queue.
                 let deletionEventID = UUID().uuidString.lowercased()
+                // SWAN-SYNC-4: one deletion per registered service, even when
+                // several services share an endpoint.
                 let recipients = try await connection.query(
                     """
-                    SELECT endpoint FROM permissioned_space_notification_registrations
+                    SELECT endpoint, service_key FROM permissioned_space_notification_registrations
                     WHERE space_uri = ? AND expires_at > ?
-                    ORDER BY endpoint ASC
+                    ORDER BY service_key ASC
                     """,
                     [.text(space.rawValue), .integer(timestamp)]
                 )
@@ -8428,20 +8431,22 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     let endpoint = try validNotificationEndpoint(
                         try requiredText(row, "endpoint")
                     )
+                    let serviceKey = try requiredText(row, "service_key")
                     _ = try await connection.query(
                         """
                         INSERT INTO permissioned_space_notification_fanout(
                             id, source_issuer, source_event_id, kind, space_uri,
-                            repo_did, wire_revision, commitment, endpoint,
+                            repo_did, wire_revision, commitment, endpoint, service_key,
                             attempts, created_at, available_at,
                             lease_token, lease_expires_at
-                        ) VALUES (?, ?, ?, 'deleted', ?, NULL, NULL, NULL, ?, 0, ?, ?, NULL, NULL)
-                        ON CONFLICT(source_issuer, source_event_id, kind, endpoint) DO NOTHING
+                        ) VALUES (?, ?, ?, 'deleted', ?, NULL, NULL, NULL, ?, ?, 0, ?, ?, NULL, NULL)
+                        ON CONFLICT(source_issuer, source_event_id, kind, endpoint, service_key) DO NOTHING
                         """,
                         [
                             .text(UUID().uuidString), .text(space.authority),
                             .text(deletionEventID), .text(space.rawValue),
-                            .text(endpoint), .integer(timestamp), .integer(timestamp),
+                            .text(endpoint), .text(serviceKey),
+                            .integer(timestamp), .integer(timestamp),
                         ]
                     )
                 }
@@ -8480,6 +8485,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                   SELECT 1 FROM permissioned_space_notification_fanout AS pending
                   WHERE pending.space_uri = permissioned_space_notification_registrations.space_uri
                     AND pending.endpoint = permissioned_space_notification_registrations.endpoint
+                    AND (pending.service_key = ''
+                         OR pending.service_key = permissioned_space_notification_registrations.service_key)
                     AND pending.kind = 'deleted'
               )
               AND NOT EXISTS (
@@ -8737,10 +8744,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
     }
 
-    /// Replaces one endpoint's subscription atomically. A registration is
-    /// keyed by the delivery endpoint, matching the pinned PDS. Re-registering
-    /// with a different optional repo replaces it; expiry cleanup below acts
-    /// as removal without accepting a broad administration endpoint.
+    /// Replaces one service's subscription atomically. A registration is
+    /// keyed by its service identity, matching the reference's
+    /// `(space, serviceDid)` key (SWAN-SYNC-4); legacy endpoint-only rows
+    /// keep their endpoint key. Re-registering with a different endpoint or
+    /// optional repo replaces it; expiry cleanup below acts as removal
+    /// without accepting a broad administration endpoint.
     /// Withdraws a subscriber's registrations by service identity, the live
     /// `unregisterNotify` contract: idempotent (succeeds whether or not a
     /// matching registration existed), gated on a space credential for this
@@ -8858,14 +8867,20 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     """,
                     [.text(registration.space.rawValue), .integer(timestamp)]
                 )
+                // SWAN-SYNC-4: a registration is keyed by its service
+                // identity, as the reference keys (space, serviceDid); the
+                // endpoint is data, so services sharing an endpoint each keep
+                // their own registration. Endpoint-only legacy rows keep
+                // their endpoint key (see spaceNotificationServiceKeySQL).
+                let serviceKey = deliveryService ?? "endpoint:" + endpoint
                 let existing = try await connection.query(
                     """
                     SELECT owner_service_did
                     FROM permissioned_space_notification_registrations
-                    WHERE space_uri = ? AND endpoint = ?
+                    WHERE space_uri = ? AND service_key = ?
                     LIMIT 1
                     """,
-                    [.text(registration.space.rawValue), .text(endpoint)]
+                    [.text(registration.space.rawValue), .text(serviceKey)]
                 )
                 if let row = existing.first {
                     let previous = row.column("owner_service_did")?.string
@@ -8893,9 +8908,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_notification_registrations(
-                        space_uri, endpoint, repo_did, expires_at, updated_at, owner_service_did, delivery_service_did
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(space_uri, endpoint) DO UPDATE SET
+                        space_uri, service_key, endpoint, repo_did, expires_at, updated_at,
+                        owner_service_did, delivery_service_did
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(space_uri, service_key) DO UPDATE SET
+                        endpoint = excluded.endpoint,
                         repo_did = excluded.repo_did,
                         expires_at = excluded.expires_at,
                         updated_at = excluded.updated_at,
@@ -8903,7 +8920,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         delivery_service_did = excluded.delivery_service_did
                     """,
                     [
-                        .text(registration.space.rawValue), .text(endpoint),
+                        .text(registration.space.rawValue), .text(serviceKey), .text(endpoint),
                         registration.repository.map(SQLiteData.text) ?? .null,
                         .integer(expiry), .integer(timestamp),
                         .text(owner),
@@ -8962,6 +8979,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                           AND authority.deletion_event_id = recipient.deletion_event_id AND authority.state = 'deleted'
                         JOIN permissioned_space_notification_fanout AS pending ON pending.space_uri = recipient.space_uri
                           AND pending.source_event_id = recipient.deletion_event_id AND pending.endpoint = recipient.endpoint
+                          AND (pending.service_key = '' OR pending.service_key = recipient.service_key)
                         WHERE pending.id = ? AND pending.source_issuer = ? AND pending.source_event_id = ?
                           AND pending.kind = 'deleted' AND pending.space_uri = ? AND pending.endpoint = ?
                           AND recipient.registration_expires_at > ?
@@ -8982,6 +9000,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     JOIN permissioned_space_notification_registrations AS registration
                       ON registration.space_uri = pending.space_uri
                      AND registration.endpoint = pending.endpoint
+                     AND (pending.service_key = '' OR registration.service_key = pending.service_key)
                     WHERE pending.id = ? AND pending.source_issuer = ?
                       AND pending.source_event_id = ? AND pending.kind = 'deleted'
                       AND pending.space_uri = ? AND pending.endpoint = ?
@@ -9028,24 +9047,27 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     do { try await requireNotificationAuthorityActive(space, connection: connection) }
                     catch is AuthorizedSimpleSpaceLifecycleError { return nil }
                 }
+                // Several services may share an endpoint (SWAN-SYNC-4). This
+                // endpoint-keyed lookup picks the active service-named row
+                // with the lowest service key, the same row
+                // enqueueWriteForwardsWithoutGate queues for that endpoint.
                 let rows = try await connection.query(
                     """
-                    SELECT repo_did, expires_at, delivery_service_did
+                    SELECT delivery_service_did
                     FROM permissioned_space_notification_registrations
-                    WHERE space_uri = ? AND endpoint = ?
+                    WHERE space_uri = ? AND endpoint = ? AND expires_at > ?
+                      AND delivery_service_did IS NOT NULL
+                      AND (? IS NULL OR repo_did IS NULL OR repo_did = ?)
+                    ORDER BY service_key ASC
+                    LIMIT 1
                     """,
-                    [.text(space.rawValue), .text(endpoint)]
+                    [
+                        .text(space.rawValue), .text(endpoint), .integer(timestamp),
+                        repository.map(SQLiteData.text) ?? .null,
+                        repository.map(SQLiteData.text) ?? .null,
+                    ]
                 )
-                guard let row = rows.first,
-                      try requiredNonnegativeInteger(row, "expires_at") > timestamp else {
-                    return nil
-                }
-                let selectedRepository = row.column("repo_did")?.string
-                guard repository == nil || selectedRepository == nil
-                    || selectedRepository == repository else {
-                    return nil
-                }
-                guard let service = row.column("delivery_service_did")?.string,
+                guard let service = rows.first?.column("delivery_service_did")?.string,
                       Self.isValidNotificationServiceIdentity(service) else {
                     return nil
                 }
@@ -9078,24 +9100,26 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     do { try await requireNotificationAuthorityActive(space, connection: readConnection) }
                     catch is AuthorizedSimpleSpaceLifecycleError { return false }
                 }
-                let rows = try await readConnection.query(
-                    """
-                    SELECT repo_did, expires_at
-                    FROM permissioned_space_notification_registrations
-                    WHERE space_uri = ? AND endpoint = ?
-                    """,
-                    [.text(space.rawValue), .text(endpoint)]
-                )
-                guard let row = rows.first,
-                      try requiredNonnegativeInteger(row, "expires_at") > timestamp else {
-                    return false
-                }
-                let selectedRepository = row.column("repo_did")?.string
                 // A repo-specific registration receives matching writes;
                 // deletions (`repository == nil`) notify every still-active
                 // recipient because the authority is no longer available to
-                // send a later lifecycle signal.
-                return repository == nil || selectedRepository == nil || selectedRepository == repository
+                // send a later lifecycle signal. Several services may share
+                // the endpoint (SWAN-SYNC-4); any active match qualifies.
+                let rows = try await readConnection.query(
+                    """
+                    SELECT 1
+                    FROM permissioned_space_notification_registrations
+                    WHERE space_uri = ? AND endpoint = ? AND expires_at > ?
+                      AND (? IS NULL OR repo_did IS NULL OR repo_did = ?)
+                    LIMIT 1
+                    """,
+                    [
+                        .text(space.rawValue), .text(endpoint), .integer(timestamp),
+                        repository.map(SQLiteData.text) ?? .null,
+                        repository.map(SQLiteData.text) ?? .null,
+                    ]
+                )
+                return !rows.isEmpty
             }
         }
     }
