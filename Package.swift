@@ -3,9 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "Swan",
-    // tvOS 18 is the floor Petrel declares; it exists only for the SwanTV
-    // experiment (docs/apple-tv-pds) and changes nothing for macOS/Linux.
-    platforms: [.macOS(.v15), .tvOS(.v18)],
+    platforms: [.macOS(.v15)],
     products: [
         .library(name: "SwanCore", targets: ["SwanCore"]),
         .library(name: "SwanSpacesWire", targets: ["SwanSpacesWire"]),
