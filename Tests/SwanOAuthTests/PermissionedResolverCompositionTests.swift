@@ -90,21 +90,44 @@ final class PermissionedResolverCompositionTests: XCTestCase {
                 .authorization(for: Self.remoteCredential, expectedSpace: remoteSpace, now: self.now)
         }
 
-        let localDelegation = try PermissionedDataJWT.createDelegationToken(
+        // October 22 (atproto ac0c9f15, guide section 3): a delegation's
+        // audience is the authority's `#atproto_pds`. The retired
+        // `#atproto_space_host` audience can no longer be minted.
+        XCTAssertThrowsError(try PermissionedDataJWT.createDelegationToken(
             issuer: localDID,
             audience: "\(localDID)#atproto_space_host",
             space: localSpace,
             key: localKey,
             now: now
+        ))
+        let localDelegation = try PermissionedDataJWT.createDelegationToken(
+            issuer: localDID,
+            audience: "\(localDID)#atproto_pds",
+            space: localSpace,
+            key: localKey,
+            now: now
         )
-        _ = try await DurableSpaceDelegationVerifier(publicKeys: delegationKeys)
+        let verifiedLocalDelegation = try await DurableSpaceDelegationVerifier(publicKeys: delegationKeys)
             .verifiedDelegation(for: localDelegation, expectedSpace: localSpace, now: now)
-        _ = try await DurableSpaceDelegationVerifier(publicKeys: delegationKeys)
+        XCTAssertEqual(verifiedLocalDelegation.audience, "\(localDID)#atproto_pds")
+        // The same pinned ES256K key validly signed the retained legacy
+        // golden, so this rejection is the audience rule, not the signature.
+        await XCTAssertCompositionThrowsError {
+            _ = try await DurableSpaceDelegationVerifier(publicKeys: delegationKeys)
+                .verifiedDelegation(
+                    for: Self.legacyAudienceRemoteDelegation,
+                    expectedSpace: remoteSpace,
+                    now: self.now
+                )
+        }
+        let verifiedRemoteDelegation = try await DurableSpaceDelegationVerifier(publicKeys: delegationKeys)
             .verifiedDelegation(
                 for: Self.remoteDelegation,
                 expectedSpace: remoteSpace,
                 now: now
             )
+        XCTAssertEqual(verifiedRemoteDelegation.issuer, remoteMember)
+        XCTAssertEqual(verifiedRemoteDelegation.audience, "\(remoteAuthority)#atproto_pds")
 
         let localService = try SpaceServiceJWT.create(
             issuer: localDID,
@@ -293,7 +316,16 @@ final class PermissionedResolverCompositionTests: XCTestCase {
         }
     }
 
+    /// The October 22 ES256K delegation golden, aud `<authority>#atproto_pds`.
+    /// It is the legacy golden below, re-signed by upstream's
+    /// `Secp256k1Keypair.sign` path with only `aud` changed:
+    /// `Scripts/space-token-goldens/`. The same token is used by
+    /// `SpaceCredentialAuthorityTests`.
     private static let remoteDelegation =
+        "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWRlbGVnYXRpb24rand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eSIsImF1ZCI6ImRpZDpwbGM6YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4I2F0cHJvdG9fcGRzIiwic3ViIjoiYXQ6Ly9kaWQ6cGxjOmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eC9zcGFjZS9hcHAuYnNreS5ib29rbWFya3MvdHMtZ29sZGVuIiwiaWF0IjoxNzUwMDAwMDAwLCJleHAiOjE3NTAwMDAwNjAsImp0aSI6InRzLW5vbmNlXzAxIn0.xKRrxDuyHIRkXSPIm48yg_gkaTuz0k0XUSOefXojt99GjLl0CRnfmR3Zf_i7a2SkEFXJEvoyYUK3HWU0S6FnuQ"
+    /// The original atproto 3f6c96d golden: the same claims and key, validly
+    /// signed, with the pre-October 22 `#atproto_space_host` audience.
+    private static let legacyAudienceRemoteDelegation =
         "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWRlbGVnYXRpb24rand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eSIsImF1ZCI6ImRpZDpwbGM6YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4I2F0cHJvdG9fc3BhY2VfaG9zdCIsInN1YiI6ImF0Oi8vZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3gvc3BhY2UvYXBwLmJza3kuYm9va21hcmtzL3RzLWdvbGRlbiIsImlhdCI6MTc1MDAwMDAwMCwiZXhwIjoxNzUwMDAwMDYwLCJqdGkiOiJ0cy1ub25jZV8wMSJ9.CiWW_bplyq9ZtybzoUL9f7J_lqlcFKkmAbY2YsVlf5Bly4Ufue7e9QN6_8PioonLWqKnmm6T-RW3Mq2C_JTC6A"
     private static let remoteCredential =
         "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWNyZWRlbnRpYWwrand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eCIsInN1YiI6ImF0Oi8vZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3gvc3BhY2UvYXBwLmJza3kuYm9va21hcmtzL3RzLWdvbGRlbiIsImlhdCI6MTc1MDAwMDAwMCwiZXhwIjoxNzUwMDA3MjAwLCJqdGkiOiJ0cy1jcmVkZW50aWFsLW5vbmNlXzAxIn0.kgRbwHruWKzbsHZlMjmSFYmz1dKBjpP0eQBvJLRYlzMAClhsOpYnRYpe2fBMGtuciGngcQgEwWYSjHpa9YmIEQ"
