@@ -340,11 +340,15 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
             reqDigest = SpaceNotificationRequestDigest.deletion(space: notification.space)
         }
         let endpoint = try notificationEndpoint(destination.endpoint, method: method)
+        // Every attempt gets a fresh random jti, as upstream createServiceJwt
+        // mints one per call: a receiver with a single-use jti store would
+        // otherwise refuse each retry as a replay. The row's own id stays the
+        // outbox bookkeeping key; the `req` digest binds the body.
         let token = try await serviceAuthentication.issue(
             issuer: notification.space.authority,
             audience: destination.audience,
             method: method,
-            eventID: notification.id.uuidString,
+            eventID: UUID().uuidString.lowercased(),
             requestBodyDigest: reqDigest,
             now: Date()
         )
