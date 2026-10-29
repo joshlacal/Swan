@@ -128,6 +128,10 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let root = try attestationTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let database = try await SQLiteControlDatabase(dataDirectory: root)
+        // SQLiteNIO asserts in deinit on an unclosed connection, so every
+        // database in this file is also closed in a defer: a thrown error must
+        // fail its test, not crash the process and cut the later classes.
+        defer { Task { try? await database.close() } }
         let key = try fixedPrivateKey()
         let jwk = try attestationJWK(key, keyID: "key-1")
         let inlineMetadata = try attestationMetadata(
@@ -212,6 +216,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let root = try attestationTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
         let oldKey = try fixedPrivateKey()
         let newKey = P256.Signing.PrivateKey()
         let oldMetadata = try attestationMetadata(
@@ -267,6 +272,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let root = try attestationTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
         let jwk = try OAuthJSONWebKey(
             x: "UVw9brnjlrkE0_7Kf1T9zQzB6Ze_N13KUVrQpsO0A18",
             y: "RTa-OlDzGPv5pUdZAqIhUCvvDVfgjFOyzApW8X2fk1Q",
@@ -316,6 +322,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let root = try attestationTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
         let key = try fixedPrivateKey()
         let metadata = try attestationMetadata(
             clientID: clientID,
@@ -369,7 +376,9 @@ final class ClientAttestationPolicyTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let serverKey = Data(repeating: 0x31, count: 32)
         let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
         let secondDatabase = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await secondDatabase.close() } }
         let firstReplay = try DurableSpaceClientAttestationReplayStore(
             controlStore: database,
             serverKey: serverKey
@@ -406,6 +415,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         try await secondDatabase.close()
 
         let reopened = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await reopened.close() } }
         let reopenedReplay = try DurableSpaceClientAttestationReplayStore(
             controlStore: reopened,
             serverKey: serverKey
@@ -461,6 +471,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let root = try attestationTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
         let transport = AttestationTransport(responseQueues: [:])
         let policy = try await attestationPolicy(
             database: database,
@@ -498,6 +509,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let root = try attestationTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
         let key = try fixedPrivateKey()
         let token = try clientAttestation(
             key: key,
