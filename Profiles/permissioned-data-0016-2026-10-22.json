@@ -3,7 +3,7 @@
   "proposalCommit": "b89d0b04495a62e0e22f1ab04c665a9c4e1c655d",
   "referenceImplementationCommit": "ac0c9f15392f6f0298d71dc52aa88c05036150be",
   "petrelGeneratorCommit": "e115236537041a900ec971be05185a70cca73e8a",
-  "petrelCommit": "e115236537041a900ec971be05185a70cca73e8a",
+  "petrelCommit": "4037e7760e2d1bb71db9a6cfdd0cd4134d4dd3bc",
   "migrationCompatibility": "additiveWithProducingBuildRestore",
   "crypto": {
     "lthashBytes": 2048,
