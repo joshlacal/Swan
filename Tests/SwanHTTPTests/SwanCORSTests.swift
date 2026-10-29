@@ -153,6 +153,9 @@ final class SwanCORSTests: XCTestCase {
                 let exposed = try XCTUnwrap(response.headers[Self.exposeHeaders])
                 XCTAssertTrue(exposed.contains("DPoP-Nonce"), exposed)
                 XCTAssertTrue(exposed.contains("WWW-Authenticate"), exposed)
+                // Scoped to the MAC-bearing Spaces responses, which declare
+                // it themselves (SpaceCredentialHTTPTests pins that side).
+                XCTAssertFalse(exposed.contains("Atproto-Space-Mac"), exposed)
             }
         }
     }
