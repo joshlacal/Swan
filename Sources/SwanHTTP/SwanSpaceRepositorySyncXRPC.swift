@@ -47,7 +47,8 @@ private enum AuthenticatedSpaceRepositorySyncFailure: Error {
 }
 
 /// The generated contract's `Output` currently contains a whole `Data`
-/// payload even though its lexicon output is `application/vnd.ipld.car`. The
+/// payload even though its lexicon output is a streamed STAR archive
+/// (`application/octet-stream`). The
 /// semantic handler therefore conforms to the generated contract for its
 /// typed parameter/context boundary, while the Hummingbird adapter invokes
 /// `prepare` and streams the resulting suffix. Calling `handle` would force
