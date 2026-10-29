@@ -13,4 +13,8 @@ public enum ControlSchemaMigrationVersion: Int, CaseIterable, Codable, Sendable 
     case accountProgramIntegration = 8
     /// The repo host's space-credential revocation list (atproto#5567).
     case spaceCredentialRevocations = 9
+    /// The `account_kem_backfill` lease and completion table for the
+    /// October 22 `#atproto_kem` backfill (Swan's counterpart to upstream's
+    /// `kem_key_backfill_lease`).
+    case accountKEMBackfill = 10
 }
