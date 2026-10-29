@@ -55,8 +55,9 @@ extension SQLiteAccountDatabase: ConversationSpaceAuthorityLifecycle {
                     """, [.text(space.rawValue), .text(accountDID), .text(space.skey), .text(event), .integer(timestamp), .integer(timestamp), .integer(timestamp)])
                 _ = try await connection.query("""
                     INSERT INTO conversation_space_deletion_recipients(
-                        space_uri, deletion_event_id, endpoint, owner_service_did, delivery_service_did, registration_expires_at)
-                    SELECT space_uri, ?, endpoint, owner_service_did, delivery_service_did, expires_at
+                        space_uri, deletion_event_id, service_key, endpoint, owner_service_did, delivery_service_did,
+                        registration_expires_at)
+                    SELECT space_uri, ?, service_key, endpoint, owner_service_did, delivery_service_did, expires_at
                     FROM permissioned_space_notification_registrations WHERE space_uri = ? AND expires_at > ?
                     """, [.text(event), .text(space.rawValue), .integer(timestamp)])
                 // Existing or already-leased write hints become non-deliverable
@@ -117,11 +118,11 @@ extension SQLiteAccountDatabase: ConversationSpaceAuthorityLifecycle {
                 _ = try await connection.query("""
                     INSERT INTO permissioned_space_notification_fanout(
                         id, source_issuer, source_event_id, kind, space_uri, repo_did, wire_revision, commitment,
-                        endpoint, attempts, created_at, available_at, lease_token, lease_expires_at)
+                        endpoint, service_key, attempts, created_at, available_at, lease_token, lease_expires_at)
                     SELECT upper(hex(randomblob(4))) || '-' || upper(hex(randomblob(2))) || '-' || upper(hex(randomblob(2))) || '-' || upper(hex(randomblob(2))) || '-' || upper(hex(randomblob(6))),
-                        ?, ?, 'deleted', space_uri, NULL, NULL, NULL, endpoint, 0, ?, ?, NULL, NULL
+                        ?, ?, 'deleted', space_uri, NULL, NULL, NULL, endpoint, service_key, 0, ?, ?, NULL, NULL
                     FROM conversation_space_deletion_recipients WHERE space_uri = ? AND deletion_event_id = ?
-                    ON CONFLICT(source_issuer, source_event_id, kind, endpoint) DO NOTHING
+                    ON CONFLICT(source_issuer, source_event_id, kind, endpoint, service_key) DO NOTHING
                     """, [.text(accountDID), .text(deletion.eventID), .integer(timestamp), .integer(timestamp), .text(deletion.space.rawValue), .text(deletion.eventID)])
                 try await pruneCompletedDeletionRegistrationsWithoutGate(space: deletion.space)
             }
@@ -155,6 +156,10 @@ extension SQLiteAccountDatabase: ConversationSpaceAuthorityLifecycle {
             """)
         // Existing pending intents predate retry rotation. Their last update
         // is the begin timestamp; already queued terminal deliveries remain owed.
+        // The backfill names the pre-v27 recipient key; a database that still
+        // needs it is backfilled here before v27 rebuilds the table in the
+        // same transaction, so it is skipped once the table is service-keyed.
+        guard try await !notificationTableHasColumn("conversation_space_deletion_recipients", "service_key") else { return }
         _ = try await connection.query("""
             INSERT INTO conversation_space_deletion_recipients(
                 space_uri, deletion_event_id, endpoint, owner_service_did, delivery_service_did, registration_expires_at)

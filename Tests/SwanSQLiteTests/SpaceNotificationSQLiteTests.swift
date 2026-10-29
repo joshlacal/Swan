@@ -1500,7 +1500,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             now: now
         )
 
-        // Service B attempts to overwrite Service A's endpoint -> fails
+        // Service B claiming Service A's service identity -> fails
         do {
             try await database.registerSpaceNotification(
                 .init(
@@ -1508,7 +1508,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                     endpoint: endpoint,
                     repository: fixture.writer,
                     expiresAt: now.addingTimeInterval(3600),
-                    service: "did:web:service-b.example#srv",
+                    service: "did:web:service-a.example#srv",
                     serviceDID: "did:web:service-b.example"
                 ),
                 authorization: credential,
@@ -1521,6 +1521,34 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                 return
             }
         }
+
+        // SWAN-SYNC-4: Service B registering its own identity behind the same
+        // endpoint is accepted, as the reference keys (space, serviceDid),
+        // and leaves Service A's registration untouched.
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpoint,
+                repository: nil,
+                expiresAt: now.addingTimeInterval(1800),
+                service: "did:web:service-b.example#srv",
+                serviceDID: "did:web:service-b.example"
+            ),
+            authorization: credential,
+            now: now
+        )
+        let shared = try await database.connection.query(
+            """
+            SELECT service_key, owner_service_did, repo_did
+            FROM permissioned_space_notification_registrations
+            WHERE space_uri = ? AND endpoint = ? ORDER BY service_key
+            """,
+            [.text(fixture.space.rawValue), .text(endpoint)]
+        )
+        XCTAssertEqual(shared.compactMap { $0.column("service_key")?.string },
+                       ["did:web:service-a.example#srv", "did:web:service-b.example#srv"])
+        XCTAssertEqual(shared.first?.column("owner_service_did")?.string, "did:web:service-a.example")
+        XCTAssertEqual(shared.first?.column("repo_did")?.string, fixture.writer)
 
         // Service A re-registering its own endpoint succeeds
         try await database.registerSpaceNotification(

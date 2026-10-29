@@ -211,11 +211,15 @@ extension SQLiteAccountDatabase {
         )
     }
 
-    /// Queues one authority-signed forward per active service-named
-    /// registration matching `repository`. Each row carries the space
-    /// revisions the space host just assigned. Endpoint-only registrations
-    /// are never enqueued: with no service identity there is no audience a
-    /// receiver could verify.
+    /// Queues one authority-signed forward per endpoint with an active
+    /// service-named registration matching `repository`. Each row carries the
+    /// space revisions the space host just assigned. Endpoint-only
+    /// registrations are never enqueued: with no service identity there is
+    /// no audience a receiver could verify. When several services share an
+    /// endpoint (SWAN-SYNC-4), the row names the lowest service key, the one
+    /// the endpoint-keyed transport lookup
+    /// (`spaceNotificationRegistrationService`) resolves; write forwards are
+    /// reasonable-effort and syncers catch up through listRepos.
     func enqueueWriteForwardsWithoutGate(
         space: SpaceURI,
         sourceEventID: String,
@@ -229,7 +233,7 @@ extension SQLiteAccountDatabase {
             """
             INSERT INTO permissioned_space_notification_fanout(
                 id, source_issuer, source_event_id, kind, space_uri,
-                repo_did, wire_revision, commitment, endpoint,
+                repo_did, wire_revision, commitment, endpoint, service_key,
                 attempts, created_at, available_at,
                 lease_token, lease_expires_at, space_rev, prev_space_rev
             )
@@ -237,18 +241,22 @@ extension SQLiteAccountDatabase {
                 substr(h,1,8)||'-'||substr(h,9,4)||'-'||substr(h,13,4)
                     ||'-'||substr(h,17,4)||'-'||substr(h,21,12),
                 ?, ?, 'write', ?,
-                ?, ?, ?, endpoint,
+                ?, ?, ?, endpoint, service_key,
                 0, ?, ?, NULL, NULL, ?, ?
             FROM (
-                SELECT hex(randomblob(16)) AS h, endpoint
-                FROM permissioned_space_notification_registrations
-                WHERE space_uri = ?
-                  AND delivery_service_did IS NOT NULL
-                  AND expires_at > ?
-                  AND (repo_did IS NULL OR repo_did = ?)
+                SELECT hex(randomblob(16)) AS h, endpoint, service_key
+                FROM (
+                    SELECT endpoint, MIN(service_key) AS service_key
+                    FROM permissioned_space_notification_registrations
+                    WHERE space_uri = ?
+                      AND delivery_service_did IS NOT NULL
+                      AND expires_at > ?
+                      AND (repo_did IS NULL OR repo_did = ?)
+                    GROUP BY endpoint
+                )
             )
             WHERE true
-            ON CONFLICT(source_issuer, source_event_id, kind, endpoint) DO NOTHING
+            ON CONFLICT(source_issuer, source_event_id, kind, endpoint, service_key) DO NOTHING
             """,
             [
                 .text(space.authority), .text(sourceEventID),

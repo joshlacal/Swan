@@ -129,7 +129,7 @@ final class ConversationSpaceAuthorityStoreTests: XCTestCase {
             for (endpoint, expires) in [(fixture.endpoint, expiry), ("https://second.example/events", expiry),
                                         ("https://expired.example/events", Date(timeIntervalSince1970: 99))] {
                 try await database.registerSpaceNotification(.init(space: fixture.space, endpoint: endpoint, repository: nil,
-                    expiresAt: expires, ownerServiceDID: fixture.service, deliveryServiceDID: fixture.service),
+                    expiresAt: expires, ownerServiceDID: fixture.service(for: endpoint), deliveryServiceDID: fixture.service(for: endpoint)),
                     authorization: fixture.credential, now: Date(timeIntervalSince1970: 98))
             }
             deletion = try await database.beginConversationSpaceDeletion(space: fixture.space, authorization: fixture.ownerAuthorization, now: start)
@@ -146,7 +146,7 @@ final class ConversationSpaceAuthorityStoreTests: XCTestCase {
             XCTAssertEqual(fanout.count, 2)
             for event in fanout {
                 let destination = try await reopened.currentSpaceDeletionDeliveryRegistration(for: event, now: delayed)
-                XCTAssertEqual(destination?.serviceIdentity, fixture.service)
+                XCTAssertEqual(destination?.serviceIdentity, fixture.service(for: event.endpoint))
             }
             let originalExpiry = try await reopened.connection.query("SELECT expires_at FROM permissioned_space_notification_registrations WHERE space_uri = ? AND endpoint = ?", [.text(fixture.space.rawValue), .text(fixture.endpoint)])
             XCTAssertEqual(originalExpiry.first?.column("expires_at")?.integer, 300_000_000, "a terminal obligation must never synthesize a renewed registration")
@@ -250,15 +250,23 @@ final class ConversationSpaceAuthorityStoreTests: XCTestCase {
                     endpoint TEXT NOT NULL, repo_did TEXT, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
                     owner_service_did TEXT NOT NULL, delivery_service_did TEXT, PRIMARY KEY(space_uri, endpoint))
                 """)
-            try await database.registerSpaceNotification(.init(space: simple, endpoint: fixture.endpoint, repository: fixture.writer,
-                expiresAt: fixture.now.addingTimeInterval(3600), ownerServiceDID: fixture.service, deliveryServiceDID: fixture.service),
-                authorization: fixture.credential(for: simple), now: fixture.now)
+            // A row the earlier binary wrote into that schema. Current code
+            // writes the v27 service-keyed shape, so insert it directly.
+            _ = try await database.connection.query("""
+                INSERT INTO permissioned_space_notification_registrations
+                    (space_uri, endpoint, repo_did, expires_at, updated_at, owner_service_did, delivery_service_did)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, [.text(simple.rawValue), .text(fixture.endpoint), .text(fixture.writer),
+                      .integer(Int(fixture.now.addingTimeInterval(3600).timeIntervalSince1970 * 1_000_000)),
+                      .integer(Int(fixture.now.timeIntervalSince1970 * 1_000_000)),
+                      .text(fixture.service), .text(fixture.service)])
             try await database.close()
         } catch { try? await database.close(); throw error }
         let reopened = try await fixture.open()
         do {
-            let rows = try await reopened.connection.query("SELECT owner_service_did, delivery_service_did, repo_did FROM permissioned_space_notification_registrations WHERE space_uri = ?", [.text(simple.rawValue)])
+            let rows = try await reopened.connection.query("SELECT owner_service_did, delivery_service_did, repo_did, service_key FROM permissioned_space_notification_registrations WHERE space_uri = ?", [.text(simple.rawValue)])
             XCTAssertEqual(rows.count, 1)
+            XCTAssertEqual(rows.first?.column("service_key")?.string, fixture.service, "v27 re-keys the preserved row by service")
             XCTAssertEqual(rows.first?.column("owner_service_did")?.string, fixture.service)
             XCTAssertEqual(rows.first?.column("delivery_service_did")?.string, fixture.service)
             XCTAssertEqual(rows.first?.column("repo_did")?.string, fixture.writer)
@@ -288,7 +296,13 @@ private struct ConversationAuthorityFixture {
         .spaceCredential(.init(subject: writer, space: space, permissions: [.read], expiresAt: now.addingTimeInterval(3600)))
     }
     func open() async throws -> SQLiteAccountDatabase { try await SQLiteAccountDatabase(dataDirectory: root, did: owner) }
+    /// One service per endpoint host: registrations are keyed by service
+    /// identity (SWAN-SYNC-4), so each endpoint here names its own service.
+    func service(for endpoint: String) -> String {
+        "did:web:\(URL(string: endpoint)?.host ?? "invalid.example")#atproto_pds"
+    }
     func register(on database: SQLiteAccountDatabase, endpoint: String, repository: String?) async throws {
+        let service = service(for: endpoint)
         try await database.registerSpaceNotification(.init(space: space, endpoint: endpoint, repository: repository,
             expiresAt: now.addingTimeInterval(3600), ownerServiceDID: service, deliveryServiceDID: service),
             authorization: credential, now: now)
