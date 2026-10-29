@@ -262,15 +262,39 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         XCTAssertEqual(ControlSchemaMigrationVersion.hardening.rawValue, 7)
         XCTAssertEqual(ControlSchemaMigrationVersion.accountProgramIntegration.rawValue, 8)
         XCTAssertEqual(ControlSchemaMigrationVersion.spaceCredentialRevocations.rawValue, 9)
+        XCTAssertEqual(ControlSchemaMigrationVersion.accountKEMBackfill.rawValue, 10)
+        // The registry names every marker the database records, contiguously.
+        XCTAssertEqual(ControlSchemaMigrationVersion.allCases.map(\.rawValue), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        // Every unconditional statement must be idempotent and additive.
+        // Rewrites belong in a marker-gated migration (v7-v9), never here.
+        let additivePrefixes = [
+            "CREATE TABLE IF NOT EXISTS ", "CREATE INDEX IF NOT EXISTS ",
+            "CREATE TRIGGER IF NOT EXISTS ", "INSERT OR IGNORE INTO control_schema_migrations(",
+        ]
+        for statement in SQLiteLayout.controlMigrations.dropFirst(SQLiteLayout.controlConnectionPragmas.count) {
+            let sql = statement.split(separator: "\n")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.hasPrefix("--") }
+                .joined(separator: " ")
+            XCTAssertTrue(additivePrefixes.contains { sql.hasPrefix($0) }, String(sql.prefix(80)))
+        }
         let schema = SQLiteLayout.controlMigrations.joined(separator: "\n")
         for table in [
             "control_schema_migrations", "identity_bindings", "did_web_claim_transactions",
             "signup_authorizations", "signup_invites", "legacy_session_families",
             "management_sessions", "authentication_factors", "factor_challenges",
-            "totp_secret_envelopes", "recovery_code_digests", "webauthn_credentials", "webauthn_challenges"
+            "totp_secret_envelopes", "recovery_code_digests", "webauthn_credentials", "webauthn_challenges",
+            "account_kem_backfill"
         ] {
             XCTAssertTrue(schema.contains("CREATE TABLE IF NOT EXISTS \(table)"), table)
         }
+        // v10 is bounded by the account registry: one row per account, removed
+        // with the account, and only the three backfill outcomes.
+        let kemBackfill = try XCTUnwrap(SQLiteLayout.controlMigrations.first {
+            $0.contains("CREATE TABLE IF NOT EXISTS account_kem_backfill")
+        })
+        XCTAssertTrue(kemBackfill.contains("account_did TEXT PRIMARY KEY REFERENCES accounts(did) ON DELETE CASCADE"))
+        XCTAssertTrue(kemBackfill.contains("CHECK(status IN ('pending', 'published', 'manual'))"))
         XCTAssertTrue(schema.contains("ON DELETE CASCADE"))
         XCTAssertTrue(schema.contains("CHECK(length(session_digest) = 32)"))
         XCTAssertTrue(schema.contains("identity_bindings_account_capacity"))
@@ -291,7 +315,7 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         let markerRows = try await database.connection.query(
             "SELECT version FROM control_schema_migrations ORDER BY version"
         )
-        XCTAssertEqual(markerRows.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        XCTAssertEqual(markerRows.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         let tables = try await database.connection.query(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('identity_bindings', 'signup_authorizations', 'legacy_session_tokens', 'management_sessions', 'authentication_factors', 'factor_challenges', 'totp_secret_envelopes', 'recovery_code_digests', 'webauthn_credentials', 'webauthn_challenges')"
         )
@@ -357,10 +381,25 @@ final class SwanAccountFoundationContractTests: XCTestCase {
             try await database.connection.query("UPDATE webauthn_credentials SET sign_count = 3 WHERE credential_id_digest = x'0101010101010101010101010101010101010101010101010101010101010101'")
             XCTFail("WebAuthn sign count rollback must be rejected")
         } catch { }
+        try await database.connection.query("INSERT INTO account_kem_backfill(account_did, status) VALUES ('\(accountA)', 'pending'), ('\(accountB)', 'pending')")
+        do {
+            try await database.connection.query("INSERT INTO account_kem_backfill(account_did, status) VALUES ('\(accountA)', 'pending')")
+            XCTFail("KEM backfill must hold at most one row per account")
+        } catch { }
+        do {
+            try await database.connection.query("INSERT INTO account_kem_backfill(account_did, status) VALUES ('did:plc:zzzzzzzzzzzzzzzzzzzzzz', 'pending')")
+            XCTFail("KEM backfill rows must belong to a registered account")
+        } catch { }
+        do {
+            try await database.connection.query("UPDATE account_kem_backfill SET status = 'abandoned' WHERE account_did = '\(accountB)'")
+            XCTFail("KEM backfill status must be pending, published or manual")
+        } catch { }
         try await database.connection.query("DELETE FROM accounts WHERE did = '\(accountA)'")
-        let cascaded = try await database.connection.query("SELECT (SELECT COUNT(*) FROM identity_bindings WHERE account_did = '\(accountA)') AS bindings, (SELECT COUNT(*) FROM authentication_factors WHERE account_did = '\(accountA)') AS factors")
+        let cascaded = try await database.connection.query("SELECT (SELECT COUNT(*) FROM identity_bindings WHERE account_did = '\(accountA)') AS bindings, (SELECT COUNT(*) FROM authentication_factors WHERE account_did = '\(accountA)') AS factors, (SELECT COUNT(*) FROM account_kem_backfill WHERE account_did = '\(accountA)') AS kem_backfill, (SELECT COUNT(*) FROM account_kem_backfill WHERE account_did = '\(accountB)') AS retained_kem_backfill")
         XCTAssertEqual(cascaded.first?.column("bindings")?.integer, 0)
         XCTAssertEqual(cascaded.first?.column("factors")?.integer, 0)
+        XCTAssertEqual(cascaded.first?.column("kem_backfill")?.integer, 0)
+        XCTAssertEqual(cascaded.first?.column("retained_kem_backfill")?.integer, 1)
         try await database.connection.query("BEGIN IMMEDIATE")
         try await database.connection.query("INSERT INTO control_schema_migrations(version, applied_at) VALUES (99, 1)")
         try await database.connection.query("ROLLBACK")
@@ -369,12 +408,13 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         try await database.close()
         let reopened = try await SQLiteControlDatabase(dataDirectory: root)
         let reopenedMarkers = try await reopened.connection.query("SELECT version FROM control_schema_migrations ORDER BY version")
-        XCTAssertEqual(reopenedMarkers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        XCTAssertEqual(reopenedMarkers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         try await reopened.close()
     }
 
-    /// v9 (atproto#5567) is additive: a database last migrated at v8 gains
-    /// the revocation table and marker on its next open, keeping its data.
+    /// v9 (atproto#5567) is additive: a database last migrated at v8 (so
+    /// also without v10) gains the revocation table, the KEM backfill table
+    /// and both markers on its next open, keeping its data.
     func testSpaceCredentialRevocationsV9UpgradesAV8Database() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("swan-space-revocations-v9-\(UUID().uuidString)")
@@ -383,24 +423,29 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         try await database.connection.query(
             "INSERT INTO accounts(did,handle,status,created_at) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa','v8.example','active',1)"
         )
-        // Rewind to the v8 shape.
+        // Rewind to the v8 shape, which predates both v9 and v10.
         try await database.connection.query("DROP TABLE permissioned_space_credential_revocations")
-        try await database.connection.query("DELETE FROM control_schema_migrations WHERE version = 9")
+        try await database.connection.query("DROP TABLE account_kem_backfill")
+        try await database.connection.query("DELETE FROM control_schema_migrations WHERE version IN (9, 10)")
         let rewound = try await database.connection.query(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='permissioned_space_credential_revocations'"
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('permissioned_space_credential_revocations', 'account_kem_backfill')"
         )
-        XCTAssertTrue(rewound.isEmpty, "positive control: the v8 shape has no revocation table")
+        XCTAssertTrue(rewound.isEmpty, "positive control: the v8 shape has no revocation or KEM backfill table")
+        let rewoundMarkers = try await database.connection.query(
+            "SELECT version FROM control_schema_migrations ORDER BY version"
+        )
+        XCTAssertEqual(rewoundMarkers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8])
         try await database.close()
 
         let upgraded = try await SQLiteControlDatabase(dataDirectory: root)
         let markers = try await upgraded.connection.query(
             "SELECT version FROM control_schema_migrations ORDER BY version"
         )
-        XCTAssertEqual(markers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        XCTAssertEqual(markers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         let tables = try await upgraded.connection.query(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='permissioned_space_credential_revocations'"
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('permissioned_space_credential_revocations', 'account_kem_backfill')"
         )
-        XCTAssertEqual(tables.count, 1)
+        XCTAssertEqual(tables.count, 2)
         let accounts = try await upgraded.connection.query("SELECT did FROM accounts")
         XCTAssertEqual(accounts.compactMap { $0.column("did")?.string }, ["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"])
         try await upgraded.recordSpaceCredentialRevocations(
@@ -414,6 +459,79 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         )
         XCTAssertTrue(revoked)
         try await upgraded.close()
+    }
+
+    /// v10 (October 22 `#atproto_kem` backfill) is additive: a database last
+    /// migrated at v9 keeps every row, gains an empty backfill table and the
+    /// marker, and then enrolls only the accounts that already existed.
+    func testAccountKEMBackfillV10UpgradesAV9DatabaseAndEnrollsExistingAccounts() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swan-account-kem-backfill-v10-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+        let second = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+        let revokedDigest = Data(repeating: 9, count: 32)
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        try await database.connection.query(
+            "INSERT INTO accounts(did,handle,status,created_at) VALUES ('\(first)','first.example','active',1),('\(second)','second.example','active',1)"
+        )
+        try await database.connection.query(
+            "INSERT INTO identity_bindings(account_did,identity_did,method,handle,state) VALUES ('\(first)','\(first)','plc','first.example','active')"
+        )
+        try await database.recordSpaceCredentialRevocations(
+            digests: [revokedDigest],
+            retainUntil: Date(timeIntervalSince1970: 2_000_000_000),
+            now: now
+        )
+        // Rewind to the v9 shape.
+        try await database.connection.query("DROP TABLE account_kem_backfill")
+        try await database.connection.query("DELETE FROM control_schema_migrations WHERE version = 10")
+        let rewound = try await database.connection.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='account_kem_backfill'"
+        )
+        XCTAssertTrue(rewound.isEmpty, "positive control: the v9 shape has no KEM backfill table")
+        let rewoundMarkers = try await database.connection.query(
+            "SELECT version FROM control_schema_migrations ORDER BY version"
+        )
+        XCTAssertEqual(rewoundMarkers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        try await database.close()
+
+        let upgraded = try await SQLiteControlDatabase(dataDirectory: root)
+        let markers = try await upgraded.connection.query(
+            "SELECT version FROM control_schema_migrations ORDER BY version"
+        )
+        XCTAssertEqual(markers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        let preserved = try await upgraded.connection.query(
+            "SELECT (SELECT COUNT(*) FROM accounts) AS accounts, (SELECT COUNT(*) FROM identity_bindings WHERE account_did = '\(first)') AS bindings, (SELECT COUNT(*) FROM account_kem_backfill) AS kem_backfill"
+        )
+        XCTAssertEqual(preserved.first?.column("accounts")?.integer, 2)
+        XCTAssertEqual(preserved.first?.column("bindings")?.integer, 1)
+        XCTAssertEqual(preserved.first?.column("kem_backfill")?.integer, 0, "the upgrade itself writes no backfill rows")
+        let stillRevoked = try await upgraded.isSpaceCredentialRevoked(digest: revokedDigest, now: now)
+        XCTAssertTrue(stillRevoked)
+
+        let claimValue = try await upgraded.claimAccountKEMBackfill(now: 100)
+        let claim = try XCTUnwrap(claimValue, "accounts created before v10 must be backfilled")
+        XCTAssertEqual(claim.did, first)
+        XCTAssertFalse(claim.requiresManualPublication)
+        let enrolled = try await upgraded.connection.query(
+            "SELECT account_did FROM account_kem_backfill ORDER BY account_did"
+        )
+        XCTAssertEqual(enrolled.compactMap { $0.column("account_did")?.string }, [first, second])
+        try await upgraded.close()
+
+        // Reopening is a no-op for an already-applied v10.
+        let reopened = try await SQLiteControlDatabase(dataDirectory: root)
+        let reopenedMarkers = try await reopened.connection.query(
+            "SELECT version FROM control_schema_migrations ORDER BY version"
+        )
+        XCTAssertEqual(reopenedMarkers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        let lease = try await reopened.connection.query(
+            "SELECT lease_token FROM account_kem_backfill WHERE account_did = '\(first)'"
+        )
+        XCTAssertEqual(lease.first?.column("lease_token")?.string, claim.token)
+        try await reopened.close()
     }
 
     func testAccountProgramV8InstallsAuxiliaryTablesAndReleasedDidWebCanBeReclaimed() async throws {
@@ -560,7 +678,7 @@ final class SwanAccountFoundationContractTests: XCTestCase {
 
         let upgraded = try await SQLiteControlDatabase(dataDirectory: root)
         let markers = try await upgraded.connection.query("SELECT version FROM control_schema_migrations ORDER BY version")
-        XCTAssertEqual(markers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        XCTAssertEqual(markers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         for (table, column) in [("did_web_claim_transactions", "reserved_key_id"), ("did_web_claim_transactions", "claim_receipt_digest"), ("legacy_session_families", "reuse_detected_at")] {
             let columns = try await upgraded.connection.query("PRAGMA table_info(\(table))")
             XCTAssertTrue(columns.contains { $0.column("name")?.string == column }, "\(table).\(column)")
