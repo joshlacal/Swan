@@ -3693,6 +3693,9 @@ extension SwanCommand {
                     accountKeySource: legacySessionAccountKeySource,
                     dataDirectory: dataURL
                 )
+            // The OAuth server key is a pure owner-only file read, so a
+            // missing or malformed key is refused before the lease as well.
+            let serverKey = try loadOAuthServerKey(fromFile: oauthServerKeyFile)
             let serviceDirectoryLease = try SwanServiceDirectoryLease(dataDirectory: dataURL)
             defer { withExtendedLifetime(serviceDirectoryLease) {} }
             let validatedLegacySessionStartup = try pinnedLegacySessionStartup?
@@ -3700,7 +3703,6 @@ extension SwanCommand {
             // The store holds its own duplicate; close the validated
             // key-root descriptor now rather than when `run()` returns.
             pinnedLegacySessionStartup = nil
-            let serverKey = try loadOAuthServerKey(fromFile: oauthServerKeyFile)
             let controlDatabase = try await SQLiteControlDatabase(dataDirectory: dataURL)
             var preopenedAccountDirectory: SQLitePreMigratedAccountDirectory?
             var preopenedManagementProvisioning: SwanManagementPLCProvisioningRuntime?

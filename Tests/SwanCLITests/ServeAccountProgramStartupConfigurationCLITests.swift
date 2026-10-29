@@ -1231,6 +1231,101 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
         )
     }
 
+    /// The OAuth server key is a mounted secret like the legacy-session
+    /// ones, and reading it is a pure file read. A blank, missing,
+    /// symlinked, wrong-mode or malformed `--oauth-server-key-file` must stop
+    /// `serve` before the service-directory lease creates the data directory
+    /// or its `.swan-service.lock`. Each case runs with no data directory and
+    /// with an existing empty one (a mounted volume), so the lease file
+    /// itself is observable.
+    func testOAuthServerKeyFileRefusesBeforeServiceLease() throws {
+        struct Case {
+            let name: String
+            /// Prepares the key file under the root and returns the value
+            /// passed to `--oauth-server-key-file`.
+            let configure: (URL) throws -> String
+        }
+
+        let validKey = Data(base64URLEncoded(Data(repeating: 0x5A, count: 32)).utf8)
+        let cases: [Case] = [
+            Case(name: "blank-path") { _ in "   " },
+            Case(name: "missing") { root in
+                root.appending(path: "oauth-server-key").path
+            },
+            Case(name: "symlinked") { root in
+                let target = root.appending(path: "oauth-server-key-target")
+                try self.protectedWrite(validKey, to: target)
+                let keyFile = root.appending(path: "oauth-server-key")
+                try FileManager.default.createSymbolicLink(
+                    at: keyFile,
+                    withDestinationURL: target
+                )
+                return keyFile.path
+            },
+            Case(name: "wrong-mode") { root in
+                let keyFile = root.appending(path: "oauth-server-key")
+                try self.protectedWrite(validKey, to: keyFile)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o644],
+                    ofItemAtPath: keyFile.path
+                )
+                return keyFile.path
+            },
+            Case(name: "malformed") { root in
+                let keyFile = root.appending(path: "oauth-server-key")
+                try self.protectedWrite(Data("not-an-oauth-server-key".utf8), to: keyFile)
+                return keyFile.path
+            },
+            Case(name: "short") { root in
+                let keyFile = root.appending(path: "oauth-server-key")
+                try self.protectedWrite(
+                    Data(self.base64URLEncoded(Data(repeating: 0x5A, count: 31)).utf8),
+                    to: keyFile
+                )
+                return keyFile.path
+            },
+        ]
+
+        for testCase in cases {
+            for dataDirectoryExists in [false, true] {
+                let label = "\(testCase.name), data directory "
+                    + (dataDirectoryExists ? "present" : "absent")
+                let root = try temporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: root) }
+                let data = root.appending(path: "data")
+                if dataDirectoryExists {
+                    try FileManager.default.createDirectory(
+                        at: data,
+                        withIntermediateDirectories: false,
+                        attributes: [.posixPermissions: 0o700]
+                    )
+                }
+                let keyFileArgument = try testCase.configure(root)
+
+                let result = try runServe(data: data, arguments: [
+                    "--oauth-server-key-file", keyFileArgument,
+                ])
+                XCTAssertNotEqual(result.status, 0, label)
+                XCTAssertTrue(result.output.isEmpty, label)
+                XCTAssertTrue(
+                    result.error.contains("oauth-server-key"),
+                    "\(label): \(result.error)"
+                )
+                XCTAssertFalse(result.error.contains(root.path), label)
+                if dataDirectoryExists {
+                    XCTAssertEqual(
+                        try FileManager.default.contentsOfDirectory(atPath: data.path),
+                        [],
+                        label
+                    )
+                } else {
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: data.path), label)
+                }
+                assertNoStartupStorageArtifacts(in: data, label: label)
+            }
+        }
+    }
+
     // MARK: - Helpers
 
     private func runServe(
