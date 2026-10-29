@@ -11,6 +11,21 @@ import XCTest
 final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable {
     private let issuer = "did:plc:abcdefghijklmnopqrstuvwx"
     private let signingKey = P256.Signing.PrivateKey()
+    /// The authority key every fixture issuer publishes as its ordinary
+    /// `atproto` verification method. Since the October 22 Spaces release a
+    /// space credential's `kid` is exactly `#atproto` and resolves only this
+    /// method (prompt-10-22-26.md section 3).
+    private let credentialKey = P256.Signing.PrivateKey()
+    /// A different key published under the retired dedicated
+    /// `atproto_space` method. October 22 ignores that method, so a lookup
+    /// that returned this key instead of ``credentialKey`` would be a
+    /// regression to the pre-October-22 dedicated-method resolution.
+    private let retiredDedicatedKey = P256.Signing.PrivateKey()
+
+    private var expectedKeyIdentity: Data {
+        PermissionedDataJWTVerificationKey.p256(credentialKey.publicKey)
+            .deterministicIdentity
+    }
 
     func testStaleGenerationCannotRemoveReplacementFlight() {
         var registry = PLCResolverFlightRegistry<Int>()
@@ -231,7 +246,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
 
         await plc.releaseNext(with: .success)
         let key = try await withinDeadline { try await lookup.value }
-        XCTAssertNotNil(key)
+        assertExactCredentialKey(key)
         await losingBodyFinished.wait()
 
         let completed = try await singleFlightDiagnostic(
@@ -292,13 +307,13 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         clock.advance(seconds: 30)
         await plc.releaseNext(with: .success)
         let firstKey = try await withinDeadline { try await first.value }
-        XCTAssertNotNil(firstKey)
+        assertExactCredentialKey(firstKey)
 
         let immediatelyCached = try await resolver.publicKey(
             for: issuer,
             keyID: PermissionedDataJWT.spaceCredentialKeyID
         )
-        XCTAssertNotNil(immediatelyCached)
+        assertExactCredentialKey(immediatelyCached)
         let immediateFetchCount = await plc.fetchCount()
         XCTAssertEqual(immediateFetchCount, 1)
 
@@ -307,7 +322,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
             for: issuer,
             keyID: PermissionedDataJWT.spaceCredentialKeyID
         )
-        XCTAssertNotNil(stillCached)
+        assertExactCredentialKey(stillCached)
         let cachedFetchCount = await plc.fetchCount()
         XCTAssertEqual(cachedFetchCount, 1)
 
@@ -321,7 +336,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         try await waitForFetchCount(2, from: plc)
         await plc.releaseNext(with: .success)
         let refreshedKey = try await withinDeadline { try await refresh.value }
-        XCTAssertNotNil(refreshedKey)
+        assertExactCredentialKey(refreshedKey)
     }
 
     func testNegativeCacheLifetimeStartsWhenFailureCompletes() async throws {
@@ -370,7 +385,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         try await waitForFetchCount(2, from: plc)
         await plc.releaseNext(with: .success)
         let retriedKey = try await withinDeadline { try await retry.value }
-        XCTAssertNotNil(retriedKey)
+        assertExactCredentialKey(retriedKey)
     }
 
     func testRefreshFailureNeverRevivesExpiredKeyMaterial() async throws {
@@ -395,7 +410,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         try await waitForFetchCount(1, from: plc)
         await plc.releaseNext(with: .success)
         let initialKey = try await withinDeadline { try await initial.value }
-        XCTAssertNotNil(initialKey)
+        assertExactCredentialKey(initialKey)
 
         clock.advance(seconds: 2)
         let failedRefresh = Task {
@@ -447,7 +462,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
 
         await XCTAssertThrowsSingleFlightError(try await withinDeadline { try await initiatingWaiter.value })
         let survivingKey = try await withinDeadline { try await survivingWaiter.value }
-        XCTAssertNotNil(survivingKey)
+        assertExactCredentialKey(survivingKey)
         let fetchCount = await plc.fetchCount()
         let peakFetchCount = await plc.peakConcurrentFetchCount()
         XCTAssertEqual(fetchCount, 1)
@@ -463,13 +478,14 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
             cacheConfiguration: .init(maximumConcurrentLookups: 2)
         )
 
+        let expectedIdentity = expectedKeyIdentity
         let lookups = issuers.map { issuer in
             Task {
                 do {
                     return try await resolver.publicKey(
                         for: issuer,
                         keyID: PermissionedDataJWT.spaceCredentialKeyID
-                    ) != nil
+                    )?.deterministicIdentity == expectedIdentity
                 } catch {
                     return false
                 }
@@ -521,6 +537,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
             cacheConfiguration: .init(maximumConcurrentLookups: 8)
         )
 
+        let expectedIdentity = expectedKeyIdentity
         let lookups = issuers.enumerated().map { index, issuer in
             let lookupIndex = index + 1
             let resolver = index.isMultiple(of: 2)
@@ -537,7 +554,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
                     succeeded = try await resolver.publicKey(
                         for: issuer,
                         keyID: PermissionedDataJWT.spaceCredentialKeyID
-                    ) != nil
+                    )?.deterministicIdentity == expectedIdentity
                 } catch {
                     succeeded = false
                 }
@@ -640,7 +657,7 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         try await waitForFetchCount(1, from: plc)
         await plc.enableAutomaticRelease(with: .success)
         let firstKey = try await withinDeadline { try await first.value }
-        XCTAssertNotNil(firstKey)
+        assertExactCredentialKey(firstKey)
 
         await lateStart.signal()
         try await waitForFetchCount(2, from: plc)
@@ -681,17 +698,42 @@ final class PLCSpaceCredentialSingleFlightTests: XCTestCase, @unchecked Sendable
         XCTAssertTrue(finalFixture.contains("automatic=true"), finalFixture)
     }
 
+    /// Stronger than a non-nil check: the lookup must return the issuer's
+    /// exact `#atproto` key, never nil and never the retired
+    /// `atproto_space` key the fixture also publishes.
+    private func assertExactCredentialKey(
+        _ key: PermissionedDataJWTVerificationKey?,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(
+            key?.deterministicIdentity,
+            expectedKeyIdentity,
+            "expected the issuer's exact #atproto verification key",
+            file: file,
+            line: line
+        )
+    }
+
     private func controlledPLC(
         for issuers: [String],
         phaseRecorder: SingleFlightPhaseRecorder? = nil
     ) throws -> SingleFlightControlledPLC {
-        let verificationKey = P256.Signing.PrivateKey().publicKey
-        let method = P256DIDKey(publicKey: verificationKey).value
+        // October 22 retired the dedicated `atproto_space` method: the
+        // credential kid `#atproto` resolves only `atproto`. The retired
+        // method stays published with a different key so every lookup below
+        // also proves it is ignored.
+        let methods = [
+            "atproto": P256DIDKey(publicKey: credentialKey.publicKey).value,
+            "atproto_space": P256DIDKey(
+                publicKey: retiredDedicatedKey.publicKey
+            ).value,
+        ]
         var snapshots = [String: SingleFlightPLCSnapshot]()
         for issuer in issuers {
             snapshots[issuer] = try snapshot(
                 issuer: issuer,
-                methods: ["atproto_space": method]
+                methods: methods
             )
         }
         return SingleFlightControlledPLC(
