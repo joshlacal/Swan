@@ -6,16 +6,23 @@ import SwanSQLite
 
 /// Runs only with the operator-configured local account key store. A failed
 /// account is retried without blocking server startup or other accounts.
+/// Only a pre-submit PLC fact (`PLCAccountRotationError.conflict`) marks an
+/// account for manual publication; PLC faults stay retryable.
 public struct SwanAccountKEMBackfillService: Service {
     private let control: SQLiteControlDatabase
     private let keys: any AccountKeyStore
     private let rotation: PLCAccountRotationService
     private let pdsOrigin: URL
+    private let pacing: Duration
     private let logger = Logger(label: "swan.kem-backfill")
 
+    /// `pacing` is the pause between accounts, so startup does not send
+    /// every account's PLC requests back-to-back.
     public init(control: SQLiteControlDatabase, keys: any AccountKeyStore,
-                rotation: PLCAccountRotationService, pdsOrigin: URL) {
+                rotation: PLCAccountRotationService, pdsOrigin: URL,
+                pacing: Duration = .seconds(1)) {
         self.control = control; self.keys = keys; self.rotation = rotation; self.pdsOrigin = pdsOrigin
+        self.pacing = pacing
     }
 
     @discardableResult
@@ -46,11 +53,12 @@ public struct SwanAccountKEMBackfillService: Service {
 
     private func runLoop() async throws {
         while !Task.isCancelled {
+            var delay: Duration = .seconds(10)
             do {
-                if try await runOnce() { continue }
+                if try await runOnce() { delay = pacing }
             } catch is CancellationError { return }
             catch { /* The durable retry retains this account's work. */ }
-            do { try await Task.sleep(for: .seconds(10)) }
+            do { try await Task.sleep(for: delay) }
             catch { return }
         }
     }

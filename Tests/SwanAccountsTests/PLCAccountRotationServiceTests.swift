@@ -52,6 +52,158 @@ final class PLCAccountRotationServiceTests: XCTestCase {
         }
     }
 
+    /// F1: a submit PLC does not take (429, 5xx, timeout) leaves the stored
+    /// KEM operation retryable instead of a permanent manual conflict, and
+    /// the retry replays that exact operation.
+    func testKEMBackfillTreatsUnacceptedSubmitAsRetryableAndReplaysIt() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let origin = URL(string: "https://swan.example")!
+            await fixture.plc.rejectNextSubmissions(1)
+            do {
+                _ = try await fixture.service.backfillKEM(did: fixture.did, expectedPDSOrigin: origin, now: fixture.now)
+                XCTFail("an unaccepted submit was reported as published")
+            } catch { XCTAssertEqual(error as? PLCAccountRotationError, .unavailable) }
+            let pending = try await localHistory(fixture)
+            XCTAssertEqual(pending.count, 2)
+            let stored = try XCTUnwrap(pending.last)
+            let unchanged = await fixture.plc.currentTerminal()
+            XCTAssertEqual(try unchanged.cid.string, fixture.genesisCID)
+
+            let replayed = try await fixture.service.backfillKEM(did: fixture.did, expectedPDSOrigin: origin, now: fixture.now)
+            XCTAssertTrue(replayed.publishedNewOperation)
+            XCTAssertEqual(replayed.operationCID, stored.cid)
+            let head = await fixture.plc.currentTerminal()
+            XCTAssertEqual(try head.cid.string, stored.cid)
+            let history = try await localHistory(fixture)
+            XCTAssertEqual(history.count, 2, "the replay must not append a second KEM operation")
+            try await fixture.opener.close()
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.opener.close()
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
+    /// F1: rotate() never persists a rotation on top of a KEM operation PLC
+    /// has not accepted. It replays that operation first, so a later rotation
+    /// is not wedged behind an orphaned parent.
+    func testRotationReplaysUnacceptedKEMOperationInsteadOfWedging() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            await fixture.plc.rejectNextSubmissions(1)
+            do {
+                _ = try await fixture.service.backfillKEM(
+                    did: fixture.did, expectedPDSOrigin: URL(string: "https://swan.example")!, now: fixture.now)
+                XCTFail("an unaccepted submit was reported as published")
+            } catch { XCTAssertEqual(error as? PLCAccountRotationError, .unavailable) }
+            let pending = try await localHistory(fixture)
+            let stored = try XCTUnwrap(pending.last)
+
+            await fixture.plc.rejectNextSubmissions(1)
+            do {
+                _ = try await fixture.service.rotate(did: fixture.did, now: fixture.now)
+                XCTFail("rotation extended an operation PLC has not accepted")
+            } catch { XCTAssertEqual(error as? PLCAccountRotationError, .unavailable) }
+            let afterFailure = try await localHistory(fixture)
+            XCTAssertEqual(afterFailure.count, 2, "no rotation may be persisted above an unaccepted operation")
+            let account = try await fixture.control.account(did: fixture.did)
+            XCTAssertEqual(account?.signingKey?.generation, 1)
+
+            let rotated = try await fixture.service.rotate(did: fixture.did, now: fixture.now)
+            XCTAssertEqual(rotated.generation, 2)
+            XCTAssertEqual(rotated.operation.prev, stored.cid)
+            XCTAssertNotNil(rotated.operation.regular?.verificationMethods["atproto_kem"])
+            let head = await fixture.plc.currentTerminal()
+            XCTAssertEqual(try head.cid.string, try rotated.operation.cid.string)
+            try await fixture.opener.close()
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.opener.close()
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
+    /// F1: a pending signing-key rotation defers the backfill; it is not a
+    /// reason to mark the account for manual publication.
+    func testKEMBackfillDefersBehindPendingRotationInsteadOfMarkingManual() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let origin = URL(string: "https://swan.example")!
+            let failure = FailOnceRotationCommit()
+            await fixture.control.setBeforeRotationCommitForTesting {
+                try await failure.checkpoint()
+            }
+            do {
+                _ = try await fixture.service.rotate(did: fixture.did, now: fixture.now)
+                XCTFail("the first atomic control commit should roll back")
+            } catch PLCAccountRotationError.unavailable {}
+            do {
+                _ = try await fixture.service.backfillKEM(did: fixture.did, expectedPDSOrigin: origin, now: fixture.now)
+                XCTFail("backfill extended a pending rotation")
+            } catch { XCTAssertEqual(error as? PLCAccountRotationError, .unavailable) }
+
+            _ = try await fixture.service.rotate(did: fixture.did, now: fixture.now)
+            let published = try await fixture.service.backfillKEM(did: fixture.did, expectedPDSOrigin: origin, now: fixture.now)
+            XCTAssertTrue(published.publishedNewOperation)
+            XCTAssertEqual(published.generation, 2)
+            try await fixture.opener.close()
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.opener.close()
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
+    /// F1: once PLC's head has moved to an operation this host did not write,
+    /// the replay and rotate() both stop with a conflict before submitting.
+    func testMovedPLCHeadIsAConflictDecidedBeforeSubmitting() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let origin = URL(string: "https://swan.example")!
+            await fixture.plc.rejectNextSubmissions(1)
+            do {
+                _ = try await fixture.service.backfillKEM(did: fixture.did, expectedPDSOrigin: origin, now: fixture.now)
+                XCTFail("an unaccepted submit was reported as published")
+            } catch { XCTAssertEqual(error as? PLCAccountRotationError, .unavailable) }
+            let genesis = await fixture.plc.currentTerminal()
+            let parent = try XCTUnwrap(genesis.regular)
+            let rotationKey = try P256.Signing.PrivateKey(rawRepresentation: Data(repeating: 71, count: 32))
+            let foreign = try PLCOperationCodec.sign(.regular(try PLCUnsignedRegularOperation(
+                rotationKeys: parent.rotationKeys, verificationMethods: parent.verificationMethods,
+                alsoKnownAs: ["at://moved.example.com"], services: parent.services,
+                prev: fixture.genesisCID)), using: rotationKey)
+            await fixture.plc.replaceTerminal(foreign)
+            let before = await fixture.plc.submissionCount()
+
+            do {
+                _ = try await fixture.service.backfillKEM(did: fixture.did, expectedPDSOrigin: origin, now: fixture.now)
+                XCTFail("backfill replayed onto a moved head")
+            } catch { XCTAssertEqual(error as? PLCAccountRotationError, .conflict) }
+            do {
+                _ = try await fixture.service.rotate(did: fixture.did, now: fixture.now)
+                XCTFail("rotation extended an operation PLC rejected")
+            } catch { XCTAssertEqual(error as? PLCAccountRotationError, .conflict) }
+            let after = await fixture.plc.submissionCount()
+            XCTAssertEqual(after, before, "a moved head is decided before anything is submitted")
+            let history = try await localHistory(fixture)
+            XCTAssertEqual(history.count, 2, "no rotation may be persisted above a rejected operation")
+            try await fixture.opener.close()
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.opener.close()
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
     func testRotationPersistsPendingHistoryAndPromotesControlGeneration() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -366,6 +518,7 @@ final class PLCAccountRotationServiceTests: XCTestCase {
         let control: SQLiteControlDatabase
         let opener: SQLitePLCAccountPreparationStoreOpener
         let keyStore: FileAccountKeyStore
+        let plc: RotatingPLCFixture
     }
 
     private func makeFixture(
@@ -493,8 +646,15 @@ final class PLCAccountRotationServiceTests: XCTestCase {
             service: service,
             control: control,
             opener: opener,
-            keyStore: keyStore
+            keyStore: keyStore,
+            plc: plc
         )
+    }
+
+    private func localHistory(_ fixture: RotationFixture) async throws -> [PublicPLCOperationHistoryEntry] {
+        let store = try await fixture.opener.openPLCAccountPreparationStore(did: fixture.did)
+        let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
+        return try await database.publicPLCOperationHistory()
     }
 
     private func temporaryDirectory() throws -> URL {
@@ -583,13 +743,27 @@ private actor RecordingLifecycleEmitter: PublicLifecycleEventEmitting {
 private actor RotatingPLCFixture: PLCClient {
     private let did: String
     private var terminal: PLCSignedOperation
+    private var rejectedSubmissions = 0
+    private var submissions = 0
 
     init(did: String, terminal: PLCSignedOperation) {
         self.did = did
         self.terminal = terminal
     }
 
+    /// PLC answers 429/5xx or times out: nothing is accepted.
+    func rejectNextSubmissions(_ count: Int) { rejectedSubmissions = count }
+    /// Another rotation-key holder moves the head.
+    func replaceTerminal(_ operation: PLCSignedOperation) { terminal = operation }
+    func currentTerminal() -> PLCSignedOperation { terminal }
+    func submissionCount() -> Int { submissions }
+
     func submit(did: String, operation: PLCSignedOperation) async throws {
+        submissions += 1
+        if rejectedSubmissions > 0 {
+            rejectedSubmissions -= 1
+            throw SwanError.unavailable("PLC fixture rate limited")
+        }
         guard did == self.did,
               operation.prev == (try terminal.cid.string),
               let parent = terminal.regular else {

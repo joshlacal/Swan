@@ -64,18 +64,31 @@ public actor PLCAccountRotationService {
 
     /// Explicitly backfills only an active account still hosted at the expected
     /// PDS. It leaves repository signing and PLC rotation keys unchanged.
+    ///
+    /// `conflict` is thrown only for facts checked before anything is
+    /// submitted (not did:plc, no rotation-key custody, the PDS endpoint moved,
+    /// a foreign KEM key, or a PLC head that is not this host's history).
+    /// Every other failure, including PLC not accepting a submitted operation,
+    /// is `unavailable` or a transport error, so the caller retries it.
     public func backfillKEM(did rawDID: String, expectedPDSOrigin: URL, now: Date = Date()) async throws -> AccountKEMBackfillResult {
         let did = try AccountIdentifiers.validateDID(rawDID)
         let origin = try PLCATProfile.canonicalPDSOrigin(expectedPDSOrigin)
-        guard did.hasPrefix("did:plc:"), let account = try await controlStore.account(did: did),
-              account.status == .active, let generation = account.signingKey?.generation,
+        guard did.hasPrefix("did:plc:"), let account = try await controlStore.account(did: did) else {
+            throw PLCAccountRotationError.conflict
+        }
+        // A deactivated account can be reactivated; it is not ineligible.
+        guard account.status == .active else { throw PLCAccountRotationError.unavailable }
+        guard let generation = account.signingKey?.generation,
               account.rotationKey?.generation == generation else { throw PLCAccountRotationError.conflict }
         let store = try await accountStoreOpener.openPLCAccountPreparationStore(did: did)
         guard let historyStore = store as? any PublicPLCIdentityHistoryStore else { throw PLCAccountRotationError.unavailable }
         let history = try await ensureHistory(store: store, historyStore: historyStore, account: account, now: now)
-        guard let terminal = history.last, terminal.signingKeyGeneration == generation else {
-            // Resolve a pending signing-key rotation through rotate() first.
-            throw PLCAccountRotationError.conflict
+        guard let terminal = history.last else { throw PLCAccountRotationError.conflict }
+        guard terminal.signingKeyGeneration == generation else {
+            // Resolve a pending signing-key rotation through rotate() first;
+            // the backfill retries once it has been promoted.
+            throw terminal.signingKeyGeneration > generation
+                ? PLCAccountRotationError.unavailable : PLCAccountRotationError.conflict
         }
         let operation = try PLCOperationCodec.decodeSignedJSON(terminal.canonicalJSON)
         guard let regular = operation.regular, regular.services["atproto_pds"]?.endpoint == origin else {
@@ -96,7 +109,7 @@ public actor PLCAccountRotationService {
                 && state.alsoKnownAs == regular.alsoKnownAs
             if !matches {
                 guard operation.prev != nil else { throw PLCAccountRotationError.conflict }
-                try await submitAndVerify(operation: operation, did: did, expectedPrevious: operation.prev)
+                try await publishLocalFollowUp(terminal, did: did)
             } else {
                 let audit = try await plcClient.fetchAudit(did: did)
                 guard let latest = audit.last, !latest.nullified, latest.cid == terminal.cid,
@@ -122,7 +135,13 @@ public actor PLCAccountRotationService {
         let proposed = try PublicPLCOperationHistoryEntry(cid: updated.cid.string, previousCID: terminal.cid,
             canonicalJSON: updated.canonicalJSON, createdAt: now, signingKeyGeneration: generation, rotationKeyGeneration: generation)
         let persisted = try await historyStore.installPublicPLCOperation(proposed)
-        try await submitAndVerify(operation: updated, did: did, expectedPrevious: terminal.cid)
+        do {
+            try await submitAndVerify(operation: updated, did: did, expectedPrevious: terminal.cid)
+        } catch PLCAccountRotationError.conflict {
+            // The operation is now local history. A retry replays it, and its
+            // pre-submit PLC head check decides whether publication is possible.
+            throw PLCAccountRotationError.unavailable
+        }
         try await lifecycleEmitter?.emitRotationIdentity(did: did, plcOperationCID: persisted.cid,
             handle: nil, materialTime: persisted.createdAt, now: now)
         return AccountKEMBackfillResult(did: did, operationCID: persisted.cid, generation: generation, publishedNewOperation: true)
@@ -201,6 +220,13 @@ public actor PLCAccountRotationService {
                 )
             }
             throw PLCAccountRotationError.conflict
+        }
+        // A same-generation follow-up (the KEM backfill operation) is appended
+        // before PLC takes it. Never persist a rotation on top of an operation
+        // PLC has not accepted: replay it first, or stop before persisting.
+        if history.count >= 2,
+           history[history.count - 2].signingKeyGeneration == expectedGeneration {
+            try await publishLocalFollowUp(terminalEntry, did: did)
         }
 
         let oldRotationKey: P256.Signing.PrivateKey
@@ -417,6 +443,40 @@ public actor PLCAccountRotationService {
         return try PLCOperationCodec.sign(.regular(unsigned), using: rotationKey)
     }
 
+    /// Publishes a locally appended operation while PLC's head is still its
+    /// parent, or confirms PLC already took it. `conflict` means PLC's head is
+    /// elsewhere and is decided before anything is submitted. A submit that
+    /// PLC does not take is `unavailable`, so a later call replays the same
+    /// stored operation.
+    private func publishLocalFollowUp(
+        _ entry: PublicPLCOperationHistoryEntry,
+        did: String
+    ) async throws {
+        guard let parent = entry.previousCID else {
+            throw PLCAccountRotationError.conflict
+        }
+        let operation: PLCSignedOperation
+        let head: String?
+        do {
+            operation = try PLCOperationCodec.decodeSignedJSON(entry.canonicalJSON)
+            head = try await plcClient.fetchAudit(did: did)
+                .last(where: { !$0.nullified })?.cid
+        } catch {
+            throw PLCAccountRotationError.unavailable
+        }
+        if head == entry.cid { return }
+        guard head == parent else { throw PLCAccountRotationError.conflict }
+        do {
+            try await submitAndVerify(
+                operation: operation,
+                did: did,
+                expectedPrevious: parent
+            )
+        } catch PLCAccountRotationError.conflict {
+            throw PLCAccountRotationError.unavailable
+        }
+    }
+
     private func submitAndVerify(
         operation: PLCSignedOperation,
         did: String,
@@ -437,10 +497,17 @@ public actor PLCAccountRotationService {
         }
         do {
             let audit = try await plcClient.fetchAudit(did: did)
-            guard let terminal = audit.last(where: { !$0.nullified }),
+            let head = audit.last(where: { !$0.nullified })
+            guard let terminal = head,
                   terminal == audit.last,
                   terminal.operation == operation,
                   terminal.cid == (try operation.cid.string) else {
+                // PLC did not take the operation (429, 5xx, timeout) and its
+                // head is still the parent: replaying it later can succeed.
+                // A head anywhere else is a real conflict.
+                if let expectedPrevious, head?.cid == expectedPrevious {
+                    throw PLCAccountRotationError.unavailable
+                }
                 throw PLCAccountRotationError.conflict
             }
             let state = try await plcClient.fetchState(did: did)
