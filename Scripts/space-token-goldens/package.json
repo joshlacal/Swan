@@ -1,0 +1,10 @@
+{
+  "name": "space-token-goldens",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned dependencies for re-signing the space delegation and client attestation goldens",
+  "dependencies": {
+    "@noble/curves": "1.8.0",
+    "@noble/hashes": "1.7.0"
+  }
+}
