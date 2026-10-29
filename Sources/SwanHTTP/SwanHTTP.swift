@@ -1644,11 +1644,16 @@ func oauthMetadataCORSHeaders(_ headers: inout HTTPFields) {
     headers[HTTPField.Name("Access-Control-Allow-Headers")!] = "Content-Type, DPoP"
 }
 
+/// The exposed pair matches upstream's OAuth provider, which exposes only
+/// `DPoP-Nonce` and `WWW-Authenticate` on these routes. They never carry
+/// `Atproto-Space-Mac`. The MAC-bearing Spaces responses expose that header
+/// themselves (`withSpaceResponseMAC`), as upstream's `getSpaceMacSecret`
+/// does.
 func oauthAPICORSHeaders(_ headers: inout HTTPFields) {
     headers[HTTPField.Name("Access-Control-Allow-Origin")!] = "*"
     headers[HTTPField.Name("Access-Control-Allow-Methods")!] = "POST, OPTIONS"
     headers[HTTPField.Name("Access-Control-Allow-Headers")!] = "Content-Type, DPoP"
-    headers[HTTPField.Name("Access-Control-Expose-Headers")!] = "DPoP-Nonce, WWW-Authenticate, Atproto-Space-Mac"
+    headers[HTTPField.Name("Access-Control-Expose-Headers")!] = "DPoP-Nonce, WWW-Authenticate"
 }
 
 func oauthMetadataCORSPreflightResponse() -> Response {
