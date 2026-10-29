@@ -26,6 +26,9 @@ final class RecreatedSpaceAdoptionTests: XCTestCase {
             receiverDID: receiver, space: space, repositoryDID: "did:plc:repositoryabcdefghij"
         )
         let database = try await SQLiteAccountDatabase(dataDirectory: root, did: receiver)
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await control.close() } }
+        let revocations = DurableSpaceCredentialRevocations(store: control)
         do {
             // Participation through the receiver's own authored repository,
             // the failure scenario in the finding.
@@ -67,7 +70,16 @@ final class RecreatedSpaceAdoptionTests: XCTestCase {
                 )
             }
             let now = deletedAt.addingTimeInterval(120)
+            // SW-B: a credential the authority revoked is refused, as serve
+            // refuses it on every presentation.
+            let revoked = try credential(issuedAt: now)
+            try await revocations.record(
+                space: space,
+                credentialIDs: [try PermissionedDataJWT.inspectSpaceCredential(revoked).claims.jti],
+                now: now
+            )
             let refused: [(String, String, String?)] = [
+                ("revoked by its authority", revoked, nil),
                 ("issued before the deletion", try credential(issuedAt: deletedAt.addingTimeInterval(-30)), nil),
                 ("issued in the deletion second", try credential(issuedAt: deletedAt), nil),
                 ("signed by an untrusted key", try credential(signedBy: P256.Signing.PrivateKey(), issuedAt: now), nil),
@@ -78,7 +90,7 @@ final class RecreatedSpaceAdoptionTests: XCTestCase {
                 do {
                     _ = try await RecreatedSpaceAdoption.adopt(
                         credential: token, space: space, deletionEventID: event,
-                        database: database, publicKeys: publicKeys, now: now
+                        database: database, publicKeys: publicKeys, revocations: revocations, now: now
                     )
                     XCTFail("adoption accepted a credential \(name)")
                 } catch let error as SwanError {
@@ -91,7 +103,7 @@ final class RecreatedSpaceAdoptionTests: XCTestCase {
             let outcome = try await RecreatedSpaceAdoption.adopt(
                 credential: try credential(issuedAt: deletedAt.addingTimeInterval(60)),
                 space: space, deletionEventID: nil,
-                database: database, publicKeys: publicKeys, now: now
+                database: database, publicKeys: publicKeys, revocations: revocations, now: now
             )
             XCTAssertEqual(outcome.deletionEventID, "deletion-1")
             XCTAssertTrue(outcome.adopted)
@@ -103,7 +115,7 @@ final class RecreatedSpaceAdoptionTests: XCTestCase {
                 _ = try await RecreatedSpaceAdoption.adopt(
                     credential: try credential(issuedAt: deletedAt.addingTimeInterval(90)),
                     space: space, deletionEventID: nil,
-                    database: database, publicKeys: publicKeys, now: now
+                    database: database, publicKeys: publicKeys, revocations: revocations, now: now
                 )
                 XCTFail("adoption without a retained deletion was accepted")
             } catch let error as SwanError {

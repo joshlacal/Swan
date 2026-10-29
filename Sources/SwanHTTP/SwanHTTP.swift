@@ -254,7 +254,9 @@ public struct SwanSpaceCredentialHTTPConfiguration: Sendable {
 /// record and blob routes remain OAuth-only unless the broader legacy
 /// ``SwanSpaceCredentialHTTPConfiguration`` is explicitly supplied.
 public struct SwanSpaceCredentialVerificationHTTPConfiguration: Sendable {
-    let credentialPublicKeys: any SpaceCredentialPublicKeyResolver
+    /// Readable so `swan account adopt-recreated-space` verifies with exactly
+    /// the resolver `serve` composes.
+    public let credentialPublicKeys: any SpaceCredentialPublicKeyResolver
 
     public init(credentialPublicKeys: any SpaceCredentialPublicKeyResolver) {
         self.credentialPublicKeys = credentialPublicKeys

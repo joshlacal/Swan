@@ -1,6 +1,7 @@
 import ArgumentParser
 import Crypto
 import Foundation
+import PetrelPLC
 import SwanCore
 import SwanOAuth
 import SwanSpaces
@@ -15,9 +16,10 @@ import SwanSQLite
 /// credential, register, and resync from scratch. Adoption is an explicit
 /// operator step, never a side effect of a read or retry: the operator
 /// presents an authority-issued credential for the recreated space, Swan
-/// verifies it with the same trust material `serve` uses, and the database
-/// accepts it only when it was issued after the retained deletion. The old
-/// projection is purged, never revived.
+/// verifies it the way `serve` verifies a presented credential (the same key
+/// composition, the same revocation list), and the database accepts it only
+/// when it was issued after the retained deletion. The old projection is
+/// purged, never revived.
 enum RecreatedSpaceAdoption {
     struct Outcome: Encodable, Equatable {
         let space: String
@@ -36,6 +38,7 @@ enum RecreatedSpaceAdoption {
         deletionEventID: String?,
         database: SQLiteAccountDatabase,
         publicKeys: any SpaceCredentialPublicKeyResolver,
+        revocations: DurableSpaceCredentialRevocations,
         now: Date = Date()
     ) async throws -> Outcome {
         guard let tombstone = try await database.recipientSpaceDeletionTombstone(space) else {
@@ -45,8 +48,15 @@ enum RecreatedSpaceAdoption {
         let authorization = try await DurableSpaceCredentialVerifier(publicKeys: publicKeys)
             .authorization(for: token, expectedSpace: space, now: now)
         // The signature, issuer, subject and lifetime were verified above;
-        // inspection only reads the issue time of that same token.
-        let issuedAt = try PermissionedDataJWT.inspectSpaceCredential(token).claims.iat
+        // inspection only reads the issue time and ID of that same token.
+        let claims = try PermissionedDataJWT.inspectSpaceCredential(token).claims
+        // `serve` refuses a credential whose `(space, jti)` the authority
+        // revoked (notifyCredentialRevoked) on every presentation, so
+        // adoption does too. An unreadable revocation list fails closed.
+        guard try await !revocations.isRevoked(space: space, credentialID: claims.jti, now: now) else {
+            throw SwanError.unauthorized("space credential was revoked")
+        }
+        let issuedAt = claims.iat
         try await database.adoptRecreatedRemoteSpace(
             space,
             expectedDeletionEventID: expectedEvent,
@@ -61,6 +71,46 @@ enum RecreatedSpaceAdoption {
             credentialIssuedAt: issuedAt,
             adopted: true
         )
+    }
+
+    /// The credential key resolver `serve` builds from the same inputs:
+    /// local account keys (with `--enable-local-space-interop`), the
+    /// notification configuration's pins and PLC resolver, and the DID
+    /// document fallback (with `--enable-spaces-open-interop`). Composing
+    /// through ``ServePermissionedRuntime/compose`` keeps the precedence and
+    /// pin-conflict checks identical instead of copying them.
+    static func credentialPublicKeys(
+        local: ServeLocalSpaceRuntime?,
+        notification: ServeNotificationRuntime,
+        openFederation: SwanDIDDocumentSpaceResolver?
+    ) async throws -> any SpaceCredentialPublicKeyResolver {
+        let runtime = try await ServePermissionedRuntime.compose(
+            local: local,
+            notification: notification,
+            openFederation: openFederation
+        )
+        guard let keys = runtime.repositoryCredentialConfiguration?.credentialPublicKeys else {
+            throw SwanError.unavailable("space credential verification keys are unavailable")
+        }
+        return keys
+    }
+
+    /// The DID-document resolver `serve --enable-spaces-open-interop` adds,
+    /// built the same way. It resolves did:plc through the production PLC
+    /// directory, which is what `serve` uses unless management permanent
+    /// deletion configures a laboratory PLC.
+    static func openFederationResolver() throws -> SwanDIDDocumentSpaceResolver {
+        let policy = try OAuthRemoteFetchPolicy()
+        let fetcher = try SwanPeerPinnedDIDDocumentFetcher(
+            documents: OAuthRemoteDocumentFetcher(
+                policy: policy,
+                transport: try NIOPeerPinnedOAuthDocumentTransport(
+                    maximumTransportTimeout: policy.timeout
+                )
+            ),
+            plcOrigin: PLCClientConfiguration.defaultProductionOrigin
+        )
+        return SwanDIDDocumentSpaceResolver(documents: fetcher)
     }
 }
 
@@ -89,8 +139,64 @@ extension SwanCommand.Account {
         @Option(name: .customLong("notification-config"), help: "The serve --notification-config file whose credential key pins or PLC resolver verify the credential")
         var notificationConfig: String
 
+        @Flag(
+            name: .customLong("enable-local-space-interop"),
+            help: "Also verify credentials from authorities hosted on this Swan with their account keys, as serve --enable-local-space-interop does"
+        )
+        var enableLocalSpaceInterop = false
+
+        @Option(
+            name: .customLong("space-account-kek-file"),
+            help: "Owner-only mounted account-KEK file required by --enable-local-space-interop"
+        )
+        var spaceAccountKEKFile: String?
+
+        @Option(
+            name: .customLong("space-account-kek-id"),
+            help: "Active account-KEK identifier for local space interop (default: primary)"
+        )
+        var spaceAccountKEKID: String?
+
+        @Option(
+            name: .customLong("space-account-key-directory"),
+            help: "Existing owner-only account key-envelope directory for local space interop; defaults to <data-directory>/keys"
+        )
+        var spaceAccountKeyDirectory: String?
+
+        @Flag(
+            name: .customLong("enable-spaces-open-interop"),
+            help: "Also resolve other did:plc and did:web authorities from their DID documents, as serve --enable-spaces-open-interop does"
+        )
+        var enableSpacesOpenInterop = false
+
         @Option(name: .long, help: "Mounted operator-secret file; never accepted as a literal argument")
         var operatorSecretFile: String?
+
+        /// The same rules `serve` applies to its local space key options.
+        func validate() throws {
+            if !enableLocalSpaceInterop {
+                guard spaceAccountKEKFile == nil,
+                      spaceAccountKEKID == nil,
+                      spaceAccountKeyDirectory == nil else {
+                    throw ValidationError(
+                        "space account key options require --enable-local-space-interop"
+                    )
+                }
+            } else {
+                guard let spaceAccountKEKFile,
+                      !spaceAccountKEKFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      spaceAccountKEKID.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true,
+                      spaceAccountKeyDirectory.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true else {
+                    throw ValidationError(
+                        "--enable-local-space-interop requires an owner-only --space-account-kek-file"
+                    )
+                }
+            }
+        }
 
         func run() async throws {
             _ = try AccountCommandSupport.authorization(secretFilePath: operatorSecretFile)
@@ -121,10 +227,37 @@ extension SwanCommand.Account {
                     from: URL(fileURLWithPath: notificationConfig),
                     continuityStore: control
                 )
-                publicKeys = try await CompositeSpaceCredentialPublicKeyResolver(
-                    local: UnavailableSpaceCredentialPublicKeyResolver(),
-                    remote: runtime.remoteCredentialPublicKeys,
-                    pinned: runtime.credentialPins
+                let local: ServeLocalSpaceRuntime?
+                if enableLocalSpaceInterop, let spaceAccountKEKFile {
+                    do {
+                        local = try await .make(
+                            keyDirectory: spaceAccountKeyDirectory.map {
+                                URL(fileURLWithPath: $0)
+                            } ?? root.appending(path: "keys"),
+                            kekFile: URL(fileURLWithPath: spaceAccountKEKFile),
+                            kekID: spaceAccountKEKID ?? "primary",
+                            controlStore: control
+                        )
+                    } catch {
+                        throw ValidationError("local space interop runtime is unavailable")
+                    }
+                } else {
+                    local = nil
+                }
+                let openFederation: SwanDIDDocumentSpaceResolver?
+                if enableSpacesOpenInterop {
+                    do {
+                        openFederation = try RecreatedSpaceAdoption.openFederationResolver()
+                    } catch {
+                        throw ValidationError("--enable-spaces-open-interop requires DID document resolution")
+                    }
+                } else {
+                    openFederation = nil
+                }
+                publicKeys = try await RecreatedSpaceAdoption.credentialPublicKeys(
+                    local: local,
+                    notification: runtime,
+                    openFederation: openFederation
                 )
             } catch {
                 try? await control.close()
@@ -147,7 +280,8 @@ extension SwanCommand.Account {
                     space: parsedSpace,
                     deletionEventID: deletionEventID,
                     database: database,
-                    publicKeys: publicKeys
+                    publicKeys: publicKeys,
+                    revocations: DurableSpaceCredentialRevocations(store: control)
                 )
                 try await database.close()
                 try await control.close()
