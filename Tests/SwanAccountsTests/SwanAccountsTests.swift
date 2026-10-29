@@ -794,6 +794,262 @@ final class SwanAccountsTests: XCTestCase {
         )
     }
 
+    /// `serve` runs the read-only key-root preflight before its service lease
+    /// exists, and opens the store only under the lease. The preflight must
+    /// therefore (a) refuse exactly the key-root contents the descriptor
+    /// initializer refuses, so it neither lets a bad root reach the lease nor
+    /// blocks a root the store accepts, and (b) leave every fixture exactly as
+    /// it found it: no writer lock, no marker, no journal recovery and no
+    /// mode repair.
+    func testExistingRootPreflightAgreesWithDescriptorInitializerAndWritesNothing() async throws {
+        struct Fixture {
+            let name: String
+            let refused: Bool
+            /// Populates `root` (an existing owner-only directory) and may
+            /// use `root`'s parent for symlink or hard-link targets.
+            let build: (URL) async throws -> Void
+        }
+
+        let configuration = try keyConfiguration(activeKeyID: "active", byte: 61)
+        let otherConfiguration = try keyConfiguration(activeKeyID: "active", byte: 62)
+        let marker = ".swan-active-kek-v1"
+        let journal = ".swan-key-provisioning-journal-v1"
+        let lock = ".swan-key-store.lock"
+        func writeOwnerOnly(_ data: Data, to url: URL, mode: Int = 0o600) throws {
+            try data.write(to: url)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: mode],
+                ofItemAtPath: url.path
+            )
+        }
+        func interruptBatch(
+            in root: URL,
+            under configuration: AccountKeyEncryptionConfiguration
+        ) async throws {
+            let store = try FileAccountKeyStore(
+                root: root,
+                configuration: configuration,
+                failAfterBatchInstallCount: 1
+            )
+            do {
+                _ = try await AccountKeyProvisioner(keyStore: store)
+                    .provisionInitial(accountDID: Self.aliceDID)
+                XCTFail("injected interruption did not fire")
+            } catch SwanError.unavailable("injected account key provisioning interruption") {}
+        }
+
+        let fixtures: [Fixture] = [
+            Fixture(name: "empty-root", refused: false) { _ in },
+            // A marker naming another valid KID is a pending KEK migration:
+            // it gates writes, not startup.
+            Fixture(name: "other-valid-marker", refused: false) { root in
+                try writeOwnerOnly(Data("retired".utf8), to: root.appending(path: marker))
+            },
+            Fixture(name: "malformed-marker", refused: true) { root in
+                try writeOwnerOnly(Data("bad id".utf8), to: root.appending(path: marker))
+            },
+            Fixture(name: "wrong-mode-marker", refused: true) { root in
+                try writeOwnerOnly(
+                    Data("active".utf8),
+                    to: root.appending(path: marker),
+                    mode: 0o644
+                )
+            },
+            Fixture(name: "symlinked-marker", refused: true) { root in
+                let target = root.deletingLastPathComponent().appending(path: "marker-target")
+                try writeOwnerOnly(Data("active".utf8), to: target)
+                try FileManager.default.createSymbolicLink(
+                    at: root.appending(path: marker),
+                    withDestinationURL: target
+                )
+            },
+            Fixture(name: "directory-marker", refused: true) { root in
+                try FileManager.default.createDirectory(
+                    at: root.appending(path: marker),
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            },
+            Fixture(name: "recoverable-journal", refused: false) { root in
+                try await interruptBatch(in: root, under: configuration)
+            },
+            Fixture(name: "journal-sealed-under-other-kek", refused: true) { root in
+                try await interruptBatch(in: root, under: otherConfiguration)
+            },
+            Fixture(name: "journal-conflicts-with-installed-entry", refused: true) { root in
+                try await interruptBatch(in: root, under: configuration)
+                let installed = try FileManager.default
+                    .contentsOfDirectory(atPath: root.path)
+                    .filter { $0.hasSuffix(".key") }
+                XCTAssertEqual(installed.count, 1)
+                for name in installed {
+                    try writeOwnerOnly(Data("tampered".utf8), to: root.appending(path: name))
+                }
+            },
+            Fixture(name: "malformed-journal", refused: true) { root in
+                try writeOwnerOnly(Data("{".utf8), to: root.appending(path: journal))
+            },
+            Fixture(name: "wrong-mode-journal", refused: true) { root in
+                try await interruptBatch(in: root, under: configuration)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o644],
+                    ofItemAtPath: root.appending(path: journal).path
+                )
+            },
+            Fixture(name: "symlinked-lock", refused: true) { root in
+                let target = root.deletingLastPathComponent().appending(path: "lock-target")
+                try writeOwnerOnly(Data(), to: target)
+                try FileManager.default.createSymbolicLink(
+                    at: root.appending(path: lock),
+                    withDestinationURL: target
+                )
+            },
+            Fixture(name: "directory-lock", refused: true) { root in
+                try FileManager.default.createDirectory(
+                    at: root.appending(path: lock),
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            },
+            Fixture(name: "hard-linked-lock", refused: true) { root in
+                try writeOwnerOnly(Data(), to: root.appending(path: lock))
+                try FileManager.default.linkItem(
+                    at: root.appending(path: lock),
+                    to: root.deletingLastPathComponent().appending(path: "lock-alias")
+                )
+            },
+            // The initializer repairs a writer lock's mode with fchmod, so
+            // the read-only preflight must not refuse it (and must not
+            // repair it either).
+            Fixture(name: "wrong-mode-lock", refused: false) { root in
+                try writeOwnerOnly(Data(), to: root.appending(path: lock), mode: 0o644)
+            },
+        ]
+
+        for fixture in fixtures {
+            // Two identical fixtures: the preflight's copy must stay
+            // byte-for-byte unchanged, the initializer's copy may be written.
+            var roots: [URL] = []
+            for _ in 0 ..< 2 {
+                let parent = try temporaryDirectory()
+                let root = parent.appending(path: "keys")
+                try FileManager.default.createDirectory(
+                    at: root,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                try await fixture.build(root)
+                roots.append(root)
+            }
+            defer {
+                for root in roots {
+                    try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
+                }
+            }
+
+            let before = try keyRootState(roots[0])
+            let preflightRefused = try withOpenedKeyRoot(roots[0]) { descriptor in
+                do {
+                    try FileAccountKeyStore.preflightExistingRoot(
+                        directoryDescriptor: descriptor,
+                        configuration: configuration
+                    )
+                    return false
+                } catch {
+                    return true
+                }
+            }
+            XCTAssertEqual(preflightRefused, fixture.refused, "preflight: \(fixture.name)")
+            XCTAssertEqual(try keyRootState(roots[0]), before, fixture.name)
+
+            let initializerRefused = try withOpenedKeyRoot(roots[1]) { descriptor in
+                do {
+                    _ = try FileAccountKeyStore(
+                        existingRootDirectoryDescriptor: descriptor,
+                        configuration: configuration
+                    )
+                    return false
+                } catch {
+                    return true
+                }
+            }
+            XCTAssertEqual(initializerRefused, fixture.refused, "initializer: \(fixture.name)")
+
+            // Positive controls: on these fixtures the initializer does
+            // write, so the unchanged preflight copy above is not vacuous.
+            let written = try FileManager.default.contentsOfDirectory(atPath: roots[1].path)
+            switch fixture.name {
+            case "empty-root":
+                XCTAssertEqual(before, [])
+                XCTAssertEqual(Set(written), [lock, marker])
+            case "recoverable-journal":
+                let pending = try FileManager.default.contentsOfDirectory(atPath: roots[0].path)
+                XCTAssertTrue(pending.contains(journal))
+                XCTAssertFalse(written.contains(journal))
+                XCTAssertGreaterThan(
+                    written.filter { $0.hasSuffix(".key") }.count,
+                    pending.filter { $0.hasSuffix(".key") }.count
+                )
+            case "wrong-mode-lock":
+                XCTAssertEqual(
+                    try permissions(of: roots[1].appending(path: lock)),
+                    0o600
+                )
+            default:
+                break
+            }
+        }
+    }
+
+    /// The preflight reads the marker and journal under a shared lock on an
+    /// existing writer lock, so it never observes a provisioning batch
+    /// half-way through (for example a journal that is removed between its
+    /// existence check and its read).
+    func testExistingRootPreflightWaitsForKeyStoreWriterLock() throws {
+        let parent = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appending(path: "keys")
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let configuration = try keyConfiguration(activeKeyID: "active", byte: 63)
+        _ = try FileAccountKeyStore(root: root, configuration: configuration)
+
+        let writer = open(
+            root.appending(path: ".swan-key-store.lock").path,
+            O_RDWR | O_NOFOLLOW | O_CLOEXEC
+        )
+        XCTAssertGreaterThanOrEqual(writer, 0)
+        defer { _ = close(writer) }
+        XCTAssertEqual(flock(writer, LOCK_EX), 0)
+
+        let rootDescriptor = open(root.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(rootDescriptor, 0)
+        defer { _ = close(rootDescriptor) }
+        let finished = DispatchSemaphore(value: 0)
+        let outcome = PreflightOutcome()
+        DispatchQueue.global().async {
+            do {
+                try FileAccountKeyStore.preflightExistingRoot(
+                    directoryDescriptor: rootDescriptor,
+                    configuration: configuration
+                )
+                outcome.set("passed")
+            } catch {
+                outcome.set("refused")
+            }
+            finished.signal()
+        }
+        // While the writer holds the lock the preflight must not finish. A
+        // preflight that skipped the lock would return in microseconds.
+        XCTAssertEqual(finished.wait(timeout: .now() + .milliseconds(300)), .timedOut)
+        XCTAssertEqual(flock(writer, LOCK_UN), 0)
+        XCTAssertEqual(finished.wait(timeout: .now() + .seconds(30)), .success)
+        XCTAssertEqual(outcome.value, "passed")
+    }
+
     func testLifecycleStatusIsCanonicalForwardCompatibleAndOnlyActiveIsActive() throws {
         XCTAssertTrue(AccountStatus.active.isActive)
         for status in [
@@ -1187,6 +1443,41 @@ final class SwanAccountsTests: XCTestCase {
         return try XCTUnwrap(attributes[.posixPermissions] as? NSNumber).intValue
     }
 
+    /// One line per entry of a flat key root, from `lstat` (never following
+    /// a link): name, type, mode, link count, size and a content digest, so
+    /// any create, remove, rename, chmod or rewrite changes the result.
+    private func keyRootState(_ root: URL) throws -> [String] {
+        try FileManager.default.contentsOfDirectory(atPath: root.path).sorted().map { name in
+            let entry = root.appending(path: name)
+            var status = stat()
+            guard lstat(entry.path, &status) == 0 else {
+                throw SwanError.unavailable("lstat failed for \(name)")
+            }
+            let type = status.st_mode & mode_t(S_IFMT)
+            var content = ""
+            if type == mode_t(S_IFREG) {
+                content = Hex.encode(SHA256.hash(data: try Data(contentsOf: entry)))
+            } else if type == mode_t(S_IFLNK) {
+                content = try FileManager.default.destinationOfSymbolicLink(atPath: entry.path)
+            }
+            return "\(name) type=\(String(type, radix: 8)) "
+                + "mode=\(String(status.st_mode & 0o7777, radix: 8)) "
+                + "nlink=\(status.st_nlink) size=\(status.st_size) \(content)"
+        }
+    }
+
+    private func withOpenedKeyRoot<Result>(
+        _ root: URL,
+        _ body: (Int32) throws -> Result
+    ) throws -> Result {
+        let descriptor = open(root.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw SwanError.unavailable("could not open key root fixture")
+        }
+        defer { _ = close(descriptor) }
+        return try body(descriptor)
+    }
+
     private func envelopeObject(_ data: Data) throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
@@ -1379,5 +1670,23 @@ private func XCTAssertThrowsErrorAsync<T>(
         XCTFail("expected error", file: file, line: line)
     } catch {
         errorHandler(error)
+    }
+}
+
+/// Hands the outcome of a preflight run on another thread back to the test.
+private final class PreflightOutcome: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: String?
+
+    func set(_ value: String) {
+        lock.lock()
+        stored = value
+        lock.unlock()
+    }
+
+    var value: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
     }
 }

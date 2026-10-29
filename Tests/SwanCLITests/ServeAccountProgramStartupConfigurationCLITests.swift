@@ -1326,6 +1326,175 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
         }
     }
 
+    /// Key-root contents the account key store refuses (a bad active-KEK
+    /// marker, an unrecoverable provisioning journal, an unsafe writer lock)
+    /// are checked read-only before the service-directory lease. A refusal
+    /// leaves no data directory or `.swan-service.lock`, and leaves the key
+    /// root exactly as it was: the store is never opened, so it writes no
+    /// writer lock or marker. Each case runs with a dedicated key root
+    /// outside an absent data directory, and with the default
+    /// `<data>/keys` root inside an existing one.
+    func testLegacySessionKeyRootContentsRefuseBeforeServiceLease() throws {
+        struct Case {
+            let name: String
+            /// Populates an existing owner-only key root. Link targets go in
+            /// the second directory, which is outside the data directory.
+            let configure: (_ keys: URL, _ outside: URL) throws -> Void
+        }
+
+        let marker = ".swan-active-kek-v1"
+        let lock = ".swan-key-store.lock"
+        let cases: [Case] = [
+            Case(name: "malformed-marker") { keys, _ in
+                try self.protectedWrite(Data("bad id".utf8), to: keys.appending(path: marker))
+            },
+            Case(name: "symlinked-marker") { keys, outside in
+                let target = outside.appending(path: "marker-target")
+                try self.protectedWrite(Data("primary".utf8), to: target)
+                try FileManager.default.createSymbolicLink(
+                    at: keys.appending(path: marker),
+                    withDestinationURL: target
+                )
+            },
+            Case(name: "malformed-journal") { keys, _ in
+                try self.protectedWrite(
+                    Data("{".utf8),
+                    to: keys.appending(path: ".swan-key-provisioning-journal-v1")
+                )
+            },
+            Case(name: "symlinked-lock") { keys, outside in
+                let target = outside.appending(path: "lock-target")
+                try self.protectedWrite(Data("x".utf8), to: target)
+                try FileManager.default.createSymbolicLink(
+                    at: keys.appending(path: lock),
+                    withDestinationURL: target
+                )
+            },
+            Case(name: "hard-linked-lock") { keys, outside in
+                try self.protectedWrite(Data("x".utf8), to: keys.appending(path: lock))
+                try FileManager.default.linkItem(
+                    at: keys.appending(path: lock),
+                    to: outside.appending(path: "lock-alias")
+                )
+            },
+        ]
+
+        for testCase in cases {
+            for defaultKeyRoot in [false, true] {
+                let label = "\(testCase.name), "
+                    + (defaultKeyRoot ? "default <data>/keys" : "dedicated key root")
+                let root = try temporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: root) }
+                let data = root.appending(path: "data")
+                let keyDirectory = defaultKeyRoot
+                    ? data.appending(path: "keys")
+                    : root.appending(path: "keys")
+                if defaultKeyRoot {
+                    try FileManager.default.createDirectory(
+                        at: data,
+                        withIntermediateDirectories: false,
+                        attributes: [.posixPermissions: 0o700]
+                    )
+                }
+                try FileManager.default.createDirectory(
+                    at: keyDirectory,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                try testCase.configure(keyDirectory, root)
+                let signingKey = root.appending(path: "legacy-signing-key")
+                try protectedWrite(
+                    Data(base64URLEncoded(Data(repeating: 0x53, count: 32)).utf8),
+                    to: signingKey
+                )
+                let kekFile = root.appending(path: "account-kek")
+                try protectedWrite(
+                    Data(base64URLEncoded(Data(repeating: 0xA5, count: 32)).utf8),
+                    to: kekFile
+                )
+                let keyRootBefore = try keyRootState(keyDirectory)
+
+                var arguments = [
+                    "--enable-legacy-sessions",
+                    "--legacy-session-signing-key-file", signingKey.path,
+                    "--legacy-session-account-kek-file", kekFile.path,
+                ]
+                if !defaultKeyRoot {
+                    arguments += [
+                        "--legacy-session-account-key-directory", keyDirectory.path,
+                    ]
+                }
+                let result = try runServe(data: data, arguments: arguments)
+                XCTAssertNotEqual(result.status, 0, label)
+                XCTAssertTrue(result.output.isEmpty, label)
+                XCTAssertTrue(
+                    result.error.contains(
+                        "legacy-session account-key-backed service-token issuer is unavailable"
+                    ),
+                    "\(label): \(result.error)"
+                )
+                XCTAssertFalse(result.error.contains(root.path), label)
+                XCTAssertEqual(try keyRootState(keyDirectory), keyRootBefore, label)
+                if defaultKeyRoot {
+                    XCTAssertEqual(
+                        try FileManager.default.contentsOfDirectory(atPath: data.path),
+                        ["keys"],
+                        label
+                    )
+                } else {
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: data.path), label)
+                }
+                assertNoStartupStorageArtifacts(in: data, label: label)
+            }
+        }
+
+        // Positive control: a fresh, empty key root passes the read-only
+        // half and stays empty; only opening the store writes into it.
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let keyDirectory = root.appending(path: "keys")
+        try FileManager.default.createDirectory(
+            at: keyDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let signingKey = root.appending(path: "legacy-signing-key")
+        try protectedWrite(
+            Data(base64URLEncoded(Data(repeating: 0x53, count: 32)).utf8),
+            to: signingKey
+        )
+        let kekFile = root.appending(path: "account-kek")
+        try protectedWrite(
+            Data(base64URLEncoded(Data(repeating: 0xA5, count: 32)).utf8),
+            to: kekFile
+        )
+        let source = try XCTUnwrap(
+            try SwanCommand.Serve.resolveLegacySessionAccountKeySource(
+                enableLegacySessions: true,
+                legacySessionAccountKEKFile: kekFile.path,
+                legacySessionAccountKEKID: nil,
+                legacySessionAccountKeyDirectory: keyDirectory.path,
+                appViewProxyAccountKEKFile: nil,
+                appViewProxyAccountKEKID: nil,
+                appViewProxyAccountKeyDirectory: nil
+            )
+        )
+        let pinned = try XCTUnwrap(
+            try SwanCommand.Serve.validateLegacySessionMountedSecrets(
+                enableLegacySessions: true,
+                legacySessionSigningKeyFile: signingKey.path,
+                accountKeySource: source,
+                dataDirectory: root.appending(path: "data")
+            )
+        )
+        XCTAssertEqual(try keyRootState(keyDirectory), [])
+        _ = try pinned.openAccountKeyStore()
+        XCTAssertEqual(
+            Set(try FileManager.default.contentsOfDirectory(atPath: keyDirectory.path)),
+            [lock, marker]
+        )
+    }
+
     // MARK: - Helpers
 
     private func runServe(
@@ -1377,6 +1546,28 @@ final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
     private func protectedWrite(_ data: Data, to url: URL) throws {
         try data.write(to: url)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    /// One line per entry of a flat key root, from `lstat` (never following
+    /// a link), so any create, remove, chmod, relink or rewrite shows up.
+    private func keyRootState(_ root: URL) throws -> [String] {
+        try FileManager.default.contentsOfDirectory(atPath: root.path).sorted().map { name in
+            let entry = root.appending(path: name)
+            var status = stat()
+            guard lstat(entry.path, &status) == 0 else {
+                throw ValidationError("lstat failed for \(name)")
+            }
+            let type = status.st_mode & mode_t(S_IFMT)
+            var content = ""
+            if type == mode_t(S_IFREG) {
+                content = try Data(contentsOf: entry).base64EncodedString()
+            } else if type == mode_t(S_IFLNK) {
+                content = try FileManager.default.destinationOfSymbolicLink(atPath: entry.path)
+            }
+            return "\(name) type=\(String(type, radix: 8)) "
+                + "mode=\(String(status.st_mode & 0o7777, radix: 8)) "
+                + "nlink=\(status.st_nlink) size=\(status.st_size) \(content)"
+        }
     }
 
     private func assertNoStartupStorageArtifacts(in data: URL, label: String) {

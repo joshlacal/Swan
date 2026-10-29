@@ -2803,7 +2803,8 @@ extension SwanCommand {
         /// Legacy-session material that passed the read-only half of the
         /// startup interlock: both mounted secrets are decoded and the key
         /// root is opened with `O_NOFOLLOW` and validated as an existing
-        /// owner-only directory.  Producing this creates and writes nothing,
+        /// owner-only directory whose contents pass the store's read-only
+        /// preflight.  Producing this creates and writes nothing,
         /// so `serve` obtains it before the service-directory lease creates
         /// the data directory.  The validated key-root descriptor stays open
         /// until `openAccountKeyStore()` hands it to `FileAccountKeyStore`,
@@ -2884,10 +2885,10 @@ extension SwanCommand {
 
         /// Validate every owner-only input needed by the legacy-session
         /// surface (HMAC signing key, account KEK, existing owner-only key
-        /// root) without creating or writing anything.  `serve` runs this
-        /// before the service-directory lease, control database, migration,
-        /// account directory, or repository bootstrap can create state, so a
-        /// refusal leaves no data directory behind.
+        /// root and its contents) without creating or writing anything.
+        /// `serve` runs this before the service-directory lease, control
+        /// database, migration, account directory, or repository bootstrap
+        /// can create state, so a refusal leaves no data directory behind.
         static func validateLegacySessionMountedSecrets(
             enableLegacySessions: Bool,
             legacySessionSigningKeyFile: String?,
@@ -2943,8 +2944,21 @@ extension SwanCommand {
                 // missing root for provisioning commands. `serve` instead
                 // opens and validates the mounted root once and pins this
                 // descriptor; the store is later built from it alone.
-                accountKeyDirectoryDescriptor =
+                let descriptor =
                     try requireExistingOwnerOnlyKeyDirectory(accountKeyDirectory)
+                // Refuse the root's contents (writer lock, active-KEK
+                // marker, provisioning journal) here too, read-only, with
+                // the same checks the store applies when it opens.
+                do {
+                    try FileAccountKeyStore.preflightExistingRoot(
+                        directoryDescriptor: descriptor,
+                        configuration: accountKeyConfiguration
+                    )
+                } catch {
+                    _ = close(descriptor)
+                    throw error
+                }
+                accountKeyDirectoryDescriptor = descriptor
             } catch {
                 throw ValidationError(
                     "legacy-session account-key-backed service-token issuer is unavailable"
@@ -3698,6 +3712,14 @@ extension SwanCommand {
             let serverKey = try loadOAuthServerKey(fromFile: oauthServerKeyFile)
             let serviceDirectoryLease = try SwanServiceDirectoryLease(dataDirectory: dataURL)
             defer { withExtendedLifetime(serviceDirectoryLease) {} }
+            // Bad key-root contents were already refused read-only above.
+            // Opening the store still writes (writer lock, active-KEK
+            // marker, journal recovery), so it stays under the lease. What
+            // can still fail here is one of those writes (I/O, or a writer
+            // lock that is owner-read-only), or a root that changed after
+            // the preflight. Such a failure can leave the data directory and
+            // its lease file behind; it cannot move above the lease without
+            // writing outside it.
             let validatedLegacySessionStartup = try pinnedLegacySessionStartup?
                 .openAccountKeyStore()
             // The store holds its own duplicate; close the validated
