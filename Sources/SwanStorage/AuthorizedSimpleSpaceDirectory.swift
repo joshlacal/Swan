@@ -581,6 +581,16 @@ public protocol AuthorizedSimpleSpaceLifecycleDirectory: Sendable {
         from space: SpaceURI,
         authorization: AuthorizationContext
     ) async throws
+
+    func exportSpaceMeta(
+        _ space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws -> SpaceMetaArchive
+
+    func importSpaceMeta(
+        _ archive: SpaceMetaArchive,
+        authorization: AuthorizationContext
+    ) async throws
 }
 
 public extension AuthorizedSimpleSpaceLifecycleDirectory {
@@ -590,6 +600,25 @@ public extension AuthorizedSimpleSpaceLifecycleDirectory {
         authorization _: AuthorizationContext
     ) async throws {
         throw SwanError.unavailable("space writer removal is unavailable")
+    }
+
+    /// `com.atproto.space.exportSpaceMeta`: the authority's state for one
+    /// live space, for the owner's OAuth with `read_self`.
+    func exportSpaceMeta(
+        _: SpaceURI,
+        authorization _: AuthorizationContext
+    ) async throws -> SpaceMetaArchive {
+        throw SwanError.unavailable("space meta export is unavailable")
+    }
+
+    /// `com.atproto.space.importSpaceMeta`: creates or replaces the
+    /// authority's space from its previous host's archive. Requires
+    /// `manage=create` and `manage=update`; publishes nothing.
+    func importSpaceMeta(
+        _: SpaceMetaArchive,
+        authorization _: AuthorizationContext
+    ) async throws {
+        throw SwanError.unavailable("space meta import is unavailable")
     }
 }
 
@@ -802,9 +831,49 @@ public protocol AuthorizedSpaceRepositoryDirectory: Sendable {
         wireRevision: String,
         authorization: AuthorizationContext
     ) async throws -> [AuthorizedSpaceRepositoryWriteResult]
+
+    func clearRepository(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> Bool
+
+    func importRepository(
+        space: SpaceURI,
+        author: String,
+        records: [SpaceRecord],
+        ltHash: Data,
+        authorization: AuthorizationContext
+    ) async throws
 }
 
 public extension AuthorizedSpaceRepositoryDirectory {
+    /// `com.atproto.space.clearRecords`: deletes the caller's records in the
+    /// space (the authority keeps its published policy and member records),
+    /// clears the operation log and advances the repo. Requires a `delete`
+    /// grant for every collection it deletes from. Returns `false`, writing
+    /// nothing, when there was nothing to delete.
+    func clearRepository(
+        space _: SpaceURI,
+        author _: String,
+        authorization _: AuthorizationContext
+    ) async throws -> Bool {
+        throw SwanError.unavailable("space repository clearing is unavailable")
+    }
+
+    /// `com.atproto.space.importRepo`: replaces the caller's repo in the
+    /// space with verified archive records at a new rev. Requires a `create`
+    /// grant for every collection in the archive.
+    func importRepository(
+        space _: SpaceURI,
+        author _: String,
+        records _: [SpaceRecord],
+        ltHash _: Data,
+        authorization _: AuthorizationContext
+    ) async throws {
+        throw SwanError.unavailable("space repository import is unavailable")
+    }
+
     /// Test and alternate adapters that do not persist a durable wire
     /// revision may opt out of seeding. The authoritative apply transaction
     /// still enforces its own monotonicity check.

@@ -813,7 +813,7 @@ private func authorizeRecordRead(
 /// domain.  Reusing the read helper would throw `AuthenticatedSpaceRecordFailure`,
 /// which the write route's catch-all would otherwise mislabel as malformed
 /// input (400) instead of an authorization denial or nonce challenge.
-private func authorizeWrite(
+func authorizeWrite(
     _ authorizer: SwanOAuthResourceAuthorizer,
     request: Request,
     fixedPath: String,
@@ -845,9 +845,11 @@ let authenticatedSpaceWriteMaximumJSONBytes = 1 * 1024 * 1024
 private let authenticatedSpaceWriteMaximumOperations =
     SpaceWriteLimits.maximumOperations
 
-private enum AuthenticatedSpaceWriteFailure: Error {
+enum AuthenticatedSpaceWriteFailure: Error {
     case invalidRequest
     case spaceNotFound
+    /// `SpaceNotFound` as a declared lexicon error (HTTP 400), for importRepo.
+    case declaredSpaceNotFound
     case denied
     case nonceChallenge
     case conflict
@@ -1001,7 +1003,7 @@ private struct AuthenticatedApplyWritesHandler: ComAtprotoSpaceApplyWrites.Serve
     }
 }
 
-private func requireSelfWrite(_ authorization: AuthorizationContext, author: String) throws {
+func requireSelfWrite(_ authorization: AuthorizationContext, author: String) throws {
     guard case let .accountOAuth(subject, _) = authorization, subject == author else {
         throw AuthenticatedSpaceWriteFailure.spaceNotFound
     }
@@ -1182,7 +1184,7 @@ func registerAuthenticatedApplyWritesEndpoint(
     registerAuthenticatedWriteWrongMethods(on: router, path: path)
 }
 
-private func withAuthenticatedSpaceWriteInput<Value: Decodable>(
+func withAuthenticatedSpaceWriteInput<Value: Decodable>(
     _ request: Request,
     context: SwanHTTPRequestContext,
     as type: Value.Type,
@@ -1241,7 +1243,7 @@ func acceptsAuthenticatedSpaceWriteContentLength(_ values: [String]) -> Bool {
     return length <= authenticatedSpaceWriteMaximumJSONBytes
 }
 
-private func authenticatedSpaceWriteResponse(
+func authenticatedSpaceWriteResponse(
     for error: any Error,
     capability: SwanAuthenticatedSpaceRecordsCapability
 ) -> Response {
@@ -1254,7 +1256,7 @@ private func authenticatedSpaceWriteResponse(
     return authenticatedSpaceWriteError(.badRequest, code: "InvalidRequest")
 }
 
-private func authenticatedSpaceWriteResponse(
+func authenticatedSpaceWriteResponse(
     for failure: SwanJSONWriteBodyCollectionFailure
 ) -> Response {
     switch failure {
@@ -1265,7 +1267,7 @@ private func authenticatedSpaceWriteResponse(
     }
 }
 
-private func registerAuthenticatedWriteWrongMethods(
+func registerAuthenticatedWriteWrongMethods(
     on router: Router<BasicRequestContext>, path: RouterPath
 ) {
     for method: HTTPRequest.Method in [.get, .head, .put, .patch, .delete, .options, .connect, .trace] {
@@ -1275,13 +1277,14 @@ private func registerAuthenticatedWriteWrongMethods(
     }
 }
 
-private func authenticatedSpaceWriteResponse(
+func authenticatedSpaceWriteResponse(
     for failure: AuthenticatedSpaceWriteFailure,
     capability: SwanAuthenticatedSpaceRecordsCapability
 ) -> Response {
     switch failure {
     case .invalidRequest: authenticatedSpaceWriteError(.badRequest, code: "InvalidRequest")
     case .spaceNotFound: authenticatedSpaceWriteError(.notFound, code: "SpaceNotFound")
+    case .declaredSpaceNotFound: authenticatedSpaceWriteError(.badRequest, code: "SpaceNotFound")
     case .denied: authenticatedSpaceWriteError(.unauthorized, code: "Unauthorized")
     case .nonceChallenge: authenticatedGetSpaceNonceChallenge(authorizer: capability.authorizer)
     case .conflict: authenticatedSpaceWriteError(.conflict, code: "ConcurrentWrite")
@@ -1289,11 +1292,11 @@ private func authenticatedSpaceWriteResponse(
     }
 }
 
-private func authenticatedSpaceWriteError(_ status: HTTPResponse.Status, code: String) -> Response {
+func authenticatedSpaceWriteError(_ status: HTTPResponse.Status, code: String) -> Response {
     authenticatedGetSpaceJSON(status, ["error": code])
 }
 
-private func authenticatedSpaceWriteJSON(_ status: HTTPResponse.Status, _ output: some Encodable) -> Response {
+func authenticatedSpaceWriteJSON(_ status: HTTPResponse.Status, _ output: some Encodable) -> Response {
     authenticatedGetSpaceJSON(status, output)
 }
 

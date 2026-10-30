@@ -323,8 +323,21 @@ Swan implements the `permissioned-data-0016-2026-10-29` profile for access-contr
 - **Authentication**: Space owner (`manage=update`).
 - **Request Body**: `{ "space": "<space-ref>", "did": "<writer DID>" }`. Drops the account from the space's writer set. Idempotent; the account is tracked again after its next authorized write.
 
-#### `com.atproto.space.clearRecords`, `importRepo`, `exportSpaceMeta`, `importSpaceMeta`
-- Pinned in the profile and routed method-correctly. See the [October 29 migration notes](migrations/2026-10-29-spaces.md) for their status.
+#### `com.atproto.space.clearRecords`
+- **Method**: `POST`; **Authentication**: the repo's own account (OAuth), with a `delete` grant for every collection being cleared.
+- **Request Body**: `{ "space": "<space-ref>", "repo": "<caller DID>" }`. Deletes every record of the caller's repo in the space at a new `rev`; the authority's published `com.atproto.space.policy` and `com.atproto.memberspace.member` records are kept and need no grant. A no-op when there is nothing to delete. Responds `{}`.
+
+#### `com.atproto.space.importRepo`
+- **Method**: `POST`, `Content-Type: application/octet-stream`, body up to 64 MiB; **Authentication**: the repo's own account (OAuth), with a `create` grant for every imported collection.
+- **Request Body**: a `getRepo` STAR archive whose commit names the caller. The records and the `data` digest are verified, then the repo is replaced at a new `rev`. Importing into the caller's own space before `importSpaceMeta` is 400 `SpaceNotFound`.
+
+#### `com.atproto.space.exportSpaceMeta`
+- **Method**: `GET`, `?space=<space-ref>`; **Authentication**: space owner (`read_self`). `NotSpaceOwner` when the space is not the caller's.
+- **Response**: an `atproto-space-meta` STAR archive (policy, members, writer set with space revisions).
+
+#### `com.atproto.space.importSpaceMeta`
+- **Method**: `POST`, `Content-Type: application/octet-stream`; **Authentication**: space owner (`manage=create` and `manage=update`).
+- **Request Body**: an `exportSpaceMeta` archive. Replaces the space's policy, members and writer set. Publishes nothing; the authority's published records arrive with its `importRepo`. `UnsupportedPolicy` for an unknown policy type.
 
 ### Memberspace members (`com.atproto.memberspace.*`)
 

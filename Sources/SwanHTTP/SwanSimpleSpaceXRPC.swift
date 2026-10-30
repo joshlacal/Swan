@@ -33,9 +33,10 @@ public struct SwanAuthenticatedSimpleSpaceLifecycleCapability: Sendable {
     }
 }
 
-private enum AuthenticatedSimpleSpaceLifecycleFailure: Error {
+enum AuthenticatedSimpleSpaceLifecycleFailure: Error {
     case invalidRequest
     case spaceNotFound
+    case notSpaceOwner
     case spaceAlreadyExists
     case unsupportedPolicy
     case policyMismatch
@@ -119,7 +120,7 @@ private func lifecycleDID(_ value: Any?) throws -> String {
     }
 }
 
-private func lifecycleSpace(_ value: Any?) throws -> SpaceURI {
+func lifecycleSpace(_ value: Any?) throws -> SpaceURI {
     let string = try lifecycleString(value)
     do {
         return try SpaceURI(SpaceRef(uriString: string).uriString())
@@ -392,6 +393,7 @@ func registerAuthenticatedSimpleSpaceLifecycleEndpoints(
         return Response(status: .ok, headers: [.cacheControl: "no-store"])
     }
     registerMemberspaceListMembers(on: router, capability: capability)
+    registerAuthenticatedSpaceMetaEndpoints(on: router, capability: capability)
 }
 
 private func registerSpaceLifecycleProcedure(
@@ -443,7 +445,7 @@ private func registerMemberspaceListMembers(
     registerSimpleSpaceWrongMethods(on: router, path: path, liveMethod: .get)
 }
 
-private func lifecycleAuthorization(
+func lifecycleAuthorization(
     _ authorizer: SwanOAuthResourceAuthorizer,
     request: Request,
     fixedPath: String,
@@ -478,7 +480,7 @@ private func requireLifecycleAuthority(
     }
 }
 
-private func lifecycleFailure(for error: Error) -> AuthenticatedSimpleSpaceLifecycleFailure {
+func lifecycleFailure(for error: Error) -> AuthenticatedSimpleSpaceLifecycleFailure {
     if error is AuthorizedSimpleSpaceLifecycleError {
         return .spaceNotFound
     }
@@ -577,7 +579,7 @@ func acceptsSimpleSpaceWriteContentLength(_ values: [String]) -> Bool {
     return length <= authenticatedSpaceWriteMaximumJSONBytes
 }
 
-private func simpleSpaceLifecycleResponse(
+func simpleSpaceLifecycleResponse(
     for error: any Error,
     capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 ) -> Response {
@@ -590,7 +592,7 @@ private func simpleSpaceLifecycleResponse(
     return simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
 }
 
-private func simpleSpaceLifecycleResponse(
+func simpleSpaceLifecycleResponse(
     for failure: SwanJSONWriteBodyCollectionFailure
 ) -> Response {
     switch failure {
@@ -652,7 +654,7 @@ private func parseSimpleSpaceListMembersParameters(
     return MemberspaceListMembersParameters(space: space, limit: limit, cursor: cursor)
 }
 
-private func registerSimpleSpaceWrongMethods(
+func registerSimpleSpaceWrongMethods(
     on router: Router<BasicRequestContext>,
     path: RouterPath,
     liveMethod: HTTPRequest.Method
@@ -665,7 +667,7 @@ private func registerSimpleSpaceWrongMethods(
     }
 }
 
-private func simpleSpaceLifecycleResponse(
+func simpleSpaceLifecycleResponse(
     for failure: AuthenticatedSimpleSpaceLifecycleFailure,
     capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 ) -> Response {
@@ -674,6 +676,8 @@ private func simpleSpaceLifecycleResponse(
         simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
     case .spaceNotFound:
         simpleSpaceLifecycleError(.badRequest, code: "SpaceNotFound")
+    case .notSpaceOwner:
+        simpleSpaceLifecycleError(.badRequest, code: "NotSpaceOwner")
     case .spaceAlreadyExists:
         simpleSpaceLifecycleError(.badRequest, code: "SpaceAlreadyExists")
     case .unsupportedPolicy:
@@ -689,7 +693,7 @@ private func simpleSpaceLifecycleResponse(
     }
 }
 
-private func simpleSpaceLifecycleError(
+func simpleSpaceLifecycleError(
     _ status: HTTPResponse.Status,
     code: String
 ) -> Response {

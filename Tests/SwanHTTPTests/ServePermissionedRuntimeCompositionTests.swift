@@ -247,10 +247,11 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let profileSet = Set(profile.endpoints)
             let generatedSet = Set(PermissionedData0016.methods.map(\.nsid))
             let matrixSet = Set(cases.map(\.nsid))
-            // Profile methods this composition does not serve yet. They stay
-            // in the profile and registry and are routed as method-correct
-            // 503 gates, checked after the semantic matrix below.
-            let gatedPending: Set<String> = [
+            // Served profile methods outside this JSON matrix: their bodies or
+            // responses are STAR archives, covered by their own tests. Here
+            // they are checked to be live (not a 503 gate), method-correct and
+            // refusing an unauthenticated caller.
+            let servedOutsideMatrix: Set<String> = [
                 "com.atproto.space.clearRecords",
                 "com.atproto.space.exportSpaceMeta",
                 "com.atproto.space.importRepo",
@@ -260,8 +261,8 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             XCTAssertEqual(PermissionedData0016.methods.count, 33)
             XCTAssertEqual(cases.count, 29)
             XCTAssertEqual(profileSet, generatedSet)
-            XCTAssertEqual(profileSet, matrixSet.union(gatedPending))
-            XCTAssertTrue(matrixSet.isDisjoint(with: gatedPending))
+            XCTAssertEqual(profileSet, matrixSet.union(servedOutsideMatrix))
+            XCTAssertTrue(matrixSet.isDisjoint(with: servedOutsideMatrix))
             XCTAssertEqual(matrixSet.count, cases.count, "matrix contains a duplicate NSID")
 
             let app = server.buildApplication(
@@ -393,10 +394,28 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                         )
                     }
                 }
-                for nsid in gatedPending.sorted() {
+                for nsid in servedOutsideMatrix.sorted() {
                     let isQuery = PermissionedData0016.methods.first { $0.nsid == nsid }?.kind == .query
-                    try await client.execute(uri: "/xrpc/\(nsid)", method: isQuery ? .get : .post) { response in
-                        XCTAssertEqual(response.status, .serviceUnavailable, nsid)
+                    let live: String
+                    var liveHeaders = HTTPFields()
+                    switch nsid {
+                    case "com.atproto.space.exportSpaceMeta":
+                        live = "/xrpc/\(nsid)?space=\(encodedSpace)"
+                    case "com.atproto.space.clearRecords":
+                        live = "/xrpc/\(nsid)"
+                        liveHeaders[.contentType] = "application/json"
+                    default:
+                        live = "/xrpc/\(nsid)"
+                        liveHeaders[.contentType] = "application/octet-stream"
+                    }
+                    let liveBody = nsid.hasSuffix("clearRecords")
+                        ? ByteBuffer(string: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\"}")
+                        : ByteBuffer(bytes: SpaceSTARCodec.magic)
+                    try await client.execute(
+                        uri: live, method: isQuery ? .get : .post, headers: liveHeaders,
+                        body: isQuery ? nil : liveBody
+                    ) { response in
+                        XCTAssertEqual(response.status, .unauthorized, nsid)
                     }
                     try await client.execute(uri: "/xrpc/\(nsid)", method: isQuery ? .post : .get) { response in
                         XCTAssertEqual(response.status, .notFound, nsid)

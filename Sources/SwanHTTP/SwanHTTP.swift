@@ -1217,6 +1217,12 @@ public struct SwanHTTPServer: Sendable {
             } else if descriptor.nsid == ComAtprotoSpaceApplyWrites.typeIdentifier,
                       let authenticatedSpaceRecords {
                 registerAuthenticatedApplyWritesEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if descriptor.nsid == "com.atproto.space.clearRecords",
+                      let authenticatedSpaceRecords {
+                registerAuthenticatedClearRecordsEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if descriptor.nsid == "com.atproto.space.importRepo",
+                      let authenticatedSpaceRecords {
+                registerAuthenticatedImportRepoEndpoint(on: router, capability: authenticatedSpaceRecords)
             } else if descriptor.nsid == ComAtprotoSpaceGetLatestCommit.typeIdentifier,
                       let authenticatedSpaceRepositorySync {
                 registerAuthenticatedGetLatestCommitEndpoint(
@@ -1412,6 +1418,8 @@ public struct SwanHTTPServer: Sendable {
              "com.atproto.space.updateSpace",
              "com.atproto.space.deleteSpace",
              "com.atproto.space.removeWriter",
+             "com.atproto.space.exportSpaceMeta",
+             "com.atproto.space.importSpaceMeta",
              "com.atproto.memberspace.putMember",
              "com.atproto.memberspace.removeMember",
              "com.atproto.memberspace.listMembers":

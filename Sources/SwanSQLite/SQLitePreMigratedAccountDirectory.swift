@@ -1503,6 +1503,144 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
+    // MARK: October 29 clearRecords / importRepo
+
+    public func clearRepository(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> Bool {
+        let database = try await selfWriteRepositoryDatabase(author: author, authorization: authorization)
+        // The authority keeps the records it publishes from the space's
+        // configuration; they are not the caller's to clear.
+        let keep: Set<String> = space.authority == author ? SpacePolicy.publishedCollections : []
+        return try await mapRepositoryMigrationErrors {
+            try await withRepositoryWriteLease(space: space, author: author) {
+                let collections = try await database.spaceRepositoryCollections(
+                    space: space, author: author, excluding: keep
+                )
+                for collection in collections {
+                    try Self.requireRecordGrant(
+                        space: space, author: author, collection: collection,
+                        permission: .delete, authorization: authorization
+                    )
+                }
+                let commit = try await requireAuthorizationFence()
+                    .withActiveAccountAuthorization(did: author) {
+                        try await database.clearSpaceRepository(
+                            space: space, author: author, keepCollections: keep
+                        )
+                    }
+                return commit != nil
+            }
+        }
+    }
+
+    public func importRepository(
+        space: SpaceURI,
+        author: String,
+        records: [SpaceRecord],
+        ltHash: Data,
+        authorization: AuthorizationContext
+    ) async throws {
+        let database = try await selfWriteRepositoryDatabase(author: author, authorization: authorization)
+        for collection in Set(records.map(\.uri.collection)).sorted() {
+            try Self.requireRecordGrant(
+                space: space, author: author, collection: collection,
+                permission: .create, authorization: authorization
+            )
+        }
+        try await mapRepositoryMigrationErrors {
+            try await withRepositoryWriteLease(space: space, author: author) {
+                _ = try await requireAuthorizationFence()
+                    .withActiveAccountAuthorization(did: author) {
+                        try await database.importSpaceRepository(
+                            space: space, author: author, records: records, ltHash: ltHash
+                        )
+                    }
+            }
+        }
+    }
+
+    /// The caller's own preopened account database, for its account OAuth
+    /// only: a space credential or service token never rewrites a repo.
+    private func selfWriteRepositoryDatabase(
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> SQLiteAccountDatabase {
+        guard case let .accountOAuth(subject, _) = authorization, subject == author else {
+            throw SwanError.unauthorized("only the repository's account may rewrite it")
+        }
+        guard let database = try await preopenedRepositoryDatabase(
+            for: author,
+            authorization: authorization
+        ) else {
+            throw SwanError.unauthorized("account repository is unavailable")
+        }
+        return database
+    }
+
+    private static func requireRecordGrant(
+        space: SpaceURI,
+        author: String,
+        collection: String,
+        permission: SwanSpaces.SpacePermission,
+        authorization: AuthorizationContext
+    ) throws {
+        // Any valid record key: the grant is per collection.
+        let uri = try SpaceRecordURI(space: space, author: author, collection: collection, rkey: "self")
+        try SpaceAuthorizationPolicy.require(
+            space: space, author: author, uri: uri,
+            authorization: authorization, permission: permission
+        )
+    }
+
+    private func mapRepositoryMigrationErrors<T: Sendable>(
+        _ body: () async throws -> T
+    ) async throws -> T {
+        do {
+            let result = try await body()
+            guard !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return result
+        } catch let error as SwanError {
+            throw error
+        } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch let error as AccountControlStoreError {
+            switch error {
+            case .invalidTransition, .notFound:
+                throw SwanError.unauthorized("account repository is unavailable")
+            default:
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    // MARK: October 29 exportSpaceMeta / importSpaceMeta
+
+    public func exportSpaceMeta(
+        _ space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws -> SpaceMetaArchive {
+        let database = try await preopenedAuthorityDatabase(for: space, authorization: authorization)
+        let archive = try await database.exportSpaceMeta(space: space, authorization: authorization)
+        try await requireLifecycleAuthorityStillAvailable(space.authority)
+        return archive
+    }
+
+    public func importSpaceMeta(
+        _ archive: SpaceMetaArchive,
+        authorization: AuthorizationContext
+    ) async throws {
+        let database = try await preopenedAuthorityDatabase(for: archive.space, authorization: authorization)
+        try await database.importSpaceMeta(archive, authorization: authorization)
+        try await requireLifecycleAuthorityStillAvailable(archive.space.authority)
+    }
+
     /// Runs one permissioned batch as the sole writer of its repository.
     ///
     /// The gate is checked out and back in around the whole body, so an entry

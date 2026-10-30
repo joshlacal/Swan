@@ -1533,6 +1533,19 @@ public enum SQLiteLayout {
         )
         """,
         """
+        -- A repository whose operation log was deliberately emptied by
+        -- clearRecords or importRepo (October 29 sections 4 and 5). Every
+        -- operation since then is retained until retention pruning deletes
+        -- one, which removes this row, so an older listRepoOps cursor gets
+        -- the retained operations and the current commit, as the reference
+        -- answers, instead of a full-recovery gap.
+        CREATE TABLE IF NOT EXISTS permissioned_repository_history_resets (
+            space_uri TEXT NOT NULL,
+            author_did TEXT NOT NULL,
+            PRIMARY KEY(space_uri, author_did)
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS permissioned_space_requests (
             request_id TEXT PRIMARY KEY,
             space_uri TEXT NOT NULL,
@@ -2387,7 +2400,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     let readConnectionGate = SQLiteConnectionGate()
     let dataDirectory: URL
     let accountDID: String
-    private let oplogRetention: Int
+    let oplogRetention: Int
     private let blobQuota: AccountBlobQuota
     private let portableExportReadOnly: Bool
     private let descriptorBackedRestore: Bool
@@ -5277,6 +5290,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 if let first = deletedOplog.first {
                     let deletedCount = try requiredNonnegativeInteger(first, "count")
                     newOplogCount = max(0, newOplogCount - deletedCount)
+                    if deletedCount > 0 {
+                        try await dropRepositoryHistoryResetWithoutGate(space: space, author: author)
+                    }
                 }
             }
 
@@ -5321,6 +5337,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         if let first = deletedRows.first {
                             let deletedCount = try requiredNonnegativeInteger(first, "count")
                             newOplogCount = max(0, newOplogCount - deletedCount)
+                            if deletedCount > 0 {
+                                try await dropRepositoryHistoryResetWithoutGate(space: space, author: author)
+                            }
                         }
                     }
                 }
@@ -7338,7 +7357,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             return .incremental(state: nil, entries: [])
         }
 
-        if let since {
+        let historyReset = try await !conn.query(
+            """
+            SELECT 1 FROM permissioned_repository_history_resets
+            WHERE space_uri = ? AND author_did = ?
+            """,
+            [.text(space.rawValue), .text(author)]
+        ).isEmpty
+        if let since, !historyReset {
             let oldestRows = try await conn.query(
                 """
                 SELECT wire_revision
@@ -8497,6 +8523,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             "permissioned_space_record_blobs",
             "permissioned_space_records",
             "permissioned_space_oplog",
+            "permissioned_repository_history_resets",
             "permissioned_space_requests",
             "permissioned_space_outbox",
             "permissioned_repository_state",
@@ -9657,7 +9684,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
         let digestHex = Hex.encode(summary.digest)
         let columns = blobNamespaceColumns(namespace)
-        return try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
+        let reference = try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
             try await putBlobLocked(
                 .file(
                     descriptor: spool.fileDescriptor,
@@ -9673,6 +9700,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 mimeType: safeBlobMIMEType(mimeType)
             )
         }
+        if case .staged = namespace {
+            // A blob copied after `com.atproto.space.importRepo` is attached
+            // to the spaces whose imported records reference it.
+            try await promoteImportedSpaceBlobReferences(cid: reference.cid)
+        }
+        return reference
     }
 
     public func blobData(for reference: BlobReference) async throws -> Data {
@@ -12080,7 +12113,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return revision + 1
     }
 
-    private func requireAccount(_ author: String) throws {
+    func requireAccount(_ author: String) throws {
         guard author == accountDID else {
             throw SwanError.unauthorized(
                 "repository author belongs to another account"
@@ -12144,7 +12177,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// readable again under a recreated space's policy (October 22 section 6).
     /// This helper is used only while an existing SQLite transaction is held,
     /// so it cannot race a deletion into a stale read or write.
-    private func requireLocalRepositorySpaceOpen(
+    func requireLocalRepositorySpaceOpen(
         _ space: SpaceURI,
         authorization: AuthorizationContext? = nil,
         connection: SQLiteConnection? = nil
@@ -12579,11 +12612,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
     }
 
-    private func ltHashElement(for record: PersistedSpaceRecord) -> String {
+    func ltHashElement(for record: PersistedSpaceRecord) -> String {
         "\(record.uri.collection)/\(record.uri.rkey)/\(record.cid)"
     }
 
-    private func repositoryStateMarker(
+    func repositoryStateMarker(
         space: SpaceURI,
         author: String,
         revision: UInt64,
@@ -12764,7 +12797,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return Int(microseconds.rounded(.down))
     }
 
-    private func opaqueNotificationPayload(eventID: UUID) -> Data {
+    func opaqueNotificationPayload(eventID: UUID) -> Data {
         Data(eventID.uuidString.lowercased().utf8)
     }
 
@@ -12815,7 +12848,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// references; DAG-CBOR links remain repository blocks and are ignored by
     /// this projection. The decoder is bounded by the already-enforced record
     /// byte limit, and the result is de-duplicated before namespace promotion.
-    private func rawBlobCIDs(in value: Data) throws -> [String] {
+    func rawBlobCIDs(in value: Data) throws -> [String] {
         let decoded = try CARRepository.decodeRecordCBOR(value)
         var cids = Set<String>()
 
@@ -12871,7 +12904,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// caller's write transaction. The edge set mirrors the record's current
     /// raw blob links exactly; `wire_revision` is the committing batch's TID,
     /// which is what `listBlobs`' `since` filter compares against.
-    private func replacePermissionedRecordBlobEdges(
+    func replacePermissionedRecordBlobEdges(
         space: SpaceURI,
         author: String,
         collection: String,
@@ -12912,7 +12945,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// `com.atproto.sync.getBlob` must keep serving it. Existing private
     /// references are idempotent, including when another space already owns
     /// the CAS.
-    private func promotePermissionedBlobReferences(
+    func promotePermissionedBlobReferences(
         _ cids: [String],
         space: SpaceURI
     ) async throws {
