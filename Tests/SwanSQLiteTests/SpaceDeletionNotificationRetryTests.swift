@@ -277,7 +277,7 @@ final class SpaceDeletionNotificationRetryTests: XCTestCase {
             freshnessWitness: PermissionedRemoteReplicaFreshnessWitness(
                 wireRevision: try TID(tidString: "222222222222a"), commitment: LtHash().commitment
             ),
-            profileID: "permissioned-data-0016-2026-10-22"
+            profileID: "permissioned-data-0016-2026-10-29"
         )
         let outcome = try await database.createPermissionedRemoteReplicaImportSession(
             binding: binding, createdAt: 100, expiresAt: 200, now: 101

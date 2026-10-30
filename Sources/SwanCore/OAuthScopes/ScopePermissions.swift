@@ -33,10 +33,11 @@ import Foundation
 //   | com.atproto.space.get*/list* (7 routes)| space/util.ts:109-127     assertSpaceRead -> read_self     |
 //   | com.atproto.space.getDelegationToken   | space/getDelegationToken.ts:22 assertSpaceScope(read)      |
 //   | com.atproto.space.listSpaces           | space/listSpaces.ts:20-25 assertSpace(filters-as-target)   |
-//   | com.atproto.simplespace.{create,update,| simplespace/{createSpace:22,updateSpace:16,deleteSpace:17, |
-//   |   delete}Space, {add,remove}Member     |   addMember:18,removeMember:17} assertSpaceScope(manage:)  |
-//   | com.atproto.simplespace.getSpace,      | simplespace/{getSpace.ts:25,listMembers.ts:20}             |
-//   |   listMembers                          |   assertSpaceScope(action:read_self)                       |
+//   | com.atproto.space.{create,update,      | October 29 (5d88b414): assertSpaceOwner(manage:)           |
+//   |   delete}Space, removeWriter,          |   (the retired simplespace lifecycle routes used the same  |
+//   |   memberspace.{put,remove}Member       |   manage: verbs)                                           |
+//   | com.atproto.space.getSpace,            | space/getSpace.ts, memberspace/listMembers.ts              |
+//   |   memberspace.listMembers              |   assertSpaceOwner(action:read_self)                       |
 //
 // Two of these carry a DOCUMENTED SWAN HARDENING of the upstream rule, not an
 // invention (§6.2, §5.6.3, §9-D16). Upstream's read arm is

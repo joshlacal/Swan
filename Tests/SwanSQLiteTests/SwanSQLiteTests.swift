@@ -3957,17 +3957,19 @@ final class SwanSQLiteTests: XCTestCase {
             throw error
         }
 
+        // October 29: a one-sided managing-app configuration is stored as a
+        // managedspace on both sides (`readManagingApp ?? writeManagingApp`),
+        // and stored managing-app decisions are no longer consulted or
+        // validated, so a stray write decision row is inert.
         let reopenedAsymm1 = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
-        await XCTAssertThrowsErrorAsync(
-            try await reopenedAsymm1.simpleSpace(
-                asymmWriteSpace,
-                authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"])
-            )
-        ) { error in
-            guard case .corruptDatabase = error as? SQLiteRepositoryError else {
-                return XCTFail("expected corruptDatabase on illegal write decision, got \(error)")
-            }
-        }
+        let asymmLookup1 = try await reopenedAsymm1.simpleSpace(
+            asymmWriteSpace,
+            authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"])
+        )
+        XCTAssertEqual(
+            asymmLookup1?.space.configuration.policy,
+            .managed(try ManagedSpacePolicy(managingApp: "did:web:manager.example"))
+        )
         try await reopenedAsymm1.close()
 
         // 2. Asymmetric: memberList read, managingApp write, corrupted with illegal read decision
@@ -4001,17 +4003,19 @@ final class SwanSQLiteTests: XCTestCase {
             throw error
         }
 
+        // October 29: a one-sided managing-app configuration is stored as a
+        // managedspace on both sides (`readManagingApp ?? writeManagingApp`),
+        // and stored managing-app decisions are no longer consulted or
+        // validated, so a stray read decision row is inert.
         let reopenedAsymm2 = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
-        await XCTAssertThrowsErrorAsync(
-            try await reopenedAsymm2.simpleSpace(
-                asymmReadSpace,
-                authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"])
-            )
-        ) { error in
-            guard case .corruptDatabase = error as? SQLiteRepositoryError else {
-                return XCTFail("expected corruptDatabase on illegal read decision, got \(error)")
-            }
-        }
+        let asymmLookup2 = try await reopenedAsymm2.simpleSpace(
+            asymmReadSpace,
+            authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"])
+        )
+        XCTAssertEqual(
+            asymmLookup2?.space.configuration.policy,
+            .managed(try ManagedSpacePolicy(managingApp: "did:web:manager.example"))
+        )
         try await reopenedAsymm2.close()
     }
 
@@ -4096,7 +4100,7 @@ final class SwanSQLiteTests: XCTestCase {
         try await database.close()
     }
 
-    func testSimpleSpaceAuthoritySchemaMigrationPreservesPolicyOnlyManagingAppAndAllowsClear() async throws {
+    func testSimpleSpaceAuthoritySchemaMigrationConvertsManagingAppToManagedSpace() async throws {
         let fixture = try Fixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let initial = try await fixture.open()
@@ -4112,45 +4116,34 @@ final class SwanSQLiteTests: XCTestCase {
                 scopes: ["atproto"]
             )
             let authority = DurableSimpleSpaceAuthority(lifecycleDatabase: database)
-            let readPolicyOnly = try await authority.update(
-                space: fixture.space,
-                patch: .init(readPolicy: .public),
+            // October 29 migration v29: both sides named the same managing
+            // app, so the row becomes a managedspace policy.
+            let migratedLookup = try await database.simpleSpace(
+                fixture.space,
                 authorization: authorization
             )
-            XCTAssertEqual(readPolicyOnly.space.configuration.readPolicy, .public)
-            XCTAssertEqual(readPolicyOnly.space.configuration.writePolicy, .managingApp)
-            XCTAssertEqual(readPolicyOnly.space.configuration.readManagingApp, "did:web:manager.example")
-            XCTAssertEqual(readPolicyOnly.space.configuration.writeManagingApp, "did:web:manager.example")
+            let migratedState = try XCTUnwrap(migratedLookup)
+            XCTAssertEqual(
+                migratedState.space.configuration.policy,
+                .managed(try ManagedSpacePolicy(managingApp: "did:web:manager.example"))
+            )
 
-            let writePolicyOnly = try await authority.update(
+            // updateSpace replaces the policy wholesale.
+            let replaced = try await authority.update(
                 space: fixture.space,
-                patch: .init(writePolicy: .public),
+                configuration: SimpleSpaceConfiguration(
+                    policy: .member(try MemberSpacePolicy(publicRead: true))
+                ),
                 authorization: authorization
             )
-            XCTAssertEqual(writePolicyOnly.space.configuration.readPolicy, .public)
-            XCTAssertEqual(writePolicyOnly.space.configuration.writePolicy, .public)
-            XCTAssertEqual(writePolicyOnly.space.configuration.readManagingApp, "did:web:manager.example")
-            XCTAssertEqual(writePolicyOnly.space.configuration.writeManagingApp, "did:web:manager.example")
-
-            let readAppCleared = try await authority.update(
-                space: fixture.space,
-                patch: .init(readManagingApp: .set(nil)),
-                authorization: authorization
+            XCTAssertEqual(
+                replaced.space.configuration.policy,
+                .member(try MemberSpacePolicy(publicRead: true))
             )
-            XCTAssertEqual(readAppCleared.space.configuration.readPolicy, .public)
-            XCTAssertEqual(readAppCleared.space.configuration.writePolicy, .public)
-            XCTAssertNil(readAppCleared.space.configuration.readManagingApp)
-            XCTAssertEqual(readAppCleared.space.configuration.writeManagingApp, "did:web:manager.example")
-
-            let cleared = try await authority.update(
-                space: fixture.space,
-                patch: .init(writeManagingApp: .set(nil)),
-                authorization: authorization
-            )
-            XCTAssertEqual(cleared.space.configuration.readPolicy, .public)
-            XCTAssertEqual(cleared.space.configuration.writePolicy, .public)
-            XCTAssertNil(cleared.space.configuration.readManagingApp)
-            XCTAssertNil(cleared.space.configuration.writeManagingApp)
+            XCTAssertEqual(replaced.space.configuration.readPolicy, .public)
+            XCTAssertEqual(replaced.space.configuration.writePolicy, .memberList)
+            XCTAssertNil(replaced.space.configuration.readManagingApp)
+            XCTAssertNil(replaced.space.configuration.writeManagingApp)
         }
 
         let inspected = try await SQLiteConnection.open(storage: .file(path: path))
@@ -5067,7 +5060,7 @@ private func installLegacySimpleSpaceAuthoritySchema(_ fixture: Fixture) async t
             [.text(fixture.space.rawValue), .text(fixture.author)]
         )
         _ = try await legacy.query(
-            "DELETE FROM permissioned_repository_migrations WHERE version IN (3, 23)"
+            "DELETE FROM permissioned_repository_migrations WHERE version IN (3, 23, 29)"
         )
         _ = try await legacy.query("PRAGMA foreign_keys = ON")
         try await legacy.close()

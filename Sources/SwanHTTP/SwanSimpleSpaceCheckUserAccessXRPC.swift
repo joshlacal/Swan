@@ -26,33 +26,34 @@ private enum SimpleSpaceCheckUserAccessFailure: Error {
     case unavailable
 }
 
-private struct SimpleSpaceCheckUserAccessHandler:
-    ComAtprotoSimplespaceCheckUserAccess.ServerHandler
-{
-    typealias Context = Request
+/// `com.atproto.managedspace.checkUserAccess` parameters `{ space, user,
+/// access, clientId? }` (unchanged from the retired simplespace method).
+private struct ManagedSpaceCheckUserAccessParameters {
+    let space: SpaceURI
+    let user: String
+    let access: String
+    let clientId: String?
+}
 
+private struct ManagedSpaceCheckUserAccessOutput: Encodable {
+    let authorized: Bool
+}
+
+private let managedSpaceCheckUserAccessNSID = "com.atproto.managedspace.checkUserAccess"
+
+private struct SimpleSpaceCheckUserAccessHandler {
     let capability: SwanSimpleSpaceCheckUserAccessCapability
 
     func handle(
-        parameters: ComAtprotoSimplespaceCheckUserAccess.Parameters,
-        input: Void,
-        context request: Request
-    ) async throws -> ComAtprotoSimplespaceCheckUserAccess.Output {
-        // Parse the generated values again through the narrower domain types
-        // before service authentication. Neither result is used for policy;
-        // this only rejects non-canonical requests without consulting storage.
-        do {
-            _ = try SpaceURI(parameters.space.uriString())
-            _ = try DID(didString: parameters.user.didString())
-        } catch {
-            throw SimpleSpaceCheckUserAccessFailure.denied
-        }
+        parameters _: ManagedSpaceCheckUserAccessParameters,
+        request: Request
+    ) async throws -> ManagedSpaceCheckUserAccessOutput {
         do {
             let compact = try exactSpaceServiceBearerToken(from: request.headers)
             _ = try await capability.serviceAuthentication.authenticate(
                 compact,
                 expectedAudience: capability.managingServiceAudience,
-                expectedMethod: ComAtprotoSimplespaceCheckUserAccess.typeIdentifier,
+                expectedMethod: managedSpaceCheckUserAccessNSID,
                 expectedRequestBodyDigest: nil,
                 now: Date()
             )
@@ -67,7 +68,7 @@ private struct SimpleSpaceCheckUserAccessHandler:
         // The pinned PDS is not an application policy engine. A successful
         // service authentication therefore proves only the caller identity;
         // it never reaches authority, membership, record, or blob state.
-        return .init(authorized: false)
+        return ManagedSpaceCheckUserAccessOutput(authorized: false)
     }
 }
 
@@ -76,12 +77,12 @@ func registerSimpleSpaceCheckUserAccessEndpoint(
     capability: SwanSimpleSpaceCheckUserAccessCapability
 ) {
     let handler = SimpleSpaceCheckUserAccessHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.simplespace.checkUserAccess"
+    let path: RouterPath = "/xrpc/com.atproto.managedspace.checkUserAccess"
     router.get(path) { request, _ async -> Response in
         do {
             let parameters = try parseSimpleSpaceCheckUserAccessParameters(request)
-            let output = try await handler.handle(parameters: parameters, input: (), context: request)
-            return simpleSpaceCheckUserAccessJSON(.ok, output)
+            let output = try await handler.handle(parameters: parameters, request: request)
+            return authenticatedGetSpaceJSON(.ok, output)
         } catch let failure as SimpleSpaceCheckUserAccessFailure {
             return simpleSpaceCheckUserAccessResponse(for: failure)
         } catch {
@@ -99,7 +100,7 @@ func registerSimpleSpaceCheckUserAccessEndpoint(
 
 private func parseSimpleSpaceCheckUserAccessParameters(
     _ request: Request
-) throws -> ComAtprotoSimplespaceCheckUserAccess.Parameters {
+) throws -> ManagedSpaceCheckUserAccessParameters {
     guard !request.uri.string.contains("#"),
           let query = request.uri.query,
           !query.isEmpty,
@@ -134,10 +135,11 @@ private func parseSimpleSpaceCheckUserAccessParameters(
         throw SimpleSpaceCheckUserAccessFailure.denied
     }
     do {
-        let space = try SpaceRef(uriString: rawSpace)
-        let user = try DID(didString: rawUser)
-        _ = try SpaceURI(space.uriString())
-        return .init(space: space, user: user, access: rawAccess, clientId: values["clientId"])
+        let space = try SpaceURI(SpaceRef(uriString: rawSpace).uriString())
+        let user = try DID(didString: rawUser).didString()
+        return ManagedSpaceCheckUserAccessParameters(
+            space: space, user: user, access: rawAccess, clientId: values["clientId"]
+        )
     } catch {
         throw SimpleSpaceCheckUserAccessFailure.denied
     }
@@ -159,11 +161,4 @@ private func simpleSpaceCheckUserAccessError(
     code: String
 ) -> Response {
     authenticatedGetSpaceJSON(status, ["error": code])
-}
-
-private func simpleSpaceCheckUserAccessJSON(
-    _ status: HTTPResponse.Status,
-    _ output: ComAtprotoSimplespaceCheckUserAccess.Output
-) -> Response {
-    authenticatedGetSpaceJSON(status, output)
 }

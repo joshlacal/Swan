@@ -150,7 +150,7 @@ public struct AuthenticatedSimpleSpaceDescription: Sendable, Equatable {
 }
 
 /// Startup-preopened authority directory for the authenticated
-/// `com.atproto.simplespace` surface.
+/// space lifecycle and memberspace surface (formerly `com.atproto.simplespace`).
 ///
 /// Implementations must never treat a request authority as permission to
 /// create, migrate, or open an account database. They preopen an explicitly
@@ -538,9 +538,12 @@ public protocol AuthorizedSimpleSpaceLifecycleDirectory: Sendable {
         authorization: AuthorizationContext
     ) async throws
 
+    /// Replaces the policy wholesale (October 29 `updateSpace`). A policy of
+    /// a different `$type` discards the previous policy's state, such as a
+    /// memberspace member list.
     func updateSimpleSpace(
         _ space: SpaceURI,
-        patch: SimpleSpaceConfigurationPatch,
+        configuration: SimpleSpaceConfiguration,
         authorization: AuthorizationContext
     ) async throws
 
@@ -569,6 +572,56 @@ public protocol AuthorizedSimpleSpaceLifecycleDirectory: Sendable {
         cursor: String?,
         authorization: AuthorizationContext
     ) async throws -> AuthorizedSimpleSpaceMemberPage
+
+    /// `com.atproto.space.removeWriter`: drops one account from the space's
+    /// writer set. Idempotent; the account is tracked again after its next
+    /// authorized write.
+    func removeSpaceWriter(
+        _ writer: String,
+        from space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws
+}
+
+public extension AuthorizedSimpleSpaceLifecycleDirectory {
+    func removeSpaceWriter(
+        _: String,
+        from _: SpaceURI,
+        authorization _: AuthorizationContext
+    ) async throws {
+        throw SwanError.unavailable("space writer removal is unavailable")
+    }
+}
+
+/// Asks a managedspace's managing app about one user
+/// (`com.atproto.managedspace.checkUserAccess`). Implementations must deny
+/// (return `false`) when the app cannot be resolved, is unreachable, or
+/// answers anything but a well-formed `{ authorized: true }`. Callers never
+/// invoke this inside a SQLite transaction.
+public protocol ManagedSpaceAccessChecking: Sendable {
+    func checkUserAccess(
+        space: SpaceURI,
+        user: String,
+        access: SimpleSpaceAccessKind,
+        clientID: String?,
+        managingApp: String
+    ) async -> Bool
+}
+
+/// The fail-closed checker used when no managing-app client is configured:
+/// every non-owner of a managedspace is refused.
+public struct DenyingManagedSpaceAccessChecker: ManagedSpaceAccessChecking {
+    public init() {}
+
+    public func checkUserAccess(
+        space _: SpaceURI,
+        user _: String,
+        access _: SimpleSpaceAccessKind,
+        clientID _: String?,
+        managingApp _: String
+    ) async -> Bool {
+        false
+    }
 }
 
 /// Startup-preopened authority policy projection used only while an

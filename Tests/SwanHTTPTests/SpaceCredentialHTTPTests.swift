@@ -62,7 +62,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 }
                 try await client.execute(uri: Self.credentialPath, method: .post, headers: headers,
                                          body: body(fixture.memberSpace)) { response in
-                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
                 }
                 for bad in ["not-a-key", "did:key:z6Mkinvalid"] {
@@ -189,7 +189,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
 
                 for (space, expectedStatus, expectedError) in [
                     (fixture.publicSpace, HTTPResponse.Status.badRequest, "SpaceDeleted"),
-                    (missingSpace, HTTPResponse.Status.notFound, "SpaceNotFound"),
+                    (missingSpace, HTTPResponse.Status.badRequest, "SpaceNotFound"),
                 ] {
                     let renewalDelegation = try self.delegation(fixture, user: Self.member, space: space)
                     try await client.execute(
@@ -367,9 +367,12 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                         headers: self.exchangeHeaders(),
                         body: self.exchangeBody(delegationToken: delegation, space: space)
                     ) { response in
-                        XCTAssertEqual(response.status, .unauthorized)
+                        // October 29: a user the policy does not admit is
+                        // told SpaceNotFound (HTTP 400), checked before the
+                        // app, as the reference authorizeUser does.
+                        XCTAssertEqual(response.status, .badRequest)
                         self.assertNoStore(response)
-                        XCTAssertEqual(try self.errorCode(response.body), "NotAuthorized")
+                        XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
                     }
                 }
                 try await client.execute(
@@ -1375,7 +1378,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             UnavailableSpaceCredentialClientAttestationPolicy()
     ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
-            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-22.json")
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-29.json")
         )
         let signing = StaticSigningKeyResolver(
             authority: Self.authority,

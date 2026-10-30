@@ -37,7 +37,7 @@ final class SwanDisposableConversationDeletionTests: XCTestCase, @unchecked Send
         var statuses: [Int] = []
         for _ in 0..<2 {
             let response = try await oauth.executeResource(token: token, method: .post,
-                path: "/xrpc/com.atproto.simplespace.deleteSpace", body: body)
+                path: "/xrpc/com.atproto.space.deleteSpace", body: body)
             XCTAssertEqual(response.status, 200, String(decoding: response.body, as: UTF8.self))
             statuses.append(response.status)
         }

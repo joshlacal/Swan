@@ -823,6 +823,40 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// October 29 section 1e: the published policy and member collections
+    /// are written only by the authority through the policy methods. Direct
+    /// writes into them are refused with 400 before any mutation.
+    func testDirectWritesIntoPublishedPolicyCollectionsAreRefused() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let app = try makeServer(fixture).buildApplication(logger: Logger(label: "PermissionedRecordWriteHTTPTests.published"))
+            let space = fixture.space.rawValue
+            let cases: [(String, String)] = [
+                (Self.createPath, #"{"space":"\#(space)","repo":"\#(Self.alice)","collection":"com.atproto.space.policy","rkey":"self","record":{"$type":"com.atproto.space.policy","policy":{"$type":"com.atproto.personalspace.policy"}}}"#),
+                (Self.putPath, #"{"space":"\#(space)","repo":"\#(Self.alice)","collection":"com.atproto.memberspace.member","rkey":"\#(Self.alice)","record":{"$type":"com.atproto.memberspace.member","read":true,"write":true}}"#),
+                (Self.deletePath, #"{"space":"\#(space)","repo":"\#(Self.alice)","collection":"com.atproto.space.policy","rkey":"self"}"#),
+                (Self.applyPath, #"{"space":"\#(space)","repo":"\#(Self.alice)","writes":[{"$type":"com.atproto.space.applyWrites#create","collection":"\#(Self.collection)","rkey":"ok","value":{"$type":"app.bsky.feed.post","text":"fine"}},{"$type":"com.atproto.space.applyWrites#create","collection":"com.atproto.memberspace.member","rkey":"\#(Self.alice)","value":{"$type":"com.atproto.memberspace.member","read":true,"write":true}}]}"#),
+            ]
+            try await app.test(.router) { client in
+                for (index, (path, body)) in cases.enumerated() {
+                    try await client.execute(uri: path, method: .post, headers: try self.writeHeaders(fixture, path: path, jti: "published-\(index)"), body: ByteBuffer(string: body)) { response in
+                        XCTAssertEqual(response.status, .badRequest, path)
+                        XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest", path)
+                    }
+                }
+                // The refused batch was atomic: its ordinary record is absent.
+                try await client.execute(uri: self.getURI(fixture, collection: Self.collection, rkey: "ok"), method: .get, headers: try self.signedHeaders(fixture, subject: Self.alice, path: Self.getPath, jti: "published-atomic")) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                }
+            }
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
     func testValidateTrueMatchesPinnedSpaceWriteParityWithoutWeakeningAtomicity() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }

@@ -32,17 +32,15 @@ final class SwanDisposableAuthorityProvisioningTests: XCTestCase, @unchecked Sen
         let skey = "oauth" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         let expectedSpace = "at://\(token.subject)/space/app.swan.test/\(skey)"
         let create: [String: Any] = ["spaceType": "app.swan.test", "skey": skey,
-            "readPolicy": ["$type": "com.atproto.simplespace.defs#memberListPolicy"],
-            "writePolicy": ["$type": "com.atproto.simplespace.defs#memberListPolicy"],
-            "appAccess": ["$type": "com.atproto.simplespace.defs#open"]]
+            "policy": ["$type": "com.atproto.memberspace.policy"]]
         let response = try await oauth.executeResource(token: token, method: .post,
-            path: "/xrpc/com.atproto.simplespace.createSpace", body: JSONSerialization.data(withJSONObject: create))
+            path: "/xrpc/com.atproto.space.createSpace", body: JSONSerialization.data(withJSONObject: create))
         XCTAssertEqual(response.status, 200, String(decoding: response.body, as: UTF8.self))
         let created = try XCTUnwrap(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
         XCTAssertEqual(created["uri"] as? String, expectedSpace)
         let member = "did:plc:xx5pwgo7a7k3sjz4xzoau2bq"
         let memberResponse = try await oauth.executeResource(token: token, method: .post,
-            path: "/xrpc/com.atproto.simplespace.putMember", body: JSONSerialization.data(withJSONObject: [
+            path: "/xrpc/com.atproto.memberspace.putMember", body: JSONSerialization.data(withJSONObject: [
                 "space": expectedSpace, "did": member, "read": true, "write": true]))
         XCTAssertEqual(memberResponse.status, 200, String(decoding: memberResponse.body, as: UTF8.self))
         guard response.status == 200, memberResponse.status == 200 else { return }

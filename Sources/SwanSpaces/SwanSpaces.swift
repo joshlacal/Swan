@@ -75,7 +75,7 @@ public struct SpaceURI: Sendable, Codable, Hashable, CustomStringConvertible {
         return (authority, Array(pieces.dropFirst()))
     }
 
-    fileprivate static func isValidDID(_ value: String) -> Bool {
+    static func isValidDID(_ value: String) -> Bool {
         let parts = value.split(separator: ":", omittingEmptySubsequences: false)
         return parts.count >= 3 && parts[0] == "did" && !parts[1].isEmpty && !parts.dropFirst(2).joined(separator: ":").isEmpty &&
             value.utf8.allSatisfy { $0 >= 33 && $0 <= 126 && $0 != 47 && $0 != 63 && $0 != 35 }
@@ -360,23 +360,19 @@ public enum SpaceAuthorizationPolicy {
         )
     }
 
-    /// The `simplespace.getSpace` description read, ported from the live
-    /// reference handler: a space credential bound to this space reads the
-    /// configuration it was minted against, while the OAuth arm requires the
-    /// authority account itself (`assertSpaceOwner`) holding `read_self` for
-    /// the space (`assertSpaceScope`), with the same ambient `atproto` bypass
-    /// as the management verbs — gated on the owner check exactly like
+    /// The `com.atproto.space.getSpace` description read: the authority
+    /// account itself (`assertSpaceOwner`) holding `read_self` for the space
+    /// (`assertSpaceScope`), with the same ambient `atproto` bypass as the
+    /// management verbs — gated on the owner check exactly like
     /// ``requireManagement(space:authorization:operation:)``.
     public static func requireSpaceDescriptionRead(
         space: SpaceURI,
         authorization: AuthorizationContext
     ) throws {
+        // October 29: getSpace is owner-only. A space credential no longer
+        // reads the configuration; members and syncers read a published
+        // `com.atproto.space.policy` record instead.
         switch authorization {
-        case let .spaceCredential(grant):
-            guard grant.space == space else {
-                throw SwanError.unauthorized("credential is for another space")
-            }
-            try grant.allows(.read)
         case let .accountOAuth(subject, permissions):
             guard subject == space.authority else {
                 throw SwanError.unauthorized("authority account OAuth is required")
@@ -388,7 +384,7 @@ public enum SpaceAuthorizationPolicy {
                 )
             }
         default:
-            throw SwanError.unauthorized("space credential or authority OAuth is required")
+            throw SwanError.unauthorized("authority account OAuth is required")
         }
     }
 
@@ -1735,6 +1731,9 @@ public struct SpaceRepositoryState: Sendable, Equatable {
     }
 }
 
+/// The October 22 per-side policy vocabulary. It survives only as the
+/// storage column encoding of a ``SpacePolicy`` and as the input of the
+/// October 22 to October 29 conversion (``SimpleSpaceConfiguration/init(readPolicy:readManagingApp:writePolicy:writeManagingApp:appAccess:)``).
 public enum SimpleSpacePolicy: String, Codable, Sendable {
     case `public`
     case memberList = "member-list"
@@ -1758,9 +1757,10 @@ public enum SimpleSpaceLimits {
     public static let maximumSpacesPerAuthority = 10_000
     /// Maximum number of member DIDs in one space, including its owner.
     public static let maximumMembersPerSpace = 10_000
-    /// Maximum number of client metadata URLs in an allow-list policy.
+    /// Maximum number of client identifiers in an `allowedApps` list.
     public static let maximumClientAllowListEntries = 1_000
-    /// Maximum number of persisted managing-app decisions in one space.
+    /// Maximum number of managing-app decisions the in-memory laboratory
+    /// authority keeps for one space.
     public static let maximumManagingAppDecisionsPerSpace = 10_000
 
 }
@@ -1772,9 +1772,8 @@ public enum SimpleSpaceCredentialPolicyError: Error, Sendable, Equatable {
     case appNotAuthorized
 }
 
-/// The pinned `com.atproto.simplespace` policy surface. A policy decision is
-/// made only by the authority; repo hosts merely verify the resulting read
-/// credential and never infer membership from a record request.
+/// Which side of a policy a decision concerns. A managing app is asked about
+/// both under `managedspace`.
 public enum SimpleSpaceAccessKind: String, Sendable, Codable {
     case read
     case write
@@ -1792,26 +1791,23 @@ public struct SimpleSpaceMember: Sendable, Equatable, Hashable, Codable {
     }
 }
 
-/// The pinned `com.atproto.simplespace` policy surface. A policy decision is
-/// made only by the authority; repo hosts merely verify the resulting read
-/// credential and never infer membership from a record request.
+/// An authority-owned space configuration: one normalized ``SpacePolicy``.
+/// A policy decision is made only by the authority; repo hosts merely verify
+/// the resulting read credential and never infer membership from a record
+/// request.
 public struct SimpleSpaceConfiguration: Sendable, Codable, Equatable {
-    private enum CodingKeys: String, CodingKey {
-        case readPolicy
-        case readManagingApp
-        case writePolicy
-        case writeManagingApp
-        case appAccess
-        case policy
-        case managingApp
+    public let policy: SpacePolicy
+
+    public init(policy: SpacePolicy) {
+        self.policy = policy
     }
 
-    public let readPolicy: SimpleSpacePolicy
-    public let readManagingApp: String?
-    public let writePolicy: SimpleSpacePolicy
-    public let writeManagingApp: String?
-    public let appAccess: SimpleSpaceAppAccess
-
+    /// Converts an October 22 configuration exactly as the reference
+    /// `006-space-policy` migration does: a stored managing app on either
+    /// side (`readManagingApp ?? writeManagingApp`) becomes `managedspace` (asked about both sides, any allow-list
+    /// dropped); anything else becomes `memberspace` with `publicRead` /
+    /// `publicWrite` from the public sides and `allowedApps` from an
+    /// allow-list. Nothing is published.
     public init(
         readPolicy: SimpleSpacePolicy = .memberList,
         readManagingApp: String? = nil,
@@ -1819,139 +1815,103 @@ public struct SimpleSpaceConfiguration: Sendable, Codable, Equatable {
         writeManagingApp: String? = nil,
         appAccess: SimpleSpaceAppAccess = .open
     ) throws {
-        guard readManagingApp?.isEmpty != true else {
-            throw SwanError.malformed("read managing app must not be empty")
+        guard readManagingApp?.isEmpty != true, writeManagingApp?.isEmpty != true else {
+            throw SwanError.malformed("managing app must not be empty")
         }
-        guard writeManagingApp?.isEmpty != true else {
-            throw SwanError.malformed("write managing app must not be empty")
-        }
-        if case let .allowList(clients) = appAccess,
-           clients.count > SimpleSpaceLimits.maximumClientAllowListEntries {
-            throw SwanError.malformed("simple-space client allow-list is too large")
-        }
-        if case let .allowList(clients) = appAccess {
-            for client in clients {
-                try Self.validateAppIdentifier(client)
+        // The reference converts on the stored app columns, not the policy
+        // columns: an app retained through a policy-only update still makes
+        // the space a managedspace.
+        if readPolicy == .managingApp || writePolicy == .managingApp
+            || readManagingApp != nil || writeManagingApp != nil {
+            guard let managingApp = readManagingApp ?? writeManagingApp else {
+                throw SwanError.malformed("managing-app policy requires a managing app")
             }
+            do {
+                policy = .managed(try ManagedSpacePolicy(managingApp: managingApp))
+            } catch {
+                throw SwanError.invalidIdentifier(managingApp)
+            }
+            return
         }
-        if let readManagingApp {
-            try Self.validateAppIdentifier(readManagingApp)
+        let allowedApps: [String]?
+        switch appAccess {
+        case .open:
+            allowedApps = nil
+        case let .allowList(clients):
+            guard clients.count <= SimpleSpaceLimits.maximumClientAllowListEntries else {
+                throw SwanError.malformed("simple-space client allow-list is too large")
+            }
+            for client in clients where !SpacePolicyValidation.isValidAppIdentifier(client) {
+                throw SwanError.invalidIdentifier(client)
+            }
+            allowedApps = clients.sorted()
         }
-        if let writeManagingApp {
-            try Self.validateAppIdentifier(writeManagingApp)
+        do {
+            policy = .member(try MemberSpacePolicy(
+                publicRead: readPolicy == .public,
+                publicWrite: writePolicy == .public,
+                allowedApps: allowedApps
+            ))
+        } catch {
+            throw SwanError.malformed("invalid simple-space configuration")
         }
-        self.readPolicy = readPolicy
-        self.readManagingApp = readManagingApp
-        self.writePolicy = writePolicy
-        self.writeManagingApp = writeManagingApp
-        self.appAccess = appAccess
+    }
+
+    /// Storage column projections of the policy. A personalspace is stored
+    /// as member-list on both sides with no members; a managedspace names its
+    /// managing app on both sides.
+    public var readPolicy: SimpleSpacePolicy {
+        switch policy {
+        case .personal: .memberList
+        case let .member(member): member.publicRead ? .public : .memberList
+        case .managed: .managingApp
+        }
+    }
+
+    public var writePolicy: SimpleSpacePolicy {
+        switch policy {
+        case .personal: .memberList
+        case let .member(member): member.publicWrite ? .public : .memberList
+        case .managed: .managingApp
+        }
+    }
+
+    public var readManagingApp: String? {
+        if case let .managed(managed) = policy { return managed.managingApp }
+        return nil
+    }
+
+    public var writeManagingApp: String? { readManagingApp }
+
+    public var appAccess: SimpleSpaceAppAccess {
+        if case let .member(member) = policy, let apps = member.allowedApps {
+            return .allowList(Set(apps))
+        }
+        return .open
     }
 
     /// Client identifiers are opaque app/service names in the wire protocol,
-    /// not URLs or DIDs. Keep their lexical contract in the shared domain
-    /// initializer so the in-memory authority and SQLite adapter cannot
-    /// disagree about what state is valid. The HTTP layer applies any stricter
-    /// transport policy before using an identifier as a network destination.
-    fileprivate static func validateAppIdentifier(_ identifier: String) throws {
-        guard !identifier.isEmpty,
-              identifier.utf8.count <= 2_048,
-              identifier.unicodeScalars.allSatisfy({
-                  $0.value >= 0x20 && $0.value != 0x7F
-              })
-        else {
+    /// not URLs or DIDs.
+    static func validateAppIdentifier(_ identifier: String) throws {
+        guard SpacePolicyValidation.isValidAppIdentifier(identifier) else {
             throw SwanError.invalidIdentifier(identifier)
         }
     }
 
+    private enum CodingKeys: String, CodingKey { case policy }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        if container.contains(.readPolicy) {
-            let readPolicy = try container.decode(SimpleSpacePolicy.self, forKey: .readPolicy)
-            let readManagingApp = try container.decodeIfPresent(String.self, forKey: .readManagingApp)
-            let writePolicy = try container.decode(SimpleSpacePolicy.self, forKey: .writePolicy)
-            let writeManagingApp = try container.decodeIfPresent(String.self, forKey: .writeManagingApp)
-            let appAccess = try container.decode(SimpleSpaceAppAccess.self, forKey: .appAccess)
-            try self.init(
-                readPolicy: readPolicy,
-                readManagingApp: readManagingApp,
-                writePolicy: writePolicy,
-                writeManagingApp: writeManagingApp,
-                appAccess: appAccess
-            )
-        } else {
-            let policy = try container.decode(SimpleSpacePolicy.self, forKey: .policy)
-            let appAccess = try container.decode(SimpleSpaceAppAccess.self, forKey: .appAccess)
-            let managingApp = try container.decodeIfPresent(String.self, forKey: .managingApp)
-            try self.init(
-                readPolicy: policy,
-                readManagingApp: managingApp,
-                writePolicy: policy,
-                writeManagingApp: managingApp,
-                appAccess: appAccess
-            )
-        }
+        let data = try container.decode(Data.self, forKey: .policy)
+        let object = try JSONSerialization.jsonObject(with: data)
+        policy = try SpacePolicy.normalized(jsonObject: object)
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(readPolicy, forKey: .readPolicy)
-        try container.encodeIfPresent(readManagingApp, forKey: .readManagingApp)
-        try container.encode(writePolicy, forKey: .writePolicy)
-        try container.encodeIfPresent(writeManagingApp, forKey: .writeManagingApp)
-        try container.encode(appAccess, forKey: .appAccess)
-    }
-}
-
-/// A non-destructive update to simple-space configuration.  The wire
-/// `updateSpace` schema makes each field optional; representing that directly
-/// prevents an omitted field from silently resetting durable policy state.
-public struct SimpleSpaceConfigurationPatch: Sendable, Equatable {
-    public enum ManagingApp: Sendable, Equatable {
-        case unchanged
-        case set(String?)
-    }
-
-    public let readPolicy: SimpleSpacePolicy?
-    public let readManagingApp: ManagingApp
-    public let writePolicy: SimpleSpacePolicy?
-    public let writeManagingApp: ManagingApp
-    public let appAccess: SimpleSpaceAppAccess?
-
-    public init(
-        readPolicy: SimpleSpacePolicy? = nil,
-        readManagingApp: ManagingApp = .unchanged,
-        writePolicy: SimpleSpacePolicy? = nil,
-        writeManagingApp: ManagingApp = .unchanged,
-        appAccess: SimpleSpaceAppAccess? = nil
-    ) {
-        self.readPolicy = readPolicy
-        self.readManagingApp = readManagingApp
-        self.writePolicy = writePolicy
-        self.writeManagingApp = writeManagingApp
-        self.appAccess = appAccess
-    }
-
-    public func applying(to current: SimpleSpaceConfiguration) throws -> SimpleSpaceConfiguration {
-        let nextReadManagingApp: String?
-        switch readManagingApp {
-        case .unchanged:
-            nextReadManagingApp = current.readManagingApp
-        case let .set(value):
-            nextReadManagingApp = value
-        }
-        let nextWriteManagingApp: String?
-        switch writeManagingApp {
-        case .unchanged:
-            nextWriteManagingApp = current.writeManagingApp
-        case let .set(value):
-            nextWriteManagingApp = value
-        }
-        return try SimpleSpaceConfiguration(
-            readPolicy: readPolicy ?? current.readPolicy,
-            readManagingApp: nextReadManagingApp,
-            writePolicy: writePolicy ?? current.writePolicy,
-            writeManagingApp: nextWriteManagingApp,
-            appAccess: appAccess ?? current.appAccess
+        try container.encode(
+            try JSONSerialization.data(withJSONObject: policy.jsonObject, options: [.sortedKeys]),
+            forKey: .policy
         )
     }
 }
@@ -1983,6 +1943,13 @@ public struct SimpleSpace: Sendable, Equatable {
               members.keys.allSatisfy(SpaceURI.isValidDID)
         else {
             throw SwanError.malformed("invalid simple-space authority state")
+        }
+        // Only memberspace keeps a member list; Swan's owner row is the one
+        // entry every policy retains.
+        if case .member = configuration.policy {} else {
+            guard members.count == 1 else {
+                throw SwanError.malformed("invalid simple-space authority state")
+            }
         }
         self.init(
             uncheckedURI: uri,
@@ -2051,7 +2018,9 @@ private struct MutableSimpleSpace: Sendable {
 
 /// Process-local policy coordinator for the laboratory. Durable deployments
 /// persist the same decisions with the authority account; it never writes to a
-/// member repository during credential issuance.
+/// member repository during credential issuance. Its managing-app decision
+/// sets stand in for a local `checkUserAccess` app: a managedspace consults
+/// them for both reads and writes.
 public actor SimpleSpaceAuthority {
     private let credentials: HMACSpaceCredentialAuthority
     private var spaces: [SpaceURI: MutableSimpleSpace] = [:]
@@ -2076,20 +2045,20 @@ public actor SimpleSpaceAuthority {
 
     public func space(_ uri: SpaceURI) -> SimpleSpace? { spaces[uri]?.snapshot }
 
+    /// Replaces the policy wholesale. A different `$type` discards the
+    /// previous policy's state, so leaving memberspace drops the member list.
     public func update(space: SpaceURI, configuration: SimpleSpaceConfiguration, by subject: String) throws {
         var state = try activeSpace(space)
         try requireOwner(state, subject: subject)
         let previous = state.configuration
         state.configuration = configuration
-        spaces[space] = state
-        if previous.readPolicy != .managingApp
-            || configuration.readPolicy != .managingApp
-            || previous.readManagingApp != configuration.readManagingApp {
-            managingAppReadDecisions[space] = []
+        if previous.policy.typeIdentifier != configuration.policy.typeIdentifier {
+            let owner = state.owner
+            state.members = state.members.filter { $0.key == owner }
         }
-        if previous.writePolicy != .managingApp
-            || configuration.writePolicy != .managingApp
-            || previous.writeManagingApp != configuration.writeManagingApp {
+        spaces[space] = state
+        if previous.readManagingApp != configuration.readManagingApp {
+            managingAppReadDecisions[space] = []
             managingAppWriteDecisions[space] = []
         }
     }
@@ -2097,6 +2066,7 @@ public actor SimpleSpaceAuthority {
     public func putMember(space: SpaceURI, member: String, read: Bool, write: Bool, by subject: String) throws {
         var state = try activeSpace(space)
         try requireOwner(state, subject: subject)
+        guard case .member = state.configuration.policy else { throw SpacePolicyError.policyMismatch }
         guard SpaceURI.isValidDID(member) else { throw SwanError.invalidIdentifier(member) }
         guard state.members[member] != nil
             || state.members.count < SimpleSpaceLimits.maximumMembersPerSpace
@@ -2114,6 +2084,7 @@ public actor SimpleSpaceAuthority {
     public func removeMember(space: SpaceURI, member: String, by subject: String) throws {
         var state = try activeSpace(space)
         try requireOwner(state, subject: subject)
+        guard case .member = state.configuration.policy else { throw SpacePolicyError.policyMismatch }
         guard SpaceURI.isValidDID(member) else {
             throw SwanError.invalidIdentifier(member)
         }
@@ -2142,9 +2113,8 @@ public actor SimpleSpaceAuthority {
             throw SwanError.invalidIdentifier(user)
         }
         let state = try activeSpace(space)
-        let policy = access == .read ? state.configuration.readPolicy : state.configuration.writePolicy
-        let managingApp = access == .read ? state.configuration.readManagingApp : state.configuration.writeManagingApp
-        guard policy == .managingApp, managingApp == app else {
+        guard case let .managed(managed) = state.configuration.policy,
+              managed.managingApp == app else {
             throw SwanError.unauthorized("wrong managing app")
         }
         switch access {
@@ -2178,9 +2148,10 @@ public actor SimpleSpaceAuthority {
         try setManagingAppAccess(space: space, user: user, access: .write, allowed: allowed, by: app)
     }
 
-    /// Evaluates user and app policy independently, then returns a read-only
-    /// credential. The caller is responsible for first validating the signed
-    /// delegation token and any required client attestation at the OAuth layer.
+    /// Checks the user before the app, as the October 29 reference does:
+    /// the app restriction is reached only once the user passes. The caller is responsible for first
+    /// validating the signed delegation token and any required client
+    /// attestation at the OAuth layer.
     public func issueReadCredential(space: SpaceURI, user: String, clientID: String?, now: Date = Date()) throws -> SignedSpaceCredential {
         guard SpaceURI.isValidDID(user) else {
             throw SwanError.invalidIdentifier(user)
@@ -2190,20 +2161,17 @@ public actor SimpleSpaceAuthority {
         }
         let state = try activeSpace(space)
         if user != state.owner {
-            switch state.configuration.appAccess {
-            case .open: break
-            case let .allowList(allowed):
-                guard let clientID, allowed.contains(clientID) else { throw SwanError.unauthorized("app is not authorized for this space") }
+            let authorized: Bool = switch state.configuration.policy {
+            case .personal: false
+            case let .member(member):
+                member.publicRead || state.members[user]?.read == true
+            case .managed:
+                managingAppReadDecisions[space, default: []].contains(user)
             }
-            switch state.configuration.readPolicy {
-            case .public: break
-            case .memberList:
-                guard state.members[user]?.read == true else { throw SwanError.unauthorized("user is not authorized to read this space") }
-            case .managingApp:
-                guard managingAppReadDecisions[space, default: []].contains(user) else {
-                    throw SwanError.unauthorized("managing app denied user access")
-                }
-            }
+            guard authorized else { throw SwanError.unauthorized("user is not authorized to read this space") }
+        }
+        guard state.configuration.policy.isAppAuthorized(clientID: clientID) else {
+            throw SwanError.unauthorized("app is not authorized for this space")
         }
         let grant = SpaceGrant(
             subject: user, space: space, permissions: [.read],
@@ -2218,13 +2186,14 @@ public actor SimpleSpaceAuthority {
         }
         let state = try activeSpace(space)
         if writer == state.owner { return }
-        switch state.configuration.writePolicy {
-        case .public: return
-        case .memberList:
-            guard state.members[writer]?.write == true else {
+        switch state.configuration.policy {
+        case .personal:
+            throw SwanError.unauthorized("writer is not authorized to write to this space")
+        case let .member(member):
+            guard member.publicWrite || state.members[writer]?.write == true else {
                 throw SwanError.unauthorized("writer is not authorized to write to this space")
             }
-        case .managingApp:
+        case .managed:
             guard managingAppWriteDecisions[space, default: []].contains(writer) else {
                 throw SwanError.unauthorized("managing app denied write access")
             }

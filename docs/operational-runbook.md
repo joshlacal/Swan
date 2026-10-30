@@ -195,7 +195,7 @@ python3 Scripts/service-snapshot.py snapshot \
   --destination /var/backups/swan/full-service-20261023 \
   --integrity-key-file /etc/swan/secrets/service-snapshot-integrity-key \
   --build-id "REPLACE_WITH_SAVED_EXECUTABLE_SHA256" \
-  --profile-id permissioned-data-0016-2026-10-22
+  --profile-id permissioned-data-0016-2026-10-29
 ```
 
 3. Rehearse restoration into a new directory using the same integrity key:

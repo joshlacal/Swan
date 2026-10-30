@@ -23,8 +23,8 @@ final class SwanCoreTests: XCTestCase {
 
     func testBootstrapWireRegistryCoversEveryPinnedOperation() {
         let methods = PermissionedData0016.methods
-        XCTAssertEqual(PermissionedData0016.profileID, "permissioned-data-0016-2026-10-22")
-        XCTAssertEqual(methods.count, 28)
+        XCTAssertEqual(PermissionedData0016.profileID, "permissioned-data-0016-2026-10-29")
+        XCTAssertEqual(methods.count, 33)
         XCTAssertEqual(Set(methods.map(\.nsid)).count, methods.count)
         // October 22 (reference ac0c9f15, atproto#5705): getRepo serves a STAR
         // archive as application/octet-stream instead of a CAR, and the
@@ -41,7 +41,7 @@ final class SwanCoreTests: XCTestCase {
             XCTAssertTrue(methods.contains { $0.nsid == nsid && $0.declaredErrors.first == "BadSpaceMac" }, nsid)
         }
         XCTAssertTrue(methods.contains { $0.nsid == "com.atproto.space.getSpaceCredential" })
-        XCTAssertTrue(methods.contains { $0.nsid == "com.atproto.simplespace.updateSpace" })
+        XCTAssertTrue(methods.contains { $0.nsid == "com.atproto.space.updateSpace" })
         XCTAssertTrue(methods.contains {
             $0.nsid == "com.atproto.space.notifyCredentialRevoked" && $0.kind == .procedure
                 && $0.outputEncoding == nil && $0.declaredErrors.isEmpty

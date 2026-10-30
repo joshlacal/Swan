@@ -19,7 +19,7 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
     private static let otherAuthority = "did:plc:bcdefghijklmnopqrstuvwxy"
     private static let privateMember = "did:plc:cdefghijklmnopqrstuvwxyz"
     private static let publicURL = URL(string: "https://swan.example")!
-    private static let path = "/xrpc/com.atproto.simplespace.getSpace"
+    private static let path = "/xrpc/com.atproto.space.getSpace"
 
     func testAuthenticatedAuthorityGetsOnlyGeneratedSpaceDescriptionUsingConfiguredDPoPTarget() async throws {
         let fixture = try await makeFixture()
@@ -52,17 +52,13 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.headers[.cacheControl], "no-store")
                     XCTAssertEqual(response.headers[.contentType], "application/json")
                     let object = try self.jsonObject(response.body)
-                    XCTAssertEqual(Set(object.keys), ["uri", "readPolicy", "writePolicy", "appAccess"])
+                    XCTAssertEqual(Set(object.keys), ["uri", "policy"])
                     XCTAssertEqual(object["uri"] as? String, fixture.space.rawValue)
-                    let readPolicy = try XCTUnwrap(object["readPolicy"] as? [String: Any])
-                    XCTAssertEqual(readPolicy["$type"] as? String, "com.atproto.simplespace.defs#memberListPolicy")
-                    XCTAssertEqual(Set(readPolicy.keys), ["$type"])
-                    let writePolicy = try XCTUnwrap(object["writePolicy"] as? [String: Any])
-                    XCTAssertEqual(writePolicy["$type"] as? String, "com.atproto.simplespace.defs#memberListPolicy")
-                    XCTAssertEqual(Set(writePolicy.keys), ["$type"])
-                    let appAccess = try XCTUnwrap(object["appAccess"] as? [String: Any])
-                    XCTAssertEqual(appAccess["$type"] as? String, "com.atproto.simplespace.defs#allowList")
-                    XCTAssertEqual(appAccess["allowed"] as? [String], ["https://reader.example", "https://writer.example"])
+                    let policy = try XCTUnwrap(object["policy"] as? [String: Any])
+                    XCTAssertEqual(policy["$type"] as? String, "com.atproto.memberspace.policy")
+                    XCTAssertEqual(policy["publicRead"] as? Bool, false)
+                    XCTAssertEqual(policy["publicWrite"] as? Bool, false)
+                    XCTAssertEqual(policy["allowedApps"] as? [String], ["https://reader.example", "https://writer.example"])
 
                     let rendered = String(decoding: response.body.readableBytesView, as: UTF8.self)
                     XCTAssertFalse(rendered.contains(Self.privateMember))
@@ -160,7 +156,7 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(try self.errorCode(response.body), "Unauthorized")
                 }
                 try await client.execute(uri: uri, method: .get, headers: wrongAuthority) { response in
-                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(response.status, .badRequest)
                     self.assertNoStore(response)
                     XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
                 }
@@ -194,7 +190,7 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
                     method: .get,
                     headers: missingHeaders
                 ) { response in
-                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(response.status, .badRequest)
                     self.assertNoStore(response)
                     XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
                 }
@@ -230,7 +226,7 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
                     method: .get,
                     headers: deletedHeaders
                 ) { response in
-                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(response.status, .badRequest)
                     self.assertNoStore(response)
                     XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
                 }
@@ -292,7 +288,7 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
             }
 
             let profile = try ProtocolProfile.load(
-                from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-01.json")
+                from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-29.json")
             )
             let closedServer = SwanHTTPServer(
                 profile: profile,
@@ -427,7 +423,7 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
         directory: (any AuthorizedSimpleSpaceDirectory)? = nil
     ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
-            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-01.json")
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-29.json")
         )
         return SwanHTTPServer(
             profile: profile,

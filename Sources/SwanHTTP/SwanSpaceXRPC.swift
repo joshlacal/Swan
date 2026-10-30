@@ -9,14 +9,12 @@ import SwanOAuth
 import SwanSpaces
 import SwanStorage
 
-/// The internal capability required to expose the authenticated space
-/// description endpoint (`com.atproto.simplespace.getSpace`, the live
-/// lexicon's successor to the removed `com.atproto.space.getSpace`). A
-/// ``SwanHTTPServer`` creates it itself from its canonical public URL and
-/// OAuth runtime, so an authorizer for a different htu or token runtime can
-/// never be accidentally attached to this route. A present credential
-/// verifier additionally serves members hosted elsewhere, whose OAuth tokens
-/// are audience-bound to their own PDS.
+/// The internal capability required to expose `com.atproto.space.getSpace`
+/// (October 29: `{ uri, policy }`, the space owner's OAuth with `read_self`
+/// only). A ``SwanHTTPServer`` creates it itself from its canonical public URL
+/// and OAuth runtime, so an authorizer for a different htu or token runtime
+/// can never be accidentally attached to this route. `credentialAuthorizer`
+/// is retained for source compatibility; a space credential is refused.
 public struct SwanAuthenticatedGetSpaceCapability: Sendable {
     let authorizer: SwanOAuthResourceAuthorizer
     let directory: any AuthorizedSimpleSpaceDirectory
@@ -37,103 +35,49 @@ private enum AuthenticatedGetSpaceFailure: Error {
     case invalidRequest
     case spaceNotFound
     case denied
-    case credentialPresentation(SpaceCredentialPresentationFailure)
     case nonceChallenge
     case unavailable
 }
 
-/// The handler conforms to the checked-in lexicon server contract. The HTTP
-/// adapter owns the strict query parse and response/error mapping; the
-/// contract handler owns the typed authorization and output translation.
-private struct AuthenticatedGetSpaceHandler: ComAtprotoSimplespaceGetSpace.ServerHandler {
-    typealias Context = Request
+/// `com.atproto.space.getSpace` output.
+struct AuthenticatedGetSpaceOutput: Encodable {
+    let uri: String
+    let policy: SpacePolicy
+}
 
+private struct AuthenticatedGetSpaceHandler {
     let capability: SwanAuthenticatedGetSpaceCapability
 
-    func handle(
-        parameters: ComAtprotoSimplespaceGetSpace.Parameters,
-        input: Void,
-        context request: Request
-    ) async throws -> ComAtprotoSimplespaceGetSpace.Output {
-        let space: SpaceURI
-        do {
-            // Parse both representations deliberately. `SpaceRef` is the
-            // generated XRPC input type, while the domain type enforces
-            // Swan's exact three-part permissioned-space URI shape.
-            space = try SpaceURI(parameters.space.uriString())
-        } catch {
-            throw AuthenticatedGetSpaceFailure.invalidRequest
-        }
-
-        // The live reference serves this to either the space authority's own
-        // OAuth session or a space credential (a member hosted elsewhere
-        // cannot present OAuth here — its token is audience-bound to its own
-        // PDS). The authorization scheme selects the verifier: an
-        // `Atproto-Space` credential is bound by its HTTP message signature,
-        // an OAuth token by DPoP.
-        let bearerToken: String?
-        do {
-            bearerToken = try spaceCredentialSchemeToken(from: request.headers)
-        } catch let failure as SpaceCredentialPresentationFailure {
-            throw AuthenticatedGetSpaceFailure.credentialPresentation(failure)
-        } catch {
+    func handle(space: SpaceURI, request: Request) async throws -> AuthenticatedGetSpaceOutput {
+        // October 29: a space credential no longer reads the configuration.
+        // Members and syncers read a published `com.atproto.space.policy`
+        // record instead.
+        if (try? spaceCredentialSchemeToken(from: request.headers)) != nil {
             throw AuthenticatedGetSpaceFailure.denied
         }
         let authorization: AuthorizationContext
-        if let token = bearerToken {
-            guard let credentialAuthorizer = capability.credentialAuthorizer else {
-                throw AuthenticatedGetSpaceFailure.denied
+        do {
+            authorization = try await capability.authorizer.authorizeSpaceRoute(
+                request: request,
+                method: "GET",
+                fixedPath: "/xrpc/com.atproto.space.getSpace"
+            )
+        } catch let failure as SwanResourceAuthorizationFailure {
+            throw switch failure {
+            case .nonceChallengeRequired: AuthenticatedGetSpaceFailure.nonceChallenge
+            case .denied: AuthenticatedGetSpaceFailure.denied
+            case .unavailable: AuthenticatedGetSpaceFailure.unavailable
             }
-            do {
-                // A space-host operation: the audience is the authority's
-                // bare DID.
-                authorization = try await capability.authorizer.authorizeSpaceCredential(
-                    token,
-                    verifier: credentialAuthorizer,
-                    request: request,
-                    expectedSpace: space,
-                    expectedAudience: space.authority,
-                    now: Date()
-                )
-            } catch let failure as SpaceCredentialPresentationFailure {
-                throw AuthenticatedGetSpaceFailure.credentialPresentation(failure)
-            } catch let error as SwanError {
-                if case .unavailable = error {
-                    throw AuthenticatedGetSpaceFailure.unavailable
-                }
-                throw AuthenticatedGetSpaceFailure.denied
-            } catch {
-                throw AuthenticatedGetSpaceFailure.denied
-            }
-            guard case let .spaceCredential(grant) = authorization,
-                  grant.space == space else {
-                throw AuthenticatedGetSpaceFailure.denied
-            }
-        } else {
-            do {
-                authorization = try await capability.authorizer.authorizeSpaceRoute(
-                    request: request,
-                    method: "GET",
-                    fixedPath: "/xrpc/com.atproto.simplespace.getSpace"
-                )
-            } catch let failure as SwanResourceAuthorizationFailure {
-                throw switch failure {
-                case .nonceChallengeRequired: AuthenticatedGetSpaceFailure.nonceChallenge
-                case .denied: AuthenticatedGetSpaceFailure.denied
-                case .unavailable: AuthenticatedGetSpaceFailure.unavailable
-                }
-            } catch {
-                throw AuthenticatedGetSpaceFailure.unavailable
-            }
-            guard case let .accountOAuth(subject, _) = authorization else {
-                throw AuthenticatedGetSpaceFailure.denied
-            }
-            // A valid account token for another authority must not prove
-            // whether this space exists. The wire endpoint uses its declared
-            // not-found result for that deliberately opaque owner mismatch.
-            guard subject == space.authority else {
-                throw AuthenticatedGetSpaceFailure.spaceNotFound
-            }
+        } catch {
+            throw AuthenticatedGetSpaceFailure.unavailable
+        }
+        guard case let .accountOAuth(subject, _) = authorization else {
+            throw AuthenticatedGetSpaceFailure.denied
+        }
+        // A valid account token for another authority must not prove
+        // whether this space exists.
+        guard subject == space.authority else {
+            throw AuthenticatedGetSpaceFailure.spaceNotFound
         }
 
         let description: AuthenticatedSimpleSpaceDescription?
@@ -144,8 +88,6 @@ private struct AuthenticatedGetSpaceHandler: ComAtprotoSimplespaceGetSpace.Serve
             )
         } catch let error as SwanError {
             if case .unauthorized = error {
-                // This is a directory/authority policy failure, distinct
-                // from a nonexistent resource. Do not render details.
                 throw AuthenticatedGetSpaceFailure.denied
             }
             throw AuthenticatedGetSpaceFailure.unavailable
@@ -155,61 +97,14 @@ private struct AuthenticatedGetSpaceHandler: ComAtprotoSimplespaceGetSpace.Serve
         guard let description else {
             throw AuthenticatedGetSpaceFailure.spaceNotFound
         }
-        // This is redundant for SwanSQLite but mandatory at this module
-        // boundary: the protocol deliberately permits alternative storage
-        // adapters. Never serialize a description for a different authority
-        // or space key just because an adapter returned one.
+        // Mandatory at this module boundary: never serialize a description
+        // for a different space just because an adapter returned one.
         guard description.space == space else {
             throw AuthenticatedGetSpaceFailure.unavailable
         }
-
-        do {
-            return try output(for: description)
-        } catch {
-            // A startup-preopened directory is expected to validate its
-            // durable state. Treat an impossible projection failure as an
-            // availability failure, never as a partly-rendered response.
-            throw AuthenticatedGetSpaceFailure.unavailable
-        }
-    }
-
-    private func output(
-        for description: AuthenticatedSimpleSpaceDescription
-    ) throws -> ComAtprotoSimplespaceGetSpace.Output {
-        let readPolicy: ComAtprotoSimplespaceGetSpace.OutputReadPolicyUnion
-        switch description.configuration.readPolicy {
-        case .public:
-            readPolicy = .comAtprotoSimplespaceDefsPublicPolicy(.init())
-        case .memberList:
-            readPolicy = .comAtprotoSimplespaceDefsMemberListPolicy(.init())
-        case .managingApp:
-            readPolicy = .comAtprotoSimplespaceDefsManagingAppPolicy(
-                .init(managingApp: description.configuration.readManagingApp ?? "")
-            )
-        }
-        let writePolicy: ComAtprotoSimplespaceGetSpace.OutputWritePolicyUnion
-        switch description.configuration.writePolicy {
-        case .public:
-            writePolicy = .comAtprotoSimplespaceDefsPublicPolicy(.init())
-        case .memberList:
-            writePolicy = .comAtprotoSimplespaceDefsMemberListPolicy(.init())
-        case .managingApp:
-            writePolicy = .comAtprotoSimplespaceDefsManagingAppPolicy(
-                .init(managingApp: description.configuration.writeManagingApp ?? "")
-            )
-        }
-        let appAccess: ComAtprotoSimplespaceGetSpace.OutputAppAccessUnion
-        switch description.configuration.appAccess {
-        case .open:
-            appAccess = .comAtprotoSimplespaceDefsOpen(.init())
-        case let .allowList(allowed):
-            appAccess = .comAtprotoSimplespaceDefsAllowList(.init(allowed: allowed.sorted()))
-        }
-        return ComAtprotoSimplespaceGetSpace.Output(
-            uri: try SpaceRef(uriString: description.space.rawValue),
-            readPolicy: readPolicy,
-            writePolicy: writePolicy,
-            appAccess: appAccess
+        return AuthenticatedGetSpaceOutput(
+            uri: description.space.rawValue,
+            policy: description.configuration.policy
         )
     }
 }
@@ -219,17 +114,17 @@ func registerAuthenticatedGetSpaceEndpoint(
     capability: SwanAuthenticatedGetSpaceCapability
 ) {
     let handler = AuthenticatedGetSpaceHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.simplespace.getSpace"
+    let path: RouterPath = "/xrpc/com.atproto.space.getSpace"
     router.get(path) { request, _ async -> Response in
-        let parameters: ComAtprotoSimplespaceGetSpace.Parameters
+        let space: SpaceURI
         do {
-            parameters = try parseAuthenticatedGetSpaceParameters(request)
+            space = try parseAuthenticatedGetSpaceParameters(request)
         } catch {
             return authenticatedGetSpaceError(.badRequest, code: "InvalidRequest")
         }
 
         do {
-            let output = try await handler.handle(parameters: parameters, input: (), context: request)
+            let output = try await handler.handle(space: space, request: request)
             return authenticatedGetSpaceJSON(.ok, output)
         } catch let failure as AuthenticatedGetSpaceFailure {
             return authenticatedGetSpaceResponse(for: failure, capability: capability)
@@ -237,7 +132,6 @@ func registerAuthenticatedGetSpaceEndpoint(
             return authenticatedGetSpaceError(.serviceUnavailable, code: "temporarily_unavailable")
         }
     }
-
     // Once this opt-in endpoint is live, keep every non-GET invocation in
     // the same explicit, no-store XRPC closure. This is deliberately scoped
     // to this route; all other profile methods retain their generic gates.
@@ -256,11 +150,9 @@ private func authenticatedGetSpaceResponse(
     case .invalidRequest:
         authenticatedGetSpaceError(.badRequest, code: "InvalidRequest")
     case .spaceNotFound:
-        authenticatedGetSpaceError(.notFound, code: "SpaceNotFound")
+        authenticatedGetSpaceError(.badRequest, code: "SpaceNotFound")
     case .denied:
         authenticatedGetSpaceError(.unauthorized, code: "Unauthorized")
-    case let .credentialPresentation(failure):
-        authenticatedGetSpaceError(failure.httpStatus, code: failure.xrpcErrorCode)
     case .nonceChallenge:
         authenticatedGetSpaceNonceChallenge(authorizer: capability.authorizer)
     case .unavailable:
@@ -270,7 +162,7 @@ private func authenticatedGetSpaceResponse(
 
 private func parseAuthenticatedGetSpaceParameters(
     _ request: Request
-) throws -> ComAtprotoSimplespaceGetSpace.Parameters {
+) throws -> SpaceURI {
     // `URI.query` intentionally strips a fragment, so retain the original
     // request target as a separate guard. A fragment must never alter the
     // identifier used for authorization or directory lookup.
@@ -288,14 +180,12 @@ private func parseAuthenticatedGetSpaceParameters(
         throw AuthenticatedGetSpaceFailure.invalidRequest
     }
     let rawSpace = try strictQueryDecode(encodedValue)
-    let uri: SpaceRef
     do {
-        uri = try SpaceRef(uriString: rawSpace)
-        _ = try SpaceURI(uri.uriString())
+        let uri = try SpaceRef(uriString: rawSpace)
+        return try SpaceURI(uri.uriString())
     } catch {
         throw AuthenticatedGetSpaceFailure.invalidRequest
     }
-    return .init(space: uri)
 }
 
 func strictQueryDecode(_ encoded: Substring) throws -> String {
@@ -1117,8 +1007,16 @@ private func requireSelfWrite(_ authorization: AuthorizationContext, author: Str
     }
 }
 
+/// Every space write handler builds its record URI here, so this is where
+/// October 29 section 1e refuses a direct write to a published
+/// configuration collection (`com.atproto.space.policy`,
+/// `com.atproto.memberspace.member`) in any repo, with HTTP 400. Only the
+/// authority's PDS writes them, from the space's configuration.
 private func makeWriteURI(space: SpaceRef, repo: DID, collection: NSID, rkey: RecordKey) throws -> SpaceRecordURI {
-    try SpaceRecordURI(space: SpaceURI(space.uriString()), author: repo.didString(), collection: collection.nsidString(), rkey: rkey.value)
+    guard !SpacePolicy.publishedCollections.contains(collection.nsidString()) else {
+        throw AuthenticatedSpaceWriteFailure.invalidRequest
+    }
+    return try SpaceRecordURI(space: SpaceURI(space.uriString()), author: repo.didString(), collection: collection.nsidString(), rkey: rkey.value)
 }
 
 private func canonicalRecordValue(_ record: ATProtocolValueContainer) throws -> Data {

@@ -357,7 +357,9 @@ private func getSpaceCredentialResponse(
     case .invalidClientAttestation:
         getSpaceCredentialError(.badRequest, code: "InvalidClientAttestation")
     case .spaceNotFound:
-        getSpaceCredentialError(.notFound, code: "SpaceNotFound")
+        // October 29: an unauthorized user is answered SpaceNotFound with
+        // the reference's HTTP 400, like an absent space.
+        getSpaceCredentialError(.badRequest, code: "SpaceNotFound")
     case .spaceDeleted:
         getSpaceCredentialError(.badRequest, code: "SpaceDeleted")
     case .appNotAuthorized:

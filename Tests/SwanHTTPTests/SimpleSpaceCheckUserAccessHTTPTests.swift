@@ -42,7 +42,7 @@ final class SimpleSpaceCheckUserAccessHTTPTests: XCTestCase, @unchecked Sendable
         let expectation = await fixture.verifier.lastExpectation()
         XCTAssertEqual(callCount, 1)
         XCTAssertEqual(expectation?.audience, Self.audience)
-        XCTAssertEqual(expectation?.method, ComAtprotoSimplespaceCheckUserAccess.typeIdentifier)
+        XCTAssertEqual(expectation?.method, "com.atproto.managedspace.checkUserAccess")
         try await fixture.close()
     }
 
@@ -58,14 +58,14 @@ final class SimpleSpaceCheckUserAccessHTTPTests: XCTestCase, @unchecked Sendable
         let malformedSignature = String(valid.dropLast()) + "x"
         let encodedSpace = checkUserAccessEncode(fixture.space.rawValue)
         let invalidQueries = [
-            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace,
-            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user,
-            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&access=invalid",
-            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&access=write&clientId=foo",
-            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&access=read&user=" + Self.user,
-            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&access=read&unknown=x",
-            "/xrpc/com.atproto.simplespace.checkUserAccess?space=at%3A%2F%2Fbad&user=" + Self.user + "&access=read",
-            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=not-a-did&access=read",
+            "/xrpc/com.atproto.managedspace.checkUserAccess?space=" + encodedSpace,
+            "/xrpc/com.atproto.managedspace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user,
+            "/xrpc/com.atproto.managedspace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&access=invalid",
+            "/xrpc/com.atproto.managedspace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&access=write&clientId=foo",
+            "/xrpc/com.atproto.managedspace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&access=read&user=" + Self.user,
+            "/xrpc/com.atproto.managedspace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&access=read&unknown=x",
+            "/xrpc/com.atproto.managedspace.checkUserAccess?space=at%3A%2F%2Fbad&user=" + Self.user + "&access=read",
+            "/xrpc/com.atproto.managedspace.checkUserAccess?space=" + encodedSpace + "&user=not-a-did&access=read",
         ]
         try await app.test(.router) { client in
             for headers in [HTTPFields(), bearer(""), bearer("not a jwt"), bearer(wrongMethod), bearer(wrongAudience), bearer(expired), bearer(malformedSignature)] {
@@ -221,7 +221,7 @@ private struct CheckUserAccessFixture {
     }
 
     func token(
-        method: String = ComAtprotoSimplespaceCheckUserAccess.typeIdentifier,
+        method: String = "com.atproto.managedspace.checkUserAccess",
         audience: String = SimpleSpaceCheckUserAccessHTTPTests.audience,
         now: Date = Date(),
         lifetime: TimeInterval = SpaceServiceJWT.lifetime
@@ -243,11 +243,11 @@ private struct CheckUserAccessFixture {
 
 private func checkUserAccessProfile() throws -> ProtocolProfile {
     let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-    return try ProtocolProfile.load(from: root.appending(path: "Profiles/permissioned-data-0016-2026-07-03.json"))
+    return try ProtocolProfile.load(from: root.appending(path: "Profiles/permissioned-data-0016-2026-10-29.json"))
 }
 
 private func checkUserAccessURI(space: SpaceURI, user: String, access: String = "read", clientID: String? = nil) -> String {
-    var result = "/xrpc/com.atproto.simplespace.checkUserAccess?space=\(checkUserAccessEncode(space.rawValue))&user=\(checkUserAccessEncode(user))&access=\(checkUserAccessEncode(access))"
+    var result = "/xrpc/com.atproto.managedspace.checkUserAccess?space=\(checkUserAccessEncode(space.rawValue))&user=\(checkUserAccessEncode(user))&access=\(checkUserAccessEncode(access))"
     if let clientID { result += "&clientId=\(checkUserAccessEncode(clientID))" }
     return result
 }

@@ -23,7 +23,7 @@ final class PermissionedRemoteReplicaSTARRecoveryTests: XCTestCase {
             let first = try fixture.archive(keys: ["aa", "b"], revision: "222222222222a")
             let result = try await orchestrator.recover(
                 target: fixture.target, requestID: "native-star-initial", source: fixture.session(first),
-                profileID: "permissioned-data-0016-2026-10-22", expiresAt: 200
+                profileID: "permissioned-data-0016-2026-10-29", expiresAt: 200
             )
             XCTAssertEqual(result.recordCount, 2)
             XCTAssertEqual(result.uniqueBlockCount, 1, "shared CIDs retain one durable body")
@@ -32,7 +32,7 @@ final class PermissionedRemoteReplicaSTARRecoveryTests: XCTestCase {
             let replacement = try fixture.archive(keys: ["b"], revision: "222222222222b")
             let replaced = try await orchestrator.recover(
                 target: fixture.target, requestID: "native-star-replace", source: fixture.session(replacement),
-                profileID: "permissioned-data-0016-2026-10-22", expiresAt: 200
+                profileID: "permissioned-data-0016-2026-10-29", expiresAt: 200
             )
             XCTAssertEqual(replaced.recordCount, 1)
             XCTAssertGreaterThan(replaced.head.generation, result.head.generation)
@@ -59,7 +59,7 @@ final class PermissionedRemoteReplicaSTARRecoveryTests: XCTestCase {
             let first = try fixture.archive(keys: ["aa"], revision: "222222222222a")
             let original = try await orchestrator.recover(
                 target: fixture.target, requestID: "native-star-good", source: fixture.session(first),
-                profileID: "permissioned-data-0016-2026-10-22", expiresAt: 200
+                profileID: "permissioned-data-0016-2026-10-29", expiresAt: 200
             )
             let next = try fixture.archive(keys: ["b"], revision: "222222222222b")
             var corrupted = next.bytes
@@ -67,7 +67,7 @@ final class PermissionedRemoteReplicaSTARRecoveryTests: XCTestCase {
             do {
                 _ = try await orchestrator.recover(
                     target: fixture.target, requestID: "native-star-corrupt", source: fixture.session(next, bytes: corrupted),
-                    profileID: "permissioned-data-0016-2026-10-22", expiresAt: 200
+                    profileID: "permissioned-data-0016-2026-10-29", expiresAt: 200
                 )
                 XCTFail("corrupt archive must not publish")
             } catch { XCTAssertEqual(error as? SpaceSTARError, .digestMismatch) }
@@ -94,7 +94,7 @@ final class PermissionedRemoteReplicaSTARRecoveryTests: XCTestCase {
         do {
             _ = try await orchestrator.recover(
                 target: fixture.target, requestID: "native-star-bad-mac", source: fixture.session(archive, invalidMAC: true),
-                profileID: "permissioned-data-0016-2026-10-22", expiresAt: 200
+                profileID: "permissioned-data-0016-2026-10-29", expiresAt: 200
             )
             XCTFail("bad MAC accepted")
         } catch { XCTAssertEqual(error as? SpaceMAC.Failure, .mismatch) }

@@ -55,7 +55,7 @@ final class SwanDisposableNativeRecoveryTests: XCTestCase, @unchecked Sendable {
                 let result = try await PermissionedRemoteReplicaRecoveryOrchestrator(database: database,
                     publicationAuthorization: { try await $0() }).recover(target: target,
                     requestID: UUID().uuidString, provider: provider,
-                    profileID: "permissioned-data-0016-2026-10-22", expiresAt: Int64(Date().timeIntervalSince1970) + 120)
+                    profileID: "permissioned-data-0016-2026-10-29", expiresAt: Int64(Date().timeIntervalSince1970) + 120)
                 XCTAssertEqual(result.recordCount, receipt.records)
                 evidence.append(["direction": receipt.direction, "space": receipt.space,
                     "records": result.recordCount, "generation": result.head.generation,

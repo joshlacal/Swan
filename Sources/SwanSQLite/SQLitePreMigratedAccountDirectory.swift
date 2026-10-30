@@ -76,6 +76,15 @@ public actor SQLitePreMigratedAccountDirectory:
     /// gate, so the added edge closes no cycle; keep it that way.
     private var repositoryWriteGates: [String: RepositoryWriteGateEntry] = [:]
     private var permanentlyRevokedDIDs: Set<String> = []
+    /// Asks a managedspace's managing app about a user. The default refuses
+    /// every non-authority user; `serve` installs the outbound
+    /// `com.atproto.managedspace.checkUserAccess` client.
+    private var managedSpaceAccessChecker: any ManagedSpaceAccessChecking =
+        DenyingManagedSpaceAccessChecker()
+
+    public func setManagedSpaceAccessChecker(_ checker: any ManagedSpaceAccessChecking) {
+        managedSpaceAccessChecker = checker
+    }
     private var drainingDatabases: [String: SQLiteAccountDatabase] = [:]
     /// At most one in-flight public-read re-admission per DID. A foreign
     /// commit invalidates one account's generation pin for every concurrent
@@ -544,7 +553,7 @@ public actor SQLitePreMigratedAccountDirectory:
 
     public func updateSimpleSpace(
         _ space: SpaceURI,
-        patch: SimpleSpaceConfigurationPatch,
+        configuration: SimpleSpaceConfiguration,
         authorization: AuthorizationContext
     ) async throws {
         let authority = try await lifecycleAuthority(
@@ -553,7 +562,22 @@ public actor SQLitePreMigratedAccountDirectory:
         )
         _ = try await authority.update(
             space: space,
-            patch: patch,
+            configuration: configuration,
+            authorization: authorization
+        )
+        try await requireLifecycleAuthorityStillAvailable(space.authority)
+    }
+
+    public func removeSpaceWriter(
+        _ writer: String,
+        from space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws {
+        _ = try await lifecycleAuthority(for: space, authorization: authorization)
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        try await database.removeSpaceWriter(
+            space: space,
+            writer: writer,
             authorization: authorization
         )
         try await requireLifecycleAuthorityStillAvailable(space.authority)
@@ -661,12 +685,35 @@ public actor SQLitePreMigratedAccountDirectory:
     ) async throws {
         let database = try await preopenedCredentialAuthorityDatabase(for: space)
         do {
-            try await database.authorizeSimpleSpaceRead(
+            let decision = try await database.authorizeSimpleSpaceRead(
                 space: space,
                 user: user,
                 clientID: clientID,
                 authorization: authorization
             )
+            if case let .requiresManagingApp(managingApp) = decision, let user {
+                // The managing app is asked with no transaction open, and
+                // its answer is re-checked against the space's current app.
+                let checker = managedSpaceAccessChecker
+                guard await checker.checkUserAccess(
+                    space: space,
+                    user: user,
+                    access: .read,
+                    clientID: clientID,
+                    managingApp: managingApp
+                ) else {
+                    throw AuthorizedSimpleSpaceLifecycleError.notFound
+                }
+                guard try await database.authorizeSimpleSpaceRead(
+                    space: space,
+                    user: user,
+                    clientID: clientID,
+                    authorization: authorization,
+                    managedApproval: managingApp
+                ) == .authorized else {
+                    throw AuthorizedSimpleSpaceLifecycleError.notFound
+                }
+            }
             try await requireCredentialAuthorityStillAvailable(space.authority)
         } catch let error as SwanError {
             throw error
@@ -866,8 +913,25 @@ public actor SQLitePreMigratedAccountDirectory:
         ) else {
             throw AuthorizedSimpleSpaceLifecycleError.notFound
         }
+        var managedWriteApproval: String?
+        if notification.space.authority != notification.repository,
+           case let .managed(managed)? = try? await database.activeSimpleSpacePolicy(notification.space) {
+            let checker = managedSpaceAccessChecker
+            if await checker.checkUserAccess(
+                space: notification.space,
+                user: notification.repository,
+                access: .write,
+                clientID: nil,
+                managingApp: managed.managingApp
+            ) {
+                managedWriteApproval = managed.managingApp
+            }
+        }
         do {
-            try await database.receiveSpaceWriteNotification(notification)
+            try await database.receiveSpaceWriteNotification(
+                notification,
+                managedWriteApproval: managedWriteApproval
+            )
             guard try await isActiveAccount(notification.space.authority), !isClosed else {
                 throw SwanError.unavailable("authenticated space directory is unavailable")
             }

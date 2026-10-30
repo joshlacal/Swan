@@ -1955,7 +1955,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Run Swan's Hummingbird server")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-10-22.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-10-29.json"
 
         @Option(name: .long, help: "Local authority DID for committed Labyrinth conversation membership policy")
         var conversationSpaceAuthority: String?
@@ -2327,7 +2327,7 @@ extension SwanCommand {
 
         @Option(
             name: .customLong("managing-service-audience"),
-            help: "Explicit service-JWT audience for com.atproto.simplespace.checkUserAccess"
+            help: "Explicit service-JWT audience for com.atproto.managedspace.checkUserAccess"
         )
         var managingServiceAudience: String?
 
@@ -4096,6 +4096,23 @@ extension SwanCommand {
                         spacesOpenInterop: enableSpacesOpenInterop ? .standard : nil,
                         openFederation: openFederationResolver
                     )
+                    // October 29 managedspace: ask the managing app through
+                    // com.atproto.managedspace.checkUserAccess, signed as the
+                    // space authority. Without a resolver or a local signer
+                    // the directory keeps its default, which refuses every
+                    // non-authority user of a managedspace.
+                    if let notifyServiceResolver, let localSpaceRuntime {
+                        let policy = try OAuthRemoteFetchPolicy(maximumBodyBytes: 4_096, timeout: 5)
+                        await directory.setManagedSpaceAccessChecker(RemoteManagedSpaceAccessChecker(
+                            resolver: notifyServiceResolver,
+                            signer: localSpaceRuntime.notificationServiceIssuer,
+                            policy: policy,
+                            transport: NIOPeerPinnedOAuthPostTransport(configuration: try .init(
+                                endpointPeers: [:],
+                                allowsDynamicPeerSelection: true
+                            ))
+                        ))
+                    }
                 } catch {
                     throw ValidationError("permissioned runtime key composition is invalid")
                 }
@@ -5295,7 +5312,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Verify a pinned Swan artifact")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-10-22.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-10-29.json"
 
         @Option(name: .long, help: "Swan package root containing generated wire sources")
         var sourceRoot: String?
@@ -5341,9 +5358,57 @@ extension SwanCommand {
             subcommands: [
                 InstallLocal.self, PreparePLC.self, ActivatePLC.self, RotatePLC.self, Show.self,
                 RecoveryCommitKey.self, KEMMethod.self, Deactivate.self, Reactivate.self, DeclareExport.self,
-                Delete.self, AdoptRecreatedSpace.self,
+                Delete.self, AdoptRecreatedSpace.self, SpacePolicyReport.self,
             ]
         )
+
+        /// Read-only report of the October 29 space-policy migration (v29)
+        /// for one account database. Before the migration has run it predicts
+        /// each lossy conversion; afterwards it prints the recorded log. The
+        /// database is opened read-only and is never migrated by this command.
+        struct SpacePolicyReport: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "space-policy-report",
+                abstract: "Report lossy October 29 space-policy conversions (read-only)"
+            )
+
+            @Option(name: .long, help: "Required Swan data directory")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Authority account DID")
+            var did: String
+
+            func run() async throws {
+                let path = SQLiteLayout.accountDatabase(
+                    in: URL(fileURLWithPath: dataDirectory, isDirectory: true),
+                    did: did
+                ).path
+                let entries = try await SpacePolicyMigrationReport.scan(databasePath: path)
+                let rows: [[String: Any]] = entries.map { entry in
+                    var row: [String: Any] = [
+                        "space": entry.spaceURI,
+                        "owner": entry.owner,
+                        "oldReadPolicy": entry.oldReadPolicy,
+                        "oldWritePolicy": entry.oldWritePolicy,
+                        "oldAppAccess": entry.oldAppAccess,
+                        "oldAllowedClients": entry.oldAllowedClients,
+                        "droppedMemberCount": entry.droppedMemberCount,
+                        "newPolicyType": entry.newPolicyType,
+                        "reasons": entry.reasons,
+                        "recorded": entry.recorded,
+                    ]
+                    row["oldReadManagingApp"] = entry.oldReadManagingApp
+                    row["oldWriteManagingApp"] = entry.oldWriteManagingApp
+                    row["newManagingApp"] = entry.newManagingApp
+                    return row
+                }
+                let data = try JSONSerialization.data(
+                    withJSONObject: ["conversions": rows],
+                    options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+                )
+                print(String(decoding: data, as: UTF8.self))
+            }
+        }
 
         /// Emits only the public method for owner-controlled DID documents.
         /// Automatic publication remains confined to the leased PLC backfill.
@@ -8281,7 +8346,7 @@ extension SwanCommand {
 
             /// Creates a forum space on an authority and adds one member.
             /// Mirrors `lab live --provision-space`: it reuses
-            /// `LabLiveSupport.provisionSpace` (simplespace.createSpace +
+            /// `LabLiveSupport.provisionSpace` (space.createSpace +
             /// putMember) through the OAuth-authorized procedure helper.
             struct Provision: AsyncParsableCommand {
                 static let configuration = CommandConfiguration(
@@ -9839,18 +9904,15 @@ private enum LabLiveSupport {
 
         let createBody = try JSONSerialization.data(
             withJSONObject: [
-                "did": space.authority,
                 "spaceType": space.spaceType,
                 "skey": space.skey,
-                "readPolicy": ["$type": "com.atproto.simplespace.defs#memberListPolicy"],
-                "writePolicy": ["$type": "com.atproto.simplespace.defs#memberListPolicy"],
-                "appAccess": ["$type": "com.atproto.simplespace.defs#open"],
+                "policy": ["$type": "com.atproto.memberspace.policy"],
             ],
             options: [.sortedKeys]
         )
         let create = try await authorizedProcedure(
             host: authority,
-            nsid: "com.atproto.simplespace.createSpace",
+            nsid: "com.atproto.space.createSpace",
             body: createBody
         )
         guard (200 ... 299).contains(create.status) ||
@@ -9867,7 +9929,7 @@ private enum LabLiveSupport {
         )
         let put = try await authorizedProcedure(
             host: authority,
-            nsid: "com.atproto.simplespace.putMember",
+            nsid: "com.atproto.memberspace.putMember",
             body: putBody
         )
         guard (200 ... 299).contains(put.status) else {
