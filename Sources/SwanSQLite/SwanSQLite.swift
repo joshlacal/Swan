@@ -4443,7 +4443,27 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
+    /// Since SQLite 3.26 a table rename rewrites the `REFERENCES` clause of
+    /// every other table that names it, even with `foreign_keys = OFF`. An
+    /// existing child outside this rebuild (the pre-v21 writer registry, the
+    /// pre-v22 notification registrations) would then point at the `_schema_v2`
+    /// copy this migration drops, and the migration's `foreign_key_check`
+    /// fails on its first row. `legacy_alter_table` keeps those clauses naming the
+    /// canonical table, which the migration recreates under the same name.
+    /// Unlike `foreign_keys`, this flag takes effect inside a transaction; it
+    /// is connection-local, so it is restored before any other statement.
     private func renameSimpleSpaceAuthorityTablesForMigration() async throws {
+        _ = try await connection.query("PRAGMA legacy_alter_table = ON")
+        do {
+            try await renameSimpleSpaceAuthorityTables()
+        } catch {
+            _ = try? await connection.query("PRAGMA legacy_alter_table = OFF")
+            throw error
+        }
+        _ = try await connection.query("PRAGMA legacy_alter_table = OFF")
+    }
+
+    private func renameSimpleSpaceAuthorityTables() async throws {
         _ = try await connection.query(
             "ALTER TABLE permissioned_simple_space_authorities RENAME TO permissioned_simple_space_authorities_schema_v2"
         )
