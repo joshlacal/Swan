@@ -1,4 +1,15 @@
 FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS account-web-build
+# Use the refreshed system store for npm downloads; Node otherwise uses its
+# bundled roots even after update-ca-certificates removes a system root.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates \
+    && sed -i \
+        -e 's@^mozilla/emSign_ECC_Root_CA_-_G3\.crt$@!mozilla/emSign_ECC_Root_CA_-_G3.crt@' \
+        -e 's@^mozilla/Comodo_AAA_Services_root\.crt$@!mozilla/Comodo_AAA_Services_root.crt@' \
+        /etc/ca-certificates.conf \
+    && update-ca-certificates --fresh \
+    && rm -rf /var/lib/apt/lists/*
+ENV NODE_OPTIONS=--use-openssl-ca
 WORKDIR /workspace/Swan/web
 COPY Swan/web/package.json Swan/web/package-lock.json ./
 RUN npm ci --ignore-scripts
@@ -13,6 +24,11 @@ RUN apt-get update \
         libsodium-dev pkg-config \
         libsecret-1-dev \
         libglib2.0-dev \
+    && sed -i \
+        -e 's@^mozilla/emSign_ECC_Root_CA_-_G3\.crt$@!mozilla/emSign_ECC_Root_CA_-_G3.crt@' \
+        -e 's@^mozilla/Comodo_AAA_Services_root\.crt$@!mozilla/Comodo_AAA_Services_root.crt@' \
+        /etc/ca-certificates.conf \
+    && update-ca-certificates --fresh \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace
 COPY Swan /workspace/Swan
@@ -22,6 +38,11 @@ RUN swift build -c release --product swan
 FROM swift:6.1-jammy@sha256:12be34a341945adb64914405ed7b568fcb2d35edbd63a3755007e47dce59456e AS runtime
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl libsodium23 libsecret-1-0 \
+    && sed -i \
+        -e 's@^mozilla/emSign_ECC_Root_CA_-_G3\.crt$@!mozilla/emSign_ECC_Root_CA_-_G3.crt@' \
+        -e 's@^mozilla/Comodo_AAA_Services_root\.crt$@!mozilla/Comodo_AAA_Services_root.crt@' \
+        /etc/ca-certificates.conf \
+    && update-ca-certificates --fresh \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --home-dir /var/lib/swan swan
 COPY --from=build /workspace/Swan/.build/release/swan /usr/local/bin/swan

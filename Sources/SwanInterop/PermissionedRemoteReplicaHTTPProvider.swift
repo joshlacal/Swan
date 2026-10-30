@@ -10,7 +10,7 @@ import SwanStorage
 /// Deterministic laboratory-only mutation applied after a bounded recovery
 /// response has been spooled and before the normal streaming verifier sees it.
 /// Production callers use the default `.none`; acceptance runs use
-/// `.corruptLastByte` to prove a bad CAR cannot replace the durable head.
+/// `.corruptLastByte` to prove a bad STAR archive cannot replace the durable head.
 public enum PermissionedRemoteReplicaSourceFault: Sendable, Equatable {
     case none
     case corruptLastByte
@@ -42,27 +42,10 @@ public enum PermissionedRemoteReplicaSourceFault: Sendable, Equatable {
     }
 }
 
-/// A live HTTP source for durable permissioned-replica recovery.  The
-/// provider performs two requests: first it fetches and checks the source's
-/// current signed commit, then it opens the CAR stream from the same
-/// configured origin and repository.  The orchestrator still performs the
-/// final CAR/context/content-binding checks before publication.
-///
-/// Scope of the first request.  It yields a *freshness* witness, not an
-/// independent authority.  The witness is fetched from the same configured
-/// origin that then serves the CAR, so it cannot corroborate that origin —
-/// an origin that lies about the CAR can serve a matching lie here.
-///
-/// Scope of the commit checks.  `verifyLatestCommit` authenticates the signed
-/// tuple (space, author, rev, ikm) plus knowledge of the IKM.  It does not
-/// authenticate the content commitment: the commitment is outside
-/// `SpaceCommitCodec.contextSigningBytes`, and the IKM travels in the clear
-/// in the same commit block, so a substituted commitment with a recomputed
-/// MAC passes both checks under the author's original signature.  Exact-
-/// content integrity is delegated to the pinned HTTPS source origin, bounded
-/// downstream by the equivocation / high-water checks in
-/// `SQLitePermissionedRemoteReplicaRecovery`.  See the F02 note in
-/// `SpaceCARCodec.verifyStreamingRecovery` and `docs/threat-boundaries.md`.
+/// A native October 22 HTTP source: independently MAC-authenticates a fresh
+/// head observation and STAR metadata using a new KEM exchange per request.
+/// Full record/digest validation and transactional publication happen in the
+/// recovery orchestrator; a metadata MAC alone is never a complete-repo proof.
 public struct PermissionedRemoteReplicaHTTPSourceProvider:
     PermissionedRemoteReplicaSourceProvider, Sendable
 {
@@ -108,92 +91,49 @@ public struct PermissionedRemoteReplicaHTTPSourceProvider:
     public func openPermissionedRemoteReplicaSource(
         target: PermissionedRemoteReplicaTarget
     ) async throws -> PermissionedRemoteReplicaSourceSession {
-        guard let verificationKey = host.permissionedCommitVerificationKey else {
-            throw InteropHTTPError.transportFailure
+        let query = ["repo": target.repositoryDID, "space": target.space.rawValue]
+        let latestPath = try host.client.xrpcPath("com.atproto.space.getLatestCommit", query: query)
+        let latest = try await PermissionedSpaceMACHTTP.query(
+            host: host, nsid: "com.atproto.space.getLatestCommit", query: query,
+            space: target.space, author: target.repositoryDID,
+            authorization: {
+                try await self.authorization(path: latestPath, provider: self.host.authorizationProvider, fallback: self.host.authorization)
+            },
+            commit: { try StrictJSON.decode(ComAtprotoSpaceGetLatestCommit.Output.self, from: $0).commit }
+        )
+        guard (200...299).contains(latest.response.status), let latestCommit = latest.commit else {
+            throw InteropHTTPError.unexpectedStatus(latest.response.status)
         }
-
-        let latestQuery = [
-            "repo": target.repositoryDID,
-            "space": target.space.rawValue,
-        ]
-        let latestPath = try host.client.xrpcPath(
-            "com.atproto.space.getLatestCommit",
-            query: latestQuery
+        let freshness = try PermissionedRemoteReplicaFreshnessWitness(
+            wireRevision: TID(tidString: latestCommit.rev), commitment: latestCommit.data
         )
-        let latestAuthorization = try await authorization(
-            path: latestPath,
-            provider: host.authorizationProvider,
-            fallback: host.authorization
-        )
-        let latest = try await host.client.query(
-            "com.atproto.space.getLatestCommit",
-            query: latestQuery,
-            authorization: latestAuthorization
-        )
-        guard (200 ... 299).contains(latest.status),
-              latest.header("content-type")?.lowercased().contains("json") == true else {
-            throw InteropHTTPError.unexpectedStatus(latest.status)
-        }
-        let output = try StrictJSON.decode(
-            ComAtprotoSpaceGetLatestCommit.Output.self,
-            from: latest.body
-        )
-        let commit = output.commit
-        let freshness = try verifyLatestCommit(
-            commit,
-            target: target,
-            verificationKey: verificationKey
-        )
-        let sourceIdentity = try PermissionedRemoteReplicaSourceIdentity(
-            origin: host.client.http.baseURL,
-            repositoryDID: target.repositoryDID,
-            verifierIdentity: verificationKey.recoveryVerifierIdentity
-        )
-        guard let lease = spoolAdmission.reserve(
-            accountDID: target.receiverDID,
-            maximumBytes: limits.maximumCARBytes
-        ) else {
+        guard let lease = spoolAdmission.reserve(accountDID: target.receiverDID, maximumBytes: limits.maximumCARBytes) else {
             throw InteropHTTPError.responseTooLarge
         }
-
-        let spoolURL = temporaryDirectory.appending(
-            path: "swan-permissioned-recovery-\(UUID().uuidString).car"
-        )
+        let spoolURL = temporaryDirectory.appending(path: "swan-permissioned-recovery-\(UUID().uuidString).star")
         do {
-            let carQuery = [
-                "repo": target.repositoryDID,
-                "space": target.space.rawValue,
-            ]
-            let carPath = try host.client.xrpcPath(
-                "com.atproto.space.getRepo",
-                query: carQuery
+            let path = try host.client.xrpcPath("com.atproto.space.getRepo", query: query)
+            let authenticated = try await PermissionedSpaceMACHTTP.streamSTAR(
+                host: host, query: query, space: target.space, author: target.repositoryDID,
+                destination: spoolURL, maximumBytes: limits.maximumCARBytes,
+                authorization: {
+                    try await self.authorization(path: path, provider: self.host.authorizationProvider, fallback: self.host.authorization)
+                }
             )
-            let carAuthorization = try await authorization(
-                path: carPath,
-                provider: host.authorizationProvider,
-                fallback: host.authorization
-            )
-            let response = try await host.client.stream(
-                "com.atproto.space.getRepo",
-                query: carQuery,
-                authorization: carAuthorization,
-                to: spoolURL,
-                maximumResponseBytes: limits.maximumCARBytes
-            )
-            guard (200 ... 299).contains(response.status),
-                  response.header("content-type")?.lowercased()
-                    .contains("application/vnd.ipld.car") == true else {
-                throw InteropHTTPError.unexpectedStatus(response.status)
+            guard (200...299).contains(authenticated.response.status), authenticated.commit != nil else {
+                throw InteropHTTPError.unexpectedStatus(authenticated.response.status)
             }
-            try fault.apply(to: spoolURL)
-            let source = try PermissionedRemoteReplicaFileSource(
-                fileURL: spoolURL
+            let identity = try PermissionedRemoteReplicaSourceIdentity(
+                origin: host.client.http.baseURL, repositoryDID: target.repositoryDID,
+                verifierIdentity: authenticated.request.verifierIdentity
             )
+            let mac = try SpaceMACHeaders.parseMAC(authenticated.response.header(SpaceMACHeaders.responseHeader), type: .repository)
+            try fault.apply(to: spoolURL)
+            let source = try PermissionedRemoteReplicaFileSource(fileURL: spoolURL)
             return try PermissionedRemoteReplicaSourceSession(
-                identity: sourceIdentity,
-                verificationKey: verificationKey,
-                freshnessWitness: freshness,
-                source: source,
+                identity: identity, authorKEMKey: authenticated.request.authorKEMKey,
+                sharedSecret: authenticated.request.sharedSecret, mac: mac,
+                freshnessWitness: freshness, source: source,
                 closeSource: {
                     await source.close()
                     try? FileManager.default.removeItem(at: spoolURL)
@@ -222,54 +162,12 @@ public struct PermissionedRemoteReplicaHTTPSourceProvider:
         return try await provider(.get, target, nil)
     }
 
-    private func verifyLatestCommit(
-        _ commit: ComAtprotoSpaceDefs.SignedCommit,
-        target: PermissionedRemoteReplicaTarget,
-        verificationKey: PermissionedDataJWTVerificationKey
-    ) throws -> PermissionedRemoteReplicaFreshnessWitness {
-        guard commit.ver == 1,
-              commit.hash.data.count == 32,
-              commit.ikm.data.count == 32,
-              commit.sig.data.count == 64,
-              commit.mac.data.count == 32 else {
-            throw InteropHTTPError.unexpectedStatus(502)
-        }
-        let context = try SpaceCommitContext(
-            space: target.space,
-            author: target.repositoryDID,
-            rev: commit.rev.toString(),
-            ikm: commit.ikm.data
-        )
-        let envelope = SpaceCommitEnvelope(
-            ver: commit.ver,
-            context: context,
-            contextSignature: commit.sig.data,
-            contentBinding: commit.mac.data,
-            commitment: commit.hash.data
-        )
-        let algorithm: String = switch verificationKey {
-        case .p256: "ES256"
-        case .secp256k1PublicKey: "ES256K"
-        }
-        guard try verificationKey.verify(
-            signature: envelope.contextSignature,
-            signingInput: try SpaceCommitCodec.contextSigningBytes(context),
-            algorithm: algorithm
-        ),
-        SpaceCommitCodec.verifyContentBinding(envelope) else {
-            throw InteropHTTPError.unexpectedStatus(502)
-        }
-        return try PermissionedRemoteReplicaFreshnessWitness(
-            wireRevision: commit.rev,
-            commitment: commit.hash.data
-        )
-    }
 }
 
-/// Owner-only, one-shot CAR source used by the HTTP provider.  Keeping the
+/// Owner-only, one-shot archive source used by the HTTP provider.  Keeping the
 /// descriptor behind an actor prevents a verifier and cleanup callback from
 /// racing a close or accidentally reading a second time.
-private actor PermissionedRemoteReplicaFileSource:
+actor PermissionedRemoteReplicaFileSource:
     SpaceCARRecoveryByteSource
 {
     private var handle: FileHandle?
@@ -284,7 +182,8 @@ private actor PermissionedRemoteReplicaFileSource:
             let handle else {
             throw InteropHTTPError.fileFailure
         }
-        return try handle.read(upToCount: maximumBytes)
+        let bytes = try handle.read(upToCount: maximumBytes)
+        return bytes?.isEmpty == true ? nil : bytes
     }
 
     func close() {

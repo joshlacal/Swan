@@ -286,6 +286,9 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
             "permissioned-data-0016-2026-07-03",
             "permissioned-data-0016-2026-07-30",
             "permissioned-data-0016-2026-08-15",
+            "permissioned-data-0016-2026-09-10",
+            "permissioned-data-0016-2026-09-19",
+            "permissioned-data-0016-2026-10-01",
         ] {
             XCTAssertNil(SwanPublicRouteSurface(profileID: name), name)
             let url = Self.packageRoot().appending(path: "Profiles/\(name).json")
@@ -392,7 +395,6 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
         // `swan serve` into an exit-64 startup refusal before any listener
         // bound. A `nil` default resolves with no filesystem access at all.
         XCTAssertNil(serve.publicProfile)
-        XCTAssertEqual(serve.profile, "Profiles/permissioned-data-0016-2026-08-15.json")
         XCTAssertEqual(
             try SwanCommand.Serve.resolvePublicRouteSurface(selector: serve.publicProfile),
             SwanPublicRouteSurface.default
@@ -410,7 +412,7 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
         )
         // `--profile` is untouched by the new option: two contract families,
         // two flags, neither able to select the other's surface.
-        XCTAssertEqual(overridden.profile, "Profiles/permissioned-data-0016-2026-08-15.json")
+        XCTAssertEqual(overridden.profile, serve.profile)
     }
 
     /// The deployment case the path-shaped default broke: a process whose
@@ -717,7 +719,7 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
             )
             let profile = try ProtocolProfile.load(
                 from: Self.packageRoot()
-                    .appending(path: "Profiles/permissioned-data-0016-2026-08-15.json")
+                    .appending(path: "Profiles/permissioned-data-0016-2026-10-01.json")
             )
             let configuration = surface.map {
                 SwanHTTPConfiguration(
@@ -788,7 +790,7 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
                 )
                 let profile = try ProtocolProfile.load(
                     from: Self.packageRoot()
-                        .appending(path: "Profiles/permissioned-data-0016-2026-08-15.json")
+                        .appending(path: "Profiles/permissioned-data-0016-2026-10-01.json")
                 )
                 let directory = SurfaceGateReadDirectory()
                 let server = SwanHTTPServer(

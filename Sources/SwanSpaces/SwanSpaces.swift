@@ -299,7 +299,9 @@ public enum SpaceAuthorizationPolicy {
                   let action = SpaceRecordAction(permission),
                   let target = SpaceScopeTarget.record(
                       space,
-                      action: action,
+                      // OAuth reaches only its own repository here, so either
+                      // read_self or read authorizes a repository read.
+                      action: action == .read ? .readSelf : action,
                       collection: uri?.collection
                   ),
                   permissions.allowsSpace(target)
@@ -330,15 +332,11 @@ public enum SpaceAuthorizationPolicy {
         }
     }
 
-    /// A single-blob read (Erratum 03). Every arm except `accountOAuth`
+    /// A single-blob read. Every arm except `accountOAuth`
     /// delegates to ``require(space:author:uri:authorization:permission:)``
     /// with `.read` — credentials, self-reads, service auth, and the refusals
-    /// are unchanged. The OAuth arm alone differs: it matches against
-    /// ``SpaceScopeTarget/blobRead(_:)`` (non-aggregate, collection-free)
-    /// instead of the derived aggregate target, so a collection-qualified
-    /// grant that reads its records can also fetch the blobs those records
-    /// reference. See the constructor's doc for why this is not a §6.5.5
-    /// bypass.
+    /// are unchanged. The OAuth arm requires the holder's own repository and
+    /// accepts read_self as well as read. Collections never constrain reads.
     public static func requireBlobRead(
         space: SpaceURI,
         author: String,
@@ -346,7 +344,8 @@ public enum SpaceAuthorizationPolicy {
     ) throws {
         if case let .accountOAuth(subject, permissions) = authorization {
             guard subject == author,
-                  permissions.allowsSpace(SpaceScopeTarget.blobRead(space))
+                  let target = SpaceScopeTarget.record(space, action: .readSelf, collection: nil),
+                  permissions.allowsSpace(target)
             else {
                 throw SwanError.unauthorized("OAuth scope does not cover this space operation")
             }
@@ -779,6 +778,10 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
     /// Exact index-plus-record suffix bytes. HTTP can combine this with its
     /// freshly created prefix before constructing response headers.
     public let bodyByteCount: Int
+    /// Byte count of the leading index block (its CAR frame prefix plus the
+    /// index map), when the producer recorded it. `getRepo?excludeValues=true`
+    /// streams only this block, so a spool without it cannot serve that form.
+    public let indexBlockByteCount: Int?
     private let adoptedHandle: FileHandle?
     private let bodyURL: URL?
     private let lease: SpaceCARSpoolLease?
@@ -797,9 +800,11 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
         indexCID: CID,
         bodyURL: URL,
         bodyByteCount: Int? = nil,
+        indexBlockByteCount: Int? = nil,
         lease: SpaceCARSpoolLease? = nil
     ) throws {
         self.indexCID = indexCID
+        self.indexBlockByteCount = indexBlockByteCount
         adoptedHandle = nil
         self.bodyURL = bodyURL
         self.lease = lease
@@ -807,7 +812,9 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
             forKeys: [.fileSizeKey]
         ).fileSize
         let resolvedByteCount = bodyByteCount ?? discovered ?? 0
-        guard resolvedByteCount >= 0 else {
+        guard resolvedByteCount >= 0,
+              indexBlockByteCount.map({ (0 ... resolvedByteCount).contains($0) }) ?? true
+        else {
             throw SpaceCARProductionLimits.limitExceeded()
         }
         self.bodyByteCount = resolvedByteCount
@@ -819,12 +826,16 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
         indexCID: CID,
         fileHandle: FileHandle,
         bodyByteCount: Int,
+        indexBlockByteCount: Int? = nil,
         lease: SpaceCARSpoolLease? = nil
     ) throws {
-        guard bodyByteCount >= 0 else {
+        guard bodyByteCount >= 0,
+              indexBlockByteCount.map({ (0 ... bodyByteCount).contains($0) }) ?? true
+        else {
             throw SpaceCARProductionLimits.limitExceeded()
         }
         self.indexCID = indexCID
+        self.indexBlockByteCount = indexBlockByteCount
         adoptedHandle = fileHandle
         bodyURL = nil
         self.lease = lease
@@ -845,8 +856,13 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
     /// expected to write each chunk directly to a streaming response body.
     /// This method owns cleanup even when the consumer throws or the request
     /// is cancelled.
+    ///
+    /// With `indexBlockOnly`, only the leading index block is streamed (the
+    /// `excludeValues` form of `getRepo`); the descriptor's total length is
+    /// still checked against ``bodyByteCount``.
     public func streamBody(
         maximumChunkBytes: Int = SpaceCARBodySpool.maximumChunkBytes,
+        indexBlockOnly: Bool = false,
         consume: (Data) async throws -> Void
     ) async throws {
         let admitted = cleanupLock.withLock {
@@ -862,6 +878,18 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
         guard (1 ... Self.maximumChunkBytes).contains(maximumChunkBytes) else {
             cleanup()
             throw SwanError.malformed("permissioned CAR chunk size is invalid")
+        }
+        let streamLimit: Int
+        if indexBlockOnly {
+            guard let indexBlockByteCount else {
+                cleanup()
+                throw SwanError.unavailable(
+                    "permissioned CAR spool is unavailable"
+                )
+            }
+            streamLimit = indexBlockByteCount
+        } else {
+            streamLimit = bodyByteCount
         }
         let handle: FileHandle
         if let adoptedHandle {
@@ -889,11 +917,11 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
 
         var streamedByteCount = 0
         var reusableChunk = Data(count: maximumChunkBytes)
-        while streamedByteCount < bodyByteCount {
+        while streamedByteCount < streamLimit {
             try Task.checkCancellation()
             let requestedByteCount = min(
                 maximumChunkBytes,
-                bodyByteCount - streamedByteCount
+                streamLimit - streamedByteCount
             )
             let chunkByteCount = try readPOSIXBytes(
                 fileDescriptor: handle.fileDescriptor,
@@ -908,7 +936,7 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
             }
             let (nextByteCount, overflow) =
                 streamedByteCount.addingReportingOverflow(chunkByteCount)
-            guard !overflow, nextByteCount <= bodyByteCount else {
+            guard !overflow, nextByteCount <= streamLimit else {
                 throw SwanError.unavailable(
                     "permissioned CAR spool is unavailable"
                 )
@@ -926,9 +954,21 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
         // The byte count is part of the authenticated producer handoff. Check
         // that the descriptor has neither truncated nor grown behind it.
         var endProbe = Data(count: 1)
+        if streamLimit < bodyByteCount {
+            guard bodyByteCount > 0, try readPOSIXBytes(
+                fileDescriptor: handle.fileDescriptor,
+                offset: bodyByteCount - 1,
+                maximumBytes: 1,
+                into: &endProbe
+            ) == 1 else {
+                throw SwanError.unavailable(
+                    "permissioned CAR spool is unavailable"
+                )
+            }
+        }
         guard try readPOSIXBytes(
             fileDescriptor: handle.fileDescriptor,
-            offset: streamedByteCount,
+            offset: bodyByteCount,
             maximumBytes: 1,
             into: &endProbe
         ) == 0 else {
@@ -1011,12 +1051,22 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
 /// exactly `[signedCommit, index]`; records are neither public-repository CAR
 /// data nor blobs and therefore cannot be passed to public export surfaces.
 public enum SpaceCARCodec {
+    /// The DRISL map and its record blocks share canonical DAG-CBOR key order:
+    /// shortest UTF-8 path first, then bytewise order for equally long paths.
+    public static func canonicalRecordPathPrecedes(_ left: String, _ right: String) -> Bool {
+        let leftBytes = left.utf8
+        let rightBytes = right.utf8
+        return leftBytes.count < rightBytes.count
+            || (leftBytes.count == rightBytes.count
+                && leftBytes.lexicographicallyPrecedes(rightBytes))
+    }
+
     public static func encode(commit: SpaceCommitEnvelope, records: [SpaceRecord]) throws -> SpaceCAR {
         let commitBlock = try encodeCommit(commit)
         let commitCID = CID.fromDAGCBOR(commitBlock)
 
         let orderedRecords = records.sorted { left, right in
-            recordPath(left).utf8.lexicographicallyPrecedes(recordPath(right).utf8)
+            canonicalRecordPathPrecedes(recordPath(left), recordPath(right))
         }
         guard Set(orderedRecords.map(recordPath)).count == orderedRecords.count else {
             throw SwanError.malformed("duplicate permissioned record path")
@@ -1037,15 +1087,10 @@ public enum SpaceCARCodec {
         output.append(headerBlock)
         appendBlock(cid: commitCID, data: commitBlock, to: &output)
         appendBlock(cid: indexCID, data: indexBlock, to: &output)
-        var emittedCIDs = Set<String>()
         for record in orderedRecords {
-            let cid = CID.fromDAGCBOR(record.value)
-            // DRISL retains every path, while CAR block storage is
-            // content-addressed. Proposal 0016 and the pinned TypeScript PDS
-            // therefore emit one block per unique CID, ordered by the first
-            // lexical path that references it.
-            guard emittedCIDs.insert(cid.string).inserted else { continue }
-            appendBlock(cid: cid, data: record.value, to: &output)
+            // Each index entry has a corresponding frame, including paths
+            // sharing a CID, as required by the reference streaming consumer.
+            appendBlock(cid: CID.fromDAGCBOR(record.value), data: record.value, to: &output)
         }
         return SpaceCAR(data: output, commitCID: commitCID, indexCID: indexCID)
     }
@@ -1083,8 +1128,8 @@ public enum SpaceCARCodec {
 
     /// Starts a canonical DAG-CBOR DRISL index map without retaining the map
     /// or its values in memory. Entries must follow Petrel's canonical
-    /// length-then-byte key order; record blocks themselves remain in the
-    /// proposal's lexicographic `collection/rkey` order.
+    /// length-then-byte key order; one record block follows for every entry
+    /// in that same order, including entries sharing a CID.
     public static func streamingIndexPrefix(recordCount: Int) throws -> Data {
         guard recordCount >= 0 else {
             throw SwanError.malformed("permissioned CAR record count is invalid")
@@ -1242,13 +1287,7 @@ public enum SpaceCARCodec {
             validatedIndex.append((path, cid))
         }
         let canonicalIndex = validatedIndex.sorted {
-            let left = Data($0.path.utf8)
-            let right = Data($1.path.utf8)
-            return left.count < right.count
-                || (
-                    left.count == right.count
-                        && left.lexicographicallyPrecedes(right)
-                )
+            canonicalRecordPathPrecedes($0.path, $1.path)
         }
         let canonicalIndexBlock = try DAGCBOR.encodeValue(
             OrderedCBORMap(entries: canonicalIndex.map {
@@ -1264,29 +1303,22 @@ public enum SpaceCARCodec {
         let lexicalIndex = validatedIndex.sorted {
             $0.path.utf8.lexicographicallyPrecedes($1.path.utf8)
         }
-        var orderedUniqueCIDs: [CID] = []
-        var seenRecordCIDs = Set<String>()
-        for entry in lexicalIndex
-        where seenRecordCIDs.insert(entry.cid.string).inserted {
-            orderedUniqueCIDs.append(entry.cid)
-        }
-        guard frames.count == orderedUniqueCIDs.count + 2 else {
-            throw SwanError.malformed("permissioned CAR has unindexed blocks")
+        guard frames.count == canonicalIndex.count + 2 else {
+            throw SwanError.malformed("permissioned CAR has missing or unindexed blocks")
         }
         var recordBlocks: [String: Data] = [:]
-        recordBlocks.reserveCapacity(orderedUniqueCIDs.count)
-        for (offset, expectedCID) in orderedUniqueCIDs.enumerated() {
+        recordBlocks.reserveCapacity(canonicalIndex.count)
+        for (offset, entry) in canonicalIndex.enumerated() {
             let frame = frames[offset + 2]
-            guard frame.cid == expectedCID,
-                  recordBlocks.updateValue(
-                      frame.body,
-                      forKey: frame.cid.string
-                  ) == nil
-            else {
+            guard frame.cid == entry.cid else {
                 throw SwanError.malformed(
                     "permissioned CAR record block order is invalid"
                 )
             }
+            if let existing = recordBlocks[frame.cid.string], existing != frame.body {
+                throw SwanError.malformed("permissioned CAR shared record block is inconsistent")
+            }
+            recordBlocks[frame.cid.string] = frame.body
         }
 
         var setHash = LtHash()
@@ -1743,20 +1775,55 @@ public enum SimpleSpaceCredentialPolicyError: Error, Sendable, Equatable {
 /// The pinned `com.atproto.simplespace` policy surface. A policy decision is
 /// made only by the authority; repo hosts merely verify the resulting read
 /// credential and never infer membership from a record request.
+public enum SimpleSpaceAccessKind: String, Sendable, Codable {
+    case read
+    case write
+}
+
+public struct SimpleSpaceMember: Sendable, Equatable, Hashable, Codable {
+    public let did: String
+    public let read: Bool
+    public let write: Bool
+
+    public init(did: String, read: Bool, write: Bool) {
+        self.did = did
+        self.read = read
+        self.write = write
+    }
+}
+
+/// The pinned `com.atproto.simplespace` policy surface. A policy decision is
+/// made only by the authority; repo hosts merely verify the resulting read
+/// credential and never infer membership from a record request.
 public struct SimpleSpaceConfiguration: Sendable, Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
-        case policy
+        case readPolicy
+        case readManagingApp
+        case writePolicy
+        case writeManagingApp
         case appAccess
+        case policy
         case managingApp
     }
 
-    public let policy: SimpleSpacePolicy
+    public let readPolicy: SimpleSpacePolicy
+    public let readManagingApp: String?
+    public let writePolicy: SimpleSpacePolicy
+    public let writeManagingApp: String?
     public let appAccess: SimpleSpaceAppAccess
-    public let managingApp: String?
 
-    public init(policy: SimpleSpacePolicy = .memberList, appAccess: SimpleSpaceAppAccess = .open, managingApp: String? = nil) throws {
-        guard managingApp?.isEmpty != true else {
-            throw SwanError.malformed("managing app must not be empty")
+    public init(
+        readPolicy: SimpleSpacePolicy = .memberList,
+        readManagingApp: String? = nil,
+        writePolicy: SimpleSpacePolicy = .memberList,
+        writeManagingApp: String? = nil,
+        appAccess: SimpleSpaceAppAccess = .open
+    ) throws {
+        guard readManagingApp?.isEmpty != true else {
+            throw SwanError.malformed("read managing app must not be empty")
+        }
+        guard writeManagingApp?.isEmpty != true else {
+            throw SwanError.malformed("write managing app must not be empty")
         }
         if case let .allowList(clients) = appAccess,
            clients.count > SimpleSpaceLimits.maximumClientAllowListEntries {
@@ -1767,18 +1834,17 @@ public struct SimpleSpaceConfiguration: Sendable, Codable, Equatable {
                 try Self.validateAppIdentifier(client)
             }
         }
-        if let managingApp {
-            try Self.validateAppIdentifier(managingApp)
+        if let readManagingApp {
+            try Self.validateAppIdentifier(readManagingApp)
         }
-        // The pinned `updateSpace` handler patches each property independently:
-        // a policy-only update must preserve an omitted `managingApp`, even
-        // when the policy becomes non-managing. An empty wire update is first
-        // translated to nil by `SimpleSpaceConfigurationPatch`, so it remains
-        // a valid explicit clear. The policy evaluator consults this property
-        // only while policy is `managing-app`.
-        self.policy = policy
+        if let writeManagingApp {
+            try Self.validateAppIdentifier(writeManagingApp)
+        }
+        self.readPolicy = readPolicy
+        self.readManagingApp = readManagingApp
+        self.writePolicy = writePolicy
+        self.writeManagingApp = writeManagingApp
         self.appAccess = appAccess
-        self.managingApp = managingApp
     }
 
     /// Client identifiers are opaque app/service names in the wire protocol,
@@ -1799,11 +1865,40 @@ public struct SimpleSpaceConfiguration: Sendable, Codable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        try self.init(
-            policy: container.decode(SimpleSpacePolicy.self, forKey: .policy),
-            appAccess: container.decode(SimpleSpaceAppAccess.self, forKey: .appAccess),
-            managingApp: container.decodeIfPresent(String.self, forKey: .managingApp)
-        )
+        if container.contains(.readPolicy) {
+            let readPolicy = try container.decode(SimpleSpacePolicy.self, forKey: .readPolicy)
+            let readManagingApp = try container.decodeIfPresent(String.self, forKey: .readManagingApp)
+            let writePolicy = try container.decode(SimpleSpacePolicy.self, forKey: .writePolicy)
+            let writeManagingApp = try container.decodeIfPresent(String.self, forKey: .writeManagingApp)
+            let appAccess = try container.decode(SimpleSpaceAppAccess.self, forKey: .appAccess)
+            try self.init(
+                readPolicy: readPolicy,
+                readManagingApp: readManagingApp,
+                writePolicy: writePolicy,
+                writeManagingApp: writeManagingApp,
+                appAccess: appAccess
+            )
+        } else {
+            let policy = try container.decode(SimpleSpacePolicy.self, forKey: .policy)
+            let appAccess = try container.decode(SimpleSpaceAppAccess.self, forKey: .appAccess)
+            let managingApp = try container.decodeIfPresent(String.self, forKey: .managingApp)
+            try self.init(
+                readPolicy: policy,
+                readManagingApp: managingApp,
+                writePolicy: policy,
+                writeManagingApp: managingApp,
+                appAccess: appAccess
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(readPolicy, forKey: .readPolicy)
+        try container.encodeIfPresent(readManagingApp, forKey: .readManagingApp)
+        try container.encode(writePolicy, forKey: .writePolicy)
+        try container.encodeIfPresent(writeManagingApp, forKey: .writeManagingApp)
+        try container.encode(appAccess, forKey: .appAccess)
     }
 }
 
@@ -1816,32 +1911,47 @@ public struct SimpleSpaceConfigurationPatch: Sendable, Equatable {
         case set(String?)
     }
 
-    public let policy: SimpleSpacePolicy?
+    public let readPolicy: SimpleSpacePolicy?
+    public let readManagingApp: ManagingApp
+    public let writePolicy: SimpleSpacePolicy?
+    public let writeManagingApp: ManagingApp
     public let appAccess: SimpleSpaceAppAccess?
-    public let managingApp: ManagingApp
 
     public init(
-        policy: SimpleSpacePolicy? = nil,
-        appAccess: SimpleSpaceAppAccess? = nil,
-        managingApp: ManagingApp = .unchanged
+        readPolicy: SimpleSpacePolicy? = nil,
+        readManagingApp: ManagingApp = .unchanged,
+        writePolicy: SimpleSpacePolicy? = nil,
+        writeManagingApp: ManagingApp = .unchanged,
+        appAccess: SimpleSpaceAppAccess? = nil
     ) {
-        self.policy = policy
+        self.readPolicy = readPolicy
+        self.readManagingApp = readManagingApp
+        self.writePolicy = writePolicy
+        self.writeManagingApp = writeManagingApp
         self.appAccess = appAccess
-        self.managingApp = managingApp
     }
 
     public func applying(to current: SimpleSpaceConfiguration) throws -> SimpleSpaceConfiguration {
-        let nextManagingApp: String?
-        switch managingApp {
+        let nextReadManagingApp: String?
+        switch readManagingApp {
         case .unchanged:
-            nextManagingApp = current.managingApp
+            nextReadManagingApp = current.readManagingApp
         case let .set(value):
-            nextManagingApp = value
+            nextReadManagingApp = value
+        }
+        let nextWriteManagingApp: String?
+        switch writeManagingApp {
+        case .unchanged:
+            nextWriteManagingApp = current.writeManagingApp
+        case let .set(value):
+            nextWriteManagingApp = value
         }
         return try SimpleSpaceConfiguration(
-            policy: policy ?? current.policy,
-            appAccess: appAccess ?? current.appAccess,
-            managingApp: nextManagingApp
+            readPolicy: readPolicy ?? current.readPolicy,
+            readManagingApp: nextReadManagingApp,
+            writePolicy: writePolicy ?? current.writePolicy,
+            writeManagingApp: nextWriteManagingApp,
+            appAccess: appAccess ?? current.appAccess
         )
     }
 }
@@ -1850,8 +1960,10 @@ public struct SimpleSpace: Sendable, Equatable {
     public let uri: SpaceURI
     public let owner: String
     public let configuration: SimpleSpaceConfiguration
-    public let members: Set<String>
+    public let members: [String: SimpleSpaceMember]
     public let isDeleted: Bool
+
+    public var memberDIDs: Set<String> { Set(members.keys) }
 
     /// A decoded authority state must still satisfy the same ownership and
     /// membership invariants as a newly created space.  SQLite adapters use
@@ -1861,14 +1973,14 @@ public struct SimpleSpace: Sendable, Equatable {
         uri: SpaceURI,
         owner: String,
         configuration: SimpleSpaceConfiguration,
-        members: Set<String>,
+        members: [String: SimpleSpaceMember],
         isDeleted: Bool
     ) throws {
         guard owner == uri.authority,
               SpaceURI.isValidDID(owner),
               members.count <= SimpleSpaceLimits.maximumMembersPerSpace,
-              members.contains(owner),
-              members.allSatisfy(SpaceURI.isValidDID)
+              members[owner] != nil,
+              members.keys.allSatisfy(SpaceURI.isValidDID)
         else {
             throw SwanError.malformed("invalid simple-space authority state")
         }
@@ -1881,11 +1993,34 @@ public struct SimpleSpace: Sendable, Equatable {
         )
     }
 
+    public init(
+        uri: SpaceURI,
+        owner: String,
+        configuration: SimpleSpaceConfiguration,
+        memberDIDs: Set<String>,
+        isDeleted: Bool
+    ) throws {
+        var memberMap: [String: SimpleSpaceMember] = [:]
+        for did in memberDIDs {
+            memberMap[did] = SimpleSpaceMember(did: did, read: true, write: true)
+        }
+        if memberMap[owner] == nil {
+            memberMap[owner] = SimpleSpaceMember(did: owner, read: true, write: true)
+        }
+        try self.init(
+            uri: uri,
+            owner: owner,
+            configuration: configuration,
+            members: memberMap,
+            isDeleted: isDeleted
+        )
+    }
+
     fileprivate init(
         uncheckedURI uri: SpaceURI,
         owner: String,
         configuration: SimpleSpaceConfiguration,
-        members: Set<String>,
+        members: [String: SimpleSpaceMember],
         isDeleted: Bool
     ) {
         self.uri = uri
@@ -1900,7 +2035,7 @@ private struct MutableSimpleSpace: Sendable {
     let uri: SpaceURI
     let owner: String
     var configuration: SimpleSpaceConfiguration
-    var members: Set<String>
+    var members: [String: SimpleSpaceMember]
     var isDeleted: Bool
 
     var snapshot: SimpleSpace {
@@ -1920,7 +2055,8 @@ private struct MutableSimpleSpace: Sendable {
 public actor SimpleSpaceAuthority {
     private let credentials: HMACSpaceCredentialAuthority
     private var spaces: [SpaceURI: MutableSimpleSpace] = [:]
-    private var managingAppDecisions: [SpaceURI: Set<String>] = [:]
+    private var managingAppReadDecisions: [SpaceURI: Set<String>] = [:]
+    private var managingAppWriteDecisions: [SpaceURI: Set<String>] = [:]
 
     public init(credentialSecret: Data) {
         credentials = HMACSpaceCredentialAuthority(key: credentialSecret)
@@ -1932,7 +2068,8 @@ public actor SimpleSpaceAuthority {
         guard spaces.count < SimpleSpaceLimits.maximumSpacesPerAuthority else {
             throw SwanError.unavailable("simple-space authority capacity exhausted")
         }
-        let state = MutableSimpleSpace(uri: space, owner: owner, configuration: configuration, members: [owner], isDeleted: false)
+        let ownerMember = SimpleSpaceMember(did: owner, read: true, write: true)
+        let state = MutableSimpleSpace(uri: space, owner: owner, configuration: configuration, members: [owner: ownerMember], isDeleted: false)
         spaces[space] = state
         return state.snapshot
     }
@@ -1945,26 +2082,33 @@ public actor SimpleSpaceAuthority {
         let previous = state.configuration
         state.configuration = configuration
         spaces[space] = state
-        // Decisions are scoped to one managing-app identity. Preserve them
-        // only when that identity remains actively governing the space.
-        if previous.policy != .managingApp
-            || configuration.policy != .managingApp
-            || previous.managingApp != configuration.managingApp {
-            managingAppDecisions[space] = []
+        if previous.readPolicy != .managingApp
+            || configuration.readPolicy != .managingApp
+            || previous.readManagingApp != configuration.readManagingApp {
+            managingAppReadDecisions[space] = []
+        }
+        if previous.writePolicy != .managingApp
+            || configuration.writePolicy != .managingApp
+            || previous.writeManagingApp != configuration.writeManagingApp {
+            managingAppWriteDecisions[space] = []
         }
     }
 
-    public func addMember(space: SpaceURI, member: String, by subject: String) throws {
+    public func putMember(space: SpaceURI, member: String, read: Bool, write: Bool, by subject: String) throws {
         var state = try activeSpace(space)
         try requireOwner(state, subject: subject)
         guard SpaceURI.isValidDID(member) else { throw SwanError.invalidIdentifier(member) }
-        guard state.members.contains(member)
+        guard state.members[member] != nil
             || state.members.count < SimpleSpaceLimits.maximumMembersPerSpace
         else {
             throw SwanError.unavailable("simple-space member capacity exhausted")
         }
-        state.members.insert(member)
+        state.members[member] = SimpleSpaceMember(did: member, read: read, write: write)
         spaces[space] = state
+    }
+
+    public func addMember(space: SpaceURI, member: String, by subject: String) throws {
+        try putMember(space: space, member: member, read: true, write: true, by: subject)
     }
 
     public func removeMember(space: SpaceURI, member: String, by subject: String) throws {
@@ -1974,7 +2118,7 @@ public actor SimpleSpaceAuthority {
             throw SwanError.invalidIdentifier(member)
         }
         guard member != state.owner else { throw SwanError.malformed("a space owner cannot be removed") }
-        state.members.remove(member)
+        state.members.removeValue(forKey: member)
         spaces[space] = state
     }
 
@@ -1983,36 +2127,55 @@ public actor SimpleSpaceAuthority {
         try requireOwner(state, subject: subject)
         state.isDeleted = true
         spaces[space] = state
-        // Deleted-space tombstones remain addressable, but their managing-app
-        // decisions no longer have any authorization meaning. Release that
-        // auxiliary set so deletion cannot retain stale policy state forever.
-        managingAppDecisions.removeValue(forKey: space)
+        managingAppReadDecisions.removeValue(forKey: space)
+        managingAppWriteDecisions.removeValue(forKey: space)
     }
 
-    /// A managing app can publish the result of its application-level access
-    /// check. The authority consults this only for `managing-app` spaces.
-    public func setManagingAppAccess(space: SpaceURI, user: String, allowed: Bool, by app: String) throws {
+    public func setManagingAppAccess(
+        space: SpaceURI,
+        user: String,
+        access: SimpleSpaceAccessKind,
+        allowed: Bool,
+        by app: String
+    ) throws {
         guard SpaceURI.isValidDID(user) else {
             throw SwanError.invalidIdentifier(user)
         }
         let state = try activeSpace(space)
-        guard state.configuration.policy == .managingApp,
-              state.configuration.managingApp == app else {
+        let policy = access == .read ? state.configuration.readPolicy : state.configuration.writePolicy
+        let managingApp = access == .read ? state.configuration.readManagingApp : state.configuration.writeManagingApp
+        guard policy == .managingApp, managingApp == app else {
             throw SwanError.unauthorized("wrong managing app")
         }
-        if allowed {
-            var decisions = managingAppDecisions[space, default: []]
-            guard decisions.contains(user)
-                || decisions.count < SimpleSpaceLimits.maximumManagingAppDecisionsPerSpace
-            else {
-                throw SwanError.unavailable(
-                    "simple-space managing-app decision capacity exhausted"
-                )
+        switch access {
+        case .read:
+            if allowed {
+                var decisions = managingAppReadDecisions[space, default: []]
+                guard decisions.contains(user) || decisions.count < SimpleSpaceLimits.maximumManagingAppDecisionsPerSpace else {
+                    throw SwanError.unavailable("simple-space managing-app decision capacity exhausted")
+                }
+                decisions.insert(user)
+                managingAppReadDecisions[space] = decisions
+            } else {
+                managingAppReadDecisions[space, default: []].remove(user)
             }
-            decisions.insert(user)
-            managingAppDecisions[space] = decisions
+        case .write:
+            if allowed {
+                var decisions = managingAppWriteDecisions[space, default: []]
+                guard decisions.contains(user) || decisions.count < SimpleSpaceLimits.maximumManagingAppDecisionsPerSpace else {
+                    throw SwanError.unavailable("simple-space managing-app decision capacity exhausted")
+                }
+                decisions.insert(user)
+                managingAppWriteDecisions[space] = decisions
+            } else {
+                managingAppWriteDecisions[space, default: []].remove(user)
+            }
         }
-        else { managingAppDecisions[space, default: []].remove(user) }
+    }
+
+    public func setManagingAppAccess(space: SpaceURI, user: String, allowed: Bool, by app: String) throws {
+        try setManagingAppAccess(space: space, user: user, access: .read, allowed: allowed, by: app)
+        try setManagingAppAccess(space: space, user: user, access: .write, allowed: allowed, by: app)
     }
 
     /// Evaluates user and app policy independently, then returns a read-only
@@ -2026,18 +2189,20 @@ public actor SimpleSpaceAuthority {
             try SimpleSpaceConfiguration.validateAppIdentifier(clientID)
         }
         let state = try activeSpace(space)
-        switch state.configuration.appAccess {
-        case .open: break
-        case let .allowList(allowed):
-            guard let clientID, allowed.contains(clientID) else { throw SwanError.unauthorized("app is not authorized for this space") }
-        }
-        switch state.configuration.policy {
-        case .public: break
-        case .memberList:
-            guard state.members.contains(user) else { throw SwanError.unauthorized("user is not a space member") }
-        case .managingApp:
-            guard managingAppDecisions[space, default: []].contains(user) else {
-                throw SwanError.unauthorized("managing app denied user access")
+        if user != state.owner {
+            switch state.configuration.appAccess {
+            case .open: break
+            case let .allowList(allowed):
+                guard let clientID, allowed.contains(clientID) else { throw SwanError.unauthorized("app is not authorized for this space") }
+            }
+            switch state.configuration.readPolicy {
+            case .public: break
+            case .memberList:
+                guard state.members[user]?.read == true else { throw SwanError.unauthorized("user is not authorized to read this space") }
+            case .managingApp:
+                guard managingAppReadDecisions[space, default: []].contains(user) else {
+                    throw SwanError.unauthorized("managing app denied user access")
+                }
             }
         }
         let grant = SpaceGrant(
@@ -2045,6 +2210,25 @@ public actor SimpleSpaceAuthority {
             expiresAt: now.addingTimeInterval(2 * 60 * 60), clientID: clientID
         )
         return try credentials.issue(SpaceCredential(grant: grant, issuedAt: now))
+    }
+
+    public func authorizeWrite(space: SpaceURI, writer: String) throws {
+        guard SpaceURI.isValidDID(writer) else {
+            throw SwanError.invalidIdentifier(writer)
+        }
+        let state = try activeSpace(space)
+        if writer == state.owner { return }
+        switch state.configuration.writePolicy {
+        case .public: return
+        case .memberList:
+            guard state.members[writer]?.write == true else {
+                throw SwanError.unauthorized("writer is not authorized to write to this space")
+            }
+        case .managingApp:
+            guard managingAppWriteDecisions[space, default: []].contains(writer) else {
+                throw SwanError.unauthorized("managing app denied write access")
+            }
+        }
     }
 
     private func activeSpace(_ uri: SpaceURI) throws -> MutableSimpleSpace {

@@ -457,6 +457,56 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
         )
     }
 
+    func testKEMOnlyBackfillHistorySurvivesEncryptedBackupRestore() async throws {
+        let fixture = try await OperatorBackupFixture()
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
+        let loadedJournal = try await fixture.database.plcAccountPreparationJournal()
+        let journal = try XCTUnwrap(loadedJournal)
+        let genesis = try SwanPLCGenesisCodec.reconstructGenesis(signingDIDKey: journal.operation.signingDIDKey,
+            rotationDIDKey: journal.operation.rotationDIDKey, canonicalHandle: journal.canonicalHandle,
+            pdsOrigin: journal.pdsOrigin, signature: journal.operation.signature)
+        let rotation = try P256.Signing.PrivateKey(rawRepresentation: await fixture.keyStore.key(for:
+            AccountKeyReference(accountDID: fixture.account.did, purpose: .rotation, generation: 1)))
+        let kem = try await AccountKeyProvisioner(keyStore: fixture.keyStore).provisionKEM(accountDID: fixture.account.did)
+        let regular = try XCTUnwrap(genesis.regular)
+        var methods = regular.verificationMethods
+        methods["atproto_kem"] = try AccountKEMKeyProvider.didKey(kem.publicKey)
+        let updated = try PLCOperationCodec.sign(.regular(PLCUnsignedRegularOperation(rotationKeys: regular.rotationKeys,
+            verificationMethods: methods, alsoKnownAs: regular.alsoKnownAs, services: regular.services, prev: genesis.cid.string)), using: rotation)
+        for (index, operation) in [genesis, updated].enumerated() {
+            _ = try await fixture.database.installPublicPLCOperation(PublicPLCOperationHistoryEntry(cid: operation.cid.string,
+                previousCID: operation.prev, canonicalJSON: operation.canonicalJSON,
+                createdAt: Date(timeIntervalSince1970: Double(1_700_000_000 + index)), signingKeyGeneration: 1, rotationKeyGeneration: 1))
+        }
+        let backup = try await fixture.completedBackup(named: "backfilled-backup")
+        let target = fixture.root.appending(path: "backfilled-restored")
+        let kek = try SwanOperatorAccountKEK(rawBytes: Data(repeating: 0xB8, count: 32))
+        _ = try await SwanOperatorAccountRestorer().restore(backupAt: backup, using: fixture.backupKey, accountKEK: kek, to: target)
+        let restored = try await SQLiteAccountDatabase(dataDirectory: target, did: fixture.account.did)
+        let history = try await restored.publicPLCOperationHistory()
+        XCTAssertEqual(history.count, 2)
+        XCTAssertEqual(history.last?.cid, try updated.cid.string)
+        XCTAssertEqual(history.last?.signingKeyGeneration, 1)
+        try await restored.close()
+    }
+
+    func testKEMBackupRestoresDedicatedKeyAndReportsContentOnlyScope() async throws {
+        let fixture = try await OperatorBackupFixture(includeKEM: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let expected = try await AccountKEMKeyProvider(keyStore: fixture.keyStore).privateKey(accountDID: fixture.account.did)
+        let backup = try await fixture.completedBackup(named: "kem-backup")
+        let target = fixture.root.appending(path: "kem-restored")
+        let kek = try SwanOperatorAccountKEK(rawBytes: Data(repeating: 0xB7, count: 32))
+        let result = try await SwanOperatorAccountRestorer().restore(backupAt: backup, using: fixture.backupKey, accountKEK: kek, to: target)
+        XCTAssertEqual(result.restoreScope, "account-content")
+        XCTAssertFalse(result.permissionedAuthorityReady)
+        let reader = try ExistingFileAccountKeyReader(root: target.appending(path: "keys"),
+            configuration: AccountKeyEncryptionConfiguration(activeKeyID: "primary", activeKey: kek.bytes))
+        let actual = try await AccountKEMKeyProvider(keyStore: reader).privateKey(accountDID: fixture.account.did)
+        XCTAssertEqual(actual.rawRepresentation, expected.rawRepresentation)
+        try await fixture.database.close()
+    }
+
     func testVerifiedBackupRestoresOneActiveAccountAndReopensEveryDurableBoundary() async throws {
         let fixture = try await OperatorBackupFixture()
         addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
@@ -1382,18 +1432,23 @@ struct OperatorBackupFixture {
     let password: String
     let secretSentinels: [Data]
 
-    init() async throws {
+    init(includeKEM: Bool = false) async throws {
         root = try temporaryDirectory(prefix: "SwanOperatorBackup")
         let handle = "alice.example.com"
         let signingKey = P256.Signing.PrivateKey()
         let rotationKey = P256.Signing.PrivateKey()
-        let unsigned = try PLCATProfile.regularOperation(
+        let kem = includeKEM ? P256.KeyAgreement.PrivateKey() : nil
+        let base = try PLCATProfile.regularOperation(
             handle: handle,
             signingPublicKey: signingKey.publicKey,
             rotationPublicKeys: [rotationKey.publicKey],
             pdsOrigin: URL(string: "https://pds.example.com")!,
             prev: nil
         )
+        var methods = base.verificationMethods
+        if let kem { methods["atproto_kem"] = try AccountKEMKeyProvider.didKey(kem.publicKey) }
+        let unsigned = try PLCUnsignedRegularOperation(rotationKeys: base.rotationKeys,
+            verificationMethods: methods, alsoKnownAs: base.alsoKnownAs, services: base.services, prev: nil)
         let operation = try PLCOperationCodec.sign(.regular(unsigned), using: rotationKey)
         let did = try PLCOperationCodec.genesisDID(for: operation)
         let kek = Data(repeating: 0xA7, count: 32)
@@ -1423,6 +1478,9 @@ struct OperatorBackupFixture {
                 key: rotationKey.rawRepresentation
             ),
         ])
+        if let kem {
+            try await keyStore.create(kem.rawRepresentation, for: AccountKEMKeyProvider.reference(accountDID: did))
+        }
         database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
         space = try SpaceURI(
             authority: did,
@@ -1455,7 +1513,8 @@ struct OperatorBackupFixture {
             operation: try PLCAccountPreparationOperationFacts(
                 signingDIDKey: XCTUnwrap(operation.regular?.verificationMethods["atproto"]),
                 rotationDIDKey: XCTUnwrap(operation.regular?.rotationKeys.first),
-                signature: XCTUnwrap(operation.regular?.signature)
+                signature: XCTUnwrap(operation.regular?.signature),
+                kemDIDKey: operation.regular?.verificationMethods["atproto_kem"]
             ),
             signingKey: signingReference,
             rotationKey: rotationReference,

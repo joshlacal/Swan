@@ -59,10 +59,13 @@ final class SimpleSpaceCheckUserAccessHTTPTests: XCTestCase, @unchecked Sendable
         let encodedSpace = checkUserAccessEncode(fixture.space.rawValue)
         let invalidQueries = [
             "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace,
-            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&user=" + Self.user,
-            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&unknown=x",
-            "/xrpc/com.atproto.simplespace.checkUserAccess?space=at%3A%2F%2Fbad&user=" + Self.user,
-            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=not-a-did",
+            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user,
+            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&access=invalid",
+            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&access=write&clientId=foo",
+            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&access=read&user=" + Self.user,
+            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=" + Self.user + "&access=read&unknown=x",
+            "/xrpc/com.atproto.simplespace.checkUserAccess?space=at%3A%2F%2Fbad&user=" + Self.user + "&access=read",
+            "/xrpc/com.atproto.simplespace.checkUserAccess?space=" + encodedSpace + "&user=not-a-did&access=read",
         ]
         try await app.test(.router) { client in
             for headers in [HTTPFields(), bearer(""), bearer("not a jwt"), bearer(wrongMethod), bearer(wrongAudience), bearer(expired), bearer(malformedSignature)] {
@@ -243,8 +246,8 @@ private func checkUserAccessProfile() throws -> ProtocolProfile {
     return try ProtocolProfile.load(from: root.appending(path: "Profiles/permissioned-data-0016-2026-07-03.json"))
 }
 
-private func checkUserAccessURI(space: SpaceURI, user: String, clientID: String? = nil) -> String {
-    var result = "/xrpc/com.atproto.simplespace.checkUserAccess?space=\(checkUserAccessEncode(space.rawValue))&user=\(checkUserAccessEncode(user))"
+private func checkUserAccessURI(space: SpaceURI, user: String, access: String = "read", clientID: String? = nil) -> String {
+    var result = "/xrpc/com.atproto.simplespace.checkUserAccess?space=\(checkUserAccessEncode(space.rawValue))&user=\(checkUserAccessEncode(user))&access=\(checkUserAccessEncode(access))"
     if let clientID { result += "&clientId=\(checkUserAccessEncode(clientID))" }
     return result
 }

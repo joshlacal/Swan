@@ -197,6 +197,38 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         XCTAssertEqual(afterConflict.first?.commitment, Data(repeating: 1, count: 32))
     }
 
+    /// SW-C: a writer signs each notifyWrite attempt with a fresh jti, so a
+    /// retry after a lost acknowledgement arrives under a new event ID. The
+    /// authority must recognize it by revision: no second receipt, no second
+    /// forward to a service-named subscriber, and no space revision bump.
+    func testRetriedWriterNotificationUnderAFreshEventIDIsANoOp() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+        let now = Date()
+        try await fixture.register(on: database, now: now)
+
+        for (eventID, offset) in [("first-attempt", 0.0), ("retry-attempt", 1.0)] {
+            try await database.receiveSpaceWriteNotification(
+                fixture.writeNotification(eventID: eventID, revision: try fixture.tid(1), commitmentByte: 4),
+                now: now.addingTimeInterval(offset)
+            )
+        }
+        let fanout = try await database.pendingNotificationFanout()
+        XCTAssertEqual(fanout.count, 1)
+        XCTAssertEqual(fanout.first?.sourceEventID, "first-attempt")
+        let receipts = try await database.connection.query(
+            "SELECT event_id FROM permissioned_space_notification_receipts WHERE space_uri = ?",
+            [.text(fixture.space.rawValue)]
+        )
+        XCTAssertEqual(receipts.map { $0.column("event_id")?.string }, ["first-attempt"])
+        let writers = try await database.spaceWriters(
+            space: fixture.space, limit: 10, cursor: nil, authorization: fixture.readCredential()
+        )
+        XCTAssertEqual(writers.map(\.wireRevision), [try fixture.tid(1).toString()])
+    }
+
     /// Erratum 03: write fanout fires for SERVICE-NAMED registrations only,
     /// from both write paths — a member's announced write and a local apply —
     /// carrying the writer/revision/commitment the `notifyWrite` body needs.
@@ -569,7 +601,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         )
     }
 
-    func testRecipientDeletionDurablyClosesLocalRepositoryAndClearsStaleOutbox() async throws {
+    func testRecipientDeletionLeavesAuthoredRepositoryOpenAndClearsOnlyItsStaleOutbox() async throws {
         let fixture = try NotificationFixture()
         let writerDatabase = try await SQLiteAccountDatabase(
             dataDirectory: fixture.root,
@@ -600,6 +632,15 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         )
         let initialOutbox = try await writerDatabase.pendingOutbox()
         XCTAssertEqual(initialOutbox.count, 1)
+        let blobBytes = Data([0x31, 0x32, 0x33])
+        let blob = try await writerDatabase.putBlob(blobBytes, namespace: .space(fixture.space))
+        try await fixture.join(space: fixture.secondarySpace, on: writerDatabase, rkey: "other-space")
+        let repository = try DurableSpaceRepository(
+            database: writerDatabase, space: fixture.space, author: fixture.writer
+        )
+        let sharedCredential = fixture.readCredential()
+        let sharedReadBeforeNotice = try await repository.record(uri, authorization: sharedCredential)
+        XCTAssertEqual(sharedReadBeforeNotice?.value, initialValue)
 
         let now = Date(timeIntervalSince1970: 1_750_000_300)
         try await writerDatabase.receiveSpaceDeletionNotification(
@@ -610,8 +651,8 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: fixture.space),
             now: now
         )
-        // A duplicate delivery must preserve the durable closure rather than
-        // reopening it or reporting a retryable failure.
+        // A duplicate delivery preserves the sync deletion signal without
+        // taking ownership of the member's authored repository.
         try await writerDatabase.receiveSpaceDeletionNotification(
             space: fixture.space,
             issuer: fixture.authority,
@@ -621,42 +662,106 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             now: now.addingTimeInterval(1)
         )
         let remainingOutbox = try await writerDatabase.pendingOutbox()
-        XCTAssertTrue(remainingOutbox.isEmpty)
+        XCTAssertEqual(remainingOutbox.map(\.space), [fixture.secondarySpace])
+        let selfRead = AuthorizationContext.accountOAuthForTesting(
+            subject: fixture.writer,
+            scopes: ["space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read_self"]
+        )
+        let record = try await repository.record(uri, authorization: selfRead)
+        XCTAssertEqual(record?.value, initialValue)
+        let blobMetadata = try await repository.permissionedBlobMetadata(cid: blob.cid, authorization: selfRead)
+        XCTAssertEqual(blobMetadata?.size, blobBytes.count)
+        let retainedBlob = try await writerDatabase.blobData(for: blob)
+        XCTAssertEqual(retainedBlob, blobBytes)
+        let spaces = try await writerDatabase.hostedSpaceURIs(
+            spaceType: nil, authority: nil, cursor: nil, limit: 100
+        )
+        XCTAssertEqual(Set(spaces), Set([fixture.space, fixture.secondarySpace]))
+        let receiptRows = try await writerDatabase.connection.query(
+            "SELECT COUNT(*) AS row_count FROM permissioned_space_notification_receipts WHERE space_uri = ?",
+            [.text(fixture.space.rawValue)]
+        )
+        XCTAssertEqual(receiptRows.first?.column("row_count")?.integer, 1)
+
+        // SWAN-SYNC-1: the recipient tombstone closes replicated and derived
+        // state only. The member's own repository stays readable through
+        // every shared facade, as upstream leaves member repositories
+        // untouched and a recreated space must be able to read them again
+        // (October 22 section 6).
+        for authorization in [
+            sharedCredential,
+            AuthorizationContext.service(subject: fixture.reader, audience: fixture.authority),
+        ] {
+            let sharedReads: [(String, @Sendable () async throws -> Void)] = [
+                ("record", { _ = try await repository.record(uri, authorization: authorization) }),
+                ("listRecords", {
+                    _ = try await repository.listRecords(
+                        collection: nil, limit: 10, cursor: nil, reverse: false, authorization: authorization
+                    )
+                }),
+                ("listBlobs", {
+                    _ = try await repository.listBlobCIDs(since: nil, cursor: nil, limit: 10, authorization: authorization)
+                }),
+                ("blobMetadata", {
+                    _ = try await repository.permissionedBlobMetadata(cid: blob.cid, authorization: authorization)
+                }),
+                ("commitState", { _ = try await repository.currentCommitState(authorization: authorization) }),
+                ("snapshot", { _ = try await repository.snapshot(authorization: authorization) }),
+                ("CAR", {
+                    let snapshot = try await repository.prepareCARSnapshot(authorization: authorization)
+                    snapshot?.spool.cleanup()
+                }),
+                ("oplog", {
+                    _ = try await repository.incrementalOplog(since: nil, limit: 10, includeValues: true, authorization: authorization)
+                }),
+            ]
+            for (name, read) in sharedReads {
+                do {
+                    try await read()
+                } catch {
+                    XCTFail("\(name) closed the member's own repository after a recipient deletion: \(error)")
+                }
+            }
+        }
+
+        let postDeletionValue = Data([0xA1, 0x61, 0x61, 0x02])
+        _ = try await writerDatabase.apply(
+            space: fixture.space,
+            author: fixture.writer,
+            expectedRevision: 1,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(2),
+            writes: [.put(uri: uri, value: postDeletionValue, cid: CID.fromDAGCBOR(postDeletionValue).string)]
+        )
+        let updated = try await repository.record(uri, authorization: selfRead)
+        XCTAssertEqual(updated?.value, postDeletionValue)
+        let sibling = try await writerDatabase.repositoryState(space: fixture.secondarySpace, author: fixture.writer)
+        XCTAssertEqual(sibling?.revision, 1)
+        // A post-deletion write still announces itself to the authority, so
+        // a recreated space learns of the member's new state.
+        let outboxAfterWrite = try await writerDatabase.pendingOutbox()
+        XCTAssertEqual(Set(outboxAfterWrite.map(\.space)), [fixture.space, fixture.secondarySpace])
+        XCTAssertEqual(outboxAfterWrite.filter { $0.space == fixture.space }.map(\.revision), [2])
+
+        try await writerDatabase.close()
+        let reopened = try await SQLiteAccountDatabase(dataDirectory: fixture.root, did: fixture.writer)
         do {
-            _ = try await writerDatabase.repositoryState(
-                space: fixture.space,
-                author: fixture.writer
-            )
-            XCTFail("recipient tombstone must close repository state reads")
-        } catch {}
-        do {
-            let postDeletionValue = Data([0xA1, 0x61, 0x61, 0x02])
-            _ = try await writerDatabase.apply(
-                space: fixture.space,
-                author: fixture.writer,
-                expectedRevision: 1,
-                requestID: UUID(),
-                wireRevision: try fixture.tid(2),
-                writes: [
-                    .put(
-                        uri: uri,
-                        value: postDeletionValue,
-                        cid: CID.fromDAGCBOR(postDeletionValue).string
-                    ),
-                ]
-            )
-            XCTFail("recipient tombstone must close repository writes")
-        } catch {}
+            let retained = try await reopened.repositoryState(space: fixture.space, author: fixture.writer)
+            XCTAssertEqual(retained?.revision, 2)
+            let reopenedBlob = try await reopened.blobData(for: blob)
+            XCTAssertEqual(reopenedBlob, blobBytes)
+            try await reopened.close()
+        } catch {
+            try? await reopened.close()
+            throw error
+        }
     }
 
     /// A deletion service JWT carries no space claim, and the verifier keeps no
     /// replay cache (`Sources/SwanOAuth/SpaceServiceAuthentication.swift:40`).
-    /// The pinned reference receiver bounds that by no-oping unless the
-    /// recipient already knows the space
-    /// (`packages/pds/src/api/com/atproto/space/notifySpaceDeleted.ts:33-34`).
-    /// Without the same precondition one valid token mints a permanent
-    /// tombstone — and a permanent receipt — for every SpaceURI under the
-    /// issuer's authority, because receipt identity includes `space_uri`.
+    /// Only spaces known through authored or synchronized state need a
+    /// deletion marker. Unknown spaces must not allocate permanent receipts
+    /// or markers, and a marker must never close the member's own repository.
     func testDeletionNotificationForAnUnjoinedSpaceIsANoOp() async throws {
         let fixture = try NotificationFixture()
         let recipient = try await SQLiteAccountDatabase(
@@ -696,8 +801,8 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         )
         XCTAssertEqual(receipts.first?.column("row_count")?.integer, 0)
 
-        // The pre-emptive tombstone would also have closed the space before
-        // this account ever joined it.
+        // An ignored signal does not prevent the member from writing its own
+        // repository in this space later.
         try await fixture.join(
             space: fixture.secondarySpace,
             on: recipient,
@@ -1304,7 +1409,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             _ = try await authority.create(
                 space: fixture.space,
                 owner: fixture.authority,
-                configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+                configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
                 authorization: .accountOAuthForTesting(subject: fixture.authority, scopes: ["atproto"])
             )
             _ = try await authority.addMember(
@@ -1427,7 +1532,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             now: now
         )
 
-        // Service B attempts to overwrite Service A's endpoint -> fails
+        // Service B claiming Service A's service identity -> fails
         do {
             try await database.registerSpaceNotification(
                 .init(
@@ -1435,7 +1540,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                     endpoint: endpoint,
                     repository: fixture.writer,
                     expiresAt: now.addingTimeInterval(3600),
-                    service: "did:web:service-b.example#srv",
+                    service: "did:web:service-a.example#srv",
                     serviceDID: "did:web:service-b.example"
                 ),
                 authorization: credential,
@@ -1448,6 +1553,34 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                 return
             }
         }
+
+        // SWAN-SYNC-4: Service B registering its own identity behind the same
+        // endpoint is accepted, as the reference keys (space, serviceDid),
+        // and leaves Service A's registration untouched.
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpoint,
+                repository: nil,
+                expiresAt: now.addingTimeInterval(1800),
+                service: "did:web:service-b.example#srv",
+                serviceDID: "did:web:service-b.example"
+            ),
+            authorization: credential,
+            now: now
+        )
+        let shared = try await database.connection.query(
+            """
+            SELECT service_key, owner_service_did, repo_did
+            FROM permissioned_space_notification_registrations
+            WHERE space_uri = ? AND endpoint = ? ORDER BY service_key
+            """,
+            [.text(fixture.space.rawValue), .text(endpoint)]
+        )
+        XCTAssertEqual(shared.compactMap { $0.column("service_key")?.string },
+                       ["did:web:service-a.example#srv", "did:web:service-b.example#srv"])
+        XCTAssertEqual(shared.first?.column("owner_service_did")?.string, "did:web:service-a.example")
+        XCTAssertEqual(shared.first?.column("repo_did")?.string, fixture.writer)
 
         // Service A re-registering its own endpoint succeeds
         try await database.registerSpaceNotification(
@@ -1752,7 +1885,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         _ = try await authority.create(
             space: fixture.space,
             owner: fixture.authority,
-            configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+            configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
             authorization: authContext
         )
         _ = try await authority.addMember(
@@ -1813,7 +1946,7 @@ private struct NotificationFixture {
         _ = try await authority.create(
             space: space,
             owner: self.authority,
-            configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+            configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
             authorization: .accountOAuthForTesting(subject: self.authority, scopes: ["atproto"])
         )
         _ = try await authority.addMember(
@@ -1828,7 +1961,7 @@ private struct NotificationFixture {
         _ = try await authority.create(
             space: secondarySpace,
             owner: self.authority,
-            configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+            configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
             authorization: .accountOAuthForTesting(subject: self.authority, scopes: ["atproto"])
         )
         _ = try await authority.addMember(

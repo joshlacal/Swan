@@ -3871,22 +3871,31 @@ final class SwanSQLiteTests: XCTestCase {
         _ = try await authority.create(
             space: space,
             owner: did,
-            configuration: try SimpleSpaceConfiguration(policy: .memberList),
+            configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList),
             authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"])
         )
         try await database.close()
 
         let databasePath = SQLiteLayout.accountDatabase(in: root, did: did).path
         let raw = try await SQLiteConnection.open(storage: .file(path: databasePath))
-        _ = try await raw.query(
-            "DELETE FROM permissioned_simple_space_members WHERE space_uri = ? AND member_did = ?",
-            [.text(space.rawValue), .text(did)]
-        )
-        _ = try await raw.query(
-            "INSERT INTO permissioned_simple_space_managing_app_decisions(space_uri, user_did) VALUES (?, ?)",
-            [.text(space.rawValue), .text("did:plc:bob")]
-        )
-        try await raw.close()
+        do {
+            _ = try await raw.query(
+                "DELETE FROM permissioned_simple_space_members WHERE space_uri = ? AND member_did = ?",
+                [.text(space.rawValue), .text(did)]
+            )
+            _ = try await raw.query(
+                "INSERT INTO permissioned_simple_space_managing_app_decisions(space_uri, user_did, access) VALUES (?, ?, 'read')",
+                [.text(space.rawValue), .text("did:plc:bob")]
+            )
+            _ = try await raw.query(
+                "INSERT INTO permissioned_simple_space_managing_app_decisions(space_uri, user_did, access) VALUES (?, ?, 'write')",
+                [.text(space.rawValue), .text("did:plc:bob")]
+            )
+            try await raw.close()
+        } catch {
+            try? await raw.close()
+            throw error
+        }
 
         let reopened = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
         await XCTAssertThrowsErrorAsync(
@@ -3915,6 +3924,95 @@ final class SwanSQLiteTests: XCTestCase {
             )
         )
         try await reopened.close()
+
+        // Verify corruption rejection across asymmetric read/write policy axes:
+        // 1. Asymmetric: managingApp read, memberList write, corrupted with illegal write decision
+        let asymmWriteSpace = try SpaceURI(authority: did, spaceType: "app.bsky.bookmarks", skey: "tamper-asymm-write")
+        let asymmDb1 = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        let asymmAuth1 = try DurableSimpleSpaceAuthority(
+            database: asymmDb1,
+            credentialSecret: Data(repeating: 7, count: 32)
+        )
+        _ = try await asymmAuth1.create(
+            space: asymmWriteSpace,
+            owner: did,
+            configuration: try SimpleSpaceConfiguration(
+                readPolicy: .managingApp,
+                readManagingApp: "did:web:manager.example",
+                writePolicy: .memberList
+            ),
+            authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"])
+        )
+        try await asymmDb1.close()
+
+        let rawAsymm1 = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        do {
+            _ = try await rawAsymm1.query(
+                "INSERT INTO permissioned_simple_space_managing_app_decisions(space_uri, user_did, access) VALUES (?, ?, 'write')",
+                [.text(asymmWriteSpace.rawValue), .text("did:plc:bob")]
+            )
+            try await rawAsymm1.close()
+        } catch {
+            try? await rawAsymm1.close()
+            throw error
+        }
+
+        let reopenedAsymm1 = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        await XCTAssertThrowsErrorAsync(
+            try await reopenedAsymm1.simpleSpace(
+                asymmWriteSpace,
+                authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"])
+            )
+        ) { error in
+            guard case .corruptDatabase = error as? SQLiteRepositoryError else {
+                return XCTFail("expected corruptDatabase on illegal write decision, got \(error)")
+            }
+        }
+        try await reopenedAsymm1.close()
+
+        // 2. Asymmetric: memberList read, managingApp write, corrupted with illegal read decision
+        let asymmReadSpace = try SpaceURI(authority: did, spaceType: "app.bsky.bookmarks", skey: "tamper-asymm-read")
+        let asymmDb2 = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        let asymmAuth2 = try DurableSimpleSpaceAuthority(
+            database: asymmDb2,
+            credentialSecret: Data(repeating: 7, count: 32)
+        )
+        _ = try await asymmAuth2.create(
+            space: asymmReadSpace,
+            owner: did,
+            configuration: try SimpleSpaceConfiguration(
+                readPolicy: .memberList,
+                writePolicy: .managingApp,
+                writeManagingApp: "did:web:manager.example"
+            ),
+            authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"])
+        )
+        try await asymmDb2.close()
+
+        let rawAsymm2 = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        do {
+            _ = try await rawAsymm2.query(
+                "INSERT INTO permissioned_simple_space_managing_app_decisions(space_uri, user_did, access) VALUES (?, ?, 'read')",
+                [.text(asymmReadSpace.rawValue), .text("did:plc:bob")]
+            )
+            try await rawAsymm2.close()
+        } catch {
+            try? await rawAsymm2.close()
+            throw error
+        }
+
+        let reopenedAsymm2 = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        await XCTAssertThrowsErrorAsync(
+            try await reopenedAsymm2.simpleSpace(
+                asymmReadSpace,
+                authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"])
+            )
+        ) { error in
+            guard case .corruptDatabase = error as? SQLiteRepositoryError else {
+                return XCTFail("expected corruptDatabase on illegal read decision, got \(error)")
+            }
+        }
+        try await reopenedAsymm2.close()
     }
 
     func testSimpleSpaceMemberPageUsesKeysetAndRejectsOversizedState() async throws {
@@ -3936,7 +4034,7 @@ final class SwanSQLiteTests: XCTestCase {
         _ = try await authority.create(
             space: space,
             owner: owner,
-            configuration: try SimpleSpaceConfiguration(policy: .memberList),
+            configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList),
             authorization: authorization
         )
         _ = try await database.addSimpleSpaceMember(
@@ -3951,14 +4049,18 @@ final class SwanSQLiteTests: XCTestCase {
             cursor: nil,
             authorization: authorization
         )
-        XCTAssertEqual(first.members, [owner])
+        XCTAssertEqual(first.members.map(\.did), [owner])
+        XCTAssertEqual(first.members.first?.read, true)
+        XCTAssertEqual(first.members.first?.write, true)
         let second = try await authority.memberPage(
             space: space,
             limit: 1,
             cursor: first.cursor,
             authorization: authorization
         )
-        XCTAssertEqual(second.members, ["did:plc:bob"])
+        XCTAssertEqual(second.members.map(\.did), ["did:plc:bob"])
+        XCTAssertEqual(second.members.first?.read, true)
+        XCTAssertEqual(second.members.first?.write, true)
 
         // Corrupt the durable child table with one row beyond the domain cap.
         // The page path must reject by a scalar count before it can map a page
@@ -4010,21 +4112,45 @@ final class SwanSQLiteTests: XCTestCase {
                 scopes: ["atproto"]
             )
             let authority = DurableSimpleSpaceAuthority(lifecycleDatabase: database)
-            let policyOnly = try await authority.update(
+            let readPolicyOnly = try await authority.update(
                 space: fixture.space,
-                patch: .init(policy: .public),
+                patch: .init(readPolicy: .public),
                 authorization: authorization
             )
-            XCTAssertEqual(policyOnly.space.configuration.policy, .public)
-            XCTAssertEqual(policyOnly.space.configuration.managingApp, "did:web:manager.example")
+            XCTAssertEqual(readPolicyOnly.space.configuration.readPolicy, .public)
+            XCTAssertEqual(readPolicyOnly.space.configuration.writePolicy, .managingApp)
+            XCTAssertEqual(readPolicyOnly.space.configuration.readManagingApp, "did:web:manager.example")
+            XCTAssertEqual(readPolicyOnly.space.configuration.writeManagingApp, "did:web:manager.example")
+
+            let writePolicyOnly = try await authority.update(
+                space: fixture.space,
+                patch: .init(writePolicy: .public),
+                authorization: authorization
+            )
+            XCTAssertEqual(writePolicyOnly.space.configuration.readPolicy, .public)
+            XCTAssertEqual(writePolicyOnly.space.configuration.writePolicy, .public)
+            XCTAssertEqual(writePolicyOnly.space.configuration.readManagingApp, "did:web:manager.example")
+            XCTAssertEqual(writePolicyOnly.space.configuration.writeManagingApp, "did:web:manager.example")
+
+            let readAppCleared = try await authority.update(
+                space: fixture.space,
+                patch: .init(readManagingApp: .set(nil)),
+                authorization: authorization
+            )
+            XCTAssertEqual(readAppCleared.space.configuration.readPolicy, .public)
+            XCTAssertEqual(readAppCleared.space.configuration.writePolicy, .public)
+            XCTAssertNil(readAppCleared.space.configuration.readManagingApp)
+            XCTAssertEqual(readAppCleared.space.configuration.writeManagingApp, "did:web:manager.example")
 
             let cleared = try await authority.update(
                 space: fixture.space,
-                patch: .init(managingApp: .set(nil)),
+                patch: .init(writeManagingApp: .set(nil)),
                 authorization: authorization
             )
-            XCTAssertEqual(cleared.space.configuration.policy, .public)
-            XCTAssertNil(cleared.space.configuration.managingApp)
+            XCTAssertEqual(cleared.space.configuration.readPolicy, .public)
+            XCTAssertEqual(cleared.space.configuration.writePolicy, .public)
+            XCTAssertNil(cleared.space.configuration.readManagingApp)
+            XCTAssertNil(cleared.space.configuration.writeManagingApp)
         }
 
         let inspected = try await SQLiteConnection.open(storage: .file(path: path))
@@ -4035,7 +4161,7 @@ final class SwanSQLiteTests: XCTestCase {
             let schema = try XCTUnwrap(schemaRows.first?.column("sql")?.string)
             XCTAssertFalse(schema.contains("policy = 'managing-app' AND managing_app IS NOT NULL"))
             let marker = try await inspected.query(
-                "SELECT 1 FROM permissioned_repository_migrations WHERE version = 3"
+                "SELECT 1 FROM permissioned_repository_migrations WHERE version = 23"
             )
             XCTAssertEqual(marker.count, 1)
             try await inspected.close()
@@ -4071,12 +4197,17 @@ final class SwanSQLiteTests: XCTestCase {
                     fixture.space,
                     authorization: authorization
                 )
-                XCTAssertEqual(state?.space.configuration.policy, .managingApp)
+                XCTAssertEqual(state?.space.configuration.readPolicy, .managingApp)
+                XCTAssertEqual(state?.space.configuration.writePolicy, .managingApp)
                 XCTAssertEqual(
-                    state?.space.configuration.managingApp,
+                    state?.space.configuration.readManagingApp,
                     "did:web:manager.example"
                 )
-                XCTAssertEqual(state?.space.members, [fixture.author])
+                XCTAssertEqual(
+                    state?.space.configuration.writeManagingApp,
+                    "did:web:manager.example"
+                )
+                XCTAssertEqual(state?.space.members, [fixture.author: SimpleSpaceMember(did: fixture.author, read: true, write: true)])
             }
         }
 
@@ -4084,16 +4215,18 @@ final class SwanSQLiteTests: XCTestCase {
         let inspected = try await SQLiteConnection.open(storage: .file(path: path))
         do {
             let marker = try await inspected.query(
-                "SELECT 1 FROM permissioned_repository_migrations WHERE version = 3"
+                "SELECT 1 FROM permissioned_repository_migrations WHERE version = 23"
             )
             XCTAssertEqual(marker.count, 1)
             let stateRows = try await inspected.query(
-                "SELECT policy, managing_app FROM permissioned_simple_space_authorities WHERE space_uri = ?",
+                "SELECT read_policy, read_managing_app, write_policy, write_managing_app FROM permissioned_simple_space_authorities WHERE space_uri = ?",
                 [.text(fixture.space.rawValue)]
             )
             XCTAssertEqual(stateRows.count, 1)
-            XCTAssertEqual(stateRows.first?.column("policy")?.string, "managing-app")
-            XCTAssertEqual(stateRows.first?.column("managing_app")?.string, "did:web:manager.example")
+            XCTAssertEqual(stateRows.first?.column("read_policy")?.string, "managing-app")
+            XCTAssertEqual(stateRows.first?.column("read_managing_app")?.string, "did:web:manager.example")
+            XCTAssertEqual(stateRows.first?.column("write_policy")?.string, "managing-app")
+            XCTAssertEqual(stateRows.first?.column("write_managing_app")?.string, "did:web:manager.example")
             let foreignKeys = try await inspected.query("PRAGMA foreign_key_check")
             XCTAssertTrue(foreignKeys.isEmpty)
             try await inspected.close()
@@ -4102,6 +4235,116 @@ final class SwanSQLiteTests: XCTestCase {
             throw error
         }
     }
+    func testDurableSimpleSpaceIndependentReadWriteAccessAndMigration() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close(); try? FileManager.default.removeItem(at: fixture.root) } }
+
+        let space = try SpaceURI(authority: fixture.author, spaceType: "app.bsky.feed.post", skey: "asymm-db")
+        let authorization: AuthorizationContext = .accountOAuthForTesting(subject: fixture.author, scopes: ["atproto"])
+
+        // 1. Create space with readPolicy: memberList, writePolicy: public
+        _ = try await database.createSimpleSpace(
+            space: space,
+            owner: fixture.author,
+            configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .public, appAccess: .open),
+            authorization: authorization
+        )
+
+        let memberCarol = "did:plc:carol"
+        // Carol not yet a member: can write under public writePolicy, cannot read under memberList readPolicy
+        try await database.authorizeSimpleSpaceWrite(space: space, user: memberCarol)
+        await XCTAssertThrowsErrorAsync(
+            try await database.authorizeSimpleSpaceRead(
+                space: space,
+                user: memberCarol,
+                clientID: nil,
+                authorization: .accountOAuthForTesting(subject: memberCarol, scopes: ["atproto"])
+            )
+        )
+
+        // 2. Put member with read: true, write: false
+        _ = try await database.putSimpleSpaceMember(
+            space: space,
+            member: memberCarol,
+            read: true,
+            write: false,
+            authorization: authorization
+        )
+        // Carol can now read
+        try await database.authorizeSimpleSpaceRead(
+            space: space,
+            user: memberCarol,
+            clientID: nil,
+            authorization: .accountOAuthForTesting(subject: memberCarol, scopes: ["atproto"])
+        )
+
+        // 3. Update write policy to memberList: now Carol cannot write because Carol's write flag is false
+        _ = try await database.updateSimpleSpace(
+            space: space,
+            configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
+            authorization: authorization
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await database.authorizeSimpleSpaceWrite(space: space, user: memberCarol)
+        )
+
+        // 4. Re-put member with read: false, write: true (replaces both flags)
+        _ = try await database.putSimpleSpaceMember(
+            space: space,
+            member: memberCarol,
+            read: false,
+            write: true,
+            authorization: authorization
+        )
+        // Now Carol can write
+        try await database.authorizeSimpleSpaceWrite(space: space, user: memberCarol)
+        // But cannot read
+        await XCTAssertThrowsErrorAsync(
+            try await database.authorizeSimpleSpaceRead(
+                space: space,
+                user: memberCarol,
+                clientID: nil,
+                authorization: .accountOAuthForTesting(subject: memberCarol, scopes: ["atproto"])
+            )
+        )
+
+        // 5. Authority (owner) always admitted for both
+        try await database.authorizeSimpleSpaceWrite(space: space, user: fixture.author)
+        try await database.authorizeSimpleSpaceRead(
+            space: space,
+            user: fixture.author,
+            clientID: nil,
+            authorization: authorization
+        )
+
+        // 6. Explicit owner flags read: false, write: false are permitted,
+        // authority authorization bypasses flags by identity and preserves admission.
+        _ = try await database.putSimpleSpaceMember(
+            space: space,
+            member: fixture.author,
+            read: false,
+            write: false,
+            authorization: authorization
+        )
+        try await database.close()
+
+        let reopenedDatabase = try await fixture.open()
+        defer { Task { try? await reopenedDatabase.close() } }
+        let authority = try DurableSimpleSpaceAuthority(
+            database: reopenedDatabase,
+            credentialSecret: Data(repeating: 7, count: 32)
+        )
+        let ownerCredential = try await authority.issueReadCredential(
+            space: space,
+            user: fixture.author,
+            clientID: nil,
+            authorization: authorization
+        )
+        XCTAssertEqual(ownerCredential.credential.grant.subject, fixture.author)
+        try await reopenedDatabase.authorizeSimpleSpaceWrite(space: space, user: fixture.author)
+    }
+
 
     func testSQLiteCreatesOwnerOnlyRootDirectoriesAndDatabaseFiles() async throws {
         let root = FileManager.default.temporaryDirectory
@@ -4313,7 +4556,8 @@ final class SwanSQLiteTests: XCTestCase {
             space: space,
             owner: fixture.author,
             configuration: try SimpleSpaceConfiguration(
-                policy: .memberList,
+                readPolicy: .memberList,
+                writePolicy: .memberList,
                 appAccess: .open
             ),
             authorization: .accountOAuthForTesting(subject: fixture.author, scopes: ["atproto"]),
@@ -4364,7 +4608,7 @@ final class SwanSQLiteTests: XCTestCase {
 
         let page = try await readTask.value
         // Atomic snapshot MUST see [owner, alice] and MUST NOT see [bob]
-        XCTAssertEqual(Set(page.members), Set([fixture.author, memberAlice]))
+        XCTAssertEqual(Set(page.members.map(\.did)), Set([fixture.author, memberAlice]))
 
         // Subsequent read (new transaction) sees all three
         let updatedPage = try await database.simpleSpaceMemberPage(
@@ -4373,7 +4617,7 @@ final class SwanSQLiteTests: XCTestCase {
             cursor: nil,
             authorization: .accountOAuthForTesting(subject: fixture.author, scopes: ["atproto"])
         )
-        XCTAssertEqual(Set(updatedPage.members), Set([fixture.author, memberAlice, memberBob]))
+        XCTAssertEqual(Set(updatedPage.members.map(\.did)), Set([fixture.author, memberAlice, memberBob]))
     }
 
     func testValidatePortableRestoreStreamingReadsAtomicSnapshot() async throws {
@@ -4460,7 +4704,8 @@ final class SwanSQLiteTests: XCTestCase {
             space: space,
             owner: fixture.author,
             configuration: try SimpleSpaceConfiguration(
-                policy: .memberList,
+                readPolicy: .memberList,
+                writePolicy: .memberList,
                 appAccess: .open
             ),
             authorization: .accountOAuthForTesting(subject: fixture.author, scopes: ["atproto"]),
@@ -4822,7 +5067,7 @@ private func installLegacySimpleSpaceAuthoritySchema(_ fixture: Fixture) async t
             [.text(fixture.space.rawValue), .text(fixture.author)]
         )
         _ = try await legacy.query(
-            "DELETE FROM permissioned_repository_migrations WHERE version = 3"
+            "DELETE FROM permissioned_repository_migrations WHERE version IN (3, 23)"
         )
         _ = try await legacy.query("PRAGMA foreign_keys = ON")
         try await legacy.close()

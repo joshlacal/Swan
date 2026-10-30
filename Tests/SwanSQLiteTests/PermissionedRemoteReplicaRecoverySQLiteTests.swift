@@ -10,6 +10,207 @@ import XCTest
 @testable import SwanSQLite
 
 final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
+  func testDeletionNotificationPurgesOnlyRemoteSpaceAndPreventsRecoveryResurrection()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "deleted-remote-space")
+    let sibling = try RemoteReplicaSQLiteFixture(
+      name: "retained-remote-space", skey: "retained"
+    )
+    defer {
+      try? FileManager.default.removeItem(at: fixture.root)
+      try? FileManager.default.removeItem(at: sibling.root)
+    }
+    let database = try await fixture.open()
+    do {
+      // Neither space has an authored repository here: synchronized state
+      // alone must make the recipient recognize the deletion notification.
+      let history = try await installIncrementalHistory(
+        fixture: fixture, database: database, requestPrefix: "deleted-space"
+      )
+      let siblingHistory = try await installIncrementalHistory(
+        fixture: sibling, database: database, requestPrefix: "retained-space"
+      )
+      let replacement = try fixture.archive(
+        revision: "222222222222e", values: ["replacement"], ikmByte: 0x71
+      )
+      let staged = try await fixture.stage(
+        database: database, archive: replacement, expectedBase: history.head,
+        requestID: "deleted-space-replacement",
+        freshnessWitness: fixture.witness(for: replacement)
+      )
+      try await database.markPermissionedRemoteReplicaImportVerified(
+        sessionID: staged.session.id, verification: staged.verification,
+        now: RemoteReplicaSQLiteFixture.operationNow
+      )
+      let siblingReplacement = try sibling.archive(
+        revision: "222222222222e", values: ["retained replacement"], ikmByte: 0x72
+      )
+      let siblingStaged = try await sibling.stage(
+        database: database, archive: siblingReplacement,
+        expectedBase: siblingHistory.head,
+        requestID: "retained-space-replacement",
+        freshnessWitness: sibling.witness(for: siblingReplacement)
+      )
+      let delayedBatch = try makeChainedIncrementalBatch(
+        target: fixture.target, expectedHead: history.head, uri: history.uri,
+        startingCID: history.terminalCID,
+        terminalRevision: "222222222222e", requestID: "deleted-space-delayed",
+        requestSequence: 4, operationCount: 1, valuePrefix: "delayed"
+      ).batch
+      let before = try await remoteReplicaDeletionRowCounts(
+        database: database, space: fixture.space, sessionID: staged.session.id
+      )
+      let siblingBefore = try await remoteReplicaDeletionRowCounts(
+        database: database, space: sibling.space, sessionID: siblingStaged.session.id
+      )
+      for (table, count) in before {
+        XCTAssertGreaterThan(count, 0, "fixture must populate \(table)")
+      }
+
+      for offset in 0 ... 1 {
+        try await database.receiveSpaceDeletionNotification(
+          space: fixture.space, issuer: fixture.space.authority,
+          audience: fixture.receiverDID, eventID: "deleted-remote-space-event",
+          requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: fixture.space),
+          now: Date(timeIntervalSince1970: 110 + Double(offset))
+        )
+      }
+      let after = try await remoteReplicaDeletionRowCounts(
+        database: database, space: fixture.space, sessionID: staged.session.id
+      )
+      for (table, count) in after {
+        XCTAssertEqual(count, 0, "deletion must purge \(table)")
+      }
+      let siblingAfter = try await remoteReplicaDeletionRowCounts(
+        database: database, space: sibling.space, sessionID: siblingStaged.session.id
+      )
+      XCTAssertEqual(siblingAfter, siblingBefore)
+      let deletionMarkers = try await database.connection.query(
+        """
+        SELECT
+          (SELECT COUNT(*) FROM permissioned_space_recipient_tombstones
+           WHERE space_uri = ?) AS tombstones,
+          (SELECT COUNT(*) FROM permissioned_space_notification_receipts
+           WHERE space_uri = ? AND action = 'deleted') AS receipts
+        """,
+        [.text(fixture.space.rawValue), .text(fixture.space.rawValue)]
+      )
+      XCTAssertEqual(deletionMarkers.first?.column("tombstones")?.integer, 1)
+      XCTAssertEqual(deletionMarkers.first?.column("receipts")?.integer, 1)
+
+      await assertRemoteReplicaError(.unknownSession) {
+        try await database.stagePermissionedRemoteReplicaIndexEntry(
+          sessionID: staged.session.id,
+          entry: SpaceCARRecoveryIndexEntry(
+            path: "\(replacement.records[0].collection)/\(replacement.records[0].rkey)",
+            cid: replacement.records[0].cid
+          ),
+          now: RemoteReplicaSQLiteFixture.operationNow
+        )
+      }
+      await assertRemoteReplicaError(.unknownSession) {
+        try await database.publishVerifiedPermissionedRemoteReplicaRecovery(
+          sessionID: staged.session.id,
+          consumedAt: RemoteReplicaSQLiteFixture.operationNow + 1,
+          now: RemoteReplicaSQLiteFixture.operationNow,
+          publicationAuthorization: fixture.publicationAuthorization
+        )
+      }
+      await assertRemoteReplicaSpaceClosed {
+        try await fixture.start(
+          database: database, archive: replacement, expectedBase: nil,
+          requestID: "deleted-space-new-import",
+          freshnessWitness: fixture.witness(for: replacement)
+        )
+      }
+      await assertRemoteReplicaSpaceClosed {
+        try await database.applyVerifiedPermissionedRemoteReplicaBatch(
+          delayedBatch, appliedAt: 111
+        )
+      }
+      await assertRemoteReplicaSpaceClosed {
+        try await database.permissionedRemoteReplicaHead(target: fixture.target)
+      }
+      await assertRemoteReplicaSpaceClosed {
+        try await database.permissionedRemoteReplicaRecord(
+          target: fixture.target, collection: history.uri.collection,
+          rkey: history.uri.rkey
+        )
+      }
+      await assertRemoteReplicaSpaceClosed {
+        try await database.permissionedRemoteReplicaRecords(target: fixture.target)
+      }
+      await assertRemoteReplicaSpaceClosed {
+        try await database.permissionedRemoteReplicaIncrementalBaseState(target: fixture.target)
+      }
+      let retainedHead = try await database.permissionedRemoteReplicaHead(target: sibling.target)
+      XCTAssertEqual(retainedHead, siblingHistory.head)
+      let retainedRecords = try await database.permissionedRemoteReplicaRecords(target: sibling.target)
+      XCTAssertEqual(retainedRecords.count, 1)
+      XCTAssertEqual(retainedRecords.first?.cid, siblingHistory.terminalCID.string)
+      let retainedSession = try await database.permissionedRemoteReplicaImportSession(
+        id: siblingStaged.session.id
+      )
+      XCTAssertEqual(retainedSession, siblingStaged.session)
+      try await database.close()
+
+      let reopened = try await fixture.open()
+      do {
+        await assertRemoteReplicaSpaceClosed {
+          try await reopened.permissionedRemoteReplicaHead(target: fixture.target)
+        }
+        await assertRemoteReplicaSpaceClosed {
+          try await fixture.start(
+            database: reopened, archive: replacement, expectedBase: nil,
+            requestID: "deleted-space-reopened-import",
+            freshnessWitness: fixture.witness(for: replacement)
+          )
+        }
+        let reopenedSibling = try await reopened.permissionedRemoteReplicaHead(target: sibling.target)
+        XCTAssertEqual(reopenedSibling, siblingHistory.head)
+        try await reopened.close()
+      } catch {
+        try? await reopened.close()
+        throw error
+      }
+    } catch {
+      try? await database.close()
+      throw error
+    }
+  }
+
+  func testCanonicalRecordOrderRecoveryWithSharedCID() async throws {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "canonical-car-order")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    do {
+      let archive = try fixture.archive(
+        revision: "222222222222a",
+        values: ["shared", "distinct", "shared"],
+        ikmByte: 0x31,
+        rkeys: ["aa", "b", "z"]
+      )
+      let installed = try await fixture.install(
+        database: database, archive: archive, expectedBase: nil,
+        requestID: "canonical-car-order",
+        publicationAuthorization: fixture.publicationAuthorization
+      )
+      XCTAssertEqual(installed.result.head.generation, 1)
+      for record in archive.records {
+        let value = try await database.permissionedRemoteReplicaRecord(
+          target: fixture.target, collection: record.collection, rkey: record.rkey
+        )
+        XCTAssertEqual(value, record.value)
+      }
+      try await assertNoRemoteReplicaStaging(in: database)
+      try await database.close()
+    } catch {
+      try? await database.close()
+      throw error
+    }
+  }
+
   func testAuthenticatedBootstrapAndCurrentGenerationQualifiedRead()
     async throws
   {
@@ -2691,7 +2892,7 @@ private struct RemoteReplicaSQLiteFixture {
     }
   }
 
-  init(name: String) throws {
+  init(name: String, skey: String = "acceptance") throws {
     root = FileManager.default.temporaryDirectory.appending(
       path: "SwanRemoteReplica-\(name)-\(UUID().uuidString)",
       directoryHint: .isDirectory
@@ -2704,7 +2905,7 @@ private struct RemoteReplicaSQLiteFixture {
     space = try SpaceURI(
       authority: "did:plc:remote-replica-authority",
       spaceType: "app.swan.remote-replica",
-      skey: "acceptance"
+      skey: skey
     )
     target = try PermissionedRemoteReplicaTarget(
       receiverDID: receiverDID,
@@ -2723,9 +2924,10 @@ private struct RemoteReplicaSQLiteFixture {
   func archive(
     revision: String,
     values: [String],
-    ikmByte: UInt8
+    ikmByte: UInt8,
+    rkeys: [String]? = nil
   ) throws -> RemoteReplicaArchive {
-    guard !values.isEmpty else {
+    guard !values.isEmpty, rkeys == nil || rkeys?.count == values.count else {
       throw RemoteReplicaSQLiteTestError.emptyFixture
     }
     let collection = "app.bsky.feed.post"
@@ -2733,9 +2935,9 @@ private struct RemoteReplicaSQLiteFixture {
     var encodedRecords: [SpaceRecord] = []
     var ltHash = LtHash()
     for (index, text) in values.enumerated() {
-      let rkey = values.count == 1
+      let rkey = rkeys?[index] ?? (values.count == 1
         ? "record"
-        : String(format: "record-%04d", index)
+        : String(format: "record-%04d", index))
       let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
         (key: "text", value: text),
       ]))
@@ -3123,6 +3325,56 @@ private func assertRemoteReplicaError<T>(
       line: line
     )
   }
+}
+
+private func assertRemoteReplicaSpaceClosed<T>(
+  file: StaticString = #filePath,
+  line: UInt = #line,
+  operation: () async throws -> T
+) async {
+  do {
+    _ = try await operation()
+    XCTFail("a deleted remote space must remain closed", file: file, line: line)
+  } catch let error as SwanError {
+    guard case .unauthorized = error else {
+      return XCTFail("expected closed-space authorization failure, got \(error)", file: file, line: line)
+    }
+  } catch {
+    XCTFail("expected closed-space authorization failure, got \(error)", file: file, line: line)
+  }
+}
+
+private func remoteReplicaDeletionRowCounts(
+  database: SQLiteAccountDatabase,
+  space: SpaceURI,
+  sessionID: String
+) async throws -> [String: Int] {
+  var counts: [String: Int] = [:]
+  let spaceTables = [
+    "permissioned_remote_replica_state",
+    "permissioned_remote_replica_records",
+    "permissioned_remote_replica_blocks",
+    "permissioned_remote_replica_block_chunks",
+    "permissioned_remote_replica_import_sessions",
+    "permissioned_remote_replica_import_results",
+    "permissioned_remote_replica_incremental_results",
+    "permissioned_remote_replica_incremental_progress",
+  ]
+  let sessionTables = [
+    "permissioned_remote_replica_import_index",
+    "permissioned_remote_replica_import_blocks",
+    "permissioned_remote_replica_import_block_chunks",
+  ]
+  for table in spaceTables + sessionTables {
+    let column = spaceTables.contains(table) ? "space_uri" : "session_id"
+    let value = spaceTables.contains(table) ? space.rawValue : sessionID
+    let rows = try await database.connection.query(
+      "SELECT COUNT(*) AS row_count FROM \(table) WHERE \(column) = ?",
+      [.text(value)]
+    )
+    counts[table] = try XCTUnwrap(rows.first?.column("row_count")?.integer)
+  }
+  return counts
 }
 
 private func assertNoRemoteReplicaStaging(

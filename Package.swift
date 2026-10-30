@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "SwanSpaces", targets: ["SwanSpaces"]),
         .library(name: "SwanStorage", targets: ["SwanStorage"]),
         .library(name: "SwanSQLite", targets: ["SwanSQLite"]),
+        .library(name: "SwanDurableStore", targets: ["SwanDurableStore"]),
         .library(name: "SwanAccounts", targets: ["SwanAccounts"]),
         .library(name: "SwanAccountExport", targets: ["SwanAccountExport"]),
         .library(name: "SwanOAuth", targets: ["SwanOAuth"]),
@@ -19,19 +20,12 @@ let package = Package(
         .executable(name: "swan", targets: ["swan"]),
     ],
     dependencies: [
-        // Petrel comes from its published repository, pinned to an exact
-        // revision, not from a sibling checkout. A `path:` dependency compiles
-        // against whatever line the neighbouring working copy happens to be
-        // sitting on, which is invisible in this manifest and unreproducible
-        // anywhere else: Swan silently built against three different Petrel
-        // lines depending on who had checked out what. The pin below is the
-        // commit that makes `CIDAsLink` public, which every record carrying a
-        // blob or a StrongRef needs. Bump it deliberately, in a commit that
-        // says why.
-        .package(
-            url: "https://github.com/joshlacal/Petrel.git",
-            revision: "5c42f60325d10b8a75a4671e3a94df0c8134d648"
-        ),
+        // Immutable October 22 SDK. Its generated sources are unchanged from
+        // generator revision e1152365, which matches the pinned corpus; this
+        // revision adds only runtime fixes (credential refresh margin, precise
+        // exchange errors, getRepo archive cap, per-task download limit).
+        .package(url: "https://github.com/joshlacal/Petrel.git",
+                 revision: "4037e7760e2d1bb71db9a6cfdd0cd4134d4dd3bc"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.36.0"),
@@ -124,6 +118,13 @@ let package = Package(
             ]
         ),
         .target(
+            name: "SwanDurableStore",
+            dependencies: [
+                .product(name: "SQLiteNIO", package: "sqlite-nio"),
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
+        .target(
             name: "SwanAccounts",
             dependencies: [
                 "CATHandleDNS", "CLibsodium", "SwanCore", "SwanStorage",
@@ -192,6 +193,7 @@ let package = Package(
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOFoundationCompat", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOSSL", package: "swift-nio-ssl"),
@@ -215,6 +217,13 @@ let package = Package(
             ]
         ),
         .testTarget(name: "SwanCoreTests", dependencies: ["SwanCore", "SwanSpacesWire"]),
+        .testTarget(
+            name: "SwanDurableStoreTests",
+            dependencies: [
+                "SwanDurableStore", "SwanSQLite", "SwanStorage",
+                .product(name: "SQLiteNIO", package: "sqlite-nio"),
+            ]
+        ),
         .testTarget(
             name: "SwanSpacesTests",
             dependencies: [

@@ -325,7 +325,7 @@ final class SwanSpacesTests: XCTestCase {
         _ = try await authority.create(
             space: memberSpace,
             owner: "did:plc:alice",
-            configuration: try .init(policy: .memberList, appAccess: .allowList(["https://reader.example/client.json"]))
+            configuration: try .init(readPolicy: .memberList, writePolicy: .memberList, appAccess: .allowList(["https://reader.example/client.json"]))
         )
         try await authority.addMember(space: memberSpace, member: "did:plc:bob", by: "did:plc:alice")
         _ = try await authority.issueReadCredential(
@@ -342,7 +342,7 @@ final class SwanSpacesTests: XCTestCase {
         _ = try await authority.create(
             space: managedSpace,
             owner: "did:plc:alice",
-            configuration: try .init(policy: .managingApp, appAccess: .open, managingApp: "did:web:app.example#space")
+            configuration: try .init(readPolicy: .managingApp, readManagingApp: "did:web:app.example#space", writePolicy: .managingApp, writeManagingApp: "did:web:app.example#space", appAccess: .open)
         )
         await XCTAssertThrowsErrorAsync(
             try await authority.issueReadCredential(space: managedSpace, user: "did:plc:bob", clientID: nil)
@@ -355,9 +355,11 @@ final class SwanSpacesTests: XCTestCase {
         // Preserve a configured app through a policy-only transition, but
         // never retain its old allow decision when that policy is restored.
         let preservedAppPublic = try SimpleSpaceConfiguration(
-            policy: .public,
-            appAccess: .open,
-            managingApp: "did:web:app.example#space"
+            readPolicy: .public,
+            readManagingApp: "did:web:app.example#space",
+            writePolicy: .public,
+            writeManagingApp: "did:web:app.example#space",
+            appAccess: .open
         )
         try await authority.update(
             space: managedSpace,
@@ -365,7 +367,8 @@ final class SwanSpacesTests: XCTestCase {
             by: "did:plc:alice"
         )
         let publicState = await authority.space(managedSpace)
-        XCTAssertEqual(publicState?.configuration.managingApp, "did:web:app.example#space")
+        XCTAssertEqual(publicState?.configuration.readManagingApp, "did:web:app.example#space")
+        XCTAssertEqual(publicState?.configuration.writeManagingApp, "did:web:app.example#space")
         await XCTAssertThrowsErrorAsync(
             try await authority.setManagingAppAccess(
                 space: managedSpace,
@@ -377,9 +380,11 @@ final class SwanSpacesTests: XCTestCase {
         try await authority.update(
             space: managedSpace,
             configuration: try .init(
-                policy: .managingApp,
-                appAccess: .open,
-                managingApp: "did:web:app.example#space"
+                readPolicy: .managingApp,
+                readManagingApp: "did:web:app.example#space",
+                writePolicy: .managingApp,
+                writeManagingApp: "did:web:app.example#space",
+                appAccess: .open
             ),
             by: "did:plc:alice"
         )
@@ -391,19 +396,68 @@ final class SwanSpacesTests: XCTestCase {
             )
         )
     }
+    func testSimpleSpaceIndependentReadWriteAccessAsymmetry() async throws {
+        let authority = SimpleSpaceAuthority(credentialSecret: Data(repeating: 5, count: 32))
+        let spaceURI = try SpaceURI(authority: "did:plc:alice", spaceType: "app.bsky.bookmarks", skey: "asymm")
+        _ = try await authority.create(
+            space: spaceURI,
+            owner: "did:plc:alice",
+            configuration: try .init(readPolicy: .memberList, writePolicy: .public, appAccess: .open)
+        )
+        // Non-member bob: public write admits write, memberList read denies read
+        try await authority.authorizeWrite(space: spaceURI, writer: "did:plc:bob")
+        await XCTAssertThrowsErrorAsync(
+            try await authority.issueReadCredential(space: spaceURI, user: "did:plc:bob", clientID: nil)
+        )
+
+        // Add bob with read: true, write: false
+        try await authority.putMember(space: spaceURI, member: "did:plc:bob", read: true, write: false, by: "did:plc:alice")
+        // Now bob can read
+        _ = try await authority.issueReadCredential(space: spaceURI, user: "did:plc:bob", clientID: nil)
+
+        // Change write policy to member-list: now bob cannot write (write: false)
+        try await authority.update(
+            space: spaceURI,
+            configuration: try .init(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
+            by: "did:plc:alice"
+        )
+        _ = try await authority.issueReadCredential(space: spaceURI, user: "did:plc:bob", clientID: nil)
+        await XCTAssertThrowsErrorAsync(
+            try await authority.authorizeWrite(space: spaceURI, writer: "did:plc:bob")
+        )
+
+        // Update bob to read: false, write: true
+        try await authority.putMember(space: spaceURI, member: "did:plc:bob", read: false, write: true, by: "did:plc:alice")
+        // Now bob can write but cannot read
+        try await authority.authorizeWrite(space: spaceURI, writer: "did:plc:bob")
+        await XCTAssertThrowsErrorAsync(
+            try await authority.issueReadCredential(space: spaceURI, user: "did:plc:bob", clientID: nil)
+        )
+
+        // Authority access is identity-based, even after an explicit flag downgrade.
+        try await authority.putMember(
+            space: spaceURI, member: "did:plc:alice", read: false, write: false, by: "did:plc:alice"
+        )
+        _ = try await authority.issueReadCredential(space: spaceURI, user: "did:plc:alice", clientID: nil)
+        try await authority.authorizeWrite(space: spaceURI, writer: "did:plc:alice")
+    }
+
 
     func testSimpleSpaceDomainRejectsMalformedIdentifiersAcrossAuthorityOperations() async throws {
         await XCTAssertThrowsErrorAsync(
             try SimpleSpaceConfiguration(
-                policy: .memberList,
+                readPolicy: .memberList,
+                writePolicy: .memberList,
                 appAccess: .allowList(["reader\u{0000}client"])
             )
         )
         await XCTAssertThrowsErrorAsync(
             try SimpleSpaceConfiguration(
-                policy: .managingApp,
-                appAccess: .open,
-                managingApp: "app\u{007f}service"
+                readPolicy: .managingApp,
+                readManagingApp: "app\u{007f}service",
+                writePolicy: .managingApp,
+                writeManagingApp: "app\u{007f}service",
+                appAccess: .open
             )
         )
 
@@ -416,7 +470,7 @@ final class SwanSpacesTests: XCTestCase {
         _ = try await authority.create(
             space: space,
             owner: space.authority,
-            configuration: try SimpleSpaceConfiguration(policy: .public)
+            configuration: try SimpleSpaceConfiguration(readPolicy: .public, writePolicy: .public)
         )
         await XCTAssertThrowsErrorAsync(
             try await authority.issueReadCredential(
@@ -452,7 +506,7 @@ final class SwanSpacesTests: XCTestCase {
     func testProcessLocalSimpleSpaceAuthorityBoundsTotalSpaceState() async throws {
         let authority = SimpleSpaceAuthority(credentialSecret: Data(repeating: 9, count: 32))
         let owner = "did:plc:alice"
-        let configuration = try SimpleSpaceConfiguration(policy: .public)
+        let configuration = try SimpleSpaceConfiguration(readPolicy: .public, writePolicy: .public)
         for index in 0 ..< SimpleSpaceLimits.maximumSpacesPerAuthority {
             let space = try SpaceURI(
                 authority: owner,
@@ -724,7 +778,7 @@ final class SwanSpacesTests: XCTestCase {
         )
     }
 
-    func testQualifiedCollectionReadScopesDenyAggregatePermissionedReads() async throws {
+    func testQualifiedCollectionReadScopesPermitAllCollectionsAndAggregateReads() async throws {
         let fixture = try DurableRepositoryFixture()
         let database = try await fixture.open()
         defer { Task { try? await database.close() } }
@@ -770,23 +824,21 @@ final class SwanSpacesTests: XCTestCase {
             authorization: collectionLimited
         )
         XCTAssertEqual(allowedRecord?.value, fixture.firstValue)
-        await XCTAssertThrowsErrorAsync(
-            try await repository.record(otherCollection, authorization: collectionLimited)
-        )
-        await XCTAssertThrowsErrorAsync(
-            try await repository.snapshot(authorization: collectionLimited)
-        )
-        await XCTAssertThrowsErrorAsync(
-            try await repository.sync(since: 0, authorization: collectionLimited)
-        )
+        let otherRecord = try await repository.record(otherCollection, authorization: collectionLimited)
+        XCTAssertEqual(otherRecord?.value, fixture.secondValue)
+        let qualifiedSnapshot = try await repository.snapshot(authorization: collectionLimited)
+        XCTAssertEqual(qualifiedSnapshot.map(\.uri), [otherCollection, fixture.first])
+        guard case let .incremental(qualifiedEntries) = try await repository.sync(
+            since: 0, authorization: collectionLimited
+        ) else { return XCTFail("a collection-qualified read must permit aggregate sync") }
+        XCTAssertEqual(qualifiedEntries.count, 2)
         let signingKey = P256.Signing.PrivateKey()
-        await XCTAssertThrowsErrorAsync(
-            try await repository.exportCAR(
-                rev: try fixture.tid(2).toString(),
-                signingKey: signingKey,
-                authorization: collectionLimited
-            )
+        let qualifiedExport = try await repository.exportCAR(
+            rev: try fixture.tid(2).toString(),
+            signingKey: signingKey,
+            authorization: collectionLimited
         )
+        XCTAssertFalse(qualifiedExport.data.isEmpty)
 
         let wildcardScope = """
         space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=*
@@ -1129,7 +1181,8 @@ final class SwanSpacesTests: XCTestCase {
             ]
         )
         let initialConfiguration = try SimpleSpaceConfiguration(
-            policy: .memberList,
+            readPolicy: .memberList,
+            writePolicy: .memberList,
             appAccess: .allowList(["https://reader.example/client.json"])
         )
         let database = try await SQLiteAccountDatabase(
@@ -1147,7 +1200,7 @@ final class SwanSpacesTests: XCTestCase {
             authorization: manage
         )
         XCTAssertEqual(created.revision, 1)
-        XCTAssertEqual(created.space.members, [authorityDID])
+        XCTAssertEqual(created.space.members, [authorityDID: SimpleSpaceMember(did: authorityDID, read: true, write: true)])
 
         await XCTAssertThrowsErrorAsync(
             try await authority.addMember(
@@ -1275,9 +1328,11 @@ final class SwanSpacesTests: XCTestCase {
             skey: "managed"
         )
         let configuration = try SimpleSpaceConfiguration(
-            policy: .managingApp,
-            appAccess: .open,
-            managingApp: "did:web:reader.example#space"
+            readPolicy: .managingApp,
+            readManagingApp: "did:web:reader.example#space",
+            writePolicy: .managingApp,
+            writeManagingApp: "did:web:reader.example#space",
+            appAccess: .open
         )
         let aliceDatabase = try await SQLiteAccountDatabase(dataDirectory: root, did: alice)
         let aliceAuthority = try DurableSimpleSpaceAuthority(

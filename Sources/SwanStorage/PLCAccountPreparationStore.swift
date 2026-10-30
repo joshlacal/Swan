@@ -89,13 +89,17 @@ public struct PLCAccountPreparationOperationFacts: Sendable, Equatable {
     public let signingDIDKey: String
     public let rotationDIDKey: String
     public let signature: String
+    public let kemDIDKey: String?
 
     public init(
         signingDIDKey: String,
         rotationDIDKey: String,
-        signature: String
+        signature: String,
+        kemDIDKey: String? = nil
     ) throws {
-        guard Self.isP256DIDKey(signingDIDKey),
+        guard kemDIDKey.map(Self.isP256DIDKey) ?? true,
+              kemDIDKey != signingDIDKey, kemDIDKey != rotationDIDKey,
+              Self.isP256DIDKey(signingDIDKey),
               Self.isP256DIDKey(rotationDIDKey),
               signingDIDKey != rotationDIDKey,
               Self.isCanonicalP256Signature(signature) else {
@@ -104,6 +108,7 @@ public struct PLCAccountPreparationOperationFacts: Sendable, Equatable {
         self.signingDIDKey = signingDIDKey
         self.rotationDIDKey = rotationDIDKey
         self.signature = signature
+        self.kemDIDKey = kemDIDKey
     }
 
     private static func isP256DIDKey(_ value: String) -> Bool {

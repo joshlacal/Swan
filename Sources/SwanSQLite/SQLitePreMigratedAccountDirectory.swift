@@ -18,6 +18,7 @@ public actor SQLitePreMigratedAccountDirectory:
     AuthorizedPreopenedAccountDirectory,
     AuthorizedSimpleSpaceLifecycleDirectory,
     AuthorizedSimpleSpaceCredentialDirectory,
+    ConversationSpaceAuthorityLifecycle,
     AuthorizedSpaceRepositoryDirectory,
     AuthorizedSpaceBlobDirectory,
     AuthorizedSpaceNotificationDirectory,
@@ -570,21 +571,39 @@ public actor SQLitePreMigratedAccountDirectory:
         try await requireLifecycleAuthorityStillAvailable(space.authority)
     }
 
-    public func addSimpleSpaceMember(
+    public func putSimpleSpaceMember(
         _ member: String,
-        to space: SpaceURI,
+        read: Bool,
+        write: Bool,
+        in space: SpaceURI,
         authorization: AuthorizationContext
     ) async throws {
         let authority = try await lifecycleAuthority(
             for: space,
             authorization: authorization
         )
-        _ = try await authority.addMember(
+        _ = try await authority.putMember(
             space: space,
             member: member,
+            read: read,
+            write: write,
             authorization: authorization
         )
         try await requireLifecycleAuthorityStillAvailable(space.authority)
+    }
+
+    public func addSimpleSpaceMember(
+        _ member: String,
+        to space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws {
+        try await putSimpleSpaceMember(
+            member,
+            read: true,
+            write: true,
+            in: space,
+            authorization: authorization
+        )
     }
 
     public func removeSimpleSpaceMember(
@@ -636,7 +655,7 @@ public actor SQLitePreMigratedAccountDirectory:
     /// policy transaction commits.
     public func authorizeSimpleSpaceCredentialRead(
         space: SpaceURI,
-        user: String,
+        user: String?,
         clientID: String?,
         authorization: AuthorizationContext
     ) async throws {
@@ -685,6 +704,83 @@ public actor SQLitePreMigratedAccountDirectory:
         } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
+    }
+
+    public func registerKnownConversationSpace(space: SpaceURI, now: Date) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        do {
+            try await database.registerKnownConversationSpace(space: space, now: now)
+            try await requireCredentialAuthorityStillAvailable(space.authority)
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
+    }
+
+    public func requireConversationSpaceActive(space: SpaceURI) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        do {
+            try await database.requireConversationSpaceActive(space: space)
+            try await requireCredentialAuthorityStillAvailable(space.authority)
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
+    }
+
+    public func beginConversationSpaceDeletion(space: SpaceURI, authorization: AuthorizationContext, now: Date) async throws -> ConversationSpaceDeletion {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        do {
+            let result = try await database.beginConversationSpaceDeletion(space: space, authorization: authorization, now: now)
+            try await requireCredentialAuthorityStillAvailable(space.authority)
+            return result
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
+    }
+
+    public func deferConversationSpaceDeletion(_ deletion: ConversationSpaceDeletion, now: Date) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: deletion.space)
+        do {
+            try await database.deferConversationSpaceDeletion(deletion, now: now)
+            try await requireCredentialAuthorityStillAvailable(deletion.space.authority)
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
+    }
+
+    public func finishConversationSpaceDeletion(_ deletion: ConversationSpaceDeletion, now: Date) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: deletion.space)
+        do {
+            try await database.finishConversationSpaceDeletion(deletion, now: now)
+            try await requireCredentialAuthorityStillAvailable(deletion.space.authority)
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
+    }
+
+    public func receiveMembershipVerifiedConversationSpaceWriteNotification(
+        _ notification: AuthorizedSpaceWriteNotification, now: Date
+    ) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: notification.space)
+        do {
+            try await database.receiveMembershipVerifiedConversationSpaceWriteNotification(notification, now: now)
+            try await requireCredentialAuthorityStillAvailable(notification.space.authority)
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch let error as AuthorizedSpaceWriteNotificationError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
+    }
+
+    public func pendingConversationSpaceDeletions(authority: String) async throws -> [ConversationSpaceDeletion] {
+        guard let database = try await preopenedActiveDatabaseIfHosted(authority) else {
+            throw SwanError.unauthorized("authority account is unavailable")
+        }
+        do {
+            let result = try await database.pendingConversationSpaceDeletions(authority: authority)
+            try await requireCredentialAuthorityStillAvailable(authority)
+            return result
+        } catch let error as SwanError { throw error }
+        catch let error as AuthorizedSimpleSpaceLifecycleError { throw error }
+        catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
     }
 
     public func unregisterSpaceNotification(
@@ -757,16 +853,18 @@ public actor SQLitePreMigratedAccountDirectory:
         // The direct writer->authority message is the only notifyWrite shape
         // that this host may apply. Authority->recipient fanout is a delivery
         // hint for a remote synchronizer, not remote operation application;
-        // it deliberately succeeds as a no-op here, matching the pinned PDS
-        // behavior for a host that does not own the space authority.
+        // it deliberately succeeds as a no-op here.
         guard notification.audience == notification.space.authority,
               notification.issuer == notification.repository else {
             return
         }
+        // A space whose authority this host does not serve is unknown here:
+        // `SpaceNotFound`, as the reference's `assertSpaceHost` answers. The
+        // sender's outbox treats that 4xx as permanent and stops retrying.
         guard let database = try await preopenedActiveDatabaseIfHosted(
             notification.space.authority
         ) else {
-            return
+            throw AuthorizedSimpleSpaceLifecycleError.notFound
         }
         do {
             try await database.receiveSpaceWriteNotification(notification)
@@ -776,6 +874,8 @@ public actor SQLitePreMigratedAccountDirectory:
         } catch let error as SwanError {
             throw error
         } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch let error as AuthorizedSpaceWriteNotificationError {
             throw error
         } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
@@ -789,6 +889,24 @@ public actor SQLitePreMigratedAccountDirectory:
         eventID: String,
         requestBodyDigest: String
     ) async throws {
+        try await receiveSpaceDeletionNotification(
+            space: space,
+            issuer: issuer,
+            audience: audience,
+            eventID: eventID,
+            requestBodyDigest: requestBodyDigest,
+            issuedAt: nil
+        )
+    }
+
+    public func receiveSpaceDeletionNotification(
+        space: SpaceURI,
+        issuer: String,
+        audience: String,
+        eventID: String,
+        requestBodyDigest: String,
+        issuedAt: Date?
+    ) async throws {
         guard let database = try await preopenedActiveDatabaseIfHosted(audience) else {
             return
         }
@@ -798,7 +916,8 @@ public actor SQLitePreMigratedAccountDirectory:
                 issuer: issuer,
                 audience: audience,
                 eventID: eventID,
-                requestBodyDigest: requestBodyDigest
+                requestBodyDigest: requestBodyDigest,
+                issuedAt: issuedAt
             )
             guard try await isActiveAccount(audience), !isClosed else {
                 throw SwanError.unavailable("authenticated space directory is unavailable")
@@ -1062,6 +1181,43 @@ public actor SQLitePreMigratedAccountDirectory:
     /// that was opened at startup. The durable repository applies aggregate
     /// read policy before it can read any record, and this facade rechecks
     /// account lifecycle/path validity before returning the opaque spool.
+    public func repositorySTARSnapshot(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositorySTARSnapshot? {
+        let database = try await preopenedRepositoryDatabase(
+            for: author,
+            authorization: authorization
+        )
+        guard let database else {
+            throw SwanError.unauthorized("account repository is unavailable")
+        }
+        do {
+            let repository = try DurableSpaceRepository(
+                database: database,
+                space: space,
+                author: author
+            )
+            let snapshot = try await repository.prepareSTARSnapshot(
+                authorization: authorization
+            )
+            guard try await isActiveAccount(author) else {
+                snapshot?.spool.cleanup()
+                throw SwanError.unauthorized("account repository is unavailable")
+            }
+            guard !isClosed else {
+                snapshot?.spool.cleanup()
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return snapshot
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
     public func repositoryCARSnapshot(
         space: SpaceURI,
         author: String,
@@ -1513,7 +1669,7 @@ public actor SQLitePreMigratedAccountDirectory:
             try PublicRepositoryReadBlobTarget(
                 did: account.did,
                 status: account.status,
-                store: database
+                store: SQLitePublicRepositoryReadBlobStore(database: database)
             )
         )
     }
@@ -3092,6 +3248,21 @@ private actor SQLiteGenerationRefreshingPublicMutationStore:
 
     func uploadedBlobMetadata(cid: String) async throws -> PublicBlobMetadata? {
         try await database.uploadedBlobMetadata(cid: cid)
+    }
+}
+
+/// Public blob serving is narrower than retained namespace storage: a CID
+/// must still be referenced by a public record when metadata or bytes open.
+/// The database checks the record projection and namespace in one snapshot.
+private struct SQLitePublicRepositoryReadBlobStore: PublicRepositoryReadBlobStore {
+    let database: SQLiteAccountDatabase
+
+    func publicBlob(cid: String) async throws -> PublicBlob? {
+        try await database.publicRepositoryBlob(cid: cid)
+    }
+
+    func publicBlobMetadata(cid: String) async throws -> PublicBlobMetadata? {
+        try await database.publicRepositoryBlobMetadata(cid: cid)
     }
 }
 

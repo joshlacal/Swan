@@ -176,6 +176,42 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
         )
     }
 
+    /// Explicit collections opt out of live defaults. Updating a declaration
+    /// changes neither the client's stated collection set nor its read access.
+    func testExplicitCollectionsRemainStableWhenTheDeclarationChanges() async throws {
+        let resolver = MutableStubLexiconResolver([
+            Self.spaceType: .space(LexiconSpace(name: "Forum", collections: [Self.thread])),
+        ])
+        let client = try PermissionedScopeClient(
+            scopes: ["atproto", "space:\(Self.spaceType)?collection=\(Self.thread)"],
+            kind: .localhostBridge
+        )
+        let fixture = try await PermissionedScopeFixture.make(lexiconResolver: resolver)
+        defer { Task { await fixture.tearDown() } }
+        let issued = try await fixture.mint(client: client, proofID: "rederive-explicit-mint")
+
+        resolver.replace([
+            Self.spaceType: .space(LexiconSpace(name: "Forum", collections: [Self.reply])),
+        ])
+        let rotated = try await fixture.runtime.tokenService.redeemLocalhostPublicRefresh(
+            try XCTUnwrap(issued.refreshToken),
+            clientID: client.clientID,
+            dpopProof: try client.session(proofID: "rederive-explicit-refresh").dpopProof,
+            requestedScopes: client.scopeSet
+        )
+        let refreshed = try await fixture.permissions(
+            accessToken: rotated.accessToken, client: client, jti: "rederive-explicit-after"
+        )
+        XCTAssertTrue(refreshed.allowsSpace(Self.write(Self.thread)))
+        XCTAssertFalse(refreshed.allowsSpace(Self.write(Self.reply)))
+        XCTAssertTrue(refreshed.allowsSpace(SpaceScopeTarget(
+            type: Self.spaceType,
+            authority: PermissionedScopeFixture.subject,
+            skey: "self",
+            operation: .readSelf(aggregate: false, collection: Self.reply)
+        )))
+    }
+
     // MARK: - Failure policy
 
     /// **Chosen policy: a re-derivation failure FAILS the refresh, and does not

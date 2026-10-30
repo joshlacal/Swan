@@ -283,19 +283,22 @@ public struct PublicPLCGenesisFacts: Sendable, Equatable {
     public let canonicalHandle: String
     public let pdsOrigin: String
     public let signature: String
+    public let kemDIDKey: String?
 
     public init(
         signingDIDKey: String,
         rotationDIDKey: String,
         canonicalHandle: String,
         pdsOrigin: String,
-        signature: String
+        signature: String,
+        kemDIDKey: String? = nil
     ) {
         self.signingDIDKey = signingDIDKey
         self.rotationDIDKey = rotationDIDKey
         self.canonicalHandle = canonicalHandle
         self.pdsOrigin = pdsOrigin
         self.signature = signature
+        self.kemDIDKey = kemDIDKey
     }
 }
 

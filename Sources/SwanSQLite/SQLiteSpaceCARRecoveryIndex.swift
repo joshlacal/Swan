@@ -139,7 +139,7 @@ public actor SQLiteSpaceCARRecoveryIndex: SpaceCARRecoveryIndex {
             _ = try await opened.query(
                 """
                 CREATE INDEX recovery_index_consumption_order
-                ON recovery_index(consumed, path)
+                ON recovery_index(consumed, length(path), path)
                 """
             )
             _ = try await opened.query(
@@ -232,7 +232,7 @@ public actor SQLiteSpaceCARRecoveryIndex: SpaceCARRecoveryIndex {
         }
     }
 
-    public func nextUnconsumedLexicographicEntry() async throws
+    public func nextUnconsumedCanonicalEntry() async throws
         -> SpaceCARRecoveryIndexEntry?
     {
         try Task.checkCancellation()
@@ -243,7 +243,7 @@ public actor SQLiteSpaceCARRecoveryIndex: SpaceCARRecoveryIndex {
                 SELECT path, cid
                 FROM recovery_index
                 WHERE consumed = 0
-                ORDER BY path ASC
+                ORDER BY length(path), path
                 LIMIT 1
                 """
             )
@@ -256,39 +256,44 @@ public actor SQLiteSpaceCARRecoveryIndex: SpaceCARRecoveryIndex {
         }
     }
 
-    public func consumeEntries(forCID cid: CID) async throws -> Int {
-        try Task.checkCancellation()
+    public func hasConsumedCID(_ cid: CID) async throws -> Bool {
         try requireOpen()
         do {
-            let countRows = try await connection.query(
-                """
-                INSERT OR IGNORE INTO recovery_consumptions(cid, path_count)
-                SELECT ?, COUNT(*)
-                FROM recovery_index
-                WHERE cid = ? AND consumed = 0
-                HAVING COUNT(*) > 0
-                RETURNING path_count
-                """,
-                [cid.bytes.sqliteData!, cid.bytes.sqliteData!]
+            let rows = try await connection.query(
+                "SELECT 1 FROM recovery_consumptions WHERE cid = ? LIMIT 1",
+                [cid.bytes.sqliteData!]
             )
-            guard countRows.count == 1,
-                  let changed = countRows[0]
-                    .column("path_count")?.integer,
-                  changed > 0,
-                  changed
-                    <= SpaceCARRecoveryLimits.absoluteMaximumIndexEntries
-            else {
+            return !rows.isEmpty
+        } catch {
+            throw SpaceCARStreamingError.stagingUnavailable
+        }
+    }
+
+    public func consumeEntry(_ entry: SpaceCARRecoveryIndexEntry) async throws {
+        try Task.checkCancellation()
+        try requireOpen()
+        guard try await nextUnconsumedCanonicalEntry() == entry else {
+            throw SpaceCARStreamingError.invalidRecordOrder
+        }
+        do {
+            let rows = try await connection.query(
+                """
+                UPDATE recovery_index SET consumed = 1
+                WHERE path = ? AND cid = ? AND consumed = 0
+                RETURNING path
+                """,
+                [Data(entry.path.utf8).sqliteData!, entry.cid.bytes.sqliteData!]
+            )
+            guard rows.count == 1 else {
                 throw SpaceCARStreamingError.invalidRecordOrder
             }
             _ = try await connection.query(
                 """
-                UPDATE recovery_index
-                SET consumed = 1
-                WHERE cid = ? AND consumed = 0
+                INSERT INTO recovery_consumptions(cid, path_count) VALUES (?, 1)
+                ON CONFLICT(cid) DO UPDATE SET path_count = path_count + 1
                 """,
-                [cid.bytes.sqliteData!]
+                [entry.cid.bytes.sqliteData!]
             )
-            return Int(changed)
         } catch let error as SpaceCARStreamingError {
             throw error
         } catch {

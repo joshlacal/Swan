@@ -319,7 +319,8 @@ public actor PLCAccountPreparationService {
             keys = try await keyProvisioner.installInitial(
                 accountDID: staged.did,
                 signingKey: staged.signingKey,
-                rotationKey: staged.rotationKey
+                rotationKey: staged.rotationKey,
+                kemKey: staged.kemKey
             )
             try await hooks.afterDIDEnvelopesPromoted?()
             let journal = try PLCAccountPreparationJournal(
@@ -425,6 +426,10 @@ public actor PLCAccountPreparationService {
                   try controlReference(keys.rotationReference) == journal.rotationKey else {
                 throw PLCAccountPreparationError.remoteMismatch
             }
+            if let expectedKEM = journal.operation.kemDIDKey {
+                let kem = try await AccountKEMKeyProvider(keyStore: keyStore).privateKey(accountDID: intent.did)
+                guard try AccountKEMKeyProvider.didKey(kem.publicKey) == expectedKEM else { throw PLCAccountPreparationError.remoteMismatch }
+            }
             return keys
         } catch let error as PLCAccountPreparationError {
             throw error
@@ -439,12 +444,13 @@ public actor PLCAccountPreparationService {
         keys: ProvisionedAccountKeys
     ) throws -> PLCSignedOperation {
         do {
-            let operation = try PLCOperationCodec.reconstructGenesis(
+            let operation = try SwanPLCGenesisCodec.reconstructGenesis(
                 signingDIDKey: journal.operation.signingDIDKey,
                 rotationDIDKey: journal.operation.rotationDIDKey,
                 canonicalHandle: journal.canonicalHandle,
                 pdsOrigin: journal.pdsOrigin,
-                signature: journal.operation.signature
+                signature: journal.operation.signature,
+                kemDIDKey: journal.operation.kemDIDKey
             )
             try PLCOperationCodec.verifyGenesis(operation, expectedDID: intent.did)
             guard try operation.cid.string == intent.operationCID,
@@ -668,14 +674,15 @@ public actor PLCAccountPreparationService {
     ) throws -> PLCAccountPreparationOperationFacts {
         guard let regular = operation.regular,
               let signingDIDKey = regular.verificationMethods["atproto"],
-              regular.verificationMethods.count == 1,
+              Set(regular.verificationMethods.keys).isSubset(of: ["atproto", "atproto_kem"]),
               regular.rotationKeys.count == 1 else {
             throw PLCAccountPreparationError.remoteMismatch
         }
         return try PLCAccountPreparationOperationFacts(
             signingDIDKey: signingDIDKey,
             rotationDIDKey: regular.rotationKeys[0],
-            signature: regular.signature
+            signature: regular.signature,
+            kemDIDKey: regular.verificationMethods["atproto_kem"]
         )
     }
 

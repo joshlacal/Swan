@@ -16,6 +16,9 @@ public struct VerifiedSpaceServiceAuthentication: Sendable, Equatable {
     public let eventID: String
     public let requestBodyDigest: String?
     public let expiresAt: Date
+    /// The token's `iat`, when it carries one. Unbound (no `req`) upstream
+    /// tokens are admitted only with an `iat` and a lifetime of at most 60 s.
+    public let issuedAt: Date?
 
     public init(
         issuer: String,
@@ -23,7 +26,8 @@ public struct VerifiedSpaceServiceAuthentication: Sendable, Equatable {
         method: String,
         eventID: String,
         requestBodyDigest: String? = nil,
-        expiresAt: Date
+        expiresAt: Date,
+        issuedAt: Date? = nil
     ) {
         self.issuer = issuer
         self.audience = audience
@@ -31,6 +35,7 @@ public struct VerifiedSpaceServiceAuthentication: Sendable, Equatable {
         self.eventID = eventID
         self.requestBodyDigest = requestBodyDigest
         self.expiresAt = expiresAt
+        self.issuedAt = issuedAt
     }
 
     public init(
@@ -47,6 +52,7 @@ public struct VerifiedSpaceServiceAuthentication: Sendable, Equatable {
         self.eventID = eventID
         self.requestBodyDigest = requestBodyDigest
         self.expiresAt = expiresAt
+        issuedAt = nil
     }
 }
 
@@ -69,7 +75,9 @@ public protocol SpaceServiceAuthenticationVerifier: Sendable {
 
 /// A small authority-scoped signer used only by durable notification
 /// transports. It cannot sign arbitrary HTTP requests or arbitrary JWT
-/// claims, and binds the outbox's stable event ID as the service JTI.
+/// claims, and binds the caller's event ID as the service JTI. Both the
+/// writer outbox and the authority fanout pass a fresh ID for every delivery
+/// attempt.
 public protocol SpaceServiceAuthenticationIssuer: Sendable {
     func issue(
         issuer: String,
@@ -311,7 +319,8 @@ public struct DurableSpaceServiceAuthenticationVerifier: SpaceServiceAuthenticat
             method: expectedMethod,
             eventID: eventID,
             requestBodyDigest: claims.requestBodyDigest,
-            expiresAt: Date(timeIntervalSince1970: TimeInterval(claims.exp))
+            expiresAt: Date(timeIntervalSince1970: TimeInterval(claims.exp)),
+            issuedAt: claims.iat.map { Date(timeIntervalSince1970: TimeInterval($0)) }
         )
     }
 }
@@ -406,7 +415,9 @@ private func validServiceAudience(_ value: String) -> Bool {
 }
 
 private func validServiceMethod(_ value: String) -> Bool {
-    value.hasPrefix("com.atproto.") && value.utf8.count <= 317 && value.utf8.allSatisfy {
+    (value.hasPrefix("com.atproto.") || value == "blue.catbird.labyrinth.getSpaceMembership"
+        || value == "blue.catbird.labyrinth.deleteSpaceGeneration")
+        && value.utf8.count <= 317 && value.utf8.allSatisfy {
         ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "z"))
             || ($0 >= UInt8(ascii: "A") && $0 <= UInt8(ascii: "Z"))
             || ($0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9"))

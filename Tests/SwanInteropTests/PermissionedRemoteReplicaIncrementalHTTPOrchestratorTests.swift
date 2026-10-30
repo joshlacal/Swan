@@ -1,6 +1,7 @@
 import Crypto
 import Foundation
 import Petrel
+import PetrelCrypto
 @testable import SwanInterop
 import SwanOAuth
 import SwanSpaces
@@ -151,7 +152,7 @@ final class PermissionedRemoteReplicaIncrementalHTTPOrchestratorTests:
             ComAtprotoSpaceListRepoOps.Output(
                 ops: Array(repeating: fixture.operation, count: 1_000),
                 commit: nil,
-                cursor: nil
+                cursor: "\(fixture.revision.toString())/999"
             )
         )
         let transport = IncrementalTransport(
@@ -177,6 +178,69 @@ final class PermissionedRemoteReplicaIncrementalHTTPOrchestratorTests:
         XCTAssertNil(capturedBatch)
         let paths = await transport.paths()
         XCTAssertEqual(paths, ["/xrpc/com.atproto.space.listRepoOps"])
+    }
+
+    func testExtendedAtomicCommitlessPageSelectsFullRecovery() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        let output = ComAtprotoSpaceListRepoOps.Output(
+            ops: Array(repeating: fixture.operation, count: 1_500), commit: nil,
+            cursor: "\(fixture.revision.toString())/1499"
+        )
+        let transport = IncrementalTransport(listStatus: 200, listBody: try JSONEncoder().encode(output), latestBody: Data())
+        let store = CapturingIncrementalStore(base: fixture.base)
+        let orchestrator = try fixture.orchestrator(transport: transport, store: store)
+        let result = try await orchestrator.synchronize(target: fixture.target, requestID: "extended-page", requestSequence: 1, appliedAt: 1)
+        XCTAssertEqual(result, .fullCARRecoveryRequired)
+        let batch = await store.capturedBatch()
+        XCTAssertNil(batch)
+    }
+
+    func testAuthenticatedIntervalOverAggregateValueBudgetSelectsFullRecovery() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        var hash = LtHash()
+        let operations = try ["a", "b"].map { suffix in
+            let value = ATProtocolValueContainer.object(["text": .string(String(repeating: suffix, count: 600 * 1_024))])
+            let cid = try CID.fromDAGCBOR(DAGCBOR.encodeValue(value.toCBORValue()))
+            let rkey = "large-\(suffix)"
+            hash.add(element: "app.bsky.feed.post/\(rkey)/\(cid.string)")
+            return ComAtprotoSpaceListRepoOps.OpEntry(rev: fixture.revision, collection: fixture.operation.collection,
+                rkey: try RecordKey(keyString: rkey), cid: cid, prev: nil, value: value)
+        }
+        let commit = ComAtprotoSpaceDefs.Commit(ver: 1, repo: fixture.commit.repo, space: fixture.commit.space,
+            rev: fixture.revision, data: Bytes(data: hash.commitment))
+        let body = try JSONEncoder().encode(ComAtprotoSpaceListRepoOps.Output(ops: operations, commit: commit, cursor: nil))
+        XCTAssertGreaterThan(body.count, 1_024 * 1_024)
+        XCTAssertLessThan(body.count, 2 * 1_024 * 1_024)
+        let transport = IncrementalTransport(listStatus: 200, listBody: body, latestBody: try fixture.latestBody(commit: commit))
+        let store = CapturingIncrementalStore(base: fixture.base)
+        let orchestrator = try fixture.orchestrator(transport: transport, store: store)
+        let result = try await orchestrator.synchronize(target: fixture.target, requestID: "large-verified-interval", requestSequence: 1, appliedAt: 1)
+        XCTAssertEqual(result, .fullCARRecoveryRequired)
+        let batch = await store.capturedBatch()
+        XCTAssertNil(batch)
+        let paths = await transport.paths()
+        XCTAssertEqual(paths, ["/xrpc/com.atproto.space.listRepoOps", "/xrpc/com.atproto.space.getLatestCommit"])
+    }
+
+    func testMalformedContinuationAndTerminalCursorFailBeforePublication() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        for (cursor, terminal) in [("malformed", false), ("\(fixture.revision.toString())/-1", false), ("222222222222a/999", false), ("\(fixture.revision.toString())/0", true)] {
+            let output = ComAtprotoSpaceListRepoOps.Output(
+                ops: Array(repeating: fixture.operation, count: terminal ? 1 : 1_000),
+                commit: terminal ? fixture.commit : nil, cursor: cursor
+            )
+            let transport = IncrementalTransport(listStatus: 200, listBody: try JSONEncoder().encode(output), latestBody: Data())
+            let store = CapturingIncrementalStore(base: fixture.base)
+            let orchestrator = try fixture.orchestrator(transport: transport, store: store)
+            do {
+                _ = try await orchestrator.synchronize(target: fixture.target, requestID: "bad-cursor", requestSequence: 1, appliedAt: 1)
+                XCTFail("invalid cursor accepted")
+            } catch {
+                XCTAssertEqual(error as? PermissionedRemoteReplicaIncrementalVerificationError, terminal ? .invalidOperation : .invalidCommit)
+            }
+            let batch = await store.capturedBatch()
+            XCTAssertNil(batch)
+        }
     }
 
     func testValidIncrementalPageBeyondJSONClientLimitSelectsFullCARRecovery() async throws {
@@ -316,8 +380,8 @@ private struct HTTPIncrementalFixture {
     let target: PermissionedRemoteReplicaTarget
     let base: PermissionedRemoteReplicaIncrementalBaseState
     let operation: ComAtprotoSpaceListRepoOps.OpEntry
-    let commit: ComAtprotoSpaceDefs.SignedCommit
-    let key: P256.Signing.PrivateKey
+    let commit: ComAtprotoSpaceDefs.Commit
+    let key: P256.KeyAgreement.PrivateKey
     let revision: TID
     let valueBytes: Data
     private let finalHash: LtHash
@@ -366,32 +430,20 @@ private struct HTTPIncrementalFixture {
         var hash = LtHash()
         hash.add(element: "app.bsky.feed.post/one/\(cid.string)")
         finalHash = hash
-        key = P256.Signing.PrivateKey()
-        commit = try Self.wireCommit(
-            try SpaceCommitCodec.sign(
-                context: try .init(
-                    space: space,
-                    author: repository,
-                    rev: revision.toString(),
-                    ikm: Data(repeating: 0x44, count: 32)
-                ),
-                commitment: hash.commitment,
-                key: key
-            )
+        key = try Self.kemKey()
+        commit = .init(
+            ver: 1, repo: try DID(didString: repository), space: try SpaceRef(uriString: space.rawValue),
+            rev: revision, data: Bytes(data: hash.commitment)
         )
     }
 
-    func signedCommit(revision: TID) throws -> ComAtprotoSpaceDefs.SignedCommit {
-        try Self.wireCommit(SpaceCommitCodec.sign(
-            context: try .init(
-                space: target.space,
-                author: target.repositoryDID,
-                rev: revision.toString(),
-                ikm: Data(repeating: 0x55, count: 32)
-            ),
-            commitment: finalHash.commitment,
-            key: key
-        ))
+    static func kemKey() throws -> P256.KeyAgreement.PrivateKey {
+        try P256.KeyAgreement.PrivateKey(rawRepresentation: Data(repeating: 0x42, count: 32))
+    }
+
+    func signedCommit(revision: TID) throws -> ComAtprotoSpaceDefs.Commit {
+        .init(ver: 1, repo: try DID(didString: target.repositoryDID),
+              space: try SpaceRef(uriString: target.space.rawValue), rev: revision, data: Bytes(data: finalHash.commitment))
     }
 
     func listBody() throws -> Data {
@@ -401,7 +453,7 @@ private struct HTTPIncrementalFixture {
     }
 
     func latestBody(
-        commit: ComAtprotoSpaceDefs.SignedCommit
+        commit: ComAtprotoSpaceDefs.Commit
     ) throws -> Data {
         try encoder.encode(ComAtprotoSpaceGetLatestCommit.Output(commit: commit))
     }
@@ -428,7 +480,7 @@ private struct HTTPIncrementalFixture {
                 label: "source",
                 client: .init(http: http),
                 authorization: .bearer(token: "test-only"),
-                permissionedCommitVerificationKey: .p256(key.publicKey)
+                permissionedKEMKey: try P256DIDKey(publicKey: P256.Signing.PublicKey(compressedRepresentation: key.publicKey.compressedRepresentation)).value
             ),
             store: store
         )
@@ -440,18 +492,6 @@ private struct HTTPIncrementalFixture {
         return encoder
     }
 
-    private static func wireCommit(
-        _ envelope: SpaceCommitEnvelope
-    ) throws -> ComAtprotoSpaceDefs.SignedCommit {
-        .init(
-            ver: envelope.ver,
-            hash: Bytes(data: envelope.commitment),
-            ikm: Bytes(data: envelope.context.ikm),
-            sig: Bytes(data: envelope.contextSignature),
-            mac: Bytes(data: envelope.contentBinding),
-            rev: try TID(tidString: envelope.context.rev)
-        )
-    }
 }
 
 private actor CapturingIncrementalStore:
@@ -515,7 +555,7 @@ private actor IncrementalTransport {
     func execute(
         method: InteropHTTPMethod,
         url: URL,
-        headers _: [String: String],
+        headers: [String: String],
         body _: Data?,
         limit: Int
     ) throws -> InteropHTTPResponse {
@@ -537,9 +577,24 @@ private actor IncrementalTransport {
             throw InteropHTTPError.unexpectedStatus(404)
         }
         guard body.count <= limit else { throw InteropHTTPError.responseTooLarge }
+        var responseHeaders = ["content-type": "application/json"]
+        let want = try SpaceMACHeaders.parseWantMAC(headers[SpaceMACHeaders.requestHeader], type: .repository)
+        if status == 200 {
+            let commit: ComAtprotoSpaceDefs.Commit?
+            if url.path.hasSuffix("getLatestCommit") {
+                commit = try JSONDecoder().decode(ComAtprotoSpaceGetLatestCommit.Output.self, from: body).commit
+            } else {
+                commit = try JSONDecoder().decode(ComAtprotoSpaceListRepoOps.Output.self, from: body).commit
+            }
+            if let commit {
+                let secret = try SpaceMAC.decapsulate(privateKey: HTTPIncrementalFixture.kemKey(), keyShare: want.keyShare)
+                let mac = try SpaceMAC.commit(sharedSecret: secret, space: commit.space.uriString(), repo: commit.repo.didString(), rev: commit.rev.toString(), data: commit.data.data)
+                responseHeaders[SpaceMACHeaders.responseHeader] = try SpaceMACHeaders.formatMAC(mac, type: .repository)
+            }
+        }
         return .init(
             status: status,
-            headers: ["content-type": "application/json"],
+            headers: responseHeaders,
             body: body,
             finalURL: url,
             redirectCount: 0

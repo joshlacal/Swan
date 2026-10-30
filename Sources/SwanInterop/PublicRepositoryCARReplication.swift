@@ -84,6 +84,7 @@ public enum PublicRepositoryCARImportFailureCode {
             case let .unexpectedStatus(status): return "HTTPUnexpectedStatus_\(status)"
             case .transportFailure: return "HTTPTransportFailure"
             case .fileFailure: return "HTTPFileFailure"
+            case .spaceCredentialRevoked: return "HTTPCredentialRevoked"
             }
         case let error as PublicRepositoryMutationStoreError:
             switch error {

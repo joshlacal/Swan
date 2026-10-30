@@ -235,49 +235,29 @@ final class ScopePermissionsFenceTests: XCTestCase {
         )
     }
 
-    // MARK: - The aggregate-read hardening (§6.5.5)
+    // MARK: - Reads ignore collection restrictions
 
-    /// **This test fails under the literal §5.6.2 port, which is the point.**
-    ///
-    /// §5.6.2 originally declared `case read` with no payload and §5.6.3's arm
-    /// was `return action.contains(.read)` — upstream's collection-INDEPENDENT
-    /// rule (`space-permission.ts:104-110`, which takes the read arms *before*
-    /// `collectionAllows` at `:112-115`). Ported literally, the second
-    /// assertion below returns TRUE: a grant naming exactly one collection
-    /// would satisfy a read that spans every collection, and the response would
-    /// silently omit the rows the grant does not cover.
-    ///
-    /// That is the widening §6.5.5 exists to prevent
-    /// (`SwanSpaces.swift:329-341`, "aggregate surfaces must not silently
-    /// censor their response"). Nothing else in the suite catches it, because a
-    /// collection-qualified read of *that same collection* — the first
-    /// assertion — is legitimate and passes either way.
-    func testAggregateReadRefusesACollectionQualifiedGrant() {
+    /// Proposal 0016 makes reads all-or-nothing at the space boundary.
+    /// An explicitly named collection restricts writes, never record or sync reads.
+    func testReadAndSyncAcceptACollectionQualifiedGrant() {
         let scope = "space:x.y.z?authority=\(user)&skey=self&action=read&collection=app.example.records"
         let permissions = permissions(
             scope,
             stated: ["authority", "skey", "action", "collection"]
         )
 
-        // Reading that one collection is exactly what the grant names.
         XCTAssertTrue(
             permissions.allowsSpace(read(aggregate: false, collection: "app.example.records"))
         )
-        // A SINGLE-blob read (Erratum 03: non-aggregate, collection-free —
-        // `SpaceScopeTarget.blobRead`'s shape) is satisfied by the same
-        // collection-qualified grant: one content-addressed object is not a
-        // cross-collection enumeration.
         XCTAssertTrue(
             permissions.allowsSpace(read(aggregate: false, collection: nil)),
-            "a collection-qualified grant must satisfy a single-blob read (Erratum 03)"
+            "a collection-qualified grant must satisfy a single-blob read"
         )
-        // Reading ACROSS collections is not.
-        XCTAssertFalse(
+        XCTAssertTrue(
             permissions.allowsSpace(read(aggregate: true, collection: nil)),
-            "a collection-qualified grant must not satisfy an aggregate read"
+            "a collection-qualified grant must satisfy an aggregate read"
         )
-        // Nor is a non-aggregate read of a DIFFERENT collection.
-        XCTAssertFalse(
+        XCTAssertTrue(
             permissions.allowsSpace(read(aggregate: false, collection: "app.other.records"))
         )
     }
@@ -472,5 +452,67 @@ final class ScopePermissionsFenceTests: XCTestCase {
         XCTAssertEqual(value.rawScopes, [wire])
         XCTAssertEqual(value, permissions(wire, stated: ["authority", "skey", "action"]))
         XCTAssertNotEqual(value, permissions(wire, stated: ["skey", "action"]))
+    }
+}
+
+// MARK: - `--enable-spaces-open-interop` upstream defaults (SWAN-09)
+
+extension ScopePermissionsFenceTests {
+    private func upstream(_ scope: String, stated: Set<String> = []) -> SwanScopePermissions {
+        SwanScopePermissions(
+            rawScopes: [scope],
+            subject: "did:plc:user",
+            statedKeys: [scope: stated]
+        ).withUpstreamSpaceDefaults()
+    }
+
+    private func exchange(type: String, authority: String) -> SpaceScopeTarget {
+        SpaceScopeTarget(type: type, authority: authority, skey: "forum", operation: .delegationExchange)
+    }
+
+    /// The proposal's canonical bare grants exchange under upstream defaults
+    /// and are refused by the hardened fence (positive and negative control).
+    func testUpstreamDefaultsLetBareAndWildcardGrantsExchange() {
+        let other = "did:plc:otherauthority"
+        let cases: [(scope: String, target: SpaceScopeTarget)] = [
+            ("space:com.example.forum?authority=*", exchange(type: "com.example.forum", authority: other)),
+            ("space:com.example.forum", exchange(type: "com.example.forum", authority: "did:plc:user")),
+            ("space:*?authority=*&action=read", exchange(type: "com.example.forum", authority: other)),
+        ]
+        for (scope, target) in cases {
+            let stated: Set<String> = scope.contains("action=") ? ["authority", "action"] : (scope.contains("authority=") ? ["authority"] : [])
+            XCTAssertTrue(upstream(scope, stated: stated).allowsSpace(target), scope)
+            XCTAssertFalse(permissions(scope, stated: stated).allowsSpace(target), scope)
+        }
+    }
+
+    /// Value coverage still applies: a defaulted `self` authority does not
+    /// exchange for another authority's space, and a write-only grant never
+    /// exchanges.
+    func testUpstreamDefaultsKeepTupleMatchingAndRequireRead() {
+        XCTAssertFalse(
+            upstream("space:com.example.forum").allowsSpace(
+                exchange(type: "com.example.forum", authority: "did:plc:otherauthority")
+            )
+        )
+        XCTAssertFalse(
+            upstream("space:com.example.forum?authority=*&action=create", stated: ["authority", "action"])
+                .allowsSpace(exchange(type: "com.example.forum", authority: "did:plc:otherauthority"))
+        )
+    }
+
+    /// Listing: a defaulted action suffices under upstream defaults; an
+    /// unfiltered listing still needs a wildcard-type grant, as upstream.
+    func testUpstreamDefaultsListingUsesDefaultedActions() {
+        XCTAssertTrue(upstream("space:x.y.z").allowsSpaceListing(type: "x.y.z", authority: "did:plc:user"))
+        XCTAssertFalse(permissions("space:x.y.z", stated: []).allowsSpaceListing(type: "x.y.z", authority: "did:plc:user"))
+        XCTAssertFalse(upstream("space:x.y.z?authority=*").allowsSpaceListing(type: nil, authority: nil))
+        XCTAssertTrue(upstream("space:*?authority=*").allowsSpaceListing(type: nil, authority: nil))
+    }
+
+    func testUpstreamDefaultsParticipateInEquality() {
+        let scope = "space:x.y.z"
+        XCTAssertNotEqual(permissions(scope, stated: []), upstream(scope))
+        XCTAssertEqual(upstream(scope), upstream(scope))
     }
 }

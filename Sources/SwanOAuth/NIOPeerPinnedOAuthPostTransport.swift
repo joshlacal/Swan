@@ -83,6 +83,27 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
         timeout: TimeInterval,
         maximumResponseBodyBytes: Int
     ) async throws -> OAuthRemoteHTTPResponse {
+        try await request(method: .POST, url: url, approvedPeers: approvedPeers,
+                          headers: headers, body: body, timeout: timeout,
+                          maximumResponseBodyBytes: maximumResponseBodyBytes)
+    }
+
+    /// Authenticated bounded policy reads reuse the same literal-peer and TLS
+    /// checks as notification POSTs. This does not widen metadata fetch APIs.
+    public func getAuthenticated(
+        url: URL, approvedPeers: Set<OAuthIPAddress>, headers: [String: String],
+        timeout: TimeInterval, maximumResponseBodyBytes: Int
+    ) async throws -> OAuthRemoteHTTPResponse {
+        try await request(method: .GET, url: url, approvedPeers: approvedPeers,
+                          headers: headers, body: Data(), timeout: timeout,
+                          maximumResponseBodyBytes: maximumResponseBodyBytes)
+    }
+
+    private func request(
+        method: HTTPMethod, url: URL, approvedPeers: Set<OAuthIPAddress>,
+        headers: [String: String], body: Data, timeout: TimeInterval,
+        maximumResponseBodyBytes: Int
+    ) async throws -> OAuthRemoteHTTPResponse {
         guard body.count <= 64 * 1_024,
               (0 ... 1_048_576).contains(maximumResponseBodyBytes),
               timeout > 0,
@@ -115,6 +136,7 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
         )
 
         return try await makeRequest(
+            method: method,
             group: configuration.resources.eventLoopGroup,
             tlsContext: configuration.resources.tlsContext,
             target: target,
@@ -164,6 +186,7 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
     }
 
     private func makeRequest(
+        method: HTTPMethod,
         group: MultiThreadedEventLoopGroup,
         tlsContext: NIOSSLContext,
         target: OAuthOriginFormRequestTarget,
@@ -241,7 +264,7 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
                 }
             }
             let head = HTTPRequestHead(
-                version: .http1_1, method: .POST, uri: target.uri, headers: requestHeaders
+                version: .http1_1, method: method, uri: target.uri, headers: requestHeaders
             )
             var buffer = channel.allocator.buffer(capacity: body.count)
             buffer.writeBytes(body)

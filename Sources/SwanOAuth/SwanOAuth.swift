@@ -215,19 +215,30 @@ public enum PermissionedDataJWT {
     public static let credentialType = "atproto-space-credential+jwt"
     public static let clientAttestationType = "atproto-client-attestation+jwt"
     /// Proposal 0016 signs user-to-space-host delegations with the user's
-    /// regular AT Protocol signing key. This is intentionally distinct from
-    /// the authority-owned `#atproto_space` credential key below.
+    /// regular AT Protocol signing key. Space credentials are signed by the
+    /// space authority's key (see ``spaceCredentialIssuedKeyID``).
     public static let delegationKeyID = "#atproto"
     public static let delegationLifetime: TimeInterval = 60
-    /// Proposal 0016 assigns a dedicated DID verification method to space
-    /// credentials. Local issuance defaults to that method; verification has
-    /// a separately named, profile-reviewed ordinary-account-key fallback.
-    public static let spaceCredentialKeyID = "#atproto_space"
-    /// Proposal 0016 permits the authority's ordinary AT Protocol verification
-    /// method when no dedicated `#atproto_space` method is published. The
-    /// pinned TypeScript PDS currently exercises this fallback in practice.
-    public static let spaceCredentialFallbackKeyID = "#atproto"
-    public static let spaceCredentialLifetime: TimeInterval = 2 * 60 * 60
+    /// October 22 requires the authority's exact `#atproto` signing method.
+    public static let spaceCredentialKeyID = "#atproto"
+    /// Source-compatible alias; it does not permit an alternate method.
+    public static let spaceCredentialFallbackKeyID = spaceCredentialKeyID
+    public static let spaceCredentialIssuedKeyID = spaceCredentialKeyID
+    /// The hard ceiling on a space credential's `exp - iat`, enforced both
+    /// when Swan mints and when it verifies (upstream #5567,
+    /// `SPACE_CREDENTIAL_MAX_AGE_SEC`). A longer credential is rejected even
+    /// when its signature is valid, because the lifetime is the revocation
+    /// window of a token that names no reader.
+    public static let spaceCredentialLifetime: TimeInterval = 60 * 60
+    /// The lifetime minted when a caller does not choose one (upstream
+    /// #5567's credential `expiresInSec`). Swan's own authority issues a
+    /// shorter credential still; see
+    /// `DurableSpaceCredentialAuthority.Configuration.defaultLifetime`.
+    public static let spaceCredentialDefaultLifetime: TimeInterval = 10 * 60
+    /// How far a credential's `iat` may lead the verifier's clock (upstream
+    /// #5567 `CLOCK_SKEW_SEC`). This is deliberately independent of, and never
+    /// wider than, the general `clockSkew` that bounds expiry.
+    public static let spaceCredentialMaximumIssuedAtLead: Int64 = 5
     public static let maximumCompactDelegationBytes = 8 * 1_024
     public static let maximumCompactSpaceCredentialBytes = 8 * 1_024
     /// `jti` is a bounded opaque nonce in proposal 0016, not a UUID grammar.
@@ -255,11 +266,21 @@ public enum PermissionedDataJWT {
     }
 
     public struct SpaceCredentialClaims: Codable, Sendable, Equatable {
+        /// The holder-key binding. Since atproto#5569 it names the P-256
+        /// `did:key` that signs each presentation's HTTP message signature;
+        /// the Spaces-only DPoP thumbprint (`cnf.jkt`) is gone, so a
+        /// credential minted in the old format fails to decode and the
+        /// holder must reacquire one.
+        public struct Confirmation: Codable, Sendable, Equatable {
+            public let kid: String
+        }
+
         public let iss: String
         public let sub: String
         public let iat: Int64
         public let exp: Int64
         public let jti: String
+        public let cnf: Confirmation
     }
 
     /// The unsigned, bounded metadata needed to select a verification key.
@@ -330,7 +351,7 @@ public enum PermissionedDataJWT {
         lifetime: TimeInterval = 60
     ) throws -> String {
         guard isPermissionedDataDID(issuer),
-              audience == "\(space.authority)#atproto_space_host",
+              audience == "\(space.authority)#atproto_pds",
               lifetime > 0,
               lifetime <= delegationLifetime,
               lifetime.rounded(.towardZero) == lifetime else {
@@ -385,7 +406,7 @@ public enum PermissionedDataJWT {
         guard claims.aud == audience,
               isPermissionedDataDID(claims.iss),
               let space = try? SpaceURI(claims.sub),
-              claims.aud == "\(space.authority)#atproto_space_host",
+              claims.aud == "\(space.authority)#atproto_pds",
               expectedSpace.map({ $0 == space }) ?? true,
               claims.jti.isValidPermissionedDataJTI else {
             throw SwanError.unauthorized("delegation token audience or space is invalid")
@@ -416,7 +437,7 @@ public enum PermissionedDataJWT {
         let claims = try decode(DelegationClaims.self, from: parsed.payload)
         guard isPermissionedDataDID(claims.iss),
               let space = try? SpaceURI(claims.sub),
-              claims.aud == "\(space.authority)#atproto_space_host",
+              claims.aud == "\(space.authority)#atproto_pds",
               claims.jti.isValidPermissionedDataJTI else {
             throw SwanError.unauthorized("delegation token issuer, audience, or subject is invalid")
         }
@@ -427,11 +448,13 @@ public enum PermissionedDataJWT {
         issuer: String,
         space: SpaceURI,
         key: P256.Signing.PrivateKey,
+        confirmationKeyID: String,
         now: Date = Date(),
-        lifetime: TimeInterval = spaceCredentialLifetime,
-        kid: String = spaceCredentialKeyID
+        lifetime: TimeInterval = spaceCredentialDefaultLifetime,
+        kid: String = spaceCredentialIssuedKeyID
     ) throws -> String {
         guard issuer == space.authority,
+              isValidConfirmationKeyID(confirmationKeyID),
               isSpaceCredentialKeyID(kid),
               lifetime > 0,
               lifetime <= spaceCredentialLifetime,
@@ -444,7 +467,8 @@ public enum PermissionedDataJWT {
             kid: kid,
             claims: SpaceCredentialClaims(
                 iss: issuer, sub: space.rawValue, iat: issuedAt,
-                exp: issuedAt + Int64(lifetime), jti: UUID().uuidString
+                exp: issuedAt + Int64(lifetime), jti: UUID().uuidString,
+                cnf: .init(kid: confirmationKeyID)
             ),
             key: key
         )
@@ -479,19 +503,26 @@ public enum PermissionedDataJWT {
             throw SwanError.malformed("invalid space credential clock skew")
         }
         let parsed = try verifySpaceCredentialStructure(token, publicKey: publicKey)
-        let claims = try decode(SpaceCredentialClaims.self, from: parsed.payload)
+        let claims = try StrictJSON.decode(SpaceCredentialClaims.self, from: parsed.payload)
         guard let space = try? SpaceURI(claims.sub),
               space.authority == claims.iss,
+              isValidConfirmationKeyID(claims.cnf.kid),
               claims.jti.isValidPermissionedDataJTI,
               expectedSpace.map({ $0 == space }) ?? true else {
             throw SwanError.unauthorized("space credential issuer or subject is invalid")
+        }
+        // Upstream #5567: a credential must have `exp > iat`, at most the
+        // one-hour ceiling, and an `iat` at most five seconds ahead.
+        guard claims.exp > claims.iat else {
+            throw SwanError.expired
         }
         try validateTimes(
             iat: claims.iat,
             exp: claims.exp,
             now: now,
             clockSkew: clockSkew,
-            maximumLifetime: Int64(spaceCredentialLifetime)
+            maximumLifetime: Int64(spaceCredentialLifetime),
+            maximumIssuedAtLead: spaceCredentialMaximumIssuedAtLead
         )
         return claims
     }
@@ -509,9 +540,10 @@ public enum PermissionedDataJWT {
               parsed.header.kid.map(isSpaceCredentialKeyID) == true else {
             throw SwanError.unauthorized("JWT type, algorithm, or key ID is invalid")
         }
-        let claims = try decode(SpaceCredentialClaims.self, from: parsed.payload)
+        let claims = try StrictJSON.decode(SpaceCredentialClaims.self, from: parsed.payload)
         guard let space = try? SpaceURI(claims.sub),
               space.authority == claims.iss,
+              isValidConfirmationKeyID(claims.cnf.kid),
               claims.jti.isValidPermissionedDataJTI else {
             throw SwanError.unauthorized("space credential issuer or subject is invalid")
         }
@@ -561,7 +593,7 @@ public enum PermissionedDataJWT {
         }
         try StrictJSON.validateTopLevelIntegerMembers(["iat", "exp"], in: payload)
         let claims = try StrictJSON.decode(ClientAttestationClaims.self, from: payload)
-        let expectedAudience = "\(authority)#atproto_space_host"
+        let expectedAudience = "\(authority)#atproto_pds"
         guard claims.iss == claims.sub,
               claims.aud == expectedAudience,
               claims.jti.isValidPermissionedDataJTI,
@@ -725,7 +757,8 @@ public enum PermissionedDataJWT {
         exp: Int64,
         now: Date,
         clockSkew: TimeInterval,
-        maximumLifetime: Int64? = nil
+        maximumLifetime: Int64? = nil,
+        maximumIssuedAtLead: Int64? = nil
     ) throws {
         guard let current = integerTimestamp(now),
               let allowedSkew = integerClockSkew(clockSkew),
@@ -736,7 +769,11 @@ public enum PermissionedDataJWT {
                   return !duration.overflow && duration.partialValue <= maximumLifetime
               }) ?? true,
               isNotTooFarInPast(exp, comparedTo: current, allowedSkew: allowedSkew),
-              isNotTooFarInFuture(iat, comparedTo: current, allowedSkew: allowedSkew) else {
+              isNotTooFarInFuture(
+                  iat,
+                  comparedTo: current,
+                  allowedSkew: maximumIssuedAtLead.map { min($0, allowedSkew) } ?? allowedSkew
+              ) else {
             throw SwanError.expired
         }
     }
@@ -776,6 +813,20 @@ public enum PermissionedDataJWT {
 
     private static func isSpaceCredentialKeyID(_ value: String) -> Bool {
         value == spaceCredentialKeyID || value == spaceCredentialFallbackKeyID
+    }
+
+    /// `cnf.kid` must be a canonical P-256 `did:key`: the only key type an
+    /// `atproto-space` HTTP message signature (`ecdsa-p256-sha256`) can use.
+    public static func isValidConfirmationKeyID(_ value: String) -> Bool {
+        guard value.utf8.count <= 256,
+              let parsed = try? P256DIDKey(value) else { return false }
+        return parsed.value == value
+    }
+
+    /// The generic DID grammar used for JWT issuers, exposed to the
+    /// presentation verifier for the `Atproto-Space-Audience` value.
+    static func isDIDString(_ value: String) -> Bool {
+        isPermissionedDataDID(value)
     }
 
     private static func integerClockSkew(_ skew: TimeInterval) -> Int64? {

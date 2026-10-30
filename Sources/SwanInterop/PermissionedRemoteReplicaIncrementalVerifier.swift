@@ -46,10 +46,11 @@ public struct VerifiedPermissionedRemoteReplicaIncrementalPage:
 public enum PermissionedRemoteReplicaIncrementalVerifier {
     public static func verify(
         operations wireOperations: [ComAtprotoSpaceListRepoOps.OpEntry],
-        commit: ComAtprotoSpaceDefs.SignedCommit,
+        commit: ComAtprotoSpaceDefs.Commit,
         base: PermissionedRemoteReplicaIncrementalBaseState,
         target: PermissionedRemoteReplicaTarget,
-        verificationKey: PermissionedDataJWTVerificationKey
+        sharedSecret: Data,
+        mac: Data
     ) throws -> VerifiedPermissionedRemoteReplicaIncrementalPage {
         guard base.head.target == target else {
             throw PermissionedRemoteReplicaIncrementalVerificationError
@@ -144,7 +145,8 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
         let freshness = try verifyCommit(
             commit,
             target: target,
-            verificationKey: verificationKey
+            sharedSecret: sharedSecret,
+            mac: mac
         )
         guard freshness.wireRevision == previousRevision else {
             throw PermissionedRemoteReplicaIncrementalVerificationError
@@ -172,52 +174,25 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
     }
 
     public static func verifyCommit(
-        _ commit: ComAtprotoSpaceDefs.SignedCommit,
+        _ commit: ComAtprotoSpaceDefs.Commit,
         target: PermissionedRemoteReplicaTarget,
-        verificationKey: PermissionedDataJWTVerificationKey
+        sharedSecret: Data,
+        mac: Data
     ) throws -> PermissionedRemoteReplicaFreshnessWitness {
-        guard commit.ver == 1,
-              commit.hash.data.count == 32,
-              commit.ikm.data.count == 32,
-              commit.sig.data.count == 64,
-              commit.mac.data.count == 32 else {
-            throw PermissionedRemoteReplicaIncrementalVerificationError
-                .invalidCommit
+        let value: SpaceRepositoryCommit
+        do {
+            value = try SpaceRepositoryCommit(
+                ver: commit.ver, repo: commit.repo.didString(),
+                space: SpaceURI(commit.space.uriString()), rev: commit.rev.toString(), data: commit.data.data
+            )
+        } catch { throw PermissionedRemoteReplicaIncrementalVerificationError.invalidCommit }
+        guard value.repo == target.repositoryDID, value.space == target.space else {
+            throw PermissionedRemoteReplicaIncrementalVerificationError.invalidCommit
         }
-        let revision = commit.rev
-        let context = try SpaceCommitContext(
-            space: target.space,
-            author: target.repositoryDID,
-            rev: commit.rev.toString(),
-            ikm: commit.ikm.data
-        )
-        let envelope = SpaceCommitEnvelope(
-            ver: commit.ver,
-            context: context,
-            contextSignature: commit.sig.data,
-            contentBinding: commit.mac.data,
-            commitment: commit.hash.data
-        )
-        guard SpaceCommitCodec.verifyContentBinding(envelope) else {
-            throw PermissionedRemoteReplicaIncrementalVerificationError
-                .contentBindingMismatch
-        }
-        let algorithm: String = switch verificationKey {
-        case .p256: "ES256"
-        case .secp256k1PublicKey: "ES256K"
-        }
-        guard try verificationKey.verify(
-            signature: commit.sig.data,
-            signingInput: try SpaceCommitCodec.contextSigningBytes(context),
-            algorithm: algorithm
-        ) else {
-            throw PermissionedRemoteReplicaIncrementalVerificationError
-                .contextSignatureMismatch
-        }
-        return try PermissionedRemoteReplicaFreshnessWitness(
-            wireRevision: revision,
-            commitment: commit.hash.data
-        )
+        do {
+            try SpaceMAC.verify(mac: mac, expected: value.mac(sharedSecret: sharedSecret))
+        } catch { throw PermissionedRemoteReplicaIncrementalVerificationError.contentBindingMismatch }
+        return try PermissionedRemoteReplicaFreshnessWitness(wireRevision: commit.rev, commitment: value.data)
     }
 
     public static func requireSameHead(
@@ -230,7 +205,7 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
         }
     }
 
-    private static func canonicalValue(
+    static func canonicalValue(
         _ value: ATProtocolValueContainer?,
         cid: CID
     ) throws -> Data {

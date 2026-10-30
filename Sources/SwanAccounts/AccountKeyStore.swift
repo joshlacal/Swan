@@ -13,6 +13,7 @@ import SwanStorage
 public enum AccountKeyPurpose: String, Codable, Sendable, CaseIterable {
     case signing = "account-signing"
     case rotation = "account-rotation"
+    case kem = "account-kem"
 }
 
 public struct AccountKeyReference: Codable, Sendable, Hashable {
@@ -127,6 +128,14 @@ public struct AccountKeyMigrationReport: Sendable, Equatable {
 
 public protocol AccountKeyMaterialReader: Sendable {
     func key(for reference: AccountKeyReference) async throws -> Data
+    /// A missing key is distinct from a corrupt or inaccessible envelope.
+    func keyIfPresent(for reference: AccountKeyReference) async throws -> Data?
+}
+
+public extension AccountKeyMaterialReader {
+    func keyIfPresent(for reference: AccountKeyReference) async throws -> Data? {
+        try await key(for: reference)
+    }
 }
 
 public protocol AccountKeyStore: AccountKeyMaterialReader {
@@ -219,6 +228,7 @@ public struct StagedPLCAccountIdentity: Sendable {
     public let operation: PLCSignedOperation
     let signingKey: P256.Signing.PrivateKey
     let rotationKey: P256.Signing.PrivateKey
+    let kemKey: P256.KeyAgreement.PrivateKey?
 
     public var operationCID: String {
         get throws { try operation.cid.string }
@@ -295,6 +305,7 @@ public actor FileAccountKeyStore:
     private struct PLCStagingPayload: Codable {
         let signingKey: Data
         let rotationKey: Data
+        let kemKey: Data?
         let did: String
         let operationJSON: Data
     }
@@ -371,6 +382,54 @@ public actor FileAccountKeyStore:
         self.configuration = configuration
         failAfterBatchInstallCount = nil
         failDirectoryIterationAfterEntryCount = nil
+    }
+
+    /// Startup-only, read-only twin of
+    /// `init(existingRootDirectoryDescriptor:configuration:)` for a key root
+    /// already opened and validated with `O_NOFOLLOW`. It applies the same
+    /// checks to the root's contents (writer lock, active-KEK marker,
+    /// interrupted provisioning journal) and throws where that initializer
+    /// would, but it creates, repairs, installs and removes nothing: an
+    /// existing writer lock is opened read-only and held shared while the
+    /// marker and journal are read, a missing lock or marker is left
+    /// missing, and a journal is authenticated without being recovered.
+    /// `serve` calls this before its service-directory lease, so bad key-root
+    /// contents are refused before the data directory exists. It does not
+    /// replace the initializer, which still runs under the lease and can
+    /// still fail on I/O.
+    @_spi(ServeStartup)
+    public static func preflightExistingRoot(
+        directoryDescriptor descriptor: Int32,
+        configuration: AccountKeyEncryptionConfiguration
+    ) throws {
+        let readOnlyLock = try openExistingLockFileReadOnly(
+            directoryDescriptor: descriptor
+        )
+        defer { if let readOnlyLock { _ = close(readOnlyLock) } }
+        let checkContents = {
+            if try entryExists(
+                named: activeKeyMarkerFilename,
+                directoryDescriptor: descriptor
+            ) {
+                _ = try readActiveKeyMarker(directoryDescriptor: descriptor)
+            }
+            if let journal = try readProvisioningJournal(
+                directoryDescriptor: descriptor
+            ) {
+                for entry in journal.entries {
+                    _ = try checkJournalEntry(
+                        entry,
+                        configuration: configuration,
+                        directoryDescriptor: descriptor
+                    )
+                }
+            }
+        }
+        if let readOnlyLock {
+            try withSharedLock(readOnlyLock, checkContents)
+        } else {
+            try checkContents()
+        }
     }
 
     init(
@@ -525,15 +584,25 @@ public actor FileAccountKeyStore:
             }
             let signingKey = P256.Signing.PrivateKey()
             let rotationKey = P256.Signing.PrivateKey()
-            guard signingKey.rawRepresentation != rotationKey.rawRepresentation else {
+            let kemKey = P256.KeyAgreement.PrivateKey()
+            guard signingKey.rawRepresentation != kemKey.rawRepresentation,
+                  rotationKey.rawRepresentation != kemKey.rawRepresentation,
+                  signingKey.rawRepresentation != rotationKey.rawRepresentation else {
                 throw SwanError.unavailable("P-256 key generation returned duplicate account keys")
             }
-            let unsigned = try PLCATProfile.regularOperation(
+            let base = try PLCATProfile.regularOperation(
                 handle: canonicalHandle,
                 signingPublicKey: signingKey.publicKey,
                 rotationPublicKeys: [rotationKey.publicKey],
                 pdsOrigin: pdsOrigin,
                 prev: nil
+            )
+            let unsigned = try PLCUnsignedRegularOperation(
+                rotationKeys: base.rotationKeys,
+                verificationMethods: base.verificationMethods.merging([
+                    "atproto_kem": try AccountKEMKeyProvider.didKey(kemKey.publicKey),
+                ]) { _, new in new },
+                alsoKnownAs: base.alsoKnownAs, services: base.services, prev: nil
             )
             let operation = try PLCOperationCodec.sign(.regular(unsigned), using: rotationKey)
             let did = try PLCOperationCodec.genesisDID(for: operation)
@@ -543,6 +612,7 @@ public actor FileAccountKeyStore:
             let payload = PLCStagingPayload(
                 signingKey: signingKey.rawRepresentation,
                 rotationKey: rotationKey.rawRepresentation,
+                kemKey: kemKey.rawRepresentation,
                 did: did,
                 operationJSON: try operation.canonicalJSON
             )
@@ -598,7 +668,8 @@ public actor FileAccountKeyStore:
                 repositoryRevision: repositoryRevision,
                 operation: operation,
                 signingKey: signingKey,
-                rotationKey: rotationKey
+                rotationKey: rotationKey,
+                kemKey: kemKey
             )
         }
     }
@@ -668,6 +739,13 @@ public actor FileAccountKeyStore:
                     == staged.rotationKey.rawRepresentation else {
                 throw SwanError.unauthorized("PLC account staging promotion is invalid")
             }
+            if let kemKey = staged.kemKey {
+                let reference = try AccountKEMKeyProvider.reference(accountDID: expectedDID)
+                let envelope = try loadEnvelope(named: Self.filename(for: reference), expectedReference: reference)
+                guard try decrypt(envelope.envelope, reference: reference) == kemKey.rawRepresentation else {
+                    throw SwanError.unauthorized("PLC account staging KEM promotion is invalid")
+                }
+            }
             try Self.remove(named: filename, directoryDescriptor: directoryDescriptor)
         }
     }
@@ -731,7 +809,8 @@ public actor FileAccountKeyStore:
         }
         let signingKey = try P256.Signing.PrivateKey(rawRepresentation: payload.signingKey)
         let rotationKey = try P256.Signing.PrivateKey(rawRepresentation: payload.rotationKey)
-        guard payload.signingKey != payload.rotationKey else {
+        let kemKey = try payload.kemKey.map { try P256.KeyAgreement.PrivateKey(rawRepresentation: $0) }
+        guard payload.kemKey != payload.signingKey, payload.kemKey != payload.rotationKey, payload.signingKey != payload.rotationKey else {
             throw SwanError.malformed("PLC account staging keys are not distinct")
         }
         let operation = try PLCOperationCodec.decodeSignedJSON(payload.operationJSON)
@@ -739,6 +818,7 @@ public actor FileAccountKeyStore:
         guard let regular = operation.regular,
               regular.verificationMethods["atproto"]
                 == P256DIDKey(publicKey: signingKey.publicKey).value,
+              regular.verificationMethods["atproto_kem"] == (try kemKey.map { try AccountKEMKeyProvider.didKey($0.publicKey) }),
               regular.rotationKeys == [P256DIDKey(publicKey: rotationKey.publicKey).value],
               regular.alsoKnownAs == ["at://\(canonicalHandle)"],
               regular.services["atproto_pds"]?.endpoint == canonical else {
@@ -752,7 +832,8 @@ public actor FileAccountKeyStore:
             repositoryRevision: repositoryRevision,
             operation: operation,
             signingKey: signingKey,
-            rotationKey: rotationKey
+            rotationKey: rotationKey,
+            kemKey: kemKey
         )
     }
 
@@ -803,6 +884,15 @@ public actor FileAccountKeyStore:
             named: Self.journalFilename,
             directoryDescriptor: directoryDescriptor
         )
+    }
+
+    public func keyIfPresent(for reference: AccountKeyReference) async throws -> Data? {
+        try withExclusiveLock {
+            let filename = Self.filename(for: reference)
+            guard try Self.entryExists(named: filename, directoryDescriptor: directoryDescriptor) else { return nil }
+            let loaded = try loadEnvelope(named: filename, expectedReference: reference)
+            return try decrypt(loaded.envelope, reference: reference)
+        }
     }
 
     public func key(for reference: AccountKeyReference) throws -> Data {
@@ -986,9 +1076,12 @@ public actor FileAccountKeyStore:
         guard let combined = sealed.combined else {
             throw SwanError.unavailable("could not serialize encrypted account key")
         }
-        let publicKey = try? P256.Signing.PrivateKey(rawRepresentation: key)
-            .publicKey
-            .x963Representation
+        let publicKey: Data?
+        if reference.purpose == .kem {
+            publicKey = try? P256.KeyAgreement.PrivateKey(rawRepresentation: key).publicKey.x963Representation
+        } else {
+            publicKey = try? P256.Signing.PrivateKey(rawRepresentation: key).publicKey.x963Representation
+        }
         let publicKeyAuthentication = publicKey.map {
             Self.publicKeyAuthentication(
                 keyID: keyID,
@@ -1343,6 +1436,52 @@ public actor FileAccountKeyStore:
         return try body()
     }
 
+    /// The preflight's view of the writer lock: `nil` when it does not
+    /// exist yet (the initializer would create it), otherwise a read-only
+    /// descriptor that passed the checks `openLockFile` applies after
+    /// opening. Its mode is not checked because `openLockFile` repairs it.
+    /// `O_NONBLOCK` keeps a FIFO planted at the lock path from blocking the
+    /// open; it does not affect `flock`.
+    private static func openExistingLockFileReadOnly(
+        directoryDescriptor: Int32
+    ) throws -> Int32? {
+        let descriptor = openat(
+            directoryDescriptor,
+            lockFilename,
+            O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        )
+        if descriptor < 0 {
+            guard errno == ENOENT else {
+                throw SwanError.unavailable("could not open account key-store writer lock")
+            }
+            return nil
+        }
+        var status = stat()
+        guard fstat(descriptor, &status) == 0,
+              (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              status.st_uid == geteuid(),
+              status.st_nlink == 1 else {
+            _ = close(descriptor)
+            throw SwanError.unavailable("account key-store writer lock failed validation")
+        }
+        return descriptor
+    }
+
+    private static func withSharedLock<Result>(
+        _ descriptor: Int32,
+        _ body: () throws -> Result
+    ) throws -> Result {
+        while flock(descriptor, LOCK_SH) != 0 {
+            guard errno == EINTR else {
+                throw SwanError.unavailable("could not acquire account key-store writer lock")
+            }
+        }
+        defer {
+            while flock(descriptor, LOCK_UN) != 0, errno == EINTR {}
+        }
+        return try body()
+    }
+
     private static func initializeActiveKeyMarkerIfNeeded(
         directoryDescriptor: Int32,
         activeKeyID: String
@@ -1378,15 +1517,45 @@ public actor FileAccountKeyStore:
         return keyID
     }
 
+    /// Finishes an interrupted provisioning batch. Each entry is checked
+    /// (read-only) and, when not yet installed, installed before the next
+    /// entry is checked; the journal is removed last.
     private static func recoverProvisioningJournal(
         directoryDescriptor: Int32,
         configuration: AccountKeyEncryptionConfiguration
     ) throws {
+        guard let journal = try readProvisioningJournal(
+            directoryDescriptor: directoryDescriptor
+        ) else {
+            return
+        }
+        for entry in journal.entries {
+            let installed = try checkJournalEntry(
+                entry,
+                configuration: configuration,
+                directoryDescriptor: directoryDescriptor
+            )
+            if !installed {
+                try installCreateOnly(
+                    entry.envelope,
+                    named: entry.filename,
+                    directoryDescriptor: directoryDescriptor
+                )
+            }
+        }
+        try remove(named: journalFilename, directoryDescriptor: directoryDescriptor)
+    }
+
+    /// Reads and structurally validates the provisioning journal without
+    /// acting on it; `nil` when there is none.
+    private static func readProvisioningJournal(
+        directoryDescriptor: Int32
+    ) throws -> ProvisioningJournal? {
         guard try entryExists(
             named: journalFilename,
             directoryDescriptor: directoryDescriptor
         ) else {
-            return
+            return nil
         }
         let encoded = try readProtected(
             named: journalFilename,
@@ -1410,29 +1579,35 @@ public actor FileAccountKeyStore:
               }) else {
             throw SwanError.malformed("invalid account key provisioning journal")
         }
+        return journal
+    }
 
-        for entry in journal.entries {
-            try validateJournalEntry(entry, configuration: configuration)
-            if try entryExists(
-                named: entry.filename,
-                directoryDescriptor: directoryDescriptor
-            ) {
-                guard try readProtected(
-                    named: entry.filename,
-                    maximumBytes: maximumEnvelopeBytes,
-                    directoryDescriptor: directoryDescriptor
-                ) == entry.envelope else {
-                    throw SwanError.conflict(expected: 0, actual: 1)
-                }
-            } else {
-                try installCreateOnly(
-                    entry.envelope,
-                    named: entry.filename,
-                    directoryDescriptor: directoryDescriptor
-                )
-            }
+    /// Authenticates one journal entry against `configuration` and compares
+    /// it with any envelope already installed under its name. Returns
+    /// whether that envelope is installed; never installs it. Entry names
+    /// are unique, so installing one entry cannot change another's verdict,
+    /// and a read-only pass over all entries reaches the verdict recovery
+    /// would.
+    private static func checkJournalEntry(
+        _ entry: JournalEntry,
+        configuration: AccountKeyEncryptionConfiguration,
+        directoryDescriptor: Int32
+    ) throws -> Bool {
+        try validateJournalEntry(entry, configuration: configuration)
+        guard try entryExists(
+            named: entry.filename,
+            directoryDescriptor: directoryDescriptor
+        ) else {
+            return false
         }
-        try remove(named: journalFilename, directoryDescriptor: directoryDescriptor)
+        guard try readProtected(
+            named: entry.filename,
+            maximumBytes: maximumEnvelopeBytes,
+            directoryDescriptor: directoryDescriptor
+        ) == entry.envelope else {
+            throw SwanError.conflict(expected: 0, actual: 1)
+        }
+        return true
     }
 
     private static func validateJournalEntry(

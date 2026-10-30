@@ -77,6 +77,19 @@ struct ServeNotificationRuntime {
         let delegationKeyPLC: DelegationKeyPLC?
     }
 
+    static func kemBackfillPLCConfiguration(_ material: ValidatedStartupMaterial?) throws -> PLCClientConfiguration {
+        guard let material else { return try .production() }
+        let configuration = try JSONDecoder().decode(Configuration.self, from: material.rawData)
+        let selection = configuration.credentialKeyPLC.map { ($0.origin, $0.laboratory, $0.allowlistedHost) }
+            ?? configuration.delegationKeyPLC.map { ($0.origin, $0.laboratory, $0.allowlistedHost) }
+        guard let selection, let origin = URL(string: selection.0) else { return try .production() }
+        if selection.1 {
+            guard let hostname = selection.2 else { throw ValidationError("KEM backfill laboratory PLC host is missing") }
+            return try .laboratory(origin: origin, allowlistedHost: hostname)
+        }
+        return try .production(origin: origin)
+    }
+
     private struct CredentialKeyPLC: Decodable {
         let origin: String
         let laboratory: Bool
@@ -546,14 +559,14 @@ struct ServeNotificationRuntime {
         case .es256:
             return try .init(
                 authority: pin.issuer,
-                keyID: pin.keyID ?? PermissionedDataJWT.spaceCredentialKeyID,
+                keyID: pin.keyID ?? PermissionedDataJWT.spaceCredentialIssuedKeyID,
                 generation: pin.generation,
                 publicKey: P256.Signing.PublicKey(x963Representation: bytes.value)
             )
         case .es256k:
             return try .init(
                 authority: pin.issuer,
-                keyID: pin.keyID ?? PermissionedDataJWT.spaceCredentialKeyID,
+                keyID: pin.keyID ?? PermissionedDataJWT.spaceCredentialIssuedKeyID,
                 generation: pin.generation,
                 secp256k1PublicKey: bytes.value
             )
@@ -767,6 +780,7 @@ private struct ServeUnavailableCredentialSigningKeyResolver:
 /// In particular, this type never hands a database, scalar, or general signing
 /// closure to the HTTP layer.
 struct ServeLocalSpaceRuntime {
+    let accountKeyStore: any AccountKeyStore
     let credentialSigningKeys: any SpaceCredentialSigningKeyResolver
     let credentialPublicKeys: any SpaceCredentialPublicKeyResolver
     let delegationPublicKeys: any SpaceDelegationPublicKeyResolver
@@ -838,6 +852,7 @@ struct ServeLocalSpaceRuntime {
             keyStore: keyStore
         )
         return .init(
+            accountKeyStore: keyStore,
             credentialSigningKeys: credentialSigningKeys,
             credentialPublicKeys: credentialPublicKeys,
             delegationPublicKeys: delegationPublicKeys,
@@ -878,6 +893,8 @@ struct ServePermissionedRuntime {
     let repositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration?
     let notificationConfiguration: SwanSpaceNotificationHTTPConfiguration?
     let checkUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration?
+    /// `--enable-spaces-open-interop`; `nil` keeps hardened behaviour.
+    var spacesOpenInterop: SwanSpacesOpenInteropConfiguration? = nil
 
     static func compose(
         local: ServeLocalSpaceRuntime?,
@@ -885,11 +902,13 @@ struct ServePermissionedRuntime {
         managingServiceAudience: String? = nil,
         clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy =
             UnavailableSpaceCredentialClientAttestationPolicy(),
-        serviceEndpointResolver: SwanServiceEndpointResolver? = nil
+        serviceEndpointResolver: SwanServiceEndpointResolver? = nil,
+        spacesOpenInterop: SwanSpacesOpenInteropConfiguration? = nil,
+        openFederation: SwanDIDDocumentSpaceResolver? = nil
     ) async throws -> ServePermissionedRuntime {
-        let credentialPublicKeys: (any SpaceCredentialPublicKeyResolver)?
-        let delegationPublicKeys: (any SpaceDelegationPublicKeyResolver)?
-        let servicePublicKeys: (any SpaceServicePublicKeyResolver)?
+        var credentialPublicKeys: (any SpaceCredentialPublicKeyResolver)?
+        var delegationPublicKeys: (any SpaceDelegationPublicKeyResolver)?
+        var servicePublicKeys: (any SpaceServicePublicKeyResolver)?
 
         switch (local, notification) {
         case let (.some(local), .some(notification)):
@@ -927,6 +946,21 @@ struct ServePermissionedRuntime {
             credentialPublicKeys = nil
             delegationPublicKeys = nil
             servicePublicKeys = nil
+        }
+        // `--enable-spaces-open-interop` (decision B(c)): after local, PLC,
+        // and pinned sources have no answer, resolve any did:plc / did:web
+        // issuer from its DID document. Only resolvers that already exist are
+        // widened, so the flag never enables a route by itself.
+        if let openFederation {
+            credentialPublicKeys = credentialPublicKeys.map {
+                FallbackSpaceCredentialPublicKeyResolver(primary: $0, fallback: openFederation)
+            }
+            delegationPublicKeys = delegationPublicKeys.map {
+                FallbackSpaceDelegationPublicKeyResolver(primary: $0, fallback: openFederation)
+            }
+            servicePublicKeys = servicePublicKeys.map {
+                FallbackSpaceServicePublicKeyResolver(primary: $0, fallback: openFederation)
+            }
         }
 
         let credentialConfiguration: SwanSpaceCredentialHTTPConfiguration?
@@ -998,7 +1032,8 @@ struct ServePermissionedRuntime {
                 .init(credentialPublicKeys: $0)
             },
             notificationConfiguration: notificationConfiguration,
-            checkUserAccessConfiguration: checkUserAccessConfiguration
+            checkUserAccessConfiguration: checkUserAccessConfiguration,
+            spacesOpenInterop: spacesOpenInterop
         )
     }
 
@@ -1023,7 +1058,11 @@ struct ServePermissionedRuntime {
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil,
         identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil,
-        foreignHandleResolution: (any SwanForeignHandleResolving)? = nil
+        foreignHandleResolution: (any SwanForeignHandleResolving)? = nil,
+        spaceCredentialPolicyDirectory: (any AuthorizedSimpleSpaceCredentialDirectory)? = nil,
+        simpleSpaceLifecycleDirectory: (any AuthorizedSimpleSpaceLifecycleDirectory)? = nil,
+        spaceNotificationDirectory: (any AuthorizedSpaceNotificationDirectory)? = nil,
+        spaceCredentialIssuance: DurableSpaceCredentialAuthority.Configuration = .standard
     ) -> SwanHTTPServer {
         SwanHTTPServer(
             profile: profile,
@@ -1041,6 +1080,7 @@ struct ServePermissionedRuntime {
             spaceRepositoryCredentialConfiguration: repositoryCredentialConfiguration,
             spaceNotificationConfiguration: notificationConfiguration,
             simpleSpaceCheckUserAccessConfiguration: checkUserAccessConfiguration,
+            spacesOpenInterop: spacesOpenInterop,
             publicRepositoryReadDirectory: directory,
             publicRepositoryMutationDirectory: publicMutationRuntime.map { _ in
                 ServePublicMutationDirectory(directory: directory, controls: accountControlStore)
@@ -1060,7 +1100,11 @@ struct ServePermissionedRuntime {
             loginClientIdentityPolicy: loginClientIdentityPolicy,
             publicFirehoseStreaming: publicFirehoseStreaming,
             identityAdmission: identityAdmission,
-            foreignHandleResolution: foreignHandleResolution
+            foreignHandleResolution: foreignHandleResolution,
+            spaceCredentialPolicyDirectory: spaceCredentialPolicyDirectory,
+            simpleSpaceLifecycleDirectory: simpleSpaceLifecycleDirectory,
+            spaceNotificationDirectory: spaceNotificationDirectory,
+            spaceCredentialIssuance: spaceCredentialIssuance
         )
     }
 }
@@ -1122,7 +1166,7 @@ private func decodeBase64URLOAuthServerKey(_ value: Data) throws -> Data {
     return key
 }
 
-private func readBoundedRegularFileNoFollow(
+func readBoundedRegularFileNoFollow(
     _ url: URL,
     maximumBytes: Int,
     requireOwnerOnly: Bool = false,
@@ -1512,6 +1556,7 @@ extension SwanCommand {
                         expectedOfflineCommitCount: input.expectedOfflineCommitCount
                     )
 
+                    let acceptedHeads = InMemoryRelayAcceptedHeadStorage()
                     var relayState: RelayRepositoryVerificationState?
                     for event in events {
                         switch event {
@@ -1519,12 +1564,14 @@ extension SwanCommand {
                             if let current = relayState {
                                 relayState = try await current.synchronizing(
                                     sync,
-                                    verifier: commitVerifier
+                                    verifier: commitVerifier,
+                                    storage: acceptedHeads
                                 )
                             } else {
                                 relayState = try await .activationSync(
                                     sync,
-                                    verifier: commitVerifier
+                                    verifier: commitVerifier,
+                                    storage: acceptedHeads
                                 )
                             }
                         case let .commit(commit):
@@ -1533,7 +1580,8 @@ extension SwanCommand {
                             }
                             relayState = try await current.applying(
                                 commit: commit,
-                                verifier: commitVerifier
+                                verifier: commitVerifier,
+                                    storage: acceptedHeads
                             )
                         case .identity, .account, .info:
                             break
@@ -1556,7 +1604,8 @@ extension SwanCommand {
                     let swanFinal = try await RelayFullRepositoryVerifier.verify(
                         car: finalCAR,
                         expected: finalHead,
-                        verifier: commitVerifier
+                        verifier: commitVerifier,
+                                    storage: acceptedHeads
                     )
                     try RelayFinalStateVerifier.verify(
                         relay: relayState.snapshot,
@@ -1906,7 +1955,18 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Run Swan's Hummingbird server")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-08-15.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-10-22.json"
+
+        @Option(name: .long, help: "Local authority DID for committed Labyrinth conversation membership policy")
+        var conversationSpaceAuthority: String?
+        @Option(name: .long, help: "Exact HTTPS MLS policy service origin; no automatic discovery")
+        var conversationSpacePolicyURL: String?
+        @Option(name: .long, help: "Service JWT audience of the MLS policy service")
+        var conversationSpacePolicyAudience: String?
+        @Option(name: .long, help: "Literal IP pin of the MLS policy service")
+        var conversationSpacePolicyPeerIP: String?
+        @Flag(name: .long, help: "Permit the configured localhost MLS policy origin for a disposable lab")
+        var conversationSpacePolicyLaboratory = false
 
         /// The public route surface is a separate contract family from
         /// `--profile`, and gets a separate flag rather than a widened one.
@@ -2278,6 +2338,12 @@ extension SwanCommand {
         var enableLocalSpaceInterop = false
 
         @Flag(
+            name: .customLong("enable-spaces-open-interop"),
+            help: "Opt into upstream atproto-spaces interop: unbound notify service auth, optional Atproto-Service-Auth on (un)registerNotify, open DID-document federation, and upstream scope/legacy-session semantics. Off by default."
+        )
+        var enableSpacesOpenInterop = false
+
+        @Flag(
             name: .customLong("enable-public-repository-mutations"),
             help: "Enable the separately composed OAuth-authorized public repository mutation capability."
         )
@@ -2475,6 +2541,16 @@ extension SwanCommand {
                         + "no route for: \(unserved.joined(separator: ", "))"
                 )
             }
+        }
+
+        /// Conversation spaces get 60-second credentials, because a removed
+        /// MLS member keeps reading until its credential expires. Every other
+        /// space keeps the authority's default lifetime.
+        static func spaceCredentialIssuance(
+            conversationPolicyEnabled: Bool
+        ) throws -> DurableSpaceCredentialAuthority.Configuration {
+            try .init(spaceTypeLifetimes: conversationPolicyEnabled
+                ? ["blue.catbird.labyrinth.conversation": 60] : [:])
         }
 
         /// Whether a resolved `--public-url` names an origin the public
@@ -2724,19 +2800,101 @@ extension SwanCommand {
             )
         }
 
-        /// Validate every owner-only input needed by the legacy-session
-        /// surface before a control database, migration, account directory,
-        /// or repository bootstrap can create state.  The key-store
-        /// constructor also validates the protected directory contents
-        /// (marker/journal) and pins its descriptor; the resulting store is
-        /// handed to composition so neither the KEK file nor directory path
-        /// is opened a second time.
+        /// Legacy-session material that passed the read-only half of the
+        /// startup interlock: both mounted secrets are decoded and the key
+        /// root is opened with `O_NOFOLLOW` and validated as an existing
+        /// owner-only directory whose contents pass the store's read-only
+        /// preflight.  Producing this creates and writes nothing,
+        /// so `serve` obtains it before the service-directory lease creates
+        /// the data directory.  The validated key-root descriptor stays open
+        /// until `openAccountKeyStore()` hands it to `FileAccountKeyStore`,
+        /// so the store is built from the exact directory that passed
+        /// validation and the pathname is never reopened.
+        final class PinnedLegacySessionStartupMaterial {
+            let signingKey: Data
+            let accountKeyConfiguration: AccountKeyEncryptionConfiguration
+            let accountKeyDirectory: URL
+            let reusesAppViewProxyConfiguration: Bool
+            private let accountKeyDirectoryDescriptor: Int32
+
+            fileprivate init(
+                signingKey: Data,
+                accountKeyConfiguration: AccountKeyEncryptionConfiguration,
+                accountKeyDirectory: URL,
+                accountKeyDirectoryDescriptor: Int32,
+                reusesAppViewProxyConfiguration: Bool
+            ) {
+                self.signingKey = signingKey
+                self.accountKeyConfiguration = accountKeyConfiguration
+                self.accountKeyDirectory = accountKeyDirectory
+                self.accountKeyDirectoryDescriptor = accountKeyDirectoryDescriptor
+                self.reusesAppViewProxyConfiguration = reusesAppViewProxyConfiguration
+            }
+
+            deinit { _ = close(accountKeyDirectoryDescriptor) }
+
+            /// The writing half of the interlock.  Opening the store creates
+            /// its writer lock and active-key marker and finishes any
+            /// interrupted provisioning journal inside the key root, so
+            /// `serve` calls this only while it holds the service-directory
+            /// lease: the default key root is `<data-directory>/keys`, which
+            /// an offline snapshot copies under the exclusive lease.
+            func openAccountKeyStore() throws -> ValidatedLegacySessionStartupMaterial {
+                let accountKeyStore: FileAccountKeyStore
+                do {
+                    // The store duplicates the validated descriptor, so a
+                    // concurrent rename or replacement of the pathname
+                    // cannot redirect initialization.
+                    accountKeyStore = try FileAccountKeyStore(
+                        existingRootDirectoryDescriptor: accountKeyDirectoryDescriptor,
+                        configuration: accountKeyConfiguration
+                    )
+                } catch {
+                    throw ValidationError(
+                        "legacy-session account-key-backed service-token issuer is unavailable"
+                    )
+                }
+                return ValidatedLegacySessionStartupMaterial(
+                    signingKey: signingKey,
+                    accountKeyConfiguration: accountKeyConfiguration,
+                    accountKeyDirectory: accountKeyDirectory,
+                    accountKeyStore: accountKeyStore,
+                    reusesAppViewProxyConfiguration: reusesAppViewProxyConfiguration
+                )
+            }
+        }
+
+        /// Both halves of the legacy-session interlock in one call, for
+        /// callers that hold no service-directory lease (focused tests and
+        /// offline composition).  `serve` calls the halves separately: the
+        /// read-only validation before the lease, the key-store writes
+        /// under it.
         static func preflightLegacySessionStartupMaterial(
             enableLegacySessions: Bool,
             legacySessionSigningKeyFile: String?,
             accountKeySource: LegacySessionAccountKeySource?,
             dataDirectory: URL
         ) throws -> ValidatedLegacySessionStartupMaterial? {
+            try validateLegacySessionMountedSecrets(
+                enableLegacySessions: enableLegacySessions,
+                legacySessionSigningKeyFile: legacySessionSigningKeyFile,
+                accountKeySource: accountKeySource,
+                dataDirectory: dataDirectory
+            )?.openAccountKeyStore()
+        }
+
+        /// Validate every owner-only input needed by the legacy-session
+        /// surface (HMAC signing key, account KEK, existing owner-only key
+        /// root and its contents) without creating or writing anything.
+        /// `serve` runs this before the service-directory lease, control
+        /// database, migration, account directory, or repository bootstrap
+        /// can create state, so a refusal leaves no data directory behind.
+        static func validateLegacySessionMountedSecrets(
+            enableLegacySessions: Bool,
+            legacySessionSigningKeyFile: String?,
+            accountKeySource: LegacySessionAccountKeySource?,
+            dataDirectory: URL
+        ) throws -> PinnedLegacySessionStartupMaterial? {
             guard enableLegacySessions else { return nil }
 
             guard let signingKeyFile = legacySessionSigningKeyFile,
@@ -2780,32 +2938,38 @@ extension SwanCommand {
 
             let accountKeyDirectory = accountKeySource.keyDirectory
                 ?? dataDirectory.appending(path: "keys")
-            let accountKeyStore: FileAccountKeyStore
+            let accountKeyDirectoryDescriptor: Int32
             do {
                 // The normal pathname constructor is allowed to create a
                 // missing root for provisioning commands. `serve` instead
-                // opens and validates the mounted root once, then gives the
-                // store only a duplicated descriptor, so a concurrent rename
-                // or replacement cannot redirect initialization.
-                accountKeyStore = try withExistingOwnerOnlyKeyDirectory(
-                    accountKeyDirectory
-                ) { descriptor in
-                    try FileAccountKeyStore(
-                        existingRootDirectoryDescriptor: descriptor,
+                // opens and validates the mounted root once and pins this
+                // descriptor; the store is later built from it alone.
+                let descriptor =
+                    try requireExistingOwnerOnlyKeyDirectory(accountKeyDirectory)
+                // Refuse the root's contents (writer lock, active-KEK
+                // marker, provisioning journal) here too, read-only, with
+                // the same checks the store applies when it opens.
+                do {
+                    try FileAccountKeyStore.preflightExistingRoot(
+                        directoryDescriptor: descriptor,
                         configuration: accountKeyConfiguration
                     )
+                } catch {
+                    _ = close(descriptor)
+                    throw error
                 }
+                accountKeyDirectoryDescriptor = descriptor
             } catch {
                 throw ValidationError(
                     "legacy-session account-key-backed service-token issuer is unavailable"
                 )
             }
 
-            return ValidatedLegacySessionStartupMaterial(
+            return PinnedLegacySessionStartupMaterial(
                 signingKey: signingKey,
                 accountKeyConfiguration: accountKeyConfiguration,
                 accountKeyDirectory: accountKeyDirectory,
-                accountKeyStore: accountKeyStore,
+                accountKeyDirectoryDescriptor: accountKeyDirectoryDescriptor,
                 reusesAppViewProxyConfiguration:
                     accountKeySource.reusesAppViewProxyConfiguration
             )
@@ -3528,17 +3692,39 @@ extension SwanCommand {
             let dataURL = URL(fileURLWithPath: dataDirectory)
             // Legacy bearer credentials are the one serve surface whose
             // mounted secrets must be validated as a single authority before
-            // any SQLite or repository path is opened.  Keep the validated
+            // any state exists.  The read-only half runs before the service
+            // lease, because the lease creates the data directory and a
+            // refused configuration must leave none behind.  The pinned key
+            // root becomes a store only under the lease, because the store
+            // writes into it and the default root lies inside the data
+            // directory that offline snapshots copy.  Keep the validated
             // bytes/configuration/store and pass them into composition below;
             // do not re-read these pathnames after bootstrap.
-            let validatedLegacySessionStartup = try Self
-                .preflightLegacySessionStartupMaterial(
+            var pinnedLegacySessionStartup = try Self
+                .validateLegacySessionMountedSecrets(
                     enableLegacySessions: enableLegacySessions,
                     legacySessionSigningKeyFile: legacySessionSigningKeyFile,
                     accountKeySource: legacySessionAccountKeySource,
                     dataDirectory: dataURL
                 )
+            // The OAuth server key is a pure owner-only file read, so a
+            // missing or malformed key is refused before the lease as well.
             let serverKey = try loadOAuthServerKey(fromFile: oauthServerKeyFile)
+            let serviceDirectoryLease = try SwanServiceDirectoryLease(dataDirectory: dataURL)
+            defer { withExtendedLifetime(serviceDirectoryLease) {} }
+            // Bad key-root contents were already refused read-only above.
+            // Opening the store still writes (writer lock, active-KEK
+            // marker, journal recovery), so it stays under the lease. What
+            // can still fail here is one of those writes (I/O, or a writer
+            // lock that is owner-read-only), or a root that changed after
+            // the preflight. Such a failure can leave the data directory and
+            // its lease file behind; it cannot move above the lease without
+            // writing outside it.
+            let validatedLegacySessionStartup = try pinnedLegacySessionStartup?
+                .openAccountKeyStore()
+            // The store holds its own duplicate; close the validated
+            // key-root descriptor now rather than when `run()` returns.
+            pinnedLegacySessionStartup = nil
             let controlDatabase = try await SQLiteControlDatabase(dataDirectory: dataURL)
             var preopenedAccountDirectory: SQLitePreMigratedAccountDirectory?
             var preopenedManagementProvisioning: SwanManagementPLCProvisioningRuntime?
@@ -3868,6 +4054,7 @@ extension SwanCommand {
                     throw ValidationError("--enable-notification-delivery requires --notification-config")
                 }
                 let permissionedRuntime: ServePermissionedRuntime
+                var openFederationResolver: SwanDIDDocumentSpaceResolver?
                 do {
                     // Erratum 03: `registerNotify` resolves a subscriber's
                     // `service` identifier through its DID document. Built
@@ -3875,29 +4062,39 @@ extension SwanCommand {
                     // peer-policied one OAuth metadata uses, and it only
                     // fires when a credentialed caller names a service.
                     let notifyServiceResolver: SwanServiceEndpointResolver?
+                    let didDocumentFetcher: SwanPeerPinnedDIDDocumentFetcher?
                     do {
                         let policy = try OAuthRemoteFetchPolicy()
-                        notifyServiceResolver = SwanServiceEndpointResolver(
-                            documents: try SwanPeerPinnedDIDDocumentFetcher(
-                                documents: OAuthRemoteDocumentFetcher(
-                                    policy: policy,
-                                    transport: try NIOPeerPinnedOAuthDocumentTransport(
-                                        maximumTransportTimeout: policy.timeout
-                                    )
-                                ),
-                                plcOrigin: managementDeletionPLCConfiguration?.origin
-                                    ?? PLCClientConfiguration.defaultProductionOrigin
-                            )
+                        let fetcher = try SwanPeerPinnedDIDDocumentFetcher(
+                            documents: OAuthRemoteDocumentFetcher(
+                                policy: policy,
+                                transport: try NIOPeerPinnedOAuthDocumentTransport(
+                                    maximumTransportTimeout: policy.timeout
+                                )
+                            ),
+                            plcOrigin: managementDeletionPLCConfiguration?.origin
+                                ?? PLCClientConfiguration.defaultProductionOrigin
                         )
+                        didDocumentFetcher = fetcher
+                        notifyServiceResolver = SwanServiceEndpointResolver(documents: fetcher)
                     } catch {
+                        didDocumentFetcher = nil
                         notifyServiceResolver = nil
                     }
+                    if enableSpacesOpenInterop, didDocumentFetcher == nil {
+                        throw ValidationError("--enable-spaces-open-interop requires DID document resolution")
+                    }
+                    openFederationResolver = enableSpacesOpenInterop
+                        ? didDocumentFetcher.map { SwanDIDDocumentSpaceResolver(documents: $0) }
+                        : nil
                     permissionedRuntime = try await .compose(
                         local: localSpaceRuntime,
                         notification: notificationRuntime,
                         managingServiceAudience: managingServiceAudience,
                         clientAttestationPolicy: clientAttestationPolicy,
-                        serviceEndpointResolver: notifyServiceResolver
+                        serviceEndpointResolver: notifyServiceResolver,
+                        spacesOpenInterop: enableSpacesOpenInterop ? .standard : nil,
+                        openFederation: openFederationResolver
                     )
                 } catch {
                     throw ValidationError("permissioned runtime key composition is invalid")
@@ -3951,6 +4148,13 @@ extension SwanCommand {
                             throw ValidationError("notification account signing runtime is unavailable")
                         }
                     }
+                    let outboxDestinations: any SwanSpaceAuthorityNotificationDestinationResolving =
+                        openFederationResolver.map {
+                            SwanOpenFederationAuthorityNotificationDestinations(
+                                configured: notificationRuntime.destinations,
+                                resolver: $0
+                            )
+                        } ?? notificationRuntime.destinations
                     let poster: OAuthBoundedJSONPoster
                     do {
                         let pinned = notificationRuntime.peerPinnedTransportConfiguration
@@ -3973,7 +4177,7 @@ extension SwanCommand {
                         directory,
                         makeOutboxTransport: { database in
                             HTTPPermissionedSpaceOutboxTransport(
-                                destinations: notificationRuntime.destinations,
+                                destinations: outboxDestinations,
                                 announcements: .init(database: database),
                                 serviceAuthentication: serviceIssuer,
                                 poster: poster
@@ -4841,6 +5045,43 @@ extension SwanCommand {
                 } else {
                     foreignHandleResolution = nil
                 }
+                let conversationLifecycle: SwanConversationSpaceLifecycle?
+                let conversationDeletionService: SwanConversationSpaceDeletionService?
+                let conversationPolicy: (any AuthorizedSimpleSpaceCredentialDirectory)?
+                let conversationOptions = [conversationSpaceAuthority, conversationSpacePolicyURL,
+                                           conversationSpacePolicyAudience, conversationSpacePolicyPeerIP]
+                if conversationOptions.contains(where: { $0 != nil }) || conversationSpacePolicyLaboratory {
+                    guard let authority = conversationSpaceAuthority,
+                          let rawOrigin = conversationSpacePolicyURL, let origin = URL(string: rawOrigin),
+                          let audience = conversationSpacePolicyAudience,
+                          let rawPeer = conversationSpacePolicyPeerIP, let peer = OAuthIPAddress(literal: rawPeer),
+                          let localSpaceRuntime, enableNotificationDelivery, notificationRuntime != nil else {
+                        throw ValidationError("conversation Space policy requires all policy options, local account custody, and notification delivery")
+                    }
+                    _ = try AccountIdentifiers.validateDID(authority)
+                    try await directory.requireActivePreopenedAccount(authority)
+                    if conversationSpacePolicyLaboratory {
+                        guard origin.host == "localhost", peer.isLoopback,
+                              !Self.isPubliclyReachableHTTPSOrigin(baseURL),
+                              OAuthIPAddress(literal: host)?.isLoopback == true else {
+                            throw ValidationError("conversation policy laboratory mode requires localhost, a loopback peer/listener, and a non-public server origin")
+                        }
+                    }
+                    let policy = try OAuthRemoteFetchPolicy(
+                        allowLocalhostDevelopment: conversationSpacePolicyLaboratory,
+                        networkAllowlist: .init(addresses: conversationSpacePolicyLaboratory ? [peer] : []),
+                        maximumBodyBytes: 8192, timeout: 5)
+                    let checker = try RemoteConversationSpaceMembershipChecker(
+                        origin: origin, audience: audience, signer: localSpaceRuntime.notificationServiceIssuer,
+                        policy: policy, transport: NIOPeerPinnedOAuthPostTransport(configuration: try .init(
+                            endpointPeers: [origin.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")): peer])))
+                    conversationPolicy = ConversationSpaceCredentialDirectory(local: directory,
+                        accounts: directory, authority: authority, membership: checker, lifecycle: directory)
+                    conversationLifecycle = SwanConversationSpaceLifecycle(local: directory, lifecycle: directory, remote: checker, membership: checker, notifications: directory, authority: authority)
+                    conversationDeletionService = SwanConversationSpaceDeletionService(lifecycle: directory, remote: checker, authority: authority)
+                } else {
+                    conversationPolicy = nil; conversationLifecycle = nil; conversationDeletionService = nil
+                }
                 let server = permissionedRuntime.makeServer(
                     profile: loadedProfile,
                     configuration: .init(
@@ -4877,7 +5118,13 @@ extension SwanCommand {
                     loginClientIdentityPolicy: loginClientIdentityPolicy,
                     publicFirehoseStreaming: publicFirehoseStreamingRuntime,
                     identityAdmission: identityAdmission,
-                    foreignHandleResolution: foreignHandleResolution
+                    foreignHandleResolution: foreignHandleResolution,
+                    spaceCredentialPolicyDirectory: conversationPolicy,
+                    simpleSpaceLifecycleDirectory: conversationLifecycle,
+                    spaceNotificationDirectory: conversationLifecycle,
+                    spaceCredentialIssuance: try Self.spaceCredentialIssuance(
+                        conversationPolicyEnabled: conversationPolicy != nil
+                    )
                 )
                 guard server.authenticatedGetSpace != nil else {
                     throw ValidationError(
@@ -4958,6 +5205,22 @@ extension SwanCommand {
                     "address": .string("\(host):\(port)"),
                 ])
                 var services: [any ServiceLifecycle.Service] = [publicApplication]
+                if let conversationDeletionService { services.append(conversationDeletionService) }
+                if let localSpaceRuntime {
+                    let backfillPLC = try managementDeletionPLCConfiguration
+                        ?? ServeNotificationRuntime.kemBackfillPLCConfiguration(notificationStartupMaterial)
+                    services.append(SwanAccountKEMBackfillService(
+                        control: controlDatabase,
+                        keys: localSpaceRuntime.accountKeyStore,
+                        rotation: PLCAccountRotationService(
+                            controlStore: controlDatabase,
+                            accountStoreOpener: SQLitePLCAccountPreparationStoreOpener(dataDirectory: dataURL),
+                            keyStore: localSpaceRuntime.accountKeyStore,
+                            plcClient: try PLCDirectoryClient(configuration: backfillPLC),
+                            lifecycleEmitter: lifecycleEmitter),
+                        pdsOrigin: baseURL))
+                    logger.info("durable account KEM backfill enabled")
+                }
                 if permissionedRuntime.notificationConfiguration != nil {
                     logger.info("space notification receiver routes enabled")
                 }
@@ -5032,7 +5295,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Verify a pinned Swan artifact")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-08-15.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-10-22.json"
 
         @Option(name: .long, help: "Swan package root containing generated wire sources")
         var sourceRoot: String?
@@ -5077,10 +5340,45 @@ extension SwanCommand {
             abstract: "Inspect or manage a provisioned Swan account",
             subcommands: [
                 InstallLocal.self, PreparePLC.self, ActivatePLC.self, RotatePLC.self, Show.self,
-                RecoveryCommitKey.self, Deactivate.self, Reactivate.self, DeclareExport.self,
-                Delete.self,
+                RecoveryCommitKey.self, KEMMethod.self, Deactivate.self, Reactivate.self, DeclareExport.self,
+                Delete.self, AdoptRecreatedSpace.self,
             ]
         )
+
+        /// Emits only the public method for owner-controlled DID documents.
+        /// Automatic publication remains confined to the leased PLC backfill.
+        struct KEMMethod: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(commandName: "kem-method",
+                abstract: "Print the public #atproto_kem method for manual DID document publication")
+            @Option(name: .long) var dataDirectory: String
+            @Option(name: .long) var did: String
+            @Option(name: .long) var identityDID: String?
+            @Option(name: .long) var operatorSecretFile: String?
+            @Option(name: .long) var accountKEKFile: String
+            @Option(name: .customLong("account-kek-id")) var accountKEKID: String = "primary"
+            @Option(name: .long) var accountKeyDirectory: String?
+
+            func run() async throws {
+                _ = try AccountCommandSupport.authorization(secretFilePath: operatorSecretFile)
+                let root = URL(fileURLWithPath: dataDirectory)
+                let control = try await SQLiteControlDatabase(dataDirectory: root)
+                do {
+                    guard let account = try await control.account(did: did), account.status == .active else {
+                        throw ValidationError("active hosted account required")
+                    }
+                    let configuration = try AccountProvisioningSecrets.requiredMountedAccountKeyConfiguration(
+                        activeKeyID: accountKEKID, secretFile: URL(fileURLWithPath: accountKEKFile))
+                    let keys = try FileAccountKeyStore(root: accountKeyDirectory.map { URL(fileURLWithPath: $0) }
+                        ?? root.appending(path: "keys"), configuration: configuration)
+                    let method = try await AccountKEMKeyProvider(keyStore: keys).verificationMethod(accountDID: did, identityDID: identityDID)
+                    try await control.close()
+                    try AccountCommandSupport.write(method)
+                } catch {
+                    try? await control.close()
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+            }
+        }
 
         /// Installs the local, durable half of a Swan account. It deliberately
         /// does not claim PLC registration or remote handle verification: the
@@ -6097,7 +6395,7 @@ extension SwanCommand {
             var sourceRedirectURI: String = ""
             @Option(name: .long, parsing: .upToNextOption)
             var scope: [String] = ["atproto"]
-            @Option(name: .customLong("permissioned-commit-key-env"))
+            @Option(name: .customLong("permissioned-commit-key-env"), help: "Compatibility option only; native reads use SWAN_LAB_KEM_KEYS_FILE or SWAN_LAB_KEM_PUBLIC_KEY")
             var permissionedCommitKeyEnvironment =
                 "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
             @Option(name: .customLong("request-id"))
@@ -6112,7 +6410,7 @@ extension SwanCommand {
             @Flag(
                 name: .customLong("full-car-recovery"),
                 inversion: .prefixedNo,
-                help: "Perform verified full-CAR replacement when incremental history is unavailable"
+                help: "Compatibility flag name; perform verified full-STAR replacement when incremental history is unavailable"
             )
             var fullCARRecovery = true
             @Option(name: .long)
@@ -6151,9 +6449,8 @@ extension SwanCommand {
                     did: receiver,
                     dataDirectory: dataURL
                 )
-                let key = try LabLiveSupport.permissionedCommitVerificationKey(
-                    environment: permissionedCommitKeyEnvironment
-                )
+                // Native reads authenticate with the dedicated per-request KEM exchange.
+                let key: PermissionedDataJWTVerificationKey? = nil
                 let sourceEndpoint = try LabLiveSupport.url(
                     explicit: sourceURL,
                     environment: "SWAN_LAB_PRODUCER_URL",
@@ -6193,8 +6490,9 @@ extension SwanCommand {
                 )
                 let source = LiveInteropHost(
                     label: "source", client: member.client,
-                    authorization: .bearer(token: credential),
-                    permissionedCommitVerificationKey: key
+                    authorization: .spaceCredential(credential),
+                    permissionedCommitVerificationKey: key,
+                    permissionedKEMKeyProvider: try LabLiveSupport.kemKeyProvider()
                 )
                 let database = try await SQLiteAccountDatabase(
                     dataDirectory: dataURL,
@@ -6441,7 +6739,7 @@ extension SwanCommand {
         struct RecoverPermissioned: AsyncParsableCommand {
             static let configuration = CommandConfiguration(
                 commandName: "recover-permissioned",
-                abstract: "Stream, verify, and durably install a permissioned repository recovery CAR"
+                abstract: "Stream, verify, and durably install a permissioned repository STAR snapshot"
             )
 
             @Option(name: .customLong("receiver-did"), help: "Managed receiver account DID")
@@ -6491,13 +6789,13 @@ extension SwanCommand {
 
             @Flag(
                 name: .customLong("allow-full-car-fallback"),
-                help: "Allow an explicitly requested full-CAR install when the source returns a successful listRepoOps response without a retention-gap error"
+                help: "Compatibility flag name; allow an explicitly requested full-STAR install when listRepoOps succeeds without a retention-gap error"
             )
             var allowFullCARFallback = false
 
             @Option(
                 name: .customLong("permissioned-commit-key-env"),
-                help: "Environment variable containing ES256:<base64url-x963> or ES256K:<base64url> repository-author public key"
+                help: "Compatibility option only; native reads use SWAN_LAB_KEM_KEYS_FILE or SWAN_LAB_KEM_PUBLIC_KEY"
             )
             var permissionedCommitKeyEnvironment =
                 "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
@@ -6589,10 +6887,7 @@ extension SwanCommand {
                         "--source-auth must be bearer or oauth"
                     )
                 }
-                let verificationKey = try LabLiveSupport
-                    .permissionedCommitVerificationKey(
-                        environment: permissionedCommitKeyEnvironment
-                    )
+                let verificationKey: PermissionedDataJWTVerificationKey? = nil
                 let requestPrefix: String
                 if requestID.isEmpty {
                     requestPrefix = "recover-\(UUID().uuidString.lowercased())"
@@ -6676,7 +6971,7 @@ extension SwanCommand {
                     did: canonicalReceiver,
                     openMode: .existingManaged
                 )
-                // The remote CAR is staged and verified before this closure is
+                // The remote STAR is staged and verified before this closure is
                 // invoked. It opens the control plane only for the final,
                 // network-free publication transaction, so deactivation
                 // cannot race the authorization decision used by recovery.
@@ -6749,19 +7044,22 @@ extension SwanCommand {
                     let source = LiveInteropHost(
                         label: "source",
                         client: sourceMember.client,
-                        authorization: .bearer(token: credential),
-                        permissionedCommitVerificationKey: verificationKey
+                        authorization: .spaceCredential(credential),
+                        permissionedCommitVerificationKey: verificationKey,
+                        permissionedKEMKeyProvider: try LabLiveSupport.kemKeyProvider()
                     )
-                    let gap = try await source.client.query(
-                        "com.atproto.space.listRepoOps",
+                    let gap = try await PermissionedSpaceMACHTTP.query(
+                        host: source, nsid: "com.atproto.space.listRepoOps",
                         query: [
                             "space": parsedSpace.rawValue,
                             "repo": canonicalRepository,
                             "since": sinceRevision.toString(),
                             "limit": "1",
                         ],
-                        authorization: source.authorization
-                    )
+                        space: parsedSpace, author: canonicalRepository,
+                        authorization: { source.authorization },
+                        commit: { try StrictJSON.decode(ComAtprotoSpaceListRepoOps.Output.self, from: $0).commit }
+                    ).response
                     gapStatus = gap.status
                     gapErrorCode = Self.responseError(gap)
                     let explicitRetentionGap = gap.status == 409
@@ -6829,7 +7127,7 @@ extension SwanCommand {
                             .code(for: error)
                         // A transport, OAuth, timeout, or unrelated storage
                         // failure is not evidence that the corrupted archive
-                        // reached and was rejected by the CAR verifier. The
+                        // reached and was rejected by the STAR verifier. The
                         // injected final-byte mutation deterministically
                         // invalidates the containing block's CID.
                         corruptionRejected = PermissionedRecoveryFailureCode
@@ -7677,31 +7975,31 @@ extension SwanCommand {
 
             @Flag(
                 name: .customLong("permissioned-list-ops-exclude-values"),
-                help: "Request the metadata-only listRepoOps form (required by the pinned TypeScript branch until its joined-query bug is fixed)"
+                help: "Request the metadata-only listRepoOps form"
             )
             var permissionedListOpsExcludeValues = false
 
             @Flag(
                 name: .customLong("permissioned-get-repo"),
-                help: "Fetch and cryptographically verify the repository host's full two-root permissioned CAR"
+                help: "Fetch and verify the repository host's full STAR snapshot and response MAC"
             )
             var permissionedGetRepo = false
 
             @Flag(
                 name: .customLong("permissioned-stateful-matrix"),
-                help: "Require create/read CID convergence plus verified listRepoOps revision/commitment and full-CAR recovery evidence"
+                help: "Require create/read CID convergence plus verified listRepoOps revision/commitment and full-STAR recovery evidence"
             )
             var permissionedStatefulMatrix = false
 
             @Flag(
                 name: .customLong("permissioned-write-only-apply-writes"),
-                help: "Opt in to one member OAuth/DPoP applyWrites batch plus a metadata-only signed terminal-revision witness"
+                help: "Opt in to one member OAuth/DPoP applyWrites batch plus a metadata-only MAC-authenticated terminal-revision witness"
             )
             var permissionedWriteOnlyApplyWrites = false
 
             @Option(
                 name: .customLong("permissioned-commit-key-env"),
-                help: "Environment variable containing a canonical did:key or ES256:<base64url-x963>/ES256K:<base64url> repository-author public key (untagged is legacy ES256K)"
+                help: "Compatibility option only; native reads use SWAN_LAB_KEM_KEYS_FILE or SWAN_LAB_KEM_PUBLIC_KEY"
             )
             var permissionedCommitKeyEnvironment = "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
 
@@ -7791,10 +8089,7 @@ extension SwanCommand {
                         environment: "SWAN_LAB_PRODUCER_URL",
                         fallback: "https://swan.test"
                     )
-                    let permissionedCommitKey = try LabLiveSupport
-                        .permissionedCommitVerificationKey(
-                            environment: permissionedCommitKeyEnvironment
-                        )
+                    let permissionedCommitKey: PermissionedDataJWTVerificationKey? = nil
                     let producer = try await LabLiveSupport.host(
                         label: "member",
                         url: producerURL,
@@ -7842,9 +8137,7 @@ extension SwanCommand {
                     environment: "SWAN_LAB_CONSUMER_URL",
                     fallback: "https://pds.test"
                 )
-                let permissionedCommitKey = try (permissionedListOps || permissionedGetRepo || permissionedStatefulMatrix)
-                    ? LabLiveSupport.permissionedCommitVerificationKey(environment: permissionedCommitKeyEnvironment)
-                    : nil
+                let permissionedCommitKey: PermissionedDataJWTVerificationKey? = nil
                 let producer = try await LabLiveSupport.host(
                     label: normalizedMode == "permissioned" ? "member" : "producer",
                     url: producerURL,
@@ -7989,7 +8282,7 @@ extension SwanCommand {
             /// Creates a forum space on an authority and adds one member.
             /// Mirrors `lab live --provision-space`: it reuses
             /// `LabLiveSupport.provisionSpace` (simplespace.createSpace +
-            /// addMember) through the OAuth-authorized procedure helper.
+            /// putMember) through the OAuth-authorized procedure helper.
             struct Provision: AsyncParsableCommand {
                 static let configuration = CommandConfiguration(
                     commandName: "provision",
@@ -8366,7 +8659,7 @@ extension SwanCommand {
                 @Option(name: .long, parsing: .upToNextOption, help: "OAuth scope to request; repeatable (default: atproto plus the derived space read scope)")
                 var scope: [String] = []
 
-                @Option(name: .customLong("permissioned-commit-key-env"), help: "Environment variable containing the repository author public key (base64url secp256k1)")
+                @Option(name: .customLong("permissioned-commit-key-env"), help: "Compatibility option only; native reads use SWAN_LAB_KEM_KEYS_FILE or SWAN_LAB_KEM_PUBLIC_KEY")
                 var permissionedCommitKeyEnvironment = "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
 
                 @Option(name: .customLong("plc-origin"), help: "PLC directory origin used to discover each writer's repo host (default: https://plc.directory)")
@@ -8378,13 +8671,13 @@ extension SwanCommand {
                 @Option(name: .customLong("plc-laboratory-allowlisted-host"), help: "Explicit Docker/service DNS host allowed for --plc-laboratory")
                 var plcLaboratoryAllowlistedHost: String?
 
-                @Option(name: .customLong("writer-host"), parsing: .upToNextOption, help: "Explicit writer repo host as did=url, optionally did=url:did:key:z... with a per-writer commit key; repeatable (overrides PLC discovery)")
+                @Option(name: .customLong("writer-host"), parsing: .upToNextOption, help: "Explicit writer repo host as did=url; repeatable (overrides PLC discovery). Legacy commit-key suffixes are accepted for compatibility and ignored by native reads")
                 var writerHost: [String] = []
 
                 @Flag(
                     name: .customLong("full-car-recovery"),
                     inversion: .prefixedNo,
-                    help: "Perform verified full-CAR replacement when incremental history is unavailable"
+                    help: "Compatibility flag name; perform verified full-STAR replacement when incremental history is unavailable"
                 )
                 var fullCARRecovery = true
 
@@ -8421,10 +8714,6 @@ extension SwanCommand {
                         dataDirectory: dataURL
                     )
                     Forum.log("forum thread: receiver account is active")
-                    let globalKey = try LabLiveSupport
-                        .optionalPermissionedCommitVerificationKey(
-                            environment: permissionedCommitKeyEnvironment
-                        )
                     let consumer = try await Forum.oauthAwareHost(
                         label: "consumer",
                         url: LabLiveSupport.url(
@@ -8491,12 +8780,7 @@ extension SwanCommand {
                             memberAuthorizationProvider: consumer.authorizationProvider
                         )
                         Forum.log("forum thread: space credential issued")
-                        guard !credential.isEmpty else {
-                            throw ValidationError("space credential exchange returned an empty credential")
-                        }
-                        let credentialAuthorization = InteropAuthorization.bearer(
-                            token: credential
-                        )
+                        let credentialAuthorization = InteropAuthorization.spaceCredential(credential)
                         Forum.log("forum thread: listing writers")
                         let writers = try await Forum.listWriters(
                             authority: authority,
@@ -8526,23 +8810,8 @@ extension SwanCommand {
                                 ))
                                 continue
                             }
-                            let writerKey: PermissionedDataJWTVerificationKey
-                            if let overrideKey = writerHosts[writer]?.commitVerificationKey {
-                                writerKey = try LabLiveSupport.decodeCommitVerificationKey(overrideKey)
-                            } else if let globalKey {
-                                writerKey = globalKey
-                            } else {
-                                failedWriters.append(writer)
-                                writerStatuses.append(ForumWriterStatus(
-                                    did: writer,
-                                    host: writerURL.host ?? writerURL.absoluteString,
-                                    outcome: "commit_key_missing",
-                                    revision: nil,
-                                    commitment: nil,
-                                    recordCount: 0
-                                ))
-                                continue
-                            }
+                            // Every writer is authenticated by its dedicated KEM key.
+                            let writerKey: PermissionedDataJWTVerificationKey? = nil
                             let source = LiveInteropHost(
                                 label: "writer-\(writer)",
                                 client: try InteropXRPCClient(
@@ -8553,7 +8822,8 @@ extension SwanCommand {
                                         .map { URL(fileURLWithPath: $0) }
                                 ),
                                 authorization: credentialAuthorization,
-                                permissionedCommitVerificationKey: writerKey
+                                permissionedCommitVerificationKey: writerKey,
+                                permissionedKEMKeyProvider: try LabLiveSupport.kemKeyProvider()
                             )
                             let target = try PermissionedRemoteReplicaTarget(
                                 receiverDID: receiver,
@@ -8887,16 +9157,16 @@ extension SwanCommand {
             }
 
             /// One explicit `--writer-host` override: the writer repo host URL
-            /// and an optional per-writer commit verification key.
+            /// and an optional legacy commit key retained only for compatibility.
             private struct WriterHostOverride: Sendable, Equatable {
                 let url: URL
                 let commitVerificationKey: String?
             }
 
             /// Parses repeatable `did=url` writer-host overrides. Each value
-            /// may optionally carry a per-writer repository commit
-            /// verification key as a `:did:key:z...` suffix, which overrides
-            /// the global SWAN_LAB_PERMISSIONED_COMMIT_KEY for that writer.
+            /// may retain a legacy `:did:key:z...` commit-key suffix. Parsing
+            /// still validates that historical syntax; current reads authenticate
+            /// with the dedicated KEM provider and do not consume this key.
             private static func writerHostMap(
                 _ values: [String]
             ) throws -> [String: WriterHostOverride] {
@@ -9060,7 +9330,12 @@ extension SwanCommand {
                         }
                         if !writers.contains(did) { writers.append(did) }
                     }
-                    guard let next = output.cursor, !next.isEmpty else { break }
+                    // atproto#5574: every nonempty page returns its last
+                    // spaceRev as the cursor; an empty page (which omits it)
+                    // ends the listing. A repo updated mid-listing can
+                    // reappear, so DIDs are de-duplicated above.
+                    guard !output.repos.isEmpty,
+                          let next = output.cursor, !next.isEmpty else { break }
                     cursor = next
                 }
                 return writers
@@ -9138,6 +9413,7 @@ extension SwanCommand {
                     case let .unexpectedStatus(status): return "HTTP\(status)"
                     case .transportFailure: return "TransportFailure"
                     case .fileFailure: return "FileFailure"
+                    case .spaceCredentialRevoked: return "CredentialRevoked"
                     }
                 }
                 if let error = error as? ValidationError {
@@ -9331,6 +9607,7 @@ private enum LabLiveSupport {
         redirectURI: String,
         scopes: [String],
         timeout: Double,
+        permissionedKEMKeyProvider: (@Sendable (String, Bool) async throws -> String)? = nil,
         permissionedCommitVerificationKey: PermissionedDataJWTVerificationKey? = nil
     ) async throws -> LiveInteropHost {
         guard timeout > 0, timeout <= 120, timeout.isFinite else {
@@ -9349,7 +9626,8 @@ private enum LabLiveSupport {
             return LiveInteropHost(
                 label: label,
                 client: client,
-                permissionedCommitVerificationKey: permissionedCommitVerificationKey
+                permissionedCommitVerificationKey: permissionedCommitVerificationKey,
+                permissionedKEMKeyProvider: try permissionedKEMKeyProvider ?? LabLiveSupport.kemKeyProvider()
             )
         case "bearer":
             try requireCredentialSafeTransport(url)
@@ -9364,7 +9642,8 @@ private enum LabLiveSupport {
                 label: label,
                 client: client,
                 authorization: .bearer(token: token),
-                permissionedCommitVerificationKey: permissionedCommitVerificationKey
+                permissionedCommitVerificationKey: permissionedCommitVerificationKey,
+                permissionedKEMKeyProvider: try permissionedKEMKeyProvider ?? LabLiveSupport.kemKeyProvider()
             )
         case "oauth":
             try requireCredentialSafeTransport(url)
@@ -9409,10 +9688,36 @@ private enum LabLiveSupport {
                 label: label,
                 client: client,
                 authorizationProvider: provider,
-                permissionedCommitVerificationKey: permissionedCommitVerificationKey
+                permissionedCommitVerificationKey: permissionedCommitVerificationKey,
+                permissionedKEMKeyProvider: try permissionedKEMKeyProvider ?? LabLiveSupport.kemKeyProvider()
             )
         default:
             throw ValidationError("live auth must be none, bearer, or oauth")
+        }
+    }
+
+    /// Dedicated public KEM pins for the disposable lab. The JSON file maps
+    /// repository DIDs to did:key values and is re-read on every resolution,
+    /// including the forced refresh after a MAC mismatch. Signing pins are
+    /// deliberately not a fallback.
+    static func kemKeyProvider() throws -> (@Sendable (String, Bool) async throws -> String)? {
+        let env = ProcessInfo.processInfo.environment
+        let file = env["SWAN_LAB_KEM_KEYS_FILE"]
+        let single = env["SWAN_LAB_KEM_PUBLIC_KEY"]
+        guard file != nil || single != nil else { return nil }
+        return { did, _ in
+            let value: String
+            if let file {
+                let bytes = try Data(contentsOf: URL(fileURLWithPath: file))
+                guard bytes.count <= 64 * 1024,
+                      let selected = try JSONDecoder().decode([String: String].self, from: bytes)[did] else {
+                    throw SwanError.unavailable("laboratory KEM key pin is unavailable")
+                }
+                value = selected
+            } else if let single { value = single }
+            else { throw SwanError.unavailable("laboratory KEM key pin is unavailable") }
+            _ = try P256DIDKey(value)
+            return value
         }
     }
 
@@ -9535,8 +9840,11 @@ private enum LabLiveSupport {
         let createBody = try JSONSerialization.data(
             withJSONObject: [
                 "did": space.authority,
-                "type": space.spaceType,
+                "spaceType": space.spaceType,
                 "skey": space.skey,
+                "readPolicy": ["$type": "com.atproto.simplespace.defs#memberListPolicy"],
+                "writePolicy": ["$type": "com.atproto.simplespace.defs#memberListPolicy"],
+                "appAccess": ["$type": "com.atproto.simplespace.defs#open"],
             ],
             options: [.sortedKeys]
         )
@@ -9553,19 +9861,19 @@ private enum LabLiveSupport {
             )
         }
 
-        let addBody = try JSONSerialization.data(
-            withJSONObject: ["space": space.rawValue, "did": member],
+        let putBody = try JSONSerialization.data(
+            withJSONObject: ["space": space.rawValue, "did": member, "read": true, "write": true],
             options: [.sortedKeys]
         )
-        let add = try await authorizedProcedure(
+        let put = try await authorizedProcedure(
             host: authority,
-            nsid: "com.atproto.simplespace.addMember",
-            body: addBody
+            nsid: "com.atproto.simplespace.putMember",
+            body: putBody
         )
-        guard (200 ... 299).contains(add.status) else {
-            let error = responseError(add) ?? "unknown"
+        guard (200 ... 299).contains(put.status) else {
+            let error = responseError(put) ?? "unknown"
             throw ValidationError(
-                "permissioned space membership failed (status=\(add.status), error=\(error))"
+                "permissioned space membership failed (status=\(put.status), error=\(error))"
             )
         }
     }
@@ -9812,7 +10120,7 @@ private func makePermanentDeletionPLCConfiguration(
     }
 }
 
-private enum AccountCommandSupport {
+enum AccountCommandSupport {
     static func authorization(secretFilePath: String?) throws -> AccountOperatorAuthorization {
         do {
             return try OperatorSecretResolver.authorize(

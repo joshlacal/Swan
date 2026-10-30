@@ -89,6 +89,41 @@ public struct StaticSwanSpaceNotificationDestinations:
     }
 }
 
+/// `--enable-spaces-open-interop` (decision B(c)): an operator-configured
+/// destination wins; otherwise the authority's DID document decides —
+/// `#atproto_pds` (type `AtprotoSpaceHost`), else `#atproto_pds`.
+/// A present-but-malformed entry is an error, so the outbox row retries
+/// rather than silently routing elsewhere.
+public struct SwanOpenFederationAuthorityNotificationDestinations:
+    SwanSpaceAuthorityNotificationDestinationResolving
+{
+    private let configured: any SwanSpaceAuthorityNotificationDestinationResolving
+    private let resolver: SwanDIDDocumentSpaceResolver
+
+    public init(
+        configured: any SwanSpaceAuthorityNotificationDestinationResolving,
+        resolver: SwanDIDDocumentSpaceResolver
+    ) {
+        self.configured = configured
+        self.resolver = resolver
+    }
+
+    public func destination(
+        forAuthority authority: String
+    ) async throws -> SwanSpaceNotificationDestination? {
+        if let destination = try await configured.destination(forAuthority: authority) {
+            return destination
+        }
+        guard let resolved = try await resolver.notifyDestination(forAuthority: authority) else {
+            return nil
+        }
+        return try SwanSpaceNotificationDestination(
+            endpoint: resolved.endpoint,
+            audience: resolved.audience
+        )
+    }
+}
+
 /// Looks up the latest durable repository state only after the outbox lease
 /// has committed. It returns commitment metadata, not records, CAR bytes,
 /// CIDs, credentials, or a database connection. A coalesced older event may
@@ -163,11 +198,17 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
             wireRevision: announcement.wireRevision,
             commitment: announcement.commitment
         )
+        // Every attempt gets a fresh random jti, as upstream createServiceJwt
+        // mints one per call. A receiver with a single-use jti store consumes
+        // it on the first attempt and would refuse the retry with a 4xx, which
+        // is acknowledged below as permanent. Receivers dedupe a repeat by the
+        // writer's revision, not by jti: Swan's authority and the reference
+        // ignore a notifyWrite whose `repoRev` is not newer.
         let token = try await serviceAuthentication.issue(
             issuer: notification.author,
             audience: destination.audience,
             method: ComAtprotoSpaceNotifyWrite.typeIdentifier,
-            eventID: notification.id.uuidString,
+            eventID: UUID().uuidString.lowercased(),
             requestBodyDigest: reqDigest,
             now: Date()
         )
@@ -186,14 +227,14 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
     }
 }
 
-/// Delivers authority-created *deletion* fanout rows after confirming their
-/// registration remains current. The pinned TypeScript `notifyWrite` handler
-/// requires `iss == repo`, while an authority cannot sign as an arbitrary
-/// member writer. Therefore write fanout is deliberately not sent across
-/// hosts; an old durable write row is acknowledged as a compatibility no-op.
-/// The configured resolver maps an opaque registered string to an allowlisted
-/// endpoint and exact audience, so a malicious registration can never steer
-/// service traffic or JWT claims.
+/// Delivers authority-created fanout rows after confirming their
+/// registration remains current: deletions, and (Erratum 03 / atproto#5574)
+/// writes forwarded to service-named subscribers as authority-signed
+/// `notifyWrite` calls carrying the space host's `spaceRev` and
+/// `prevSpaceRev`. Forwarding is reasonable-effort; subscribers recover
+/// missed updates through `listRepos`. The configured resolver maps an opaque
+/// registered string to an allowlisted endpoint and exact audience, so a
+/// malicious registration can never steer service traffic or JWT claims.
 public struct HTTPPermissionedSpaceNotificationFanoutTransport:
     PermissionedSpaceNotificationFanoutTransport
 {
@@ -218,13 +259,25 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
         // A replacement, expiry, or future explicit removal wins over a row
         // that was already queued. Treat the stale delivery as a successful
         // no-op; the lease worker will acknowledge it without network I/O.
-        guard try await database.isSpaceNotificationRegistrationActive(
-            space: notification.space,
-            endpoint: notification.endpoint,
-            repository: notification.repository,
-            now: Date()
-        ) else {
-            return
+        let service: String?
+        if notification.kind == .deleted {
+            guard let registration = try await database.currentSpaceDeletionDeliveryRegistration(
+                for: notification
+            ) else { return }
+            service = registration.serviceIdentity
+        } else {
+            guard try await database.isSpaceNotificationRegistrationActive(
+                space: notification.space,
+                endpoint: notification.endpoint,
+                repository: notification.repository,
+                now: Date()
+            ) else { return }
+            service = try await database.spaceNotificationRegistrationService(
+                space: notification.space,
+                endpoint: notification.endpoint,
+                repository: notification.repository,
+                now: Date()
+            )
         }
         // Erratum 03: a SERVICE-NAMED registration is its own destination —
         // the endpoint carries DID-document provenance from registration-time
@@ -234,12 +287,6 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
         // Endpoint-only legacy rows keep requiring the operator map: with no
         // service identity there is no audience a receiver could verify, and
         // their raw URLs never became network destinations before.
-        let service = try await database.spaceNotificationRegistrationService(
-            space: notification.space,
-            endpoint: notification.endpoint,
-            repository: notification.repository,
-            now: Date()
-        )
         let destination: SwanSpaceNotificationDestination
         if let service {
             guard let registered = URL(string: notification.endpoint) else {
@@ -264,24 +311,6 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
         }
         let method: String
         let body: Data
-        switch notification.kind {
-        case .write:
-            guard let repository = notification.repository,
-                  let wireRevision = notification.wireRevision,
-                  let commitment = notification.commitment else {
-                throw SwanError.malformed("write fanout row is incomplete")
-            }
-            method = ComAtprotoSpaceNotifyWrite.typeIdentifier
-            body = try notificationJSON(
-                space: notification.space,
-                repository: repository,
-                wireRevision: wireRevision,
-                commitment: commitment
-            )
-        case .deleted:
-            method = ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
-            body = try deletionJSON(space: notification.space)
-        }
         let reqDigest: String
         switch notification.kind {
         case .write:
@@ -290,21 +319,42 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
                   let commitment = notification.commitment else {
                 throw SwanError.malformed("write fanout row is incomplete")
             }
-            reqDigest = SpaceNotificationRequestDigest.write(
+            // A forward must carry the space revision the space host
+            // assigned. Rows queued before space revisions existed have none
+            // and are retired unsent; the subscriber catches up via listRepos.
+            guard let spaceRevision = notification.spaceRevision else { return }
+            method = ComAtprotoSpaceNotifyWrite.typeIdentifier
+            body = try notificationJSON(
                 space: notification.space,
                 repository: repository,
                 wireRevision: wireRevision,
-                commitment: commitment
+                commitment: commitment,
+                spaceRevision: spaceRevision,
+                previousSpaceRevision: notification.previousSpaceRevision
+            )
+            reqDigest = SpaceNotificationRequestDigest.forwardedWrite(
+                space: notification.space,
+                repository: repository,
+                wireRevision: wireRevision,
+                commitment: commitment,
+                spaceRevision: spaceRevision,
+                previousSpaceRevision: notification.previousSpaceRevision
             )
         case .deleted:
+            method = ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
+            body = try deletionJSON(space: notification.space)
             reqDigest = SpaceNotificationRequestDigest.deletion(space: notification.space)
         }
         let endpoint = try notificationEndpoint(destination.endpoint, method: method)
+        // Every attempt gets a fresh random jti, as upstream createServiceJwt
+        // mints one per call: a receiver with a single-use jti store would
+        // otherwise refuse each retry as a replay. The row's own id stays the
+        // outbox bookkeeping key; the `req` digest binds the body.
         let token = try await serviceAuthentication.issue(
             issuer: notification.space.authority,
             audience: destination.audience,
             method: method,
-            eventID: notification.id.uuidString,
+            eventID: UUID().uuidString.lowercased(),
             requestBodyDigest: reqDigest,
             now: Date()
         )
@@ -355,21 +405,33 @@ private func notificationEndpoint(_ endpoint: URL, method: String) throws -> URL
     return url
 }
 
+/// The repo-host hop is `{space, repo, repoRev, hash}`; a space-host
+/// forward adds `spaceRev` and, except on the space's first update,
+/// `prevSpaceRev`.
 private func notificationJSON(
     space: SpaceURI,
     repository: String,
     wireRevision: String,
-    commitment: Data
+    commitment: Data,
+    spaceRevision: String? = nil,
+    previousSpaceRevision: String? = nil
 ) throws -> Data {
     guard commitment.count == 32,
           let revision = try? TID(tidString: wireRevision) else {
         throw SwanError.malformed("writer notification is invalid")
     }
+    let spaceRev = try spaceRevision.map { try TID(tidString: $0) }
+    let prevSpaceRev = try previousSpaceRevision.map { try TID(tidString: $0) }
+    guard spaceRev != nil || prevSpaceRev == nil else {
+        throw SwanError.malformed("writer notification is invalid")
+    }
     let input = try ComAtprotoSpaceNotifyWrite.Input(
         space: SpaceRef(uriString: space.rawValue),
         repo: DID(didString: repository),
-        rev: revision,
-        hash: Bytes(data: commitment)
+        repoRev: revision,
+        data: Bytes(data: commitment),
+        spaceRev: spaceRev,
+        prevSpaceRev: prevSpaceRev
     )
     return try SwanJSONEncoders.sortedNoEscaping.encode(input)
 }

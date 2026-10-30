@@ -52,11 +52,14 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.headers[.cacheControl], "no-store")
                     XCTAssertEqual(response.headers[.contentType], "application/json")
                     let object = try self.jsonObject(response.body)
-                    XCTAssertEqual(Set(object.keys), ["uri", "policy", "appAccess"])
+                    XCTAssertEqual(Set(object.keys), ["uri", "readPolicy", "writePolicy", "appAccess"])
                     XCTAssertEqual(object["uri"] as? String, fixture.space.rawValue)
-                    let policy = try XCTUnwrap(object["policy"] as? [String: Any])
-                    XCTAssertEqual(policy["$type"] as? String, "com.atproto.simplespace.defs#memberListPolicy")
-                    XCTAssertEqual(Set(policy.keys), ["$type"])
+                    let readPolicy = try XCTUnwrap(object["readPolicy"] as? [String: Any])
+                    XCTAssertEqual(readPolicy["$type"] as? String, "com.atproto.simplespace.defs#memberListPolicy")
+                    XCTAssertEqual(Set(readPolicy.keys), ["$type"])
+                    let writePolicy = try XCTUnwrap(object["writePolicy"] as? [String: Any])
+                    XCTAssertEqual(writePolicy["$type"] as? String, "com.atproto.simplespace.defs#memberListPolicy")
+                    XCTAssertEqual(Set(writePolicy.keys), ["$type"])
                     let appAccess = try XCTUnwrap(object["appAccess"] as? [String: Any])
                     XCTAssertEqual(appAccess["$type"] as? String, "com.atproto.simplespace.defs#allowList")
                     XCTAssertEqual(appAccess["allowed"] as? [String], ["https://reader.example", "https://writer.example"])
@@ -289,7 +292,7 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
             }
 
             let profile = try ProtocolProfile.load(
-                from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-08-15.json")
+                from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-01.json")
             )
             let closedServer = SwanHTTPServer(
                 profile: profile,
@@ -424,7 +427,7 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
         directory: (any AuthorizedSimpleSpaceDirectory)? = nil
     ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
-            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-08-15.json")
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-01.json")
         )
         return SwanHTTPServer(
             profile: profile,
@@ -454,7 +457,8 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
                 space: space,
                 owner: Self.authority,
                 configuration: try SimpleSpaceConfiguration(
-                    policy: .memberList,
+                    readPolicy: .memberList,
+                    writePolicy: .memberList,
                     appAccess: .allowList(["https://writer.example", "https://reader.example"])
                 ),
                 authorization: authorization
@@ -675,7 +679,7 @@ private struct TestDirectory: AuthorizedSimpleSpaceDirectory {
             )
             return AuthenticatedSimpleSpaceDescription(
                 space: otherSpace,
-                configuration: try SimpleSpaceConfiguration(policy: .public, appAccess: .open)
+                configuration: try SimpleSpaceConfiguration(readPolicy: .public, writePolicy: .public, appAccess: .open)
             )
         }
     }

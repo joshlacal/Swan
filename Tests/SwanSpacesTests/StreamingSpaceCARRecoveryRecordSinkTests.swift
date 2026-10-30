@@ -112,25 +112,26 @@ private actor RecoveryIndex: SpaceCARRecoveryIndex {
         entries.append(entry)
     }
 
-    func nextUnconsumedLexicographicEntry()
+    func nextUnconsumedCanonicalEntry()
         -> SpaceCARRecoveryIndexEntry?
     {
         entries
             .filter { !consumed.contains($0.path) }
-            .sorted { $0.path < $1.path }
+            .sorted { SpaceCARCodec.canonicalRecordPathPrecedes($0.path, $1.path) }
             .first
     }
 
-    func consumeEntries(forCID cid: CID) throws -> Int {
-        let matches = entries.filter {
-            $0.cid == cid && !consumed.contains($0.path)
-        }
-        guard !matches.isEmpty else {
+    func hasConsumedCID(_ cid: CID) -> Bool {
+        entries.contains { $0.cid == cid && consumed.contains($0.path) }
+    }
+
+    func consumeEntry(_ entry: SpaceCARRecoveryIndexEntry) throws {
+        guard nextUnconsumedCanonicalEntry() == entry,
+              consumed.insert(entry.path).inserted else {
             throw SpaceCARStreamingError.invalidRecordOrder
         }
-        matches.forEach { consumed.insert($0.path) }
-        return matches.count
     }
+
 }
 
 private actor RecordingRecoverySink: SpaceCARRecoveryRecordSink {

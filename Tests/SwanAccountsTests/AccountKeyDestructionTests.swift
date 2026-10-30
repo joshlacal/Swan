@@ -37,6 +37,12 @@ final class AccountKeyDestructionTests: XCTestCase {
             in: store,
             marker: 0x60
         )
+        // Four generations of signing, rotation and #atproto_kem envelopes.
+        XCTAssertEqual(
+            try keyEnvelopeFiles(in: root, accountDID: staging.did).count,
+            12
+        )
+        XCTAssertEqual(targetReferences.filter { $0.purpose == .kem }.count, 4)
 
         let report = try await store.destroyAccountKeyMaterial(
             try AccountKeyDestructionRequest(
@@ -57,11 +63,19 @@ final class AccountKeyDestructionTests: XCTestCase {
             await XCTAssertThrowsErrorAsync(
                 try await store.key(for: reference)
             )
+            // Removed, not merely unreadable: no purpose is skipped.
+            let remaining = try await store.keyIfPresent(for: reference)
+            XCTAssertNil(remaining, "\(reference.purpose) generation \(reference.generation)")
         }
+        XCTAssertTrue(
+            try keyEnvelopeFiles(in: root, accountDID: staging.did).isEmpty
+        )
         for reference in otherReferences {
             let key = try await store.key(for: reference)
             XCTAssertEqual(key.count, 32)
         }
+        _ = try await AccountKEMKeyProvider(keyStore: store)
+            .privateKey(accountDID: otherStaging.did)
         let deletedStaging = try await store.stagedPLCAccountIdentity(
             requestID: staging.requestID,
             canonicalHandle: staging.canonicalHandle,
@@ -166,7 +180,8 @@ final class AccountKeyDestructionTests: XCTestCase {
         )
         let otherReference = try XCTUnwrap(otherReferences.first)
         let targetFiles = try keyEnvelopeFiles(in: root, accountDID: targetDID)
-        XCTAssertEqual(targetFiles.count, 4)
+        // Two generations of signing, rotation and #atproto_kem envelopes.
+        XCTAssertEqual(targetFiles.count, 6)
         var object = try XCTUnwrap(
             JSONSerialization.jsonObject(
                 with: Data(contentsOf: targetFiles[0])
@@ -201,12 +216,114 @@ final class AccountKeyDestructionTests: XCTestCase {
         )
         // The corrupt file itself is deliberately unreadable, but every other
         // target generation and every other DID must remain untouched.
+        XCTAssertEqual(
+            try keyEnvelopeFiles(in: root, accountDID: targetDID)
+                .map(\.lastPathComponent),
+            targetFiles.map(\.lastPathComponent)
+        )
         for reference in targetReferences where reference != corruptReference {
             let key = try await store.key(for: reference)
             XCTAssertEqual(key.count, 32)
         }
         let otherKey = try await store.key(for: otherReference)
         XCTAssertEqual(otherKey.count, 32)
+    }
+
+    /// The October 22 `#atproto_kem` envelope is authenticated before removal
+    /// exactly like the signing and rotation envelopes: corrupting any one
+    /// purpose aborts destruction before a single file is removed.
+    func testCorruptEnvelopeOfEveryPurposeIncludingKEMFailsClosedBeforeAnyRemoval() async throws {
+        XCTAssertTrue(AccountKeyPurpose.allCases.contains(.kem))
+        for purpose in AccountKeyPurpose.allCases {
+            let parent = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: parent) }
+            let root = parent.appending(path: "keys")
+            let store = try FileAccountKeyStore(
+                root: root,
+                configuration: try configuration()
+            )
+            let targetDID = "did:plc:abcdefghijklmnopqrstuvwx"
+            let otherDID = "did:plc:bcdefghijklmnopqrstuvwxy"
+            let targetReferences = try await createGenerations(
+                did: targetDID,
+                generations: 1 ... 2,
+                in: store,
+                marker: 0x20
+            )
+            let otherReferences = try await createGenerations(
+                did: otherDID,
+                generations: 1 ... 1,
+                in: store,
+                marker: 0x70
+            )
+            // Generation one is the KEM key AccountKEMKeyProvider publishes.
+            let corruptReference = try AccountKeyReference(
+                accountDID: targetDID,
+                purpose: purpose,
+                generation: 1
+            )
+            let targetFiles = try keyEnvelopeFiles(in: root, accountDID: targetDID)
+            XCTAssertEqual(targetFiles.count, 6, "\(purpose)")
+            try corruptSealedKey(
+                in: try envelopeFile(for: corruptReference, among: targetFiles)
+            )
+
+            await XCTAssertThrowsErrorAsync(
+                try await store.destroyAccountKeyMaterial(
+                    AccountKeyDestructionRequest(
+                        accountDID: targetDID,
+                        stagingBindings: []
+                    )
+                )
+            )
+            XCTAssertEqual(
+                try keyEnvelopeFiles(in: root, accountDID: targetDID)
+                    .map(\.lastPathComponent),
+                targetFiles.map(\.lastPathComponent),
+                "\(purpose): no target envelope may be removed"
+            )
+            for reference in targetReferences where reference != corruptReference {
+                let key = try await store.key(for: reference)
+                XCTAssertEqual(key.count, 32, "\(purpose)")
+            }
+            for reference in otherReferences {
+                let key = try await store.key(for: reference)
+                XCTAssertEqual(key.count, 32, "\(purpose)")
+            }
+        }
+    }
+
+    private func envelopeFile(
+        for reference: AccountKeyReference,
+        among files: [URL]
+    ) throws -> URL {
+        let matches = try files.filter { url in
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(
+                    with: Data(contentsOf: url)
+                ) as? [String: Any]
+            )
+            return object["purpose"] as? String == reference.purpose.rawValue
+                && (object["generation"] as? NSNumber)?.uint64Value
+                    == reference.generation
+        }
+        XCTAssertEqual(matches.count, 1)
+        return try XCTUnwrap(matches.first)
+    }
+
+    private func corruptSealedKey(in file: URL) throws {
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: file)
+            ) as? [String: Any]
+        )
+        var sealed = try XCTUnwrap(
+            Data(base64Encoded: try XCTUnwrap(object["sealedKey"] as? String))
+        )
+        sealed[sealed.startIndex] ^= 0x01
+        object["sealedKey"] = sealed.base64EncodedString()
+        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            .write(to: file, options: .atomic)
     }
 
     private func createGenerations(

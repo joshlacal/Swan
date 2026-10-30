@@ -54,9 +54,6 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
         appliedAt: Int64
     ) async throws -> PermissionedRemoteReplicaIncrementalSyncOutcome {
         Self.stageLog("synchronize start for \(target.repositoryDID)")
-        guard let key = source.permissionedCommitVerificationKey else {
-            throw InteropHTTPError.transportFailure
-        }
         guard let base = try await store
             .permissionedRemoteReplicaIncrementalBaseState(target: target) else {
             return .fullCARRecoveryRequired
@@ -69,28 +66,29 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
         )
         Self.stageLog("listRepoOps response received")
         let output: ComAtprotoSpaceListRepoOps.Output
+        let pageRequest: PermissionedSpaceMACRequest
+        let pageMAC: Data?
         switch page {
         case .fullRecoveryRequired:
             return .fullCARRecoveryRequired
-        case let .output(value):
+        case let .output(value, request, mac):
             output = value
+            pageRequest = request
+            pageMAC = mac
         }
-        guard output.cursor == nil else {
-            throw PermissionedRemoteReplicaIncrementalVerificationError
-                .invalidOperation
-        }
-        guard let terminalCommit = output.commit else {
-            // The pinned handler omits the commit only when exactly `limit`
-            // operations were returned. Its continuation key is only `rev`,
-            // while every operation in one atomic applyWrites batch shares a
-            // revision. Advancing `since` can therefore skip the remainder of
-            // a revision split by the wire limit. Select full CAR instead of
-            // attempting a lossy revision-only continuation.
-            if output.ops.count == Self.maximumWirePageOperations {
+        guard let terminalCommit = output.commit, let pageMAC else {
+            // The current reference uses a rev/index cursor for a full page.
+            // This client deliberately falls back to complete STAR recovery
+            // rather than publishing any unauthenticated intermediate page.
+            if (Self.maximumWirePageOperations...SpaceWriteLimits.maximumOperations).contains(output.ops.count),
+               let cursor = output.cursor, let last = output.ops.last,
+               Self.validContinuation(cursor, lastRevision: last.rev.toString()) {
                 return .fullCARRecoveryRequired
             }
-            throw PermissionedRemoteReplicaIncrementalVerificationError
-                .invalidCommit
+            throw PermissionedRemoteReplicaIncrementalVerificationError.invalidCommit
+        }
+        guard output.cursor == nil else {
+            throw PermissionedRemoteReplicaIncrementalVerificationError.invalidOperation
         }
         let operations = output.ops
         // The pinned PDS omits values for mutations superseded by a later
@@ -105,51 +103,54 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
             return .fullCARRecoveryRequired
         }
 
-            let latest = try await getLatestCommit(
-                target: target,
-                verificationKey: key
-            )
-            Self.stageLog("getLatestCommit verified")
+        let latest = try await getLatestCommit(
+            target: target
+        )
+        Self.stageLog("getLatestCommit verified")
 
-            if operations.isEmpty {
-                let page = try PermissionedRemoteReplicaIncrementalVerifier
-                    .verifyCommit(
-                        terminalCommit,
-                        target: target,
-                        verificationKey: key
-                    )
-                try PermissionedRemoteReplicaIncrementalVerifier.requireSameHead(
-                    page, latest
-                )
-                guard page.wireRevision == base.head.wireRevision,
-                      page.commitment == base.head.commitment else {
-                    throw PermissionedRemoteReplicaIncrementalVerificationError
-                        .mixedHead
-                }
-                return .unchanged(base.head)
-            }
-
-            let verified = try PermissionedRemoteReplicaIncrementalVerifier
-                .verify(
-                    operations: operations,
-                    commit: terminalCommit,
-                    base: base,
+        if operations.isEmpty {
+            let page = try PermissionedRemoteReplicaIncrementalVerifier
+                .verifyCommit(
+                    terminalCommit,
                     target: target,
-                    verificationKey: key
+                    sharedSecret: pageRequest.sharedSecret,
+                    mac: pageMAC
                 )
-            Self.stageLog("incremental interval verified (\(verified.operations.count) operations)")
             try PermissionedRemoteReplicaIncrementalVerifier.requireSameHead(
-                verified.freshnessWitness, latest
+                page, latest
             )
-            let digest = PermissionedRemoteReplicaIncrementalBatch
-                .canonicalDigest(
-                    target: target,
-                    expectedHead: base.head,
-                    terminalHead: verified.terminalHead,
-                    operations: verified.operations,
-                    requestSequence: requestSequence
-                )
-            let batch = try PermissionedRemoteReplicaIncrementalBatch(
+            guard page.wireRevision == base.head.wireRevision,
+                  page.commitment == base.head.commitment else {
+                throw PermissionedRemoteReplicaIncrementalVerificationError
+                    .mixedHead
+            }
+            return .unchanged(base.head)
+        }
+
+        let verified = try PermissionedRemoteReplicaIncrementalVerifier
+            .verify(
+                operations: operations,
+                commit: terminalCommit,
+                base: base,
+                target: target,
+                sharedSecret: pageRequest.sharedSecret,
+                mac: pageMAC
+            )
+        Self.stageLog("incremental interval verified (\(verified.operations.count) operations)")
+        try PermissionedRemoteReplicaIncrementalVerifier.requireSameHead(
+            verified.freshnessWitness, latest
+        )
+        let digest = PermissionedRemoteReplicaIncrementalBatch
+            .canonicalDigest(
+                target: target,
+                expectedHead: base.head,
+                terminalHead: verified.terminalHead,
+                operations: verified.operations,
+                requestSequence: requestSequence
+            )
+        let batch: PermissionedRemoteReplicaIncrementalBatch
+        do {
+            batch = try PermissionedRemoteReplicaIncrementalBatch(
                 target: target,
                 expectedHead: base.head,
                 terminalHead: verified.terminalHead,
@@ -158,19 +159,33 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                 requestSequence: requestSequence,
                 requestDigest: digest
             )
-            return map(try await publicationAuthorization {
-                Self.stageLog("durable apply starting")
-                let outcome = try await store.applyVerifiedPermissionedRemoteReplicaBatch(
-                    batch,
-                    appliedAt: appliedAt
-                )
-                Self.stageLog("durable apply completed")
-                return outcome
-            })
+        } catch PermissionedRemoteReplicaIncrementalInputError.invalidOperationBudget {
+            // The authenticated interval can fit the HTTP cap while exceeding
+            // the durable batch's aggregate value budget. Recover via bounded
+            // STAR staging without partially applying this interval.
+            return .fullCARRecoveryRequired
+        }
+        return map(try await publicationAuthorization {
+            Self.stageLog("durable apply starting")
+            let outcome = try await store.applyVerifiedPermissionedRemoteReplicaBatch(
+                batch,
+                appliedAt: appliedAt
+            )
+            Self.stageLog("durable apply completed")
+            return outcome
+        })
+    }
+
+    private static func validContinuation(_ cursor: String, lastRevision: String) -> Bool {
+        let pieces = cursor.split(separator: "/", omittingEmptySubsequences: false)
+        guard pieces.count == 2, pieces[0] == lastRevision,
+              let index = UInt64(pieces[1]), index <= 9_007_199_254_740_991,
+              String(index) == pieces[1] else { return false }
+        return true
     }
 
     private enum ListResult {
-        case output(ComAtprotoSpaceListRepoOps.Output)
+        case output(ComAtprotoSpaceListRepoOps.Output, PermissionedSpaceMACRequest, Data?)
         case fullRecoveryRequired
     }
 
@@ -191,20 +206,18 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
         let path = try source.client.xrpcPath(
             "com.atproto.space.listRepoOps", query: query
         )
-        let response: InteropHTTPResponse
+        let authenticated: PermissionedSpaceMACResponse
         do {
-            response = try await source.client.query(
-                "com.atproto.space.listRepoOps",
-                query: query,
-                authorization: try await authorization(path: path)
+            authenticated = try await PermissionedSpaceMACHTTP.query(
+                host: source, nsid: "com.atproto.space.listRepoOps", query: query,
+                space: target.space, author: target.repositoryDID,
+                authorization: { try await self.authorization(path: path) },
+                commit: { try StrictJSON.decode(ComAtprotoSpaceListRepoOps.Output.self, from: $0).commit }
             )
         } catch InteropHTTPError.responseTooLarge {
-            // A legitimate value-bearing page can exceed the bounded JSON
-            // client's memory ceiling even though its operation count is at
-            // the pinned wire limit. The complete repository CAR is already
-            // the safe recovery representation for an unconsumable interval.
             return .fullRecoveryRequired
         }
+        let response = authenticated.response
         if response.status == 409 {
             guard response.header("content-type")?.lowercased().contains("json")
                     == true,
@@ -222,43 +235,26 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                 == true else {
             throw InteropHTTPError.unexpectedStatus(response.status)
         }
-        return .output(try StrictJSON.decode(
-            ComAtprotoSpaceListRepoOps.Output.self,
-            from: response.body
-        ))
+        let output = try StrictJSON.decode(ComAtprotoSpaceListRepoOps.Output.self, from: response.body)
+        let mac = output.commit == nil ? nil : try SpaceMACHeaders.parseMAC(response.header(SpaceMACHeaders.responseHeader), type: .repository)
+        return .output(output, authenticated.request, mac)
     }
 
     private func getLatestCommit(
-        target: PermissionedRemoteReplicaTarget,
-        verificationKey: PermissionedDataJWTVerificationKey
+        target: PermissionedRemoteReplicaTarget
     ) async throws -> PermissionedRemoteReplicaFreshnessWitness {
-        let query = [
-            "space": target.space.rawValue,
-            "repo": target.repositoryDID,
-        ]
-        let path = try source.client.xrpcPath(
-            "com.atproto.space.getLatestCommit", query: query
+        let query = ["space": target.space.rawValue, "repo": target.repositoryDID]
+        let path = try source.client.xrpcPath("com.atproto.space.getLatestCommit", query: query)
+        let authenticated = try await PermissionedSpaceMACHTTP.query(
+            host: source, nsid: "com.atproto.space.getLatestCommit", query: query,
+            space: target.space, author: target.repositoryDID,
+            authorization: { try await self.authorization(path: path) },
+            commit: { try StrictJSON.decode(ComAtprotoSpaceGetLatestCommit.Output.self, from: $0).commit }
         )
-        let response = try await source.client.query(
-            "com.atproto.space.getLatestCommit",
-            query: query,
-            authorization: try await authorization(path: path)
-        )
-        guard (200 ... 299).contains(response.status),
-              response.header("content-type")?.lowercased().contains("json")
-                == true else {
-            throw InteropHTTPError.unexpectedStatus(response.status)
+        guard (200...299).contains(authenticated.response.status), let commit = authenticated.commit else {
+            throw InteropHTTPError.unexpectedStatus(authenticated.response.status)
         }
-        let output = try StrictJSON.decode(
-            ComAtprotoSpaceGetLatestCommit.Output.self,
-            from: response.body
-        )
-        let commit = output.commit
-        return try PermissionedRemoteReplicaIncrementalVerifier.verifyCommit(
-            commit,
-            target: target,
-            verificationKey: verificationKey
-        )
+        return try PermissionedRemoteReplicaFreshnessWitness(wireRevision: TID(tidString: commit.rev), commitment: commit.data)
     }
 
     private func authorization(path: String) async throws -> InteropAuthorization {

@@ -138,7 +138,7 @@ final class StreamingSpaceCARRecoveryTests: XCTestCase {
         }
     }
 
-    func testStreamingRecoveryAcceptsOneSharedCIDBlockAndCountsEveryIndexedPath() async throws {
+    func testStreamingRecoveryAcceptsCanonicalSharedCIDFramesAndCountsEveryIndexedPath() async throws {
         let author = "did:plc:alice"
         let space = try SpaceURI(
             authority: author,
@@ -153,10 +153,9 @@ final class StreamingSpaceCARRecoveryTests: XCTestCase {
         ]))
         let sharedCID = CID.fromDAGCBOR(sharedValue)
         let distinctCID = CID.fromDAGCBOR(distinctValue)
-        // Canonical DAG-CBOR index order is length-then-bytes (`b`, `z`,
-        // `aa`), while block order is lexical first occurrence (`aa`, `b`).
-        // Repeating sharedCID at `z` proves consumption is by CID without
-        // perturbing that first-path order.
+        // Both index and record blocks use length-then-bytes (`b`, `z`,
+        // `aa`). The shared CID appears in both `z` and `aa` frames while
+        // staging and the unique-block limit count it only once.
         let values = [
             (rkey: "aa", value: sharedValue),
             (rkey: "b", value: distinctValue),
@@ -194,9 +193,76 @@ final class StreamingSpaceCARRecoveryTests: XCTestCase {
         let frames = try testCARFrameRanges(encoded.data)
         XCTAssertEqual(
             frames.count,
-            4,
-            "commit, DRISL index, and two unique record CIDs must be emitted"
+            5,
+            "commit, DRISL index, and one record frame per path must be emitted"
         )
+        var expectedDistinctFrame = try SpaceCARCodec.streamingBlockPrefix(
+            cid: distinctCID, dataLength: distinctValue.count
+        )
+        expectedDistinctFrame.append(distinctValue)
+        var expectedSharedFrame = try SpaceCARCodec.streamingBlockPrefix(
+            cid: sharedCID, dataLength: sharedValue.count
+        )
+        expectedSharedFrame.append(sharedValue)
+        XCTAssertEqual(Data(encoded.data[frames[2]]), expectedDistinctFrame)
+        XCTAssertEqual(Data(encoded.data[frames[3]]), expectedSharedFrame)
+        XCTAssertEqual(Data(encoded.data[frames[4]]), expectedSharedFrame)
+
+        // The former lexical order (`aa`, `b`) has the same valid blocks and
+        // commitment but violates the updated proposal's record block order.
+        var lexicalCAR = Data(encoded.data[..<frames[2].lowerBound])
+        lexicalCAR.append(encoded.data[frames[3]])
+        lexicalCAR.append(encoded.data[frames[2]])
+        lexicalCAR.append(encoded.data[frames[4]])
+        XCTAssertThrowsError(try SpaceCARCodec.verify(
+            lexicalCAR, space: space, author: author, publicKey: key.publicKey
+        ))
+        do {
+            _ = try await SpaceCARCodec.verifyStreamingRecovery(
+                from: InstrumentedSpaceCARSource(bytes: lexicalCAR, chunkByteCount: 19),
+                space: space,
+                author: author,
+                contextSignatureVerifier: {
+                    try SpaceCommitCodec.verifyContextSignature($0, publicKey: key.publicKey)
+                },
+                index: InMemorySpaceRecoveryIndex(),
+                limits: try SpaceCARRecoveryLimits(maximumCARBytes: lexicalCAR.count)
+            )
+            XCTFail("lexical record block order was accepted")
+        } catch let error as SpaceCARStreamingError {
+            XCTAssertEqual(error, .invalidRecordOrder)
+        }
+        var corruptRepeatedFrame = encoded.data
+        corruptRepeatedFrame[frames[4].upperBound - 1] ^= 1
+        do {
+            _ = try await SpaceCARCodec.verifyStreamingRecovery(
+                from: InstrumentedSpaceCARSource(bytes: corruptRepeatedFrame, chunkByteCount: 19),
+                space: space, author: author,
+                contextSignatureVerifier: {
+                    try SpaceCommitCodec.verifyContextSignature($0, publicKey: key.publicKey)
+                },
+                index: InMemorySpaceRecoveryIndex(),
+                limits: try SpaceCARRecoveryLimits(maximumCARBytes: corruptRepeatedFrame.count)
+            )
+            XCTFail("a corrupt repeated CID frame was accepted")
+        } catch let error as SpaceCARStreamingError {
+            XCTAssertEqual(error, .blockCIDMismatch)
+        }
+        let compactCAR = Data(encoded.data[..<frames[4].lowerBound])
+        do {
+            _ = try await SpaceCARCodec.verifyStreamingRecovery(
+                from: InstrumentedSpaceCARSource(bytes: compactCAR, chunkByteCount: 19),
+                space: space, author: author,
+                contextSignatureVerifier: {
+                    try SpaceCommitCodec.verifyContextSignature($0, publicKey: key.publicKey)
+                },
+                index: InMemorySpaceRecoveryIndex(),
+                limits: try SpaceCARRecoveryLimits(maximumCARBytes: compactCAR.count)
+            )
+            XCTFail("a compact CAR missing an indexed shared-CID frame was accepted")
+        } catch let error as SpaceCARStreamingError {
+            XCTAssertEqual(error, .unindexedBlocks)
+        }
         let overlayShapedCAR = encoded.data
         let summary = try await SpaceCARCodec.verifyStreamingRecovery(
             from: InstrumentedSpaceCARSource(
@@ -217,6 +283,7 @@ final class StreamingSpaceCARRecoveryTests: XCTestCase {
             )
         )
         XCTAssertEqual(summary.recordCount, 3)
+        XCTAssertEqual(summary.uniqueBlockCount, 2)
         XCTAssertEqual(summary.commitment, ltHash.commitment)
         let materialized = try SpaceCARCodec.verify(
             overlayShapedCAR,
@@ -239,7 +306,7 @@ final class StreamingSpaceCARRecoveryTests: XCTestCase {
         )
     }
 
-    func testStreamingRecoveryRejectsRepeatedBlockForAnAlreadyConsumedCID() async throws {
+    func testStreamingRecoveryRejectsSharedCIDFrameWithoutAnIndexEntry() async throws {
         let author = "did:plc:alice"
         let space = try SpaceURI(
             authority: author,
@@ -280,7 +347,7 @@ final class StreamingSpaceCARRecoveryTests: XCTestCase {
         let encoded = try SpaceCARCodec.encode(commit: commit, records: records)
         let frames = try testCARFrameRanges(encoded.data)
         let firstRecordFrame = frames[2]
-        var repeatedCIDCAR = Data(encoded.data[..<firstRecordFrame.upperBound])
+        var repeatedCIDCAR = encoded.data
         repeatedCIDCAR.append(encoded.data[firstRecordFrame])
 
         do {
@@ -302,7 +369,7 @@ final class StreamingSpaceCARRecoveryTests: XCTestCase {
                     maximumCARBytes: repeatedCIDCAR.count
                 )
             )
-            XCTFail("a second record block for an already consumed CID was accepted")
+            XCTFail("a shared CID frame without a corresponding index entry was accepted")
         } catch let error as SpaceCARStreamingError {
             XCTAssertEqual(error, .invalidRecordOrder)
         }
@@ -819,22 +886,21 @@ private actor InMemorySpaceRecoveryIndex: SpaceCARRecoveryIndex {
         entries.append(entry)
     }
 
-    func nextUnconsumedLexicographicEntry() -> SpaceCARRecoveryIndexEntry? {
+    func nextUnconsumedCanonicalEntry() -> SpaceCARRecoveryIndexEntry? {
         entries
             .filter { !consumedPaths.contains($0.path) }
-            .min { $0.path.utf8.lexicographicallyPrecedes($1.path.utf8) }
+            .min { SpaceCARCodec.canonicalRecordPathPrecedes($0.path, $1.path) }
     }
 
-    func consumeEntries(forCID cid: CID) throws -> Int {
-        let matching = entries.filter {
-            $0.cid == cid && !consumedPaths.contains($0.path)
-        }
-        guard !matching.isEmpty else {
+    func hasConsumedCID(_ cid: CID) -> Bool {
+        entries.contains { $0.cid == cid && consumedPaths.contains($0.path) }
+    }
+
+    func consumeEntry(_ entry: SpaceCARRecoveryIndexEntry) throws {
+        guard nextUnconsumedCanonicalEntry() == entry,
+              consumedPaths.insert(entry.path).inserted else {
             throw SpaceCARStreamingError.invalidRecordOrder
         }
-        for entry in matching {
-            consumedPaths.insert(entry.path)
-        }
-        return matching.count
     }
+
 }

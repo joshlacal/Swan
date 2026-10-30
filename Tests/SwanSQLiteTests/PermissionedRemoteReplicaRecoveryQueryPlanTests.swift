@@ -27,6 +27,25 @@ final class PermissionedRemoteReplicaRecoveryQueryPlanTests:
         )
         defer { Task { try? await database.close() } }
 
+        let consumptionPlan = try await database.connection.query(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT path, cid
+            FROM permissioned_remote_replica_import_index
+            WHERE session_id = ? AND consumed = 0
+            ORDER BY length(path), path
+            LIMIT 1
+            """,
+            [.text("canonical-consumption")]
+        )
+        let consumptionDetails = consumptionPlan.compactMap {
+            $0.column("detail")?.string?.uppercased()
+        }
+        XCTAssertTrue(consumptionDetails.contains {
+            $0.contains("PERMISSIONED_REMOTE_REPLICA_IMPORT_INDEX_UNCONSUMED_CANONICAL")
+        }, "record consumption must use the unconsumed canonical index: \(consumptionDetails)")
+        XCTAssertFalse(consumptionDetails.contains { $0.contains("USE TEMP B-TREE") })
+
         let plan = try await database.connection.query(
             """
             EXPLAIN QUERY PLAN

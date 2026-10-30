@@ -70,9 +70,12 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
                         XCTAssertEqual(inspection.header.typ, PermissionedDataJWT.delegationType)
                         XCTAssertEqual(inspection.header.kid, PermissionedDataJWT.delegationKeyID)
                         XCTAssertEqual(inspection.claims.iss, Self.user)
+                        // October 22 (atproto ac0c9f15, guide section 3):
+                        // `<authority>#atproto_pds`, previously
+                        // `#atproto_space_host`.
                         XCTAssertEqual(
                             inspection.claims.aud,
-                            "\(Self.authority)#atproto_space_host"
+                            "\(Self.authority)#atproto_pds"
                         )
                         XCTAssertEqual(inspection.claims.sub, fixture.space.rawValue)
                         XCTAssertEqual(inspection.claims.exp - inspection.claims.iat, 60)
@@ -84,6 +87,7 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
                             now: Date()
                         )
                         XCTAssertEqual(verified.issuer, Self.user)
+                        XCTAssertEqual(verified.audience, "\(Self.authority)#atproto_pds")
                         XCTAssertEqual(verified.space, fixture.space)
                     }
                 }

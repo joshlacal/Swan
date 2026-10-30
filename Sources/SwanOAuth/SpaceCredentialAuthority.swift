@@ -18,7 +18,7 @@ public struct SpaceCredentialAuthoritySigningKey: Sendable {
 
     init(
         authority: String,
-        keyID: String = PermissionedDataJWT.spaceCredentialKeyID,
+        keyID: String = PermissionedDataJWT.spaceCredentialIssuedKeyID,
         privateKey: P256.Signing.PrivateKey
     ) {
         self.authority = authority
@@ -77,14 +77,15 @@ public protocol SpaceCredentialPublicKeyResolver: Sendable {
 public protocol SpaceCredentialAuthoritySigner: Sendable {
     func issueSpaceCredential(
         space: SpaceURI,
-        user: String,
+        user: String?,
         authorization: AuthorizationContext,
         clientAttestation: String?,
+        confirmationKeyID: String,
         now: Date
     ) async throws -> String
 }
 
-/// The narrow bearer-token boundary used by future repository routes. It
+/// The narrow JWT signature boundary used by repository routes. It
 /// returns a space credential context only after compact parsing, exact
 /// issuer/space binding, public-key selection, signature verification, and
 /// time validation have all succeeded.
@@ -96,11 +97,105 @@ public protocol SpaceCredentialAuthorizationVerifier: Sendable {
     ) async throws -> AuthorizationContext
 }
 
+/// The request fields an `Atproto-Space` presentation is judged on. Each is
+/// the complete list of received field lines, so a duplicated
+/// `Authorization` or `Atproto-Space-Audience` stays visible to the verifier.
+public struct SpaceCredentialHTTPPresentation: Sendable, Equatable {
+    public let authorization: [String]
+    public let audience: [String]
+    public let signatureInput: [String]
+    public let signature: [String]
+
+    public init(
+        authorization: [String],
+        audience: [String],
+        signatureInput: [String],
+        signature: [String]
+    ) {
+        self.authorization = authorization
+        self.audience = audience
+        self.signatureInput = signatureInput
+        self.signature = signature
+    }
+}
+
+/// A credential whose JWT and request signature both verified. The audience
+/// is what the *client* signed; the caller still compares it with the audience
+/// its operation requires and checks revocation of ``credentialID``.
+public struct VerifiedSpaceCredentialPresentation: Sendable {
+    public let authorization: AuthorizationContext
+    public let space: SpaceURI
+    public let audience: String
+    /// The credential's `jti`, the key a repo host's revocation list uses.
+    public let credentialID: String
+}
+
+/// The presentation failures the protocol names on the wire. Every other
+/// credential failure keeps Swan's existing opaque denial.
+public enum SpaceCredentialPresentationFailure: Error, Sendable, Equatable {
+    case unsupportedAuthorization
+    /// `BadSpaceSignature`: missing, duplicated, malformed, or invalid HTTP
+    /// message signature or audience field.
+    case badSignature
+    /// `BadSpaceAudience`: the signed audience is not the one this operation
+    /// requires (repo owner for repo reads, bare authority DID for space-host
+    /// operations).
+    case badAudience
+    /// `CredentialRevoked`: the authority revoked this credential's `jti`.
+    case revoked
+}
+
+public extension SpaceCredentialAuthorizationVerifier {
+    /// Verifies the credential JWT (issuer, signature, type, subject space,
+    /// lifetime, key binding) and then the request's `atproto-space` HTTP
+    /// message signature against the credential's `cnf.kid`, covering
+    /// exactly `authorization` and `atproto-space-audience`.
+    func verifiedPresentation(
+        _ token: String,
+        expectedSpace: SpaceURI,
+        presentation: SpaceCredentialHTTPPresentation,
+        now: Date
+    ) async throws -> VerifiedSpaceCredentialPresentation {
+        let authorization = try await authorization(for: token, expectedSpace: expectedSpace, now: now)
+        // Inspection re-reads the bytes the verifier above just authenticated.
+        let claims = try PermissionedDataJWT.inspectSpaceCredential(token).claims
+        guard presentation.authorization.count == 1,
+              presentation.authorization[0]
+                .trimmingCharacters(in: CharacterSet(charactersIn: " \t"))
+                .hasSuffix(" \(token)"),
+              presentation.audience.count == 1 else {
+            throw SpaceCredentialPresentationFailure.badSignature
+        }
+        let audience = presentation.audience[0]
+            .trimmingCharacters(in: CharacterSet(charactersIn: " \t"))
+        guard PermissionedDataJWT.isDIDString(audience) else {
+            throw SpaceCredentialPresentationFailure.badSignature
+        }
+        do {
+            _ = try SpaceHTTPSignature.verify(
+                authorization: presentation.authorization,
+                audience: presentation.audience,
+                signatureInput: presentation.signatureInput,
+                signature: presentation.signature,
+                credentialKeyID: claims.cnf.kid
+            )
+        } catch {
+            throw SpaceCredentialPresentationFailure.badSignature
+        }
+        return VerifiedSpaceCredentialPresentation(
+            authorization: authorization,
+            space: expectedSpace,
+            audience: audience,
+            credentialID: claims.jti
+        )
+    }
+}
+
 /// Resolves the public material for an inspected user-to-space-host
 /// delegation. This is a separate protocol from
 /// ``SpaceCredentialPublicKeyResolver`` because delegations are signed by the
-/// user's `#atproto` key while space credentials are signed by an authority's
-/// dedicated `#atproto_space` key. Implementations may be local,
+/// user's `#atproto` key while space credentials are signed by the space
+/// authority's exact `#atproto` key. Implementations may be local,
 /// operator-pinned, or explicitly startup-bound to a PLC. Any remote
 /// implementation must keep its issuer allowlist, transport policy,
 /// continuity checks, and cache bounds outside request input; the protocol
@@ -223,9 +318,9 @@ public struct LocalAccountSpaceCredentialSigningKeyResolver:
         // no atomic account/key projection, so deactivation, permanent-deletion
         // revocation, or a key rotation can commit while it runs. Re-read the
         // account and its key references and treat any intervening change as
-        // terminal: the caller signs a two-hour credential immediately on
-        // return, and a credential signed under a revoked authority outlives
-        // the revocation that should have prevented it. The verification
+        // terminal: the caller signs a credential immediately on return, and a
+        // credential signed under a revoked authority outlives the revocation
+        // that should have prevented it. The verification
         // resolvers below apply exactly this fence twice (`:304-317`,
         // `:397-410`); the signing path was the odd one out.
         //
@@ -243,8 +338,12 @@ public struct LocalAccountSpaceCredentialSigningKeyResolver:
         else {
             throw SwanError.unavailable("space credential signing key is unavailable")
         }
+        // The account's `#atproto` method is the only verification method a
+        // Swan-hosted did:plc or did:web authority publishes, and this is its
+        // key, so the credential must name `#atproto`.
         return SpaceCredentialAuthoritySigningKey(
             authority: authority,
+            keyID: PermissionedDataJWT.spaceCredentialIssuedKeyID,
             privateKey: privateKey
         )
     }
@@ -451,7 +550,7 @@ public struct PinnedSpaceCredentialPublicKey: Sendable {
 
     public init(
         authority: String,
-        keyID: String = PermissionedDataJWT.spaceCredentialKeyID,
+        keyID: String = PermissionedDataJWT.spaceCredentialIssuedKeyID,
         generation: UInt64,
         publicKey: P256.Signing.PublicKey
     ) throws {
@@ -471,7 +570,7 @@ public struct PinnedSpaceCredentialPublicKey: Sendable {
     /// local and does not parse a DID document or make a network request.
     public init(
         authority: String,
-        keyID: String = PermissionedDataJWT.spaceCredentialKeyID,
+        keyID: String = PermissionedDataJWT.spaceCredentialIssuedKeyID,
         generation: UInt64,
         secp256k1PublicKey: Data
     ) throws {
@@ -523,17 +622,7 @@ public struct PinnedSpaceCredentialPublicKeyResolver:
     ) async throws -> PermissionedDataJWTVerificationKey? {
         let exact = PinnedKey(authority: issuer, keyID: keyID)
         if let key = keys[exact] { return key }
-        // A credential header normally names `#atproto_space`, but proposal
-        // 0016 permits the ordinary account key if no dedicated method is
-        // published. The pinned TypeScript PDS currently resolves exactly
-        // this fallback for simplespace authorities.
-        guard keyID == PermissionedDataJWT.spaceCredentialKeyID else {
-            return nil
-        }
-        return keys[PinnedKey(
-            authority: issuer,
-            keyID: PermissionedDataJWT.spaceCredentialFallbackKeyID
-        )]
+        return nil
     }
 
     private struct PinnedKey: Hashable, Sendable {
@@ -693,27 +782,46 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
         /// that window to something an operator can reason about while leaving
         /// the exchange cheap enough to repeat.
         ///
-        /// This changes only what this authority mints.
-        /// ``PermissionedDataJWT/spaceCredentialLifetime`` remains the two-hour
-        /// interop ceiling, so credentials minted by another proposal-0016
-        /// implementation are still accepted unchanged.
+        /// This changes only what this authority mints. It is already below
+        /// upstream's 600-second default (#5567).
+        /// ``PermissionedDataJWT/spaceCredentialLifetime`` is the one-hour
+        /// ceiling both minting and verification enforce, so a credential
+        /// minted by another implementation with upstream's default verifies.
         public static let defaultLifetime: TimeInterval = 5 * 60
 
         public static let standard = Configuration(uncheckedLifetime: defaultLifetime)
 
         public let lifetime: TimeInterval
+        /// Lifetimes that replace ``lifetime`` for the named space types only,
+        /// so a policy that wants shorter credentials (the conversation policy)
+        /// does not shorten every other space on the authority.
+        public let spaceTypeLifetimes: [String: TimeInterval]
 
-        public init(lifetime: TimeInterval = defaultLifetime) throws {
-            guard lifetime > 0,
-                  lifetime <= PermissionedDataJWT.spaceCredentialLifetime,
-                  lifetime.rounded(.towardZero) == lifetime else {
+        public init(
+            lifetime: TimeInterval = defaultLifetime,
+            spaceTypeLifetimes: [String: TimeInterval] = [:]
+        ) throws {
+            guard Self.isValidLifetime(lifetime),
+                  spaceTypeLifetimes.values.allSatisfy(Self.isValidLifetime) else {
                 throw SwanError.malformed("invalid space credential lifetime")
             }
             self.lifetime = lifetime
+            self.spaceTypeLifetimes = spaceTypeLifetimes
+        }
+
+        public func lifetime(for space: SpaceURI) -> TimeInterval {
+            spaceTypeLifetimes[space.spaceType] ?? lifetime
         }
 
         private init(uncheckedLifetime: TimeInterval) {
             lifetime = uncheckedLifetime
+            spaceTypeLifetimes = [:]
+        }
+
+        private static func isValidLifetime(_ lifetime: TimeInterval) -> Bool {
+            lifetime > 0
+                && lifetime <= PermissionedDataJWT.spaceCredentialLifetime
+                && lifetime.rounded(.towardZero) == lifetime
         }
     }
 
@@ -736,9 +844,10 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
 
     public func issueSpaceCredential(
         space: SpaceURI,
-        user: String,
+        user: String?,
         authorization: AuthorizationContext,
         clientAttestation: String? = nil,
+        confirmationKeyID: String,
         now: Date = Date()
     ) async throws -> String {
         // A credential never authorizes creation of another credential. The
@@ -752,11 +861,14 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
             requesterMatches = subject == user
         case let .spaceDelegation(subject, delegatedSpace):
             requesterMatches = subject == user && delegatedSpace == space
+        case .public:
+            requesterMatches = user == nil
         default:
             requesterMatches = false
         }
         guard requesterMatches,
-              (try? AccountIdentifiers.validateDID(user)) != nil else {
+              PermissionedDataJWT.isValidConfirmationKeyID(confirmationKeyID),
+              user == nil || (try? AccountIdentifiers.validateDID(user!)) != nil else {
             throw SwanError.unauthorized("credential requester does not match the requested user")
         }
         let clientID: String?
@@ -783,14 +895,25 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
                 || signingKey.keyID == PermissionedDataJWT.spaceCredentialFallbackKeyID else {
             throw SwanError.unavailable("space credential signing key is unavailable")
         }
-        return try PermissionedDataJWT.createSpaceCredential(
+        // Mint immediately after the key resolver's generation fence. The
+        // token remains transient and is never returned unless final policy
+        // still authorizes it after the custody suspension.
+        let credential = try PermissionedDataJWT.createSpaceCredential(
             issuer: space.authority,
             space: space,
             key: signingKey.privateKey,
+            confirmationKeyID: confirmationKeyID,
             now: now,
-            lifetime: configuration.lifetime,
+            lifetime: configuration.lifetime(for: space),
             kid: signingKey.keyID
         )
+        // This may suspend for a current membership check. A key rotation
+        // here can invalidate an already-minted token through normal key
+        // verification; it cannot cause us to mint with an old key afterward.
+        try await policyDirectory.authorizeSimpleSpaceCredentialRead(
+            space: space, user: user, clientID: clientID, authorization: authorization
+        )
+        return credential
     }
 }
 
@@ -833,7 +956,7 @@ public struct DurableSpaceDelegationVerifier: SpaceDelegationAuthorizationVerifi
         now: Date = Date()
     ) async throws -> VerifiedSpaceDelegation {
         let inspection = try PermissionedDataJWT.inspectDelegationToken(token)
-        let expectedAudience = "\(expectedSpace.authority)#atproto_space_host"
+        let expectedAudience = "\(expectedSpace.authority)#atproto_pds"
         guard inspection.claims.aud == expectedAudience,
               inspection.claims.sub == expectedSpace.rawValue else {
             throw SwanError.unauthorized("delegation token does not match the requested authority or space")
@@ -869,16 +992,22 @@ public struct DurableSpaceDelegationVerifier: SpaceDelegationAuthorizationVerifi
 /// read-only authorization context. The `SpaceGrant.subject` is the authority
 /// issuer because proposal 0016 credentials intentionally contain no reader
 /// identity; issuance is separately bound to a reader by
-/// ``DurableSpaceCredentialAuthority`` and is never inferred during bearer
-/// verification.
+/// ``DurableSpaceCredentialAuthority``. HTTP requests additionally prove
+/// possession of the credential's confirmation key (`cnf.kid`) with an
+/// `atproto-space` HTTP message signature; see
+/// ``SpaceCredentialAuthorizationVerifier/verifiedPresentation(_:expectedSpace:presentation:now:)``.
 public struct DurableSpaceCredentialVerifier: SpaceCredentialAuthorizationVerifier {
     public struct Configuration: Sendable, Equatable {
         public static let standard = Configuration(uncheckedClockSkew: 60)
+        /// The widest expiry skew a deployment may configure. Revocation
+        /// retention (``DurableSpaceCredentialRevocations/retention``) is
+        /// sized from it.
+        public static let maximumClockSkew: TimeInterval = 5 * 60
 
         public let clockSkew: TimeInterval
 
         public init(clockSkew: TimeInterval = 60) throws {
-            guard (0 ... 5 * 60).contains(clockSkew) else {
+            guard (0 ... Self.maximumClockSkew).contains(clockSkew) else {
                 throw SwanError.malformed("invalid space credential clock skew")
             }
             self.clockSkew = clockSkew

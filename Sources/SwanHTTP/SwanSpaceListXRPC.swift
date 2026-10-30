@@ -39,7 +39,7 @@ private struct AuthenticatedListSpacesHandler: ComAtprotoSpaceListSpaces.ServerH
         input: Void,
         context request: Request
     ) async throws -> ComAtprotoSpaceListSpaces.Output {
-        let spaceType = parameters.type?.nsidString()
+        let spaceType = parameters.spaceType?.nsidString()
         let authority = parameters.did?.didString()
         let cursor: SpaceURI?
         do {
@@ -59,7 +59,7 @@ private struct AuthenticatedListSpacesHandler: ComAtprotoSpaceListSpaces.ServerH
 
         let authorization: AuthorizationContext
         do {
-            authorization = try await capability.authorizer.authorize(
+            authorization = try await capability.authorizer.authorizeSpaceRoute(
                 request: request,
                 method: "GET",
                 fixedPath: "/xrpc/com.atproto.space.listSpaces"
@@ -174,9 +174,13 @@ private func parseAuthenticatedListSpacesParameters(
     if let query, !query.isEmpty {
         for segment in query.split(separator: "&", omittingEmptySubsequences: false) {
             let pair = segment.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            // `spaceType` is the October 1 alpha filter name. The retired
+            // `type` key is rejected like any unknown key rather than
+            // ignored, so an old client gets a 400 instead of an unfiltered
+            // listing.
             guard pair.count == 2,
                   let key = String(bytes: pair[0].utf8, encoding: .utf8),
-                  ["type", "did", "limit", "cursor"].contains(key),
+                  ["spaceType", "did", "limit", "cursor"].contains(key),
                   !pair[1].isEmpty,
                   values[key] == nil else {
                 throw AuthenticatedSpaceListFailure.invalidRequest
@@ -187,7 +191,7 @@ private func parseAuthenticatedListSpacesParameters(
         throw AuthenticatedSpaceListFailure.invalidRequest
     }
 
-    let type = try values["type"].map { try NSID(nsidString: bounded($0, maximumBytes: 317)) }
+    let spaceType = try values["spaceType"].map { try NSID(nsidString: bounded($0, maximumBytes: 317)) }
     let did = try values["did"].map { try DID(didString: bounded($0, maximumBytes: 2_048)) }
     let limit: Int?
     if let raw = values["limit"] {
@@ -203,12 +207,12 @@ private func parseAuthenticatedListSpacesParameters(
     if let cursor {
         let parsed = try SpaceURI(cursor)
         guard parsed.rawValue == cursor,
-              (type == nil || parsed.spaceType == type?.nsidString()),
+              (spaceType == nil || parsed.spaceType == spaceType?.nsidString()),
               (did == nil || parsed.authority == did?.didString()) else {
             throw AuthenticatedSpaceListFailure.invalidRequest
         }
     }
-    return .init(type: type, did: did, limit: limit, cursor: cursor)
+    return .init(spaceType: spaceType, did: did, limit: limit, cursor: cursor)
 }
 
 private func authenticatedListSpacesResponse(

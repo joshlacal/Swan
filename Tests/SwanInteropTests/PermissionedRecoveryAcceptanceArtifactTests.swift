@@ -4,6 +4,8 @@ import Crypto
 import SwanSpaces
 import SwanStorage
 import Petrel
+import PetrelCrypto
+import SwanOAuth
 import XCTest
 
 final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
@@ -21,19 +23,7 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
         let cid = CID.fromDAGCBOR(recordValue)
         let expectedURI = "\(space.rawValue)/\(repository)/\(collection)/\(rkey)"
         let revision = "3lqjz7x4abc2m"
-        let ikm = Data(repeating: 0x22, count: 32)
-        let signingKey = P256.Signing.PrivateKey()
-        let context = try SpaceCommitContext(
-            space: space,
-            author: repository,
-            rev: revision,
-            ikm: ikm
-        )
-        let envelope = try SpaceCommitCodec.sign(
-            context: context,
-            commitment: Data(repeating: 0x11, count: 32),
-            key: signingKey
-        )
+        let kemKey = P256.KeyAgreement.PrivateKey()
         let createResult = ComAtprotoSpaceApplyWrites.CreateResult(
             uri: try ATProtocolURI(uriString: expectedURI),
             cid: cid,
@@ -42,13 +32,9 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
         let applyOutput = ComAtprotoSpaceApplyWrites.Output(
             results: [.comAtprotoSpaceApplyWritesCreateResult(createResult)]
         )
-        let signedCommit = ComAtprotoSpaceDefs.SignedCommit(
-            ver: envelope.ver,
-            hash: Bytes(data: envelope.commitment),
-            ikm: Bytes(data: envelope.context.ikm),
-            sig: Bytes(data: envelope.contextSignature),
-            mac: Bytes(data: envelope.contentBinding),
-            rev: try TID(tidString: revision)
+        let signedCommit = ComAtprotoSpaceDefs.Commit(
+            ver: 1, repo: try DID(didString: repository), space: try SpaceRef(uriString: space.rawValue),
+            rev: try TID(tidString: revision), data: Bytes(data: Data(repeating: 0x11, count: 32))
         )
         let op = ComAtprotoSpaceListRepoOps.OpEntry(
             rev: try TID(tidString: revision),
@@ -69,7 +55,8 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
         let listResponseBody = try encoder.encode(listOutput)
         let transport = MockWriteOnlyTransport(
             applyResponseBody: applyResponseBody,
-            listResponseBody: listResponseBody
+            listResponseBody: listResponseBody,
+            kemKey: kemKey
         )
         let http = try InteropHTTPClient(
             baseURL: URL(string: "https://member.test")!,
@@ -89,7 +76,7 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
             label: "mock-member",
             client: client,
             authorizationProvider: { _, _, _ in .bearer(token: "mock-token") },
-            permissionedCommitVerificationKey: .p256(signingKey.publicKey)
+            permissionedKEMKey: try P256DIDKey(publicKey: P256.Signing.PublicKey(compressedRepresentation: kemKey.publicKey.compressedRepresentation)).value
         )
         let recorder = InteropFixtureRecorder()
 
@@ -141,7 +128,7 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
 
         XCTAssertEqual(artifact.applyStatus, 200)
         XCTAssertEqual(artifact.witnessStatus, 200)
-        XCTAssertEqual(artifact.profileID, "permissioned-data-0016-2026-08-15")
+        XCTAssertEqual(artifact.profileID, OfflineProtocolProfileVerifier.stableProfileID)
         XCTAssertTrue(artifact.fixturePolicy.hasPrefix("summary-only"))
         XCTAssertEqual(artifact.terminalRevision, "3lqjz7x4abc2m")
         XCTAssertEqual(artifact.operationCount, 3)
@@ -209,7 +196,7 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
             errorCode: nil
         )
 
-        XCTAssertEqual(artifact.profileID, "permissioned-data-0016-2026-08-15")
+        XCTAssertEqual(artifact.profileID, OfflineProtocolProfileVerifier.stableProfileID)
         XCTAssertEqual(artifact.gapErrorCode, "full_repo_recovery_required")
         XCTAssertEqual(artifact.priorCommitment, digest)
         XCTAssertTrue(artifact.replacementCASAdvanced)
@@ -303,6 +290,13 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
         XCTAssertEqual(artifact.errorCode, "<redacted>")
     }
 
+    func testNativeCorruptionClassificationRequiresSTARContentFailure() {
+        XCTAssertTrue(PermissionedRecoveryFailureCode.isInjectedFinalByteCorruptionRejection(SpaceSTARError.digestMismatch))
+        for error in [SpaceSTARError.badMAC, SpaceSTARError.wrongRepository, SpaceMAC.Failure.mismatch, InteropHTTPError.transportFailure] as [any Error] {
+            XCTAssertFalse(PermissionedRecoveryFailureCode.isInjectedFinalByteCorruptionRejection(error))
+        }
+    }
+
     func testRecoveryFailureCodesDoNotReflectArbitraryErrors() {
         XCTAssertEqual(
             PermissionedRecoveryFailureCode.code(
@@ -349,7 +343,10 @@ private actor MockWriteOnlyTransport {
     private let listResponseBody: Data
     private var calls: [Call] = []
 
-    init(applyResponseBody: Data, listResponseBody: Data) {
+    let kemKey: P256.KeyAgreement.PrivateKey
+
+    init(applyResponseBody: Data, listResponseBody: Data, kemKey: P256.KeyAgreement.PrivateKey) {
+        self.kemKey = kemKey
         self.applyResponseBody = applyResponseBody
         self.listResponseBody = listResponseBody
     }
@@ -383,9 +380,17 @@ private actor MockWriteOnlyTransport {
         guard responseBody.count <= limit else {
             throw InteropHTTPError.responseTooLarge
         }
+        var responseHeaders = ["content-type": "application/json"]
+        if method == .get {
+            let want = try SpaceMACHeaders.parseWantMAC(headers[SpaceMACHeaders.requestHeader], type: .repository)
+            let secret = try SpaceMAC.decapsulate(privateKey: kemKey, keyShare: want.keyShare)
+            let commit = try XCTUnwrap(JSONDecoder().decode(ComAtprotoSpaceListRepoOps.Output.self, from: responseBody).commit)
+            let mac = try SpaceMAC.commit(sharedSecret: secret, space: commit.space.uriString(), repo: commit.repo.didString(), rev: commit.rev.toString(), data: commit.data.data)
+            responseHeaders[SpaceMACHeaders.responseHeader] = try SpaceMACHeaders.formatMAC(mac, type: .repository)
+        }
         return InteropHTTPResponse(
             status: 200,
-            headers: ["content-type": "application/json"],
+            headers: responseHeaders,
             body: responseBody,
             finalURL: url,
             redirectCount: 0

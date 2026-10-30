@@ -28,6 +28,13 @@ public struct SwanOAuthRuntime: Sendable {
     /// delegations. It shares the injected non-persisted HMAC key with the
     /// OAuth runtime but has a distinct storage and digest namespace.
     public let spaceDelegationReplayStore: DurableSpaceDelegationReplayStore
+    /// Single-use reservation for unbound (no `req`) upstream service JWTs,
+    /// consulted only when spaces open interop is enabled.
+    public let spaceServiceJWTReplayStore: DurableSpaceServiceJWTReplayStore
+    /// The repo host's space-credential revocation list (atproto#5567),
+    /// consulted on every credential presentation and written by
+    /// `notifyCredentialRevoked`.
+    public let spaceCredentialRevocations: DurableSpaceCredentialRevocations
     public let browserSessionService: OAuthBrowserSessionService
     /// The nonce MAC key is the injected non-persisted OAuth server key. It
     /// never crosses into `OAuthControlStore`; validators receive this service
@@ -53,7 +60,8 @@ public struct SwanOAuthRuntime: Sendable {
     public let lexiconResolver: (any SwanLexiconResolving)?
 
     public init(
-        controlStore: any OAuthControlStore & SpaceDelegationReplayStore,
+        controlStore: any OAuthControlStore & SpaceDelegationReplayStore
+            & SpaceCredentialRevocationStore,
         serverKey: Data,
         lexiconResolver: (any SwanLexiconResolving)? = nil,
         identityAdmission: (any SwanIdentityAdmissionEvaluating)? = nil
@@ -73,6 +81,11 @@ public struct SwanOAuthRuntime: Sendable {
             controlStore: controlStore,
             serverKey: serverKey
         )
+        spaceServiceJWTReplayStore = try DurableSpaceServiceJWTReplayStore(
+            controlStore: controlStore,
+            serverKey: serverKey
+        )
+        spaceCredentialRevocations = DurableSpaceCredentialRevocations(store: controlStore)
         browserSessionService = try OAuthBrowserSessionService(serverKey: serverKey)
         dpopNonceService = DPoPNonceService(secret: serverKey)
     }
@@ -1647,5 +1660,62 @@ public actor DurableSpaceDelegationReplayStore {
         return !bytes.isEmpty
             && bytes.count <= PermissionedDataJWT.maximumOpaqueJTIBytes
             && bytes.allSatisfy { $0 >= 0x20 && $0 != 0x7f }
+    }
+}
+
+/// Reserves an *unbound* upstream service JWT (one with no `req` claim)
+/// exactly once through its expiry. Upstream service auth carries no body
+/// binding, so a captured token could otherwise be replayed with a different
+/// body inside its 60-second life; Swan is stricter than upstream here (which
+/// keeps no service-auth `jti` cache), which is harmless for interop.
+///
+/// It shares the delegation replay table: the HMAC input is domain-separated
+/// (`swan.space.service-jwt-replay-v1`), so the two namespaces cannot collide.
+public actor DurableSpaceServiceJWTReplayStore {
+    private let controlStore: any SpaceDelegationReplayStore
+    private let macKey: SymmetricKey
+
+    public init(
+        controlStore: any SpaceDelegationReplayStore,
+        serverKey: Data
+    ) throws {
+        guard serverKey.count == 32 else {
+            throw SwanError.malformed("OAuth server key must be exactly 32 bytes")
+        }
+        self.controlStore = controlStore
+        macKey = SymmetricKey(data: serverKey)
+    }
+
+    /// Returns `true` only for the first use of `(issuer, method, jti)`.
+    public func claim(
+        issuer: String,
+        method: String,
+        jti: String,
+        expiresAt: Date,
+        now: Date = Date()
+    ) async throws -> Bool {
+        guard !jti.isEmpty, jti.utf8.count <= 256, expiresAt > now else {
+            throw SwanError.expired
+        }
+        var input = Data("swan.space.service-jwt-replay-v1\u{0}".utf8)
+        for field in [issuer, method, jti] {
+            let bytes = Data(field.utf8)
+            var length = UInt64(bytes.count).bigEndian
+            withUnsafeBytes(of: &length) { input.append(contentsOf: $0) }
+            input.append(bytes)
+        }
+        let digest = Data(HMAC<SHA256>.authenticationCode(for: input, using: macKey))
+        do {
+            return try await controlStore.claimSpaceDelegation(
+                digest: digest,
+                expiresAt: expiresAt,
+                now: now
+            )
+        } catch let error as OAuthControlStoreError {
+            if error == .expired { throw SwanError.expired }
+            throw SwanError.unauthorized("service authentication rejected")
+        } catch {
+            throw SwanError.unavailable("service authentication replay store unavailable")
+        }
     }
 }

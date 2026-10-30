@@ -73,7 +73,23 @@ final class SpaceCredentialSigningFenceTests: XCTestCase {
         )
         let resolved = try await resolver.signingKey(for: Self.authority)
         XCTAssertEqual(resolved?.authority, Self.authority)
-        XCTAssertEqual(resolved?.keyID, PermissionedDataJWT.spaceCredentialKeyID)
+        XCTAssertEqual(resolved?.keyID, "#atproto")
+    }
+
+    /// SWAN-01: a Swan-hosted did:web authority publishes only `#atproto`
+    /// (`SwanDidWebIdentity`), so its credentials must name `#atproto` too.
+    func testDidWebAuthoritySigningKeyNamesPublishedAtprotoMethod() async throws {
+        let didWeb = "did:web:authority.example.com"
+        let fixture = try await Fixture.make(authority: didWeb)
+        addTeardownBlock { try? await fixture.close() }
+
+        let resolver = LocalAccountSpaceCredentialSigningKeyResolver(
+            accounts: fixture.accounts,
+            keyStore: fixture.keyStore
+        )
+        let resolved = try await resolver.signingKey(for: didWeb)
+        XCTAssertEqual(resolved?.authority, didWeb)
+        XCTAssertEqual(resolved?.keyID, "#atproto")
     }
 
     /// An unmanaged DID stays a fall-through (`nil`), not the terminal error the
@@ -201,7 +217,9 @@ final class SpaceCredentialSigningFenceTests: XCTestCase {
         let keyStore: FileAccountKeyStore
         let accounts: DurableAccountDirectory
 
-        static func make() async throws -> Fixture {
+        static func make(
+            authority: String = SpaceCredentialSigningFenceTests.authority
+        ) async throws -> Fixture {
             let root = FileManager.default.temporaryDirectory
                 .appending(path: "SpaceCredentialSigningFenceTests-\(UUID().uuidString)")
             try FileManager.default.createDirectory(
@@ -223,11 +241,11 @@ final class SpaceCredentialSigningFenceTests: XCTestCase {
                 )
                 let keys = try await AccountKeyProvisioner(keyStore: keyStore)
                     .provisionInitial(
-                        accountDID: SpaceCredentialSigningFenceTests.authority
+                        accountDID: authority
                     )
                 _ = try await control.createAccount(
                     try AccountControlRegistration(
-                        did: SpaceCredentialSigningFenceTests.authority,
+                        did: authority,
                         canonicalHandle: "authority.example.com",
                         passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
                         signingKey: try .init(

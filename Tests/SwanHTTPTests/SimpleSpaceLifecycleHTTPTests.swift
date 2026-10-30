@@ -23,7 +23,8 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
     private static let createPath = "/xrpc/com.atproto.simplespace.createSpace"
     private static let updatePath = "/xrpc/com.atproto.simplespace.updateSpace"
     private static let deletePath = "/xrpc/com.atproto.simplespace.deleteSpace"
-    private static let addPath = "/xrpc/com.atproto.simplespace.addMember"
+    private static let putPath = "/xrpc/com.atproto.simplespace.putMember"
+    private static let addPath = "/xrpc/com.atproto.simplespace.putMember"
     private static let removePath = "/xrpc/com.atproto.simplespace.removeMember"
     private static let listPath = "/xrpc/com.atproto.simplespace.listMembers"
 
@@ -158,8 +159,9 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         do {
             let app = try makeServer(fixture).buildApplication(logger: Logger(label: "SimpleSpaceLifecycleHTTPTests.success"))
-            let create = #"{"did":"\#(Self.alice)","type":"\#(Self.type)"}"#
-            let managingConfig = #"{"space":"PLACEHOLDER","policy":"managing-app","managingApp":"did:web:manager.example","appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
+            let create = #"{"did":"\#(Self.alice)","spaceType":"\#(Self.type)","readPolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
+            let managingConfig = #"{"space":"PLACEHOLDER","readPolicy":{"$type":"com.atproto.simplespace.defs#managingAppPolicy","managingApp":"did:web:manager.example"},"writePolicy":{"$type":"com.atproto.simplespace.defs#managingAppPolicy","managingApp":"did:web:manager.example"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
+            let publicConfig = #"{"space":"PLACEHOLDER","readPolicy":{"$type":"com.atproto.simplespace.defs#publicPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
             try await app.test(.router) { client in
                 try await client.execute(
                     uri: Self.createPath,
@@ -175,14 +177,21 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(space.spaceType, Self.type)
                     XCTAssertFalse(space.skey.isEmpty)
 
-                    let configure = managingConfig.replacingOccurrences(of: "PLACEHOLDER", with: uri)
-                    let configHeaders = try self.postHeaders(fixture, path: Self.updatePath, jti: "configure-managing")
+                    // SWAN-24 option B: Swan does not implement managing-app
+                    // evaluation, so updateSpace refuses the policy.
+                    let configureManaging = managingConfig.replacingOccurrences(of: "PLACEHOLDER", with: uri)
+                    try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(fixture, path: Self.updatePath, jti: "configure-managing"), body: ByteBuffer(string: configureManaging)) { response in
+                        XCTAssertEqual(response.status, .badRequest)
+                        XCTAssertEqual(try self.errorCode(response.body), "UnsupportedPolicy")
+                    }
+                    let configure = publicConfig.replacingOccurrences(of: "PLACEHOLDER", with: uri)
+                    let configHeaders = try self.postHeaders(fixture, path: Self.updatePath, jti: "configure-public")
                     try await client.execute(uri: Self.updatePath, method: .post, headers: configHeaders, body: ByteBuffer(string: configure)) { response in
                         XCTAssertEqual(response.status, .ok)
                         XCTAssertEqual(response.headers[.cacheControl], "no-store")
                     }
-                    // Omit policy/managingApp: appAccess changes, while the
-                    // existing managing-app facts must remain intact.
+                    // Omit policy: appAccess changes, while the existing
+                    // policy facts must remain intact.
                     let patch = #"{"space":"\#(uri)","appAccess":{"$type":"com.atproto.simplespace.defs#allowList","allowed":["https://client.example"]}}"#
                     try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(fixture, path: Self.updatePath, jti: "patch-app"), body: ByteBuffer(string: patch)) { response in
                         XCTAssertEqual(response.status, .ok)
@@ -190,58 +199,50 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     let getPath = "/xrpc/com.atproto.simplespace.getSpace?space=\(self.percentEncode(uri))"
                     try await client.execute(uri: getPath, method: .get, headers: try self.getHeaders(fixture, path: "/xrpc/com.atproto.simplespace.getSpace", jti: "get-patched")) { response in
                         XCTAssertEqual(response.status, .ok)
-                        let policy = try XCTUnwrap((try self.jsonObject(response.body))["policy"] as? [String: Any])
-                        XCTAssertEqual(policy["$type"] as? String, "com.atproto.simplespace.defs#managingAppPolicy")
-                        XCTAssertEqual(policy["managingApp"] as? String, "did:web:manager.example")
+                        let object = try self.jsonObject(response.body)
+                        let policy = try XCTUnwrap(object["readPolicy"] as? [String: Any])
+                        XCTAssertEqual(policy["$type"] as? String, "com.atproto.simplespace.defs#publicPolicy")
+                        let writePolicy = try XCTUnwrap(object["writePolicy"] as? [String: Any])
+                        XCTAssertEqual(writePolicy["$type"] as? String, "com.atproto.simplespace.defs#memberListPolicy")
                     }
 
                     // Pinned updateSpace patches each property independently:
-                    // changing policy must not erase an omitted managingApp.
-                    let policyOnly = #"{"space":"\#(uri)","policy":"public"}"#
-                    try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(fixture, path: Self.updatePath, jti: "policy-only-public"), body: ByteBuffer(string: policyOnly)) { response in
+                    // changing readPolicy must not touch writePolicy.
+                    let policyOnly = #"{"space":"\#(uri)","readPolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"}}"#
+                    try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(fixture, path: Self.updatePath, jti: "policy-only-member-list"), body: ByteBuffer(string: policyOnly)) { response in
                         XCTAssertEqual(response.status, .ok)
                     }
-                    try await client.execute(uri: getPath, method: .get, headers: try self.getHeaders(fixture, path: "/xrpc/com.atproto.simplespace.getSpace", jti: "get-policy-only-public")) { response in
+                    try await client.execute(uri: getPath, method: .get, headers: try self.getHeaders(fixture, path: "/xrpc/com.atproto.simplespace.getSpace", jti: "get-policy-only-member-list")) { response in
                         XCTAssertEqual(response.status, .ok)
-                        let policy = try XCTUnwrap((try self.jsonObject(response.body))["policy"] as? [String: Any])
-                        // A managing app stored under a policy that does not
-                        // consult one is deliberately not emitted.
-                        XCTAssertEqual(policy["$type"] as? String, "com.atproto.simplespace.defs#publicPolicy")
+                        let object = try self.jsonObject(response.body)
+                        let policy = try XCTUnwrap(object["readPolicy"] as? [String: Any])
+                        XCTAssertEqual(policy["$type"] as? String, "com.atproto.simplespace.defs#memberListPolicy")
                         XCTAssertEqual(Set(policy.keys), ["$type"])
+                        let writePolicy = try XCTUnwrap(object["writePolicy"] as? [String: Any])
+                        XCTAssertEqual(writePolicy["$type"] as? String, "com.atproto.simplespace.defs#memberListPolicy")
                     }
-                    let restoreManagingPolicy = #"{"space":"\#(uri)","policy":"managing-app"}"#
+                    let restoreManagingPolicy = #"{"space":"\#(uri)","readPolicy":{"$type":"com.atproto.simplespace.defs#managingAppPolicy","managingApp":"did:web:manager.example"}}"#
                     try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(fixture, path: Self.updatePath, jti: "policy-only-managing"), body: ByteBuffer(string: restoreManagingPolicy)) { response in
-                        XCTAssertEqual(response.status, .ok)
-                    }
-                    try await client.execute(uri: getPath, method: .get, headers: try self.getHeaders(fixture, path: "/xrpc/com.atproto.simplespace.getSpace", jti: "get-policy-restored")) { response in
-                        XCTAssertEqual(response.status, .ok)
-                        let policy = try XCTUnwrap((try self.jsonObject(response.body))["policy"] as? [String: Any])
-                        // The public-policy interlude must not have erased the
-                        // omitted managingApp: restoring the policy re-emits it.
-                        XCTAssertEqual(policy["$type"] as? String, "com.atproto.simplespace.defs#managingAppPolicy")
-                        XCTAssertEqual(policy["managingApp"] as? String, "did:web:manager.example")
+                        XCTAssertEqual(response.status, .badRequest)
+                        XCTAssertEqual(try self.errorCode(response.body), "UnsupportedPolicy")
                     }
 
-                    // Match the pinned TypeScript handler: an empty
-                    // managingApp is an explicit clear rather than an
-                    // omitted-field reset, and it does not rewrite policy.
-                    let clearManagingApp = #"{"space":"\#(uri)","managingApp":""}"#
+                    let clearManagingApp = #"{"space":"\#(uri)","readPolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"}}"#
                     try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(fixture, path: Self.updatePath, jti: "clear-managing"), body: ByteBuffer(string: clearManagingApp)) { response in
                         XCTAssertEqual(response.status, .ok)
                     }
                     try await client.execute(uri: getPath, method: .get, headers: try self.getHeaders(fixture, path: "/xrpc/com.atproto.simplespace.getSpace", jti: "get-cleared")) { response in
                         XCTAssertEqual(response.status, .ok)
-                        let policy = try XCTUnwrap((try self.jsonObject(response.body))["policy"] as? [String: Any])
-                        XCTAssertEqual(policy["$type"] as? String, "com.atproto.simplespace.defs#managingAppPolicy")
-                        XCTAssertEqual(policy["managingApp"] as? String, "")
+                        let policy = try XCTUnwrap((try self.jsonObject(response.body))["readPolicy"] as? [String: Any])
+                        XCTAssertEqual(policy["$type"] as? String, "com.atproto.simplespace.defs#memberListPolicy")
                     }
 
-                    let add = #"{"space":"\#(uri)","did":"\#(Self.bob)"}"#
-                    try await client.execute(uri: Self.addPath, method: .post, headers: try self.postHeaders(fixture, path: Self.addPath, jti: "add-member"), body: ByteBuffer(string: add)) { response in
+                    let add = #"{"space":"\#(uri)","did":"\#(Self.bob)","read":true,"write":false}"#
+                    try await client.execute(uri: Self.putPath, method: .post, headers: try self.postHeaders(fixture, path: Self.putPath, jti: "add-member"), body: ByteBuffer(string: add)) { response in
                         XCTAssertEqual(response.status, .ok)
                     }
-                    // add is idempotent.
-                    try await client.execute(uri: Self.addPath, method: .post, headers: try self.postHeaders(fixture, path: Self.addPath, jti: "add-member-again"), body: ByteBuffer(string: add)) { response in
+                    // put is idempotent.
+                    try await client.execute(uri: Self.putPath, method: .post, headers: try self.postHeaders(fixture, path: Self.putPath, jti: "add-member-again"), body: ByteBuffer(string: add)) { response in
                         XCTAssertEqual(response.status, .ok)
                     }
                     let first = "\(Self.listPath)?space=\(self.percentEncode(uri))&limit=1"
@@ -249,24 +250,31 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                         XCTAssertEqual(response.status, .ok)
                         self.assertNoStore(response)
                         let body = try self.jsonObject(response.body)
-                        XCTAssertEqual((body["members"] as? [[String: String]])?.map(\.["did"]), [Self.alice])
+                        let members = body["members"] as? [[String: Any]]
+                        XCTAssertEqual(members?.first?["did"] as? String, Self.alice)
+                        XCTAssertEqual(members?.first?["read"] as? Bool, true)
+                        XCTAssertEqual(members?.first?["write"] as? Bool, true)
                         XCTAssertEqual(body["cursor"] as? String, Self.alice)
                     }
                     let second = "\(Self.listPath)?space=\(self.percentEncode(uri))&limit=1&cursor=\(self.percentEncode(Self.alice))"
                     try await client.execute(uri: second, method: .get, headers: try self.getHeaders(fixture, path: Self.listPath, jti: "members-second")) { response in
                         XCTAssertEqual(response.status, .ok)
-                        XCTAssertEqual(((try self.jsonObject(response.body))["members"] as? [[String: String]])?.map(\.["did"]), [Self.bob])
+                        let secondMembers = (try self.jsonObject(response.body))["members"] as? [[String: Any]]
+                        XCTAssertEqual(secondMembers?.first?["did"] as? String, Self.bob)
+                        XCTAssertEqual(secondMembers?.first?["read"] as? Bool, true)
+                        XCTAssertEqual(secondMembers?.first?["write"] as? Bool, false)
                     }
                     let ownerRemoval = #"{"space":"\#(uri)","did":"\#(Self.alice)"}"#
                     try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(fixture, path: Self.removePath, jti: "remove-owner"), body: ByteBuffer(string: ownerRemoval)) { response in
                         XCTAssertEqual(response.status, .badRequest)
                         XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
                     }
-                    try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(fixture, path: Self.removePath, jti: "remove-member"), body: ByteBuffer(string: add)) { response in
+                    let removeMember = #"{"space":"\#(uri)","did":"\#(Self.bob)"}"#
+                    try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(fixture, path: Self.removePath, jti: "remove-member"), body: ByteBuffer(string: removeMember)) { response in
                         XCTAssertEqual(response.status, .ok)
                     }
                     // remove is idempotent.
-                    try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(fixture, path: Self.removePath, jti: "remove-member-again"), body: ByteBuffer(string: add)) { response in
+                    try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(fixture, path: Self.removePath, jti: "remove-member-again"), body: ByteBuffer(string: removeMember)) { response in
                         XCTAssertEqual(response.status, .ok)
                     }
                     let delete = #"{"space":"\#(uri)"}"#
@@ -294,7 +302,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 // The reference implementation's canonical create body omits
                 // `did` — it defaults to the authenticated caller, and no
                 // other value is admissible anyway.
-                let create = #"{"type":"\#(Self.type)","skey":"did-defaulted"}"#
+                let create = #"{"spaceType":"\#(Self.type)","skey":"did-defaulted","readPolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "create-no-did"), body: ByteBuffer(string: create)) { response in
                     XCTAssertEqual(response.status, .ok)
                     let uri = try XCTUnwrap((try self.jsonObject(response.body))["uri"] as? String)
@@ -305,16 +313,35 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 }
                 // An explicit foreign `did` stays indistinguishable from an
                 // absent space — the authority gate is unchanged.
-                let foreign = #"{"did":"\#(Self.bob)","type":"\#(Self.type)","skey":"foreign-did"}"#
+                let foreign = #"{"did":"\#(Self.bob)","spaceType":"\#(Self.type)","skey":"foreign-did","readPolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "create-foreign-did"), body: ByteBuffer(string: foreign)) { response in
                     XCTAssertEqual(response.status, .notFound)
                     XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
                 }
-                // `type` remains the one required field.
+                // `spaceType` remains the one required field.
                 let missingType = #"{"skey":"typeless"}"#
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "create-missing-type"), body: ByteBuffer(string: missingType)) { response in
                     XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
+                // The pre-October-1 field name is rejected, alone or next to
+                // `spaceType`, and creates nothing.
+                let legacyType = #"{"type":"\#(Self.type)","skey":"legacy-type","readPolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "create-legacy-type"), body: ByteBuffer(string: legacyType)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
+                let bothTypes = #"{"type":"\#(Self.type)","spaceType":"\#(Self.type)","skey":"legacy-type","readPolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "create-both-types"), body: ByteBuffer(string: bothTypes)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
+                // Nothing was created: the same skey is still free.
+                let modern = #"{"spaceType":"\#(Self.type)","skey":"legacy-type","readPolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "create-after-legacy"), body: ByteBuffer(string: modern)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let uri = try XCTUnwrap((try self.jsonObject(response.body))["uri"] as? String)
+                    XCTAssertEqual(try SpaceURI(uri).skey, "legacy-type")
                 }
             }
             try await close(fixture)
@@ -330,6 +357,8 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
     /// that shape beside the retired string/`config` dialect (shipped-surface
     /// leniency), refuses a body that mixes them, and answers the lexicon's
     /// `UnsupportedPolicy` / `UnsupportedAppAccess` for an unknown variant.
+    /// A well-formed `#managingAppPolicy` is `UnsupportedPolicy` too
+    /// (SWAN-24 option B); a malformed one stays `InvalidRequest`.
     /// The description read reflects the union round trip.
     func testLifecycleAdmitsTheLiveUnionDialectAndRefusesMixedOrUnknownVariants() async throws {
         let fixture = try await makeFixture()
@@ -338,7 +367,19 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
             let app = try makeServer(fixture).buildApplication(logger: Logger(label: "SimpleSpaceLifecycleHTTPTests.union"))
             try await app.test(.router) { client in
                 // Live shape: required type + policy + appAccess unions.
-                let create = #"{"type":"\#(Self.type)","skey":"union","policy":{"$type":"com.atproto.simplespace.defs#managingAppPolicy","managingApp":"did:web:manager.example#forum"},"appAccess":{"$type":"com.atproto.simplespace.defs#allowList","allowed":["https://client.example"]}}"#
+                // SWAN-24 option B: a well-formed managing-app policy is the
+                // lexicon's UnsupportedPolicy, for read and for write.
+                let managingRead = #"{"spaceType":"\#(Self.type)","skey":"union-managing","readPolicy":{"$type":"com.atproto.simplespace.defs#managingAppPolicy","managingApp":"did:web:manager.example#forum"},"writePolicy":{"$type":"com.atproto.simplespace.defs#publicPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "union-create-managing-read"), body: ByteBuffer(string: managingRead)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "UnsupportedPolicy")
+                }
+                let managingWrite = #"{"spaceType":"\#(Self.type)","skey":"union-managing","readPolicy":{"$type":"com.atproto.simplespace.defs#publicPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#managingAppPolicy","managingApp":"did:web:manager.example#forum"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "union-create-managing-write"), body: ByteBuffer(string: managingWrite)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "UnsupportedPolicy")
+                }
+                let create = #"{"spaceType":"\#(Self.type)","skey":"union","readPolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#publicPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#allowList","allowed":["https://client.example"]}}"#
                 var uri = ""
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "union-create"), body: ByteBuffer(string: create)) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -348,44 +389,37 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(uri: getPath, method: .get, headers: try self.getHeaders(fixture, path: "/xrpc/com.atproto.simplespace.getSpace", jti: "union-get")) { response in
                     XCTAssertEqual(response.status, .ok)
                     let object = try self.jsonObject(response.body)
-                    XCTAssertEqual(Set(object.keys), ["uri", "policy", "appAccess"])
-                    let policy = try XCTUnwrap(object["policy"] as? [String: Any])
-                    XCTAssertEqual(policy["$type"] as? String, "com.atproto.simplespace.defs#managingAppPolicy")
-                    XCTAssertEqual(policy["managingApp"] as? String, "did:web:manager.example#forum")
+                    XCTAssertEqual(Set(object.keys), ["uri", "readPolicy", "writePolicy", "appAccess"])
+                    let readPolicy = try XCTUnwrap(object["readPolicy"] as? [String: Any])
+                    XCTAssertEqual(readPolicy["$type"] as? String, "com.atproto.simplespace.defs#memberListPolicy")
+                    let writePolicy = try XCTUnwrap(object["writePolicy"] as? [String: Any])
+                    XCTAssertEqual(writePolicy["$type"] as? String, "com.atproto.simplespace.defs#publicPolicy")
                     let appAccess = try XCTUnwrap(object["appAccess"] as? [String: Any])
                     XCTAssertEqual(appAccess["$type"] as? String, "com.atproto.simplespace.defs#allowList")
                     XCTAssertEqual(appAccess["allowed"] as? [String], ["https://client.example"])
                 }
-                // Live updateSpace: union policy replaces wholesale.
-                let update = #"{"space":"\#(uri)","policy":{"$type":"com.atproto.simplespace.defs#publicPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
+                let update = #"{"space":"\#(uri)","readPolicy":{"$type":"com.atproto.simplespace.defs#publicPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
                 try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(fixture, path: Self.updatePath, jti: "union-update"), body: ByteBuffer(string: update)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
                 try await client.execute(uri: getPath, method: .get, headers: try self.getHeaders(fixture, path: "/xrpc/com.atproto.simplespace.getSpace", jti: "union-get-2")) { response in
                     XCTAssertEqual(response.status, .ok)
                     let object = try self.jsonObject(response.body)
-                    XCTAssertEqual((object["policy"] as? [String: Any])?["$type"] as? String, "com.atproto.simplespace.defs#publicPolicy")
+                    XCTAssertEqual((object["readPolicy"] as? [String: Any])?["$type"] as? String, "com.atproto.simplespace.defs#publicPolicy")
+                    XCTAssertEqual((object["writePolicy"] as? [String: Any])?["$type"] as? String, "com.atproto.simplespace.defs#publicPolicy")
                     XCTAssertEqual((object["appAccess"] as? [String: Any])?["$type"] as? String, "com.atproto.simplespace.defs#open")
                 }
-                // Mixed dialects in one body: refused.
-                let mixed = #"{"type":"\#(Self.type)","skey":"mixed","config":{"policy":"public","appAccess":{"$type":"com.atproto.simplespace.defs#open"}},"policy":{"$type":"com.atproto.simplespace.defs#publicPolicy"}}"#
-                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "union-mixed"), body: ByteBuffer(string: mixed)) { response in
-                    XCTAssertEqual(response.status, .badRequest)
-                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
-                }
-                // Unknown union variants: the lexicon's named errors.
-                let badPolicy = #"{"type":"\#(Self.type)","skey":"bad-policy","policy":{"$type":"com.atproto.simplespace.defs#oraclePolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
+                let badPolicy = #"{"spaceType":"\#(Self.type)","skey":"bad-policy","readPolicy":{"$type":"com.atproto.simplespace.defs#oraclePolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "union-bad-policy"), body: ByteBuffer(string: badPolicy)) { response in
                     XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "UnsupportedPolicy")
                 }
-                let badAccess = #"{"type":"\#(Self.type)","skey":"bad-access","policy":{"$type":"com.atproto.simplespace.defs#publicPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#denyList","denied":[]}}"#
+                let badAccess = #"{"spaceType":"\#(Self.type)","skey":"bad-access","readPolicy":{"$type":"com.atproto.simplespace.defs#publicPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#publicPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#denyList","denied":[]}}"#
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "union-bad-access"), body: ByteBuffer(string: badAccess)) { response in
                     XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
                 }
-                // A #managingAppPolicy must carry its target.
-                let emptyManaging = #"{"type":"\#(Self.type)","skey":"empty-managing","policy":{"$type":"com.atproto.simplespace.defs#managingAppPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
+                let emptyManaging = #"{"spaceType":"\#(Self.type)","skey":"empty-managing","readPolicy":{"$type":"com.atproto.simplespace.defs#managingAppPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#publicPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "union-empty-managing"), body: ByteBuffer(string: emptyManaging)) { response in
                     XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
@@ -410,7 +444,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
         do {
             let app = try makeServer(fixture).buildApplication(logger: Logger(label: "SimpleSpaceLifecycleHTTPTests.phoenix"))
             try await app.test(.router) { client in
-                let create = #"{"type":"\#(Self.type)","skey":"phoenix"}"#
+                let create = #"{"spaceType":"\#(Self.type)","skey":"phoenix","readPolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
                 var uri = ""
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "phoenix-create"), body: ByteBuffer(string: create)) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -424,7 +458,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 }
                 // Distinguish the stored configuration from create defaults so
                 // the recreate below can prove it applies the SUPPLIED config.
-                let publicise = #"{"space":"\#(uri)","policy":"public"}"#
+                let publicise = #"{"space":"\#(uri)","readPolicy":{"$type":"com.atproto.simplespace.defs#publicPolicy"}}"#
                 try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(fixture, path: Self.updatePath, jti: "phoenix-publicise"), body: ByteBuffer(string: publicise)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
@@ -442,8 +476,10 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 let getPath = "/xrpc/com.atproto.simplespace.getSpace?space=\(self.percentEncode(uri))"
                 try await client.execute(uri: getPath, method: .get, headers: try self.getHeaders(fixture, path: "/xrpc/com.atproto.simplespace.getSpace", jti: "phoenix-get-2")) { response in
                     XCTAssertEqual(response.status, .ok)
-                    let policy = try XCTUnwrap((try self.jsonObject(response.body))["policy"] as? [String: Any])
-                    XCTAssertEqual(policy["$type"] as? String, "com.atproto.simplespace.defs#memberListPolicy", "a recreate applies the supplied configuration, not the pre-deletion one")
+                    let readPolicy = try XCTUnwrap((try self.jsonObject(response.body))["readPolicy"] as? [String: Any])
+                    XCTAssertEqual(readPolicy["$type"] as? String, "com.atproto.simplespace.defs#memberListPolicy", "a recreate applies the supplied configuration, not the pre-deletion one")
+                    let writePolicy = try XCTUnwrap((try self.jsonObject(response.body))["writePolicy"] as? [String: Any])
+                    XCTAssertEqual(writePolicy["$type"] as? String, "com.atproto.simplespace.defs#memberListPolicy")
                 }
             }
             try await close(fixture)
@@ -465,24 +501,25 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
             let updateToken = try await issueToken(fixture.runtime, subject: Self.alice, scopes: [updateScope])
             let deleteToken = try await issueToken(fixture.runtime, subject: Self.alice, scopes: [deleteScope])
             let app = try makeServer(fixture).buildApplication(logger: Logger(label: "SimpleSpaceLifecycleHTTPTests.scopes"))
-            let create = #"{"did":"\#(Self.alice)","type":"\#(Self.type)","skey":"scoped"}"#
+            let create = #"{"did":"\#(Self.alice)","spaceType":"\#(Self.type)","skey":"scoped","readPolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
             try await app.test(.router) { client in
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(createToken, fixture: fixture, path: Self.createPath, jti: "scoped-create"), body: ByteBuffer(string: create)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
-                let member = #"{"space":"\#(space.rawValue)","did":"\#(Self.bob)"}"#
-                try await client.execute(uri: Self.addPath, method: .post, headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.addPath, jti: "update-scope-add"), body: ByteBuffer(string: member)) { response in
+                let member = #"{"space":"\#(space.rawValue)","did":"\#(Self.bob)","read":true,"write":true}"#
+                try await client.execute(uri: Self.putPath, method: .post, headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.putPath, jti: "update-scope-add"), body: ByteBuffer(string: member)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
                 let memberList = "\(Self.listPath)?space=\(self.percentEncode(space.rawValue))"
                 try await client.execute(uri: memberList, method: .get, headers: try self.getHeaders(updateToken, fixture: fixture, path: Self.listPath, jti: "update-scope-list")) { response in
                     XCTAssertEqual(response.status, .ok)
-                    XCTAssertEqual(((try self.jsonObject(response.body))["members"] as? [[String: String]])?.map { $0["did"] }, [Self.alice, Self.bob])
+                    XCTAssertEqual(((try self.jsonObject(response.body))["members"] as? [[String: Any]])?.compactMap { $0["did"] as? String }, [Self.alice, Self.bob])
                 }
-                try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.removePath, jti: "update-scope-remove"), body: ByteBuffer(string: member)) { response in
+                let removeMember = #"{"space":"\#(space.rawValue)","did":"\#(Self.bob)"}"#
+                try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.removePath, jti: "update-scope-remove"), body: ByteBuffer(string: removeMember)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
-                let update = #"{"space":"\#(space.rawValue)","policy":"public"}"#
+                let update = #"{"space":"\#(space.rawValue)","readPolicy":{"$type":"com.atproto.simplespace.defs#publicPolicy"}}"#
                 try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(createToken, fixture: fixture, path: Self.updatePath, jti: "wrong-manage"), body: ByteBuffer(string: update)) { response in
                     XCTAssertEqual(response.status, .unauthorized)
                     XCTAssertEqual(try self.errorCode(response.body), "Unauthorized")
@@ -490,11 +527,11 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.updatePath, jti: "right-manage"), body: ByteBuffer(string: update)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
-                let replayHeaders = try self.postHeaders(updateToken, fixture: fixture, path: Self.addPath, jti: "add-replay")
-                try await client.execute(uri: Self.addPath, method: .post, headers: replayHeaders, body: ByteBuffer(string: member)) { response in
+                let replayHeaders = try self.postHeaders(updateToken, fixture: fixture, path: Self.putPath, jti: "add-replay")
+                try await client.execute(uri: Self.putPath, method: .post, headers: replayHeaders, body: ByteBuffer(string: member)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
-                try await client.execute(uri: Self.addPath, method: .post, headers: replayHeaders, body: ByteBuffer(string: member)) { response in
+                try await client.execute(uri: Self.putPath, method: .post, headers: replayHeaders, body: ByteBuffer(string: member)) { response in
                     XCTAssertEqual(response.status, .unauthorized)
                     XCTAssertEqual(try self.errorCode(response.body), "Unauthorized")
                 }
@@ -508,7 +545,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .notFound)
                     XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
                 }
-                let duplicate = #"{"did":"\#(Self.alice)","did":"\#(Self.bob)","type":"\#(Self.type)"}"#
+                let duplicate = #"{"did":"\#(Self.alice)","did":"\#(Self.bob)","spaceType":"\#(Self.type)"}"#
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "duplicate-body"), body: ByteBuffer(string: duplicate)) { response in
                     XCTAssertEqual(response.status, .badRequest)
                 }
@@ -561,7 +598,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         do {
             let app = try makeServer(fixture).buildApplication(logger: Logger(label: "SimpleSpaceLifecycleHTTPTests.closed"))
-            let create = #"{"did":"\#(Self.alice)","type":"\#(Self.type)","skey":"closed"}"#
+            let create = #"{"did":"\#(Self.alice)","spaceType":"\#(Self.type)","skey":"closed","readPolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
             _ = try await fixture.control.transitionStatus(
                 did: Self.alice,
                 to: .deactivated,
@@ -600,6 +637,51 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
             throw error
         }
     }
+    func testPutMemberReplacesBothAccessValues() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let app = try makeServer(fixture).buildApplication(logger: Logger(label: "SimpleSpaceLifecycleHTTPTests.putReplaces"))
+            let create = #"{"did":"\#(Self.alice)","spaceType":"\#(Self.type)","readPolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"writePolicy":{"$type":"com.atproto.simplespace.defs#memberListPolicy"},"appAccess":{"$type":"com.atproto.simplespace.defs#open"}}"#
+            try await app.test(.router) { client in
+                var uri = ""
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "put-replaces-create"), body: ByteBuffer(string: create)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    uri = try XCTUnwrap((try self.jsonObject(response.body))["uri"] as? String)
+                }
+                // Put bob with read: true, write: false
+                let put1 = #"{"space":"\#(uri)","did":"\#(Self.bob)","read":true,"write":false}"#
+                try await client.execute(uri: Self.putPath, method: .post, headers: try self.postHeaders(fixture, path: Self.putPath, jti: "put-1"), body: ByteBuffer(string: put1)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                let listUri = "\(Self.listPath)?space=\(self.percentEncode(uri))"
+                try await client.execute(uri: listUri, method: .get, headers: try self.getHeaders(fixture, path: Self.listPath, jti: "list-1")) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let members = (try self.jsonObject(response.body))["members"] as? [[String: Any]]
+                    let bobMember = members?.first(where: { ($0["did"] as? String) == Self.bob })
+                    XCTAssertEqual(bobMember?["read"] as? Bool, true)
+                    XCTAssertEqual(bobMember?["write"] as? Bool, false)
+                }
+                // Re-put bob with read: false, write: true (replaces both flags)
+                let put2 = #"{"space":"\#(uri)","did":"\#(Self.bob)","read":false,"write":true}"#
+                try await client.execute(uri: Self.putPath, method: .post, headers: try self.postHeaders(fixture, path: Self.putPath, jti: "put-2"), body: ByteBuffer(string: put2)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                try await client.execute(uri: listUri, method: .get, headers: try self.getHeaders(fixture, path: Self.listPath, jti: "list-2")) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let members = (try self.jsonObject(response.body))["members"] as? [[String: Any]]
+                    let bobMember = members?.first(where: { ($0["did"] as? String) == Self.bob })
+                    XCTAssertEqual(bobMember?["read"] as? Bool, false)
+                    XCTAssertEqual(bobMember?["write"] as? Bool, true)
+                }
+            }
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
 
     private func makeFixture() async throws -> SimpleSpaceFixture {
         let root = FileManager.default.temporaryDirectory.appending(path: "SimpleSpaceLifecycleHTTPTests-\(UUID().uuidString)")
@@ -634,7 +716,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
         authenticatedDirectory: (any AuthorizedSimpleSpaceDirectory)? = nil
     ) throws -> SwanHTTPServer {
         SwanHTTPServer(
-            profile: try ProtocolProfile.load(from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-08-15.json")),
+            profile: try ProtocolProfile.load(from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-01.json")),
             configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: Self.publicURL),
             oauthRuntime: fixture.runtime,
             authenticatedGetSpaceDirectory: authenticatedDirectory ?? fixture.directory,
@@ -745,9 +827,9 @@ private actor CountingSimpleSpaceDirectory:
         domainCallCount += 1
         try await base.deleteSimpleSpace(space, authorization: authorization)
     }
-    func addSimpleSpaceMember(_ member: String, to space: SpaceURI, authorization: AuthorizationContext) async throws {
+    func putSimpleSpaceMember(_ member: String, read: Bool, write: Bool, in space: SpaceURI, authorization: AuthorizationContext) async throws {
         domainCallCount += 1
-        try await base.addSimpleSpaceMember(member, to: space, authorization: authorization)
+        try await base.putSimpleSpaceMember(member, read: read, write: write, in: space, authorization: authorization)
     }
     func removeSimpleSpaceMember(_ member: String, from space: SpaceURI, authorization: AuthorizationContext) async throws {
         domainCallCount += 1

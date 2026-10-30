@@ -153,6 +153,9 @@ final class SwanCORSTests: XCTestCase {
                 let exposed = try XCTUnwrap(response.headers[Self.exposeHeaders])
                 XCTAssertTrue(exposed.contains("DPoP-Nonce"), exposed)
                 XCTAssertTrue(exposed.contains("WWW-Authenticate"), exposed)
+                // Scoped to the MAC-bearing Spaces responses, which declare
+                // it themselves (SpaceCredentialHTTPTests pins that side).
+                XCTAssertFalse(exposed.contains("Atproto-Space-Mac"), exposed)
             }
         }
     }
@@ -272,7 +275,7 @@ final class SwanCORSTests: XCTestCase {
             )
             let profile = try ProtocolProfile.load(
                 from: Self.packageRoot()
-                    .appending(path: "Profiles/permissioned-data-0016-2026-08-15.json")
+                    .appending(path: "Profiles/permissioned-data-0016-2026-10-01.json")
             )
             let server = SwanHTTPServer(
                 profile: profile,

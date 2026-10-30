@@ -39,13 +39,16 @@ private enum AuthenticatedSpaceRepositorySyncFailure: Error {
     case spaceNotFound
     case repoNotFound
     case denied
+    case credentialPresentation(SpaceCredentialPresentationFailure)
     case nonceChallenge
     case fullRecoveryRequired
+    case malformedCursor
     case unavailable
 }
 
 /// The generated contract's `Output` currently contains a whole `Data`
-/// payload even though its lexicon output is `application/vnd.ipld.car`. The
+/// payload even though its lexicon output is a streamed STAR archive
+/// (`application/octet-stream`). The
 /// semantic handler therefore conforms to the generated contract for its
 /// typed parameter/context boundary, while the Hummingbird adapter invokes
 /// `prepare` and streams the resulting suffix. Calling `handle` would force
@@ -58,81 +61,33 @@ private struct AuthenticatedGetRepoHandler:
 
     struct PreparedResponse: Sendable {
         let prefix: Data
-        let spool: SpaceCARBodySpool
+        let spool: SpaceSTARBodySpool
+        let mac: Data?
     }
 
-    func prepare(
-        parameters: ComAtprotoSpaceGetRepo.Parameters,
-        context request: Request
-    ) async throws -> PreparedResponse {
+    func prepare(parameters: ComAtprotoSpaceGetRepo.Parameters, context request: Request) async throws -> PreparedResponse {
         let target = try syncTarget(parameters.space, parameters.repo)
         let authorization = try await authorizeRepositorySyncRead(
-            capability,
-            request: request,
-            expectedSpace: target.space,
-            fixedPath: "/xrpc/com.atproto.space.getRepo"
+            capability, request: request, expectedSpace: target.space,
+            expectedAudience: target.author, fixedPath: "/xrpc/com.atproto.space.getRepo"
         )
         try requireRepositoryReadAuthorization(authorization, author: target.author)
-        let snapshot: AuthorizedSpaceRepositoryCARSnapshot?
+        let secret = try await spaceResponseMACSecret(
+            request: request, author: target.author, type: .repository, provider: capability.commitSigner
+        )
+        guard let snapshot = try await capability.directory.repositorySTARSnapshot(
+            space: target.space, author: target.author, authorization: authorization
+        ) else { throw AuthenticatedSpaceRepositorySyncFailure.repoNotFound }
         do {
-            snapshot = try await capability.directory.repositoryCARSnapshot(
-                space: target.space,
-                author: target.author,
-                authorization: authorization
-            )
-        } catch let error as SwanError {
-            if case .unauthorized = error {
-                throw AuthenticatedSpaceRepositorySyncFailure.denied
-            }
-            if case .malformed = error {
-                throw AuthenticatedSpaceRepositorySyncFailure.invalidRequest
-            }
-            throw AuthenticatedSpaceRepositorySyncFailure.unavailable
-        } catch {
-            throw AuthenticatedSpaceRepositorySyncFailure.unavailable
-        }
-        guard let snapshot else {
-            throw AuthenticatedSpaceRepositorySyncFailure.repoNotFound
-        }
-
-        do {
-            guard snapshot.state.space == target.space,
-                  snapshot.state.author == target.author,
-                  snapshot.state.commitment.count == 32,
-                  let revision = snapshot.state.wireRevision
-            else {
+            guard snapshot.state.space == target.space, snapshot.state.author == target.author,
+                  let revision = snapshot.state.wireRevision else {
                 throw AuthenticatedSpaceRepositorySyncFailure.unavailable
             }
-            _ = try TID(tidString: revision)
-            let envelope = try await capability.commitSigner.signRepositoryCommit(
-                space: target.space,
-                author: target.author,
-                wireRevision: revision,
-                commitment: snapshot.state.commitment
-            )
-            guard envelope.ver == 1,
-                  envelope.context.space == target.space,
-                  envelope.context.author == target.author,
-                  envelope.context.rev == revision,
-                  envelope.commitment == snapshot.state.commitment,
-                  SpaceCommitCodec.verifyContentBinding(envelope)
-            else {
-                throw AuthenticatedSpaceRepositorySyncFailure.unavailable
-            }
-            return PreparedResponse(
-                prefix: try SpaceCARCodec.recoveryPrefix(
-                    commit: envelope,
-                    indexCID: snapshot.spool.indexCID
-                ),
-                spool: snapshot.spool
-            )
-        } catch {
-            snapshot.spool.cleanup()
-            if let failure = error as? AuthenticatedSpaceRepositorySyncFailure {
-                throw failure
-            }
-            throw AuthenticatedSpaceRepositorySyncFailure.unavailable
-        }
+            let commit = try SpaceRepositoryCommit(repo: target.author, space: target.space,
+                                                   rev: revision, data: snapshot.state.commitment)
+            return PreparedResponse(prefix: try SpaceSTARCodec.prefix(commit: commit),
+                                    spool: snapshot.spool, mac: try secret.map { try commit.mac(sharedSecret: $0) })
+        } catch { snapshot.spool.cleanup(); throw error }
     }
 
     func handle(
@@ -151,6 +106,7 @@ private struct AuthenticatedGetLatestCommitHandler:
 {
     typealias Context = Request
     let capability: SwanAuthenticatedSpaceRepositorySyncCapability
+    let fixedPath: String
 
     func handle(
         parameters: ComAtprotoSpaceGetLatestCommit.Parameters,
@@ -162,7 +118,8 @@ private struct AuthenticatedGetLatestCommitHandler:
             capability,
             request: request,
             expectedSpace: target.space,
-            fixedPath: "/xrpc/com.atproto.space.getLatestCommit"
+            expectedAudience: target.author,
+            fixedPath: fixedPath
         )
         try requireRepositoryReadAuthorization(authorization, author: target.author)
         let state = try await repositoryCommitState(
@@ -201,6 +158,7 @@ private struct AuthenticatedListRepoOpsHandler:
             capability,
             request: request,
             expectedSpace: target.space,
+            expectedAudience: target.author,
             fixedPath: "/xrpc/com.atproto.space.listRepoOps"
         )
         try requireRepositoryReadAuthorization(authorization, author: target.author)
@@ -209,12 +167,22 @@ private struct AuthenticatedListRepoOpsHandler:
         guard (1 ... 1_000).contains(limit) else {
             throw AuthenticatedSpaceRepositorySyncFailure.invalidRequest
         }
+        // The reference cursor (`${rev}/${idx}`) takes precedence over
+        // `since`. Swan never splits one revision's atomic batch across pages
+        // (see below), so every cursor Swan issues ends a revision and
+        // resuming strictly after that revision is exact.
+        let resumeAfter: String?
+        if let cursor = parameters.cursor {
+            resumeAfter = try parseRepositoryOplogCursor(cursor).revision
+        } else {
+            resumeAfter = parameters.since?.toString()
+        }
         let read: AuthorizedSpaceRepositoryOplogRead
         do {
             read = try await capability.directory.repositoryOplog(
                 space: target.space,
                 author: target.author,
-                since: parameters.since?.toString(),
+                since: resumeAfter,
                 limit: limit,
                 includeValues: parameters.excludeValues != true,
                 maximumAggregateValueBytes: PublicRepositoryJSONReadLimits
@@ -238,7 +206,7 @@ private struct AuthenticatedListRepoOpsHandler:
             throw AuthenticatedSpaceRepositorySyncFailure.fullRecoveryRequired
         case let .incremental(state, entries):
             let operations = try entries.map(syncWireOperation)
-            let commit: ComAtprotoSpaceDefs.SignedCommit?
+            let commit: ComAtprotoSpaceDefs.Commit?
             // This is deliberately the reference condition, not `ops.isEmpty`:
             // an exactly-full final page does not bind a head commit until the
             // caller asks again and receives the short/empty page. Storage can
@@ -256,9 +224,44 @@ private struct AuthenticatedListRepoOpsHandler:
             } else {
                 commit = nil
             }
-            return .init(ops: operations, commit: commit, cursor: nil)
+            // Like the reference, a cursor accompanies exactly the pages that
+            // carry no commit (more may follow).
+            var cursor: String?
+            if commit == nil, let last = operations.last {
+                let lastRevision = last.rev.toString()
+                let index = operations.reduce(-1) {
+                    $1.rev.toString() == lastRevision ? $0 + 1 : $0
+                }
+                cursor = formatRepositoryOplogCursor(
+                    revision: lastRevision,
+                    index: index
+                )
+            }
+            return .init(ops: operations, commit: commit, cursor: cursor)
         }
     }
+}
+
+/// Parses the reference `listRepoOps` cursor, `${rev}/${idx}`. Anything else
+/// is the lexicon's `MalformedCursor`.
+private func parseRepositoryOplogCursor(
+    _ cursor: String
+) throws -> (revision: String, index: Int) {
+    let parts = cursor.split(separator: "/", omittingEmptySubsequences: false)
+    guard cursor.utf8.count <= 64,
+          parts.count == 2,
+          let revision = try? TID(tidString: String(parts[0])),
+          !parts[1].isEmpty,
+          parts[1].utf8.count <= 9,
+          parts[1].utf8.allSatisfy({ $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }),
+          let index = Int(parts[1]) else {
+        throw AuthenticatedSpaceRepositorySyncFailure.malformedCursor
+    }
+    return (revision.toString(), index)
+}
+
+private func formatRepositoryOplogCursor(revision: String, index: Int) -> String {
+    "\(revision)/\(index)"
 }
 
 private func syncTarget(
@@ -298,15 +301,20 @@ private func requireRepositoryReadAuthorization(
     }
 }
 
+/// A credential reading a repo signs the repo owner's DID as its audience
+/// (`expectedAudience`); OAuth keeps its DPoP sender constraint.
 private func authorizeRepositorySyncRead(
     _ capability: SwanAuthenticatedSpaceRepositorySyncCapability,
     request: Request,
     expectedSpace: SpaceURI,
+    expectedAudience: String,
     fixedPath: String
 ) async throws -> AuthorizationContext {
     let bearerToken: String?
     do {
         bearerToken = try spaceCredentialSchemeToken(from: request.headers)
+    } catch let failure as SpaceCredentialPresentationFailure {
+        throw AuthenticatedSpaceRepositorySyncFailure.credentialPresentation(failure)
     } catch {
         throw AuthenticatedSpaceRepositorySyncFailure.denied
     }
@@ -315,11 +323,16 @@ private func authorizeRepositorySyncRead(
             throw AuthenticatedSpaceRepositorySyncFailure.denied
         }
         do {
-            return try await credentialAuthorizer.authorization(
-                for: bearerToken,
+            return try await capability.authorizer.authorizeSpaceCredential(
+                bearerToken,
+                verifier: credentialAuthorizer,
+                request: request,
                 expectedSpace: expectedSpace,
+                expectedAudience: expectedAudience,
                 now: Date()
             )
+        } catch let failure as SpaceCredentialPresentationFailure {
+            throw AuthenticatedSpaceRepositorySyncFailure.credentialPresentation(failure)
         } catch let error as SwanError {
             if case .unavailable = error {
                 throw AuthenticatedSpaceRepositorySyncFailure.unavailable
@@ -330,7 +343,7 @@ private func authorizeRepositorySyncRead(
         }
     }
     do {
-        return try await capability.authorizer.authorize(
+        return try await capability.authorizer.authorizeSpaceRoute(
             request: request,
             method: "GET",
             fixedPath: fixedPath
@@ -383,34 +396,16 @@ private func signedCommit(
     expectedSpace: SpaceURI,
     expectedAuthor: String,
     capability: SwanAuthenticatedSpaceRepositorySyncCapability
-) async throws -> ComAtprotoSpaceDefs.SignedCommit? {
+) async throws -> ComAtprotoSpaceDefs.Commit? {
     guard let revision = state.wireRevision else { return nil }
-    let envelope: SpaceCommitEnvelope
-    do {
-        envelope = try await capability.commitSigner.signRepositoryCommit(
-            space: expectedSpace,
-            author: expectedAuthor,
-            wireRevision: revision,
-            commitment: state.commitment
-        )
-    } catch {
-        throw AuthenticatedSpaceRepositorySyncFailure.unavailable
-    }
-    guard envelope.ver == 1,
-          envelope.context.space == expectedSpace,
-          envelope.context.author == expectedAuthor,
-          envelope.context.rev == revision,
-          envelope.commitment == state.commitment,
-          SpaceCommitCodec.verifyContentBinding(envelope) else {
+    guard state.space == expectedSpace, state.author == expectedAuthor,
+          state.commitment.count == 32 else {
         throw AuthenticatedSpaceRepositorySyncFailure.unavailable
     }
     return .init(
-        ver: envelope.ver,
-        hash: Bytes(data: envelope.commitment),
-        ikm: Bytes(data: envelope.context.ikm),
-        sig: Bytes(data: envelope.contextSignature),
-        mac: Bytes(data: envelope.contentBinding),
-        rev: try TID(tidString: envelope.context.rev)
+        ver: 1, repo: try DID(didString: expectedAuthor),
+        space: try SpaceRef(uriString: expectedSpace.rawValue),
+        rev: try TID(tidString: revision), data: Bytes(data: state.commitment)
     )
 }
 
@@ -472,12 +467,15 @@ func registerAuthenticatedGetLatestCommitEndpoint(
     on router: Router<BasicRequestContext>,
     capability: SwanAuthenticatedSpaceRepositorySyncCapability
 ) {
-    let handler = AuthenticatedGetLatestCommitHandler(capability: capability)
-    let paths: [RouterPath] = [
+    let paths = [
         "/xrpc/com.atproto.space.getLatestCommit",
-        RouterPath("/xrpc/\(spaceGetRepoStateAliasNSID)"),
+        "/xrpc/\(spaceGetRepoStateAliasNSID)",
     ]
-    for path in paths {
+    for fixedPath in paths {
+        let path = RouterPath(fixedPath)
+        let handler = AuthenticatedGetLatestCommitHandler(
+            capability: capability, fixedPath: fixedPath
+        )
         router.get(path) { request, _ async -> Response in
             let parameters: ComAtprotoSpaceGetLatestCommit.Parameters
             do {
@@ -487,7 +485,14 @@ func registerAuthenticatedGetLatestCommitEndpoint(
             }
             do {
                 let output = try await handler.handle(parameters: parameters, input: (), context: request)
-                return authenticatedGetLatestCommitJSON(.ok, output)
+                let secret = try await spaceResponseMACSecret(
+                    request: request, author: parameters.repo.didString(), type: .repository,
+                    provider: capability.commitSigner
+                )
+                let mac = try secret.map { try responseCommit(output.commit).mac(sharedSecret: $0) }
+                return try withSpaceResponseMAC(authenticatedGetLatestCommitJSON(.ok, output), mac: mac, type: .repository)
+            } catch is SpaceMACHeaders.HeaderError {
+                return authenticatedRepositorySyncError(.badRequest, code: "BadSpaceMac")
             } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
                 return authenticatedRepositorySyncResponse(for: failure, capability: capability)
             } catch {
@@ -508,6 +513,8 @@ func registerAuthenticatedListRepoOpsEndpoint(
         let parameters: ComAtprotoSpaceListRepoOps.Parameters
         do {
             parameters = try parseAuthenticatedListRepoOpsParameters(request)
+        } catch AuthenticatedSpaceRepositorySyncFailure.malformedCursor {
+            return authenticatedRepositorySyncError(.badRequest, code: "MalformedCursor")
         } catch {
             return authenticatedRepositorySyncError(.badRequest, code: "InvalidRequest")
         }
@@ -519,7 +526,17 @@ func registerAuthenticatedListRepoOpsEndpoint(
         }
         do {
             let output = try await handler.handle(parameters: parameters, input: (), context: request)
-            return authenticatedListRepoOpsJSON(.ok, output, lease: lease)
+            let secret = try await spaceResponseMACSecret(
+                request: request, author: parameters.repo.didString(), type: .repository,
+                provider: capability.commitSigner
+            )
+            let mac: Data?
+            if let secret, let commit = output.commit { mac = try responseCommit(commit).mac(sharedSecret: secret) }
+            else { mac = nil }
+            return try withSpaceResponseMAC(authenticatedListRepoOpsJSON(.ok, output, lease: lease), mac: mac, type: .repository)
+        } catch is SpaceMACHeaders.HeaderError {
+            lease.release()
+            return authenticatedRepositorySyncError(.badRequest, code: "BadSpaceMac")
         } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
             lease.release()
             return authenticatedRepositorySyncResponse(for: failure, capability: capability)
@@ -548,10 +565,10 @@ func registerAuthenticatedGetRepoEndpoint(
             let prepared = try await handler.prepare(parameters: parameters, context: request)
             // No content length is supplied: writing directly from the private
             // spool is the deliberate bounded-memory transport contract.
-            return Response(
+            return try withSpaceResponseMAC(Response(
                 status: .ok,
                 headers: [
-                    .contentType: "application/vnd.ipld.car",
+                    .contentType: SpaceSTARCodec.mediaType,
                     .cacheControl: "no-store",
                 ],
                 body: .init { writer in
@@ -562,7 +579,9 @@ func registerAuthenticatedGetRepoEndpoint(
                     }
                     try await writer.finish(nil)
                 }
-            )
+            ), mac: prepared.mac, type: .repository)
+        } catch is SpaceMACHeaders.HeaderError {
+            return authenticatedRepositorySyncError(.badRequest, code: "BadSpaceMac")
         } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
             return authenticatedRepositorySyncResponse(for: failure, capability: capability)
         } catch {
@@ -577,11 +596,9 @@ private let spaceGetLatestCommitQuerySchema = StrictQuerySchema(
 )
 private let spaceListRepoOpsQuerySchema = StrictQuerySchema(
     required: ["space", "repo"],
-    optional: ["since", "limit", "excludeValues"]
+    optional: ["since", "limit", "cursor", "excludeValues"]
 )
-private let spaceGetRepoQuerySchema = StrictQuerySchema(
-    required: ["space", "repo"]
-)
+private let spaceGetRepoQuerySchema = StrictQuerySchema(required: ["space", "repo"])
 
 private func parseAuthenticatedGetLatestCommitParameters(
     _ request: Request
@@ -619,12 +636,17 @@ private func parseAuthenticatedListRepoOpsParameters(
         return try TID(tidString: value)
     }
     let limit = try query["limit"].map(strictRepositoryOplogLimit)
+    let cursor = try query["cursor"].map { value -> String in
+        _ = try parseRepositoryOplogCursor(value)
+        return value
+    }
     let excludeValues = try query["excludeValues"].map(strictBoolean)
     return .init(
         space: space,
         repo: repo,
         since: since,
         limit: limit,
+        cursor: cursor,
         excludeValues: excludeValues
     )
 }
@@ -685,6 +707,8 @@ private func authenticatedRepositorySyncResponse(
         authenticatedRepositorySyncError(.notFound, code: "RepoNotFound")
     case .denied:
         authenticatedRepositorySyncError(.unauthorized, code: "Unauthorized")
+    case let .credentialPresentation(failure):
+        authenticatedRepositorySyncError(failure.httpStatus, code: failure.xrpcErrorCode)
     case .nonceChallenge:
         authenticatedGetSpaceNonceChallenge(authorizer: capability.authorizer)
     case .fullRecoveryRequired:
@@ -694,6 +718,8 @@ private func authenticatedRepositorySyncResponse(
             .conflict,
             code: "full_repo_recovery_required"
         )
+    case .malformedCursor:
+        authenticatedRepositorySyncError(.badRequest, code: "MalformedCursor")
     case .unavailable:
         authenticatedRepositorySyncError(.serviceUnavailable, code: "temporarily_unavailable")
     }
@@ -711,10 +737,9 @@ private func authenticatedRepositorySyncError(
 /// wire projection after the generated handler has performed typed work.
 private struct SignedCommitWireOutput: Encodable {
     let ver: Int
-    let hash: Bytes
-    let ikm: Bytes
-    let sig: Bytes
-    let mac: Bytes
+    let repo: String
+    let space: String
+    let data: Bytes
     let rev: String
 }
 
@@ -725,6 +750,7 @@ private struct GetLatestCommitWireOutput: Encodable {
 private struct RepoOplogWireOutput: Encodable {
     let ops: [RepoOplogWireEntry]
     let commit: SignedCommitWireOutput?
+    let cursor: String?
 }
 
 private struct RepoOplogWireEntry: Encodable {
@@ -755,15 +781,14 @@ private struct RepoOplogWireEntry: Encodable {
 }
 
 private func signedCommitWire(
-    _ commit: ComAtprotoSpaceDefs.SignedCommit?
+    _ commit: ComAtprotoSpaceDefs.Commit?
 ) -> SignedCommitWireOutput? {
     commit.map {
         SignedCommitWireOutput(
             ver: $0.ver,
-            hash: $0.hash,
-            ikm: $0.ikm,
-            sig: $0.sig,
-            mac: $0.mac,
+            repo: $0.repo.didString(),
+            space: $0.space.uriString(),
+            data: $0.data,
             rev: $0.rev.toString()
         )
     }
@@ -797,9 +822,15 @@ private func authenticatedListRepoOpsJSON(
                     value: $0.value
                 )
             },
-            commit: signedCommitWire(output.commit)
+            commit: signedCommitWire(output.commit),
+            cursor: output.cursor
         ),
         maximumBytes: PublicRepositoryJSONReadLimits.maximumListRecordsResponseBytes,
         lease: lease
     )
+}
+
+private func responseCommit(_ commit: ComAtprotoSpaceDefs.Commit) throws -> SpaceRepositoryCommit {
+    try SpaceRepositoryCommit(ver: commit.ver, repo: commit.repo.didString(),
+                              space: SpaceURI(commit.space.uriString()), rev: commit.rev.toString(), data: commit.data.data)
 }

@@ -137,7 +137,74 @@ final class PermissionedRepositoryCARStreamingTests: XCTestCase {
         XCTAssertEqual(admission.snapshot.reservedBytes, 0)
     }
 
-    func testSQLiteProducerEmitsOneBlockForSharedCIDAndStreamingConsumerCountsPaths()
+    func testSQLiteProducerUsesCanonicalPathOrderForDistinctAndSharedCIDs() async throws {
+        let fixture = try PermissionedCARFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        let shared = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "text", value: "shared"),
+        ]))
+        let distinct = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "text", value: "distinct"),
+        ]))
+        let records = try [
+            fixture.record(rkey: "aa", value: shared),
+            fixture.record(rkey: "b", value: distinct),
+            fixture.record(rkey: "z", value: shared),
+        ]
+        _ = try await database.apply(
+            space: fixture.space, author: fixture.author,
+            expectedRevision: 0, requestID: UUID(),
+            wireRevision: try TID(tidString: "222222222222a"),
+            writes: records.map {
+                .put(uri: $0.uri, value: $0.value, cid: CID.fromDAGCBOR($0.value).string)
+            }
+        )
+        let snapshot = try await database.prepareRepositoryCARSnapshot(
+            space: fixture.space, author: fixture.author
+        )
+        let prepared = try XCTUnwrap(snapshot)
+        defer { prepared.spool.cleanup() }
+        let key = P256.Signing.PrivateKey()
+        var car = try fixture.recoveryPrefix(prepared: prepared, signingKey: key)
+        try await prepared.spool.streamBody { car.append($0) }
+        XCTAssertEqual(try testPermissionedCARFrameCount(car), 5)
+        var expectedSuffix = try SpaceCARCodec.streamingBlockPrefix(
+            cid: CID.fromDAGCBOR(distinct), dataLength: distinct.count
+        )
+        expectedSuffix.append(distinct)
+        expectedSuffix.append(try SpaceCARCodec.streamingBlockPrefix(
+            cid: CID.fromDAGCBOR(shared), dataLength: shared.count
+        ))
+        expectedSuffix.append(shared)
+        expectedSuffix.append(try SpaceCARCodec.streamingBlockPrefix(
+            cid: CID.fromDAGCBOR(shared), dataLength: shared.count
+        ))
+        expectedSuffix.append(shared)
+        XCTAssertEqual(Data(car.suffix(expectedSuffix.count)), expectedSuffix)
+
+        let index = try await SQLiteSpaceCARRecoveryIndex.create(temporaryParentURL: fixture.root)
+        do {
+            let summary = try await SpaceCARCodec.verifyStreamingRecovery(
+                from: PermissionedCARDataSource(car),
+                space: fixture.space, author: fixture.author,
+                contextSignatureVerifier: {
+                    try SpaceCommitCodec.verifyContextSignature($0, publicKey: key.publicKey)
+                },
+                index: index, recordSink: index,
+                limits: try SpaceCARRecoveryLimits(maximumCARBytes: car.count)
+            )
+            XCTAssertEqual(summary.recordCount, 3)
+            XCTAssertEqual(summary.logicalRestoredByteCount, shared.count * 2 + distinct.count)
+            await index.cleanup()
+        } catch {
+            await index.cleanup()
+            throw error
+        }
+    }
+
+    func testSQLiteProducerRepeatsSharedCIDFramesAndStreamingConsumerDeduplicatesStorage()
         async throws
     {
         let fixture = try PermissionedCARFixture()
@@ -186,7 +253,7 @@ final class PermissionedRepositoryCARStreamingTests: XCTestCase {
         )
         var car = prefix
         try await prepared.spool.streamBody { car.append($0) }
-        XCTAssertEqual(try testPermissionedCARFrameCount(car), 3)
+        XCTAssertEqual(try testPermissionedCARFrameCount(car), 4)
         XCTAssertEqual(prepared.spool.bodyByteCount, car.count - prefix.count)
         XCTAssertTrue(prepared.spool.isCleanedUp)
         do {
@@ -466,16 +533,13 @@ final class PermissionedRepositoryCARStreamingTests: XCTestCase {
                 scratchBytes,
                 logicalEntryBytes * 6 + 1 * 1_024 * 1_024
             )
-            let first = try await index.nextUnconsumedLexicographicEntry()
+            let first = try await index.nextUnconsumedCanonicalEntry()
             XCTAssertEqual(first?.path, "app.bsky.feed.post/max-000000")
-            let consumedCount = try await index.consumeEntries(forCID: cid)
-            XCTAssertEqual(
-                consumedCount,
-                SpaceCARRecoveryLimits.absoluteMaximumIndexEntries
-            )
-            let remaining = try await index
-                .nextUnconsumedLexicographicEntry()
-            XCTAssertNil(remaining)
+            try await index.consumeEntry(try XCTUnwrap(first))
+            let consumed = try await index.hasConsumedCID(cid)
+            XCTAssertTrue(consumed)
+            let remaining = try await index.nextUnconsumedCanonicalEntry()
+            XCTAssertEqual(remaining?.path, "app.bsky.feed.post/max-000001")
             await sampler.sample(currentPermissionedCARResidentBytes())
             samplingTask.cancel()
             _ = await samplingTask.result

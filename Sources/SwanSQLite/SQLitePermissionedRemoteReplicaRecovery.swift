@@ -2,6 +2,7 @@ import Crypto
 import Foundation
 import Petrel
 import SQLiteNIO
+import SwanCore
 import SwanSpaces
 import SwanStorage
 
@@ -53,7 +54,7 @@ public struct SQLitePermissionedRemoteReplicaRecoveryStaging:
         )
     }
 
-    public func nextUnconsumedLexicographicEntry() async throws
+    public func nextUnconsumedCanonicalEntry() async throws
         -> SpaceCARRecoveryIndexEntry?
     {
         try await database
@@ -63,11 +64,15 @@ public struct SQLitePermissionedRemoteReplicaRecoveryStaging:
             )
     }
 
-    public func consumeEntries(forCID cid: CID) async throws -> Int {
-        try await database.consumePermissionedRemoteReplicaIndexEntries(
-            sessionID: sessionID,
-            cid: cid,
-            now: now()
+    public func hasConsumedCID(_ cid: CID) async throws -> Bool {
+        try await database.hasConsumedPermissionedRemoteReplicaCID(
+            sessionID: sessionID, cid: cid, now: now()
+        )
+    }
+
+    public func consumeEntry(_ entry: SpaceCARRecoveryIndexEntry) async throws {
+        try await database.consumePermissionedRemoteReplicaIndexEntry(
+            sessionID: sessionID, entry: entry, now: now()
         )
     }
 
@@ -119,7 +124,9 @@ extension SQLiteAccountDatabase:
             throw PermissionedRemoteReplicaRecoveryError.receiverMismatch
         }
         return try await withConnectionGate {
-            try await loadPermissionedRemoteReplicaHead(target: target)
+            try await writerReadTransaction {
+                try await loadPermissionedRemoteReplicaHead(target: target)
+            }
         }
     }
 
@@ -140,6 +147,7 @@ extension SQLiteAccountDatabase:
         }
         return try await withConnectionGate {
             try await transaction {
+                try await requireRemoteReplicaSpaceOpen(binding.target.space)
                 if let committed = try await loadPermissionedRemoteReplicaResult(
                     requestID: binding.requestID,
                     expectedBinding: binding
@@ -295,7 +303,11 @@ extension SQLiteAccountDatabase:
         id: String
     ) async throws -> PermissionedRemoteReplicaImportSession {
         try await withConnectionGate {
-            try await loadPermissionedRemoteReplicaSession(id: id)
+            try await writerReadTransaction {
+                let session = try await loadPermissionedRemoteReplicaSession(id: id)
+                try await requireRemoteReplicaSpaceOpen(session.binding.target.space)
+                return session
+            }
         }
     }
 
@@ -469,74 +481,78 @@ extension SQLiteAccountDatabase:
         now: Int64
     ) async throws -> SpaceCARRecoveryIndexEntry? {
         try await withConnectionGate {
-            _ = try await requireActiveRemoteReplicaSession(
-                id: sessionID, now: now, allowed: [.receiving]
-            )
-            let rows = try await connection.query(
-                """
-                SELECT path, cid
-                FROM permissioned_remote_replica_import_index
-                WHERE session_id = ? AND consumed = 0
-                ORDER BY path
-                LIMIT 1
-                """,
-                [.text(sessionID)]
-            )
-            guard let row = rows.first else { return nil }
-            guard let pathData = remoteReplicaData(row, "path"),
-                  let path = String(data: pathData, encoding: .utf8),
-                  let cidRaw = row.column("cid")?.string,
-                  let cid = try? CID.parse(cidRaw) else {
-                throw PermissionedRemoteReplicaRecoveryError.corruptStaging
+            try await writerReadTransaction {
+                _ = try await requireActiveRemoteReplicaSession(
+                    id: sessionID, now: now, allowed: [.receiving]
+                )
+                let rows = try await connection.query(
+                    """
+                    SELECT path, cid
+                    FROM permissioned_remote_replica_import_index
+                    WHERE session_id = ? AND consumed = 0
+                    ORDER BY length(path), path
+                    LIMIT 1
+                    """,
+                    [.text(sessionID)]
+                )
+                guard let row = rows.first else { return nil }
+                guard let pathData = remoteReplicaData(row, "path"),
+                      let path = String(data: pathData, encoding: .utf8),
+                      let cidRaw = row.column("cid")?.string,
+                      let cid = try? CID.parse(cidRaw) else {
+                    throw PermissionedRemoteReplicaRecoveryError.corruptStaging
+                }
+                try validateRemoteReplicaCID(cid)
+                return SpaceCARRecoveryIndexEntry(path: path, cid: cid)
             }
-            try validateRemoteReplicaCID(cid)
-            return SpaceCARRecoveryIndexEntry(path: path, cid: cid)
         }
     }
 
-    public func consumePermissionedRemoteReplicaIndexEntries(
-        sessionID: String,
-        cid: CID,
-        now: Int64
-    ) async throws -> Int {
+    public func hasConsumedPermissionedRemoteReplicaCID(
+        sessionID: String, cid: CID, now: Int64
+    ) async throws -> Bool {
+        try await withConnectionGate {
+            try await writerReadTransaction {
+                _ = try await requireActiveRemoteReplicaSession(
+                    id: sessionID, now: now, allowed: [.receiving]
+                )
+                let rows = try await connection.query(
+                    """
+                    SELECT 1 FROM permissioned_remote_replica_import_index
+                    WHERE session_id = ? AND cid = ? AND consumed = 1 LIMIT 1
+                    """,
+                    [.text(sessionID), .text(cid.string)]
+                )
+                return !rows.isEmpty
+            }
+        }
+    }
+
+    public func consumePermissionedRemoteReplicaIndexEntry(
+        sessionID: String, entry: SpaceCARRecoveryIndexEntry, now: Int64
+    ) async throws {
         try await withConnectionGate {
             try await transaction {
                 _ = try await requireActiveRemoteReplicaSession(
                     id: sessionID, now: now, allowed: [.receiving]
                 )
-                let countRows = try await connection.query(
+                let rows = try await connection.query(
                     """
-                    SELECT COUNT(*) AS count
-                    FROM permissioned_remote_replica_import_index
-                    WHERE session_id = ? AND cid = ? AND consumed = 0
+                    UPDATE permissioned_remote_replica_import_index SET consumed = 1
+                    WHERE session_id = ? AND path = ? AND cid = ? AND consumed = 0
+                      AND path = (
+                        SELECT path FROM permissioned_remote_replica_import_index
+                        WHERE session_id = ? AND consumed = 0
+                        ORDER BY length(path), path LIMIT 1
+                      )
+                    RETURNING path
                     """,
-                    [.text(sessionID), .text(cid.string)]
+                    [.text(sessionID), Data(entry.path.utf8).sqliteData!,
+                     .text(entry.cid.string), .text(sessionID)]
                 )
-                let count = remoteReplicaInteger(
-                    countRows.first, "count"
-                )
-                guard count > 0,
-                      count <= SpaceCARRecoveryLimits
-                        .absoluteMaximumIndexEntries else {
+                guard rows.count == 1 else {
                     throw SpaceCARStreamingError.invalidRecordOrder
                 }
-                _ = try await connection.query(
-                    """
-                    UPDATE permissioned_remote_replica_import_index
-                    SET consumed = 1
-                    WHERE session_id = ? AND cid = ? AND consumed = 0
-                    """,
-                    [.text(sessionID), .text(cid.string)]
-                )
-                let changedRows = try await connection.query(
-                    "SELECT changes() AS count"
-                )
-                guard remoteReplicaInteger(
-                    changedRows.first, "count"
-                ) == count else {
-                    throw SpaceCARStreamingError.invalidRecordOrder
-                }
-                return count
             }
         }
     }
@@ -726,6 +742,94 @@ extension SQLiteAccountDatabase:
                 }
             }
         }
+    }
+
+    public func markPermissionedRemoteReplicaSTARImportVerified(
+        sessionID: String,
+        verification: VerifiedStreamingSpaceSTARRecovery,
+        now: Int64
+    ) async throws {
+        let metadata = try SpaceSTARCodec.encodeMetadata(verification.commit)
+        let commitCID = CID.fromDAGCBOR(metadata)
+        // STAR has no index block. Compute the existing durable projection's
+        // canonical digest from bounded SQLite pages after stream validation.
+        let projection: (index: CID, uniqueCount: Int, logicalBytes: Int) = try await withConnectionGate {
+            try await writerReadTransaction {
+                let session = try await requireActiveRemoteReplicaSession(
+                    id: sessionID, now: now, allowed: [.receiving]
+                )
+                guard verification.commit.repo == session.binding.target.repositoryDID,
+                      verification.commit.space == session.binding.target.space,
+                      verification.recordCount <= session.binding.limits.maximumIndexEntries else {
+                    throw PermissionedRemoteReplicaRecoveryError.corruptStaging
+                }
+                var hasher = SHA256()
+                hasher.update(data: try SpaceCARCodec.streamingIndexPrefix(recordCount: verification.recordCount))
+                var previousLength = -1
+                var previousPath = Data()
+                var seen = 0
+                while seen < verification.recordCount {
+                    let rows = try await connection.query(
+                        """
+                        SELECT path, cid, consumed FROM permissioned_remote_replica_import_index
+                        WHERE session_id = ? AND (length(path) > ? OR (length(path) = ? AND path > ?))
+                        ORDER BY length(path), path LIMIT ?
+                        """,
+                        [.text(sessionID), .integer(previousLength), .integer(previousLength),
+                         previousPath.sqliteData!, .integer(PermissionedRemoteReplicaRecoveryBudgets.maximumRowsPerPass)]
+                    )
+                    guard !rows.isEmpty else { throw PermissionedRemoteReplicaRecoveryError.corruptStaging }
+                    for row in rows {
+                        guard let pathBytes = remoteReplicaData(row, "path"),
+                              let path = String(data: pathBytes, encoding: .utf8),
+                              remoteReplicaInteger(row, "consumed") == 1,
+                              let cid = try? CID.parse(remoteReplicaText(row, "cid")) else {
+                            throw PermissionedRemoteReplicaRecoveryError.corruptStaging
+                        }
+                        hasher.update(data: try SpaceCARCodec.streamingIndexEntry(path: path, cid: cid))
+                        previousLength = pathBytes.count
+                        previousPath = pathBytes
+                        seen += 1
+                    }
+                }
+                let counts = try await connection.query(
+                    """
+                    SELECT COUNT(*) AS record_count, COALESCE(SUM(blocks.byte_count), 0) AS logical_bytes,
+                           COUNT(DISTINCT idx.cid) AS unique_count
+                    FROM permissioned_remote_replica_import_index AS idx
+                    JOIN permissioned_remote_replica_import_blocks AS blocks
+                      ON blocks.session_id = idx.session_id AND blocks.cid = idx.cid AND blocks.complete = 1
+                    WHERE idx.session_id = ?
+                    """, [.text(sessionID)]
+                )
+                let logical = remoteReplicaInteger(counts.first, "logical_bytes")
+                let unique = remoteReplicaInteger(counts.first, "unique_count")
+                guard seen == verification.recordCount,
+                      remoteReplicaInteger(counts.first, "record_count") == verification.recordCount,
+                      unique <= session.binding.limits.maximumUniqueBlocks,
+                      logical <= session.binding.limits.maximumLogicalRestoredBytes else {
+                    throw PermissionedRemoteReplicaRecoveryError.corruptStaging
+                }
+                return (CID(codec: .dagCBOR, multihash: .init(
+                    algorithm: Multihash.sha256Code, length: Multihash.sha256Length,
+                    digest: Data(hasher.finalize())
+                )), unique, logical)
+            }
+        }
+        try await stagePermissionedRemoteReplicaRoots(sessionID: sessionID, commit: commitCID, index: projection.index, now: now)
+        try await stagePermissionedRemoteReplicaCommit(sessionID: sessionID, cid: commitCID, body: metadata, now: now)
+        // Reuse the existing network-free publication receipt validation. Its
+        // root-named fields identify local immutable projections for STAR;
+        // no CAR bytes, signature, or synthetic signed envelope are created.
+        let receipt = VerifiedStreamingSpaceCARRecovery(
+            commitRootCID: commitCID, indexRootCID: projection.index,
+            wireRevision: try TID(tidString: verification.commit.rev),
+            recordCount: verification.recordCount, uniqueBlockCount: projection.uniqueCount,
+            verifiedExpectedWitnessCount: 0, ltHash: verification.ltHash,
+            commitment: verification.commit.data, commitBodyDigest: Data(SHA256.hash(data: metadata)),
+            receivedByteCount: verification.receivedByteCount, logicalRestoredByteCount: projection.logicalBytes
+        )
+        try await markPermissionedRemoteReplicaImportVerified(sessionID: sessionID, verification: receipt, now: now)
     }
 
     public func markPermissionedRemoteReplicaImportVerified(
@@ -937,7 +1041,12 @@ extension SQLiteAccountDatabase:
                 throw PermissionedRemoteReplicaRecoveryError.staleRecovery
             }
 
-            let generation = (current?.generation ?? 0) + 1
+            let generationFloor = try await remoteReplicaGenerationFloor(space: session.binding.target.space)
+            let previousGeneration = max(current?.generation ?? 0, generationFloor)
+            guard previousGeneration < UInt64(Int.max) else {
+                throw PermissionedRemoteReplicaRecoveryError.targetCASConflict
+            }
+            let generation = previousGeneration + 1
             guard generation > 0, generation <= UInt64(Int.max) else {
                 throw PermissionedRemoteReplicaRecoveryError
                     .targetCASConflict
@@ -1632,6 +1741,7 @@ extension SQLiteAccountDatabase:
         committedAt: Int64,
         requiredStatus: PermissionedRemoteReplicaImportStatus
     ) async throws -> CommittedPermissionedRemoteReplicaRecovery {
+        try await requireRemoteReplicaSpaceOpen(session.binding.target.space)
         let integrity = remoteReplicaResultIntegrityDigest(
             binding: session.binding,
             head: head,
@@ -2876,6 +2986,7 @@ extension SQLiteAccountDatabase:
             throw PermissionedRemoteReplicaRecoveryError.invalidTimestamp
         }
         let session = try await loadPermissionedRemoteReplicaSession(id: id)
+        try await requireRemoteReplicaSpaceOpen(session.binding.target.space)
         guard session.expiresAt > now else {
             throw PermissionedRemoteReplicaRecoveryError.expiredSession
         }
@@ -2982,9 +3093,23 @@ extension SQLiteAccountDatabase:
         )
     }
 
+    /// The caller owns the connection gate; reads and mutations check inside
+    /// their data transaction. A recipient deletion closes imported content
+    /// durably, including sessions and batches verified before it arrived.
+    func requireRemoteReplicaSpaceOpen(_ space: SpaceURI) async throws {
+        let tombstones = try await connection.query(
+            "SELECT 1 FROM permissioned_space_recipient_tombstones WHERE space_uri = ? LIMIT 1",
+            [.text(space.rawValue)]
+        )
+        guard tombstones.isEmpty else {
+            throw SwanError.unauthorized("permissioned space is closed")
+        }
+    }
+
     func loadPermissionedRemoteReplicaHead(
         target: PermissionedRemoteReplicaTarget
     ) async throws -> PermissionedRemoteReplicaHead? {
+        try await requireRemoteReplicaSpaceOpen(target.space)
         let rows = try await connection.query(
             """
             SELECT *
@@ -3077,19 +3202,23 @@ extension SQLiteAccountDatabase:
         ) else {
             throw PermissionedRemoteReplicaRecoveryError.corruptStaging
         }
-        let envelope: SpaceCommitEnvelope
-        do {
-            envelope = try SpaceCARCodec.structurallyValidateRecoveryCommit(
-                commitBody,
-                space: binding.target.space,
-                author: binding.target.repositoryDID
-            )
-        } catch {
-            throw PermissionedRemoteReplicaRecoveryError.corruptStaging
-        }
         let wireRevision: TID
+        let expectedCommitment: Data
         do {
-            wireRevision = try TID(tidString: envelope.context.rev)
+            if let commit = try? SpaceSTARCodec.decodeMetadata(
+                commitBody, space: binding.target.space, author: binding.target.repositoryDID
+            ) {
+                wireRevision = try TID(tidString: commit.rev)
+                expectedCommitment = commit.data
+            } else {
+                // Historical locally retained CAR recovery sessions remain
+                // readable; current network sessions only enter through STAR.
+                let envelope = try SpaceCARCodec.structurallyValidateRecoveryCommit(
+                    commitBody, space: binding.target.space, author: binding.target.repositoryDID
+                )
+                wireRevision = try TID(tidString: envelope.context.rev)
+                expectedCommitment = envelope.commitment
+            }
         } catch {
             throw PermissionedRemoteReplicaRecoveryError.corruptStaging
         }
@@ -3205,7 +3334,7 @@ extension SQLiteAccountDatabase:
             )
         )
         guard calculatedIndex == indexRoot,
-              ltHash.commitment == envelope.commitment else {
+              ltHash.commitment == expectedCommitment else {
             throw PermissionedRemoteReplicaRecoveryError.corruptStaging
         }
 

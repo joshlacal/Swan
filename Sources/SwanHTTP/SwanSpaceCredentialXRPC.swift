@@ -14,6 +14,7 @@ import SwanStorage
 /// route nor the capability has a database handle, remote resolver, or raw
 /// signing material.
 public struct SwanSpaceCredentialExchangeCapability: Sendable {
+    let authorizer: SwanOAuthResourceAuthorizer
     let delegationAuthorizer: any SpaceDelegationAuthorizationVerifier
     /// The runtime's dedicated HMAC-backed replay store. A delegation is
     /// reserved after its signature is verified but before policy evaluation
@@ -23,10 +24,12 @@ public struct SwanSpaceCredentialExchangeCapability: Sendable {
     let credentialIssuer: any SpaceCredentialAuthoritySigner
 
     init(
+        authorizer: SwanOAuthResourceAuthorizer,
         delegationAuthorizer: any SpaceDelegationAuthorizationVerifier,
         delegationReplayStore: DurableSpaceDelegationReplayStore,
         credentialIssuer: any SpaceCredentialAuthoritySigner
     ) {
+        self.authorizer = authorizer
         self.delegationAuthorizer = delegationAuthorizer
         self.delegationReplayStore = delegationReplayStore
         self.credentialIssuer = credentialIssuer
@@ -36,7 +39,7 @@ public struct SwanSpaceCredentialExchangeCapability: Sendable {
 enum SwanSpaceCredentialHTTP {
     /// Exchange bodies contain only a space URI and (optionally) a compact
     /// client attestation. Keep this much smaller than record-write JSON so a
-    /// procedure that returns a bearer credential cannot become a generic
+    /// procedure that returns a bound credential cannot become a generic
     /// buffered upload endpoint.
     static let maximumJSONBytes = 16 * 1_024
 }
@@ -44,8 +47,12 @@ enum SwanSpaceCredentialHTTP {
 private enum SpaceCredentialExchangeFailure: Error {
     case invalidRequest
     case invalidDelegation
+    /// `BadSpaceSignature`: the exchange's `atproto-space` HTTP message
+    /// signature is missing, malformed, or does not verify under its keyid.
+    case invalidSignature
     case invalidClientAttestation
     case spaceNotFound
+    case spaceDeleted
     case appNotAuthorized
     case notAuthorized
     case unavailable
@@ -70,71 +77,39 @@ private struct AuthenticatedGetSpaceCredentialHandler:
             throw SpaceCredentialExchangeFailure.invalidRequest
         }
 
-        let delegation: String
-        do {
-            guard let token = try exactBearerToken(from: request.headers) else {
+        let confirmationKeyID = input.credentialKid
+        guard PermissionedDataJWT.isValidConfirmationKeyID(confirmationKeyID) else {
+            throw SpaceCredentialExchangeFailure.invalidRequest
+        }
+        var user: String?
+        var authorization: AuthorizationContext = .public
+        if let delegation = input.delegationToken {
+            do {
+                let grant = try await capability.delegationAuthorizer.verifiedDelegation(
+                    for: delegation, expectedSpace: space, now: Date()
+                )
+                guard case let .spaceDelegation(subject, delegatedSpace) = grant.authorization,
+                      delegatedSpace == space, grant.issuer == subject, grant.space == space,
+                      try await capability.delegationReplayStore.claim(
+                        issuer: grant.issuer, audience: grant.audience, space: grant.space,
+                        jti: grant.jti, expiresAt: grant.expiresAt.addingTimeInterval(60), now: Date()
+                      ) else {
+                    throw SpaceCredentialExchangeFailure.invalidDelegation
+                }
+                user = subject
+                authorization = grant.authorization
+            } catch {
                 throw SpaceCredentialExchangeFailure.invalidDelegation
             }
-            delegation = token
-        } catch let failure as SpaceCredentialExchangeFailure {
-            throw failure
-        } catch {
-            throw SpaceCredentialExchangeFailure.invalidDelegation
-        }
-
-        let delegationGrant: VerifiedSpaceDelegation
-        do {
-            delegationGrant = try await capability.delegationAuthorizer.verifiedDelegation(
-                for: delegation,
-                expectedSpace: space,
-                now: Date()
-            )
-        } catch {
-            // The public exchange surface never distinguishes an unknown
-            // issuer/pin/key from malformed, expired, wrong-audience, or bad
-            // signature delegation material. None of these paths may enter a
-            // durable policy transaction or invoke the signing resolver.
-            throw SpaceCredentialExchangeFailure.invalidDelegation
-        }
-        guard case let .spaceDelegation(user, delegatedSpace) = delegationGrant.authorization,
-              delegatedSpace == space,
-              delegationGrant.issuer == user,
-              delegationGrant.space == space else {
-            throw SpaceCredentialExchangeFailure.invalidDelegation
-        }
-
-        // Proposal 0016 delegations are single-use. Reserve the verified
-        // opaque JTI before attestation/policy/signing so a duplicate request
-        // cannot create another credential, and so the authority never
-        // evaluates policy or decrypts a signing key for a rejected replay.
-        let replayNow = Date()
-        do {
-            let replayExpiry = delegationGrant.expiresAt.addingTimeInterval(60)
-            guard try await capability.delegationReplayStore.claim(
-                issuer: delegationGrant.issuer,
-                audience: delegationGrant.audience,
-                space: delegationGrant.space,
-                jti: delegationGrant.jti,
-                expiresAt: replayExpiry,
-                now: replayNow
-            ) else {
-                throw SpaceCredentialExchangeFailure.invalidDelegation
-            }
-        } catch let failure as SpaceCredentialExchangeFailure {
-            throw failure
-        } catch {
-            // Retain the same opaque delegation error for a duplicate or an
-            // unavailable replay store; the exchange must not continue into
-            // durable policy/signing without its single-use reservation.
-            throw SpaceCredentialExchangeFailure.invalidDelegation
         }
 
         do {
             let credential = try await capability.credentialIssuer.issueSpaceCredential(
                 space: space,
                 user: user,
-                authorization: delegationGrant.authorization,
+                authorization: authorization,
                 clientAttestation: input.clientAttestation,
+                confirmationKeyID: confirmationKeyID,
                 now: Date()
             )
             return .init(credential: credential)
@@ -145,8 +120,10 @@ private struct AuthenticatedGetSpaceCredentialHandler:
             case .unavailable:
                 throw SpaceCredentialExchangeFailure.unavailable
             }
-        } catch is AuthorizedSimpleSpaceLifecycleError {
-            throw SpaceCredentialExchangeFailure.spaceNotFound
+        } catch let failure as AuthorizedSimpleSpaceLifecycleError {
+            throw failure == .deleted
+                ? SpaceCredentialExchangeFailure.spaceDeleted
+                : SpaceCredentialExchangeFailure.spaceNotFound
         } catch is SimpleSpaceCredentialPolicyError {
             throw SpaceCredentialExchangeFailure.appNotAuthorized
         } catch let error as SwanError {
@@ -239,15 +216,17 @@ private func decodeGetSpaceCredentialInput(
     guard let root = try? JSONSerialization.jsonObject(with: data)
         as? [String: Any],
         !root.isEmpty,
-        Set(root.keys).isSubset(of: ["space", "clientAttestation"]),
+        Set(root.keys).isSubset(of: ["space", "credentialKid", "delegationToken", "clientAttestation"]),
         root.keys.filter({ $0 == "space" }).count == 1,
         let rawSpace = root["space"] as? String,
         !rawSpace.isEmpty,
-        rawSpace.utf8.count <= 2_048 else {
+        rawSpace.utf8.count <= 2_048,
+        let credentialKid = root["credentialKid"] as? String,
+        PermissionedDataJWT.isValidConfirmationKeyID(credentialKid) else {
         throw SpaceCredentialExchangeFailure.invalidRequest
     }
-    if let attestation = root["clientAttestation"] {
-        guard let text = attestation as? String,
+    for field in ["clientAttestation", "delegationToken"] where root[field] != nil {
+        guard let text = root[field] as? String,
               !text.isEmpty,
               text.utf8.count <= PermissionedDataJWT.maximumCompactDelegationBytes else {
             throw SpaceCredentialExchangeFailure.invalidRequest
@@ -267,9 +246,9 @@ private func decodeGetSpaceCredentialInput(
 
 /// Returns a compact Bearer value only when the request has exactly one
 /// authorization field whose scheme is Bearer (case-insensitive per HTTP).
-/// `nil` means another scheme (notably DPoP) and lets the caller use its own
-/// proof policy; a malformed Bearer field is an error and must not fall
-/// through to a different authentication scheme.
+/// `nil` means another scheme and lets the caller use its own policy; a
+/// malformed Bearer field is an error and must not fall through to a
+/// different authentication scheme.
 func exactBearerToken(from headers: HTTPFields) throws -> String? {
     let values = headers[values: .authorization]
     guard values.count <= 1 else {
@@ -297,39 +276,56 @@ func exactBearerToken(from headers: HTTPFields) throws -> String? {
     return nil
 }
 
-/// A compact space-credential candidate presented under EITHER the `Bearer`
-/// or the `DPoP` scheme (Erratum 03 addendum — defect class instance #8).
+/// The authorization scheme a space credential is presented under
+/// (atproto#5569), compared case-insensitively.
+let spaceCredentialAuthorizationScheme = "Atproto-Space-Credential"
+
+/// A compact space credential presented as `Authorization: Atproto-Space
+/// <credential>`, or `nil` when the request uses another scheme so the caller
+/// falls through to its OAuth policy unchanged.
 ///
-/// The reference contract presents a space credential under `DPoP` ("a space
-/// credential is bound to a key"), and its own history carries the lesson
-/// verbatim: "`bearer_token` used to read this, which refuses the DPoP scheme
-/// outright — a conformant presentation could not reach the handler." Swan's
-/// credentials carry no key binding today, so the accompanying proof is
-/// surplus rather than verifiable; accepting the presentation SCHEME grants
-/// nothing the same token under `Bearer` does not already grant.
-///
-/// A `DPoP`-scheme value is returned ONLY when its (unverified) JOSE header
-/// names the space-credential type — a DPoP OAuth access token stays `nil`
-/// and flows to the caller's own OAuth proof policy exactly as before. The
-/// `typ` peek routes; every security decision still happens in the verifier.
+/// Throws (an opaque denial) when the presentation is unusable as either:
+/// a duplicated `Authorization` field naming this scheme, a malformed
+/// credential value, or a credential JWT smuggled under `Bearer` or `DPoP`
+/// (the pre-#5569 DPoP-bound presentation). The `typ` peek only routes; the
+/// verifier makes every security decision.
 func spaceCredentialSchemeToken(from headers: HTTPFields) throws -> String? {
-    if let bearer = try exactBearerToken(from: headers) { return bearer }
     let values = headers[values: .authorization]
-    guard let raw = values.first else { return nil }
+    let prefix = spaceCredentialAuthorizationScheme + " "
+    let isSpaceScheme: (String) -> Bool = { raw in
+        raw.count >= prefix.count
+            && raw.prefix(prefix.count).caseInsensitiveCompare(prefix) == .orderedSame
+    }
+    if values.contains(where: isSpaceScheme) {
+        guard values.count == 1 else {
+            throw SpaceCredentialPresentationFailure.badSignature
+        }
+        let token = String(values[0].dropFirst(prefix.count))
+        guard !token.isEmpty,
+              token.utf8.count <= PermissionedDataJWT.maximumCompactSpaceCredentialBytes,
+              token.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+            throw SpaceCredentialPresentationFailure.badSignature
+        }
+        return token
+    }
+    if values.contains(where: { $0.lowercased().hasPrefix("atproto-space ") }) {
+        throw SpaceCredentialPresentationFailure.unsupportedAuthorization
+    }
+    if let bearer = try exactBearerToken(from: headers) {
+        guard unverifiedCompactJOSEType(of: bearer) != PermissionedDataJWT.credentialType else {
+            throw SwanError.unauthorized("space credential presented under the wrong scheme")
+        }
+        return nil
+    }
     let dpopPrefix = "DPoP "
-    guard raw.count >= dpopPrefix.count,
-          raw.prefix(dpopPrefix.count)
-              .caseInsensitiveCompare(dpopPrefix) == .orderedSame else {
-        return nil
+    if let raw = values.first,
+       raw.count >= dpopPrefix.count,
+       raw.prefix(dpopPrefix.count).caseInsensitiveCompare(dpopPrefix) == .orderedSame,
+       unverifiedCompactJOSEType(of: String(raw.dropFirst(dpopPrefix.count)))
+        == PermissionedDataJWT.credentialType {
+        throw SwanError.unauthorized("space credential presented under the wrong scheme")
     }
-    let token = String(raw.dropFirst(dpopPrefix.count))
-    guard !token.isEmpty,
-          token.utf8.count <= PermissionedDataJWT.maximumCompactDelegationBytes,
-          token.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }),
-          unverifiedCompactJOSEType(of: token) == PermissionedDataJWT.credentialType else {
-        return nil
-    }
-    return token
+    return nil
 }
 
 /// The JOSE header `typ` of a compact token, decoded WITHOUT verification —
@@ -355,11 +351,15 @@ private func getSpaceCredentialResponse(
     case .invalidRequest:
         getSpaceCredentialError(.badRequest, code: "InvalidRequest")
     case .invalidDelegation:
-        getSpaceCredentialError(.unauthorized, code: "InvalidDelegationToken")
+        getSpaceCredentialError(.badRequest, code: "InvalidDelegationToken")
+    case .invalidSignature:
+        getSpaceCredentialError(.unauthorized, code: "BadSpaceSignature")
     case .invalidClientAttestation:
         getSpaceCredentialError(.badRequest, code: "InvalidClientAttestation")
     case .spaceNotFound:
         getSpaceCredentialError(.notFound, code: "SpaceNotFound")
+    case .spaceDeleted:
+        getSpaceCredentialError(.badRequest, code: "SpaceDeleted")
     case .appNotAuthorized:
         getSpaceCredentialError(.unauthorized, code: "AppNotAuthorized")
     case .notAuthorized:

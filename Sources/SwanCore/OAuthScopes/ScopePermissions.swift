@@ -208,6 +208,23 @@ public struct SwanScopePermissions: Sendable, Equatable, Hashable {
 
     private let grants: [Grant]
 
+    /// Upstream space-scope semantics, set only under `swan serve
+    /// --enable-spaces-open-interop` (Josh, 2026-10-01, decision B(d)). When
+    /// `true`, the two Swan-specific fences relax to upstream's rules: a
+    /// DEFAULTED `action` (read/create/update/delete) satisfies
+    /// getDelegationToken and listSpaces, and a wildcard-type grant may
+    /// exchange a delegation. Value coverage (type/authority/skey) and the
+    /// listing fence's wildcard-request rule are unchanged. `false` (the
+    /// default) is Swan's hardened §5.6.3 / §6.1 behaviour.
+    public private(set) var upstreamSpaceDefaults = false
+
+    /// A copy evaluated under upstream space-scope semantics.
+    public func withUpstreamSpaceDefaults() -> SwanScopePermissions {
+        var copy = self
+        copy.upstreamSpaceDefaults = true
+        return copy
+    }
+
     /// - Parameters:
     ///   - rawScopes: the token family's effective scope strings, verbatim.
     ///   - subject: the account DID the grant was issued to, or `nil` at a
@@ -262,12 +279,14 @@ public struct SwanScopePermissions: Sendable, Equatable, Hashable {
         lhs.rawScopes == rhs.rawScopes
             && lhs.subject == rhs.subject
             && lhs.statedKeys == rhs.statedKeys
+            && lhs.upstreamSpaceDefaults == rhs.upstreamSpaceDefaults
     }
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(rawScopes)
         hasher.combine(subject)
         hasher.combine(statedKeys)
+        hasher.combine(upstreamSpaceDefaults)
     }
 
     /// The base AT Protocol session scope. An explicit predicate rather than a
@@ -402,7 +421,8 @@ public extension SwanScopePermissions {
             }
             guard Self.isExchangeableDelegationGrant(
                 resolved,
-                statedKeys: grant.statedKeys
+                statedKeys: grant.statedKeys,
+                upstreamDefaults: upstreamSpaceDefaults
             ) else { return false }
             return resolved.matches(
                 SpaceScopeTarget(
@@ -473,8 +493,15 @@ public extension SwanScopePermissions {
     /// originating grant's collection set, not a stricter predicate here.
     internal static func isExchangeableDelegationGrant(
         _ grant: SpacePermission,
-        statedKeys: Set<String>
+        statedKeys: Set<String>,
+        upstreamDefaults: Bool = false
     ) -> Bool {
+        // Upstream (`getDelegationToken.ts`: assertSpaceRef action 'read'):
+        // any grant whose effective — stated or defaulted — actions include
+        // read, any type. Only under `--enable-spaces-open-interop`.
+        if upstreamDefaults {
+            return grant.action.contains(.read)
+        }
         // 1. Stated action containing read (provenance witness — a missing
         //    bit denies; it never grants).
         guard statedKeys.contains("action"), grant.action.contains(.read) else { return false }
@@ -487,7 +514,7 @@ public extension SwanScopePermissions {
     /// (`SwanCore.swift:290-309`).
     ///
     /// **Upstream HAS an analogue.** `packages/pds/src/api/com/atproto/space/listSpaces.ts:20-25`
-    /// asserts `assertSpace({ type: type ?? '*', authority: authority ?? '*',
+    /// asserts `assertSpace({ type: spaceType ?? '*', authority: authority ?? '*',
     /// skey: '*', action: 'read_self' })` — it makes the *request filters* the
     /// match target and defaults each absent filter to `'*'`. Its comment at
     /// `:16-18` states Swan's own rationale in upstream's words: "No one space
@@ -513,7 +540,7 @@ public extension SwanScopePermissions {
     /// Reads DURABLE provenance (§9-D23): under the new grammar `skey`
     /// *defaults* to `["*"]` and `action` defaults to a list *containing*
     /// `read`, so without the stated-key witness a bare `space:<t>` grant would
-    /// silently start satisfying `listSpaces?type=<t>&authority=<self>`.
+    /// silently start satisfying `listSpaces?spaceType=<t>&did=<self>`.
     /// **§6.1 AMENDED (2026-08-15, Josh: "Amend").** The original fence
     /// additionally required stated `authority`+`skey` with literal `skey=*`,
     /// action exactly `[.read]`, and no stated `collection`/`manage`. That
@@ -537,7 +564,9 @@ public extension SwanScopePermissions {
             //    defaulted grant never lists) and grants a read: `read` or
             //    upstream's `read_self`, which suffices for a route that
             //    only ever lists the subject's own spaces.
-            guard grant.statedKeys.contains("action"),
+            //    Under `--enable-spaces-open-interop` the witness is dropped
+            //    and a defaulted action list suffices, as upstream.
+            guard upstreamSpaceDefaults || grant.statedKeys.contains("action"),
                   resolved.action.contains(.read) || resolved.action.contains(.readSelf)
             else { return false }
             // 2. aggregateDimension on type and authority (SwanCore.swift:324-327):

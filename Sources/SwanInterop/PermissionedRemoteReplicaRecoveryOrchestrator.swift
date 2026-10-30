@@ -30,7 +30,12 @@ private actor PermissionedRemoteReplicaSourceCloseGate {
 
 public struct PermissionedRemoteReplicaSourceSession: Sendable {
     public let identity: PermissionedRemoteReplicaSourceIdentity
-    public let verificationKey: PermissionedDataJWTVerificationKey
+    public let verificationKey: PermissionedDataJWTVerificationKey?
+    fileprivate let starAuthentication: STARAuthentication?
+    fileprivate struct STARAuthentication: Sendable {
+        let sharedSecret: Data
+        let mac: Data
+    }
     public let freshnessWitness: PermissionedRemoteReplicaFreshnessWitness
     public let source: any SpaceCARRecoveryByteSource
     /// Releases the source descriptor and any temporary transport spool. The
@@ -51,11 +56,35 @@ public struct PermissionedRemoteReplicaSourceSession: Sendable {
         }
         self.identity = identity
         self.verificationKey = verificationKey
+        self.starAuthentication = nil
         self.freshnessWitness = freshnessWitness
         self.source = source
         self.closeGate = PermissionedRemoteReplicaSourceCloseGate(
             action: closeSource
         )
+    }
+
+    /// Native October 22 source session. The dedicated KEM key's fingerprint
+    /// binds source custody; the shared secret and MAC are request-specific.
+    public init(
+        identity: PermissionedRemoteReplicaSourceIdentity,
+        authorKEMKey: String,
+        sharedSecret: Data,
+        mac: Data,
+        freshnessWitness: PermissionedRemoteReplicaFreshnessWitness,
+        source: any SpaceCARRecoveryByteSource,
+        closeSource: @escaping @Sendable () async -> Void
+    ) throws {
+        guard identity.verifierIdentity == (try PermissionedSpaceMACRequest.verifierIdentity(authorKEMKey: authorKEMKey)),
+              sharedSecret.count == 32, mac.count == 32 else {
+            throw PermissionedRemoteReplicaRecoveryError.invalidBinding
+        }
+        self.identity = identity
+        self.verificationKey = nil
+        self.starAuthentication = STARAuthentication(sharedSecret: sharedSecret, mac: mac)
+        self.freshnessWitness = freshnessWitness
+        self.source = source
+        self.closeGate = PermissionedRemoteReplicaSourceCloseGate(action: closeSource)
     }
 
     fileprivate func close() async {
@@ -239,35 +268,53 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
     ) async throws -> CommittedPermissionedRemoteReplicaRecovery {
         let staging = stagingFactory(sessionID)
         do {
-            let verification = try await SpaceCARCodec.verifyStreamingRecovery(
-                from: source.source,
-                space: target.space,
-                author: target.repositoryDID,
-                contextSignatureVerifier: { envelope in
-                    let signingInput = try SpaceCommitCodec.contextSigningBytes(
-                        envelope.context
-                    )
-                    let algorithm: String = switch source.verificationKey {
-                    case .p256: "ES256"
-                    case .secp256k1PublicKey: "ES256K"
+            let verifiedAt: Int64
+            if let authentication = source.starAuthentication {
+                let sink = PermissionedRemoteReplicaSTARStaging(staging: staging)
+                let verification = try await SpaceSTARCodec.verifyStreaming(
+                    source: source.source, sink: sink,
+                    space: target.space, author: target.repositoryDID,
+                    limits: try SpaceSTARLimits(
+                        maximumArchiveBytes: limits.maximumCARBytes,
+                        maximumRecordCount: limits.maximumIndexEntries
+                    ),
+                    commitVerifier: { commit in
+                        try SpaceMAC.verify(
+                            mac: authentication.mac,
+                            expected: commit.mac(sharedSecret: authentication.sharedSecret)
+                        )
+                        return true
                     }
-                    return try source.verificationKey.verify(
-                        signature: envelope.contextSignature,
-                        signingInput: signingInput,
-                        algorithm: algorithm
-                    )
-                },
-                index: staging,
-                recordSink: staging,
-                limits: limits
-            )
-            await source.close()
-            let verifiedAt = now()
-            try await store.markPermissionedRemoteReplicaImportVerified(
-                sessionID: sessionID,
-                verification: verification,
-                now: verifiedAt
-            )
+                )
+                await source.close()
+                verifiedAt = now()
+                try await store.markPermissionedRemoteReplicaSTARImportVerified(
+                    sessionID: sessionID, verification: verification, now: verifiedAt
+                )
+            } else {
+                // Explicit compatibility for historical local CAR fixtures.
+                // The HTTP source provider never selects this branch.
+                guard let key = source.verificationKey else {
+                    throw PermissionedRemoteReplicaRecoveryError.invalidBinding
+                }
+                let verification = try await SpaceCARCodec.verifyStreamingRecovery(
+                    from: source.source, space: target.space, author: target.repositoryDID,
+                    contextSignatureVerifier: { envelope in
+                        let input = try SpaceCommitCodec.contextSigningBytes(envelope.context)
+                        let algorithm: String = switch key {
+                        case .p256: "ES256"
+                        case .secp256k1PublicKey: "ES256K"
+                        }
+                        return try key.verify(signature: envelope.contextSignature, signingInput: input, algorithm: algorithm)
+                    },
+                    index: staging, recordSink: staging, limits: limits
+                )
+                await source.close()
+                verifiedAt = now()
+                try await store.markPermissionedRemoteReplicaImportVerified(
+                    sessionID: sessionID, verification: verification, now: verifiedAt
+                )
+            }
             return try await store
                 .publishVerifiedPermissionedRemoteReplicaRecovery(
                     sessionID: sessionID,
@@ -335,4 +382,34 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
         }
         return Data(SHA256.hash(data: material))
     }
+}
+
+/// Bridges one verified STAR record at a time into the existing private
+/// SQLite staging tables. Shared CIDs have one durable body and distinct paths.
+private struct PermissionedRemoteReplicaSTARStaging: SpaceSTARRecoverySink {
+    let staging: PermissionedRemoteReplicaRecoveryOrchestrator.Staging
+
+    func stage(record: SpaceRecord) async throws {
+        let cid = try CID.parse(record.cid)
+        let known = try await staging.hasConsumedCID(cid)
+        let entry = SpaceCARRecoveryIndexEntry(path: "\(record.uri.collection)/\(record.uri.rkey)", cid: cid)
+        try await staging.insert(entry)
+        if !known {
+            try await staging.beginRecord(cid: cid, byteCount: record.value.count)
+            var offset = 0
+            var chunk = 0
+            while offset < record.value.count {
+                let count = min(SpaceCARRecoveryLimits.maximumChunkBytes, record.value.count - offset)
+                try await staging.appendRecordChunk(cid: cid, chunkIndex: chunk, bytes: Data(record.value[offset..<offset + count]))
+                offset += count
+                chunk += 1
+            }
+            try await staging.completeRecord(cid: cid, byteCount: record.value.count, chunkCount: chunk)
+        }
+        try await staging.consumeEntry(entry)
+    }
+
+    // The owning orchestrator poisons and cleans its durable session on every
+    // failure. A sink cannot independently publish any staged row.
+    func discard() async {}
 }

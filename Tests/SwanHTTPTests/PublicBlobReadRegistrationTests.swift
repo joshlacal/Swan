@@ -196,6 +196,18 @@ final class PublicBlobReadRegistrationTests: XCTestCase, @unchecked Sendable {
             try await sink(bytes)
         }
 
+        let repository = try await PublicBlobReadTestRepository.install(
+            database: fixture.aliceStore, did: Self.alice
+        )
+        try await repository.commit([
+            .create(
+                path: try PublicRepositoryPath(collection: "app.bsky.feed.post", recordKey: "avatar"),
+                record: try PublicBlobReadTestRepository.record(
+                    cid: reference.cid, size: bytes.count, mimeType: "image/png"
+                )
+            ),
+        ])
+
         let app = fixture.server.buildApplication(
             logger: Logger(label: "PublicBlobReadRegistrationTests.live")
         )
@@ -414,9 +426,9 @@ final class PublicBlobReadRegistrationTests: XCTestCase, @unchecked Sendable {
     ///
     /// `publicIdentityVerifier: nil` is the directory's documented
     /// public-repository-disabled mode, which is exactly the shape this test
-    /// wants — no genesis, no repository generation, nothing but the account's
-    /// blob storage. It keeps the fixture to the seam under test while still
-    /// running the production `publicRepositoryBlobOutcome(did:)`, which
+    /// wants — no admitted repository generation. The test installs a signed
+    /// public record before serving its blob. This still exercises
+    /// the production `publicRepositoryBlobOutcome(did:)`, which
     /// resolves its target from the control row and the preopened inventory
     /// and never consults a generation.
     private func makeLiveFixture() async throws -> LiveFixture {

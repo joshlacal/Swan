@@ -35,11 +35,11 @@ public struct InteropDPoPKey: @unchecked Sendable {
     public func proof(
         method: String,
         target: URL,
-        nonce: String,
+        nonce: String? = nil,
         accessToken: String? = nil,
         now: Date = Date()
     ) throws -> String {
-        guard !nonce.isEmpty, nonce.utf8.count <= 4_096,
+        guard nonce.map({ !$0.isEmpty && $0.utf8.count <= 4_096 }) ?? true,
               let normalizedMethod = method.uppercased().nilIfEmpty else {
             throw SwanError.malformed("DPoP proof inputs are invalid")
         }
@@ -77,7 +77,7 @@ public struct InteropDPoPKey: @unchecked Sendable {
         let htu: String
         let iat: Int64
         let jti: String
-        let nonce: String
+        let nonce: String?
         var ath: String?
 
         init(
@@ -85,7 +85,7 @@ public struct InteropDPoPKey: @unchecked Sendable {
             target: String,
             issuedAt: Int64,
             jwtID: String,
-            nonce: String,
+            nonce: String?,
             accessTokenHash: String?
         ) {
             htm = method

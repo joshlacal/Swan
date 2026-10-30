@@ -6,11 +6,11 @@
   },
   "lexicons": {
     "emit": [
-      "../Swan/.interop-cache/atproto-bddc99fb24c34b4078b9bf65837283f37b49ab66/lexicons/com/atproto/space",
-      "../Swan/.interop-cache/atproto-bddc99fb24c34b4078b9bf65837283f37b49ab66/lexicons/com/atproto/simplespace"
+      "../Swan/.interop-cache/atproto-ac0c9f15392f6f0298d71dc52aa88c05036150be/lexicons/com/atproto/space",
+      "../Swan/.interop-cache/atproto-ac0c9f15392f6f0298d71dc52aa88c05036150be/lexicons/com/atproto/simplespace"
     ],
     "reference": [
-      "../Swan/.interop-cache/atproto-bddc99fb24c34b4078b9bf65837283f37b49ab66/lexicons"
+      "../Swan/.interop-cache/atproto-ac0c9f15392f6f0298d71dc52aa88c05036150be/lexicons"
     ],
     "exclude_namespaces": ["tools.ozone"]
   },

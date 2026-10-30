@@ -357,13 +357,7 @@ public actor PLCSpaceCredentialPublicKeyResolver:
             return nil
         }
 
-        // The pinned TypeScript PDS emits `kid: #atproto_space` while its
-        // current simplespace authority publishes only the ordinary
-        // `#atproto` method. Proposal 0016 defines the dedicated method as
-        // preferred with an ordinary-account-key fallback, so try the
-        // fallback only when the dedicated method is genuinely absent. A
-        // present-but-malformed dedicated method remains fail-closed and
-        // never silently downgrades to another key.
+        // October 22 credentials resolve only the authority's exact atproto method.
         for methodName in methodNames {
             guard let encodedKey = state.verificationMethods[methodName] else {
                 continue
@@ -648,13 +642,6 @@ public actor PLCSpaceCredentialPublicKeyResolver:
     }
 
     private static func methodNames(for keyID: String) -> [String]? {
-        switch keyID {
-        case PermissionedDataJWT.spaceCredentialKeyID:
-            ["atproto_space", "atproto"]
-        case PermissionedDataJWT.spaceCredentialFallbackKeyID:
-            ["atproto"]
-        default:
-            nil
-        }
+        keyID == "#atproto" ? ["atproto"] : nil
     }
 }

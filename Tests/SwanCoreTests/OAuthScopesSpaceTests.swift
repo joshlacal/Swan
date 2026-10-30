@@ -196,14 +196,10 @@ struct OAuthScopesSpaceTests {
         #expect(!resolved.matches(target(authority: "did:plc:other", operation: Self.plainRead)))
     }
 
-    // MARK: §6.5.5 — the `aggregate` and `collection` hardenings on read/readSelf
+    // MARK: Proposal 0016 — reads ignore collections
 
     @Test
-    func aggregateReadRequiresUnqualifiedOrWildcardCollectionGrant() throws {
-        // SwanSpaces.swift:329-341 — an aggregate surface (listSpaces) must not
-        // silently censor its response, so it needs an unqualified or `*`
-        // collection grant; a grant scoped to one collection must NOT satisfy it
-        // even though `create` would be a perfectly normal write grant shape.
+    func aggregateReadIgnoresTheGrantCollection() throws {
         let bare = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=read")
         #expect(bare.matches(target(operation: .read(aggregate: true, collection: nil))))
 
@@ -215,23 +211,31 @@ struct OAuthScopesSpaceTests {
         let qualified = try SpacePermission.parse(
             "space:com.atmoboards.forum?authority=*&action=read&collection=com.atmoboards.thread"
         )
-        #expect(!qualified.matches(target(operation: .read(aggregate: true, collection: nil))))
+        #expect(qualified.matches(target(operation: .read(aggregate: true, collection: nil))))
     }
 
     @Test
-    func nonAggregateCollectionQualifiedReadStaysCollectionIndependentByDefault() throws {
-        // A caller MAY additionally scope a single-space read to one
-        // collection; a grant naming no collections still satisfies it (reads
-        // are collection-independent by default), but a grant that DOES name
-        // collections must include the requested one.
+    func collectionQualifiedReadIgnoresTheRequestedCollection() throws {
         let bare = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=read")
         #expect(bare.matches(target(operation: .read(aggregate: false, collection: "com.atmoboards.thread"))))
 
         let qualified = try SpacePermission.parse(
             "space:com.atmoboards.forum?authority=*&action=read&collection=com.atmoboards.reply"
         )
-        #expect(!qualified.matches(target(operation: .read(aggregate: false, collection: "com.atmoboards.thread"))))
+        #expect(qualified.matches(target(operation: .read(aggregate: false, collection: "com.atmoboards.thread"))))
         #expect(qualified.matches(target(operation: .read(aggregate: false, collection: "com.atmoboards.reply"))))
+    }
+
+    @Test
+    func readSelfIgnoresCollectionsWithoutGrantingReadOrWrite() throws {
+        let grant = try SpacePermission.parse(
+            "space:com.atmoboards.forum?authority=*&action=read_self&collection=com.atmoboards.reply"
+        )
+        #expect(grant.matches(target(operation: .readSelf(aggregate: true, collection: nil))))
+        #expect(grant.matches(target(operation: .readSelf(aggregate: false, collection: "com.atmoboards.thread"))))
+        #expect(!grant.matches(target(operation: Self.plainRead)))
+        #expect(!grant.matches(target(operation: .write(.create, collection: "com.atmoboards.reply"))))
+        #expect(!grant.matches(target(operation: .delegationExchange)))
     }
 
     // MARK: scopeNeeded (§5.6.6)

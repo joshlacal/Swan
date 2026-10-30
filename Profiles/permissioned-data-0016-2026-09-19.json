@@ -1,0 +1,84 @@
+{
+  "id": "permissioned-data-0016-2026-09-19",
+  "proposalCommit": "119fa6b63476d30c2516846c714319046e0422f3",
+  "referenceImplementationCommit": "907f41a7b379a7e649a6c4842864946eef6eb757",
+  "petrelGeneratorCommit": "710ecb0af23f07737c5c9b60eeed24092cb3aa3c",
+  "petrelCommit": "35155c926fb7e49e139883feb29308d61aff8db5",
+  "migrationCompatibility": "destructiveBeforeAlpha",
+  "crypto": {
+    "lthashBytes": 2048,
+    "lthashHash": "BLAKE3-XOF",
+    "commitmentHash": "SHA-256",
+    "contentBinding": "HKDF-Expand/HMAC-SHA-256"
+  },
+  "permissionedDataIsEncrypted": false,
+  "oplogRetention": 10000,
+  "referenceArchiveSHA256": "418f7213539e2c8f0945a9f8e6e22643073dc1c3f3248115bc626e4c29c1c579",
+  "petrelManifest": "PetrelManifest.json",
+  "petrelManifestSHA256": "da8cb92a90c3524f8663e5357dcb8b226716beba1402738244bdb3d79fe174af",
+  "lexiconManifest": "permissioned-data-0016-2026-09-19.lexicons.sha256",
+  "lexiconManifestSHA256": "7ecbc75972d592e349f0227ff3bc1f0841fe3fda83e16ff1d3c39bbfaeca9de8",
+  "generatedWireManifest": "permissioned-data-0016-2026-09-19.generated-wire.sha256",
+  "generatedWireManifestSHA256": "3f4efbc98fb24c7b6883f5255c5b2e59bc74c971dc7753da1da2a1e2ab1b667e",
+  "intentionalDivergences": [
+    {
+      "endpoint": "com.atproto.space.getRepo",
+      "referenceBehavior": "The live permissioned-data handler serves a signed-commit repo snapshot built in memory via buildSignedCommit and serializeRepo, holding the actor database open while records page out lazily.",
+      "swanBehavior": "Streams proposal-0016 two-root full-recovery CARs from a private bounded-memory spool; the generated handler is retained for typed parameter/context semantics but its Data-returning method is never used by the transport."
+    },
+    {
+      "endpoint": "com.atproto.space.notifyWrite",
+      "referenceBehavior": "The live handler rejects a request unless auth.credentials.iss equals body.repo, but its authority fanout signs iss as ownerDid while retaining a member writer in body.repo; the resulting cross-host fanout shape is not accepted by that same receiver when owner and writer differ.",
+      "swanBehavior": "Emits and accepts only direct writer-to-authority notifications with iss equal to repo and an exact configured authority service identity as aud. It intentionally does not emit or accept authority-signed cross-host write fanout; registrations remain discovery state and notifySpaceDeleted remains the separate authority-signed tombstone control plane."
+    }
+  ],
+  "compatibilityExceptions": [
+    {
+      "id": "did-plc-server-0.0.1-submit-status",
+      "pinnedComponent": "@did-plc/server@0.0.1 from reference implementation 907f41a7b379a7e649a6c4842864946eef6eb757",
+      "referenceBehavior": "POST /:did ends in Express res.sendStatus(200), producing status 200, Content-Type text/plain; charset=utf-8, and the two ASCII bytes OK.",
+      "swanBehavior": "Only explicit laboratory policy did-plc-server-0.0.1 accepts that exact no-redirect response at the requested URL; production and all PLC JSON reads retain strict validation."
+    },
+    {
+      "id": "typescript-space-oplog-retention-gap",
+      "pinnedComponent": "packages/pds/src/api/com/atproto/space/listRepoOps.ts from reference implementation 907f41a7b379a7e649a6c4842864946eef6eb757",
+      "referenceBehavior": "An old since cursor is filtered with rev > since and returns HTTP 200; the live handler does not emit full_repo_recovery_required for a retention gap.",
+      "swanBehavior": "Emits HTTP 409 full_repo_recovery_required when its retained range is exceeded. The recovery CLI remains strict by default and exposes an explicit --allow-full-car-fallback only for qualified reference-host full-CAR testing; fallback artifacts are excluded from retention-gap validation."
+    }
+  ],
+  "retiredCompatibilityExceptions": [
+    {
+      "id": "typescript-space-list-repo-ops-values-ambiguous-space",
+      "retiredBecause": "Fixed upstream: at bddc99fb the listRepoOps reader qualifies every space selector (space_record_oplog.space) and joins record values on uri AND cid, so value-bearing pages no longer 500. Swan's behavior is now conformant, not an exception."
+    }
+  ],
+  "endpoints": [
+    "com.atproto.space.applyWrites",
+    "com.atproto.space.createRecord",
+    "com.atproto.space.deleteRecord",
+    "com.atproto.space.getBlob",
+    "com.atproto.space.getDelegationToken",
+    "com.atproto.space.getLatestCommit",
+    "com.atproto.space.getRecord",
+    "com.atproto.space.getRepo",
+    "com.atproto.space.getSpaceCredential",
+    "com.atproto.space.listBlobs",
+    "com.atproto.space.listRecords",
+    "com.atproto.space.listRepoOps",
+    "com.atproto.space.listRepos",
+    "com.atproto.space.listSpaces",
+    "com.atproto.space.notifySpaceDeleted",
+    "com.atproto.space.notifyWrite",
+    "com.atproto.space.putRecord",
+    "com.atproto.space.registerNotify",
+    "com.atproto.space.unregisterNotify",
+    "com.atproto.simplespace.putMember",
+    "com.atproto.simplespace.checkUserAccess",
+    "com.atproto.simplespace.createSpace",
+    "com.atproto.simplespace.deleteSpace",
+    "com.atproto.simplespace.getSpace",
+    "com.atproto.simplespace.listMembers",
+    "com.atproto.simplespace.removeMember",
+    "com.atproto.simplespace.updateSpace"
+  ]
+}

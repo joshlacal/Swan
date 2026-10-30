@@ -9,11 +9,10 @@ import SwanStorage
 /// The only failures a future resource HTTP adapter needs to render. They do
 /// not carry a token, DPoP proof, JTI, account identifier, or storage detail.
 ///
-/// A missing or structurally unusable proof receives a fresh nonce challenge.
-/// Once a proof has enough structure to attempt validation, every invalid,
-/// expired, replayed, token-binding, and account-lifecycle predicate becomes
-/// the same denial. This avoids turning the protected-resource boundary into
-/// a DPoP or account-status oracle.
+/// Missing, malformed, or expired nonces receive a fresh nonce challenge.
+/// Other proof, token-binding, and account-lifecycle failures remain opaque
+/// denials. Challenging a stale nonce does not authorize the request: the
+/// retry must still pass every proof, token, and account check.
 public enum SwanResourceAuthorizationFailure: Error, Sendable, Equatable {
     case nonceChallengeRequired
     case denied
@@ -45,6 +44,9 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
     /// without `--enable-legacy-sessions` gets: a `Bearer` credential then falls
     /// through to the DPoP parser and is refused exactly as it is today.
     private let legacySessions: DurableLegacySessionService?
+    /// `--enable-spaces-open-interop` (decision B(d)); consulted only by
+    /// ``authorizeSpaceRoute(request:method:fixedPath:legacyAdmission:now:)``.
+    private let spacesOpenInterop: Bool
 
     /// `publicURL` is the process's configured canonical public identity, not
     /// a request-derived origin. It must be a scheme/host root URL so each
@@ -53,7 +55,8 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         publicURL: URL,
         runtime: SwanOAuthRuntime,
         accountControlStore: any AccountControlStore,
-        legacySessions: DurableLegacySessionService? = nil
+        legacySessions: DurableLegacySessionService? = nil,
+        spacesOpenInterop: Bool = false
     ) throws {
         guard Self.validPublicURL(publicURL) else {
             throw SwanError.malformed("resource authorization public URL is invalid")
@@ -62,6 +65,7 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         self.runtime = runtime
         self.accountControlStore = accountControlStore
         self.legacySessions = legacySessions
+        self.spacesOpenInterop = spacesOpenInterop
     }
 
     /// Issues a challenge nonce from the exact OAuth runtime used by
@@ -70,6 +74,163 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
     /// a nonce that its DPoP validator will reject.
     public func issueNonce(now: Date = Date()) -> String {
         runtime.dpopNonceService.issue(now: now)
+    }
+
+    /// Reads the `atproto-space-credential` presentation fields as complete field-line
+    /// lists. The request URI, Host, and method are deliberately not inputs:
+    /// a space signature binds only the credential and its audience.
+    static func spaceCredentialPresentation(
+        from headers: HTTPFields
+    ) -> SpaceCredentialHTTPPresentation {
+        SpaceCredentialHTTPPresentation(
+            authorization: headers[values: .authorization],
+            audience: headers[values: spaceAudienceField],
+            signatureInput: headers[values: signatureInputField],
+            signature: headers[values: signatureField]
+        )
+    }
+
+    static let spaceAudienceField = HTTPField.Name(SpaceHTTPSignature.audienceFieldName)!
+    static let signatureInputField = HTTPField.Name(SpaceHTTPSignature.signatureInputFieldName)!
+    static let signatureField = HTTPField.Name(SpaceHTTPSignature.signatureFieldName)!
+
+    /// Verifies an `Atproto-Space-Credential` credential presentation for one operation.
+    /// `expectedAudience` is derived by the route from the operation, never
+    /// from the request's Host or this server's identity: the repo owner's
+    /// DID for repo reads, the space authority's bare DID for space-host
+    /// operations. A credential whose `(space, jti)` the authority revoked is
+    /// refused while the revocation is retained; an unreadable revocation
+    /// list fails closed as unavailable. Throws
+    /// ``SpaceCredentialPresentationFailure`` for the protocol's named errors
+    /// and the verifier's opaque errors otherwise.
+    func authorizeSpaceCredential(
+        _ token: String,
+        verifier: any SpaceCredentialAuthorizationVerifier,
+        request: Request,
+        expectedSpace: SpaceURI,
+        expectedAudience: String,
+        now: Date = Date()
+    ) async throws -> AuthorizationContext {
+        let presentation = try await verifier.verifiedPresentation(
+            token,
+            expectedSpace: expectedSpace,
+            presentation: Self.spaceCredentialPresentation(from: request.headers),
+            now: now
+        )
+        // The reference checks revocation before the handler's audience
+        // check; keep that order so a revoked credential always reports
+        // CredentialRevoked.
+        guard try await !runtime.spaceCredentialRevocations.isRevoked(
+            space: presentation.space,
+            credentialID: presentation.credentialID,
+            now: now
+        ) else {
+            throw SpaceCredentialPresentationFailure.revoked
+        }
+        guard presentation.audience == expectedAudience else {
+            throw SpaceCredentialPresentationFailure.badAudience
+        }
+        return presentation.authorization
+    }
+
+    /// Records an authority's `notifyCredentialRevoked` for this repo host.
+    func recordSpaceCredentialRevocations(
+        space: SpaceURI,
+        credentialIDs: [String],
+        now: Date = Date()
+    ) async throws {
+        try await runtime.spaceCredentialRevocations.record(
+            space: space,
+            credentialIDs: credentialIDs,
+            now: now
+        )
+    }
+
+    /// Whether `did` names an account this host stores, in any lifecycle
+    /// state (the reference includes deactivated and taken-down accounts):
+    /// the audience test for `notifyCredentialRevoked`. Store failures are
+    /// `SwanError.unavailable`.
+    func hostsAccount(did: String) async throws -> Bool {
+        do {
+            return try await accountControlStore.account(did: did) != nil
+        } catch {
+            throw SwanError.unavailable("account directory unavailable")
+        }
+    }
+
+    /// Which legacy sessions a space route admits under open interop.
+    enum SpaceRouteLegacyAdmission: Sendable {
+        /// Upstream `ACCESS_STANDARD`: account-password and app-password
+        /// sessions (own-repo space reads/writes, listSpaces).
+        case standard
+        /// Upstream `ACCESS_FULL`: account-password sessions only
+        /// (getDelegationToken).
+        case fullAccessOnly
+    }
+
+    /// ``authorize(request:method:fixedPath:now:)`` for an atproto-spaces
+    /// route. Without `--enable-spaces-open-interop` it is exactly that.
+    ///
+    /// With the flag (decision B(d)), an OAuth grant is evaluated under
+    /// upstream space-scope defaults, and a legacy session is admitted as
+    /// upstream admits it: it becomes an account grant for
+    /// `space:*?authority=*&collection=*` with default actions, so the domain
+    /// policy still confines it to the subject's own repository and grants no
+    /// `manage` operation. App-password sessions are refused where
+    /// `legacyAdmission` is ``SpaceRouteLegacyAdmission/fullAccessOnly``.
+    func authorizeSpaceRoute(
+        request: Request,
+        method: String,
+        fixedPath: String,
+        legacyAdmission: SpaceRouteLegacyAdmission = .standard,
+        now: Date = Date()
+    ) async throws -> AuthorizationContext {
+        let context = try await authorize(
+            request: request,
+            method: method,
+            fixedPath: fixedPath,
+            now: now
+        )
+        guard spacesOpenInterop else { return context }
+        switch context {
+        case let .accountOAuth(subject, permissions):
+            return .accountOAuth(
+                subject: subject,
+                permissions: permissions.withUpstreamSpaceDefaults()
+            )
+        case let .accountLegacySession(subject, _):
+            guard let legacySessions,
+                  let bearer = Self.bearerToken(from: request.headers) else {
+                throw SwanResourceAuthorizationFailure.denied
+            }
+            if legacyAdmission == .fullAccessOnly {
+                do {
+                    let fullAccessSubject = try await legacySessions.authorizeFullAccess(
+                        accessJWT: bearer,
+                        now: now
+                    )
+                    guard fullAccessSubject == subject else {
+                        throw SwanResourceAuthorizationFailure.denied
+                    }
+                } catch {
+                    throw SwanResourceAuthorizationFailure.denied
+                }
+            }
+            return .accountOAuth(
+                subject: subject,
+                permissions: Self.upstreamLegacySpacePermissions(subject: subject)
+            )
+        default:
+            return context
+        }
+    }
+
+    /// The space grant an upstream legacy session carries under open interop.
+    static func upstreamLegacySpacePermissions(subject: String) -> SwanScopePermissions {
+        SwanScopePermissions(
+            rawScopes: ["atproto", "space:*?authority=*&collection=*"],
+            subject: subject
+        ).withUpstreamSpaceDefaults()
     }
 
     /// Returns only a domain authorization context. A raw opaque token, a
@@ -87,6 +248,17 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         fixedPath: String,
         now: Date = Date()
     ) async throws -> AuthorizationContext {
+        // Credential-aware read routes have already selected their separate
+        // verifier. A space credential presented to an account-only route is
+        // never an OAuth token and cannot acquire write access by satisfying
+        // that route's nonce challenge.
+        do {
+            guard try spaceCredentialSchemeToken(from: request.headers) == nil else {
+                throw SwanResourceAuthorizationFailure.denied
+            }
+        } catch {
+            throw SwanResourceAuthorizationFailure.denied
+        }
         // A legacy session presents `Bearer`, an OAuth token presents `DPoP`.
         // The two prefixes are disjoint, so this dispatch cannot mistake one for
         // the other, and it is the ONLY place a bearer credential enters the
@@ -142,6 +314,11 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
                 now: now
             )
         } catch {
+            // Cached nonces outlive their five-minute validity, including
+            // across fresh logins. A bare denial leaves the client stuck.
+            if !runtime.dpopNonceService.isValid(presentedNonce, now: now) {
+                throw SwanResourceAuthorizationFailure.nonceChallengeRequired
+            }
             throw Self.proofFailure(for: error)
         }
 
@@ -383,5 +560,21 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
 
     private enum HeaderError: Error {
         case malformed
+    }
+}
+
+extension SpaceCredentialPresentationFailure {
+    /// The lexicon error name each route renders with HTTP 401, matching the
+    /// reference PDS (`AuthRequiredError(..., 'BadSpaceSignature' |
+    /// 'BadSpaceAudience' | 'CredentialRevoked')`).
+    var httpStatus: HTTPResponse.Status { self == .unsupportedAuthorization ? .badRequest : .unauthorized }
+
+    var xrpcErrorCode: String {
+        switch self {
+        case .unsupportedAuthorization: "InvalidToken"
+        case .badSignature: "BadSpaceSignature"
+        case .badAudience: "BadSpaceAudience"
+        case .revoked: "CredentialRevoked"
+        }
     }
 }

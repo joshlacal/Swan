@@ -595,16 +595,45 @@ final class ForumLabCLITests: XCTestCase {
             }
         }
         process.environment = processEnvironment
-        let stdout = Pipe()
-        let stderr = Pipe()
+        // A child can block while flushing stdout at exit if its parent waits
+        // before draining a Pipe. File-backed capture keeps both streams
+        // writable throughout execution and preserves their separate results.
+        let captureRoot = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: captureRoot) }
+        let stdoutURL = captureRoot.appending(path: "stdout")
+        let stderrURL = captureRoot.appending(path: "stderr")
+        for url in [stdoutURL, stderrURL] {
+            guard FileManager.default.createFile(
+                atPath: url.path,
+                contents: Data(),
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                throw NSError(domain: "ForumLabCLITests.capture", code: 1)
+            }
+        }
+        let stdout = try FileHandle(forWritingTo: stdoutURL)
+        let stderr = try FileHandle(forWritingTo: stderrURL)
+        defer {
+            try? stdout.close()
+            try? stderr.close()
+        }
         process.standardOutput = stdout
         process.standardError = stderr
         try process.run()
+        let deadline = ContinuousClock().now.advanced(by: .seconds(30))
+        while process.isRunning, ContinuousClock().now < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        if process.isRunning {
+            _ = kill(process.processIdentifier, SIGKILL)
+            process.waitUntilExit()
+            throw NSError(domain: "ForumLabCLITests.timeout", code: 1)
+        }
         process.waitUntilExit()
         return (
             process.terminationStatus,
-            stdout.fileHandleForReading.readDataToEndOfFile(),
-            stderr.fileHandleForReading.readDataToEndOfFile()
+            try Data(contentsOf: stdoutURL),
+            try Data(contentsOf: stderrURL)
         )
     }
 

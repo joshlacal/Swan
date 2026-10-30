@@ -254,7 +254,9 @@ public struct SwanSpaceCredentialHTTPConfiguration: Sendable {
 /// record and blob routes remain OAuth-only unless the broader legacy
 /// ``SwanSpaceCredentialHTTPConfiguration`` is explicitly supplied.
 public struct SwanSpaceCredentialVerificationHTTPConfiguration: Sendable {
-    let credentialPublicKeys: any SpaceCredentialPublicKeyResolver
+    /// Readable so `swan account adopt-recreated-space` verifies with exactly
+    /// the resolver `serve` composes.
+    public let credentialPublicKeys: any SpaceCredentialPublicKeyResolver
 
     public init(credentialPublicKeys: any SpaceCredentialPublicKeyResolver) {
         self.credentialPublicKeys = credentialPublicKeys
@@ -292,6 +294,63 @@ public struct SwanSpaceRepositorySyncHTTPConfiguration: Sendable {
 /// solely by `registerNotify` (Erratum 03) to resolve the credentialed
 /// caller's OWN `service` identifier through its DID document — a lookup the
 /// caller explicitly requested by naming it.
+/// The opt-in upstream-interop posture for atproto spaces, selected only by
+/// `swan serve --enable-spaces-open-interop`. Absent (the default) keeps
+/// Swan's hardened behaviour unchanged. When present:
+///
+/// - (a) notifyWrite / notifySpaceDeleted admit *unbound* upstream service
+///   JWTs (no `req` claim) whose `iss`/`aud`/`lxm` check out, whose lifetime
+///   is at most 60 s, and whose `jti` is unused. A token that does carry
+///   `req` must still match the body, and Swan still sends `req`. (notifyWrite
+///   accepts `aud` as the bare authority DID or `<authority>#atproto_pds`
+///   in both postures.)
+/// - (b) registerNotify / unregisterNotify accept the space credential alone;
+///   `Atproto-Service-Auth`, when present, still proves service ownership.
+///   Header-less registrations are rate-capped per space and per
+///   credential subject.
+/// - (d) space OAuth scopes use upstream defaults (an omitted `action`
+///   defaults to read/create/update/delete for getDelegationToken and
+///   listSpaces, and a wildcard type may exchange), and legacy sessions reach
+///   spaces as upstream: account-password sessions at getDelegationToken,
+///   and both kinds for own-repo reads/writes and listSpaces.
+///
+/// Open federation (c) is composed by `swan serve` into the key resolvers and
+/// notifyWrite destinations; it has no HTTP-layer state.
+public struct SwanSpacesOpenInteropConfiguration: Sendable, Equatable {
+    /// Upstream `createServiceJwt` mints `exp = iat + 60`.
+    public static let maximumUnboundServiceLifetime: TimeInterval = 60
+    public static let standard = SwanSpacesOpenInteropConfiguration(
+        uncheckedPerSpace: 32,
+        uncheckedPerSubject: 8
+    )
+
+    /// Header-less registerNotify calls admitted per space per hour.
+    public let maximumHeaderlessRegistrationsPerSpacePerHour: Int
+    /// Header-less registerNotify calls admitted per (space, credential
+    /// subject) per hour.
+    public let maximumHeaderlessRegistrationsPerSubjectPerHour: Int
+
+    public init(
+        maximumHeaderlessRegistrationsPerSpacePerHour: Int = 32,
+        maximumHeaderlessRegistrationsPerSubjectPerHour: Int = 8
+    ) throws {
+        guard (1 ... 1_024).contains(maximumHeaderlessRegistrationsPerSpacePerHour),
+              (1 ... maximumHeaderlessRegistrationsPerSpacePerHour)
+                .contains(maximumHeaderlessRegistrationsPerSubjectPerHour) else {
+            throw SwanError.malformed("spaces open interop registration caps are invalid")
+        }
+        self.maximumHeaderlessRegistrationsPerSpacePerHour =
+            maximumHeaderlessRegistrationsPerSpacePerHour
+        self.maximumHeaderlessRegistrationsPerSubjectPerHour =
+            maximumHeaderlessRegistrationsPerSubjectPerHour
+    }
+
+    private init(uncheckedPerSpace: Int, uncheckedPerSubject: Int) {
+        maximumHeaderlessRegistrationsPerSpacePerHour = uncheckedPerSpace
+        maximumHeaderlessRegistrationsPerSubjectPerHour = uncheckedPerSubject
+    }
+}
+
 public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
     public let serviceAuthentication: any SpaceServiceAuthenticationVerifier
     let recipientBindings: SwanSpaceNotificationRecipientBindings
@@ -352,6 +411,7 @@ public struct SwanHTTPServer: Sendable {
     /// `OAuthTokenVault` fallback: an incomplete or missing durable runtime is
     /// a startup failure, not a switch back to process-local bearer state.
     public let oauthRuntime: SwanOAuthRuntime
+    private let accountResourceAuthorizer: SwanOAuthResourceAuthorizer?
     /// Discovery is unavailable unless a later complete OAuth HTTP assembly
     /// explicitly supplies a ready gate. Durable OAuth primitives alone are
     /// not sufficient authorization-server behavior.
@@ -504,6 +564,7 @@ public struct SwanHTTPServer: Sendable {
         spaceRepositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration? = nil,
         spaceNotificationConfiguration: SwanSpaceNotificationHTTPConfiguration? = nil,
         simpleSpaceCheckUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration? = nil,
+        spacesOpenInterop: SwanSpacesOpenInteropConfiguration? = nil,
         publicRepositoryReadDirectory: (any PublicRepositoryReadDirectory)? = nil,
         publicRepositoryMutationDirectory: (any PublicRepositoryMutationDirectory)? = nil,
         publicRepositoryMutationSignerProvider: (any PublicRepositoryMutationSignerProvider)? = nil,
@@ -527,7 +588,11 @@ public struct SwanHTTPServer: Sendable {
         /// Resolves handles this host does not hold, for
         /// `com.atproto.identity.resolveHandle`. Absent keeps that anonymous
         /// route off the network entirely.
-        foreignHandleResolution: (any SwanForeignHandleResolving)? = nil
+        foreignHandleResolution: (any SwanForeignHandleResolving)? = nil,
+        spaceCredentialPolicyDirectory: (any AuthorizedSimpleSpaceCredentialDirectory)? = nil,
+        simpleSpaceLifecycleDirectory: (any AuthorizedSimpleSpaceLifecycleDirectory)? = nil,
+        spaceNotificationDirectory: (any AuthorizedSpaceNotificationDirectory)? = nil,
+        spaceCredentialIssuance: DurableSpaceCredentialAuthority.Configuration = .standard
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -616,17 +681,18 @@ public struct SwanHTTPServer: Sendable {
         // Never accept a caller-supplied authorizer here: it might bind DPoP
         // to another public URL or runtime. Failure to form the exact local
         // binding is a safe closed route, not a best-effort fallback.
-        if let authenticatedGetSpaceDirectory,
-           let accountControlStore,
-           Self.permitsResourceAuthorization(on: configuration),
-           let authorizer = try? SwanOAuthResourceAuthorizer(
-               publicURL: configuration.publicURL,
-               runtime: oauthRuntime,
-               accountControlStore: accountControlStore,
-               // `nil` unless the deployment enabled legacy sessions, which
-               // leaves this authorizer DPoP-only exactly as before.
-               legacySessions: legacySessionXRPC?.sessions
-           ) {
+        if let accountControlStore, Self.permitsResourceAuthorization(on: configuration) {
+            accountResourceAuthorizer = try? SwanOAuthResourceAuthorizer(
+                publicURL: configuration.publicURL,
+                runtime: oauthRuntime,
+                accountControlStore: accountControlStore,
+                legacySessions: legacySessionXRPC?.sessions,
+                spacesOpenInterop: spacesOpenInterop != nil
+            )
+        } else {
+            accountResourceAuthorizer = nil
+        }
+        if let authenticatedGetSpaceDirectory, let authorizer = accountResourceAuthorizer {
             // Formed once, ahead of every capability that verifies compact
             // space credentials — including the description endpoint, whose
             // live contract admits a member hosted elsewhere by credential.
@@ -664,6 +730,7 @@ public struct SwanHTTPServer: Sendable {
                     authorizer: authorizer,
                     directory: repositoryDirectory,
                     credentialAuthorizer: credentialVerifier,
+                    macProvider: spaceRepositorySyncConfiguration?.commitSigner,
                     jsonReadAdmission: resolvedJSONReadAdmission,
                     jsonWriteAdmission: resolvedJSONWriteAdmission,
                     jsonWriteBodyPolicy: resolvedJSONWriteBodyPolicy
@@ -680,8 +747,8 @@ public struct SwanHTTPServer: Sendable {
             } else {
                 authenticatedSpaceList = nil
             }
-            if let lifecycleDirectory = authenticatedGetSpaceDirectory
-                as? any AuthorizedSimpleSpaceLifecycleDirectory {
+            if let lifecycleDirectory = simpleSpaceLifecycleDirectory ?? (authenticatedGetSpaceDirectory
+                as? any AuthorizedSimpleSpaceLifecycleDirectory) {
                 authenticatedSimpleSpaceLifecycle = SwanAuthenticatedSimpleSpaceLifecycleCapability(
                     authorizer: authorizer,
                     directory: lifecycleDirectory,
@@ -701,14 +768,16 @@ public struct SwanHTTPServer: Sendable {
                 as? any AuthorizedSimpleSpaceCredentialDirectory,
                let exchangeCredentialConfiguration {
                 authenticatedSpaceCredentialExchange = SwanSpaceCredentialExchangeCapability(
+                    authorizer: authorizer,
                     delegationAuthorizer: DurableSpaceDelegationVerifier(
                         publicKeys: exchangeCredentialConfiguration.delegationPublicKeys
                     ),
                     delegationReplayStore: oauthRuntime.spaceDelegationReplayStore,
                     credentialIssuer: DurableSpaceCredentialAuthority(
-                        policyDirectory: credentialDirectory,
+                        policyDirectory: spaceCredentialPolicyDirectory ?? credentialDirectory,
                         signingKeys: exchangeCredentialConfiguration.authoritySigningKeys,
-                        clientAttestationPolicy: exchangeCredentialConfiguration.clientAttestationPolicy
+                        clientAttestationPolicy: exchangeCredentialConfiguration.clientAttestationPolicy,
+                        configuration: spaceCredentialIssuance
                     )
                 )
             } else {
@@ -769,11 +838,12 @@ public struct SwanHTTPServer: Sendable {
             } else {
                 authenticatedSpaceBlobs = nil
             }
-            if let notificationDirectory = authenticatedGetSpaceDirectory
-                as? any AuthorizedSpaceNotificationDirectory,
+            if let notificationDirectory = spaceNotificationDirectory ?? (authenticatedGetSpaceDirectory
+                as? any AuthorizedSpaceNotificationDirectory),
                let spaceCredentialConfiguration,
                let spaceNotificationConfiguration {
                 authenticatedSpaceNotifications = SwanAuthenticatedSpaceNotificationsCapability(
+                    authorizer: authorizer,
                     directory: notificationDirectory,
                     credentialAuthorizer: DurableSpaceCredentialVerifier(
                         publicKeys: spaceCredentialConfiguration.credentialPublicKeys
@@ -783,7 +853,13 @@ public struct SwanHTTPServer: Sendable {
                     notificationJSONDecodeObserver:
                         spaceNotificationConfiguration.notificationJSONDecodeObserver,
                     serviceEndpointResolver:
-                        spaceNotificationConfiguration.serviceEndpointResolver
+                        spaceNotificationConfiguration.serviceEndpointResolver,
+                    openInterop: spacesOpenInterop.map {
+                        SwanSpacesOpenInteropNotificationPolicy(
+                            configuration: $0,
+                            replayStore: oauthRuntime.spaceServiceJWTReplayStore
+                        )
+                    }
                 )
             } else {
                 authenticatedSpaceNotifications = nil
@@ -1027,7 +1103,8 @@ public struct SwanHTTPServer: Sendable {
         )
         legacySessionXRPC?.register(
             on: router,
-            requestBodyAdmission: requestBodyAdmission
+            requestBodyAdmission: requestBodyAdmission,
+            resourceAuthorizer: accountResourceAuthorizer
         )
         actorPreferencesXRPC?.register(
             on: router,
@@ -1198,6 +1275,13 @@ public struct SwanHTTPServer: Sendable {
                     capability: authenticatedSpaceNotifications,
                     requestBodyAdmission: requestBodyAdmission
                 )
+            } else if descriptor.nsid == ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier,
+                      let authenticatedSpaceNotifications {
+                registerAuthenticatedNotifyCredentialRevokedEndpoint(
+                    on: router,
+                    capability: authenticatedSpaceNotifications,
+                    requestBodyAdmission: requestBodyAdmission
+                )
             } else if descriptor.nsid == ComAtprotoSimplespaceCheckUserAccess.typeIdentifier,
                       let simpleSpaceCheckUserAccess {
                 registerSimpleSpaceCheckUserAccessEndpoint(
@@ -1327,7 +1411,7 @@ public struct SwanHTTPServer: Sendable {
         case ComAtprotoSimplespaceCreateSpace.typeIdentifier,
              ComAtprotoSimplespaceUpdateSpace.typeIdentifier,
              ComAtprotoSimplespaceDeleteSpace.typeIdentifier,
-             ComAtprotoSimplespaceAddMember.typeIdentifier,
+             ComAtprotoSimplespacePutMember.typeIdentifier,
              ComAtprotoSimplespaceRemoveMember.typeIdentifier,
              ComAtprotoSimplespaceListMembers.typeIdentifier:
             true
@@ -1562,6 +1646,11 @@ func oauthMetadataCORSHeaders(_ headers: inout HTTPFields) {
     headers[HTTPField.Name("Access-Control-Allow-Headers")!] = "Content-Type, DPoP"
 }
 
+/// The exposed pair matches upstream's OAuth provider, which exposes only
+/// `DPoP-Nonce` and `WWW-Authenticate` on these routes. They never carry
+/// `Atproto-Space-Mac`. The MAC-bearing Spaces responses expose that header
+/// themselves (`withSpaceResponseMAC`), as upstream's `getSpaceMacSecret`
+/// does.
 func oauthAPICORSHeaders(_ headers: inout HTTPFields) {
     headers[HTTPField.Name("Access-Control-Allow-Origin")!] = "*"
     headers[HTTPField.Name("Access-Control-Allow-Methods")!] = "POST, OPTIONS"

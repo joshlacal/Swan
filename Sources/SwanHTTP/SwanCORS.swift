@@ -50,6 +50,11 @@ struct SwanCORSMiddleware<Context: RequestContext>: RouterMiddleware {
     /// challenge. Swan's OAuth routes already declare exactly this pair
     /// (`oauthAPICORSHeaders`); hoisting it here extends the same decision to
     /// the XRPC surface rather than making a new one.
+    ///
+    /// `Atproto-Space-Mac` is deliberately absent. Only the four MAC-bearing
+    /// Spaces methods emit it, and they expose it on their own responses
+    /// (`withSpaceResponseMAC`), as upstream's `getSpaceMacSecret` does.
+    /// `decorate` leaves that route-level declaration in place.
     private static var exposedHeaders: String {
         "DPoP-Nonce, WWW-Authenticate"
     }
