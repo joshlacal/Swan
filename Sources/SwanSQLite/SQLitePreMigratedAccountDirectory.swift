@@ -76,6 +76,15 @@ public actor SQLitePreMigratedAccountDirectory:
     /// gate, so the added edge closes no cycle; keep it that way.
     private var repositoryWriteGates: [String: RepositoryWriteGateEntry] = [:]
     private var permanentlyRevokedDIDs: Set<String> = []
+    /// Asks a managedspace's managing app about a user. The default refuses
+    /// every non-authority user; `serve` installs the outbound
+    /// `com.atproto.managedspace.checkUserAccess` client.
+    private var managedSpaceAccessChecker: any ManagedSpaceAccessChecking =
+        DenyingManagedSpaceAccessChecker()
+
+    public func setManagedSpaceAccessChecker(_ checker: any ManagedSpaceAccessChecking) {
+        managedSpaceAccessChecker = checker
+    }
     private var drainingDatabases: [String: SQLiteAccountDatabase] = [:]
     /// At most one in-flight public-read re-admission per DID. A foreign
     /// commit invalidates one account's generation pin for every concurrent
@@ -544,7 +553,7 @@ public actor SQLitePreMigratedAccountDirectory:
 
     public func updateSimpleSpace(
         _ space: SpaceURI,
-        patch: SimpleSpaceConfigurationPatch,
+        configuration: SimpleSpaceConfiguration,
         authorization: AuthorizationContext
     ) async throws {
         let authority = try await lifecycleAuthority(
@@ -553,7 +562,22 @@ public actor SQLitePreMigratedAccountDirectory:
         )
         _ = try await authority.update(
             space: space,
-            patch: patch,
+            configuration: configuration,
+            authorization: authorization
+        )
+        try await requireLifecycleAuthorityStillAvailable(space.authority)
+    }
+
+    public func removeSpaceWriter(
+        _ writer: String,
+        from space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws {
+        _ = try await lifecycleAuthority(for: space, authorization: authorization)
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        try await database.removeSpaceWriter(
+            space: space,
+            writer: writer,
             authorization: authorization
         )
         try await requireLifecycleAuthorityStillAvailable(space.authority)
@@ -661,12 +685,35 @@ public actor SQLitePreMigratedAccountDirectory:
     ) async throws {
         let database = try await preopenedCredentialAuthorityDatabase(for: space)
         do {
-            try await database.authorizeSimpleSpaceRead(
+            let decision = try await database.authorizeSimpleSpaceRead(
                 space: space,
                 user: user,
                 clientID: clientID,
                 authorization: authorization
             )
+            if case let .requiresManagingApp(managingApp) = decision, let user {
+                // The managing app is asked with no transaction open, and
+                // its answer is re-checked against the space's current app.
+                let checker = managedSpaceAccessChecker
+                guard await checker.checkUserAccess(
+                    space: space,
+                    user: user,
+                    access: .read,
+                    clientID: clientID,
+                    managingApp: managingApp
+                ) else {
+                    throw AuthorizedSimpleSpaceLifecycleError.notFound
+                }
+                guard try await database.authorizeSimpleSpaceRead(
+                    space: space,
+                    user: user,
+                    clientID: clientID,
+                    authorization: authorization,
+                    managedApproval: managingApp
+                ) == .authorized else {
+                    throw AuthorizedSimpleSpaceLifecycleError.notFound
+                }
+            }
             try await requireCredentialAuthorityStillAvailable(space.authority)
         } catch let error as SwanError {
             throw error
@@ -866,8 +913,25 @@ public actor SQLitePreMigratedAccountDirectory:
         ) else {
             throw AuthorizedSimpleSpaceLifecycleError.notFound
         }
+        var managedWriteApproval: String?
+        if notification.space.authority != notification.repository,
+           case let .managed(managed)? = try? await database.activeSimpleSpacePolicy(notification.space) {
+            let checker = managedSpaceAccessChecker
+            if await checker.checkUserAccess(
+                space: notification.space,
+                user: notification.repository,
+                access: .write,
+                clientID: nil,
+                managingApp: managed.managingApp
+            ) {
+                managedWriteApproval = managed.managingApp
+            }
+        }
         do {
-            try await database.receiveSpaceWriteNotification(notification)
+            try await database.receiveSpaceWriteNotification(
+                notification,
+                managedWriteApproval: managedWriteApproval
+            )
             guard try await isActiveAccount(notification.space.authority), !isClosed else {
                 throw SwanError.unavailable("authenticated space directory is unavailable")
             }
@@ -1437,6 +1501,144 @@ public actor SQLitePreMigratedAccountDirectory:
         } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
+    }
+
+    // MARK: October 29 clearRecords / importRepo
+
+    public func clearRepository(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> Bool {
+        let database = try await selfWriteRepositoryDatabase(author: author, authorization: authorization)
+        // The authority keeps the records it publishes from the space's
+        // configuration; they are not the caller's to clear.
+        let keep: Set<String> = space.authority == author ? SpacePolicy.publishedCollections : []
+        return try await mapRepositoryMigrationErrors {
+            try await withRepositoryWriteLease(space: space, author: author) {
+                let collections = try await database.spaceRepositoryCollections(
+                    space: space, author: author, excluding: keep
+                )
+                for collection in collections {
+                    try Self.requireRecordGrant(
+                        space: space, author: author, collection: collection,
+                        permission: .delete, authorization: authorization
+                    )
+                }
+                let commit = try await requireAuthorizationFence()
+                    .withActiveAccountAuthorization(did: author) {
+                        try await database.clearSpaceRepository(
+                            space: space, author: author, keepCollections: keep
+                        )
+                    }
+                return commit != nil
+            }
+        }
+    }
+
+    public func importRepository(
+        space: SpaceURI,
+        author: String,
+        records: [SpaceRecord],
+        ltHash: Data,
+        authorization: AuthorizationContext
+    ) async throws {
+        let database = try await selfWriteRepositoryDatabase(author: author, authorization: authorization)
+        for collection in Set(records.map(\.uri.collection)).sorted() {
+            try Self.requireRecordGrant(
+                space: space, author: author, collection: collection,
+                permission: .create, authorization: authorization
+            )
+        }
+        try await mapRepositoryMigrationErrors {
+            try await withRepositoryWriteLease(space: space, author: author) {
+                _ = try await requireAuthorizationFence()
+                    .withActiveAccountAuthorization(did: author) {
+                        try await database.importSpaceRepository(
+                            space: space, author: author, records: records, ltHash: ltHash
+                        )
+                    }
+            }
+        }
+    }
+
+    /// The caller's own preopened account database, for its account OAuth
+    /// only: a space credential or service token never rewrites a repo.
+    private func selfWriteRepositoryDatabase(
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> SQLiteAccountDatabase {
+        guard case let .accountOAuth(subject, _) = authorization, subject == author else {
+            throw SwanError.unauthorized("only the repository's account may rewrite it")
+        }
+        guard let database = try await preopenedRepositoryDatabase(
+            for: author,
+            authorization: authorization
+        ) else {
+            throw SwanError.unauthorized("account repository is unavailable")
+        }
+        return database
+    }
+
+    private static func requireRecordGrant(
+        space: SpaceURI,
+        author: String,
+        collection: String,
+        permission: SwanSpaces.SpacePermission,
+        authorization: AuthorizationContext
+    ) throws {
+        // Any valid record key: the grant is per collection.
+        let uri = try SpaceRecordURI(space: space, author: author, collection: collection, rkey: "self")
+        try SpaceAuthorizationPolicy.require(
+            space: space, author: author, uri: uri,
+            authorization: authorization, permission: permission
+        )
+    }
+
+    private func mapRepositoryMigrationErrors<T: Sendable>(
+        _ body: () async throws -> T
+    ) async throws -> T {
+        do {
+            let result = try await body()
+            guard !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return result
+        } catch let error as SwanError {
+            throw error
+        } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch let error as AccountControlStoreError {
+            switch error {
+            case .invalidTransition, .notFound:
+                throw SwanError.unauthorized("account repository is unavailable")
+            default:
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    // MARK: October 29 exportSpaceMeta / importSpaceMeta
+
+    public func exportSpaceMeta(
+        _ space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws -> SpaceMetaArchive {
+        let database = try await preopenedAuthorityDatabase(for: space, authorization: authorization)
+        let archive = try await database.exportSpaceMeta(space: space, authorization: authorization)
+        try await requireLifecycleAuthorityStillAvailable(space.authority)
+        return archive
+    }
+
+    public func importSpaceMeta(
+        _ archive: SpaceMetaArchive,
+        authorization: AuthorizationContext
+    ) async throws {
+        let database = try await preopenedAuthorityDatabase(for: archive.space, authorization: authorization)
+        try await database.importSpaceMeta(archive, authorization: authorization)
+        try await requireLifecycleAuthorityStillAvailable(archive.space.authority)
     }
 
     /// Runs one permissioned batch as the sole writer of its repository.

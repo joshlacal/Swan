@@ -242,7 +242,7 @@ The primary server daemon is started using `swan serve`. Below is the complete r
 | `--notification-account-kek-file <path>` | String (File path) | Account KEK file for signing writer notifications. |
 | `--notification-account-kek-id <id>` | String (`primary`) | Active account KEK identifier for notification signing. |
 | `--notification-account-key-directory <path>` | String (`<data-directory>/keys`) | Key-envelope directory for notification signing. |
-| `--managing-service-audience <aud>` | String | Explicit service-JWT audience for `com.atproto.simplespace.checkUserAccess`. |
+| `--managing-service-audience <aud>` | String | Explicit service-JWT audience for the served `com.atproto.managedspace.checkUserAccess`. |
 
 ## Docker deployment
 

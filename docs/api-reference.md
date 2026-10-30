@@ -268,7 +268,7 @@ Swan intentionally closes or does not implement several reference PDS XRPC endpo
 | `com.atproto.sync.listRepoOps` | `GET` | `404 Not Found` | Public sync listRepoOps is not served; permissioned space sync provides `com.atproto.space.listRepoOps`. |
 | `com.atproto.sync.getHostStatus` | `GET` | `404 Not Found` | Use `/health` or `describeServer`. |
 | `com.atproto.sync.getBlobLimit` | `GET` | `404 Not Found` | Not implemented. |
-| `com.atproto.space.getSpace` | `GET` | `404 Not Found` | Use `com.atproto.simplespace.getSpace`. |
+| `com.atproto.simplespace.*` | any | `404 Not Found` | Retired October 29; use `com.atproto.space.*`, `com.atproto.memberspace.*` and `com.atproto.managedspace.*`. |
 
 ---
 
@@ -278,7 +278,7 @@ When an inbound request under `/xrpc/**` matches no exact local route, Swan eval
 
 ### Routing admission logic
 
-1. **Deny-list check**: Prefixes `com.atproto.space.` and `blue.catbird.` and exact NSIDs `app.bsky.actor.getPreferences` and `app.bsky.actor.putPreferences` are always denied with `403/404` and never leave the host.
+1. **Deny-list check**: Prefixes `com.atproto.space.`, `com.atproto.memberspace.`, `com.atproto.managedspace.`, `com.atproto.personalspace.`, `com.atproto.simplespace.` and `blue.catbird.` and exact NSIDs `app.bsky.actor.getPreferences` and `app.bsky.actor.putPreferences` are always denied with `403/404` and never leave the host.
 2. **Proxy header presence (`atproto-proxy`)**:
    - If an `atproto-proxy: <did>#<service-id>` header is present, the NSID must match the proxyable namespace allow-list:
      - Namespaces: `app.bsky.*`, `chat.bsky.*`, `tools.ozone.*`
@@ -291,57 +291,79 @@ When an inbound request under `/xrpc/**` matches no exact local route, Swan eval
 
 ## Permissioned spaces plane
 
-Swan implements the `permissioned-data-0016-2026-10-22` profile for access-controlled collaborative data spaces. All endpoints are mounted under `/xrpc/`. Space references are `at://` URIs, not bare DIDs. Policy and app-access values are tagged union objects with a lexicon `$type`, not strings.
+Swan implements the `permissioned-data-0016-2026-10-29` profile for access-controlled collaborative data spaces. All endpoints are mounted under `/xrpc/`. Space references are `at://` URIs, not bare DIDs. A space has exactly one policy, a tagged object whose `$type` is `com.atproto.personalspace.policy`, `com.atproto.memberspace.policy` or `com.atproto.managedspace.policy`. The retired `com.atproto.simplespace.*` routes answer `404 Not Found` and are never proxied.
 
-### Space lifecycle and membership (`com.atproto.simplespace.*`)
+### Space lifecycle (`com.atproto.space.*`)
 
-#### `com.atproto.simplespace.createSpace`
+#### `com.atproto.space.createSpace`
 - **Method**: `POST`
-- **Authentication**: Account OAuth DPoP.
-- **Request Body**: JSON object with required `spaceType` (space-type NSID), `readPolicy`, `writePolicy`, and `appAccess`; optional `skey` (record key). The authenticated account is the authority; do not send a `did` field. The pre-October-1 field name `type` is rejected with 400 `InvalidRequest`.
-- **Returns**: JSON object `{ "uri": "<space-ref>" }`.
+- **Authentication**: Account OAuth DPoP (`manage=create` or the base `atproto` scope).
+- **Request Body**: `{ "spaceType": "<NSID>", "skey": "<record key, optional>", "policy": <policy> }`. `spaceType` and `policy` are required. The authenticated account is the authority. An unknown policy `$type` is 400 `UnsupportedPolicy`; a malformed known policy (a non-boolean flag, a `managingApp` that is not a DID with an optional fragment) is 400 `InvalidRequest`.
+- **Returns**: `{ "uri": "<space-ref>" }`. Re-creating a live space is 400 `SpaceAlreadyExists`; re-creating a deleted one is a fresh create with the supplied policy.
 
-#### `com.atproto.simplespace.getSpace`
+#### `com.atproto.space.getSpace`
 - **Method**: `GET`
-- **Authentication**: OAuth or a space credential; the caller must be authorized for the space.
-- **Parameters**: Query parameter `space` (space reference, required).
-- **Returns**: JSON object with `uri`, `readPolicy`, `writePolicy`, and `appAccess`. Use `listMembers` for the member roster.
+- **Authentication**: The authority's own OAuth with `read_self` (or the base `atproto` scope). A space credential is refused; members read a published `com.atproto.space.policy` record instead.
+- **Parameters**: `space` (required).
+- **Returns**: `{ "uri": "...", "policy": <policy> }`. Any other caller, and an absent or deleted space, is 400 `SpaceNotFound`.
 
-#### `com.atproto.simplespace.updateSpace`
+#### `com.atproto.space.updateSpace`
 - **Method**: `POST`
-- **Authentication**: Space Owner.
-- **Request Body**: JSON object `{ "space": "<space URI>", "readPolicy": <policy (optional)>, "writePolicy": <policy (optional)>, "appAccess": <access (optional)> }` — each policy updates independently; omitted policies are preserved.
-- **Returns**: 200 OK empty response.
+- **Authentication**: Space owner (`manage=update`).
+- **Request Body**: `{ "space": "<space-ref>", "policy": <policy> }`, both required.
+- **Behaviour**: Replaces the policy wholesale; omitted fields take their defaults. Changing the policy `$type` discards the previous policy's state (a memberspace member list). Published `com.atproto.space.policy` and `com.atproto.memberspace.member` records are created, updated or withdrawn in the same transaction.
 
-#### `com.atproto.simplespace.deleteSpace`
+#### `com.atproto.space.deleteSpace`
 - **Method**: `POST`
-- **Authentication**: Space Owner.
-- **Request Body**: JSON object `{ "space": "<space-ref>" }`.
-- **Returns**: 200 OK empty response.
+- **Authentication**: Space owner (`manage=delete`).
+- **Request Body**: `{ "space": "<space-ref>" }`. Idempotent.
 
-#### `com.atproto.simplespace.putMember`
+#### `com.atproto.space.removeWriter`
 - **Method**: `POST`
-- **Authentication**: Space Owner.
-- **Request Body**: JSON object `{ "space": "<space-ref>", "did": "<member DID>", "read": true|false, "write": true|false }` (all fields required; both flags replaced atomically).
-- **Returns**: 200 OK empty response.
+- **Authentication**: Space owner (`manage=update`).
+- **Request Body**: `{ "space": "<space-ref>", "did": "<writer DID>" }`. Drops the account from the space's writer set. Idempotent; the account is tracked again after its next authorized write.
 
-#### `com.atproto.simplespace.removeMember`
-- **Method**: `POST`
-- **Authentication**: Space Owner.
-- **Request Body**: JSON object `{ "space": "<space-ref>", "did": "<member DID>" }`.
-- **Returns**: 200 OK empty response.
+#### `com.atproto.space.clearRecords`
+- **Method**: `POST`; **Authentication**: the repo's own account (OAuth), with a `delete` grant for every collection being cleared.
+- **Request Body**: `{ "space": "<space-ref>", "repo": "<caller DID>" }`. Deletes every record of the caller's repo in the space at a new `rev`; the authority's published `com.atproto.space.policy` and `com.atproto.memberspace.member` records are kept and need no grant. A no-op when there is nothing to delete. Responds `{}`.
 
-#### `com.atproto.simplespace.listMembers`
-- **Method**: `GET`
-- **Authentication**: Owner OAuth on the authority's PDS, with a covering read grant. A space credential is not sufficient.
-- **Parameters**: Query parameters `space` (space reference, required), `cursor` (optional), `limit` (integer, 1–1000; default 100).
-- **Returns**: JSON object `{ "members": [ { "did": "...", "read": true, "write": false } ], "cursor": "..." }`.
+#### `com.atproto.space.importRepo`
+- **Method**: `POST`, `Content-Type: application/octet-stream`, body up to 64 MiB; **Authentication**: the repo's own account (OAuth), with a `create` grant for every imported collection.
+- **Request Body**: a `getRepo` STAR archive whose commit names the caller. The records and the `data` digest are verified, then the repo is replaced at a new `rev`. Importing into the caller's own space before `importSpaceMeta` is 400 `SpaceNotFound`.
 
-#### `com.atproto.simplespace.checkUserAccess`
-- **Method**: `GET`
-- **Authentication**: Service JWT.
-- **Parameters**: Query parameters `space` (space reference, required), `user` (user DID, required), `access` (`read` or `write`, required), `clientId` (optional; must be omitted for `access=write`).
-- **Returns**: JSON object `{ "authorized": true|false }`.
+#### `com.atproto.space.exportSpaceMeta`
+- **Method**: `GET`, `?space=<space-ref>`; **Authentication**: space owner (`read_self`). `NotSpaceOwner` when the space is not the caller's.
+- **Response**: an `atproto-space-meta` STAR archive (policy, members, writer set with space revisions).
+
+#### `com.atproto.space.importSpaceMeta`
+- **Method**: `POST`, `Content-Type: application/octet-stream`; **Authentication**: space owner (`manage=create` and `manage=update`).
+- **Request Body**: an `exportSpaceMeta` archive. Replaces the space's policy, members and writer set. Publishes nothing; the authority's published records arrive with its `importRepo`. `UnsupportedPolicy` for an unknown policy type.
+
+### Memberspace members (`com.atproto.memberspace.*`)
+
+These answer 400 `PolicyMismatch` when the space's policy is not a memberspace policy.
+
+#### `com.atproto.memberspace.putMember`
+- **Method**: `POST`; **Authentication**: space owner (`manage=update`).
+- **Request Body**: `{ "space", "did", "read", "write" }`, all required; both flags are replaced. `write: false` also drops the account from the writer set.
+
+#### `com.atproto.memberspace.removeMember`
+- **Method**: `POST`; **Authentication**: space owner (`manage=update`).
+- **Request Body**: `{ "space", "did" }`. Also drops the account from the writer set. Removing the authority itself is 400 `InvalidRequest`.
+
+#### `com.atproto.memberspace.listMembers`
+- **Method**: `GET`; **Authentication**: the authority's OAuth with `read_self`. A space credential is not sufficient.
+- **Parameters**: `space` (required), `cursor`, `limit` (1–1000; default 100).
+- **Returns**: `{ "members": [ { "did", "read", "write" } ], "cursor" }`. Swan lists the authority itself as a read/write member (an intentional divergence recorded in the profile).
+
+### Managedspace (`com.atproto.managedspace.*`)
+
+A managedspace defers every user decision to `managingApp`. On a credential request (read, with the attested `clientId`) and on a write notification (write, without `clientId`) Swan calls the managing app's `com.atproto.managedspace.checkUserAccess` with service auth (`lxm=com.atproto.managedspace.checkUserAccess`, `aud=managingApp`). The endpoint is the named service in the app's DID document, or `#atproto_pds` for a bare DID. Any failure — unresolvable app, transport error, non-200 status, or a body other than `{ "authorized": true }` — denies. No network request is made inside a database transaction and no answer is cached. Without a configured resolver and transport, every non-authority user of a managedspace is refused.
+
+#### `com.atproto.managedspace.checkUserAccess` (served)
+- **Method**: `GET`; **Authentication**: service JWT.
+- **Parameters**: `space`, `user`, `access` (`read`|`write`), `clientId` (optional; must be omitted for `access=write`).
+- **Returns**: `{ "authorized": false }`. Swan does not act as a managing app.
 
 ---
 

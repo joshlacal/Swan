@@ -382,7 +382,7 @@ public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
 }
 
 /// Explicitly enables Swan's generic managing-app response for
-/// `com.atproto.simplespace.checkUserAccess`.  It deliberately contains no
+/// `com.atproto.managedspace.checkUserAccess`.  It deliberately contains no
 /// account directory, authority policy, or repository capability: a generic
 /// PDS can verify who called it, but cannot make an application-policy grant.
 public struct SwanSimpleSpaceCheckUserAccessHTTPConfiguration: Sendable {
@@ -1177,7 +1177,7 @@ public struct SwanHTTPServer: Sendable {
         // answer 404 rather than 503 when one is written.
         for descriptor in PermissionedData0016.methods
             .filter({ profile.endpoints.contains($0.nsid) }) {
-            if descriptor.nsid == ComAtprotoSimplespaceGetSpace.typeIdentifier,
+            if descriptor.nsid == "com.atproto.space.getSpace",
                let authenticatedGetSpace {
                 registerAuthenticatedGetSpaceEndpoint(on: router, capability: authenticatedGetSpace)
             } else if descriptor.nsid == ComAtprotoSpaceGetDelegationToken.typeIdentifier,
@@ -1217,6 +1217,12 @@ public struct SwanHTTPServer: Sendable {
             } else if descriptor.nsid == ComAtprotoSpaceApplyWrites.typeIdentifier,
                       let authenticatedSpaceRecords {
                 registerAuthenticatedApplyWritesEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if descriptor.nsid == "com.atproto.space.clearRecords",
+                      let authenticatedSpaceRecords {
+                registerAuthenticatedClearRecordsEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if descriptor.nsid == "com.atproto.space.importRepo",
+                      let authenticatedSpaceRecords {
+                registerAuthenticatedImportRepoEndpoint(on: router, capability: authenticatedSpaceRecords)
             } else if descriptor.nsid == ComAtprotoSpaceGetLatestCommit.typeIdentifier,
                       let authenticatedSpaceRepositorySync {
                 registerAuthenticatedGetLatestCommitEndpoint(
@@ -1282,7 +1288,7 @@ public struct SwanHTTPServer: Sendable {
                     capability: authenticatedSpaceNotifications,
                     requestBodyAdmission: requestBodyAdmission
                 )
-            } else if descriptor.nsid == ComAtprotoSimplespaceCheckUserAccess.typeIdentifier,
+            } else if descriptor.nsid == "com.atproto.managedspace.checkUserAccess",
                       let simpleSpaceCheckUserAccess {
                 registerSimpleSpaceCheckUserAccessEndpoint(
                     on: router,
@@ -1408,12 +1414,15 @@ public struct SwanHTTPServer: Sendable {
 
     private static func isSimpleSpaceLifecycleMethod(_ nsid: String) -> Bool {
         switch nsid {
-        case ComAtprotoSimplespaceCreateSpace.typeIdentifier,
-             ComAtprotoSimplespaceUpdateSpace.typeIdentifier,
-             ComAtprotoSimplespaceDeleteSpace.typeIdentifier,
-             ComAtprotoSimplespacePutMember.typeIdentifier,
-             ComAtprotoSimplespaceRemoveMember.typeIdentifier,
-             ComAtprotoSimplespaceListMembers.typeIdentifier:
+        case "com.atproto.space.createSpace",
+             "com.atproto.space.updateSpace",
+             "com.atproto.space.deleteSpace",
+             "com.atproto.space.removeWriter",
+             "com.atproto.space.exportSpaceMeta",
+             "com.atproto.space.importSpaceMeta",
+             "com.atproto.memberspace.putMember",
+             "com.atproto.memberspace.removeMember",
+             "com.atproto.memberspace.listMembers":
             true
         default:
             false
@@ -1724,7 +1733,12 @@ private func registerUnknownPermissionedEndpointGuards(
     ]
     let paths: [RouterPath] = [
         "/xrpc/com.atproto.space.*",
+        // Retired October 29; kept so a stale client gets a 404, never the
+        // pipethrough.
         "/xrpc/com.atproto.simplespace.*",
+        "/xrpc/com.atproto.memberspace.*",
+        "/xrpc/com.atproto.managedspace.*",
+        "/xrpc/com.atproto.personalspace.*",
     ]
 
     for path in paths {

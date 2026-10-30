@@ -32,7 +32,14 @@ public enum SwanXRPCProxyRoutingFailure: Error, Sendable, Equatable {
 /// proxyable space, and an allow-list of the namespaces that may be proxied at
 /// all, so dropping or disabling a local route fails closed.
 public struct SwanXRPCProxyRouter: Sendable {
-    private static let deniedPrefixes = ["com.atproto.space.", "blue.catbird."]
+    private static let deniedPrefixes = [
+        "com.atproto.space.",
+        "com.atproto.memberspace.",
+        "com.atproto.managedspace.",
+        "com.atproto.personalspace.",
+        "com.atproto.simplespace.",
+        "blue.catbird.",
+    ]
     /// Exact NSIDs Swan owns inside a namespace it otherwise proxies.
     ///
     /// Account preferences are PDS state: the AppView does not store them, so

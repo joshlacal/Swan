@@ -74,7 +74,7 @@ public extension SpaceScopeTarget {
         )
     }
 
-    /// The `simplespace.getSpace` configuration read accepts read_self and
+    /// The `space.getSpace` and `memberspace.listMembers` owner reads accept read_self and
     /// read grants regardless of their collection parameters.
     static func spaceDescriptionRead(_ space: SpaceURI) -> SpaceScopeTarget {
         SpaceScopeTarget(

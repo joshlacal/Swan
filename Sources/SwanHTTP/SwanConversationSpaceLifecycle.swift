@@ -37,9 +37,13 @@ public struct SwanConversationSpaceLifecycle: AuthorizedSimpleSpaceLifecycleDire
         try requireLocalPolicy(space)
         try await local.createSimpleSpace(space, configuration: configuration, authorization: authorization)
     }
-    public func updateSimpleSpace(_ space: SpaceURI, patch: SimpleSpaceConfigurationPatch, authorization: AuthorizationContext) async throws {
+    public func updateSimpleSpace(_ space: SpaceURI, configuration: SimpleSpaceConfiguration, authorization: AuthorizationContext) async throws {
         try requireLocalPolicy(space)
-        try await local.updateSimpleSpace(space, patch: patch, authorization: authorization)
+        try await local.updateSimpleSpace(space, configuration: configuration, authorization: authorization)
+    }
+    public func removeSpaceWriter(_ writer: String, from space: SpaceURI, authorization: AuthorizationContext) async throws {
+        try requireLocalPolicy(space)
+        try await local.removeSpaceWriter(writer, from: space, authorization: authorization)
     }
     public func putSimpleSpaceMember(_ member: String, read: Bool, write: Bool, in space: SpaceURI, authorization: AuthorizationContext) async throws {
         try requireLocalPolicy(space)

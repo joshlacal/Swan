@@ -249,7 +249,25 @@ public enum SpaceSTARCodec {
         ]))
     }
 
+    /// `com.atproto.space.importRepo`: an account's own archive, read
+    /// without a MAC (section 5d). The records must still fold to the
+    /// commit's `data`; the caller checks that `repo` is the caller.
+    public static func decodeImport(
+        _ bytes: Data, limits: SpaceSTARLimits = .standard
+    ) throws -> VerifiedSpaceSTARRecovery {
+        var reader = STARBufferReader(bytes: Data(bytes))
+        guard try reader.readExactly(magic.count) == magic else { throw SpaceSTARError.invalidMagic }
+        let commit = try decodeMetadataUnchecked(reader.frame(maximum: SpaceSTARLimits.maximumMetadataBytes))
+        return try decode(bytes, space: commit.space, author: commit.repo, limits: limits) { _ in true }
+    }
+
     public static func decodeMetadata(_ bytes: Data, space: SpaceURI, author: String) throws -> SpaceRepositoryCommit {
+        let commit = try decodeMetadataUnchecked(bytes)
+        guard commit.space == space, commit.repo == author else { throw SpaceSTARError.wrongRepository }
+        return commit
+    }
+
+    private static func decodeMetadataUnchecked(_ bytes: Data) throws -> SpaceRepositoryCommit {
         // Petrel's public generic DRISL decoder is exposed through CARReader.
         // This bounded one-block envelope stays internal and does not alter
         // the STAR bytes, which are compared with canonical encoding below.
@@ -274,7 +292,6 @@ public enum SpaceSTARCodec {
             commit = try SpaceRepositoryCommit(repo: repo, space: SpaceURI(rawSpace), rev: rev, data: data)
             guard try encodeMetadata(commit) == bytes else { throw SpaceSTARError.invalidMetadata }
         } catch { throw SpaceSTARError.invalidMetadata }
-        guard commit.space == space, commit.repo == author else { throw SpaceSTARError.wrongRepository }
         return commit
     }
 
@@ -322,7 +339,7 @@ public enum SpaceSTARCodec {
 
     private static func recordPath(_ record: SpaceRecord) -> String { "\(record.uri.collection)/\(record.uri.rkey)" }
 
-    private static func appendFrame(_ value: Data, to output: inout Data) {
+    static func appendFrame(_ value: Data, to output: inout Data) {
         appendLength(value.count, to: &output)
         output.append(value)
     }
@@ -338,7 +355,7 @@ public enum SpaceSTARCodec {
     }
 }
 
-private struct STARBufferReader {
+struct STARBufferReader {
     let bytes: Data
     var offset = 0
     var isAtEnd: Bool { offset == bytes.count }

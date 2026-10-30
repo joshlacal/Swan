@@ -8,4 +8,5 @@ import Crypto
 extension SymmetricKey: @unchecked Sendable {}
 extension P256.Signing.PrivateKey: @unchecked Sendable {}
 extension P256.Signing.PublicKey: @unchecked Sendable {}
+extension P256.KeyAgreement.PrivateKey: @unchecked Sendable {}
 

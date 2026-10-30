@@ -307,7 +307,7 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
                 authorization: .accountOAuthForTesting(subject: bob, scopes: ["atproto"])
             )
         )
-        // The live simplespace.getSpace contract gates the owner's OAuth on a
+        // The live space.getSpace contract gates the owner's OAuth on a
         // read_self-satisfying space grant — a scoped read for exactly this
         // space now succeeds where the retired manage-gated endpoint refused.
         let scopedDescription = try await directory.space(

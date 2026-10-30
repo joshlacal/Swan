@@ -91,7 +91,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-10-22.json"
+                        path: "Profiles/permissioned-data-0016-2026-10-29.json"
                     )
                 ),
                 configuration: .init(
@@ -169,7 +169,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(
-                    path: "Profiles/permissioned-data-0016-2026-10-22.json"
+                    path: "Profiles/permissioned-data-0016-2026-10-29.json"
                 )
             )
             let server = composition.makeServer(
@@ -212,11 +212,11 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 as: UTF8.self
             )
             let cases: [SemanticCase] = [
-                .init(nsid: "com.atproto.simplespace.createSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.createSpace", body: "{\"did\":\"\(localDID)\",\"spaceType\":\"app.bsky.bookmarks\",\"skey\":\"\(lifecycle.skey)\",\"readPolicy\":{\"$type\":\"com.atproto.simplespace.defs#publicPolicy\"},\"writePolicy\":{\"$type\":\"com.atproto.simplespace.defs#publicPolicy\"},\"appAccess\":{\"$type\":\"com.atproto.simplespace.defs#open\"}}", authorization: .oauth, invariant: .jsonString("uri", lifecycle.rawValue)),
-                .init(nsid: "com.atproto.simplespace.updateSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.updateSpace", body: "{\"space\":\"\(lifecycle.rawValue)\",\"readPolicy\":{\"$type\":\"com.atproto.simplespace.defs#publicPolicy\"}}", authorization: .oauth, invariant: .emptyBody),
-                .init(nsid: "com.atproto.simplespace.putMember", method: .post, uri: "/xrpc/com.atproto.simplespace.putMember", body: "{\"space\":\"\(lifecycle.rawValue)\",\"did\":\"\(remoteDID)\",\"read\":true,\"write\":true}", authorization: .oauth, invariant: .emptyBody),
-                .init(nsid: "com.atproto.simplespace.listMembers", method: .get, uri: "/xrpc/com.atproto.simplespace.listMembers?space=\(encodedLifecycle)", body: nil, authorization: .oauth, invariant: .jsonArrayContains("members", field: "did", value: remoteDID)),
-                .init(nsid: "com.atproto.simplespace.getSpace", method: .get, uri: "/xrpc/com.atproto.simplespace.getSpace?space=\(encodedSpace)", body: nil, authorization: .oauth, invariant: .jsonString("uri", space.rawValue)),
+                .init(nsid: "com.atproto.space.createSpace", method: .post, uri: "/xrpc/com.atproto.space.createSpace", body: "{\"spaceType\":\"app.bsky.bookmarks\",\"skey\":\"\(lifecycle.skey)\",\"policy\":{\"$type\":\"com.atproto.memberspace.policy\",\"publicRead\":true,\"publicWrite\":true}}", authorization: .oauth, invariant: .jsonString("uri", lifecycle.rawValue)),
+                .init(nsid: "com.atproto.space.updateSpace", method: .post, uri: "/xrpc/com.atproto.space.updateSpace", body: "{\"space\":\"\(lifecycle.rawValue)\",\"policy\":{\"$type\":\"com.atproto.memberspace.policy\",\"publicRead\":true}}", authorization: .oauth, invariant: .emptyBody),
+                .init(nsid: "com.atproto.memberspace.putMember", method: .post, uri: "/xrpc/com.atproto.memberspace.putMember", body: "{\"space\":\"\(lifecycle.rawValue)\",\"did\":\"\(remoteDID)\",\"read\":true,\"write\":true}", authorization: .oauth, invariant: .emptyBody),
+                .init(nsid: "com.atproto.memberspace.listMembers", method: .get, uri: "/xrpc/com.atproto.memberspace.listMembers?space=\(encodedLifecycle)", body: nil, authorization: .oauth, invariant: .jsonArrayContains("members", field: "did", value: remoteDID)),
+                .init(nsid: "com.atproto.space.getSpace", method: .get, uri: "/xrpc/com.atproto.space.getSpace?space=\(encodedSpace)", body: nil, authorization: .oauth, invariant: .jsonString("uri", space.rawValue)),
                 .init(nsid: "com.atproto.space.listSpaces", method: .get, uri: "/xrpc/com.atproto.space.listSpaces", body: nil, authorization: .oauth, invariant: .jsonArrayContains("spaces", field: "uri", value: lifecycle.rawValue)),
                 .init(nsid: "com.atproto.space.getDelegationToken", method: .get, uri: "/xrpc/com.atproto.space.getDelegationToken?space=\(encodedSpace)", body: nil, authorization: .oauth, invariant: .jsonNonEmptyString("token")),
                 .init(nsid: "com.atproto.space.getSpaceCredential", method: .post, uri: "/xrpc/com.atproto.space.getSpaceCredential", body: credentialExchangeBody, authorization: .delegation, invariant: .jsonNonEmptyString("credential")),
@@ -234,10 +234,11 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.space.unregisterNotify", method: .post, uri: "/xrpc/com.atproto.space.unregisterNotify", body: "{\"space\":\"\(space.rawValue)\",\"service\":\"\(remoteDID)#notify\"}", authorization: .unregisterNotify, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.notifyWrite", method: .post, uri: "/xrpc/com.atproto.space.notifyWrite", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"repoRev\":\"222222222222z\",\"data\":{\"$bytes\":\"\(Data(repeating: 0x31, count: 32).base64EncodedString())\"}}", authorization: .notifyWrite, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.listRepos", method: .get, uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)", body: nil, authorization: .credential, invariant: .jsonArrayContains("repos", field: "did", value: localDID)),
-                .init(nsid: "com.atproto.simplespace.checkUserAccess", method: .get, uri: "/xrpc/com.atproto.simplespace.checkUserAccess?space=\(encodedSpace)&user=\(remoteDID)&access=read", body: nil, authorization: .checkUserAccess, invariant: .jsonBoolean("authorized", false)),
+                .init(nsid: "com.atproto.managedspace.checkUserAccess", method: .get, uri: "/xrpc/com.atproto.managedspace.checkUserAccess?space=\(encodedSpace)&user=\(remoteDID)&access=read", body: nil, authorization: .checkUserAccess, invariant: .jsonBoolean("authorized", false)),
                 .init(nsid: "com.atproto.space.deleteRecord", method: .post, uri: "/xrpc/com.atproto.space.deleteRecord", body: recordPrefix + ",\"rkey\":\"delete-me\"}", authorization: .oauth, invariant: .jsonEmptyObject),
-                .init(nsid: "com.atproto.simplespace.removeMember", method: .post, uri: "/xrpc/com.atproto.simplespace.removeMember", body: "{\"space\":\"\(lifecycle.rawValue)\",\"did\":\"\(remoteDID)\"}", authorization: .oauth, invariant: .emptyBody),
-                .init(nsid: "com.atproto.simplespace.deleteSpace", method: .post, uri: "/xrpc/com.atproto.simplespace.deleteSpace", body: "{\"space\":\"\(lifecycle.rawValue)\"}", authorization: .oauth, invariant: .emptyBody),
+                .init(nsid: "com.atproto.memberspace.removeMember", method: .post, uri: "/xrpc/com.atproto.memberspace.removeMember", body: "{\"space\":\"\(lifecycle.rawValue)\",\"did\":\"\(remoteDID)\"}", authorization: .oauth, invariant: .emptyBody),
+                .init(nsid: "com.atproto.space.removeWriter", method: .post, uri: "/xrpc/com.atproto.space.removeWriter", body: "{\"space\":\"\(lifecycle.rawValue)\",\"did\":\"\(remoteDID)\"}", authorization: .oauth, invariant: .emptyBody),
+                .init(nsid: "com.atproto.space.deleteSpace", method: .post, uri: "/xrpc/com.atproto.space.deleteSpace", body: "{\"space\":\"\(lifecycle.rawValue)\"}", authorization: .oauth, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.notifySpaceDeleted", method: .post, uri: "/xrpc/com.atproto.space.notifySpaceDeleted", body: "{\"space\":\"\(lifecycle.rawValue)\"}", authorization: .notifyDeleted, invariant: .emptyBody),
                 // Last: it revokes the matrix credential, checked after the loop.
                 .init(nsid: "com.atproto.space.notifyCredentialRevoked", method: .post, uri: "/xrpc/com.atproto.space.notifyCredentialRevoked", body: "{\"space\":\"\(space.rawValue)\",\"credentials\":[\"\(credentialJTI)\"]}", authorization: .notifyCredentialRevoked, invariant: .emptyBody),
@@ -246,16 +247,22 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let profileSet = Set(profile.endpoints)
             let generatedSet = Set(PermissionedData0016.methods.map(\.nsid))
             let matrixSet = Set(cases.map(\.nsid))
-            // Profile methods this composition does not serve yet. They stay
-            // in the profile and registry and are routed as method-correct
-            // 503 gates, checked after the semantic matrix below.
-            let gatedPending: Set<String> = []
-            XCTAssertEqual(profile.endpoints.count, 28)
-            XCTAssertEqual(PermissionedData0016.methods.count, 28)
-            XCTAssertEqual(cases.count, 28)
+            // Served profile methods outside this JSON matrix: their bodies or
+            // responses are STAR archives, covered by their own tests. Here
+            // they are checked to be live (not a 503 gate), method-correct and
+            // refusing an unauthenticated caller.
+            let servedOutsideMatrix: Set<String> = [
+                "com.atproto.space.clearRecords",
+                "com.atproto.space.exportSpaceMeta",
+                "com.atproto.space.importRepo",
+                "com.atproto.space.importSpaceMeta",
+            ]
+            XCTAssertEqual(profile.endpoints.count, 33)
+            XCTAssertEqual(PermissionedData0016.methods.count, 33)
+            XCTAssertEqual(cases.count, 29)
             XCTAssertEqual(profileSet, generatedSet)
-            XCTAssertEqual(profileSet, matrixSet.union(gatedPending))
-            XCTAssertTrue(matrixSet.isDisjoint(with: gatedPending))
+            XCTAssertEqual(profileSet, matrixSet.union(servedOutsideMatrix))
+            XCTAssertTrue(matrixSet.isDisjoint(with: servedOutsideMatrix))
             XCTAssertEqual(matrixSet.count, cases.count, "matrix contains a duplicate NSID")
 
             let app = server.buildApplication(
@@ -387,11 +394,30 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                         )
                     }
                 }
-                for nsid in gatedPending.sorted() {
-                    try await client.execute(uri: "/xrpc/\(nsid)", method: .post) { response in
-                        XCTAssertEqual(response.status, .serviceUnavailable, nsid)
+                for nsid in servedOutsideMatrix.sorted() {
+                    let isQuery = PermissionedData0016.methods.first { $0.nsid == nsid }?.kind == .query
+                    let live: String
+                    var liveHeaders = HTTPFields()
+                    switch nsid {
+                    case "com.atproto.space.exportSpaceMeta":
+                        live = "/xrpc/\(nsid)?space=\(encodedSpace)"
+                    case "com.atproto.space.clearRecords":
+                        live = "/xrpc/\(nsid)"
+                        liveHeaders[.contentType] = "application/json"
+                    default:
+                        live = "/xrpc/\(nsid)"
+                        liveHeaders[.contentType] = "application/octet-stream"
                     }
-                    try await client.execute(uri: "/xrpc/\(nsid)", method: .get) { response in
+                    let liveBody = nsid.hasSuffix("clearRecords")
+                        ? ByteBuffer(string: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\"}")
+                        : ByteBuffer(bytes: SpaceSTARCodec.magic)
+                    try await client.execute(
+                        uri: live, method: isQuery ? .get : .post, headers: liveHeaders,
+                        body: isQuery ? nil : liveBody
+                    ) { response in
+                        XCTAssertEqual(response.status, .unauthorized, nsid)
+                    }
+                    try await client.execute(uri: "/xrpc/\(nsid)", method: isQuery ? .post : .get) { response in
                         XCTAssertEqual(response.status, .notFound, nsid)
                     }
                 }
@@ -591,7 +617,8 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 )
                 XCTAssertEqual(
                     lifecycleRows.first?.column("write_policy")?.string,
-                    "public"
+                    "member-list",
+                    "updateSpace replaces the policy wholesale: publicWrite was omitted"
                 )
                 XCTAssertGreaterThan(
                     lifecycleRows.first?.column("revision")?.integer ?? 0,
@@ -830,7 +857,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-10-22.json"
+                        path: "Profiles/permissioned-data-0016-2026-10-29.json"
                     )
                 ),
                 configuration: .init(
@@ -858,7 +885,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             try await app.test(.router) { client in
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.simplespace.getSpace",
+                    uri: "/xrpc/com.atproto.space.getSpace",
                     method: .get
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -1135,7 +1162,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         if testCase.method == .post {
             return (path, "{}", .badRequest, "InvalidRequest")
         }
-        if testCase.nsid == ComAtprotoSimplespaceCheckUserAccess.typeIdentifier {
+        if testCase.nsid == "com.atproto.managedspace.checkUserAccess" {
             // This endpoint deliberately makes malformed queries
             // indistinguishable from authorization denial.
             return (path, nil, .unauthorized, "Unauthorized")
@@ -1245,7 +1272,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let checkUserAccess = try SpaceServiceJWT.create(
                 issuer: space.authority,
                 audience: managingAudience,
-                method: ComAtprotoSimplespaceCheckUserAccess.typeIdentifier,
+                method: "com.atproto.managedspace.checkUserAccess",
                 eventID: jti,
                 key: fixture.localKey
             )

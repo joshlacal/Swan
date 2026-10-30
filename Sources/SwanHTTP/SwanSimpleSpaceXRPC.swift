@@ -33,98 +33,123 @@ public struct SwanAuthenticatedSimpleSpaceLifecycleCapability: Sendable {
     }
 }
 
-private enum AuthenticatedSimpleSpaceLifecycleFailure: Error {
+enum AuthenticatedSimpleSpaceLifecycleFailure: Error {
     case invalidRequest
     case spaceNotFound
+    case notSpaceOwner
     case spaceAlreadyExists
     case unsupportedPolicy
-    case unsupportedAppAccess
+    case policyMismatch
     case denied
     case nonceChallenge
     case unavailable
 }
 
-/// A `policy` value in either dialect the shipped surface accepts: the live
-/// lexicon's typed union (`#publicPolicy` / `#memberListPolicy` /
-/// `#managingAppPolicy`, the latter carrying its own `managingApp`), or the
-/// retired string form (`"public"` / `"member-list"` / `"managing-app"`) that
-/// pre-bddc99fb clients still emit. An unrecognized union `$type` is the
-/// lexicon's `UnsupportedPolicy`, not a malformed request.
-///
-/// `#managingAppPolicy` is also `UnsupportedPolicy` (SWAN-24 option B).
-/// Swan has no outbound `com.atproto.simplespace.checkUserAccess` client, so
-/// a managing-app space would silently deny every non-owner; proposal 0016
-/// says a host MUST reject a policy it does not implement at createSpace /
-/// updateSpace time.
-private enum SimpleSpacePolicyWire: Decodable {
-    case union(SimpleSpacePolicy, managingApp: String?)
-
-    init(from decoder: Decoder) throws {
-        let union = try ComAtprotoSimplespaceUpdateSpace.InputReadPolicyUnion(from: decoder)
-        switch union {
-        case .comAtprotoSimplespaceDefsPublicPolicy:
-            self = .union(.public, managingApp: nil)
-        case .comAtprotoSimplespaceDefsMemberListPolicy:
-            self = .union(.memberList, managingApp: nil)
-        case .comAtprotoSimplespaceDefsManagingAppPolicy:
-            throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
-        case .unexpected:
-            throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
-        }
-    }
-}
-
-private enum SimpleSpaceAppAccessWire: Decodable {
-    case open
-    case allowList(Set<String>)
-
-    init(from decoder: Decoder) throws {
-        let union = try ComAtprotoSimplespaceCreateSpace.InputAppAccessUnion(from: decoder)
-        switch union {
-        case .comAtprotoSimplespaceDefsOpen:
-            self = .open
-        case let .comAtprotoSimplespaceDefsAllowList(value):
-            guard value.allowed.count <= 1_000 else {
-                throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-            }
-            self = .allowList(Set(value.allowed))
-        case .unexpected:
-            throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedAppAccess
-        }
-    }
-
-    var domainValue: SimpleSpaceAppAccess {
-        switch self {
-        case .open: .open
-        case let .allowList(clients): .allowList(clients)
-        }
-    }
-}
-
-private struct SimpleSpaceCreateWireInput: Decodable {
-    let did: DID?
-    let spaceType: NSID
+/// `com.atproto.space.createSpace` input `{ spaceType, skey?, policy }`.
+/// Swan's Petrel pin predates October 29, so the input is decoded by hand.
+private struct SpaceCreateWireInput {
+    let spaceType: String
     let skey: String?
-    let readPolicy: SimpleSpacePolicyWire
-    let writePolicy: SimpleSpacePolicyWire
-    let appAccess: SimpleSpaceAppAccessWire
+    let policy: SpacePolicy
+
+    init(_ root: SpaceLifecycleJSONObject) throws {
+        spaceType = try lifecycleString(root["spaceType"])
+        skey = try root["skey"].map(lifecycleString)
+        policy = try lifecyclePolicy(root["policy"])
+    }
 }
 
-private struct AuthenticatedSimpleSpaceCreateHandler {
+/// `com.atproto.space.updateSpace` input `{ space, policy }`, both required.
+private struct SpaceUpdateWireInput {
+    let space: SpaceURI
+    let policy: SpacePolicy
+
+    init(_ root: SpaceLifecycleJSONObject) throws {
+        space = try lifecycleSpace(root["space"])
+        policy = try lifecyclePolicy(root["policy"])
+    }
+}
+
+/// `{ space }` (deleteSpace) and `{ space, did }` (removeMember,
+/// removeWriter).
+private struct SpaceMemberWireInput {
+    let space: SpaceURI
+    let did: String?
+
+    init(_ root: SpaceLifecycleJSONObject) throws {
+        space = try lifecycleSpace(root["space"])
+        did = try root["did"].map(lifecycleDID)
+    }
+}
+
+/// `com.atproto.memberspace.putMember` input `{ space, did, read, write }`.
+private struct SpacePutMemberWireInput {
+    let space: SpaceURI
+    let did: String
+    let read: Bool
+    let write: Bool
+
+    init(_ root: SpaceLifecycleJSONObject) throws {
+        space = try lifecycleSpace(root["space"])
+        did = try lifecycleDID(root["did"])
+        read = try lifecycleBool(root["read"])
+        write = try lifecycleBool(root["write"])
+    }
+}
+
+private func lifecycleString(_ value: Any?) throws -> String {
+    guard let string = value as? String, !string.isEmpty, string.utf8.count <= 2_048 else {
+        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+    }
+    return string
+}
+
+private func lifecycleBool(_ value: Any?) throws -> Bool {
+    guard let value, SpacePolicy.isJSONBoolean(value), let bool = value as? Bool else {
+        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+    }
+    return bool
+}
+
+private func lifecycleDID(_ value: Any?) throws -> String {
+    let string = try lifecycleString(value)
+    do {
+        return try DID(didString: string).didString()
+    } catch {
+        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+    }
+}
+
+func lifecycleSpace(_ value: Any?) throws -> SpaceURI {
+    let string = try lifecycleString(value)
+    do {
+        return try SpaceURI(SpaceRef(uriString: string).uriString())
+    } catch {
+        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+    }
+}
+
+private func lifecyclePolicy(_ value: Any?) throws -> SpacePolicy {
+    guard let value else { throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest }
+    do {
+        return try SpacePolicy.normalized(jsonObject: value)
+    } catch SpacePolicyError.unsupportedPolicy {
+        throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
+    } catch {
+        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+    }
+}
+
+private struct AuthenticatedSpaceCreateHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
-    func handle(
-        parameters _: Void,
-        input: SimpleSpaceCreateWireInput,
-        context request: Request
-    ) async throws -> ComAtprotoSimplespaceCreateSpace.Output {
-        // Authorization runs before the space URI is built: the authority
-        // defaults to the caller, so identity must be known first. The
-        // token is still validated exactly once.
+    func handle(_ input: SpaceCreateWireInput, request: Request) async throws -> SpaceCreateWireOutput {
+        // Authorization runs before the space URI is built: the authority is
+        // the caller, so identity must be known first.
         let authorization = try await lifecycleAuthorization(
             capability.authorizer,
             request: request,
-            fixedPath: "/xrpc/com.atproto.simplespace.createSpace"
+            fixedPath: "/xrpc/com.atproto.space.createSpace"
         )
         guard case let .accountOAuth(subject, _) = authorization else {
             throw AuthenticatedSimpleSpaceLifecycleFailure.spaceNotFound
@@ -138,62 +163,45 @@ private struct AuthenticatedSimpleSpaceCreateHandler {
                 skey = try await capability.tidAllocator.next().toString()
             }
             space = try SpaceURI(
-                authority: input.did?.didString() ?? subject,
-                spaceType: input.spaceType.nsidString(),
+                authority: subject,
+                spaceType: try NSID(nsidString: input.spaceType).nsidString(),
                 skey: skey
             )
         } catch {
             throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
         }
         try requireLifecycleAuthority(authorization, space: space)
-        let configuration = try simpleSpaceConfiguration(input)
         do {
             try await capability.directory.createSimpleSpace(
                 space,
-                configuration: configuration,
+                configuration: SimpleSpaceConfiguration(policy: input.policy),
                 authorization: authorization
             )
         } catch {
             throw lifecycleFailure(for: error)
         }
-        do {
-            return try .init(uri: SpaceRef(uriString: space.rawValue))
-        } catch {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.unavailable
-        }
+        return SpaceCreateWireOutput(uri: space.rawValue)
     }
 }
 
-/// The wire input for `updateSpace`, admitting the live lexicon shape
-/// (`space`, optional `policy`/`appAccess` unions) and the retired dialect's
-/// string `policy` plus top-level `managingApp`.
-private struct SimpleSpaceUpdateWireInput: Decodable {
-    let space: SpaceRef
-    let readPolicy: SimpleSpacePolicyWire?
-    let writePolicy: SimpleSpacePolicyWire?
-    let appAccess: SimpleSpaceAppAccessWire?
+private struct SpaceCreateWireOutput: Encodable {
+    let uri: String
 }
 
-private struct AuthenticatedSimpleSpaceUpdateHandler {
+private struct AuthenticatedSpaceUpdateHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
-    func handle(
-        parameters _: Void,
-        input: SimpleSpaceUpdateWireInput,
-        context request: Request
-    ) async throws {
-        let space = try lifecycleSpace(input.space)
+    func handle(_ input: SpaceUpdateWireInput, request: Request) async throws {
         let authorization = try await lifecycleAuthorization(
             capability.authorizer,
             request: request,
-            fixedPath: "/xrpc/com.atproto.simplespace.updateSpace"
+            fixedPath: "/xrpc/com.atproto.space.updateSpace"
         )
-        try requireLifecycleAuthority(authorization, space: space)
-        let patch = try simpleSpacePatch(input)
+        try requireLifecycleAuthority(authorization, space: input.space)
         do {
             try await capability.directory.updateSimpleSpace(
-                space,
-                patch: patch,
+                input.space,
+                configuration: SimpleSpaceConfiguration(policy: input.policy),
                 authorization: authorization
             )
         } catch {
@@ -202,53 +210,65 @@ private struct AuthenticatedSimpleSpaceUpdateHandler {
     }
 }
 
-private struct AuthenticatedSimpleSpaceDeleteHandler: ComAtprotoSimplespaceDeleteSpace.ServerHandler {
-    typealias Context = Request
+private struct AuthenticatedSpaceDeleteHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
-    func handle(
-        parameters: Void,
-        input: ComAtprotoSimplespaceDeleteSpace.Input,
-        context request: Request
-    ) async throws {
-        let space = try lifecycleSpace(input.space)
+    func handle(_ input: SpaceMemberWireInput, request: Request) async throws {
         let authorization = try await lifecycleAuthorization(
             capability.authorizer,
             request: request,
-            fixedPath: "/xrpc/com.atproto.simplespace.deleteSpace"
+            fixedPath: "/xrpc/com.atproto.space.deleteSpace"
         )
-        try requireLifecycleAuthority(authorization, space: space)
+        try requireLifecycleAuthority(authorization, space: input.space)
         do {
-            try await capability.directory.deleteSimpleSpace(space, authorization: authorization)
+            try await capability.directory.deleteSimpleSpace(input.space, authorization: authorization)
         } catch {
             throw lifecycleFailure(for: error)
         }
     }
 }
 
-private struct AuthenticatedSimpleSpacePutMemberHandler: ComAtprotoSimplespacePutMember.ServerHandler {
-    typealias Context = Request
+private struct AuthenticatedSpaceRemoveWriterHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
-    func handle(
-        parameters: Void,
-        input: ComAtprotoSimplespacePutMember.Input,
-        context request: Request
-    ) async throws {
-        let space = try lifecycleSpace(input.space)
-        let member = input.did.didString()
+    func handle(_ input: SpaceMemberWireInput, request: Request) async throws {
+        guard let writer = input.did else {
+            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+        }
         let authorization = try await lifecycleAuthorization(
             capability.authorizer,
             request: request,
-            fixedPath: "/xrpc/com.atproto.simplespace.putMember"
+            fixedPath: "/xrpc/com.atproto.space.removeWriter"
         )
-        try requireLifecycleAuthority(authorization, space: space)
+        try requireLifecycleAuthority(authorization, space: input.space)
+        do {
+            try await capability.directory.removeSpaceWriter(
+                writer,
+                from: input.space,
+                authorization: authorization
+            )
+        } catch {
+            throw lifecycleFailure(for: error)
+        }
+    }
+}
+
+private struct AuthenticatedMemberspacePutMemberHandler {
+    let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
+
+    func handle(_ input: SpacePutMemberWireInput, request: Request) async throws {
+        let authorization = try await lifecycleAuthorization(
+            capability.authorizer,
+            request: request,
+            fixedPath: "/xrpc/com.atproto.memberspace.putMember"
+        )
+        try requireLifecycleAuthority(authorization, space: input.space)
         do {
             try await capability.directory.putSimpleSpaceMember(
-                member,
+                input.did,
                 read: input.read,
                 write: input.write,
-                in: space,
+                in: input.space,
                 authorization: authorization
             )
         } catch {
@@ -257,27 +277,23 @@ private struct AuthenticatedSimpleSpacePutMemberHandler: ComAtprotoSimplespacePu
     }
 }
 
-private struct AuthenticatedSimpleSpaceRemoveMemberHandler: ComAtprotoSimplespaceRemoveMember.ServerHandler {
-    typealias Context = Request
+private struct AuthenticatedMemberspaceRemoveMemberHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
-    func handle(
-        parameters: Void,
-        input: ComAtprotoSimplespaceRemoveMember.Input,
-        context request: Request
-    ) async throws {
-        let space = try lifecycleSpace(input.space)
-        let member = input.did.didString()
+    func handle(_ input: SpaceMemberWireInput, request: Request) async throws {
+        guard let member = input.did else {
+            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+        }
         let authorization = try await lifecycleAuthorization(
             capability.authorizer,
             request: request,
-            fixedPath: "/xrpc/com.atproto.simplespace.removeMember"
+            fixedPath: "/xrpc/com.atproto.memberspace.removeMember"
         )
-        try requireLifecycleAuthority(authorization, space: space)
+        try requireLifecycleAuthority(authorization, space: input.space)
         do {
             try await capability.directory.removeSimpleSpaceMember(
                 member,
-                from: space,
+                from: input.space,
                 authorization: authorization
             )
         } catch {
@@ -286,20 +302,24 @@ private struct AuthenticatedSimpleSpaceRemoveMemberHandler: ComAtprotoSimplespac
     }
 }
 
-private struct AuthenticatedSimpleSpaceListMembersHandler: ComAtprotoSimplespaceListMembers.ServerHandler {
-    typealias Context = Request
+private struct MemberspaceListMembersParameters {
+    let space: SpaceURI
+    let limit: Int?
+    let cursor: String?
+}
+
+private struct AuthenticatedMemberspaceListMembersHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
     func handle(
-        parameters: ComAtprotoSimplespaceListMembers.Parameters,
-        input: Void,
-        context request: Request
-    ) async throws -> ComAtprotoSimplespaceListMembers.Output {
-        let space = try lifecycleSpace(parameters.space)
+        _ parameters: MemberspaceListMembersParameters,
+        request: Request
+    ) async throws -> SimpleSpaceMembersWireOutput {
+        let space = parameters.space
         let authorization = try await lifecycleAuthorization(
             capability.authorizer,
             request: request,
-            fixedPath: "/xrpc/com.atproto.simplespace.listMembers",
+            fixedPath: "/xrpc/com.atproto.memberspace.listMembers",
             method: "GET"
         )
         try requireLifecycleAuthority(authorization, space: space)
@@ -314,14 +334,10 @@ private struct AuthenticatedSimpleSpaceListMembersHandler: ComAtprotoSimplespace
         } catch {
             throw lifecycleFailure(for: error)
         }
-        do {
-            return try .init(
-                cursor: page.cursor,
-                members: page.members.map { try .init(did: DID(didString: $0.did), read: $0.read, write: $0.write) }
-            )
-        } catch {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.unavailable
-        }
+        return SimpleSpaceMembersWireOutput(
+            cursor: page.cursor,
+            members: page.members.map { .init(did: $0.did, read: $0.read, write: $0.write) }
+        )
     }
 }
 
@@ -329,139 +345,97 @@ func registerAuthenticatedSimpleSpaceLifecycleEndpoints(
     on router: Router<BasicRequestContext>,
     capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 ) {
-    registerSimpleSpaceCreate(on: router, capability: capability)
-    registerSimpleSpaceUpdate(on: router, capability: capability)
-    registerSimpleSpaceDelete(on: router, capability: capability)
-    registerSimpleSpacePutMember(on: router, capability: capability)
-    registerSimpleSpaceRemoveMember(on: router, capability: capability)
-    registerSimpleSpaceListMembers(on: router, capability: capability)
+    let create = AuthenticatedSpaceCreateHandler(capability: capability)
+    registerSpaceLifecycleProcedure(
+        on: router, path: "/xrpc/com.atproto.space.createSpace", capability: capability,
+        required: ["spaceType", "policy"], allowed: ["spaceType", "skey", "policy"]
+    ) { root, request in
+        authenticatedGetSpaceJSON(.ok, try await create.handle(try SpaceCreateWireInput(root), request: request))
+    }
+    let update = AuthenticatedSpaceUpdateHandler(capability: capability)
+    registerSpaceLifecycleProcedure(
+        on: router, path: "/xrpc/com.atproto.space.updateSpace", capability: capability,
+        required: ["space", "policy"], allowed: ["space", "policy"]
+    ) { root, request in
+        try await update.handle(try SpaceUpdateWireInput(root), request: request)
+        return Response(status: .ok, headers: [.cacheControl: "no-store"])
+    }
+    let delete = AuthenticatedSpaceDeleteHandler(capability: capability)
+    registerSpaceLifecycleProcedure(
+        on: router, path: "/xrpc/com.atproto.space.deleteSpace", capability: capability,
+        required: ["space"], allowed: ["space"]
+    ) { root, request in
+        try await delete.handle(try SpaceMemberWireInput(root), request: request)
+        return Response(status: .ok, headers: [.cacheControl: "no-store"])
+    }
+    let removeWriter = AuthenticatedSpaceRemoveWriterHandler(capability: capability)
+    registerSpaceLifecycleProcedure(
+        on: router, path: "/xrpc/com.atproto.space.removeWriter", capability: capability,
+        required: ["space", "did"], allowed: ["space", "did"]
+    ) { root, request in
+        try await removeWriter.handle(try SpaceMemberWireInput(root), request: request)
+        return Response(status: .ok, headers: [.cacheControl: "no-store"])
+    }
+    let putMember = AuthenticatedMemberspacePutMemberHandler(capability: capability)
+    registerSpaceLifecycleProcedure(
+        on: router, path: "/xrpc/com.atproto.memberspace.putMember", capability: capability,
+        required: ["space", "did", "read", "write"], allowed: ["space", "did", "read", "write"]
+    ) { root, request in
+        try await putMember.handle(try SpacePutMemberWireInput(root), request: request)
+        return Response(status: .ok, headers: [.cacheControl: "no-store"])
+    }
+    let removeMember = AuthenticatedMemberspaceRemoveMemberHandler(capability: capability)
+    registerSpaceLifecycleProcedure(
+        on: router, path: "/xrpc/com.atproto.memberspace.removeMember", capability: capability,
+        required: ["space", "did"], allowed: ["space", "did"]
+    ) { root, request in
+        try await removeMember.handle(try SpaceMemberWireInput(root), request: request)
+        return Response(status: .ok, headers: [.cacheControl: "no-store"])
+    }
+    registerMemberspaceListMembers(on: router, capability: capability)
+    registerAuthenticatedSpaceMetaEndpoints(on: router, capability: capability)
 }
 
-private func registerSimpleSpaceCreate(
+private func registerSpaceLifecycleProcedure(
     on router: Router<BasicRequestContext>,
-    capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
+    path: RouterPath,
+    capability: SwanAuthenticatedSimpleSpaceLifecycleCapability,
+    required: Set<String>,
+    allowed: Set<String>,
+    operation: @escaping @Sendable (SpaceLifecycleJSONObject, Request) async throws -> Response
 ) {
-    let handler = AuthenticatedSimpleSpaceCreateHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.simplespace.createSpace"
     router.post(path) { request, context async -> Response in
         await withSimpleSpaceInput(
             request,
             context: context,
-            as: SimpleSpaceCreateWireInput.self,
             capability: capability,
-            // `spaceType` is the October 1 alpha field name; a body that
-            // still sends the retired `type` fails the key-set check.
-            required: ["spaceType", "readPolicy", "writePolicy", "appAccess"],
-            allowed: ["did", "spaceType", "skey", "readPolicy", "writePolicy", "appAccess"]
-        ) { input in
-            authenticatedGetSpaceJSON(
-                .ok,
-                try await handler.handle(parameters: (), input: input, context: request)
-            )
+            required: required,
+            allowed: allowed
+        ) { root in
+            try await operation(root, request)
         }
     }
     registerSimpleSpaceWrongMethods(on: router, path: path, liveMethod: .post)
 }
 
-private func registerSimpleSpaceUpdate(
-    on router: Router<BasicRequestContext>,
-    capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
-) {
-    let handler = AuthenticatedSimpleSpaceUpdateHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.simplespace.updateSpace"
-    router.post(path) { request, context async -> Response in
-        await withSimpleSpaceInput(
-            request,
-            context: context,
-            as: SimpleSpaceUpdateWireInput.self,
-            capability: capability,
-            required: ["space"],
-            allowed: ["space", "readPolicy", "writePolicy", "appAccess"]
-        ) { input in
-            _ = try await handler.handle(parameters: (), input: input, context: request)
-            return Response(status: .ok, headers: [.cacheControl: "no-store"])
-        }
-    }
-    registerSimpleSpaceWrongMethods(on: router, path: path, liveMethod: .post)
+/// A strictly validated JSON object body. `[String: Any]` is not `Sendable`;
+/// the dictionary is created and consumed within one request task.
+struct SpaceLifecycleJSONObject: @unchecked Sendable {
+    let root: [String: Any]
+    subscript(key: String) -> Any? { root[key] }
 }
 
-private func registerSimpleSpaceDelete(
+private func registerMemberspaceListMembers(
     on router: Router<BasicRequestContext>,
     capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 ) {
-    let handler = AuthenticatedSimpleSpaceDeleteHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.simplespace.deleteSpace"
-    router.post(path) { request, context async -> Response in
-        await withSimpleSpaceInput(
-            request,
-            context: context,
-            as: ComAtprotoSimplespaceDeleteSpace.Input.self,
-            capability: capability,
-            required: ["space"],
-            allowed: ["space"]
-        ) { input in
-            _ = try await handler.handle(parameters: (), input: input, context: request)
-            return Response(status: .ok, headers: [.cacheControl: "no-store"])
-        }
-    }
-    registerSimpleSpaceWrongMethods(on: router, path: path, liveMethod: .post)
-}
-
-private func registerSimpleSpacePutMember(
-    on router: Router<BasicRequestContext>,
-    capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
-) {
-    let handler = AuthenticatedSimpleSpacePutMemberHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.simplespace.putMember"
-    router.post(path) { request, context async -> Response in
-        await withSimpleSpaceInput(
-            request,
-            context: context,
-            as: ComAtprotoSimplespacePutMember.Input.self,
-            capability: capability,
-            required: ["space", "did", "read", "write"],
-            allowed: ["space", "did", "read", "write"]
-        ) { input in
-            _ = try await handler.handle(parameters: (), input: input, context: request)
-            return Response(status: .ok, headers: [.cacheControl: "no-store"])
-        }
-    }
-    registerSimpleSpaceWrongMethods(on: router, path: path, liveMethod: .post)
-}
-
-private func registerSimpleSpaceRemoveMember(
-    on router: Router<BasicRequestContext>,
-    capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
-) {
-    let handler = AuthenticatedSimpleSpaceRemoveMemberHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.simplespace.removeMember"
-    router.post(path) { request, context async -> Response in
-        await withSimpleSpaceInput(
-            request,
-            context: context,
-            as: ComAtprotoSimplespaceRemoveMember.Input.self,
-            capability: capability,
-            required: ["space", "did"],
-            allowed: ["space", "did"]
-        ) { input in
-            _ = try await handler.handle(parameters: (), input: input, context: request)
-            return Response(status: .ok, headers: [.cacheControl: "no-store"])
-        }
-    }
-    registerSimpleSpaceWrongMethods(on: router, path: path, liveMethod: .post)
-}
-
-private func registerSimpleSpaceListMembers(
-    on router: Router<BasicRequestContext>,
-    capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
-) {
-    let handler = AuthenticatedSimpleSpaceListMembersHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.simplespace.listMembers"
+    let handler = AuthenticatedMemberspaceListMembersHandler(capability: capability)
+    let path: RouterPath = "/xrpc/com.atproto.memberspace.listMembers"
     router.get(path) { request, _ async -> Response in
         do {
             let parameters = try parseSimpleSpaceListMembersParameters(request)
-            let output = try await handler.handle(parameters: parameters, input: (), context: request)
-            return simpleSpaceMembersJSON(.ok, output)
+            let output = try await handler.handle(parameters, request: request)
+            return authenticatedGetSpaceJSON(.ok, output)
         } catch let failure as AuthenticatedSimpleSpaceLifecycleFailure {
             return simpleSpaceLifecycleResponse(for: failure, capability: capability)
         } catch {
@@ -471,7 +445,7 @@ private func registerSimpleSpaceListMembers(
     registerSimpleSpaceWrongMethods(on: router, path: path, liveMethod: .get)
 }
 
-private func lifecycleAuthorization(
+func lifecycleAuthorization(
     _ authorizer: SwanOAuthResourceAuthorizer,
     request: Request,
     fixedPath: String,
@@ -506,17 +480,16 @@ private func requireLifecycleAuthority(
     }
 }
 
-private func lifecycleSpace(_ uri: SpaceRef) throws -> SpaceURI {
-    do {
-        return try SpaceURI(uri.uriString())
-    } catch {
-        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-    }
-}
-
-private func lifecycleFailure(for error: Error) -> AuthenticatedSimpleSpaceLifecycleFailure {
+func lifecycleFailure(for error: Error) -> AuthenticatedSimpleSpaceLifecycleFailure {
     if error is AuthorizedSimpleSpaceLifecycleError {
         return .spaceNotFound
+    }
+    if let error = error as? SpacePolicyError {
+        switch error {
+        case .unsupportedPolicy: return .unsupportedPolicy
+        case .invalidPolicy: return .invalidRequest
+        case .policyMismatch: return .policyMismatch
+        }
     }
     guard let error = error as? SwanError else { return .unavailable }
     switch error {
@@ -527,101 +500,13 @@ private func lifecycleFailure(for error: Error) -> AuthenticatedSimpleSpaceLifec
     }
 }
 
-private func simpleSpaceConfiguration(
-    _ input: SimpleSpaceCreateWireInput
-) throws -> SimpleSpaceConfiguration {
-    do {
-        let (readPolicy, readManagingApp): (SimpleSpacePolicy, String?)
-        switch input.readPolicy {
-        case let .union(value, app):
-            readPolicy = value
-            readManagingApp = app
-        }
-        let (writePolicy, writeManagingApp): (SimpleSpacePolicy, String?)
-        switch input.writePolicy {
-        case let .union(value, app):
-            writePolicy = value
-            writeManagingApp = app
-        }
-        return try .init(
-            readPolicy: readPolicy,
-            readManagingApp: readManagingApp,
-            writePolicy: writePolicy,
-            writeManagingApp: writeManagingApp,
-            appAccess: input.appAccess.domainValue
-        )
-    } catch let failure as AuthenticatedSimpleSpaceLifecycleFailure {
-        throw failure
-    } catch {
-        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-    }
-}
-
-private func simpleSpacePatch(
-    _ input: SimpleSpaceUpdateWireInput
-) throws -> SimpleSpaceConfigurationPatch {
-    do {
-        let readPolicy: SimpleSpacePolicy?
-        let readManagingApp: SimpleSpaceConfigurationPatch.ManagingApp
-        if let inputRead = input.readPolicy {
-            switch inputRead {
-            case let .union(value, .some(app)):
-                readPolicy = value
-                guard !app.isEmpty, app.utf8.count <= 2_048 else {
-                    throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-                }
-                readManagingApp = .set(app)
-            case let .union(value, nil):
-                readPolicy = value
-                readManagingApp = .set(nil)
-            }
-        } else {
-            readPolicy = nil
-            readManagingApp = .unchanged
-        }
-
-        let writePolicy: SimpleSpacePolicy?
-        let writeManagingApp: SimpleSpaceConfigurationPatch.ManagingApp
-        if let inputWrite = input.writePolicy {
-            switch inputWrite {
-            case let .union(value, .some(app)):
-                writePolicy = value
-                guard !app.isEmpty, app.utf8.count <= 2_048 else {
-                    throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-                }
-                writeManagingApp = .set(app)
-            case let .union(value, nil):
-                writePolicy = value
-                writeManagingApp = .set(nil)
-            }
-        } else {
-            writePolicy = nil
-            writeManagingApp = .unchanged
-        }
-
-        let appAccess = input.appAccess?.domainValue
-        return .init(
-            readPolicy: readPolicy,
-            readManagingApp: readManagingApp,
-            writePolicy: writePolicy,
-            writeManagingApp: writeManagingApp,
-            appAccess: appAccess
-        )
-    } catch let failure as AuthenticatedSimpleSpaceLifecycleFailure {
-        throw failure
-    } catch {
-        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-    }
-}
-
-private func withSimpleSpaceInput<Value: Decodable>(
+private func withSimpleSpaceInput(
     _ request: Request,
     context: SwanHTTPRequestContext,
-    as type: Value.Type,
     capability: SwanAuthenticatedSimpleSpaceLifecycleCapability,
     required: Set<String>,
     allowed: Set<String>,
-    operation: (Value) async throws -> Response
+    operation: (SpaceLifecycleJSONObject) async throws -> Response
 ) async -> Response {
     let contentTypes = request.headers[values: .contentType]
     guard contentTypes.count == 1,
@@ -669,8 +554,7 @@ private func withSimpleSpaceInput<Value: Decodable>(
                 }
                 throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
             }
-            try validateSimpleSpaceJSON(root)
-            return try JSONDecoder().decode(type, from: data)
+            return SpaceLifecycleJSONObject(root: root)
         } catch let failure as AuthenticatedSimpleSpaceLifecycleFailure {
             throw failure
         } catch {
@@ -695,7 +579,7 @@ func acceptsSimpleSpaceWriteContentLength(_ values: [String]) -> Bool {
     return length <= authenticatedSpaceWriteMaximumJSONBytes
 }
 
-private func simpleSpaceLifecycleResponse(
+func simpleSpaceLifecycleResponse(
     for error: any Error,
     capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 ) -> Response {
@@ -708,7 +592,7 @@ private func simpleSpaceLifecycleResponse(
     return simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
 }
 
-private func simpleSpaceLifecycleResponse(
+func simpleSpaceLifecycleResponse(
     for failure: SwanJSONWriteBodyCollectionFailure
 ) -> Response {
     switch failure {
@@ -719,91 +603,9 @@ private func simpleSpaceLifecycleResponse(
     }
 }
 
-/// Binds every field the six lifecycle contracts accept before the generated
-/// decoder sees it. The duplicate-key parser above applies recursively; this
-/// semantic pass rejects unknown/nullable nested configuration fields too.
-private func validateSimpleSpaceJSON(_ root: [String: Any]) throws {
-    for key in ["did", "spaceType", "skey", "space"] {
-        if let value = root[key] {
-            guard let string = value as? String,
-                  !string.isEmpty,
-                  string.utf8.count <= 2_048 else {
-                throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-            }
-        }
-    }
-    if let readPolicy = root["readPolicy"] {
-        try validateSimpleSpacePolicyJSON(readPolicy)
-    }
-    if let writePolicy = root["writePolicy"] {
-        try validateSimpleSpacePolicyJSON(writePolicy)
-    }
-    if let appAccess = root["appAccess"] {
-        guard let object = appAccess as? [String: Any] else {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-        }
-        try validateSimpleSpaceAppAccessJSON(object)
-    }
-    if let read = root["read"] {
-        guard read is Bool else {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-        }
-    }
-    if let write = root["write"] {
-        guard write is Bool else {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-        }
-    }
-}
-
-private func validateSimpleSpacePolicyJSON(_ value: Any) throws {
-    guard let object = value as? [String: Any],
-          let type = object["$type"] as? String else {
-        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-    }
-    switch type {
-    case ComAtprotoSimplespaceDefs.PublicPolicy.typeIdentifier,
-         ComAtprotoSimplespaceDefs.MemberListPolicy.typeIdentifier:
-        guard Set(object.keys) == Set(["$type"]) else {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-        }
-    case ComAtprotoSimplespaceDefs.ManagingAppPolicy.typeIdentifier:
-        guard Set(object.keys) == Set(["$type", "managingApp"]),
-              let managingApp = object["managingApp"] as? String,
-              !managingApp.isEmpty,
-              managingApp.utf8.count <= 2_048 else {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-        }
-        // Well-formed but not implemented: see `SimpleSpacePolicyWire`.
-        throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
-    default:
-        throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
-    }
-}
-private func validateSimpleSpaceAppAccessJSON(_ access: [String: Any]) throws {
-    guard let type = access["$type"] as? String else {
-        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-    }
-    switch type {
-    case ComAtprotoSimplespaceDefs.Open.typeIdentifier:
-        guard Set(access.keys) == Set(["$type"]) else {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-        }
-    case ComAtprotoSimplespaceDefs.AllowList.typeIdentifier:
-        guard Set(access.keys) == Set(["$type", "allowed"]),
-              let allowed = access["allowed"] as? [String],
-              allowed.count <= 1_000,
-              allowed.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 2_048 }) else {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-        }
-    default:
-        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-    }
-}
-
 private func parseSimpleSpaceListMembersParameters(
     _ request: Request
-) throws -> ComAtprotoSimplespaceListMembers.Parameters {
+) throws -> MemberspaceListMembersParameters {
     guard !request.uri.string.contains("#"),
           let query = request.uri.query,
           !query.isEmpty,
@@ -827,8 +629,7 @@ private func parseSimpleSpaceListMembersParameters(
           rawSpace.utf8.count <= 2_048 else {
         throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
     }
-    let space = try SpaceRef(uriString: rawSpace)
-    _ = try lifecycleSpace(space)
+    let space = try lifecycleSpace(rawSpace)
     let limit: Int?
     if let rawLimit = values["limit"] {
         guard rawLimit.utf8.allSatisfy({ $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }),
@@ -850,10 +651,10 @@ private func parseSimpleSpaceListMembersParameters(
     } else {
         cursor = nil
     }
-    return .init(space: space, limit: limit, cursor: cursor)
+    return MemberspaceListMembersParameters(space: space, limit: limit, cursor: cursor)
 }
 
-private func registerSimpleSpaceWrongMethods(
+func registerSimpleSpaceWrongMethods(
     on router: Router<BasicRequestContext>,
     path: RouterPath,
     liveMethod: HTTPRequest.Method
@@ -866,7 +667,7 @@ private func registerSimpleSpaceWrongMethods(
     }
 }
 
-private func simpleSpaceLifecycleResponse(
+func simpleSpaceLifecycleResponse(
     for failure: AuthenticatedSimpleSpaceLifecycleFailure,
     capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 ) -> Response {
@@ -874,13 +675,15 @@ private func simpleSpaceLifecycleResponse(
     case .invalidRequest:
         simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
     case .spaceNotFound:
-        simpleSpaceLifecycleError(.notFound, code: "SpaceNotFound")
+        simpleSpaceLifecycleError(.badRequest, code: "SpaceNotFound")
+    case .notSpaceOwner:
+        simpleSpaceLifecycleError(.badRequest, code: "NotSpaceOwner")
     case .spaceAlreadyExists:
         simpleSpaceLifecycleError(.badRequest, code: "SpaceAlreadyExists")
     case .unsupportedPolicy:
         simpleSpaceLifecycleError(.badRequest, code: "UnsupportedPolicy")
-    case .unsupportedAppAccess:
-        simpleSpaceLifecycleError(.badRequest, code: "UnsupportedAppAccess")
+    case .policyMismatch:
+        simpleSpaceLifecycleError(.badRequest, code: "PolicyMismatch")
     case .denied:
         simpleSpaceLifecycleError(.unauthorized, code: "Unauthorized")
     case .nonceChallenge:
@@ -890,33 +693,20 @@ private func simpleSpaceLifecycleResponse(
     }
 }
 
-private func simpleSpaceLifecycleError(
+func simpleSpaceLifecycleError(
     _ status: HTTPResponse.Status,
     code: String
 ) -> Response {
     authenticatedGetSpaceJSON(status, ["error": code])
 }
 
-private struct SimpleSpaceMembersWireOutput: Encodable {
+struct SimpleSpaceMembersWireOutput: Encodable {
     let cursor: String?
     let members: [SimpleSpaceMemberWireOutput]
 }
 
-private struct SimpleSpaceMemberWireOutput: Encodable {
+struct SimpleSpaceMemberWireOutput: Encodable {
     let did: String
     let read: Bool
     let write: Bool
-}
-
-private func simpleSpaceMembersJSON(
-    _ status: HTTPResponse.Status,
-    _ output: ComAtprotoSimplespaceListMembers.Output
-) -> Response {
-    authenticatedGetSpaceJSON(
-        status,
-        SimpleSpaceMembersWireOutput(
-            cursor: output.cursor,
-            members: output.members.map { .init(did: $0.did.didString(), read: $0.read, write: $0.write) }
-        )
-    )
 }

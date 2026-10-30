@@ -712,6 +712,10 @@ public enum SQLiteLayout {
             write_policy TEXT NOT NULL CHECK(write_policy IN ('public', 'member-list', 'managing-app')),
             write_managing_app TEXT,
             app_access TEXT NOT NULL CHECK(app_access IN ('open', 'allow-list')),
+            policy_type TEXT NOT NULL DEFAULT 'memberspace'
+                CHECK(policy_type IN ('personalspace', 'memberspace', 'managedspace')),
+            publish_policy INTEGER NOT NULL DEFAULT 0 CHECK(publish_policy IN (0, 1)),
+            publish_members INTEGER NOT NULL DEFAULT 0 CHECK(publish_members IN (0, 1)),
             is_deleted INTEGER NOT NULL CHECK(is_deleted IN (0, 1)),
             revision INTEGER NOT NULL CHECK(revision > 0),
             created_at INTEGER NOT NULL CHECK(created_at >= 0),
@@ -1529,6 +1533,19 @@ public enum SQLiteLayout {
         )
         """,
         """
+        -- A repository whose operation log was deliberately emptied by
+        -- clearRecords or importRepo (October 29 sections 4 and 5). Every
+        -- operation since then is retained until retention pruning deletes
+        -- one, which removes this row, so an older listRepoOps cursor gets
+        -- the retained operations and the current commit, as the reference
+        -- answers, instead of a full-recovery gap.
+        CREATE TABLE IF NOT EXISTS permissioned_repository_history_resets (
+            space_uri TEXT NOT NULL,
+            author_did TEXT NOT NULL,
+            PRIMARY KEY(space_uri, author_did)
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS permissioned_space_requests (
             request_id TEXT PRIMARY KEY,
             space_uri TEXT NOT NULL,
@@ -2263,7 +2280,17 @@ struct SQLiteTestingHooks: Sendable {
     }
 }
 
-private struct LoadedSimpleSpaceAuthority: Sendable {
+/// A user decision the authority's account database can make without
+/// network I/O.
+public enum SimpleSpaceUserDecision: Sendable, Equatable {
+    case authorized
+    case denied
+    /// The space is a managedspace: the named managing app decides, through
+    /// `com.atproto.managedspace.checkUserAccess`, outside the transaction.
+    case requiresManagingApp(String)
+}
+
+struct LoadedSimpleSpaceAuthority: Sendable {
     let state: DurableSimpleSpaceState
     let managingAppReadAllowedUsers: Set<String>
     let managingAppWriteAllowedUsers: Set<String>
@@ -2373,7 +2400,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     let readConnectionGate = SQLiteConnectionGate()
     let dataDirectory: URL
     let accountDID: String
-    private let oplogRetention: Int
+    let oplogRetention: Int
     private let blobQuota: AccountBlobQuota
     private let portableExportReadOnly: Bool
     private let descriptorBackedRestore: Bool
@@ -2803,6 +2830,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migrateSpaceWriterSequenceIfNeeded()
             try await migrateSpaceNotificationServiceKeysIfNeeded()
             try await migrateRemoteReplicaLifecycleFenceIfNeeded()
+            try await migrateSpacePolicyIfNeeded()
         }
         try await migrateSpaceNotificationReceiptScopeIfNeeded()
         try await compactSpaceNotificationReceiptsIfNeeded()
@@ -4415,7 +4443,27 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
+    /// Since SQLite 3.26 a table rename rewrites the `REFERENCES` clause of
+    /// every other table that names it, even with `foreign_keys = OFF`. An
+    /// existing child outside this rebuild (the pre-v21 writer registry, the
+    /// pre-v22 notification registrations) would then point at the `_schema_v2`
+    /// copy this migration drops, and the migration's `foreign_key_check`
+    /// fails on its first row. `legacy_alter_table` keeps those clauses naming the
+    /// canonical table, which the migration recreates under the same name.
+    /// Unlike `foreign_keys`, this flag takes effect inside a transaction; it
+    /// is connection-local, so it is restored before any other statement.
     private func renameSimpleSpaceAuthorityTablesForMigration() async throws {
+        _ = try await connection.query("PRAGMA legacy_alter_table = ON")
+        do {
+            try await renameSimpleSpaceAuthorityTables()
+        } catch {
+            _ = try? await connection.query("PRAGMA legacy_alter_table = OFF")
+            throw error
+        }
+        _ = try await connection.query("PRAGMA legacy_alter_table = OFF")
+    }
+
+    private func renameSimpleSpaceAuthorityTables() async throws {
         _ = try await connection.query(
             "ALTER TABLE permissioned_simple_space_authorities RENAME TO permissioned_simple_space_authorities_schema_v2"
         )
@@ -4822,6 +4870,33 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
         return try await withConnectionGate {
             try await transaction {
+                try await applyWithoutGate(
+                    space: space,
+                    author: author,
+                    expectedRevision: expectedRevision,
+                    requestID: requestID,
+                    wireRevision: wireRevision,
+                    writes: writes,
+                    eventID: eventID,
+                    permissionedBlobCIDs: permissionedBlobCIDs
+                )
+            }
+        }
+    }
+
+    /// The transaction body of ``apply(space:author:expectedRevision:requestID:wireRevision:writes:eventID:)``.
+    /// The caller holds the connection gate and an open write transaction and
+    /// has already validated the batch.
+    func applyWithoutGate(
+        space: SpaceURI,
+        author: String,
+        expectedRevision: UInt64,
+        requestID: UUID,
+        wireRevision: TID,
+        writes: [SQLiteSpaceWrite],
+        eventID: UUID,
+        permissionedBlobCIDs: Set<String>
+    ) async throws -> PersistedRepositoryCommit {
             try await requireLocalRepositorySpaceOpen(space)
             let duplicate = try await connection.query(
                 "SELECT 1 FROM permissioned_space_requests WHERE request_id = ?",
@@ -5235,6 +5310,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 if let first = deletedOplog.first {
                     let deletedCount = try requiredNonnegativeInteger(first, "count")
                     newOplogCount = max(0, newOplogCount - deletedCount)
+                    if deletedCount > 0 {
+                        try await dropRepositoryHistoryResetWithoutGate(space: space, author: author)
+                    }
                 }
             }
 
@@ -5279,6 +5357,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         if let first = deletedRows.first {
                             let deletedCount = try requiredNonnegativeInteger(first, "count")
                             newOplogCount = max(0, newOplogCount - deletedCount)
+                            if deletedCount > 0 {
+                                try await dropRepositoryHistoryResetWithoutGate(space: space, author: author)
+                            }
                         }
                     }
                 }
@@ -5328,8 +5409,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 entries: entries,
                 outbox: outbox
             )
-            }
-        }
     }
 
     public func repositorySnapshot(
@@ -7298,7 +7377,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             return .incremental(state: nil, entries: [])
         }
 
-        if let since {
+        let historyReset = try await !conn.query(
+            """
+            SELECT 1 FROM permissioned_repository_history_resets
+            WHERE space_uri = ? AND author_did = ?
+            """,
+            [.text(space.rawValue), .text(author)]
+        ).isEmpty
+        if let since, !historyReset {
             let oldestRows = try await conn.query(
                 """
                 SELECT wire_revision
@@ -7677,20 +7763,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         SET is_deleted = 0, revision = ?,
                             read_policy = ?, read_managing_app = ?,
                             write_policy = ?, write_managing_app = ?,
-                            app_access = ?,
+                            app_access = ?, policy_type = ?,
+                            publish_policy = ?, publish_members = ?,
                             updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
                         WHERE space_uri = ?
                         """,
-                        [
-                            .integer(try sqliteRevision(nextRevision)),
-                            .text(configuration.readPolicy.rawValue),
-                            configuration.readManagingApp.map(SQLiteData.text) ?? .null,
-                            .text(configuration.writePolicy.rawValue),
-                            configuration.writeManagingApp.map(SQLiteData.text) ?? .null,
-                            .text(simpleSpaceAppAccessName(configuration.appAccess)),
-                            .integer(timestamp), .integer(timestamp),
-                            .text(space.rawValue),
-                        ]
+                        [.integer(try sqliteRevision(nextRevision))]
+                            + simpleSpacePolicyColumnBindings(configuration)
+                            + [
+                                .integer(timestamp), .integer(timestamp),
+                                .text(space.rawValue),
+                            ]
                     )
                     _ = try await connection.query(
                         "DELETE FROM permissioned_simple_space_members WHERE space_uri = ?",
@@ -7707,6 +7790,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         space: space,
                         appAccess: configuration.appAccess
                     )
+                    try await reconcilePublishedSpaceRecordsWithoutGate(space: space, now: now)
                     return try await requiredSimpleSpace(space).state
                 }
                 _ = try await connection.query(
@@ -7714,18 +7798,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     INSERT INTO permissioned_simple_space_authorities(
                         space_uri, owner_did, read_policy, read_managing_app,
                         write_policy, write_managing_app, app_access,
+                        policy_type, publish_policy, publish_members,
                         is_deleted, revision, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
                     """,
-                    [
-                        .text(space.rawValue), .text(owner),
-                        .text(configuration.readPolicy.rawValue),
-                        configuration.readManagingApp.map(SQLiteData.text) ?? .null,
-                        .text(configuration.writePolicy.rawValue),
-                        configuration.writeManagingApp.map(SQLiteData.text) ?? .null,
-                        .text(simpleSpaceAppAccessName(configuration.appAccess)),
-                        .integer(timestamp), .integer(timestamp),
-                    ]
+                    [.text(space.rawValue), .text(owner)]
+                        + simpleSpacePolicyColumnBindings(configuration)
+                        + [.integer(timestamp), .integer(timestamp)]
                 )
                 _ = try await connection.query(
                     """
@@ -7738,6 +7817,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     space: space,
                     appAccess: configuration.appAccess
                 )
+                try await reconcilePublishedSpaceRecordsWithoutGate(space: space, now: now)
                 return try await requiredSimpleSpace(space).state
             }
         }
@@ -7792,14 +7872,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try requireAuthorityAccount(space: space)
         return try await withReadConnectionGate {
             try await readTransaction {
-                try requireAuthorityManagement(
+                // October 29 listMembers: the owner's OAuth with `read_self`
+                // (`assertSpaceOwner(..., { action: 'read_self' })`), not a
+                // management verb.
+                try SpaceAuthorizationPolicy.requireSpaceDescriptionRead(
                     space: space,
-                    authorization: authorization,
-                    operation: .update
+                    authorization: authorization
                 )
                 let authorityRows = try await readConnection.query(
                     """
-                    SELECT owner_did, read_policy, read_managing_app, write_policy, write_managing_app, app_access, is_deleted
+                    SELECT owner_did, read_policy, read_managing_app, write_policy, write_managing_app, app_access,
+                           policy_type, is_deleted
                     FROM permissioned_simple_space_authorities
                     WHERE space_uri = ?
                     LIMIT 1
@@ -7852,6 +7935,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 }
                 guard deleted == 0 else {
                     throw AuthorizedSimpleSpaceLifecycleError.notFound
+                }
+                guard try requiredText(authorityRow, "policy_type") == "memberspace" else {
+                    throw SpacePolicyError.policyMismatch
                 }
 
                 let memberCountRows = try await readConnection.query(
@@ -7985,6 +8071,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
+    /// `com.atproto.space.updateSpace`: replaces the policy wholesale. A
+    /// policy of a different `$type` migrates the space, discarding the
+    /// previous policy's state (the member list, apart from Swan's owner row),
+    /// so migrating back does not restore it. Published records follow.
     public func updateSimpleSpace(
         space: SpaceURI,
         configuration: SimpleSpaceConfiguration,
@@ -8013,17 +8103,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     UPDATE permissioned_simple_space_authorities
                     SET read_policy = ?, read_managing_app = ?,
                         write_policy = ?, write_managing_app = ?,
-                        app_access = ?,
+                        app_access = ?, policy_type = ?,
+                        publish_policy = ?, publish_members = ?,
                         revision = ?,
                         updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
                     WHERE space_uri = ?
                     """,
-                    [
-                        .text(configuration.readPolicy.rawValue),
-                        configuration.readManagingApp.map(SQLiteData.text) ?? .null,
-                        .text(configuration.writePolicy.rawValue),
-                        configuration.writeManagingApp.map(SQLiteData.text) ?? .null,
-                        .text(simpleSpaceAppAccessName(configuration.appAccess)),
+                    simpleSpacePolicyColumnBindings(configuration) + [
                         .integer(try sqliteRevision(nextRevision)),
                         .integer(timestamp), .integer(timestamp),
                         .text(space.rawValue),
@@ -8033,99 +8119,19 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     space: space,
                     appAccess: configuration.appAccess
                 )
-                if previous.readPolicy != .managingApp
-                    || configuration.readPolicy != .managingApp
-                    || previous.readManagingApp != configuration.readManagingApp {
+                if previous.policy.typeIdentifier != configuration.policy.typeIdentifier {
                     _ = try await connection.query(
-                        "DELETE FROM permissioned_simple_space_managing_app_decisions WHERE space_uri = ? AND access = 'read'",
+                        "DELETE FROM permissioned_simple_space_members WHERE space_uri = ? AND member_did != ?",
+                        [.text(space.rawValue), .text(stored.state.space.owner)]
+                    )
+                }
+                if previous.readManagingApp != configuration.readManagingApp {
+                    _ = try await connection.query(
+                        "DELETE FROM permissioned_simple_space_managing_app_decisions WHERE space_uri = ?",
                         [.text(space.rawValue)]
                     )
                 }
-                if previous.writePolicy != .managingApp
-                    || configuration.writePolicy != .managingApp
-                    || previous.writeManagingApp != configuration.writeManagingApp {
-                    _ = try await connection.query(
-                        "DELETE FROM permissioned_simple_space_managing_app_decisions WHERE space_uri = ? AND access = 'write'",
-                        [.text(space.rawValue)]
-                    )
-                }
-                return try await requiredSimpleSpace(space).state
-            }
-        }
-    }
-
-    /// Applies an XRPC `updateSpace` patch inside one authority transaction.
-    /// Fetching configuration in the HTTP layer and writing it back later
-    /// would race another patch and turn an omitted property into a stale
-    /// reset, so the patch is resolved against the durable row while the
-    /// write transaction is held.
-    public func patchSimpleSpace(
-        space: SpaceURI,
-        patch: SimpleSpaceConfigurationPatch,
-        authorization: AuthorizationContext,
-        now: Date = Date()
-    ) async throws -> DurableSimpleSpaceState {
-        let timestamp = try simpleSpaceTimestamp(now)
-        return try await withConnectionGate {
-            try await transaction {
-                try requireAuthorityAccount(space: space)
-                try requireAuthorityManagement(
-                    space: space,
-                    authorization: authorization,
-                    operation: .update
-                )
-                let stored = try await requiredSimpleSpace(space)
-                try requireActiveSimpleSpace(stored.state)
-                let configuration = try patch.applying(
-                    to: stored.state.space.configuration
-                )
-                try validateSimpleSpaceConfiguration(configuration)
-                guard configuration != stored.state.space.configuration else {
-                    return stored.state
-                }
-                let previous = stored.state.space.configuration
-                let nextRevision = try nextSimpleSpaceRevision(stored.state.revision)
-                _ = try await connection.query(
-                    """
-                    UPDATE permissioned_simple_space_authorities
-                    SET read_policy = ?, read_managing_app = ?,
-                        write_policy = ?, write_managing_app = ?,
-                        app_access = ?,
-                        revision = ?,
-                        updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
-                    WHERE space_uri = ?
-                    """,
-                    [
-                        .text(configuration.readPolicy.rawValue),
-                        configuration.readManagingApp.map(SQLiteData.text) ?? .null,
-                        .text(configuration.writePolicy.rawValue),
-                        configuration.writeManagingApp.map(SQLiteData.text) ?? .null,
-                        .text(simpleSpaceAppAccessName(configuration.appAccess)),
-                        .integer(try sqliteRevision(nextRevision)),
-                        .integer(timestamp), .integer(timestamp),
-                        .text(space.rawValue),
-                    ]
-                )
-                try await replaceSimpleSpaceClients(
-                    space: space,
-                    appAccess: configuration.appAccess
-                )
-                if previous.readPolicy != .managingApp
-                    || configuration.readPolicy != .managingApp
-                    || previous.readManagingApp != configuration.readManagingApp {
-                    _ = try await connection.query(
-                        "DELETE FROM permissioned_simple_space_managing_app_decisions WHERE space_uri = ? AND access = 'read'",
-                        [.text(space.rawValue)]
-                    )
-                }
-                if previous.writePolicy != .managingApp
-                    || configuration.writePolicy != .managingApp
-                    || previous.writeManagingApp != configuration.writeManagingApp {
-                    _ = try await connection.query(
-                        "DELETE FROM permissioned_simple_space_managing_app_decisions WHERE space_uri = ? AND access = 'write'",
-                        [.text(space.rawValue)]
-                    )
-                }
+                try await reconcilePublishedSpaceRecordsWithoutGate(space: space, now: now)
                 return try await requiredSimpleSpace(space).state
             }
         }
@@ -8153,6 +8159,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 )
                 let stored = try await requiredSimpleSpace(space)
                 try requireActiveSimpleSpace(stored.state)
+                guard case .member = stored.state.space.configuration.policy else {
+                    throw SpacePolicyError.policyMismatch
+                }
+                if !write {
+                    try await removeSpaceWriterWithoutGate(space: space, writer: member)
+                }
                 let existing = stored.state.space.members[member]
                 if existing == nil {
                     guard stored.state.space.members.count < Self.maximumSimpleSpaceMembers else {
@@ -8179,6 +8191,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     ]
                 )
                 try await touchSimpleSpace(space: space, revision: stored.state.revision, timestamp: timestamp)
+                try await reconcilePublishedSpaceRecordsWithoutGate(space: space, now: now)
                 return try await requiredSimpleSpace(space).state
             }
         }
@@ -8220,9 +8233,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 )
                 let stored = try await requiredSimpleSpace(space)
                 try requireActiveSimpleSpace(stored.state)
+                guard case .member = stored.state.space.configuration.policy else {
+                    throw SpacePolicyError.policyMismatch
+                }
                 guard member != stored.state.space.owner else {
                     throw SwanError.malformed("a space owner cannot be removed")
                 }
+                try await removeSpaceWriterWithoutGate(space: space, writer: member)
                 guard stored.state.space.members[member] != nil else {
                     return stored.state
                 }
@@ -8231,6 +8248,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     [.text(space.rawValue), .text(member)]
                 )
                 try await touchSimpleSpace(space: space, revision: stored.state.revision, timestamp: timestamp)
+                try await reconcilePublishedSpaceRecordsWithoutGate(space: space, now: now)
                 return try await requiredSimpleSpace(space).state
             }
         }
@@ -8525,6 +8543,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             "permissioned_space_record_blobs",
             "permissioned_space_records",
             "permissioned_space_oplog",
+            "permissioned_repository_history_resets",
             "permissioned_space_requests",
             "permissioned_space_outbox",
             "permissioned_repository_state",
@@ -9146,20 +9165,28 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// commit together before any network delivery.
     public func receiveSpaceWriteNotification(
         _ notification: AuthorizedSpaceWriteNotification,
-        now: Date = Date()
+        now: Date = Date(),
+        managedWriteApproval: String? = nil
     ) async throws {
-        try await receiveSpaceWriteNotification(notification, now: now, liveConversationMembershipConfirmed: false)
+        try await receiveSpaceWriteNotification(
+            notification, now: now, liveConversationMembershipConfirmed: false,
+            managedWriteApproval: managedWriteApproval
+        )
     }
 
     public func receiveMembershipVerifiedConversationSpaceWriteNotification(
         _ notification: AuthorizedSpaceWriteNotification, now: Date
     ) async throws {
         try validateConversationAuthority(notification.space)
-        try await receiveSpaceWriteNotification(notification, now: now, liveConversationMembershipConfirmed: true)
+        try await receiveSpaceWriteNotification(
+            notification, now: now, liveConversationMembershipConfirmed: true,
+            managedWriteApproval: nil
+        )
     }
 
     private func receiveSpaceWriteNotification(
-        _ notification: AuthorizedSpaceWriteNotification, now: Date, liveConversationMembershipConfirmed: Bool
+        _ notification: AuthorizedSpaceWriteNotification, now: Date, liveConversationMembershipConfirmed: Bool,
+        managedWriteApproval: String?
     ) async throws {
         guard notification.issuer == notification.repository,
               notification.audience == notification.space.authority,
@@ -9198,19 +9225,16 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 } else {
                     let state = try await requiredSimpleSpace(notification.space)
                     try requireActiveSimpleSpace(state.state)
-                    if notification.repository != state.state.space.owner {
-                        switch state.state.space.configuration.writePolicy {
-                        case .public:
-                            break
-                        case .memberList:
-                            guard state.state.space.members[notification.repository]?.write == true else {
-                                throw SwanError.unauthorized("writer is not a space member")
-                            }
-                        case .managingApp:
-                            guard state.managingAppWriteAllowedUsers.contains(notification.repository) else {
-                                throw SwanError.unauthorized("managing app denied write access")
-                            }
-                        }
+                    // Under managedspace the managing app was asked before
+                    // this transaction; its approval must name the app the
+                    // space still delegates to.
+                    guard Self.simpleSpaceUserDecision(
+                        space: state.state.space,
+                        user: notification.repository,
+                        access: .write,
+                        managedApproval: managedWriteApproval ?? ""
+                    ) == .authorized else {
+                        throw SwanError.unauthorized("writer is not authorized to write to this space")
                     }
                 }
 
@@ -9458,18 +9482,29 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// context is already verified by the OAuth/delegation layer, but it must
     /// still name the user for whom a credential is being minted. It never
     /// mutates membership or carries policy state in memory across a restart.
+    /// Checks the user before the app, as the October 29 reference does.
+    /// A user the policy refuses is answered as though the space does not
+    /// exist (``AuthorizedSimpleSpaceLifecycleError/notFound``); only then
+    /// is the app checked (``SimpleSpaceCredentialPolicyError/appNotAuthorized``).
+    /// Under managedspace the user decision belongs to the managing app,
+    /// which this read transaction never calls: without `managedApproval`
+    /// naming the space's current managing app it returns
+    /// ``SimpleSpaceUserDecision/requiresManagingApp(_:)`` so the caller can
+    /// ask the app outside any transaction and call again.
+    @discardableResult
     public func authorizeSimpleSpaceRead(
         space: SpaceURI,
         user: String?,
         clientID: String?,
-        authorization: AuthorizationContext
-    ) async throws {
+        authorization: AuthorizationContext,
+        managedApproval: String? = nil
+    ) async throws -> SimpleSpaceUserDecision {
         if let user, !isValidSimpleSpaceDID(user) {
             throw SwanError.invalidIdentifier(user)
         }
         if let clientID { try validateSimpleSpaceAppIdentifier(clientID) }
         try requireAuthorityAccount(space: space)
-        try await withReadConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
                 try requireSimpleSpaceCredentialRequester(
                     space: space,
@@ -9480,60 +9515,95 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 guard !stored.state.space.isDeleted else {
                     throw AuthorizedSimpleSpaceLifecycleError.deleted
                 }
-                if user == nil, stored.state.space.configuration.readPolicy != .public {
+                let policy = stored.state.space.configuration.policy
+                if let user {
+                    switch Self.simpleSpaceUserDecision(
+                        space: stored.state.space,
+                        user: user,
+                        access: .read,
+                        managedApproval: managedApproval
+                    ) {
+                    case .authorized: break
+                    case .denied: throw AuthorizedSimpleSpaceLifecycleError.notFound
+                    case let .requiresManagingApp(app): return .requiresManagingApp(app)
+                    }
+                } else if !policy.isPublicRead {
                     throw AuthorizedSimpleSpaceLifecycleError.notFound
                 }
-                switch stored.state.space.configuration.appAccess {
-                case .open:
-                    break
-                case let .allowList(clients):
-                    guard let clientID, clients.contains(clientID) else {
-                        throw SimpleSpaceCredentialPolicyError.appNotAuthorized
-                    }
+                guard policy.isAppAuthorized(clientID: clientID) else {
+                    throw SimpleSpaceCredentialPolicyError.appNotAuthorized
                 }
-                if user != stored.state.space.owner {
-                    switch stored.state.space.configuration.readPolicy {
-                    case .public:
-                        break
-                    case .memberList:
-                        guard user.flatMap { stored.state.space.members[$0] }?.read == true else {
-                            throw SwanError.unauthorized("user is not a space member")
-                        }
-                    case .managingApp:
-                        guard user.map { stored.managingAppReadAllowedUsers.contains($0) } == true else {
-                            throw SwanError.unauthorized("managing app denied user access")
-                        }
-                    }
-                }
+                return .authorized
             }
         }
     }
+
+    /// The reference `authorizeUser` over a loaded space. The authority is
+    /// always authorized; personalspace admits no one else; memberspace uses
+    /// its public flags and member list; managedspace defers to its managing
+    /// app, whose answer arrives as `managedApproval`.
+    static func simpleSpaceUserDecision(
+        space: SimpleSpace,
+        user: String,
+        access: SimpleSpaceAccessKind,
+        managedApproval: String?
+    ) -> SimpleSpaceUserDecision {
+        if user == space.owner { return .authorized }
+        switch space.configuration.policy {
+        case .personal:
+            return .denied
+        case let .member(member):
+            let isPublic = access == .read ? member.publicRead : member.publicWrite
+            if isPublic { return .authorized }
+            guard let entry = space.members[user] else { return .denied }
+            return (access == .read ? entry.read : entry.write) ? .authorized : .denied
+        case let .managed(managed):
+            guard let managedApproval else { return .requiresManagingApp(managed.managingApp) }
+            return managedApproval == managed.managingApp ? .authorized : .denied
+        }
+    }
+
+    /// The write side of ``authorizeSimpleSpaceRead(space:user:clientID:authorization:managedApproval:)``.
+    @discardableResult
     public func authorizeSimpleSpaceWrite(
         space: SpaceURI,
-        user: String
-    ) async throws {
+        user: String,
+        managedApproval: String? = nil
+    ) async throws -> SimpleSpaceUserDecision {
         guard isValidSimpleSpaceDID(user) else {
             throw SwanError.invalidIdentifier(user)
         }
         try requireAuthorityAccount(space: space)
-        try await withReadConnectionGate {
+        return try await withReadConnectionGate {
             try await readTransaction {
                 let stored = try await requiredSimpleSpace(space, connection: readConnection)
                 try requireActiveSimpleSpace(stored.state)
-                if user != stored.state.space.owner {
-                    switch stored.state.space.configuration.writePolicy {
-                    case .public:
-                        break
-                    case .memberList:
-                        guard stored.state.space.members[user]?.write == true else {
-                            throw SwanError.unauthorized("writer is not a space member")
-                        }
-                    case .managingApp:
-                        guard stored.managingAppWriteAllowedUsers.contains(user) else {
-                            throw SwanError.unauthorized("managing app denied write access")
-                        }
-                    }
+                switch Self.simpleSpaceUserDecision(
+                    space: stored.state.space,
+                    user: user,
+                    access: .write,
+                    managedApproval: managedApproval
+                ) {
+                case .authorized: return .authorized
+                case .denied: throw SwanError.unauthorized("writer is not authorized to write to this space")
+                case let .requiresManagingApp(app): return .requiresManagingApp(app)
                 }
+            }
+        }
+    }
+
+    /// The stored policy of an active authority-owned space, read without
+    /// authorization for the pre-transaction managing-app check. `nil` when
+    /// the space is not an active simple space of this account.
+    public func activeSimpleSpacePolicy(_ space: SpaceURI) async throws -> SpacePolicy? {
+        guard space.authority == accountDID else { return nil }
+        return try await withReadConnectionGate {
+            try await readTransaction {
+                guard let stored = try await loadSimpleSpace(space, connection: readConnection),
+                      !stored.state.space.isDeleted else {
+                    return nil
+                }
+                return stored.state.space.configuration.policy
             }
         }
     }
@@ -9634,7 +9704,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
         let digestHex = Hex.encode(summary.digest)
         let columns = blobNamespaceColumns(namespace)
-        return try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
+        let reference = try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
             try await putBlobLocked(
                 .file(
                     descriptor: spool.fileDescriptor,
@@ -9650,6 +9720,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 mimeType: safeBlobMIMEType(mimeType)
             )
         }
+        if case .staged = namespace {
+            // A blob copied after `com.atproto.space.importRepo` is attached
+            // to the spaces whose imported records reference it.
+            try await promoteImportedSpaceBlobReferences(cid: reference.cid)
+        }
+        return reference
     }
 
     public func blobData(for reference: BlobReference) async throws -> Data {
@@ -11532,7 +11608,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    private func requireAuthorityAccount(
+    func requireAuthorityAccount(
         space: SpaceURI,
         owner: String? = nil
     ) throws {
@@ -11552,7 +11628,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    private func requireAuthorityManagement(
+    func requireAuthorityManagement(
         space: SpaceURI,
         authorization: AuthorizationContext,
         operation: SimpleSpaceManagementOperation
@@ -11622,7 +11698,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    private func requireActiveSimpleSpace(
+    func requireActiveSimpleSpace(
         _ state: DurableSimpleSpaceState
     ) throws {
         guard !state.space.isDeleted else {
@@ -11630,7 +11706,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    private func validateSimpleSpaceConfiguration(
+    func validateSimpleSpaceConfiguration(
         _ configuration: SimpleSpaceConfiguration
     ) throws {
         switch configuration.appAccess {
@@ -11674,7 +11750,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// `SpaceURI` intentionally keeps its lexical helpers file-private. Use
     /// its public throwing initializer as the one source of truth instead of
     /// copying a relaxed DID regular expression into the persistence layer.
-    private func isValidSimpleSpaceDID(_ did: String) -> Bool {
+    func isValidSimpleSpaceDID(_ did: String) -> Bool {
         (try? SpaceURI(
             authority: did,
             spaceType: "app.swan.validation",
@@ -11721,7 +11797,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return value
     }
 
-    private func simpleSpaceAppAccessName(
+    func simpleSpaceAppAccessName(
         _ appAccess: SimpleSpaceAppAccess
     ) -> String {
         switch appAccess {
@@ -11730,7 +11806,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    private func requiredSimpleSpace(
+    func requiredSimpleSpace(
         _ space: SpaceURI,
         connection: SQLiteConnection? = nil
     ) async throws -> LoadedSimpleSpaceAuthority {
@@ -11741,7 +11817,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return stored
     }
 
-    private func loadSimpleSpace(
+    func loadSimpleSpace(
         _ expectedSpace: SpaceURI,
         connection: SQLiteConnection? = nil
     ) async throws -> LoadedSimpleSpaceAuthority? {
@@ -11749,7 +11825,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let rows = try await conn.query(
             """
             SELECT space_uri, owner_did, read_policy, read_managing_app, write_policy, write_managing_app,
-                   app_access, is_deleted, revision, created_at, updated_at
+                   app_access, policy_type, publish_policy, publish_members,
+                   is_deleted, revision, created_at, updated_at
             FROM permissioned_simple_space_authorities
             WHERE space_uri = ?
             """,
@@ -11912,7 +11989,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
         let configuration: SimpleSpaceConfiguration
         do {
-            configuration = try SimpleSpaceConfiguration(
+            configuration = try storedSimpleSpaceConfiguration(
+                policyType: try requiredText(row, "policy_type"),
+                publishPolicy: try requiredInteger(row, "publish_policy"),
+                publishMembers: try requiredInteger(row, "publish_members"),
                 readPolicy: readPolicy,
                 readManagingApp: readManagingApp,
                 writePolicy: writePolicy,
@@ -12004,7 +12084,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
     }
 
-    private func replaceSimpleSpaceClients(
+    func replaceSimpleSpaceClients(
         space: SpaceURI,
         appAccess: SimpleSpaceAppAccess
     ) async throws {
@@ -12026,7 +12106,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    private func touchSimpleSpace(
+    func touchSimpleSpace(
         space: SpaceURI,
         revision: UInt64,
         timestamp: Int
@@ -12046,14 +12126,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
     }
 
-    private func nextSimpleSpaceRevision(_ revision: UInt64) throws -> UInt64 {
+    func nextSimpleSpaceRevision(_ revision: UInt64) throws -> UInt64 {
         guard revision < UInt64(Int.max) else {
             throw SQLiteRepositoryError.revisionOutOfRange(revision)
         }
         return revision + 1
     }
 
-    private func requireAccount(_ author: String) throws {
+    func requireAccount(_ author: String) throws {
         guard author == accountDID else {
             throw SwanError.unauthorized(
                 "repository author belongs to another account"
@@ -12117,7 +12197,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// readable again under a recreated space's policy (October 22 section 6).
     /// This helper is used only while an existing SQLite transaction is held,
     /// so it cannot race a deletion into a stale read or write.
-    private func requireLocalRepositorySpaceOpen(
+    func requireLocalRepositorySpaceOpen(
         _ space: SpaceURI,
         authorization: AuthorizationContext? = nil,
         connection: SQLiteConnection? = nil
@@ -12238,7 +12318,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    private func loadStateWithCounts(
+    func loadStateWithCounts(
         space: SpaceURI,
         author: String,
         connection: SQLiteConnection? = nil
@@ -12314,7 +12394,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try await loadStateWithCounts(space: space, author: author, connection: connection)?.state
     }
 
-    private func loadRecord(
+    func loadRecord(
         _ uri: SpaceRecordURI,
         connection: SQLiteConnection? = nil
     ) async throws -> PersistedSpaceRecord? {
@@ -12552,11 +12632,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
     }
 
-    private func ltHashElement(for record: PersistedSpaceRecord) -> String {
+    func ltHashElement(for record: PersistedSpaceRecord) -> String {
         "\(record.uri.collection)/\(record.uri.rkey)/\(record.cid)"
     }
 
-    private func repositoryStateMarker(
+    func repositoryStateMarker(
         space: SpaceURI,
         author: String,
         revision: UInt64,
@@ -12737,7 +12817,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return Int(microseconds.rounded(.down))
     }
 
-    private func opaqueNotificationPayload(eventID: UUID) -> Data {
+    func opaqueNotificationPayload(eventID: UUID) -> Data {
         Data(eventID.uuidString.lowercased().utf8)
     }
 
@@ -12788,7 +12868,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// references; DAG-CBOR links remain repository blocks and are ignored by
     /// this projection. The decoder is bounded by the already-enforced record
     /// byte limit, and the result is de-duplicated before namespace promotion.
-    private func rawBlobCIDs(in value: Data) throws -> [String] {
+    func rawBlobCIDs(in value: Data) throws -> [String] {
         let decoded = try CARRepository.decodeRecordCBOR(value)
         var cids = Set<String>()
 
@@ -12844,7 +12924,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// caller's write transaction. The edge set mirrors the record's current
     /// raw blob links exactly; `wire_revision` is the committing batch's TID,
     /// which is what `listBlobs`' `since` filter compares against.
-    private func replacePermissionedRecordBlobEdges(
+    func replacePermissionedRecordBlobEdges(
         space: SpaceURI,
         author: String,
         collection: String,
@@ -12885,7 +12965,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// `com.atproto.sync.getBlob` must keep serving it. Existing private
     /// references are idempotent, including when another space already owns
     /// the CAS.
-    private func promotePermissionedBlobReferences(
+    func promotePermissionedBlobReferences(
         _ cids: [String],
         space: SpaceURI
     ) async throws {
@@ -13111,14 +13191,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return Int(microseconds.rounded(.down))
     }
 
-    private func sqliteRevision(_ revision: UInt64) throws -> Int {
+    func sqliteRevision(_ revision: UInt64) throws -> Int {
         guard revision <= UInt64(Int.max) else {
             throw SQLiteRepositoryError.revisionOutOfRange(revision)
         }
         return Int(revision)
     }
 
-    private func requiredNonnegativeInteger(
+    func requiredNonnegativeInteger(
         _ row: SQLiteRow,
         _ column: String
     ) throws -> Int {
@@ -13152,7 +13232,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return integer
     }
 
-    private func requiredRevision(
+    func requiredRevision(
         _ row: SQLiteRow,
         _ column: String
     ) throws -> UInt64 {
@@ -13176,7 +13256,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return UInt64(value)
     }
 
-    private func requiredBlob(
+    func requiredBlob(
         _ row: SQLiteRow,
         _ column: String
     ) throws -> Data {
@@ -13202,7 +13282,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return value
     }
 
-    private func requiredTID(
+    func requiredTID(
         _ row: SQLiteRow,
         _ column: String
     ) throws -> TID {
@@ -13215,7 +13295,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return tid
     }
 
-    private func blob(_ data: Data) -> SQLiteData {
+    func blob(_ data: Data) -> SQLiteData {
         // SQLiteNIO's Foundation conformance binds Data as a native BLOB.
         data.sqliteData!
     }
@@ -14328,20 +14408,6 @@ public actor DurableSimpleSpaceAuthority {
         )
     }
 
-    public func update(
-        space: SpaceURI,
-        patch: SimpleSpaceConfigurationPatch,
-        authorization: AuthorizationContext,
-        now: Date = Date()
-    ) async throws -> DurableSimpleSpaceState {
-        try await database.patchSimpleSpace(
-            space: space,
-            patch: patch,
-            authorization: authorization,
-            now: now
-        )
-    }
-
     public func putMember(
         space: SpaceURI,
         member: String,
@@ -14474,12 +14540,16 @@ public actor DurableSimpleSpaceAuthority {
         authorization: AuthorizationContext,
         now: Date = Date()
     ) async throws -> SignedSpaceCredential {
-        try await database.authorizeSimpleSpaceRead(
+        // This facade has no managing-app client, so a managedspace admits
+        // only its authority here.
+        guard try await database.authorizeSimpleSpaceRead(
             space: space,
             user: user,
             clientID: clientID,
             authorization: authorization
-        )
+        ) == .authorized else {
+            throw AuthorizedSimpleSpaceLifecycleError.notFound
+        }
         let grant = SpaceGrant(
             subject: user,
             space: space,
@@ -14496,6 +14566,8 @@ public actor DurableSimpleSpaceAuthority {
         space: SpaceURI,
         user: String
     ) async throws {
-        try await database.authorizeSimpleSpaceWrite(space: space, user: user)
+        guard try await database.authorizeSimpleSpaceWrite(space: space, user: user) == .authorized else {
+            throw SwanError.unauthorized("managing app denied write access")
+        }
     }
 }

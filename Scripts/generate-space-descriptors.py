@@ -10,11 +10,13 @@ parser.add_argument("--reference-root", type=Path, required=True)
 parser.add_argument("--check", action="store_true")
 args = parser.parse_args()
 root = Path(__file__).resolve().parent.parent
-profile_id = "permissioned-data-0016-2026-10-22"
+profile_id = "permissioned-data-0016-2026-10-29"
 schemas = sorted([*args.reference_root.glob("lexicons/com/atproto/space/*.json"),
-                  *args.reference_root.glob("lexicons/com/atproto/simplespace/*.json")])
-if len(schemas) != 30:
-    raise SystemExit("expected the exact 30-file October 22 corpus")
+                  *args.reference_root.glob("lexicons/com/atproto/memberspace/*.json"),
+                  *args.reference_root.glob("lexicons/com/atproto/managedspace/*.json"),
+                  *args.reference_root.glob("lexicons/com/atproto/personalspace/*.json")])
+if len(schemas) != 39:
+    raise SystemExit("expected the exact 39-file October 29 corpus")
 profile = json.loads((root / "Profiles" / f"{profile_id}.json").read_text())
 ordered = {json.loads(path.read_text())["id"]: json.loads(path.read_text()) for path in schemas}
 quote = lambda value: "nil" if value is None else json.dumps(value)

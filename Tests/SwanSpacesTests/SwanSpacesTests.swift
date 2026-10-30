@@ -352,23 +352,28 @@ final class SwanSpacesTests: XCTestCase {
         )
         _ = try await authority.issueReadCredential(space: managedSpace, user: "did:plc:bob", clientID: nil)
 
-        // Preserve a configured app through a policy-only transition, but
-        // never retain its old allow decision when that policy is restored.
-        let preservedAppPublic = try SimpleSpaceConfiguration(
+        // October 29: a policy is replaced wholesale, and any configured
+        // managing app makes the space a managedspace (`read ?? write`, as
+        // the reference `configToPolicy`). Leaving the managedspace drops the
+        // app, and an old allow decision is never retained when it returns.
+        let managedFromOneSide = try SimpleSpaceConfiguration(
             readPolicy: .public,
             readManagingApp: "did:web:app.example#space",
             writePolicy: .public,
-            writeManagingApp: "did:web:app.example#space",
             appAccess: .open
+        )
+        XCTAssertEqual(
+            managedFromOneSide.policy,
+            .managed(try ManagedSpacePolicy(managingApp: "did:web:app.example#space"))
         )
         try await authority.update(
             space: managedSpace,
-            configuration: preservedAppPublic,
+            configuration: SimpleSpaceConfiguration(policy: .member(try MemberSpacePolicy(publicRead: true, publicWrite: true))),
             by: "did:plc:alice"
         )
         let publicState = await authority.space(managedSpace)
-        XCTAssertEqual(publicState?.configuration.readManagingApp, "did:web:app.example#space")
-        XCTAssertEqual(publicState?.configuration.writeManagingApp, "did:web:app.example#space")
+        XCTAssertNil(publicState?.configuration.readManagingApp)
+        XCTAssertNil(publicState?.configuration.writeManagingApp)
         await XCTAssertThrowsErrorAsync(
             try await authority.setManagingAppAccess(
                 space: managedSpace,
@@ -1391,6 +1396,11 @@ final class SwanSpacesTests: XCTestCase {
                 )
             )
         )
+        // October 29: a managedspace defers every non-authority user to the
+        // managing app at request time. A stored decision is no longer
+        // consulted, and this facade has no outbound checker, so alice is
+        // refused even after a recorded approval. The authority itself is
+        // always authorized.
         _ = try await bobAuthority.setManagingAppAccess(
             space: space,
             user: alice,
@@ -1400,11 +1410,19 @@ final class SwanSpacesTests: XCTestCase {
                 audience: bob
             )
         )
+        await XCTAssertThrowsErrorAsync(
+            try await bobAuthority.issueReadCredential(
+                space: space,
+                user: alice,
+                clientID: nil,
+                authorization: .accountOAuthForTesting(subject: alice, scopes: ["atproto"])
+            )
+        )
         _ = try await bobAuthority.issueReadCredential(
             space: space,
-            user: alice,
+            user: bob,
             clientID: nil,
-            authorization: .accountOAuthForTesting(subject: alice, scopes: ["atproto"])
+            authorization: ownerAuthorization
         )
         let deleted = try await bobAuthority.delete(
             space: space,
@@ -1419,9 +1437,9 @@ final class SwanSpacesTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(
             try await bobAuthority.issueReadCredential(
                 space: space,
-                user: alice,
+                user: bob,
                 clientID: nil,
-                authorization: .accountOAuthForTesting(subject: alice, scopes: ["atproto"])
+                authorization: ownerAuthorization
             )
         )
         try await aliceDatabase.close()

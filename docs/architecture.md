@@ -47,7 +47,7 @@ flowchart TB
 Swan's codebase is divided into modular Swift Package Manager library targets, each with a defined boundary and responsibility:
 
 - `SwanCore`: Core cryptographic primitives (SHA-256, BLAKE3, K-256, P-256), base data structures, error types, logging configuration, and fundamental domain protocols.
-- `SwanSpacesWire`: Typed wire models and lexicon definitions for permissioned spaces (`com.atproto.space.*` and `com.atproto.simplespace.*`), generated from AT Protocol lexicons via Petrel.
+- `SwanSpacesWire`: Typed wire models and lexicon definitions for permissioned spaces (`com.atproto.space.*`, `com.atproto.memberspace.*`, `com.atproto.managedspace.*` and `com.atproto.personalspace.*`), generated from AT Protocol lexicons via Petrel.
 - `SwanPublicWire`: Wire models, query parameter decoders, and response serializers for public AT Protocol repository endpoints and sync interfaces.
 - `SwanSpaces`: Permissioned data and spaces engine, LtHash16 cryptographic accumulator, capability delegations, space oplogs, reader-bound commit verification, and durable outbox delivery.
 - `SwanStorage`: Abstract storage protocols and interfaces defining the contracts for repositories, spaces, credentials, replay guards, WebAuthn challenges, and audit logs.

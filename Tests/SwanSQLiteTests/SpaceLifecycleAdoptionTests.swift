@@ -184,7 +184,7 @@ private struct LifecycleAdoptionFixture {
             source: PermissionedRemoteReplicaSourceIdentity(origin: URL(string: "https://writer.example")!, repositoryDID: target.repositoryDID, verifierIdentity: "key-sha256:" + String(repeating: "a", count: 64)),
             target: target, expectedBase: nil,
             freshnessWitness: PermissionedRemoteReplicaFreshnessWitness(wireRevision: revision, commitment: commit.data),
-            profileID: "permissioned-data-0016-2026-10-22"
+            profileID: "permissioned-data-0016-2026-10-29"
         )
         let outcome = try await database.createPermissionedRemoteReplicaImportSession(binding: binding, createdAt: 100, expiresAt: 200, now: 101)
         guard case let .staged(session) = outcome else { throw SwanError.malformed("unexpected lifecycle fixture import") }

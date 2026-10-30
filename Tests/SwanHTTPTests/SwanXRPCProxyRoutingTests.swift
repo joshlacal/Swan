@@ -13,7 +13,14 @@ final class SwanXRPCProxyRoutingTests: XCTestCase {
     }
 
     func testSwanOwnedNamespacesAreDeniedEvenWithoutLocalRoute() {
-        for nsid in ["com.atproto.space.listSpaces", "blue.catbird.mlsChat.getConvos"] {
+        for nsid in [
+            "com.atproto.space.listSpaces",
+            "com.atproto.memberspace.listMembers",
+            "com.atproto.managedspace.checkUserAccess",
+            "com.atproto.personalspace.anything",
+            "com.atproto.simplespace.getSpace",
+            "blue.catbird.mlsChat.getConvos",
+        ] {
             XCTAssertThrowsError(try router.route(nsid: nsid, proxyHeader: nil)) { error in
                 XCTAssertEqual(error as? SwanXRPCProxyRoutingFailure, .denied)
             }

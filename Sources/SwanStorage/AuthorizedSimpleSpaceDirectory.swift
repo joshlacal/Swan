@@ -150,7 +150,7 @@ public struct AuthenticatedSimpleSpaceDescription: Sendable, Equatable {
 }
 
 /// Startup-preopened authority directory for the authenticated
-/// `com.atproto.simplespace` surface.
+/// space lifecycle and memberspace surface (formerly `com.atproto.simplespace`).
 ///
 /// Implementations must never treat a request authority as permission to
 /// create, migrate, or open an account database. They preopen an explicitly
@@ -538,9 +538,12 @@ public protocol AuthorizedSimpleSpaceLifecycleDirectory: Sendable {
         authorization: AuthorizationContext
     ) async throws
 
+    /// Replaces the policy wholesale (October 29 `updateSpace`). A policy of
+    /// a different `$type` discards the previous policy's state, such as a
+    /// memberspace member list.
     func updateSimpleSpace(
         _ space: SpaceURI,
-        patch: SimpleSpaceConfigurationPatch,
+        configuration: SimpleSpaceConfiguration,
         authorization: AuthorizationContext
     ) async throws
 
@@ -569,6 +572,85 @@ public protocol AuthorizedSimpleSpaceLifecycleDirectory: Sendable {
         cursor: String?,
         authorization: AuthorizationContext
     ) async throws -> AuthorizedSimpleSpaceMemberPage
+
+    /// `com.atproto.space.removeWriter`: drops one account from the space's
+    /// writer set. Idempotent; the account is tracked again after its next
+    /// authorized write.
+    func removeSpaceWriter(
+        _ writer: String,
+        from space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws
+
+    func exportSpaceMeta(
+        _ space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws -> SpaceMetaArchive
+
+    func importSpaceMeta(
+        _ archive: SpaceMetaArchive,
+        authorization: AuthorizationContext
+    ) async throws
+}
+
+public extension AuthorizedSimpleSpaceLifecycleDirectory {
+    func removeSpaceWriter(
+        _: String,
+        from _: SpaceURI,
+        authorization _: AuthorizationContext
+    ) async throws {
+        throw SwanError.unavailable("space writer removal is unavailable")
+    }
+
+    /// `com.atproto.space.exportSpaceMeta`: the authority's state for one
+    /// live space, for the owner's OAuth with `read_self`.
+    func exportSpaceMeta(
+        _: SpaceURI,
+        authorization _: AuthorizationContext
+    ) async throws -> SpaceMetaArchive {
+        throw SwanError.unavailable("space meta export is unavailable")
+    }
+
+    /// `com.atproto.space.importSpaceMeta`: creates or replaces the
+    /// authority's space from its previous host's archive. Requires
+    /// `manage=create` and `manage=update`; publishes nothing.
+    func importSpaceMeta(
+        _: SpaceMetaArchive,
+        authorization _: AuthorizationContext
+    ) async throws {
+        throw SwanError.unavailable("space meta import is unavailable")
+    }
+}
+
+/// Asks a managedspace's managing app about one user
+/// (`com.atproto.managedspace.checkUserAccess`). Implementations must deny
+/// (return `false`) when the app cannot be resolved, is unreachable, or
+/// answers anything but a well-formed `{ authorized: true }`. Callers never
+/// invoke this inside a SQLite transaction.
+public protocol ManagedSpaceAccessChecking: Sendable {
+    func checkUserAccess(
+        space: SpaceURI,
+        user: String,
+        access: SimpleSpaceAccessKind,
+        clientID: String?,
+        managingApp: String
+    ) async -> Bool
+}
+
+/// The fail-closed checker used when no managing-app client is configured:
+/// every non-owner of a managedspace is refused.
+public struct DenyingManagedSpaceAccessChecker: ManagedSpaceAccessChecking {
+    public init() {}
+
+    public func checkUserAccess(
+        space _: SpaceURI,
+        user _: String,
+        access _: SimpleSpaceAccessKind,
+        clientID _: String?,
+        managingApp _: String
+    ) async -> Bool {
+        false
+    }
 }
 
 /// Startup-preopened authority policy projection used only while an
@@ -749,9 +831,49 @@ public protocol AuthorizedSpaceRepositoryDirectory: Sendable {
         wireRevision: String,
         authorization: AuthorizationContext
     ) async throws -> [AuthorizedSpaceRepositoryWriteResult]
+
+    func clearRepository(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> Bool
+
+    func importRepository(
+        space: SpaceURI,
+        author: String,
+        records: [SpaceRecord],
+        ltHash: Data,
+        authorization: AuthorizationContext
+    ) async throws
 }
 
 public extension AuthorizedSpaceRepositoryDirectory {
+    /// `com.atproto.space.clearRecords`: deletes the caller's records in the
+    /// space (the authority keeps its published policy and member records),
+    /// clears the operation log and advances the repo. Requires a `delete`
+    /// grant for every collection it deletes from. Returns `false`, writing
+    /// nothing, when there was nothing to delete.
+    func clearRepository(
+        space _: SpaceURI,
+        author _: String,
+        authorization _: AuthorizationContext
+    ) async throws -> Bool {
+        throw SwanError.unavailable("space repository clearing is unavailable")
+    }
+
+    /// `com.atproto.space.importRepo`: replaces the caller's repo in the
+    /// space with verified archive records at a new rev. Requires a `create`
+    /// grant for every collection in the archive.
+    func importRepository(
+        space _: SpaceURI,
+        author _: String,
+        records _: [SpaceRecord],
+        ltHash _: Data,
+        authorization _: AuthorizationContext
+    ) async throws {
+        throw SwanError.unavailable("space repository import is unavailable")
+    }
+
     /// Test and alternate adapters that do not persist a durable wire
     /// revision may opt out of seeding. The authoritative apply transaction
     /// still enforces its own monotonicity check.

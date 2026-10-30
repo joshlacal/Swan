@@ -167,7 +167,13 @@ public struct ConversationSpaceCredentialDirectory: AuthorizedSimpleSpaceCredent
             throw SwanError.unauthorized("verified conversation delegation required")
         }
         try await accounts.requireActivePreopenedAccount(authority)
-        try await membership.requireMembership(space: space, user: user, now: Date())
+        do {
+            try await membership.requireMembership(space: space, user: user, now: Date())
+        } catch SwanError.unauthorized {
+            // October 29 section 2: a user the policy refuses is answered as
+            // though the space does not exist.
+            throw AuthorizedSimpleSpaceLifecycleError.notFound
+        }
         try await lifecycle.registerKnownConversationSpace(space: space, now: Date())
         try await accounts.requireActivePreopenedAccount(authority)
         try await lifecycle.requireConversationSpaceActive(space: space)
