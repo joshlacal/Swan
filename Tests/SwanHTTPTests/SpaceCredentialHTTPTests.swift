@@ -381,7 +381,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     headers: self.exchangeHeaders(),
                     body: self.exchangeBody(delegationToken: outsiderAllow, space: fixture.allowListSpace)
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(response.status, .badRequest)
                     self.assertNoStore(response)
                     XCTAssertEqual(try self.errorCode(response.body), "AppNotAuthorized")
                 }
@@ -521,7 +521,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     headers: self.exchangeHeaders(),
                     body: self.exchangeBody(delegationToken: consumedWithoutAttestation, space: fixture.allowListSpace)
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(
                         try self.errorCode(response.body),
                         "AppNotAuthorized"

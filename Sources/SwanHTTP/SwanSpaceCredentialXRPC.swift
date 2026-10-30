@@ -363,9 +363,12 @@ private func getSpaceCredentialResponse(
     case .spaceDeleted:
         getSpaceCredentialError(.badRequest, code: "SpaceDeleted")
     case .appNotAuthorized:
-        getSpaceCredentialError(.unauthorized, code: "AppNotAuthorized")
+        // The reference throws InvalidRequestError('AppNotAuthorized'), an
+        // HTTP 400. 401 is reserved for delegation-signature failures.
+        getSpaceCredentialError(.badRequest, code: "AppNotAuthorized")
     case .notAuthorized:
-        getSpaceCredentialError(.unauthorized, code: "NotAuthorized")
+        // The lexicon's stand-in for User/AppNotAuthorized, both 400.
+        getSpaceCredentialError(.badRequest, code: "NotAuthorized")
     case .unavailable:
         getSpaceCredentialError(.serviceUnavailable, code: "temporarily_unavailable")
     }
