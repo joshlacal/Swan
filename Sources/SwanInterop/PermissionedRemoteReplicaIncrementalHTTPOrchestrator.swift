@@ -119,23 +119,60 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
             try PermissionedRemoteReplicaIncrementalVerifier.requireSameHead(
                 page, latest
             )
-            guard page.wireRevision == base.head.wireRevision,
-                  page.commitment == base.head.commitment else {
+            if page.wireRevision == base.head.wireRevision,
+               page.commitment == base.head.commitment {
+                return .unchanged(base.head)
+            }
+            // An authenticated, newer head with no oplog entries after the
+            // checkpoint is a legitimate reference state: `clearRecords`
+            // truncates the oplog and changes the data digest, and
+            // `importRepo` truncates it and advances the rev over unchanged
+            // data. Neither is expressible as an incremental batch (the
+            // durable store requires operations), so recover the complete
+            // repository. A head that is not newer than the checkpoint is a
+            // stale or rolled-back answer and is never accepted.
+            guard page.wireRevision > base.head.wireRevision else {
                 throw PermissionedRemoteReplicaIncrementalVerificationError
                     .mixedHead
             }
-            return .unchanged(base.head)
+            return .fullCARRecoveryRequired
         }
 
-        let verified = try PermissionedRemoteReplicaIncrementalVerifier
-            .verify(
-                operations: operations,
-                commit: terminalCommit,
-                base: base,
-                target: target,
-                sharedSecret: pageRequest.sharedSecret,
-                mac: pageMAC
+        let verified: VerifiedPermissionedRemoteReplicaIncrementalPage
+        do {
+            verified = try PermissionedRemoteReplicaIncrementalVerifier
+                .verify(
+                    operations: operations,
+                    commit: terminalCommit,
+                    base: base,
+                    target: target,
+                    sharedSecret: pageRequest.sharedSecret,
+                    mac: pageMAC
+                )
+        } catch PermissionedRemoteReplicaIncrementalVerificationError
+            .commitmentMismatch {
+            // Writes after a `clearRecords` (or an import) reach the oplog,
+            // but the truncated history no longer carries the deletes that
+            // bridge the checkpoint to the new digest, so the replayed LtHash
+            // cannot match. Only an authenticated, current and newer terminal
+            // head may select recovery; an unauthenticated page must not be
+            // able to force it.
+            let terminal = try PermissionedRemoteReplicaIncrementalVerifier
+                .verifyCommit(
+                    terminalCommit,
+                    target: target,
+                    sharedSecret: pageRequest.sharedSecret,
+                    mac: pageMAC
+                )
+            try PermissionedRemoteReplicaIncrementalVerifier.requireSameHead(
+                terminal, latest
             )
+            guard terminal.wireRevision > base.head.wireRevision else {
+                throw PermissionedRemoteReplicaIncrementalVerificationError
+                    .commitmentMismatch
+            }
+            return .fullCARRecoveryRequired
+        }
         Self.stageLog("incremental interval verified (\(verified.operations.count) operations)")
         try PermissionedRemoteReplicaIncrementalVerifier.requireSameHead(
             verified.freshnessWitness, latest

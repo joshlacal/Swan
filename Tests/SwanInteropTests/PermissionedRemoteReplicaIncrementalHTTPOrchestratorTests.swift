@@ -336,6 +336,214 @@ final class PermissionedRemoteReplicaIncrementalHTTPOrchestratorTests:
         XCTAssertEqual(paths, ["/xrpc/com.atproto.space.listRepoOps"])
     }
 
+    // MARK: - Truncated oplog (clearRecords / importRepo)
+
+    func testEmptyPageAtCheckpointHeadIsUnchanged() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        let head = try fixture.commit(
+            revision: fixture.base.head.wireRevision,
+            commitment: fixture.base.head.commitment
+        )
+        let (outcome, store, transport) = try await fixture.synchronizeEmpty(
+            page: head, latest: head
+        )
+        XCTAssertEqual(outcome, .unchanged(fixture.base.head))
+        let batch = await store.capturedBatch()
+        XCTAssertNil(batch)
+        let paths = await transport.paths()
+        XCTAssertEqual(paths, [
+            "/xrpc/com.atproto.space.listRepoOps",
+            "/xrpc/com.atproto.space.getLatestCommit",
+        ])
+    }
+
+    /// Upstream `clearRecords` truncates the oplog, changes the data digest
+    /// and advances the rev, so `listRepoOps` returns no ops under a newer
+    /// authenticated head.
+    func testClearedRepositoryWithNoOpsSelectsFullRecoveryWithoutApply() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        let cleared = try fixture.commit(
+            revision: fixture.revision,
+            commitment: fixture.otherCommitment
+        )
+        XCTAssertNotEqual(cleared.data.data, fixture.base.head.commitment)
+        let (outcome, store, transport) = try await fixture.synchronizeEmpty(
+            page: cleared, latest: cleared
+        )
+        XCTAssertEqual(outcome, .fullCARRecoveryRequired)
+        let batch = await store.capturedBatch()
+        XCTAssertNil(batch)
+        let paths = await transport.paths()
+        XCTAssertEqual(paths, [
+            "/xrpc/com.atproto.space.listRepoOps",
+            "/xrpc/com.atproto.space.getLatestCommit",
+        ])
+    }
+
+    /// Upstream `importRepo` truncates the oplog and advances the rev over
+    /// unchanged data. The durable batch requires operations, so the safe
+    /// choice is full recovery rather than an in-place head advance.
+    func testRevisionOnlyAdvanceWithNoOpsSelectsFullRecoveryWithoutApply() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        let imported = try fixture.commit(
+            revision: fixture.revision,
+            commitment: fixture.base.head.commitment
+        )
+        let (outcome, store, _) = try await fixture.synchronizeEmpty(
+            page: imported, latest: imported
+        )
+        XCTAssertEqual(outcome, .fullCARRecoveryRequired)
+        let batch = await store.capturedBatch()
+        XCTAssertNil(batch)
+    }
+
+    func testEmptyPageWithOlderOrEqualRevisionAndDifferentDataStillThrows() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        let older = try TID(tidString: "2222222222227")
+        XCTAssertLessThan(older, fixture.base.head.wireRevision)
+        for revision in [older, fixture.base.head.wireRevision] {
+            for commitment in [fixture.otherCommitment, fixture.base.head.commitment]
+                where !(revision == fixture.base.head.wireRevision
+                    && commitment == fixture.base.head.commitment) {
+                let stale = try fixture.commit(
+                    revision: revision, commitment: commitment
+                )
+                do {
+                    let (outcome, _, _) = try await fixture.synchronizeEmpty(
+                        page: stale, latest: stale
+                    )
+                    XCTFail("stale head accepted: \(outcome)")
+                } catch let error
+                    as PermissionedRemoteReplicaIncrementalVerificationError {
+                    XCTAssertEqual(error, .mixedHead)
+                }
+            }
+        }
+    }
+
+    func testEmptyNewerPageWithMixedLatestHeadStillThrows() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        let cleared = try fixture.commit(
+            revision: fixture.revision,
+            commitment: fixture.otherCommitment
+        )
+        let later = try fixture.commit(
+            revision: try TID(tidString: "222222222222c"),
+            commitment: fixture.otherCommitment
+        )
+        do {
+            let (outcome, _, _) = try await fixture.synchronizeEmpty(
+                page: cleared, latest: later
+            )
+            XCTFail("mixed head accepted: \(outcome)")
+        } catch let error as PermissionedRemoteReplicaIncrementalVerificationError {
+            XCTAssertEqual(error, .mixedHead)
+        }
+    }
+
+    func testTamperedMACOnEmptyNewerPageCannotForceFullRecovery() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        let cleared = try fixture.commit(
+            revision: fixture.revision,
+            commitment: fixture.otherCommitment
+        )
+        do {
+            let (outcome, _, _) = try await fixture.synchronizeEmpty(
+                page: cleared, latest: cleared, tamperListMAC: true
+            )
+            XCTFail("tampered MAC accepted: \(outcome)")
+        } catch is PermissionedRemoteReplicaIncrementalVerificationError {
+            XCTFail("tampered MAC reached the verifier")
+        } catch {
+            // Rejected by the MAC transport before any head is trusted.
+        }
+    }
+
+    /// Writes after a clear reach the oplog but the bridging deletes do not,
+    /// so the replayed LtHash cannot match the authenticated digest.
+    func testAuthenticatedNonEmptyPageWithLtHashMismatchSelectsFullRecovery() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        let terminal = try fixture.commit(
+            revision: fixture.revision,
+            commitment: fixture.otherCommitment
+        )
+        let transport = IncrementalTransport(
+            listStatus: 200,
+            listBody: try fixture.listBody(ops: [fixture.operation], commit: terminal),
+            latestBody: try fixture.latestBody(commit: terminal)
+        )
+        let store = CapturingIncrementalStore(base: fixture.base)
+        let orchestrator = try fixture.orchestrator(transport: transport, store: store)
+        let outcome = try await orchestrator.synchronize(
+            target: fixture.target, requestID: "post-clear-writes",
+            requestSequence: 1, appliedAt: 1
+        )
+        XCTAssertEqual(outcome, .fullCARRecoveryRequired)
+        let batch = await store.capturedBatch()
+        XCTAssertNil(batch)
+    }
+
+    func testLtHashMismatchWithMixedLatestHeadStillThrows() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        let terminal = try fixture.commit(
+            revision: fixture.revision,
+            commitment: fixture.otherCommitment
+        )
+        let later = try fixture.commit(
+            revision: try TID(tidString: "222222222222c"),
+            commitment: fixture.otherCommitment
+        )
+        let transport = IncrementalTransport(
+            listStatus: 200,
+            listBody: try fixture.listBody(ops: [fixture.operation], commit: terminal),
+            latestBody: try fixture.latestBody(commit: later)
+        )
+        let store = CapturingIncrementalStore(base: fixture.base)
+        let orchestrator = try fixture.orchestrator(transport: transport, store: store)
+        do {
+            _ = try await orchestrator.synchronize(
+                target: fixture.target, requestID: "post-clear-mixed",
+                requestSequence: 1, appliedAt: 1
+            )
+            XCTFail("mixed head selected recovery")
+        } catch let error as PermissionedRemoteReplicaIncrementalVerificationError {
+            XCTAssertEqual(error, .mixedHead)
+        }
+        let batch = await store.capturedBatch()
+        XCTAssertNil(batch)
+    }
+
+    func testTamperedMACOnLtHashMismatchPageCannotForceFullRecovery() async throws {
+        let fixture = try HTTPIncrementalFixture()
+        let terminal = try fixture.commit(
+            revision: fixture.revision,
+            commitment: fixture.otherCommitment
+        )
+        let transport = IncrementalTransport(
+            listStatus: 200,
+            listBody: try fixture.listBody(ops: [fixture.operation], commit: terminal),
+            latestBody: try fixture.latestBody(commit: terminal),
+            tamperListMAC: true
+        )
+        let store = CapturingIncrementalStore(base: fixture.base)
+        let orchestrator = try fixture.orchestrator(transport: transport, store: store)
+        do {
+            let outcome = try await orchestrator.synchronize(
+                target: fixture.target, requestID: "post-clear-tampered",
+                requestSequence: 1, appliedAt: 1
+            )
+            XCTFail("tampered MAC accepted: \(outcome)")
+        } catch is PermissionedRemoteReplicaIncrementalVerificationError {
+            XCTFail("tampered MAC reached the verifier")
+        } catch {
+            // Rejected by the MAC transport before any head is trusted.
+        }
+        let batch = await store.capturedBatch()
+        XCTAssertNil(batch)
+        let paths = await transport.paths()
+        XCTAssertFalse(paths.contains("/xrpc/com.atproto.space.getLatestCommit"))
+    }
+
     func testPublicationAuthorizationFailurePreventsDurableApply() async throws {
         let fixture = try HTTPIncrementalFixture()
         let transport = IncrementalTransport(
@@ -447,9 +655,50 @@ private struct HTTPIncrementalFixture {
     }
 
     func listBody() throws -> Data {
+        try listBody(ops: [operation], commit: commit)
+    }
+
+    func listBody(
+        ops: [ComAtprotoSpaceListRepoOps.OpEntry],
+        commit: ComAtprotoSpaceDefs.Commit
+    ) throws -> Data {
         try encoder.encode(ComAtprotoSpaceListRepoOps.Output(
-            ops: [operation], commit: commit, cursor: nil
+            ops: ops, commit: commit, cursor: nil
         ))
+    }
+
+    /// A digest that neither the empty checkpoint nor the fixture interval
+    /// produces.
+    var otherCommitment: Data {
+        var hash = LtHash()
+        hash.add(element: "app.bsky.feed.post/unrelated/bafyunrelated")
+        return hash.commitment
+    }
+
+    func commit(revision: TID, commitment: Data) throws -> ComAtprotoSpaceDefs.Commit {
+        .init(ver: 1, repo: try DID(didString: target.repositoryDID),
+              space: try SpaceRef(uriString: target.space.rawValue), rev: revision, data: Bytes(data: commitment))
+    }
+
+    func synchronizeEmpty(
+        page: ComAtprotoSpaceDefs.Commit,
+        latest: ComAtprotoSpaceDefs.Commit,
+        tamperListMAC: Bool = false
+    ) async throws -> (
+        PermissionedRemoteReplicaIncrementalSyncOutcome,
+        CapturingIncrementalStore,
+        IncrementalTransport
+    ) {
+        let transport = IncrementalTransport(
+            listStatus: 200,
+            listBody: try listBody(ops: [], commit: page),
+            latestBody: try latestBody(commit: latest),
+            tamperListMAC: tamperListMAC
+        )
+        let store = CapturingIncrementalStore(base: base)
+        let outcome = try await orchestrator(transport: transport, store: store)
+            .synchronize(target: target, requestID: "empty-page", requestSequence: 1, appliedAt: 1)
+        return (outcome, store, transport)
     }
 
     func latestBody(
@@ -543,13 +792,15 @@ private actor IncrementalTransport {
     let listStatus: Int
     let listBody: Data
     let latestBody: Data
+    let tamperListMAC: Bool
     private var requestedPaths: [String] = []
     private var requestedURLs: [URL] = []
 
-    init(listStatus: Int, listBody: Data, latestBody: Data) {
+    init(listStatus: Int, listBody: Data, latestBody: Data, tamperListMAC: Bool = false) {
         self.listStatus = listStatus
         self.listBody = listBody
         self.latestBody = latestBody
+        self.tamperListMAC = tamperListMAC
     }
 
     func execute(
@@ -588,7 +839,10 @@ private actor IncrementalTransport {
             }
             if let commit {
                 let secret = try SpaceMAC.decapsulate(privateKey: HTTPIncrementalFixture.kemKey(), keyShare: want.keyShare)
-                let mac = try SpaceMAC.commit(sharedSecret: secret, space: commit.space.uriString(), repo: commit.repo.didString(), rev: commit.rev.toString(), data: commit.data.data)
+                var mac = try SpaceMAC.commit(sharedSecret: secret, space: commit.space.uriString(), repo: commit.repo.didString(), rev: commit.rev.toString(), data: commit.data.data)
+                if tamperListMAC, url.path.hasSuffix("listRepoOps") {
+                    mac[mac.startIndex] ^= 0x01
+                }
                 responseHeaders[SpaceMACHeaders.responseHeader] = try SpaceMACHeaders.formatMAC(mac, type: .repository)
             }
         }
