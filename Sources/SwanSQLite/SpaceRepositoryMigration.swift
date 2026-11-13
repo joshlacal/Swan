@@ -429,7 +429,7 @@ extension SQLiteAccountDatabase {
                     }
                     writers.append(try SpaceMetaWriter(
                         did: try migrationText(row, "repo_did"),
-                        rev: try migrationText(row, "wire_revision"),
+                        repoRev: try migrationText(row, "wire_revision"),
                         data: try requiredBlob(row, "commitment"),
                         spaceRev: spaceRev
                     ))
@@ -552,7 +552,7 @@ extension SQLiteAccountDatabase {
                         ) VALUES (?, ?, ?, ?, ?, ?)
                         """,
                         [
-                            .text(space.rawValue), .text(writer.did), .text(writer.rev),
+                            .text(space.rawValue), .text(writer.did), .text(writer.repoRev),
                             blob(writer.data), .integer(updatedAt), .text(writer.spaceRev),
                         ]
                     )

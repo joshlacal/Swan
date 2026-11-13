@@ -56,7 +56,7 @@ public struct SpaceRepositoryCommit: Sendable, Equatable, Codable {
 
 public enum SpaceSTARError: Error, Sendable, Equatable {
     case invalidMagic, invalidCommit, invalidMetadata, invalidVarint
-    case truncated, limitExceeded, invalidRecord, invalidOrder
+    case invalidControl, trailingBytes, truncated, limitExceeded, invalidRecord, invalidOrder
     case wrongRepository, badMAC, digestMismatch, invalidSource
 }
 
@@ -106,7 +106,7 @@ public protocol SpaceSTARRecoverySink: Sendable {
 
 public enum SpaceSTARCodec {
     public static let magic = Data([0x2a, 0x6c, 0x01, 0x00])
-    public static let mediaType = "application/octet-stream"
+    public static let mediaType = "application/vnd.dasl.star"
     public static let metadataType = "atproto-space-repo"
 
     /// Input order is part of the producer contract. This intentionally rejects
@@ -130,7 +130,13 @@ public enum SpaceSTARCodec {
             result.append(frame)
             setHash.add(element: "\(path)/\(CID.fromDAGCBOR(record.value).string)")
         }
-        guard commitmentMatches(setHash.commitment, commit.data) else { throw SpaceSTARError.digestMismatch }
+        guard commitmentMatches(setHash.commitment, commit.data) else {
+            throw SpaceSTARError.digestMismatch
+        }
+        guard result.count < limits.maximumArchiveBytes else {
+            throw SpaceSTARError.limitExceeded
+        }
+        result.append(0x00)
         return result
     }
 
@@ -151,7 +157,7 @@ public enum SpaceSTARCodec {
         guard (1...SpaceSTARLimits.maximumRecordBytes).contains(valueByteCount) else {
             throw SpaceSTARError.limitExceeded
         }
-        var output = Data()
+        var output = Data([0x01])
         appendFrame(Data(path.utf8), to: &output)
         appendLength(valueByteCount, to: &output)
         return output
@@ -162,7 +168,7 @@ public enum SpaceSTARCodec {
         try validatePath(path)
         try validateRecord(record.value)
         guard record.cid == CID.fromDAGCBOR(record.value).string else { throw SpaceSTARError.invalidRecord }
-        var output = Data()
+        var output = Data([0x01])
         appendFrame(Data(path.utf8), to: &output)
         appendFrame(record.value, to: &output)
         return output
@@ -189,7 +195,7 @@ public enum SpaceSTARCodec {
         var previous: Data?
         var setHash = LtHash()
         var records: [SpaceRecord] = []
-        while !reader.isAtEnd {
+        while try reader.nextPair() {
             guard records.count < limits.maximumRecordCount else { throw SpaceSTARError.limitExceeded }
             let key = try reader.frame(maximum: SpaceSTARLimits.maximumPathBytes)
             let value = try reader.frame(maximum: SpaceSTARLimits.maximumRecordBytes)
@@ -212,19 +218,16 @@ public enum SpaceSTARCodec {
         let reader = STARStreamingReader(source: source, maximumBytes: limits.maximumArchiveBytes)
         do {
             guard try await reader.readExactly(magic.count) == magic else { throw SpaceSTARError.invalidMagic }
-            guard let metadata = try await reader.frame(maximum: SpaceSTARLimits.maximumMetadataBytes) else {
-                throw SpaceSTARError.truncated
-            }
+            let metadata = try await reader.frame(maximum: SpaceSTARLimits.maximumMetadataBytes)
             let commit = try decodeMetadata(metadata, space: space, author: author)
             guard try commitVerifier(commit) else { throw SpaceSTARError.badMAC }
             var previous: Data?
             var setHash = LtHash()
             var count = 0
-            while let key = try await reader.frame(maximum: SpaceSTARLimits.maximumPathBytes) {
+            while try await reader.nextPair() {
                 guard count < limits.maximumRecordCount else { throw SpaceSTARError.limitExceeded }
-                guard let value = try await reader.frame(maximum: SpaceSTARLimits.maximumRecordBytes) else {
-                    throw SpaceSTARError.truncated
-                }
+                let key = try await reader.frame(maximum: SpaceSTARLimits.maximumPathBytes)
+                let value = try await reader.frame(maximum: SpaceSTARLimits.maximumRecordBytes)
                 let record = try parseRecord(key: key, value: value, commit: commit, previous: &previous)
                 setHash.add(element: "\(recordPath(record))/\(record.cid)")
                 try await sink.stage(record: record)
@@ -366,6 +369,21 @@ struct STARBufferReader {
         return Data(bytes[offset..<offset + count])
     }
 
+    mutating func nextPair() throws -> Bool {
+        guard !isAtEnd else { throw SpaceSTARError.truncated }
+        let control = bytes[offset]
+        offset += 1
+        switch control {
+        case 0x00:
+            guard isAtEnd else { throw SpaceSTARError.trailingBytes }
+            return false
+        case 0x01:
+            return true
+        default:
+            throw SpaceSTARError.invalidControl
+        }
+    }
+
     mutating func frame(maximum: Int) throws -> Data {
         var value: UInt64 = 0
         for index in 0..<6 {
@@ -426,13 +444,25 @@ private final class STARStreamingReader {
         return result
     }
 
-    func frame(maximum: Int) async throws -> Data? {
+    func nextPair() async throws -> Bool {
+        guard try await fill() else { throw SpaceSTARError.truncated }
+        let control = buffered[offset]
+        offset += 1
+        switch control {
+        case 0x00:
+            if try await fill() { throw SpaceSTARError.trailingBytes }
+            return false
+        case 0x01:
+            return true
+        default:
+            throw SpaceSTARError.invalidControl
+        }
+    }
+
+    func frame(maximum: Int) async throws -> Data {
         var value: UInt64 = 0
         for index in 0..<6 {
-            guard try await fill() else {
-                if index == 0 { return nil }
-                throw SpaceSTARError.truncated
-            }
+            guard try await fill() else { throw SpaceSTARError.truncated }
             let byte = buffered[offset]
             offset += 1
             value |= UInt64(byte & 0x7f) << (7 * index)

@@ -48,8 +48,8 @@ final class SpaceSTARCodecTests: XCTestCase {
 
     func testEmptyArchiveMatchesIndependentFramingAndCBORVector() throws {
         // Encoded independently with a minimal Python standard-library CBOR
-        // encoder and SHA256(bytes(2048)); this does not call Swan's writer.
-        let vector = "2a6c0100a301a6637265766d32323232323232323232323232637665720164646174615820e5a00aa9991ac8a5ee3109844d84a55583bd20572ad3ffcd42792f3c36b183ad647265706f6d6469643a706c633a616c69636565247479706572617470726f746f2d73706163652d7265706f657370616365783061743a2f2f6469643a706c633a616c6963652f73706163652f6170702e62736b792e626f6f6b6d61726b732f73656c66"
+        // encoder and SHA256(bytes(2048)); the final 00 is STAR end-of-pairs.
+        let vector = "2a6c0100a301a6637265766d32323232323232323232323232637665720164646174615820e5a00aa9991ac8a5ee3109844d84a55583bd20572ad3ffcd42792f3c36b183ad647265706f6d6469643a706c633a616c69636565247479706572617470726f746f2d73706163652d7265706f657370616365783061743a2f2f6469643a706c633a616c6963652f73706163652f6170702e62736b792e626f6f6b6d61726b732f73656c6600"
         let commit = try commit([])
         let archive = try SpaceSTARCodec.encode(commit: commit, records: [])
         XCTAssertEqual(Hex.encode(archive), vector)
@@ -74,6 +74,22 @@ final class SpaceSTARCodecTests: XCTestCase {
         let archive = try SpaceSTARCodec.encode(commit: commit, records: records)
         for count in 0..<archive.count {
             XCTAssertThrowsError(try verify(Data(archive.prefix(count)), commit: commit), "prefix \(count)")
+        }
+    }
+
+    func testRejectsMissingEndInvalidControlAndTrailingBytes() throws {
+        let commit = try commit([])
+        let archive = try SpaceSTARCodec.encode(commit: commit, records: [])
+        XCTAssertThrowsError(try verify(Data(archive.dropLast()), commit: commit)) {
+            XCTAssertEqual($0 as? SpaceSTARError, .truncated)
+        }
+        var invalidControl = archive
+        invalidControl[invalidControl.index(before: invalidControl.endIndex)] = 0x02
+        XCTAssertThrowsError(try verify(invalidControl, commit: commit)) {
+            XCTAssertEqual($0 as? SpaceSTARError, .invalidControl)
+        }
+        XCTAssertThrowsError(try verify(archive + Data([0xff]), commit: commit)) {
+            XCTAssertEqual($0 as? SpaceSTARError, .trailingBytes)
         }
     }
 
@@ -125,7 +141,9 @@ final class SpaceSTARCodecTests: XCTestCase {
             XCTAssertEqual($0 as? SpaceSTARError, .badMAC)
         }
         let wrongDigest = try SpaceRepositoryCommit(repo: author, space: space, rev: commit.rev, data: Data(repeating: 1, count: 32))
-        let tampered = try SpaceSTARCodec.prefix(commit: wrongDigest) + records.reduce(into: Data()) { $0.append(try SpaceSTARCodec.recordFrame($1)) }
+        let tampered = try SpaceSTARCodec.prefix(commit: wrongDigest)
+            + records.reduce(into: Data()) { $0.append(try SpaceSTARCodec.recordFrame($1)) }
+            + Data([0x00])
         XCTAssertThrowsError(try verify(tampered, commit: wrongDigest)) { XCTAssertEqual($0 as? SpaceSTARError, .digestMismatch) }
     }
 
@@ -134,11 +152,11 @@ final class SpaceSTARCodecTests: XCTestCase {
         let prefix = try SpaceSTARCodec.prefix(commit: commit)
         let path = Data("app.bsky.feed.post/a".utf8)
         // Declares 1 MiB + 1; the payload is absent and the size error wins.
-        let oversized = prefix + frame(path) + Data([0x81, 0x80, 0x40])
+        let oversized = prefix + Data([0x01]) + frame(path) + Data([0x81, 0x80, 0x40])
         XCTAssertThrowsError(try verify(oversized, commit: commit)) { XCTAssertEqual($0 as? SpaceSTARError, .limitExceeded) }
-        let malformed = prefix + frame(Data([0xff])) + frame(Data([0xa0]))
+        let malformed = prefix + Data([0x01]) + frame(Data([0xff])) + frame(Data([0xa0])) + Data([0x00])
         XCTAssertThrowsError(try verify(malformed, commit: commit)) { XCTAssertEqual($0 as? SpaceSTARError, .invalidRecord) }
-        let invalidValue = prefix + frame(path) + frame(Data([0xa1, 0x61, 0x61, 0x18, 0]))
+        let invalidValue = prefix + Data([0x01]) + frame(path) + frame(Data([0xa1, 0x61, 0x61, 0x18, 0])) + Data([0x00])
         XCTAssertThrowsError(try verify(invalidValue, commit: commit)) { XCTAssertEqual($0 as? SpaceSTARError, .invalidRecord) }
     }
 
@@ -156,11 +174,11 @@ final class SpaceSTARCodecTests: XCTestCase {
         let wasDiscarded = await sink.wasDiscarded
         XCTAssertFalse(wasDiscarded)
         let failedSink = TestSTARSink()
-        let corrupt = archive + frame(Data("app.bsky.feed.post/c".utf8)) + frame(Data([0xa0]))
+        let corrupt = archive + Data([0xff])
         do {
             _ = try await SpaceSTARCodec.verifyStreaming(source: TestSTARSource(bytes: corrupt, chunkSize: 7), sink: failedSink, space: space, author: author) { $0 == commit }
-            XCTFail("digest mismatch must fail")
-        } catch { XCTAssertEqual(error as? SpaceSTARError, .digestMismatch) }
+            XCTFail("trailing data must fail")
+        } catch { XCTAssertEqual(error as? SpaceSTARError, .trailingBytes) }
         let failedDiscarded = await failedSink.wasDiscarded
         let remainingCount = await failedSink.records.count
         XCTAssertTrue(failedDiscarded)

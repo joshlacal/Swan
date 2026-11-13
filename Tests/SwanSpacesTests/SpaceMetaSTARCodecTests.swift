@@ -5,8 +5,8 @@ import SwanCore
 @testable import SwanSpaces
 import XCTest
 
-/// The `atproto-space-meta` STAR profile (October 29 section 5b): what the
-/// reader refuses, so an import can never silently drop access state.
+/// The `atproto-space-meta` STAR profile: what the reader refuses, so an
+/// import can never silently drop access state.
 final class SpaceMetaSTARCodecTests: XCTestCase {
     private let owner = "did:plc:alice"
     private var space: SpaceURI { get throws { try SpaceURI("at://did:plc:alice/space/app.bsky.bookmarks/self") } }
@@ -21,7 +21,7 @@ final class SpaceMetaSTARCodecTests: XCTestCase {
             ],
             writers: [
                 try SpaceMetaWriter(
-                    did: "did:plc:bob", rev: "3m2aaaaaaaaa2", data: Data(repeating: 1, count: 32),
+                    did: "did:plc:bob", repoRev: "3m2aaaaaaaaa2", data: Data(repeating: 1, count: 32),
                     spaceRev: "3m2aaaaaaaab2"
                 ),
             ]
@@ -45,9 +45,9 @@ final class SpaceMetaSTARCodecTests: XCTestCase {
         ]))
     }
 
-    private func writer() throws -> Data {
+    private func writer(revisionKey: String = "repoRev") throws -> Data {
         try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
-            (key: "rev", value: "3m2aaaaaaaaa2"),
+            (key: revisionKey, value: "3m2aaaaaaaaa2"),
             (key: "data", value: Data(repeating: 1, count: 32)),
             (key: "spaceRev", value: "3m2aaaaaaaab2"),
         ]))
@@ -57,9 +57,11 @@ final class SpaceMetaSTARCodecTests: XCTestCase {
         var output = SpaceSTARCodec.magic
         SpaceSTARCodec.appendFrame(try metadata ?? self.metadata(), to: &output)
         for (key, value) in entries {
+            output.append(0x01)
             SpaceSTARCodec.appendFrame(Data(key.utf8), to: &output)
             SpaceSTARCodec.appendFrame(value, to: &output)
         }
+        output.append(0x00)
         return output
     }
 
@@ -86,6 +88,17 @@ final class SpaceMetaSTARCodecTests: XCTestCase {
         ]))
         XCTAssertEqual(decoded.members, [try SpaceMetaMember(did: "did:plc:bob", read: true, write: false)])
         XCTAssertEqual(decoded.writers.map(\.spaceRev), ["3m2aaaaaaaab2"])
+    }
+
+    func testRejectsLegacyWriterRevAndInvalidControls() throws {
+        assertInvalid(
+            try raw([("policy", try policy()), ("writer/did:plc:bob", try writer(revisionKey: "rev"))]),
+            "legacy rev"
+        )
+        var invalidControl = try raw([("policy", try policy())])
+        invalidControl[SpaceSTARCodec.magic.count + 1 + (try metadata().count)] = 0x02
+        assertInvalid(invalidControl, "invalid control")
+        assertInvalid(try raw([("policy", try policy())]) + Data([0xff]), "trailing bytes")
     }
 
     func testUnknownPolicyTypeIsUnsupportedPolicy() throws {
@@ -152,6 +165,6 @@ final class SpaceMetaSTARCodecTests: XCTestCase {
         XCTAssertThrowsError(try SpaceMetaSTARCodec.encode(try SpaceMetaArchive(
             space: space, policy: .member(try MemberSpacePolicy()), members: [bob, bob], writers: []
         )))
-        XCTAssertThrowsError(try SpaceMetaWriter(did: "did:plc:bob", rev: "3m2aaaaaaaaa2", data: Data(count: 31), spaceRev: "3m2aaaaaaaab2"))
+        XCTAssertThrowsError(try SpaceMetaWriter(did: "did:plc:bob", repoRev: "3m2aaaaaaaaa2", data: Data(count: 31), spaceRev: "3m2aaaaaaaab2"))
     }
 }

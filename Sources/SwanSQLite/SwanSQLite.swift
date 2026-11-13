@@ -6353,6 +6353,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 guard count == metrics.recordCount, setHash.commitment == state.commitment else {
                     throw SQLiteRepositoryError.corruptDatabase("STAR snapshot digest is invalid")
                 }
+                try reserveRepositoryCARBodyBytes(1, currentByteCount: &totalBytes)
+                try writeCARSpoolData(Data([0x00]), to: body)
                 try body.synchronize()
                 let spool = try SpaceSTARBodySpool(fileHandle: body, bodyByteCount: totalBytes, lease: lease)
                 transferred = true

@@ -17,22 +17,22 @@ public struct SpaceMetaMember: Sendable, Equatable {
     }
 }
 
-/// One entry of a space's writer set, as `listRepos` reports it: the repo's
-/// latest accepted `rev` and `data`, and the space revision the host gave it.
+/// One member of a space's writer set, as `listWriters` reports it: the
+/// repo's latest accepted revision and data, and the space revision the host gave it.
 public struct SpaceMetaWriter: Sendable, Equatable {
     public let did: String
-    public let rev: String
+    public let repoRev: String
     public let data: Data
     public let spaceRev: String
 
-    public init(did: String, rev: String, data: Data, spaceRev: String) throws {
+    public init(did: String, repoRev: String, data: Data, spaceRev: String) throws {
         guard SpaceURI.isValidDID(did), data.count == 32,
-              (try? TID(tidString: rev)) != nil,
+              (try? TID(tidString: repoRev)) != nil,
               (try? TID(tidString: spaceRev)) != nil else {
             throw SpaceMetaArchiveError.invalidArchive
         }
         self.did = did
-        self.rev = rev
+        self.repoRev = repoRev
         self.data = data
         self.spaceRev = spaceRev
     }
@@ -70,13 +70,13 @@ public enum SpaceMetaArchiveError: Error, Sendable, Equatable {
 }
 
 /// The `atproto-space-meta` STAR profile. It is framed like `getRepo`'s
-/// archive: magic, a DRISL metadata frame, then key/value frames in three
-/// sections in this order, each in strict bytewise key order:
+/// archive: magic, a DRISL metadata frame, then `0x01` key/value pairs and a
+/// final `0x00`, in three sections in this order and strict bytewise key order:
 ///
 /// 1. `policy`: the policy object.
 /// 2. Policy state, keyed like record paths. Of the baseline policies only
 ///    memberspace has any: `com.atproto.memberspace.member/<did as rkey>`.
-/// 3. `writer/<did>` → `{ rev, data, spaceRev }`.
+/// 3. `writer/<did>` → `{ repoRev, data, spaceRev }`.
 ///
 /// The reader refuses a missing `policy`, a section or key out of order, a
 /// duplicate key, and any policy-state key the policy does not define. It
@@ -90,7 +90,7 @@ public enum SpaceMetaSTARCodec {
     /// bytes, so this admits several hundred thousand of each.
     public static let maximumArchiveBytes = 64 * 1_024 * 1_024
     static let maximumKeyBytes = 4_096
-    static let maximumValueBytes = 65_536
+    static let maximumValueBytes = 1_048_576
 
     public static func encode(_ archive: SpaceMetaArchive) throws -> Data {
         var output = SpaceSTARCodec.magic
@@ -114,7 +114,7 @@ public enum SpaceMetaSTARCodec {
             writerPairs.append((
                 Data((writerKeyPrefix + writer.did).utf8),
                 try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
-                    (key: "rev", value: writer.rev),
+                    (key: "repoRev", value: writer.repoRev),
                     (key: "data", value: writer.data),
                     (key: "spaceRev", value: writer.spaceRev),
                 ]))
@@ -128,9 +128,11 @@ public enum SpaceMetaSTARCodec {
             pairs += sorted
         }
         for pair in pairs {
+            output.append(0x01)
             SpaceSTARCodec.appendFrame(pair.key, to: &output)
             SpaceSTARCodec.appendFrame(pair.value, to: &output)
         }
+        output.append(0x00)
         guard output.count <= maximumArchiveBytes else { throw SpaceMetaArchiveError.invalidArchive }
         return output
     }
@@ -170,7 +172,7 @@ public enum SpaceMetaSTARCodec {
         var writers: [SpaceMetaWriter] = []
         var section: Section?
         var previousKey: Data?
-        while !reader.isAtEnd {
+        while try reader.nextPair() {
             let keyBytes = try reader.frame(maximum: maximumKeyBytes)
             let valueBytes = try reader.frame(maximum: maximumValueBytes)
             guard let key = String(data: keyBytes, encoding: .utf8), Data(key.utf8) == keyBytes else {
@@ -209,12 +211,15 @@ public enum SpaceMetaSTARCodec {
                 memberValues.append((did, value))
             case .writers:
                 let did = String(key.dropFirst(writerKeyPrefix.count))
-                guard let rev = value["rev"] as? String,
+                guard value["rev"] == nil,
+                      let repoRev = value["repoRev"] as? String,
                       let data = value["data"] as? Data,
                       let spaceRev = value["spaceRev"] as? String else {
                     throw SpaceMetaArchiveError.invalidArchive
                 }
-                writers.append(try SpaceMetaWriter(did: did, rev: rev, data: data, spaceRev: spaceRev))
+                writers.append(try SpaceMetaWriter(
+                    did: did, repoRev: repoRev, data: data, spaceRev: spaceRev
+                ))
             }
         }
         guard let policy else { throw SpaceMetaArchiveError.invalidArchive }

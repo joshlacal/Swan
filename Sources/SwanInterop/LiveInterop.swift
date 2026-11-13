@@ -1475,6 +1475,8 @@ public enum PermissionedRecoveryFailureCode {
             case .invalidCommit: return "STARInvalidCommit"
             case .invalidMetadata: return "STARInvalidMetadata"
             case .invalidVarint: return "STARInvalidVarint"
+            case .invalidControl: return "STARInvalidControl"
+            case .trailingBytes: return "STARTrailingBytes"
             case .truncated: return "STARTruncated"
             case .limitExceeded: return "STARLimitExceeded"
             case .invalidRecord: return "STARInvalidRecord"
