@@ -4041,9 +4041,9 @@ final class SwanSQLiteTests: XCTestCase {
             configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList),
             authorization: authorization
         )
-        _ = try await database.addSimpleSpaceMember(
+        _ = try await database.putSimpleSpaceMembers(
             space: space,
-            member: "did:plc:bob",
+            members: [.init(did: "did:plc:bob", read: true, write: true)],
             authorization: authorization
         )
 
@@ -4559,9 +4559,9 @@ final class SwanSQLiteTests: XCTestCase {
         )
 
         let memberAlice = "did:plc:alice00000000000000000001"
-        _ = try await database.addSimpleSpaceMember(
+        _ = try await database.putSimpleSpaceMembers(
             space: space,
-            member: memberAlice,
+            members: [.init(did: memberAlice, read: true, write: true)],
             authorization: .accountOAuthForTesting(subject: fixture.author, scopes: ["atproto"]),
             now: now.addingTimeInterval(1)
         )
@@ -4590,9 +4590,9 @@ final class SwanSQLiteTests: XCTestCase {
 
         // Concurrent mutation on writer connection adds memberBob and commits
         let memberBob = "did:plc:bob00000000000000000000002"
-        _ = try await database.addSimpleSpaceMember(
+        _ = try await database.putSimpleSpaceMembers(
             space: space,
-            member: memberBob,
+            members: [.init(did: memberBob, read: true, write: true)],
             authorization: .accountOAuthForTesting(subject: fixture.author, scopes: ["atproto"]),
             now: now.addingTimeInterval(2)
         )

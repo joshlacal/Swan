@@ -790,14 +790,12 @@ private struct Fixture: Sendable {
                 authorization: authorization,
                 now: Date(timeIntervalSince1970: 1_750_000_000)
             )
-            for member in members {
-                _ = try await database.addSimpleSpaceMember(
-                    space: space,
-                    member: member,
-                    authorization: authorization,
-                    now: Date(timeIntervalSince1970: 1_750_000_001)
-                )
-            }
+            _ = try await database.putSimpleSpaceMembers(
+                space: space,
+                members: members.map { .init(did: $0, read: true, write: true) },
+                authorization: authorization,
+                now: Date(timeIntervalSince1970: 1_750_000_001)
+            )
             try await database.close()
         } catch {
             try? await database.close()

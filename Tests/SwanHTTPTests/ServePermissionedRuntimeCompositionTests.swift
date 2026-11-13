@@ -84,7 +84,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 localDID
             )
             XCTAssertEqual(
-                composition.checkUserAccessConfiguration?.managingServiceAudience,
+                composition.managedSpaceCheckAccessConfiguration?.managingServiceAudience,
                 managingAudience
             )
 
@@ -113,7 +113,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             XCTAssertNotNil(server.authenticatedSpaceRepositorySync)
             XCTAssertNotNil(server.authenticatedSpaceBlobs)
             XCTAssertNotNil(server.authenticatedSpaceNotifications)
-            XCTAssertNotNil(server.simpleSpaceCheckUserAccess)
+            XCTAssertNotNil(server.managedSpaceCheckAccess)
             XCTAssertNotNil(server.publicRepositoryReadDirectory)
 
             let app = server.buildApplication(
@@ -727,7 +727,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 notification: notification
             )
             XCTAssertNotNil(composition.notificationConfiguration)
-            XCTAssertNil(composition.checkUserAccessConfiguration)
+            XCTAssertNil(composition.managedSpaceCheckAccessConfiguration)
             try await fixture.close()
         } catch {
             try? await fixture.close()
@@ -876,9 +876,9 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             // selected; it must not be required merely to expose the local
             // endpoint contracts.
             XCTAssertNotNil(composition.notificationConfiguration)
-            XCTAssertNotNil(composition.checkUserAccessConfiguration)
+            XCTAssertNotNil(composition.managedSpaceCheckAccessConfiguration)
             XCTAssertNotNil(server.authenticatedSpaceNotifications)
-            XCTAssertNotNil(server.simpleSpaceCheckUserAccess)
+            XCTAssertNotNil(server.managedSpaceCheckAccess)
 
             let app = server.buildApplication(
                 logger: Logger(label: "ServePermissionedRuntimeCompositionTests.local")
