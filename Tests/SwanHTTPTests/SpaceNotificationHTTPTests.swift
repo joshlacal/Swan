@@ -2583,7 +2583,7 @@ extension SpaceNotificationHTTPTests {
             let listURI = "/xrpc/com.atproto.space.listWriters?space=\(fixture.space.rawValue.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!)"
             let revokedHeaders = try SpaceCredentialSignatureTestSupport.headers(token: revoked, audience: authority)
             let keptHeaders = try SpaceCredentialSignatureTestSupport.headers(token: kept, audience: authority)
-            let method = SwanSpaceNotificationNSID.notifyCredentialsRevoked
+            let method = ComAtprotoSpaceNotifyCredentialsRevoked.typeIdentifier
             let body = revocationBody(fixture.space, [revokedJTI])
             let digest = SpaceNotificationRequestDigest.credentialRevocation(
                 space: fixture.space, credentials: [revokedJTI]
@@ -2644,7 +2644,7 @@ extension SpaceNotificationHTTPTests {
             let keys = SignedServiceKeys()
             let app = try fixture.server(serviceAuthentication: try keys.verifier(authority: authority, writer: writer))
                 .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.revocationAuth"))
-            let method = SwanSpaceNotificationNSID.notifyCredentialsRevoked
+            let method = ComAtprotoSpaceNotifyCredentialsRevoked.typeIdentifier
             let body = revocationBody(fixture.space, ["jti-1"])
             let digest = SpaceNotificationRequestDigest.credentialRevocation(space: fixture.space, credentials: ["jti-1"])
             @Sendable func token(
@@ -2710,7 +2710,7 @@ extension SpaceNotificationHTTPTests {
                 serviceAuthentication: try keys.verifier(authority: authority, writer: writer),
                 spacesOpenInterop: .standard
             ).buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.revocationInterop"))
-            let method = SwanSpaceNotificationNSID.notifyCredentialsRevoked
+            let method = ComAtprotoSpaceNotifyCredentialsRevoked.typeIdentifier
             let unbound = serviceHeaders(try SpaceServiceJWT.create(
                 issuer: authority, audience: writer, method: method,
                 eventID: "upstream-revocation", key: keys.authority

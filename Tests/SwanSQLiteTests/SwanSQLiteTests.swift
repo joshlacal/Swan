@@ -3938,7 +3938,7 @@ final class SwanSQLiteTests: XCTestCase {
             owner: did,
             configuration: try SimpleSpaceConfiguration(
                 readPolicy: .managingApp,
-                readManagingApp: "did:web:manager.example",
+                readManagingApp: "did:web:manager.example#space",
                 writePolicy: .memberList
             ),
             authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"])
@@ -3968,7 +3968,7 @@ final class SwanSQLiteTests: XCTestCase {
         )
         XCTAssertEqual(
             asymmLookup1?.space.configuration.policy,
-            .managed(try ManagedSpacePolicy(managingApp: "did:web:manager.example"))
+            .managed(try ManagedSpacePolicy(managingApp: "did:web:manager.example#space"))
         )
         try await reopenedAsymm1.close()
 
@@ -3985,7 +3985,7 @@ final class SwanSQLiteTests: XCTestCase {
             configuration: try SimpleSpaceConfiguration(
                 readPolicy: .memberList,
                 writePolicy: .managingApp,
-                writeManagingApp: "did:web:manager.example"
+                writeManagingApp: "did:web:manager.example#space"
             ),
             authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"])
         )
@@ -4014,7 +4014,7 @@ final class SwanSQLiteTests: XCTestCase {
         )
         XCTAssertEqual(
             asymmLookup2?.space.configuration.policy,
-            .managed(try ManagedSpacePolicy(managingApp: "did:web:manager.example"))
+            .managed(try ManagedSpacePolicy(managingApp: "did:web:manager.example#space"))
         )
         try await reopenedAsymm2.close()
     }

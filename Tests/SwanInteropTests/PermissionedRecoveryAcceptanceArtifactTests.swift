@@ -291,7 +291,7 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
     }
 
     func testNativeCorruptionClassificationRequiresSTARContentFailure() {
-        XCTAssertTrue(PermissionedRecoveryFailureCode.isInjectedFinalByteCorruptionRejection(SpaceSTARError.digestMismatch))
+        XCTAssertTrue(PermissionedRecoveryFailureCode.isInjectedFinalByteCorruptionRejection(SpaceSTARError.truncated))
         for error in [SpaceSTARError.badMAC, SpaceSTARError.wrongRepository, SpaceMACHeaders.HeaderError.invalidSpaceMAC, InteropHTTPError.transportFailure] as [any Error] {
             XCTAssertFalse(PermissionedRecoveryFailureCode.isInjectedFinalByteCorruptionRejection(error))
         }

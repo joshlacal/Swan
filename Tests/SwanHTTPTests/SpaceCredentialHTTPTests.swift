@@ -625,6 +625,9 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         let fixture = try await Fixture.make()
         defer { fixture.cleanup() }
         do {
+            await fixture.directory.setManagedSpaceAccessChecker(
+                FixedManagedSpaceAccessChecker(read: false, write: false)
+            )
             let app = try makeServer(fixture).buildApplication(
                 logger: Logger(label: "SpaceCredentialHTTPTests.policy")
             )
@@ -685,6 +688,72 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             throw error
         }
     }
+    func testManagedDirectoryUpstreamFailureMapsTo502AndKeepsRegistration() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let endpoint = "https://notify.example"
+            let token = "managed-token"
+            await fixture.directory.setManagedSpaceAccessChecker(
+                FixedManagedSpaceAccessChecker(read: true, write: false)
+            )
+            let app = try makeServer(
+                fixture,
+                registrationConfirmer: RegistrationConfirmationProbe()
+            ).buildApplication(logger: Logger(label: "SpaceCredentialHTTPTests.managedUpstream"))
+            func body(_ delegation: String) throws -> ByteBuffer {
+                ByteBuffer(data: try JSONSerialization.data(withJSONObject: [
+                    "space": fixture.managingSpace.rawValue,
+                    "credentialKey": try SpaceCredentialSignatureTestSupport.keyID,
+                    "delegationToken": delegation,
+                    "notify": ["endpoint": endpoint, "token": token],
+                ]))
+            }
+            try await app.test(.router) { client in
+                let initial = try self.delegation(
+                    fixture, user: Self.member, space: fixture.managingSpace
+                )
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: self.exchangeHeaders(),
+                    body: try body(initial)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                let registered = try await fixture.directory.spaceSyncRegistration(
+                    space: fixture.managingSpace, endpoint: endpoint, token: token
+                )
+                XCTAssertNotNil(registered)
+
+                await fixture.directory.setManagedSpaceAccessChecker(
+                    UnavailableManagedSpaceAccessChecker()
+                )
+                let retry = try self.delegation(
+                    fixture, user: Self.member, space: fixture.managingSpace
+                )
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: self.exchangeHeaders(),
+                    body: try body(retry)
+                ) { response in
+                    XCTAssertEqual(response.status, .badGateway)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(try self.errorCode(response.body), "UpstreamFailure")
+                }
+            }
+            let retained = try await fixture.directory.spaceSyncRegistration(
+                space: fixture.managingSpace, endpoint: endpoint, token: token
+            )
+            XCTAssertNotNil(retained)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
 
     func testUnavailableAttestationPolicyMapsSanitizedServiceUnavailable() async throws {
         let fixture = try await Fixture.make()
@@ -1909,6 +1978,20 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         let index = result.index(result.endIndex, offsetBy: -offsetFromEnd)
         result.replaceSubrange(index ... index, with: result[index] == "A" ? "B" : "A")
         return result
+    }
+}
+
+private struct FixedManagedSpaceAccessChecker: ManagedSpaceAccessChecking {
+    let read: Bool
+    let write: Bool
+
+    func checkAccess(
+        space _: SpaceURI,
+        repo _: String?,
+        clientID _: String?,
+        managingApp _: String
+    ) async throws -> ManagedSpaceAccess {
+        ManagedSpaceAccess(read: read, write: write)
     }
 }
 

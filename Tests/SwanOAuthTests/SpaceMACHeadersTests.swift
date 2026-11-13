@@ -76,9 +76,10 @@ final class SpaceMACHeadersTests: XCTestCase {
             ),
             request
         )
+        XCTAssertNil(try SpaceMACHeaders.parseRequest([""], profile: .commit))
+        XCTAssertNil(try SpaceMACHeaders.parseRequest([" \t"], profile: .commit))
 
         let failures = [
-            "",
             #"a=("atproto-space-commit");keyid="\#(keyID)";tag="atproto-space-commit""#,
             #"a=("atproto-space-record";sf);keyid="\#(keyID)";tag="atproto-space-commit""#,
             #"a=("atproto-space-commit";sf);keyid="did:key:invalid";tag="atproto-space-commit""#,

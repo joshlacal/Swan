@@ -403,7 +403,7 @@ final class SpaceRepositoryMigrationOctober29Tests: XCTestCase {
                 ],
                 authorization: owner
             )
-            for (did, spaceRev) in [(Self.bob, "3mzzzzzzzzzy2"), (Self.carol, "3mzzzzzzzzzz2")] {
+            for (did, spaceRev) in [(Self.bob, "3wzzzzzzzzzy2"), (Self.carol, "3wzzzzzzzzzz2")] {
                 _ = try await database.connection.query(
                     """
                     INSERT OR REPLACE INTO permissioned_space_writers(
@@ -430,7 +430,7 @@ final class SpaceRepositoryMigrationOctober29Tests: XCTestCase {
         ], "the owner row Swan keeps is not exported")
         // The owner's own writer entry (from publishing the policy) travels too.
         XCTAssertEqual(archive.writers.map(\.did), [Self.alice, Self.bob, Self.carol])
-        XCTAssertEqual(archive.writers.suffix(2).map(\.spaceRev), ["3mzzzzzzzzzy2", "3mzzzzzzzzzz2"])
+        XCTAssertEqual(archive.writers.suffix(2).map(\.spaceRev), ["3wzzzzzzzzzy2", "3wzzzzzzzzzz2"])
 
         try await withDatabase(newHost) { database in
             // manage=update alone is not enough: importing also creates.
@@ -464,8 +464,8 @@ final class SpaceRepositoryMigrationOctober29Tests: XCTestCase {
                     )
                 }
             }
-            XCTAssertEqual(sequence?.previousSpaceRevision, "3mzzzzzzzzzz2")
-            XCTAssertGreaterThan(try XCTUnwrap(sequence?.spaceRevision), "3mzzzzzzzzzz2")
+            XCTAssertEqual(sequence?.previousSpaceRevision, "3wzzzzzzzzzz2")
+            XCTAssertGreaterThan(try XCTUnwrap(sequence?.spaceRevision), "3wzzzzzzzzzz2")
         }
     }
 }

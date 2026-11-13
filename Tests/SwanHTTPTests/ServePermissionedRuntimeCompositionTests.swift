@@ -37,6 +37,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         case jsonNestedString(String, String, String)
         case jsonBoolean(String, Bool)
         case jsonEmptyObject
+        case jsonAccess(read: Bool, write: Bool)
         case emptyBody
         case blob(Data)
         case star
@@ -56,9 +57,8 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         case credential
         case delegation
         case notifyRepoUpdate
-        case notifyDeleted
         case notifyCredentialsRevoked
-        case checkUserAccess
+        case checkAccess
     }
 
     func testExactServeCompositionRetainsConfigurationAndInstallsAllRoutes() async throws {
@@ -167,7 +167,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(
-                    path: "Profiles/permissioned-data-0016-2026-10-29.json"
+                    path: "Profiles/permissioned-data-0016-2026-11-12.json"
                 )
             )
             let server = composition.makeServer(
@@ -230,12 +230,11 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.space.getBlob", method: .get, uri: "/xrpc/com.atproto.space.getBlob?space=\(encodedSpace)&repo=\(localDID)&cid=\(blobCID)", body: nil, authorization: .oauth, invariant: .blob(blobPayload)),
                 .init(nsid: "com.atproto.space.notifyRepoUpdate", method: .post, uri: "/xrpc/com.atproto.space.notifyRepoUpdate", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"repoRev\":\"222222222222z\",\"data\":{\"$bytes\":\"\(Data(repeating: 0x31, count: 32).base64EncodedString())\"}}", authorization: .notifyRepoUpdate, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.listWriters", method: .get, uri: "/xrpc/com.atproto.space.listWriters?space=\(encodedSpace)", body: nil, authorization: .credential, invariant: .jsonArrayContains("repos", field: "repo", value: localDID)),
-                .init(nsid: "com.atproto.managedspace.checkUserAccess", method: .get, uri: "/xrpc/com.atproto.managedspace.checkUserAccess?space=\(encodedSpace)&user=\(remoteDID)&access=read", body: nil, authorization: .checkUserAccess, invariant: .jsonBoolean("authorized", false)),
+                .init(nsid: ComAtprotoManagedspaceCheckAccess.typeIdentifier, method: .get, uri: "/xrpc/\(ComAtprotoManagedspaceCheckAccess.typeIdentifier)?space=\(encodedSpace)&repo=\(remoteDID)", body: nil, authorization: .checkAccess, invariant: .jsonAccess(read: false, write: false)),
                 .init(nsid: "com.atproto.space.deleteRecord", method: .post, uri: "/xrpc/com.atproto.space.deleteRecord", body: recordPrefix + ",\"rkey\":\"delete-me\"}", authorization: .oauth, invariant: .jsonEmptyObject),
                 .init(nsid: "com.atproto.memberspace.removeMembers", method: .post, uri: "/xrpc/com.atproto.memberspace.removeMembers", body: "{\"space\":\"\(lifecycle.rawValue)\",\"dids\":[\"\(remoteDID)\"]}", authorization: .oauth, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.removeWriter", method: .post, uri: "/xrpc/com.atproto.space.removeWriter", body: "{\"space\":\"\(lifecycle.rawValue)\",\"repo\":\"\(remoteDID)\"}", authorization: .oauth, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.deleteSpace", method: .post, uri: "/xrpc/com.atproto.space.deleteSpace", body: "{\"space\":\"\(lifecycle.rawValue)\"}", authorization: .oauth, invariant: .emptyBody),
-                .init(nsid: "com.atproto.space.notifySpaceDeleted", method: .post, uri: "/xrpc/com.atproto.space.notifySpaceDeleted", body: "{\"space\":\"\(lifecycle.rawValue)\"}", authorization: .notifyDeleted, invariant: .emptyBody),
                 // Last: it revokes the matrix credential, checked after the loop.
                 .init(nsid: "com.atproto.space.notifyCredentialsRevoked", method: .post, uri: "/xrpc/com.atproto.space.notifyCredentialsRevoked", body: "{\"space\":\"\(space.rawValue)\",\"credentials\":[\"\(credentialJTI)\"]}", authorization: .notifyCredentialsRevoked, invariant: .emptyBody),
             ]
@@ -253,12 +252,17 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 "com.atproto.space.importRepo",
                 "com.atproto.space.importSpaceMeta",
             ]
-            XCTAssertEqual(profile.endpoints.count, 33)
-            XCTAssertEqual(PermissionedData0016.methods.count, 33)
-            XCTAssertEqual(cases.count, 29)
+            let outboundCallbacks: Set<String> = [
+                ComAtprotoSpaceConfirmRegistration.typeIdentifier,
+                ComAtprotoSpaceNotifySpaceUpdate.typeIdentifier,
+            ]
+            XCTAssertEqual(profile.endpoints.count, 32)
+            XCTAssertEqual(PermissionedData0016.methods.count, 32)
+            XCTAssertEqual(cases.count, 26)
             XCTAssertEqual(profileSet, generatedSet)
-            XCTAssertEqual(profileSet, matrixSet.union(servedOutsideMatrix))
+            XCTAssertEqual(profileSet, matrixSet.union(servedOutsideMatrix).union(outboundCallbacks))
             XCTAssertTrue(matrixSet.isDisjoint(with: servedOutsideMatrix))
+            XCTAssertTrue(matrixSet.isDisjoint(with: outboundCallbacks))
             XCTAssertEqual(matrixSet.count, cases.count, "matrix contains a duplicate NSID")
 
             let app = server.buildApplication(
@@ -304,7 +308,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                             await tokenCapture.setDelegation(
                                 try XCTUnwrap(self.jsonObject(response.body)["token"] as? String)
                             )
-                        } else if testCase.nsid == ComAtprotoSpaceGetSpaceCredential.typeIdentifier {
+                        } else if testCase.nsid == ComAtprotoSpaceAuthorizeSpaceSync.typeIdentifier {
                             await tokenCapture.setCredential(
                                 try XCTUnwrap(self.jsonObject(response.body)["credential"] as? String)
                             )
@@ -1158,7 +1162,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         if testCase.method == .post {
             return (path, "{}", .badRequest, "InvalidRequest")
         }
-        if testCase.nsid == "com.atproto.managedspace.checkUserAccess" {
+        if testCase.nsid == ComAtprotoManagedspaceCheckAccess.typeIdentifier {
             // This endpoint deliberately makes malformed queries
             // indistinguishable from authorization denial.
             return (path, nil, .unauthorized, "Unauthorized")
@@ -1207,24 +1211,12 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let notifyRepoUpdate = try SpaceServiceJWT.create(
                 issuer: localDID,
                 audience: space.authority,
-                method: SwanSpaceNotificationNSID.notifyRepoUpdate,
+                method: ComAtprotoSpaceNotifyRepoUpdate.typeIdentifier,
                 eventID: jti,
                 requestBodyDigest: writeDigest,
                 key: fixture.localKey
             )
             headers = [.authorization: "Bearer \(notifyRepoUpdate)"]
-        case .notifyDeleted:
-            let lifecycleSpace = fixture.lifecycleSpace ?? space
-            let deletionDigest = SpaceNotificationRequestDigest.deletion(space: lifecycleSpace)
-            let notifyDeleted = try SpaceServiceJWT.create(
-                issuer: lifecycleSpace.authority,
-                audience: recipientService,
-                method: ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier,
-                eventID: jti,
-                requestBodyDigest: deletionDigest,
-                key: fixture.localKey
-            )
-            headers = [.authorization: "Bearer \(notifyDeleted)"]
         case .notifyCredentialsRevoked:
             // Service auth from the space authority, addressed to a repo
             // account this host stores, binding the body by default.
@@ -1232,7 +1224,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let revocation = try SpaceServiceJWT.create(
                 issuer: space.authority,
                 audience: localDID,
-                method: SwanSpaceNotificationNSID.notifyCredentialsRevoked,
+                method: ComAtprotoSpaceNotifyCredentialsRevoked.typeIdentifier,
                 eventID: jti,
                 requestBodyDigest: SpaceNotificationRequestDigest.credentialRevocation(
                     space: space, credentials: [credentialJTI]
@@ -1240,15 +1232,15 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 key: fixture.localKey
             )
             headers = [.authorization: "Bearer \(revocation)"]
-        case .checkUserAccess:
-            let checkUserAccess = try SpaceServiceJWT.create(
+        case .checkAccess:
+            let checkAccess = try SpaceServiceJWT.create(
                 issuer: space.authority,
                 audience: managingAudience,
-                method: "com.atproto.managedspace.checkUserAccess",
+                method: ComAtprotoManagedspaceCheckAccess.typeIdentifier,
                 eventID: jti,
                 key: fixture.localKey
             )
-            headers = [.authorization: "Bearer \(checkUserAccess)"]
+            headers = [.authorization: "Bearer \(checkAccess)"]
         }
         if method == .get, let profile = semanticMACProfile(for: path) {
             let exchange = try SpaceMACKeyAgreement.send(
@@ -1477,6 +1469,12 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         case let .jsonBoolean(key, value):
             XCTAssertEqual(response.headers[.contentType], "application/json", nsid, file: file, line: line)
             XCTAssertEqual(try jsonObject(response.body)[key] as? Bool, value, nsid, file: file, line: line)
+        case let .jsonAccess(read, write):
+            XCTAssertEqual(response.headers[.contentType], "application/json", nsid, file: file, line: line)
+            let object = try jsonObject(response.body)
+            XCTAssertEqual(Set(object.keys), ["read", "write"], nsid, file: file, line: line)
+            XCTAssertEqual(object["read"] as? Bool, read, nsid, file: file, line: line)
+            XCTAssertEqual(object["write"] as? Bool, write, nsid, file: file, line: line)
         case .jsonEmptyObject:
             XCTAssertEqual(response.headers[.contentType], "application/json", nsid, file: file, line: line)
             XCTAssertTrue(try jsonObject(response.body).isEmpty, nsid, file: file, line: line)
@@ -1538,6 +1536,13 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                   let object = try? JSONSerialization.jsonObject(with: body)
                     as? [String: Any] else { return false }
             return object[key] as? Bool == value
+        case let .jsonAccess(read, write):
+            guard contentType == "application/json",
+                  let object = try? JSONSerialization.jsonObject(with: body)
+                    as? [String: Any] else { return false }
+            return Set(object.keys) == ["read", "write"]
+                && object["read"] as? Bool == read
+                && object["write"] as? Bool == write
         case .jsonEmptyObject:
             return contentType == "application/json"
                 && ((try? JSONSerialization.jsonObject(with: body) as? [String: Any])?.isEmpty == true)
