@@ -260,8 +260,8 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "PolicyMismatch")
                 }
-                let removeMember = #"{"space":"\#(uri)","dids":["\#(Self.bob)"]}"#
-                try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(fixture, path: Self.removePath, jti: "remove-member-personal"), body: ByteBuffer(string: removeMember)) { response in
+                let removal = #"{"space":"\#(uri)","dids":["\#(Self.bob)"]}"#
+                try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(fixture, path: Self.removePath, jti: "remove-member-personal"), body: ByteBuffer(string: removal)) { response in
                     XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "PolicyMismatch")
                 }
@@ -275,7 +275,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(members?.compactMap { $0["did"] as? String }, [Self.alice])
                 }
 
-                try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(fixture, path: Self.removePath, jti: "remove-member"), body: ByteBuffer(string: removeMember)) { response in
+                try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(fixture, path: Self.removePath, jti: "remove-member"), body: ByteBuffer(string: removal)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
                 let delete = #"{"space":"\#(uri)"}"#
@@ -492,8 +492,8 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertEqual(((try self.jsonObject(response.body))["members"] as? [[String: Any]])?.compactMap { $0["did"] as? String }, [Self.alice, Self.bob])
                 }
-                let removeMember = #"{"space":"\#(space.rawValue)","dids":["\#(Self.bob)"]}"#
-                try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.removePath, jti: "update-scope-remove"), body: ByteBuffer(string: removeMember)) { response in
+                let removal = #"{"space":"\#(space.rawValue)","dids":["\#(Self.bob)"]}"#
+                try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.removePath, jti: "update-scope-remove"), body: ByteBuffer(string: removal)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
                 let update = #"{"space":"\#(space.rawValue)","policy":{"$type":"com.atproto.memberspace.policy","publicRead":true}}"#

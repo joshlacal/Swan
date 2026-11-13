@@ -544,7 +544,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
     }
   }
 
-  func testSubscribeReposMalformedCursorRejectsUpgrade() async throws {
+  func testSubscribeReposInvalidCursorRejectsUpgrade() async throws {
     let fixture = try await makeFixture()
     defer { try? FileManager.default.removeItem(at: fixture.root) }
     do {

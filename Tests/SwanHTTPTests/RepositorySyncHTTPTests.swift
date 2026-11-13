@@ -875,7 +875,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
     /// SWAN-08: `listRepoOps` accepts the reference `${rev}/${idx}` cursor
     /// (preferred over `since`), emits one on each full page, and returns the
     /// current commit on every page. Following cursors yields every operation once.
-    func testListRepoOpsCursorPagesEveryOperationOnceAndRejectsMalformedCursor() async throws {
+    func testListRepoOpsCursorPagesEveryOperationOnceAndRejectsInvalidCursor() async throws {
         let fixture = try await Fixture.make()
         defer { fixture.cleanup() }
         do {
