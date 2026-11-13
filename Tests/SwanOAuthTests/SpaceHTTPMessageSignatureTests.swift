@@ -229,8 +229,8 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
     func testCoveredComponentsMustBeExactlyTheProfiledList() throws {
         for components in [
             "(\"atproto-space-audience\");tag=\"atproto-space-credential\"",
-            "(\"atproto-space-audience\" \"authorization\")",
-            "(\"authorization\" \"atproto-space-audience\" \"content-type\")",
+            "(\"atproto-space-audience\" \"authorization\");tag=\"atproto-space-credential\"",
+            "(\"authorization\" \"atproto-space-audience\" \"content-type\");tag=\"atproto-space-credential\"",
             "(\"authorization\" \"authorization\" \"atproto-space-audience\");tag=\"atproto-space-credential\"",
             "(\"authorization\";sf \"atproto-space-audience\");tag=\"atproto-space-credential\"",
             "(authorization \"atproto-space-audience\");tag=\"atproto-space-credential\"",
