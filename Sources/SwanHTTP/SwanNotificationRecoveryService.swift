@@ -8,22 +8,22 @@ import SwanSQLite
 /// send leaves the SQLite lease row for this service to reclaim on restart.
 public struct SwanNotificationRecoveryService: Service {
     public typealias OutboxTransportFactory = @Sendable (SQLiteAccountDatabase) -> any PermissionedSpaceOutboxTransport
-    public typealias FanoutTransportFactory = @Sendable (SQLiteAccountDatabase) -> any PermissionedSpaceNotificationFanoutTransport
+    public typealias SyncTransportFactory = @Sendable (SQLiteAccountDatabase) -> any PermissionedSpaceSyncNotificationTransport
 
     private let databases: [SQLiteAccountDatabase]
     private let makeOutboxTransport: OutboxTransportFactory
-    private let makeFanoutTransport: FanoutTransportFactory
+    private let makeSyncTransport: SyncTransportFactory
     private let configuration: PermissionedSpaceOutboxDeliveryConfiguration
 
     public init(
         databases: [SQLiteAccountDatabase],
         makeOutboxTransport: @escaping OutboxTransportFactory,
-        makeFanoutTransport: @escaping FanoutTransportFactory,
+        makeSyncTransport: @escaping SyncTransportFactory,
         configuration: PermissionedSpaceOutboxDeliveryConfiguration = .standard
     ) {
         self.databases = databases
         self.makeOutboxTransport = makeOutboxTransport
-        self.makeFanoutTransport = makeFanoutTransport
+        self.makeSyncTransport = makeSyncTransport
         self.configuration = configuration
     }
 
@@ -33,13 +33,13 @@ public struct SwanNotificationRecoveryService: Service {
     public static func fromPreopenedDirectory(
         _ directory: SQLitePreMigratedAccountDirectory,
         makeOutboxTransport: @escaping OutboxTransportFactory,
-        makeFanoutTransport: @escaping FanoutTransportFactory,
+        makeSyncTransport: @escaping SyncTransportFactory,
         configuration: PermissionedSpaceOutboxDeliveryConfiguration = .standard
     ) async throws -> SwanNotificationRecoveryService {
         try await .init(
             databases: directory.notificationRecoveryDatabases(),
             makeOutboxTransport: makeOutboxTransport,
-            makeFanoutTransport: makeFanoutTransport,
+            makeSyncTransport: makeSyncTransport,
             configuration: configuration
         )
     }
@@ -53,13 +53,13 @@ public struct SwanNotificationRecoveryService: Service {
                         transport: makeOutboxTransport(database),
                         configuration: configuration
                     )
-                    let fanout = PermissionedSpaceNotificationFanoutDeliveryWorker(
+                    let sync = PermissionedSpaceSyncNotificationDeliveryWorker(
                         database: database,
-                        transport: makeFanoutTransport(database),
+                        transport: makeSyncTransport(database),
                         configuration: configuration
                     )
                     group.addTask { await outbox.runUntilCancelled() }
-                    group.addTask { await fanout.runUntilCancelled() }
+                    group.addTask { await sync.runUntilCancelled() }
                 }
                 await group.waitForAll()
             }

@@ -906,69 +906,6 @@ public actor SQLitePreMigratedAccountDirectory:
         catch { throw SwanError.unavailable("conversation authority directory is unavailable") }
     }
 
-    public func unregisterSpaceNotification(
-        space: SpaceURI,
-        ownerServiceDID: String,
-        deliveryServiceDID: String?,
-        authorization: AuthorizationContext
-    ) async throws {
-        let database = try await preopenedCredentialAuthorityDatabase(for: space)
-        do {
-            try await database.unregisterSpaceNotification(
-                space: space,
-                ownerServiceDID: ownerServiceDID,
-                deliveryServiceDID: deliveryServiceDID,
-                authorization: authorization
-            )
-            try await requireCredentialAuthorityStillAvailable(space.authority)
-        } catch let error as SwanError {
-            throw error
-        } catch let error as AuthorizedSimpleSpaceLifecycleError {
-            throw error
-        } catch {
-            throw SwanError.unavailable("authenticated space directory is unavailable")
-        }
-    }
-
-    public func unregisterSpaceNotification(
-        space: SpaceURI,
-        serviceDID: String,
-        authorization: AuthorizationContext
-    ) async throws {
-        let baseDID = serviceIssuerDID(serviceDID) ?? serviceDID
-        try await unregisterSpaceNotification(
-            space: space,
-            ownerServiceDID: baseDID,
-            deliveryServiceDID: serviceDID,
-            authorization: authorization
-        )
-    }
-
-    public func registerSpaceNotification(
-        _ registration: AuthorizedSpaceNotificationRegistration,
-        serviceDID: String,
-        authorization: AuthorizationContext
-    ) async throws {
-        let database = try await preopenedCredentialAuthorityDatabase(
-            for: registration.space
-        )
-        do {
-            try await database.registerSpaceNotification(
-                registration,
-                serviceDID: serviceDID,
-                authorization: authorization
-            )
-            try await requireCredentialAuthorityStillAvailable(
-                registration.space.authority
-            )
-        } catch let error as SwanError {
-            throw error
-        } catch let error as AuthorizedSimpleSpaceLifecycleError {
-            throw error
-        } catch {
-            throw SwanError.unavailable("authenticated space directory is unavailable")
-        }
-    }
 
     public func receiveSpaceWriteNotification(
         _ notification: AuthorizedSpaceWriteNotification
@@ -1022,52 +959,6 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
-    public func receiveSpaceDeletionNotification(
-        space: SpaceURI,
-        issuer: String,
-        audience: String,
-        eventID: String,
-        requestBodyDigest: String
-    ) async throws {
-        try await receiveSpaceDeletionNotification(
-            space: space,
-            issuer: issuer,
-            audience: audience,
-            eventID: eventID,
-            requestBodyDigest: requestBodyDigest,
-            issuedAt: nil
-        )
-    }
-
-    public func receiveSpaceDeletionNotification(
-        space: SpaceURI,
-        issuer: String,
-        audience: String,
-        eventID: String,
-        requestBodyDigest: String,
-        issuedAt: Date?
-    ) async throws {
-        guard let database = try await preopenedActiveDatabaseIfHosted(audience) else {
-            return
-        }
-        do {
-            try await database.receiveSpaceDeletionNotification(
-                space: space,
-                issuer: issuer,
-                audience: audience,
-                eventID: eventID,
-                requestBodyDigest: requestBodyDigest,
-                issuedAt: issuedAt
-            )
-            guard try await isActiveAccount(audience), !isClosed else {
-                throw SwanError.unavailable("authenticated space directory is unavailable")
-            }
-        } catch let error as SwanError {
-            throw error
-        } catch {
-            throw SwanError.unavailable("authenticated space directory is unavailable")
-        }
-    }
 
     /// Reads one record only from a database which was opened during startup.
     /// The actor never treats a requested DID as a construction request: a

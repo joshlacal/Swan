@@ -60,12 +60,6 @@ public struct SwanConversationSpaceLifecycle: AuthorizedSimpleSpaceLifecycleDire
     public func listSpaceWriters(space: SpaceURI, limit: Int, cursor: String?, authorization: AuthorizationContext) async throws -> [AuthorizedSpaceWriter] {
         try await notifications.listSpaceWriters(space: space, limit: limit, cursor: cursor, authorization: authorization)
     }
-    public func registerSpaceNotification(_ registration: AuthorizedSpaceNotificationRegistration, serviceDID: String, authorization: AuthorizationContext) async throws {
-        try await notifications.registerSpaceNotification(registration, serviceDID: serviceDID, authorization: authorization)
-    }
-    public func unregisterSpaceNotification(space: SpaceURI, ownerServiceDID: String, deliveryServiceDID: String?, authorization: AuthorizationContext) async throws {
-        try await notifications.unregisterSpaceNotification(space: space, ownerServiceDID: ownerServiceDID, deliveryServiceDID: deliveryServiceDID, authorization: authorization)
-    }
     public func receiveSpaceWriteNotification(_ notification: AuthorizedSpaceWriteNotification) async throws {
         guard isConversation(notification.space) else { return try await notifications.receiveSpaceWriteNotification(notification) }
         guard notification.space.authority == authority, notification.issuer == notification.repository,
@@ -73,12 +67,6 @@ public struct SwanConversationSpaceLifecycle: AuthorizedSimpleSpaceLifecycleDire
         try await membership.requireMembership(space: notification.space, user: notification.repository, now: Date())
         try await lifecycle.registerKnownConversationSpace(space: notification.space, now: Date())
         try await lifecycle.receiveMembershipVerifiedConversationSpaceWriteNotification(notification, now: Date())
-    }
-    public func receiveSpaceDeletionNotification(space: SpaceURI, issuer: String, audience: String, eventID: String, requestBodyDigest: String) async throws {
-        try await notifications.receiveSpaceDeletionNotification(space: space, issuer: issuer, audience: audience, eventID: eventID, requestBodyDigest: requestBodyDigest)
-    }
-    public func receiveSpaceDeletionNotification(space: SpaceURI, issuer: String, audience: String, eventID: String, requestBodyDigest: String, issuedAt: Date?) async throws {
-        try await notifications.receiveSpaceDeletionNotification(space: space, issuer: issuer, audience: audience, eventID: eventID, requestBodyDigest: requestBodyDigest, issuedAt: issuedAt)
     }
     private func isConversation(_ space: SpaceURI) -> Bool { space.spaceType == "blue.catbird.labyrinth.conversation" }
     private func requireLocalPolicy(_ space: SpaceURI) throws {

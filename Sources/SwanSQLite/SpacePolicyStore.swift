@@ -157,6 +157,7 @@ extension SQLiteAccountDatabase {
             after: previousSpaceRevision,
             now: now
         )
+        let timestamp = Int(now.timeIntervalSince1970 * 1_000_000)
         _ = try await connection.query(
             """
             UPDATE permissioned_space_writers
@@ -164,16 +165,26 @@ extension SQLiteAccountDatabase {
             WHERE space_uri = ? AND repo_did = ? AND removed_at IS NULL
             """,
             [
-                .integer(Int(now.timeIntervalSince1970 * 1_000_000)),
+                .integer(timestamp),
                 .text(spaceRevision),
                 .text(space.rawValue),
                 .text(writer),
             ]
         )
-        return SpaceWriterSequence(
+        let sequence = SpaceWriterSequence(
             spaceRevision: spaceRevision,
             previousSpaceRevision: previousSpaceRevision
         )
+        try await enqueueSpaceSyncUpdateWithoutGate(
+            space: space,
+            kind: .repoRemoved,
+            repository: writer,
+            wireRevision: nil,
+            commitment: nil,
+            sequence: sequence,
+            timestamp: timestamp
+        )
+        return sequence
     }
 
     /// `com.atproto.space.removeWriter`: the authority (with `manage=update`)

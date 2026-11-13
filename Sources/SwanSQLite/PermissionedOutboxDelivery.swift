@@ -213,29 +213,40 @@ public actor PermissionedSpaceOutboxDeliveryWorker {
     }
 }
 
-/// Delivers the authority's registered-recipient fanout queue. It is separate
-/// from ``PermissionedSpaceOutboxDeliveryWorker`` because an incoming writer
-/// announcement has no right to select or acknowledge the writer PDS's
-/// commit outbox. Both queues use the same post-transaction lease discipline.
-public protocol PermissionedSpaceNotificationFanoutTransport: Sendable {
-    func deliver(_ notification: PersistedSpaceNotificationFanout) async throws
+public enum PermissionedSpaceSyncNotificationDisposition: Sendable, Equatable {
+    case delivered
+    case retryableFailure
+    case rejected
 }
 
-public enum PermissionedSpaceNotificationFanoutDeliveryResult: Sendable, Equatable {
+public protocol PermissionedSpaceSyncNotificationTransport: Sendable {
+    func deliver(
+        _ notification: PersistedSpaceSyncNotification
+    ) async -> PermissionedSpaceSyncNotificationDisposition
+}
+
+public enum PermissionedSpaceSyncNotificationDeliveryResult:
+    Sendable, Equatable
+{
     case idle
     case delivered(eventID: UUID)
     case failed(eventID: UUID, attempts: Int)
+    case dropped(eventID: UUID)
     case leaseLost(eventID: UUID)
 }
 
-public actor PermissionedSpaceNotificationFanoutDeliveryWorker {
+public actor PermissionedSpaceSyncNotificationDeliveryWorker {
+    private static let reliableRetryDelays: [TimeInterval] = [
+        60, 10 * 60, 60 * 60, 6 * 60 * 60, 12 * 60 * 60,
+    ]
+
     private let database: SQLiteAccountDatabase
-    private let transport: any PermissionedSpaceNotificationFanoutTransport
+    private let transport: any PermissionedSpaceSyncNotificationTransport
     private let configuration: PermissionedSpaceOutboxDeliveryConfiguration
 
     public init(
         database: SQLiteAccountDatabase,
-        transport: any PermissionedSpaceNotificationFanoutTransport,
+        transport: any PermissionedSpaceSyncNotificationTransport,
         configuration: PermissionedSpaceOutboxDeliveryConfiguration = .standard
     ) {
         self.database = database
@@ -245,52 +256,83 @@ public actor PermissionedSpaceNotificationFanoutDeliveryWorker {
 
     public func deliverNext(
         now: Date = Date()
-    ) async throws -> PermissionedSpaceNotificationFanoutDeliveryResult {
-        guard let lease = try await database.leaseNextNotificationFanout(
+    ) async throws -> PermissionedSpaceSyncNotificationDeliveryResult {
+        guard let lease = try await database.leaseNextSpaceSyncNotification(
             now: now,
             leaseDuration: configuration.leaseDuration
         ) else {
             return .idle
         }
-        guard lease.event.attempts < Int.max else {
-            throw SQLiteRepositoryError.corruptDatabase("notification fanout attempts overflow")
+        let event = lease.event
+        guard try await database.spaceSyncNotificationIsOwed(event) else {
+            return try await finish(lease, dropRegistration: false, delivered: false)
         }
-        do {
-            // Network I/O is intentionally after the durable lease commit.
-            try await transport.deliver(lease.event)
-            let completed = try await database.completeNotificationFanoutLease(
-                eventID: lease.event.id,
-                token: lease.token
-            )
-            return completed ? .delivered(eventID: lease.event.id) : .leaseLost(eventID: lease.event.id)
-        } catch {
-            let retryAt = now.addingTimeInterval(
-                configuration.retryDelay(afterFailureAttempt: lease.event.attempts + 1)
-            )
-            guard let attempts = try await database.failNotificationFanoutLease(
-                eventID: lease.event.id,
-                token: lease.token,
-                retryAt: retryAt
-            ) else {
-                return .leaseLost(eventID: lease.event.id)
+        let disposition = await transport.deliver(event)
+        switch disposition {
+        case .delivered:
+            return try await finish(lease, dropRegistration: false, delivered: true)
+        case .rejected:
+            return try await finish(lease, dropRegistration: true, delivered: false)
+        case .retryableFailure where !event.isReliable:
+            return try await finish(lease, dropRegistration: false, delivered: false)
+        case .retryableFailure:
+            guard let expiresAt = event.retryExpiresAt else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "reliable space sync notification has no retry deadline"
+                )
             }
-            return .failed(eventID: lease.event.id, attempts: attempts)
+            if now >= expiresAt {
+                return try await finish(lease, dropRegistration: true, delivered: false)
+            }
+            let delay = Self.reliableRetryDelays[
+                min(event.attempts, Self.reliableRetryDelays.count - 1)
+            ]
+            guard let attempts = try await database.failSpaceSyncNotificationLease(
+                eventID: event.id,
+                token: lease.token,
+                retryAt: now.addingTimeInterval(delay)
+            ) else {
+                return .leaseLost(eventID: event.id)
+            }
+            return .failed(eventID: event.id, attempts: attempts)
         }
+    }
+
+    private func finish(
+        _ lease: PersistedSpaceSyncNotificationLease,
+        dropRegistration: Bool,
+        delivered: Bool
+    ) async throws -> PermissionedSpaceSyncNotificationDeliveryResult {
+        let completed = try await database.completeSpaceSyncNotificationLease(
+            eventID: lease.event.id,
+            token: lease.token,
+            dropRegistration: dropRegistration
+        )
+        guard completed else { return .leaseLost(eventID: lease.event.id) }
+        return delivered
+            ? .delivered(eventID: lease.event.id)
+            : .dropped(eventID: lease.event.id)
     }
 
     public func runUntilCancelled() async {
         while !Task.isCancelled {
             do {
                 if case .idle = try await deliverNext() {
-                    try await Task.sleep(nanoseconds: nanoseconds(configuration.idlePollInterval))
+                    try await Task.sleep(
+                        nanoseconds: UInt64(
+                            (configuration.idlePollInterval * 1_000_000_000)
+                                .rounded(.up)
+                        )
+                    )
                 }
             } catch {
-                try? await Task.sleep(nanoseconds: nanoseconds(configuration.idlePollInterval))
+                try? await Task.sleep(
+                    nanoseconds: UInt64(
+                        (configuration.idlePollInterval * 1_000_000_000)
+                            .rounded(.up)
+                    )
+                )
             }
         }
-    }
-
-    private func nanoseconds(_ interval: TimeInterval) -> UInt64 {
-        UInt64((interval * 1_000_000_000).rounded(.up))
     }
 }

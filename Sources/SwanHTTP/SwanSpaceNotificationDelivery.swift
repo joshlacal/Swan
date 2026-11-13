@@ -415,149 +415,158 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
     }
 }
 
-/// Delivers authority-created fanout rows after confirming their
-/// registration remains current: deletions, and (Erratum 03 / atproto#5574)
-/// writes forwarded to service-named subscribers as authority-signed
-/// `notifyWrite` calls carrying the space host's `spaceRev` and
-/// `prevSpaceRev`. Forwarding is reasonable-effort; subscribers recover
-/// missed updates through `listRepos`. The configured resolver maps an opaque
-/// registered string to an allowlisted endpoint and exact audience, so a
-/// malicious registration can never steer service traffic or JWT claims.
-public struct HTTPPermissionedSpaceNotificationFanoutTransport:
-    PermissionedSpaceNotificationFanoutTransport
+/// Sends continuous sync updates to the exact endpoint selected by the
+/// registration. The opaque token is the only authorization material; these
+/// calls intentionally carry no service-authentication header.
+public struct HTTPPermissionedSpaceSyncNotificationTransport:
+    PermissionedSpaceSyncNotificationTransport
 {
-    private let database: SQLiteAccountDatabase
-    private let destinations: any SwanRegisteredSpaceNotificationDestinationResolving
-    private let serviceAuthentication: any SpaceServiceAuthenticationIssuer
     private let poster: OAuthBoundedJSONPoster
 
-    public init(
-        database: SQLiteAccountDatabase,
-        destinations: any SwanRegisteredSpaceNotificationDestinationResolving,
-        serviceAuthentication: any SpaceServiceAuthenticationIssuer,
-        poster: OAuthBoundedJSONPoster
-    ) {
-        self.database = database
-        self.destinations = destinations
-        self.serviceAuthentication = serviceAuthentication
+    public init(poster: OAuthBoundedJSONPoster) {
         self.poster = poster
     }
 
-    public func deliver(_ notification: PersistedSpaceNotificationFanout) async throws {
-        // A replacement, expiry, or future explicit removal wins over a row
-        // that was already queued. Treat the stale delivery as a successful
-        // no-op; the lease worker will acknowledge it without network I/O.
-        let service: String?
-        if notification.kind == .deleted {
-            guard let registration = try await database.currentSpaceDeletionDeliveryRegistration(
-                for: notification
-            ) else { return }
-            service = registration.serviceIdentity
-        } else {
-            guard try await database.isSpaceNotificationRegistrationActive(
-                space: notification.space,
-                endpoint: notification.endpoint,
-                repository: notification.repository,
-                now: Date()
-            ) else { return }
-            service = try await database.spaceNotificationRegistrationService(
-                space: notification.space,
-                endpoint: notification.endpoint,
-                repository: notification.repository,
-                now: Date()
-            )
-        }
-        // Erratum 03: a SERVICE-NAMED registration is its own destination —
-        // the endpoint carries DID-document provenance from registration-time
-        // resolution, and the identifier is the verifiable JWT audience. The
-        // poster still applies the full egress policy per request, so a
-        // resolved endpoint gets the same SSRF refusals as a configured one.
-        // Endpoint-only legacy rows keep requiring the operator map: with no
-        // service identity there is no audience a receiver could verify, and
-        // their raw URLs never became network destinations before.
-        let destination: SwanSpaceNotificationDestination
-        if let service {
-            guard let registered = URL(string: notification.endpoint) else {
-                throw SwanError.malformed("registered notification endpoint is invalid")
-            }
-            destination = try SwanSpaceNotificationDestination(
-                endpoint: registered,
-                audience: service
-            )
-        } else if notification.kind == .deleted,
-                  let configured = try await destinations.destination(
-                      forRegisteredEndpoint: notification.endpoint
-                  ) {
-            destination = configured
-        } else if notification.kind == .write {
-            // A write row for a registration that lost (or never had) its
-            // service identity: nothing verifiable to deliver. Pre-Erratum-03
-            // rows are also retired through here.
-            return
-        } else {
-            throw SwanError.unavailable("registered notification destination is unavailable")
-        }
-        let method: String
+    public func deliver(
+        _ notification: PersistedSpaceSyncNotification
+    ) async -> PermissionedSpaceSyncNotificationDisposition {
+        let endpoint: URL
         let body: Data
-        let reqDigest: String
-        switch notification.kind {
-        case .write:
-            guard let repository = notification.repository,
-                  let wireRevision = notification.wireRevision,
-                  let commitment = notification.commitment else {
-                throw SwanError.malformed("write fanout row is incomplete")
+        do {
+            guard let base = URL(string: notification.endpoint) else {
+                return .rejected
             }
-            // A forward must carry the space revision the space host
-            // assigned. Rows queued before space revisions existed have none
-            // and are retired unsent; the subscriber catches up via listRepos.
-            guard let spaceRevision = notification.spaceRevision else { return }
-            method = ComAtprotoSpaceNotifyWrite.typeIdentifier
-            body = try notificationJSON(
-                space: notification.space,
-                repository: repository,
-                wireRevision: wireRevision,
-                commitment: commitment,
-                spaceRevision: spaceRevision,
-                previousSpaceRevision: notification.previousSpaceRevision
+            endpoint = try notificationEndpoint(
+                base,
+                method: SwanSpaceNotificationNSID.notifySpaceUpdate
             )
-            reqDigest = SpaceNotificationRequestDigest.forwardedWrite(
-                space: notification.space,
-                repository: repository,
-                wireRevision: wireRevision,
-                commitment: commitment,
-                spaceRevision: spaceRevision,
-                previousSpaceRevision: notification.previousSpaceRevision
-            )
-        case .deleted:
-            method = ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
-            body = try deletionJSON(space: notification.space)
-            reqDigest = SpaceNotificationRequestDigest.deletion(space: notification.space)
+            body = try spaceSyncNotificationJSON(notification)
+        } catch {
+            return .rejected
         }
-        let endpoint = try notificationEndpoint(destination.endpoint, method: method)
-        // Every attempt gets a fresh random jti, as upstream createServiceJwt
-        // mints one per call: a receiver with a single-use jti store would
-        // otherwise refuse each retry as a replay. The row's own id stays the
-        // outbox bookkeeping key; the `req` digest binds the body.
-        let token = try await serviceAuthentication.issue(
-            issuer: notification.space.authority,
-            audience: destination.audience,
-            method: method,
-            eventID: UUID().uuidString.lowercased(),
-            requestBodyDigest: reqDigest,
-            now: Date()
-        )
         do {
             try await poster.postJSON(
                 to: endpoint,
-                headers: notificationHeaders(token),
+                headers: ["content-type": "application/json"],
                 body: body
             )
+            return .delivered
         } catch is OAuthOutboundPostPermanentlyRejected {
-            // A verified peer answered 4xx (bulleted.app has no deletion
-            // receiver at all, for instance): permanent, acknowledge.
-            return
+            return .rejected
+        } catch {
+            return .retryableFailure
         }
     }
+}
+
+private struct SpaceSyncNotificationRequest: Encodable {
+    let space: String
+    let token: String
+    let update: SpaceSyncNotificationUpdate
+}
+
+private enum SpaceSyncNotificationUpdate: Encodable {
+    private enum CodingKeys: String, CodingKey {
+        case type = "$type"
+        case repo
+        case repoRev
+        case data
+        case spaceRev
+        case prevSpaceRev
+    }
+
+    case repoWrite(
+        repo: String,
+        repoRev: String,
+        data: Bytes,
+        spaceRev: String,
+        prevSpaceRev: String?
+    )
+    case repoRemoved(repo: String, spaceRev: String, prevSpaceRev: String?)
+    case spaceDeleted
+    case registrationExpired(spaceRev: String)
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .repoWrite(repo, repoRev, data, spaceRev, prevSpaceRev):
+            try values.encode(
+                "com.atproto.space.defs#repoWrite",
+                forKey: .type
+            )
+            try values.encode(repo, forKey: .repo)
+            try values.encode(repoRev, forKey: .repoRev)
+            try values.encode(data, forKey: .data)
+            try values.encode(spaceRev, forKey: .spaceRev)
+            try values.encodeIfPresent(prevSpaceRev, forKey: .prevSpaceRev)
+        case let .repoRemoved(repo, spaceRev, prevSpaceRev):
+            try values.encode(
+                "com.atproto.space.defs#repoRemoved",
+                forKey: .type
+            )
+            try values.encode(repo, forKey: .repo)
+            try values.encode(spaceRev, forKey: .spaceRev)
+            try values.encodeIfPresent(prevSpaceRev, forKey: .prevSpaceRev)
+        case .spaceDeleted:
+            try values.encode(
+                "com.atproto.space.notifySpaceUpdate#spaceDeleted",
+                forKey: .type
+            )
+        case let .registrationExpired(spaceRev):
+            try values.encode(
+                "com.atproto.space.notifySpaceUpdate#registrationExpired",
+                forKey: .type
+            )
+            try values.encode(spaceRev, forKey: .spaceRev)
+        }
+    }
+}
+
+private func spaceSyncNotificationJSON(
+    _ notification: PersistedSpaceSyncNotification
+) throws -> Data {
+    let update: SpaceSyncNotificationUpdate
+    switch notification.kind {
+    case .repoWrite:
+        guard let repo = notification.repository,
+              let repoRev = notification.wireRevision,
+              let data = notification.commitment,
+              data.count == 32,
+              let spaceRev = notification.spaceRevision else {
+            throw SwanError.malformed("repository update notification is incomplete")
+        }
+        update = .repoWrite(
+            repo: repo,
+            repoRev: repoRev,
+            data: Bytes(data: data),
+            spaceRev: spaceRev,
+            prevSpaceRev: notification.previousSpaceRevision
+        )
+    case .repoRemoved:
+        guard let repo = notification.repository,
+              let spaceRev = notification.spaceRevision else {
+            throw SwanError.malformed("repository removal notification is incomplete")
+        }
+        update = .repoRemoved(
+            repo: repo,
+            spaceRev: spaceRev,
+            prevSpaceRev: notification.previousSpaceRevision
+        )
+    case .spaceDeleted:
+        update = .spaceDeleted
+    case .registrationExpired:
+        guard let spaceRev = notification.spaceRevision else {
+            throw SwanError.malformed("registration expiry notification is incomplete")
+        }
+        update = .registrationExpired(spaceRev: spaceRev)
+    }
+    return try SwanJSONEncoders.sortedNoEscaping.encode(
+        SpaceSyncNotificationRequest(
+            space: notification.space.rawValue,
+            token: notification.token,
+            update: update
+        )
+    )
 }
 
 /// The TypeScript XRPC client treats a DID-document PDS/service endpoint as

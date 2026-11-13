@@ -132,13 +132,6 @@ extension SQLiteAccountDatabase {
                 "ALTER TABLE permissioned_space_writers ADD COLUMN space_rev TEXT"
             )
         }
-        for column in ["space_rev", "prev_space_rev"] {
-            if try await !tableHasColumn("permissioned_space_notification_fanout", column) {
-                _ = try await connection.query(
-                    "ALTER TABLE permissioned_space_notification_fanout ADD COLUMN \(column) TEXT"
-                )
-            }
-        }
         let pendingSpaces = try await connection.query(
             """
             SELECT DISTINCT space_uri FROM permissioned_space_writers
@@ -211,66 +204,85 @@ extension SQLiteAccountDatabase {
         )
     }
 
-    /// Queues one authority-signed forward per endpoint with an active
-    /// service-named registration matching `repository`. Each row carries the
-    /// space revisions the space host just assigned. Endpoint-only
-    /// registrations are never enqueued: with no service identity there is
-    /// no audience a receiver could verify. When several services share an
-    /// endpoint (SWAN-SYNC-4), the row names the lowest service key, the one
-    /// the endpoint-keyed transport lookup
-    /// (`spaceNotificationRegistrationService`) resolves; write forwards are
-    /// reasonable-effort and syncers catch up through listWriters.
-    func enqueueWriteForwardsWithoutGate(
+    /// Queues one best-effort update for every active sync registration. A
+    /// registration that has lapsed gets one durable expiry notice in place
+    /// of this update and is silent until it is renewed.
+    func enqueueSpaceSyncUpdateWithoutGate(
         space: SpaceURI,
-        sourceEventID: String,
+        kind: PersistedSpaceSyncNotification.Kind,
         repository: String,
-        wireRevision: String,
-        commitment: Data,
+        wireRevision: String?,
+        commitment: Data?,
         sequence: SpaceWriterSequence,
         timestamp: Int
     ) async throws {
+        guard kind == .repoWrite || kind == .repoRemoved,
+              (kind == .repoWrite
+                ? wireRevision != nil && commitment?.count == 32
+                : wireRevision == nil && commitment == nil) else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid queued space sync update"
+            )
+        }
+        let uuidSQL =
+            "substr(h,1,8)||'-'||substr(h,9,4)||'-'||substr(h,13,4)" +
+            "||'-'||substr(h,17,4)||'-'||substr(h,21,12)"
         _ = try await connection.query(
             """
-            INSERT INTO permissioned_space_notification_fanout(
-                id, source_issuer, source_event_id, kind, space_uri,
-                repo_did, wire_revision, commitment, endpoint, service_key,
-                attempts, created_at, available_at,
-                lease_token, lease_expires_at, space_rev, prev_space_rev
+            INSERT INTO permissioned_space_sync_notifications(
+                id, kind, space_uri, endpoint, token, repo_did, repo_revision,
+                commitment, space_revision, previous_space_revision,
+                registration_expires_at, attempts, created_at, available_at,
+                retry_expires_at, lease_token, lease_expires_at
             )
-            SELECT
-                substr(h,1,8)||'-'||substr(h,9,4)||'-'||substr(h,13,4)
-                    ||'-'||substr(h,17,4)||'-'||substr(h,21,12),
-                ?, ?, 'write', ?,
-                ?, ?, ?, endpoint, service_key,
-                0, ?, ?, NULL, NULL, ?, ?
+            SELECT \(uuidSQL), ?, ?, endpoint, token, ?, ?, ?, ?, ?,
+                   NULL, 0, ?, ?, NULL, NULL, NULL
             FROM (
-                SELECT hex(randomblob(16)) AS h, endpoint, service_key
-                FROM (
-                    SELECT endpoint, MIN(service_key) AS service_key
-                    FROM permissioned_space_notification_registrations
-                    WHERE space_uri = ?
-                      AND delivery_service_did IS NOT NULL
-                      AND expires_at > ?
-                      AND (repo_did IS NULL OR repo_did = ?)
-                    GROUP BY endpoint
-                )
+                SELECT hex(randomblob(16)) AS h, endpoint, token
+                FROM permissioned_space_sync_registrations
+                WHERE space_uri = ? AND expires_at > ? AND expiry_notified = 0
             )
-            WHERE true
-            ON CONFLICT(source_issuer, source_event_id, kind, endpoint, service_key) DO NOTHING
             """,
             [
-                .text(space.authority), .text(sourceEventID),
-                .text(space.rawValue),
-                .text(repository),
-                .text(wireRevision),
-                commitment.sqliteData!,
-                .integer(timestamp), .integer(timestamp),
+                .text(kind.rawValue), .text(space.rawValue), .text(repository),
+                wireRevision.map { .text($0) } ?? .null,
+                commitment?.sqliteData ?? .null,
                 .text(sequence.spaceRevision),
                 sequence.previousSpaceRevision.map { .text($0) } ?? .null,
-                .text(space.rawValue),
-                .integer(timestamp),
-                .text(repository),
+                .integer(timestamp), .integer(timestamp),
+                .text(space.rawValue), .integer(timestamp),
             ]
+        )
+        let retryExpiresAt = timestamp + 72 * 60 * 60 * 1_000_000
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_space_sync_notifications(
+                id, kind, space_uri, endpoint, token, repo_did, repo_revision,
+                commitment, space_revision, previous_space_revision,
+                registration_expires_at, attempts, created_at, available_at,
+                retry_expires_at, lease_token, lease_expires_at
+            )
+            SELECT \(uuidSQL), 'registrationExpired', ?, endpoint, token,
+                   NULL, NULL, NULL, ?, NULL, expires_at, 0, ?, ?, ?, NULL, NULL
+            FROM (
+                SELECT hex(randomblob(16)) AS h, endpoint, token, expires_at
+                FROM permissioned_space_sync_registrations
+                WHERE space_uri = ? AND expires_at <= ? AND expiry_notified = 0
+            )
+            """,
+            [
+                .text(space.rawValue), .text(sequence.spaceRevision),
+                .integer(timestamp), .integer(timestamp), .integer(retryExpiresAt),
+                .text(space.rawValue), .integer(timestamp),
+            ]
+        )
+        _ = try await connection.query(
+            """
+            UPDATE permissioned_space_sync_registrations
+            SET expiry_notified = 1
+            WHERE space_uri = ? AND expires_at <= ? AND expiry_notified = 0
+            """,
+            [.text(space.rawValue), .integer(timestamp)]
         )
     }
 

@@ -291,33 +291,17 @@ public struct SwanSpaceRepositorySyncHTTPConfiguration: Sendable {
 }
 
 /// Explicitly enables only the local/pinned service-JWT verification needed
-/// by the writer notification endpoints. Incoming service CLAIMS still never
-/// turn an XRPC request into a network lookup; the one resolver here is used
-/// solely by `registerNotify` (Erratum 03) to resolve the credentialed
-/// caller's OWN `service` identifier through its DID document — a lookup the
-/// caller explicitly requested by naming it.
-/// The opt-in upstream-interop posture for atproto spaces, selected only by
-/// `swan serve --enable-spaces-open-interop`. Absent (the default) keeps
-/// Swan's hardened behaviour unchanged. When present:
+/// by the repo-host notification endpoints.
 ///
-/// - (a) notifyWrite / notifySpaceDeleted admit *unbound* upstream service
-///   JWTs (no `req` claim) whose `iss`/`aud`/`lxm` check out, whose lifetime
-///   is at most 60 s, and whose `jti` is unused. A token that does carry
-///   `req` must still match the body, and Swan still sends `req`. (notifyWrite
-///   accepts `aud` as the bare authority DID or `<authority>#atproto_pds`
-///   in both postures.)
-/// - (b) registerNotify / unregisterNotify accept the space credential alone;
-///   `Atproto-Service-Auth`, when present, still proves service ownership.
-///   Header-less registrations are rate-capped per space and per
-///   credential subject.
-/// - (d) space OAuth scopes use upstream defaults (an omitted `action`
-///   defaults to read/create/update/delete for getDelegationToken and
-///   listSpaces, and a wildcard type may exchange), and legacy sessions reach
-///   spaces as upstream: account-password sessions at getDelegationToken,
-///   and both kinds for own-repo reads/writes and listSpaces.
+/// The opt-in upstream-interop posture is selected only by
+/// `swan serve --enable-spaces-open-interop`. When present, repo-host
+/// notifications admit unbound upstream service JWTs whose issuer, audience,
+/// method, lifetime, and one-time event ID check out. A token that carries a
+/// request digest must still match the body.
 ///
-/// Open federation (c) is composed by `swan serve` into the key resolvers and
-/// notifyWrite destinations; it has no HTTP-layer state.
+/// Space OAuth scopes also use upstream defaults in this mode. Open
+/// federation is composed by `swan serve` into key resolvers and authority
+/// destinations; it has no HTTP-layer state.
 public struct SwanSpacesOpenInteropConfiguration: Sendable, Equatable {
     /// Upstream `createServiceJwt` mints `exp = iat + 60`.
     public static let maximumUnboundServiceLifetime: TimeInterval = 60
@@ -326,10 +310,9 @@ public struct SwanSpacesOpenInteropConfiguration: Sendable, Equatable {
         uncheckedPerSubject: 8
     )
 
-    /// Header-less registerNotify calls admitted per space per hour.
+    /// Retained command-line compatibility values; registration admission
+    /// moved into authorizeSpaceSync and no longer consumes these caps.
     public let maximumHeaderlessRegistrationsPerSpacePerHour: Int
-    /// Header-less registerNotify calls admitted per (space, credential
-    /// subject) per hour.
     public let maximumHeaderlessRegistrationsPerSubjectPerHour: Int
 
     public init(
@@ -855,11 +838,8 @@ public struct SwanHTTPServer: Sendable {
                         publicKeys: spaceCredentialConfiguration.credentialPublicKeys
                     ),
                     serviceAuthentication: spaceNotificationConfiguration.serviceAuthentication,
-                    recipientBindings: spaceNotificationConfiguration.recipientBindings,
                     notificationJSONDecodeObserver:
                         spaceNotificationConfiguration.notificationJSONDecodeObserver,
-                    serviceEndpointResolver:
-                        spaceNotificationConfiguration.serviceEndpointResolver,
                     openInterop: spacesOpenInterop.map {
                         SwanSpacesOpenInteropNotificationPolicy(
                             configuration: $0,
@@ -1253,27 +1233,20 @@ public struct SwanHTTPServer: Sendable {
                     on: router,
                     capability: authenticatedSpaceBlobs
                 )
-            } else if descriptor.nsid == ComAtprotoSpaceListRepos.typeIdentifier,
+            } else if descriptor.nsid == "com.atproto.space.listWriters",
                       let authenticatedSpaceNotifications {
                 registerAuthenticatedListSpaceWritersEndpoint(
                     on: router,
                     capability: authenticatedSpaceNotifications
                 )
-            } else if descriptor.nsid == ComAtprotoSpaceNotifyWrite.typeIdentifier,
+            } else if descriptor.nsid == SwanSpaceNotificationNSID.notifyRepoUpdate,
                       let authenticatedSpaceNotifications {
                 registerAuthenticatedNotifyRepoUpdateEndpoint(
                     on: router,
                     capability: authenticatedSpaceNotifications,
                     requestBodyAdmission: requestBodyAdmission
                 )
-            } else if descriptor.nsid == ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier,
-                      let authenticatedSpaceNotifications {
-                registerAuthenticatedNotifySpaceDeletedEndpoint(
-                    on: router,
-                    capability: authenticatedSpaceNotifications,
-                    requestBodyAdmission: requestBodyAdmission
-                )
-            } else if descriptor.nsid == ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier,
+            } else if descriptor.nsid == SwanSpaceNotificationNSID.notifyCredentialsRevoked,
                       let authenticatedSpaceNotifications {
                 registerAuthenticatedNotifyCredentialsRevokedEndpoint(
                     on: router,

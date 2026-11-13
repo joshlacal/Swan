@@ -53,16 +53,15 @@ extension SQLiteAccountDatabase: ConversationSpaceAuthorityLifecycle {
                     ON CONFLICT(space_uri) DO UPDATE SET state = 'deleting', deletion_event_id = excluded.deletion_event_id,
                         deletion_started_at = excluded.deletion_started_at, updated_at = MAX(updated_at, excluded.updated_at)
                     """, [.text(space.rawValue), .text(accountDID), .text(space.skey), .text(event), .integer(timestamp), .integer(timestamp), .integer(timestamp)])
-                _ = try await connection.query("""
-                    INSERT INTO conversation_space_deletion_recipients(
-                        space_uri, deletion_event_id, service_key, endpoint, owner_service_did, delivery_service_did,
-                        registration_expires_at)
-                    SELECT space_uri, ?, service_key, endpoint, owner_service_did, delivery_service_did, expires_at
-                    FROM permissioned_space_notification_registrations WHERE space_uri = ? AND expires_at > ?
-                    """, [.text(event), .text(space.rawValue), .integer(timestamp)])
-                // Existing or already-leased write hints become non-deliverable
-                // as soon as deletion begins; deletion fanout waits for DS success.
-                _ = try await connection.query("DELETE FROM permissioned_space_notification_fanout WHERE space_uri = ? AND kind = 'write'", [.text(space.rawValue)])
+                // Stop queued repository updates as soon as deletion begins;
+                // the reliable deletion notice is queued only after DS succeeds.
+                _ = try await connection.query(
+                    """
+                    DELETE FROM permissioned_space_sync_notifications
+                    WHERE space_uri = ? AND kind IN ('repoWrite', 'repoRemoved')
+                    """,
+                    [.text(space.rawValue)]
+                )
                 return try ConversationSpaceDeletion(space: space, eventID: event)
             }
         }
@@ -108,23 +107,16 @@ extension SQLiteAccountDatabase: ConversationSpaceAuthorityLifecycle {
                     throw SwanError.unauthorized("conversation deletion intent mismatch")
                 }
                 if state == "deleted" {
-                    try await pruneCompletedDeletionRegistrationsWithoutGate(space: deletion.space)
                     return
                 }
                 _ = try await connection.query("UPDATE conversation_space_authorities SET state = 'deleted', updated_at = MAX(updated_at, ?) WHERE space_uri = ?",
                     [.integer(timestamp), .text(deletion.space.rawValue)])
                 _ = try await connection.query("DELETE FROM permissioned_space_writers WHERE space_uri = ?", [.text(deletion.space.rawValue)])
                 try await deleteAuthorityRepositoryWithoutGate(space: deletion.space)
-                _ = try await connection.query("""
-                    INSERT INTO permissioned_space_notification_fanout(
-                        id, source_issuer, source_event_id, kind, space_uri, repo_did, wire_revision, commitment,
-                        endpoint, service_key, attempts, created_at, available_at, lease_token, lease_expires_at)
-                    SELECT upper(hex(randomblob(4))) || '-' || upper(hex(randomblob(2))) || '-' || upper(hex(randomblob(2))) || '-' || upper(hex(randomblob(2))) || '-' || upper(hex(randomblob(6))),
-                        ?, ?, 'deleted', space_uri, NULL, NULL, NULL, endpoint, service_key, 0, ?, ?, NULL, NULL
-                    FROM conversation_space_deletion_recipients WHERE space_uri = ? AND deletion_event_id = ?
-                    ON CONFLICT(source_issuer, source_event_id, kind, endpoint, service_key) DO NOTHING
-                    """, [.text(accountDID), .text(deletion.eventID), .integer(timestamp), .integer(timestamp), .text(deletion.space.rawValue), .text(deletion.eventID)])
-                try await pruneCompletedDeletionRegistrationsWithoutGate(space: deletion.space)
+                try await enqueueSpaceDeletedNotificationsWithoutGate(
+                    space: deletion.space,
+                    timestamp: timestamp
+                )
             }
         }
         try await recoverPrivateBlobLifecycle()
@@ -154,46 +146,8 @@ extension SQLiteAccountDatabase: ConversationSpaceAuthorityLifecycle {
             UPDATE conversation_space_authorities SET deletion_started_at = updated_at
             WHERE state != 'active' AND deletion_started_at IS NULL
             """)
-        // Existing pending intents predate retry rotation. Their last update
-        // is the begin timestamp; already queued terminal deliveries remain owed.
-        // The backfill names the pre-v27 recipient key; a database that still
-        // needs it is backfilled here before v27 rebuilds the table in the
-        // same transaction, so it is skipped once the table is service-keyed.
-        guard try await !notificationTableHasColumn("conversation_space_deletion_recipients", "service_key") else { return }
-        _ = try await connection.query("""
-            INSERT INTO conversation_space_deletion_recipients(
-                space_uri, deletion_event_id, endpoint, owner_service_did, delivery_service_did, registration_expires_at)
-            SELECT authority.space_uri, authority.deletion_event_id, registration.endpoint,
-                registration.owner_service_did, registration.delivery_service_did, registration.expires_at
-            FROM conversation_space_authorities AS authority
-            JOIN permissioned_space_notification_registrations AS registration ON registration.space_uri = authority.space_uri
-            WHERE (authority.state = 'deleting' AND registration.expires_at > authority.deletion_started_at)
-               OR (authority.state = 'deleted' AND EXISTS (
-                   SELECT 1 FROM permissioned_space_notification_fanout AS pending
-                   WHERE pending.space_uri = authority.space_uri AND pending.source_event_id = authority.deletion_event_id
-                     AND pending.endpoint = registration.endpoint AND pending.kind = 'deleted'))
-            ON CONFLICT(space_uri, endpoint) DO NOTHING
-            """)
+        // v30 discards the retired deletion-recipient snapshots and queues
+        // deletion directly from the new endpoint/token registrations.
     }
 
-    /// Preserve every authenticated registration while removing its historical
-    /// simple-space-only FK. Both authority kinds are admitted transactionally.
-    func migrateConversationNotificationRegistrationForeignKeyIfNeeded() async throws {
-        let references = try await connection.query("PRAGMA foreign_key_list(permissioned_space_notification_registrations)")
-        guard !references.isEmpty else { return }
-        _ = try await connection.query("""
-            CREATE TABLE permissioned_space_notification_registrations_conversation_migration (
-                space_uri TEXT NOT NULL, endpoint TEXT NOT NULL, repo_did TEXT,
-                expires_at INTEGER NOT NULL CHECK(expires_at >= 0), updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
-                owner_service_did TEXT NOT NULL, delivery_service_did TEXT,
-                PRIMARY KEY(space_uri, endpoint), CHECK(length(endpoint) > 0))
-            """)
-        _ = try await connection.query("""
-            INSERT INTO permissioned_space_notification_registrations_conversation_migration
-            SELECT space_uri, endpoint, repo_did, expires_at, updated_at, owner_service_did, delivery_service_did
-            FROM permissioned_space_notification_registrations
-            """)
-        _ = try await connection.query("DROP TABLE permissioned_space_notification_registrations")
-        _ = try await connection.query("ALTER TABLE permissioned_space_notification_registrations_conversation_migration RENAME TO permissioned_space_notification_registrations")
-    }
 }

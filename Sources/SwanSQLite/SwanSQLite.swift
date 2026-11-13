@@ -772,13 +772,6 @@ public enum SQLiteLayout {
             WHERE state = 'deleting'
         """,
         """
-        CREATE TABLE IF NOT EXISTS conversation_space_deletion_recipients (
-            space_uri TEXT NOT NULL REFERENCES conversation_space_authorities(space_uri) ON DELETE CASCADE,
-            deletion_event_id TEXT NOT NULL, endpoint TEXT NOT NULL, owner_service_did TEXT NOT NULL,
-            delivery_service_did TEXT, registration_expires_at INTEGER NOT NULL CHECK(registration_expires_at >= 0),
-            PRIMARY KEY(space_uri, endpoint), CHECK(length(endpoint) > 0))
-        """,
-        """
         CREATE TABLE IF NOT EXISTS permissioned_space_writers (
             space_uri TEXT NOT NULL,
             repo_did TEXT NOT NULL,
@@ -787,19 +780,6 @@ public enum SQLiteLayout {
             updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
             removed_at INTEGER CHECK(removed_at IS NULL OR removed_at >= 0),
             PRIMARY KEY(space_uri, repo_did)
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS permissioned_space_notification_registrations (
-            space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
-            endpoint TEXT NOT NULL,
-            repo_did TEXT,
-            expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
-            updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
-            owner_service_did TEXT NOT NULL,
-            delivery_service_did TEXT,
-            PRIMARY KEY(space_uri, endpoint),
-            CHECK(length(endpoint) > 0)
         )
         """,
         """
@@ -839,42 +819,8 @@ public enum SQLiteLayout {
         )
         """,
         """
-        CREATE TABLE IF NOT EXISTS permissioned_space_notification_fanout (
-            id TEXT PRIMARY KEY,
-            source_issuer TEXT NOT NULL,
-            source_event_id TEXT NOT NULL,
-            kind TEXT NOT NULL CHECK(kind IN ('write', 'deleted')),
-            space_uri TEXT NOT NULL,
-            repo_did TEXT,
-            wire_revision TEXT,
-            commitment BLOB,
-            endpoint TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
-            created_at INTEGER NOT NULL CHECK(created_at >= 0),
-            available_at INTEGER NOT NULL CHECK(available_at >= 0),
-            lease_token TEXT,
-            lease_expires_at INTEGER,
-            UNIQUE(source_issuer, source_event_id, kind, endpoint),
-            CHECK(
-                (kind = 'write' AND repo_did IS NOT NULL AND wire_revision IS NOT NULL
-                    AND commitment IS NOT NULL AND length(commitment) = 32)
-                OR (kind = 'deleted' AND repo_did IS NULL AND wire_revision IS NULL
-                    AND commitment IS NULL)
-            ),
-            CHECK(
-                (lease_token IS NULL AND lease_expires_at IS NULL)
-                OR (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL
-                    AND lease_expires_at >= 0)
-            )
-        )
-        """,
-        """
         CREATE INDEX IF NOT EXISTS permissioned_space_writers_page
         ON permissioned_space_writers(space_uri, repo_did)
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS permissioned_space_notification_fanout_available
-        ON permissioned_space_notification_fanout(available_at, created_at, id)
         """,
     ]
 
@@ -2072,77 +2018,75 @@ public struct PersistedOutboxLease: Sendable, Equatable {
     }
 }
 
-/// A durable authority fanout intent. It is deliberately independent from
-/// the writer PDS outbox: the former is created while accepting an incoming
-/// service announcement, whereas the latter is created atomically with a
-/// local repository commit. Neither carries any permissioned record content.
-public struct PersistedSpaceNotificationFanout: Sendable, Equatable {
+/// A queued `notifySpaceUpdate` delivery. Repository updates are attempted
+/// once; deletion and expiry notices carry a retry deadline.
+public struct PersistedSpaceSyncNotification: Sendable, Equatable {
     public enum Kind: String, Sendable, Equatable {
-        case write
-        case deleted
+        case repoWrite
+        case repoRemoved
+        case spaceDeleted
+        case registrationExpired
     }
 
     public let id: UUID
-    public let sourceIssuer: String
-    public let sourceEventID: String
     public let kind: Kind
     public let space: SpaceURI
+    public let endpoint: String
+    public let token: String
     public let repository: String?
     public let wireRevision: String?
     public let commitment: Data?
-    public let endpoint: String
-    public let attempts: Int
-    /// The space revision assigned to a forwarded write, and the space's
-    /// preceding one (`nil` on its first update). Both are `nil` for deletion
-    /// rows and for write rows queued before space revisions existed, which
-    /// the transport retires without sending.
     public let spaceRevision: String?
     public let previousSpaceRevision: String?
+    public let registrationExpiredAt: Date?
+    public let retryExpiresAt: Date?
+    public let attempts: Int
+
+    public var isReliable: Bool {
+        kind == .spaceDeleted || kind == .registrationExpired
+    }
 
     public init(
         id: UUID,
-        sourceIssuer: String,
-        sourceEventID: String,
         kind: Kind,
         space: SpaceURI,
-        repository: String?,
-        wireRevision: String?,
-        commitment: Data?,
         endpoint: String,
-        attempts: Int,
+        token: String,
+        repository: String? = nil,
+        wireRevision: String? = nil,
+        commitment: Data? = nil,
         spaceRevision: String? = nil,
-        previousSpaceRevision: String? = nil
+        previousSpaceRevision: String? = nil,
+        registrationExpiredAt: Date? = nil,
+        retryExpiresAt: Date? = nil,
+        attempts: Int
     ) {
         self.id = id
-        self.sourceIssuer = sourceIssuer
-        self.sourceEventID = sourceEventID
         self.kind = kind
         self.space = space
+        self.endpoint = endpoint
+        self.token = token
         self.repository = repository
         self.wireRevision = wireRevision
         self.commitment = commitment
-        self.endpoint = endpoint
-        self.attempts = attempts
         self.spaceRevision = spaceRevision
         self.previousSpaceRevision = previousSpaceRevision
+        self.registrationExpiredAt = registrationExpiredAt
+        self.retryExpiresAt = retryExpiresAt
+        self.attempts = attempts
     }
 }
 
-/// A current delivery binding read together with its durable deletion intent.
-/// A nil service identity denotes a legacy endpoint requiring the operator map.
-public struct PersistedSpaceDeletionDeliveryRegistration: Sendable {
-    public let serviceIdentity: String?
-}
-
-/// A lease for one authority fanout intent. The endpoint is exposed only to a
-/// transport after it has been validated by that transport's SSRF policy; it
-/// is never rendered by a public XRPC response or stored in an error string.
-public struct PersistedSpaceNotificationFanoutLease: Sendable, Equatable {
-    public let event: PersistedSpaceNotificationFanout
+public struct PersistedSpaceSyncNotificationLease: Sendable, Equatable {
+    public let event: PersistedSpaceSyncNotification
     public let token: UUID
     public let expiresAt: Date
 
-    public init(event: PersistedSpaceNotificationFanout, token: UUID, expiresAt: Date) {
+    public init(
+        event: PersistedSpaceSyncNotification,
+        token: UUID,
+        expiresAt: Date
+    ) {
         self.event = event
         self.token = token
         self.expiresAt = expiresAt
@@ -2825,12 +2769,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             for statement in SQLiteLayout.spaceNotificationSchemaStatements {
                 _ = try await connection.query(statement)
             }
-            try await migrateSpaceNotificationOwnershipIfNeeded()
-            try await migrateConversationNotificationRegistrationForeignKeyIfNeeded()
             try await migrateConversationDeletionRecipientsIfNeeded()
             try await migratePermissionedSpaceWriterForeignKeyIfNeeded()
             try await migrateSpaceWriterSequenceIfNeeded()
-            try await migrateSpaceNotificationServiceKeysIfNeeded()
             try await migrateRemoteReplicaLifecycleFenceIfNeeded()
             try await migrateSpacePolicyIfNeeded()
             try await migrateSpaceNotificationsV30IfNeeded()
@@ -2895,7 +2836,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     }
     /// November 12 account-schema v30. Shape checks, rather than the marker
     /// alone, let a database opened by an intermediate build finish the
-    /// migration. This is additive and never renames an FK target.
+    /// migration. No foreign-key target is renamed: the retired October
+    /// registration and fanout tables are dropped after the new tables exist.
     private func migrateSpaceNotificationsV30IfNeeded() async throws {
         let writerColumns = try await connection.query(
             "PRAGMA table_info(permissioned_space_writers)"
@@ -2908,12 +2850,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 """
             )
         }
-        let registrationTable = try await connection.query(
-            """
-            SELECT 1 FROM sqlite_master
-            WHERE type = 'table' AND name = 'permissioned_space_sync_registrations'
-            """
-        )
         _ = try await connection.query(
             """
             CREATE TABLE IF NOT EXISTS permissioned_space_sync_registrations (
@@ -2934,12 +2870,73 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             ON permissioned_space_sync_registrations(expires_at, expiry_notified)
             """
         )
-        if registrationTable.isEmpty {
-            // The November registration identity is unrelated to the retired
-            // endpoint/service rows. Do not guess a token: discard them.
-            _ = try await connection.query(
-                "DELETE FROM permissioned_space_notification_registrations"
+        _ = try await connection.query(
+            """
+            CREATE TABLE IF NOT EXISTS permissioned_space_sync_notifications (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK(kind IN (
+                    'repoWrite', 'repoRemoved', 'spaceDeleted', 'registrationExpired'
+                )),
+                space_uri TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                token TEXT NOT NULL,
+                repo_did TEXT,
+                repo_revision TEXT,
+                commitment BLOB,
+                space_revision TEXT,
+                previous_space_revision TEXT,
+                registration_expires_at INTEGER,
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                available_at INTEGER NOT NULL CHECK(available_at >= 0),
+                retry_expires_at INTEGER,
+                lease_token TEXT,
+                lease_expires_at INTEGER,
+                CHECK(
+                    (kind = 'repoWrite' AND repo_did IS NOT NULL
+                        AND repo_revision IS NOT NULL
+                        AND commitment IS NOT NULL AND length(commitment) = 32
+                        AND space_revision IS NOT NULL
+                        AND registration_expires_at IS NULL
+                        AND retry_expires_at IS NULL)
+                    OR (kind = 'repoRemoved' AND repo_did IS NOT NULL
+                        AND repo_revision IS NULL AND commitment IS NULL
+                        AND space_revision IS NOT NULL
+                        AND registration_expires_at IS NULL
+                        AND retry_expires_at IS NULL)
+                    OR (kind = 'spaceDeleted' AND repo_did IS NULL
+                        AND repo_revision IS NULL AND commitment IS NULL
+                        AND space_revision IS NULL
+                        AND previous_space_revision IS NULL
+                        AND registration_expires_at IS NULL
+                        AND retry_expires_at IS NOT NULL)
+                    OR (kind = 'registrationExpired' AND repo_did IS NULL
+                        AND repo_revision IS NULL AND commitment IS NULL
+                        AND space_revision IS NOT NULL
+                        AND previous_space_revision IS NULL
+                        AND registration_expires_at IS NOT NULL
+                        AND retry_expires_at IS NOT NULL)
+                ),
+                CHECK(
+                    (lease_token IS NULL AND lease_expires_at IS NULL)
+                    OR (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL
+                        AND lease_expires_at >= 0)
+                )
             )
+            """
+        )
+        _ = try await connection.query(
+            """
+            CREATE INDEX IF NOT EXISTS permissioned_space_sync_notifications_available
+            ON permissioned_space_sync_notifications(available_at, created_at, id)
+            """
+        )
+        for retired in [
+            "permissioned_space_notification_fanout",
+            "conversation_space_deletion_recipients",
+            "permissioned_space_notification_registrations",
+        ] {
+            _ = try await connection.query("DROP TABLE IF EXISTS \(retired)")
         }
         _ = try await connection.query(
             """
@@ -3153,54 +3150,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
     }
 
-    /// Notification ownership is authenticated at registration time. Legacy
-    /// rows are discarded before rebuilding the table with a required owner.
-    private func migrateSpaceNotificationOwnershipIfNeeded() async throws {
-        let columns = try await connection.query(
-            "PRAGMA table_info(permissioned_space_notification_registrations)"
-        )
-        if !columns.isEmpty {
-            let ownerCol = columns.first { $0.column("name")?.string == "owner_service_did" }
-            let hasDeliveryCol = columns.contains { $0.column("name")?.string == "delivery_service_did" }
-            let isNotNull = (ownerCol?.column("notnull")?.integer ?? 0) == 1
-            if !isNotNull || !hasDeliveryCol {
-                _ = try await connection.query("DROP TABLE IF EXISTS permissioned_space_notification_registrations_legacy")
-                _ = try await connection.query(
-                    "ALTER TABLE permissioned_space_notification_registrations RENAME TO permissioned_space_notification_registrations_legacy"
-                )
-                _ = try await connection.query(
-                    """
-                    CREATE TABLE permissioned_space_notification_registrations (
-                        space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
-                        endpoint TEXT NOT NULL,
-                        repo_did TEXT,
-                        expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
-                        updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
-                        owner_service_did TEXT NOT NULL,
-                        delivery_service_did TEXT,
-                        PRIMARY KEY(space_uri, endpoint),
-                        CHECK(length(endpoint) > 0)
-                    )
-                    """
-                )
-                _ = try await connection.query("DROP TABLE permissioned_space_notification_registrations_legacy")
-            }
-        }
-        let version = Self.spaceNotificationOwnershipMigrationVersion
-        let applied = try await connection.query(
-            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
-            [.integer(version)]
-        )
-        if applied.isEmpty {
-            _ = try await connection.query(
-                "INSERT INTO permissioned_repository_migrations(version, applied_at) VALUES (?, ?)",
-                [
-                    .integer(version),
-                    .integer(Int(Date().timeIntervalSince1970 * 1_000_000))
-                ]
-            )
-        }
-    }
 
     /// Task 42 originally shipped staging tables before the exact projection
     /// binding columns. In-flight sessions cannot be upgraded safely because
@@ -5318,9 +5267,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                    commitment: ltHash.commitment,
                    updatedAt: Int64(createdAt)
                ) {
-                try await enqueueWriteForwardsWithoutGate(
+                try await enqueueSpaceSyncUpdateWithoutGate(
                     space: space,
-                    sourceEventID: eventID.uuidString.lowercased(),
+                    kind: .repoWrite,
                     repository: author,
                     wireRevision: wireRevision.toString(),
                     commitment: ltHash.commitment,
@@ -5929,12 +5878,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     "permissioned_space_outbox",
                     "permissioned_simple_space_authorities",
                     "conversation_space_authorities",
-                    "conversation_space_deletion_recipients",
+                    "permissioned_space_sync_registrations",
                     "permissioned_simple_space_members",
                     "permissioned_simple_space_clients",
                     "permissioned_simple_space_managing_app_decisions",
                     "permissioned_space_writers",
-                    "permissioned_space_notification_registrations",
+                    "permissioned_space_sync_notifications",
                 ] {
                     let unexpected = try await readConnection.query(
                         "SELECT 1 FROM \(table) LIMIT 1"
@@ -6168,12 +6117,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     "permissioned_space_outbox",
                     "permissioned_simple_space_authorities",
                     "conversation_space_authorities",
-                    "conversation_space_deletion_recipients",
+                    "permissioned_space_sync_registrations",
                     "permissioned_simple_space_members",
                     "permissioned_simple_space_clients",
                     "permissioned_simple_space_managing_app_decisions",
                     "permissioned_space_writers",
-                    "permissioned_space_notification_registrations",
+                    "permissioned_space_sync_notifications",
                 ] {
                     let unexpected = try await readConnection.query(
                         "SELECT 1 FROM \(table) LIMIT 1"
@@ -7856,16 +7805,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     // Reviving one is a fresh create, never a way to expose
                     // pre-deletion records or reapply old managing decisions.
                     try await deleteAuthorityRepositoryWithoutGate(space: space)
-                    // A fresh incarnation cannot inherit either subscriptions
-                    // or queued deletion signals from its predecessor.
-                    _ = try await connection.query(
-                        "DELETE FROM permissioned_space_notification_fanout WHERE space_uri = ?",
-                        [.text(space.rawValue)]
-                    )
-                    _ = try await connection.query(
-                        "DELETE FROM permissioned_space_notification_registrations WHERE space_uri = ?",
-                        [.text(space.rawValue)]
-                    )
                     let storedRevision = try requiredRevision(row, "revision")
                     let nextRevision = try nextSimpleSpaceRevision(storedRevision)
                     _ = try await connection.query(
@@ -8532,7 +8471,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     // Retry also repairs tombstones created before authority
                     // repository cleanup became part of deletion.
                     try await deleteAuthorityRepositoryWithoutGate(space: space)
-                    try await pruneCompletedDeletionRegistrationsWithoutGate(space: space)
                     return try await requiredSimpleSpace(space).state
                 }
                 let nextRevision = try nextSimpleSpaceRevision(stored.state.revision)
@@ -8554,48 +8492,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     [.text(space.rawValue)]
                 )
                 try await deleteAuthorityRepositoryWithoutGate(space: space)
-                // The lifecycle tombstone and every registered-recipient
-                // notification intent commit together.  Delivery happens
-                // later through the lease worker; endpoint strings stay
-                // opaque here and no record/CAR data enters the queue.
-                let deletionEventID = UUID().uuidString.lowercased()
-                // SWAN-SYNC-4: one deletion per registered service, even when
-                // several services share an endpoint.
-                let recipients = try await connection.query(
-                    """
-                    SELECT endpoint, service_key FROM permissioned_space_notification_registrations
-                    WHERE space_uri = ? AND expires_at > ?
-                    ORDER BY service_key ASC
-                    """,
-                    [.text(space.rawValue), .integer(timestamp)]
+                try await enqueueSpaceDeletedNotificationsWithoutGate(
+                    space: space,
+                    timestamp: timestamp
                 )
-                for row in recipients {
-                    let endpoint = try validNotificationEndpoint(
-                        try requiredText(row, "endpoint")
-                    )
-                    let serviceKey = try requiredText(row, "service_key")
-                    _ = try await connection.query(
-                        """
-                        INSERT INTO permissioned_space_notification_fanout(
-                            id, source_issuer, source_event_id, kind, space_uri,
-                            repo_did, wire_revision, commitment, endpoint, service_key,
-                            attempts, created_at, available_at,
-                            lease_token, lease_expires_at
-                        ) VALUES (?, ?, ?, 'deleted', ?, NULL, NULL, NULL, ?, ?, 0, ?, ?, NULL, NULL)
-                        ON CONFLICT(source_issuer, source_event_id, kind, endpoint, service_key) DO NOTHING
-                        """,
-                        [
-                            .text(UUID().uuidString), .text(space.authority),
-                            .text(deletionEventID), .text(space.rawValue),
-                            .text(endpoint), .text(serviceKey),
-                            .integer(timestamp), .integer(timestamp),
-                        ]
-                    )
-                }
-                // Delivery rechecks this registration's expiry and resolved
-                // service audience. Retain it until its deletion intent drains;
-                // an idempotent delete must not cancel pending delivery either.
-                try await pruneCompletedDeletionRegistrationsWithoutGate(space: space)
                 return try await requiredSimpleSpace(space).state
             }
         }
@@ -8606,54 +8506,46 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return deletedState
     }
 
-    /// Preserve the registration facts needed by pending deletion deliveries,
-    /// and reclaim them once their exact endpoint has no deletion intent left.
-    /// A live/recreated authority never loses a current registration here.
-    func pruneCompletedDeletionRegistrationsWithoutGate(space: SpaceURI) async throws {
+    /// Replaces any pending update/expiry work with one reliable deletion
+    /// notice for every active or lapsed registration, then drops the
+    /// registrations. The queue retains the endpoint and opaque token.
+    func enqueueSpaceDeletedNotificationsWithoutGate(
+        space: SpaceURI,
+        timestamp: Int
+    ) async throws {
         _ = try await connection.query(
-            """
-            DELETE FROM permissioned_space_notification_registrations
-            WHERE space_uri = ?
-              AND (EXISTS (
-                  SELECT 1 FROM permissioned_simple_space_authorities AS authority
-                  WHERE authority.space_uri = permissioned_space_notification_registrations.space_uri
-                    AND authority.is_deleted != 0
-              ) OR EXISTS (
-                  SELECT 1 FROM conversation_space_authorities AS authority
-                  WHERE authority.space_uri = permissioned_space_notification_registrations.space_uri
-                    AND authority.state = 'deleted'
-              ))
-              AND NOT EXISTS (
-                  SELECT 1 FROM permissioned_space_notification_fanout AS pending
-                  WHERE pending.space_uri = permissioned_space_notification_registrations.space_uri
-                    AND pending.endpoint = permissioned_space_notification_registrations.endpoint
-                    AND (pending.service_key = ''
-                         OR pending.service_key = permissioned_space_notification_registrations.service_key)
-                    AND pending.kind = 'deleted'
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM conversation_space_authorities AS authority
-                  JOIN permissioned_space_notification_fanout AS pending
-                    ON pending.space_uri = authority.space_uri AND pending.source_event_id = authority.deletion_event_id
-                  WHERE authority.space_uri = permissioned_space_notification_registrations.space_uri
-                    AND authority.state = 'deleted' AND pending.kind = 'deleted'
-              )
-            """,
+            "DELETE FROM permissioned_space_sync_notifications WHERE space_uri = ?",
             [.text(space.rawValue)]
         )
+        let retryExpiresAt = timestamp + 72 * 60 * 60 * 1_000_000
         _ = try await connection.query(
             """
-            DELETE FROM conversation_space_deletion_recipients
-            WHERE space_uri = ?
-              AND EXISTS (SELECT 1 FROM conversation_space_authorities AS authority
-                  WHERE authority.space_uri = conversation_space_deletion_recipients.space_uri
-                    AND authority.state = 'deleted'
-                    AND authority.deletion_event_id = conversation_space_deletion_recipients.deletion_event_id)
-              AND NOT EXISTS (SELECT 1 FROM permissioned_space_notification_fanout AS pending
-                  WHERE pending.space_uri = conversation_space_deletion_recipients.space_uri
-                    AND pending.source_event_id = conversation_space_deletion_recipients.deletion_event_id
-                    AND pending.kind = 'deleted')
-            """, [.text(space.rawValue)])
+            INSERT INTO permissioned_space_sync_notifications(
+                id, kind, space_uri, endpoint, token, repo_did, repo_revision,
+                commitment, space_revision, previous_space_revision,
+                registration_expires_at, attempts, created_at, available_at,
+                retry_expires_at, lease_token, lease_expires_at
+            )
+            SELECT
+                substr(h,1,8)||'-'||substr(h,9,4)||'-'||substr(h,13,4)
+                    ||'-'||substr(h,17,4)||'-'||substr(h,21,12),
+                'spaceDeleted', ?, endpoint, token, NULL, NULL, NULL, NULL,
+                NULL, NULL, 0, ?, ?, ?, NULL, NULL
+            FROM (
+                SELECT hex(randomblob(16)) AS h, endpoint, token
+                FROM permissioned_space_sync_registrations
+                WHERE space_uri = ?
+            )
+            """,
+            [
+                .text(space.rawValue), .integer(timestamp), .integer(timestamp),
+                .integer(retryExpiresAt), .text(space.rawValue),
+            ]
+        )
+        _ = try await connection.query(
+            "DELETE FROM permissioned_space_sync_registrations WHERE space_uri = ?",
+            [.text(space.rawValue)]
+        )
     }
 
     /// Deletes only the authority's own repository in this account database.
@@ -8686,10 +8578,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 [.text(space.rawValue)]
             )
         }
-        _ = try await connection.query(
-            "DELETE FROM permissioned_space_notification_fanout WHERE space_uri = ? AND kind = 'write'",
-            [.text(space.rawValue)]
-        )
         _ = try await connection.query(
             "DELETE FROM permissioned_simple_space_managing_app_decisions WHERE space_uri = ?",
             [.text(space.rawValue)]
@@ -8892,80 +8780,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
     }
 
-    /// Replaces one service's subscription atomically. A registration is
-    /// keyed by its service identity, matching the reference's
-    /// `(space, serviceDid)` key (SWAN-SYNC-4); legacy endpoint-only rows
-    /// keep their endpoint key. Re-registering with a different endpoint or
-    /// optional repo replaces it; expiry cleanup below acts as removal
-    /// without accepting a broad administration endpoint.
-    /// Withdraws a subscriber's registrations by service identity, the live
-    /// `unregisterNotify` contract: idempotent (succeeds whether or not a
-    /// matching registration existed), gated on a space credential for this
-    /// exact space and on the space still being active.
-    public func unregisterSpaceNotification(
-        space: SpaceURI,
-        ownerServiceDID: String? = nil,
-        deliveryServiceDID: String? = nil,
-        service: String? = nil,
-        serviceDID: String? = nil,
-        authorization: AuthorizationContext
-    ) async throws {
-        let ownerCandidate = ownerServiceDID ?? serviceDID ?? (service != nil && !service!.isEmpty ? service : nil)
-        guard let owner = ownerCandidate,
-              Self.isValidNotificationServiceIdentity(owner) else {
-            throw SwanError.unauthorized("service authentication is required")
-        }
-        try requireAuthorityAccount(space: space)
-        guard case let .spaceCredential(grant) = authorization,
-              grant.space == space else {
-            throw SwanError.unauthorized("space credential is required")
-        }
-        try grant.allows(.read)
-        try await withConnectionGate {
-            try await transaction {
-                try await requireNotificationAuthorityActive(space, connection: connection)
-                let baseDID = serviceIssuerDID(owner) ?? owner
-                let requested = deliveryServiceDID ?? (ownerServiceDID != nil ? nil : (service ?? serviceDID))
-                if let requested {
-                    guard Self.isValidNotificationServiceIdentity(requested) else {
-                        throw SwanError.invalidIdentifier("notification service identity")
-                    }
-                    let isOwnerWithoutFragment = (requested == owner || requested == baseDID) && !requested.contains("#")
-                    if isOwnerWithoutFragment {
-                        _ = try await connection.query(
-                            """
-                            DELETE FROM permissioned_space_notification_registrations
-                            WHERE space_uri = ?
-                              AND (owner_service_did = ? OR owner_service_did = ?)
-                              AND (delivery_service_did = ? OR delivery_service_did IS NULL)
-                            """,
-                            [.text(space.rawValue), .text(owner), .text(baseDID), .text(requested)]
-                        )
-                    } else {
-                        _ = try await connection.query(
-                            """
-                            DELETE FROM permissioned_space_notification_registrations
-                            WHERE space_uri = ?
-                              AND (owner_service_did = ? OR owner_service_did = ?)
-                              AND delivery_service_did = ?
-                            """,
-                            [.text(space.rawValue), .text(owner), .text(baseDID), .text(requested)]
-                        )
-                    }
-                } else {
-                    _ = try await connection.query(
-                        """
-                        DELETE FROM permissioned_space_notification_registrations
-                        WHERE space_uri = ?
-                          AND (owner_service_did = ? OR owner_service_did = ?)
-                          AND delivery_service_did IS NULL
-                        """,
-                        [.text(space.rawValue), .text(owner), .text(baseDID)]
-                    )
-                }
-            }
-        }
-    }
 
     public func activeSpaceRevision(_ space: SpaceURI) async throws -> String? {
         try requireAuthorityAccount(space: space)
@@ -9048,6 +8862,33 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     registration.space,
                     connection: connection
                 )
+                let exists = try await connection.query(
+                    """
+                    SELECT 1 FROM permissioned_space_sync_registrations
+                    WHERE space_uri = ? AND endpoint = ? AND token = ?
+                    """,
+                    [
+                        .text(registration.space.rawValue),
+                        .text(registration.endpoint),
+                        .text(registration.token),
+                    ]
+                ).isEmpty == false
+                if !exists {
+                    let count = try await connection.query(
+                        """
+                        SELECT COUNT(*) AS count
+                        FROM permissioned_space_sync_registrations
+                        WHERE space_uri = ?
+                        """,
+                        [.text(registration.space.rawValue)]
+                    ).first?.column("count")?.integer
+                    guard let count,
+                          count < Self.maximumNotificationRegistrationsPerSpace else {
+                        throw SwanError.unavailable(
+                            "space sync registration capacity is exhausted"
+                        )
+                    }
+                }
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_sync_registrations(
@@ -9067,6 +8908,18 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         .integer(updatedAt),
                     ]
                 )
+                _ = try await connection.query(
+                    """
+                    DELETE FROM permissioned_space_sync_notifications
+                    WHERE space_uri = ? AND endpoint = ? AND token = ?
+                      AND kind = 'registrationExpired'
+                    """,
+                    [
+                        .text(registration.space.rawValue),
+                        .text(registration.endpoint),
+                        .text(registration.token),
+                    ]
+                )
             }
         }
     }
@@ -9081,6 +8934,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await transaction {
                 _ = try await connection.query(
                     """
+                    DELETE FROM permissioned_space_sync_notifications
+                    WHERE space_uri = ? AND endpoint = ? AND token = ?
+                    """,
+                    [.text(space.rawValue), .text(endpoint), .text(token)]
+                )
+                _ = try await connection.query(
+                    """
                     DELETE FROM permissioned_space_sync_registrations
                     WHERE space_uri = ? AND endpoint = ? AND token = ?
                     """,
@@ -9090,310 +8950,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    public func registerSpaceNotification(
-        _ registration: AuthorizedSpaceNotificationRegistration,
-        serviceDID: String? = nil,
-        authorization: AuthorizationContext,
-        now: Date = Date()
-    ) async throws {
-        let ownerCandidate = serviceDID ?? (!registration.ownerServiceDID.isEmpty ? registration.ownerServiceDID : nil)
-        guard let owner = ownerCandidate,
-              Self.isValidNotificationServiceIdentity(owner) else {
-            throw SwanError.unauthorized("service authentication is required")
-        }
-        let deliveryService = registration.deliveryServiceDID ?? registration.service
-        if let deliveryService {
-            guard Self.isValidNotificationServiceIdentity(deliveryService) else {
-                throw SwanError.invalidIdentifier("notification service identity")
-            }
-        }
-        let endpoint = try validNotificationEndpoint(registration.endpoint)
-        if let repository = registration.repository {
-            guard isValidSimpleSpaceDID(repository) else {
-                throw SwanError.invalidIdentifier("notification repository")
-            }
-        }
-        let timestamp = try simpleSpaceTimestamp(now)
-        let expiry = try simpleSpaceTimestamp(registration.expiresAt)
-        guard expiry > timestamp,
-              expiry - timestamp <= 24 * 60 * 60 * 1_000_000 else {
-            throw SwanError.malformed("notification registration lifetime is invalid")
-        }
-        try requireAuthorityAccount(space: registration.space)
-        guard case let .spaceCredential(grant) = authorization,
-              grant.space == registration.space else {
-            throw SwanError.unauthorized("space credential is required")
-        }
-        try grant.allows(.read)
-        try await withConnectionGate {
-            try await transaction {
-                try await requireNotificationAuthorityActive(registration.space, connection: connection)
-                // Expired registrations are no longer recipients. Prune them
-                // before admission so expiry immediately returns capacity and
-                // the count below is part of the same write transaction.
-                _ = try await connection.query(
-                    """
-                    DELETE FROM permissioned_space_notification_registrations
-                    WHERE space_uri = ? AND expires_at <= ?
-                    """,
-                    [.text(registration.space.rawValue), .integer(timestamp)]
-                )
-                // SWAN-SYNC-4: a registration is keyed by its service
-                // identity, as the reference keys (space, serviceDid); the
-                // endpoint is data, so services sharing an endpoint each keep
-                // their own registration. Endpoint-only legacy rows keep
-                // their endpoint key (see spaceNotificationServiceKeySQL).
-                let serviceKey = deliveryService ?? "endpoint:" + endpoint
-                let existing = try await connection.query(
-                    """
-                    SELECT owner_service_did
-                    FROM permissioned_space_notification_registrations
-                    WHERE space_uri = ? AND service_key = ?
-                    LIMIT 1
-                    """,
-                    [.text(registration.space.rawValue), .text(serviceKey)]
-                )
-                if let row = existing.first {
-                    let previous = row.column("owner_service_did")?.string
-                    let baseDID = serviceIssuerDID(owner) ?? owner
-                    guard previous == owner || previous == baseDID || serviceIssuerDID(previous ?? "") == baseDID else {
-                        throw SwanError.unauthorized("notification registration owner mismatch")
-                    }
-                } else {
-                    let countRows = try await connection.query(
-                        """
-                        SELECT COUNT(*) AS registration_count
-                        FROM permissioned_space_notification_registrations
-                        WHERE space_uri = ?
-                        """,
-                        [.text(registration.space.rawValue)]
-                    )
-                    guard let countRow = countRows.first,
-                          try requiredNonnegativeInteger(countRow, "registration_count")
-                              < Self.maximumNotificationRegistrationsPerSpace else {
-                        throw SwanError.unavailable(
-                            "notification registration capacity exhausted"
-                        )
-                    }
-                }
-                _ = try await connection.query(
-                    """
-                    INSERT INTO permissioned_space_notification_registrations(
-                        space_uri, service_key, endpoint, repo_did, expires_at, updated_at,
-                        owner_service_did, delivery_service_did
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(space_uri, service_key) DO UPDATE SET
-                        endpoint = excluded.endpoint,
-                        repo_did = excluded.repo_did,
-                        expires_at = excluded.expires_at,
-                        updated_at = excluded.updated_at,
-                        owner_service_did = excluded.owner_service_did,
-                        delivery_service_did = excluded.delivery_service_did
-                    """,
-                    [
-                        .text(registration.space.rawValue), .text(serviceKey), .text(endpoint),
-                        registration.repository.map(SQLiteData.text) ?? .null,
-                        .integer(expiry), .integer(timestamp),
-                        .text(owner),
-                        deliveryService.map(SQLiteData.text) ?? .null,
-                    ]
-                )
-            }
-        }
-    }
-
-    /// A subscriber service identifier: a DID with an optional single
-    /// `#fragment`. Charset-bounded here so a stored identity can always be a
-    /// service-JWT audience; the HTTP layer has already resolved it to an
-    /// endpoint through the DID document.
-    static func isValidNotificationServiceIdentity(_ value: String) -> Bool {
-        guard !value.isEmpty, value.utf8.count <= 640,
-              value.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7F }) else {
-            return false
-        }
-        let parts = value.split(separator: "#", omittingEmptySubsequences: false)
-        guard (1 ... 2).contains(parts.count),
-              parts.allSatisfy({ !$0.isEmpty }),
-              parts[0].hasPrefix("did:") else {
-            return false
-        }
-        return true
-    }
-
-    /// Atomically binds a queued deletion's exact identity to its still-active
-    /// registration. Recreating a space cancels old intents, including events
-    /// a worker has already leased into memory; reusing the endpoint cannot
-    /// make that predecessor's deletion current again.
-    public func currentSpaceDeletionDeliveryRegistration(
-        for notification: PersistedSpaceNotificationFanout,
-        now: Date = Date()
-    ) async throws -> PersistedSpaceDeletionDeliveryRegistration? {
-        try requireAuthorityAccount(space: notification.space)
-        guard notification.kind == .deleted,
-              notification.sourceIssuer == notification.space.authority,
-              notification.repository == nil, notification.wireRevision == nil,
-              notification.commitment == nil else { return nil }
-        let timestamp = try simpleSpaceTimestamp(now)
-        return try await withReadConnectionGate {
-            try await readTransaction {
-                if notification.space.spaceType == "blue.catbird.labyrinth.conversation" {
-                    // SWAN-SYNC-3: like the simple-space branch below, a
-                    // recipient is owed the deletion only until its
-                    // registration expires (October 22 section 6). An expired
-                    // recipient renews its credential and is answered
-                    // SpaceDeleted; its row is acknowledged and pruned.
-                    let owed = try await readConnection.query(
-                        """
-                        SELECT recipient.delivery_service_did
-                        FROM conversation_space_deletion_recipients AS recipient
-                        JOIN conversation_space_authorities AS authority ON authority.space_uri = recipient.space_uri
-                          AND authority.deletion_event_id = recipient.deletion_event_id AND authority.state = 'deleted'
-                        JOIN permissioned_space_notification_fanout AS pending ON pending.space_uri = recipient.space_uri
-                          AND pending.source_event_id = recipient.deletion_event_id AND pending.endpoint = recipient.endpoint
-                          AND (pending.service_key = '' OR pending.service_key = recipient.service_key)
-                        WHERE pending.id = ? AND pending.source_issuer = ? AND pending.source_event_id = ?
-                          AND pending.kind = 'deleted' AND pending.space_uri = ? AND pending.endpoint = ?
-                          AND recipient.registration_expires_at > ?
-                        """, [.text(notification.id.uuidString), .text(notification.sourceIssuer),
-                               .text(notification.sourceEventID), .text(notification.space.rawValue), .text(notification.endpoint),
-                               .integer(timestamp)])
-                    guard let row = owed.first else { return nil }
-                    let service = row.column("delivery_service_did")?.string
-                    if let service, !Self.isValidNotificationServiceIdentity(service) {
-                        throw SwanError.unavailable("registered notification destination is unavailable")
-                    }
-                    return PersistedSpaceDeletionDeliveryRegistration(serviceIdentity: service)
-                }
-                let rows = try await readConnection.query(
-                    """
-                    SELECT registration.delivery_service_did
-                    FROM permissioned_space_notification_fanout AS pending
-                    JOIN permissioned_space_notification_registrations AS registration
-                      ON registration.space_uri = pending.space_uri
-                     AND registration.endpoint = pending.endpoint
-                     AND (pending.service_key = '' OR registration.service_key = pending.service_key)
-                    WHERE pending.id = ? AND pending.source_issuer = ?
-                      AND pending.source_event_id = ? AND pending.kind = 'deleted'
-                      AND pending.space_uri = ? AND pending.endpoint = ?
-                      AND registration.expires_at > ?
-                    """,
-                    [
-                        .text(notification.id.uuidString), .text(notification.sourceIssuer),
-                        .text(notification.sourceEventID), .text(notification.space.rawValue),
-                        .text(notification.endpoint), .integer(timestamp),
-                    ]
-                )
-                guard let row = rows.first else { return nil }
-                let service = row.column("delivery_service_did")?.string
-                if let service, !Self.isValidNotificationServiceIdentity(service) {
-                    throw SwanError.unavailable("registered notification destination is unavailable")
-                }
-                return PersistedSpaceDeletionDeliveryRegistration(serviceIdentity: service)
-            }
-        }
-    }
-
-    /// The active registration's service identity for one `(space, endpoint)`
-    /// row, or `nil` when the row is absent, expired, filtered out by its
-    /// per-repo binding, or a legacy endpoint-only registration. Delivery
-    /// treats `nil` as "not a dynamic destination" — a replaced or withdrawn
-    /// service registration turns a leased fanout row into a safe no-op.
-    public func spaceNotificationRegistrationService(
-        space: SpaceURI,
-        endpoint: String,
-        repository: String?,
-        now: Date = Date()
-    ) async throws -> String? {
-        let endpoint = try validNotificationEndpoint(endpoint)
-        if let repository {
-            guard isValidSimpleSpaceDID(repository) else {
-                throw SwanError.invalidIdentifier("notification repository")
-            }
-        }
-        let timestamp = try simpleSpaceTimestamp(now)
-        try requireAuthorityAccount(space: space)
-        return try await withConnectionGate {
-            try await readTransaction {
-                if repository != nil {
-                    do { try await requireNotificationAuthorityActive(space, connection: connection) }
-                    catch is AuthorizedSimpleSpaceLifecycleError { return nil }
-                }
-                // Several services may share an endpoint (SWAN-SYNC-4). This
-                // endpoint-keyed lookup picks the active service-named row
-                // with the lowest service key, the same row
-                // enqueueWriteForwardsWithoutGate queues for that endpoint.
-                let rows = try await connection.query(
-                    """
-                    SELECT delivery_service_did
-                    FROM permissioned_space_notification_registrations
-                    WHERE space_uri = ? AND endpoint = ? AND expires_at > ?
-                      AND delivery_service_did IS NOT NULL
-                      AND (? IS NULL OR repo_did IS NULL OR repo_did = ?)
-                    ORDER BY service_key ASC
-                    LIMIT 1
-                    """,
-                    [
-                        .text(space.rawValue), .text(endpoint), .integer(timestamp),
-                        repository.map(SQLiteData.text) ?? .null,
-                        repository.map(SQLiteData.text) ?? .null,
-                    ]
-                )
-                guard let service = rows.first?.column("delivery_service_did")?.string,
-                      Self.isValidNotificationServiceIdentity(service) else {
-                    return nil
-                }
-                return service
-            }
-        }
-    }
-
-    /// Checks the durable registration immediately before a fanout transport
-    /// uses it. A replaced, expired, or future removed registration turns a
-    /// leased fanout row into a safe no-op rather than allowing a stale queue
-    /// entry to keep sending to an endpoint after policy has changed.
-    public func isSpaceNotificationRegistrationActive(
-        space: SpaceURI,
-        endpoint: String,
-        repository: String?,
-        now: Date = Date()
-    ) async throws -> Bool {
-        let endpoint = try validNotificationEndpoint(endpoint)
-        if let repository {
-            guard isValidSimpleSpaceDID(repository) else {
-                throw SwanError.invalidIdentifier("notification repository")
-            }
-        }
-        let timestamp = try simpleSpaceTimestamp(now)
-        try requireAuthorityAccount(space: space)
-        return try await withReadConnectionGate {
-            try await readTransaction {
-                if repository != nil {
-                    do { try await requireNotificationAuthorityActive(space, connection: readConnection) }
-                    catch is AuthorizedSimpleSpaceLifecycleError { return false }
-                }
-                // A repo-specific registration receives matching writes;
-                // deletions (`repository == nil`) notify every still-active
-                // recipient because the authority is no longer available to
-                // send a later lifecycle signal. Several services may share
-                // the endpoint (SWAN-SYNC-4); any active match qualifies.
-                let rows = try await readConnection.query(
-                    """
-                    SELECT 1
-                    FROM permissioned_space_notification_registrations
-                    WHERE space_uri = ? AND endpoint = ? AND expires_at > ?
-                      AND (? IS NULL OR repo_did IS NULL OR repo_did = ?)
-                    LIMIT 1
-                    """,
-                    [
-                        .text(space.rawValue), .text(endpoint), .integer(timestamp),
-                        repository.map(SQLiteData.text) ?? .null,
-                        repository.map(SQLiteData.text) ?? .null,
-                    ]
-                )
-                return !rows.isEmpty
-            }
-        }
-    }
 
     private func requireNotificationAuthorityActive(_ space: SpaceURI, connection: SQLiteConnection) async throws {
         if space.spaceType == "blue.catbird.labyrinth.conversation" {
@@ -9529,9 +9085,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     ]
                 )
 
-                try await enqueueWriteForwardsWithoutGate(
+                try await enqueueSpaceSyncUpdateWithoutGate(
                     space: notification.space,
-                    sourceEventID: eventID,
+                    kind: .repoWrite,
                     repository: notification.repository,
                     wireRevision: notification.wireRevision,
                     commitment: notification.commitment,
@@ -9542,191 +9098,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    /// `issuedAt` is the notice's service-JWT `iat`. Senders mint a fresh
-    /// `jti` per attempt (upstream `createServiceJwt`, and Swan since X2), so
-    /// the event ID cannot tell a retry from a new deletion. The `iat` can:
-    /// a notice signed before the authority issued the credential that
-    /// adopted a recreated space concerns an older lifecycle and is ignored.
-    /// Without an `iat` the notice is honoured.
-    public func receiveSpaceDeletionNotification(
-        space: SpaceURI,
-        issuer: String,
-        audience: String,
-        eventID: String,
-        requestBodyDigest: String,
-        issuedAt: Date? = nil,
-        now: Date = Date()
-    ) async throws {
-        guard issuer == space.authority, audience == accountDID,
-              isValidSimpleSpaceDID(issuer) else {
-            throw SwanError.unauthorized("invalid space deletion notification")
-        }
-        let expectedDigest = SpaceNotificationRequestDigest.deletion(space: space)
-        guard requestBodyDigest == expectedDigest else {
-            throw SwanError.unauthorized("space deletion request body digest mismatch")
-        }
-        let eventID = try validServiceEventID(eventID)
-        let timestamp = try simpleSpaceTimestamp(now)
-        let noticeIssuedAt = Self.authoritySeconds(issuedAt)
-        try await withConnectionGate {
-            try await transaction {
-                let retired = try await connection.query(
-                    "SELECT 1 FROM permissioned_remote_replica_retired_events WHERE space_uri = ? AND event_id = ?",
-                    [.text(space.rawValue), .text(eventID)]
-                )
-                guard retired.isEmpty else { return }
-                // SW-A: a notice signed before the newest lifecycle fact this
-                // receiver holds (the adopting credential, or a newer notice)
-                // is a stale retry. It must not re-close an adopted space.
-                if let noticeIssuedAt,
-                   let fence = try await remoteReplicaAuthorityFence(space: space),
-                   noticeIssuedAt < fence {
-                    return
-                }
-                // The deletion service JWT binds the space URI via `req`
-                // (requestBodyDigest) and the event ID is consumed transactionally.
-                // The pinned receiver bounds this by no-oping unless the
-                // recipient already knows the space
-                // (`packages/pds/src/api/com/atproto/space/notifySpaceDeleted.ts:33-34`).
-                // A syncer may have only a downloaded replica or an in-flight
-                // import. A member's own authored repository is a separate
-                // storage plane and remains available to that account.
-                let participation = try await connection.query(
-                    """
-                    SELECT 1
-                    FROM permissioned_repository_state
-                    WHERE space_uri = ? AND author_did = ?
-                    UNION ALL
-                    SELECT 1
-                    FROM permissioned_simple_space_authorities
-                    WHERE space_uri = ? AND owner_did = ?
-                    UNION ALL
-                    SELECT 1 FROM permissioned_remote_replica_state
-                    WHERE space_uri = ?
-                    UNION ALL
-                    SELECT 1 FROM permissioned_remote_replica_import_sessions
-                    WHERE space_uri = ?
-                    UNION ALL
-                    SELECT 1 FROM permissioned_space_recipient_tombstones
-                    WHERE space_uri = ?
-                    LIMIT 1
-                    """,
-                    [
-                        .text(space.rawValue), .text(accountDID),
-                        .text(space.rawValue), .text(accountDID),
-                        .text(space.rawValue), .text(space.rawValue),
-                        .text(space.rawValue),
-                    ]
-                )
-                guard !participation.isEmpty else { return }
-                let tombstones = try await connection.query(
-                    """
-                    SELECT deletion_event_id
-                    FROM permissioned_space_recipient_tombstones
-                    WHERE space_uri = ?
-                    """,
-                    [.text(space.rawValue)]
-                )
-                // A repeat (retried or duplicate) notice finds the tombstone
-                // the first one wrote. It must not touch state created since.
-                let retainedEventID = tombstones.first?.column("deletion_event_id")?.string
-                let duplicate = try await connection.query(
-                    """
-                    SELECT action, space_uri, request_digest
-                    FROM permissioned_space_notification_receipts
-                    WHERE issuer = ? AND event_id = ?
-                    """,
-                    [.text(issuer), .text(eventID)]
-                )
-                if let prior = duplicate.first {
-                    guard prior.column("action")?.string == "deleted",
-                          prior.column("space_uri")?.string == space.rawValue,
-                          prior.column("request_digest")?.string == expectedDigest else {
-                        throw SwanError.unauthorized("service event was bound to different request")
-                    }
-                }
-                if duplicate.isEmpty, tombstones.isEmpty {
-                    _ = try await connection.query(
-                        """
-                        INSERT INTO permissioned_space_notification_receipts(
-                            issuer, event_id, action, space_uri, request_digest, received_at
-                        ) VALUES (?, ?, 'deleted', ?, ?, ?)
-                        """,
-                        [
-                            .text(issuer), .text(eventID),
-                            .text(space.rawValue),
-                            .text(expectedDigest),
-                            .integer(timestamp),
-                        ]
-                    )
-                }
-                // Durable notice purges replicated and derived state and
-                // prevents a delayed import from reinstalling replicas until
-                // an operator adopts a recreated space. It never closes the
-                // recipient account's own authored repository or blob
-                // namespace: credentialed reads and later writes (with their
-                // notifyWrite outbox rows) continue, as upstream leaves member
-                // repositories untouched (October 22 section 6).
-                _ = try await connection.query(
-                    """
-                    INSERT INTO permissioned_space_recipient_tombstones(
-                        space_uri, authority_did, deletion_event_id, closed_at
-                    ) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(space_uri) DO NOTHING
-                    """,
-                    [
-                        .text(space.rawValue), .text(issuer), .text(eventID),
-                        .integer(timestamp),
-                    ]
-                )
-                try await retainRemoteReplicaGenerationFloor(
-                    space: space,
-                    eventID: retainedEventID ?? eventID
-                )
-                if let noticeIssuedAt {
-                    try await raiseRemoteReplicaAuthorityFence(space: space, to: noticeIssuedAt)
-                }
-                // Records must precede blocks because their FK deliberately
-                // has no cascade. Block chunks and import staging cascade from
-                // their exact-space parent rows. Repeat notices also clean up
-                // replica residue left by older versions of this receiver.
-                for table in [
-                    "permissioned_remote_replica_records",
-                    "permissioned_remote_replica_blocks",
-                    "permissioned_remote_replica_state",
-                    "permissioned_remote_replica_import_sessions",
-                    "permissioned_remote_replica_import_results",
-                    "permissioned_remote_replica_incremental_results",
-                    "permissioned_remote_replica_incremental_progress",
-                    "permissioned_space_writers",
-                ] {
-                    _ = try await connection.query(
-                        "DELETE FROM \(table) WHERE space_uri = ?",
-                        [.text(space.rawValue)]
-                    )
-                }
-                // Only the first notice drops the account's queued notifyWrite
-                // rows for the deleted lifecycle. A repeat must keep rows the
-                // account's own later writes queued (SW-A).
-                if retainedEventID == nil {
-                    _ = try await connection.query(
-                        "DELETE FROM permissioned_space_outbox WHERE space_uri = ?",
-                        [.text(space.rawValue)]
-                    )
-                }
-                _ = try await connection.query(
-                    """
-                    UPDATE permissioned_space_notification_fanout
-                    SET lease_token = NULL,
-                        lease_expires_at = NULL,
-                        available_at = 9223372036854775807
-                    WHERE space_uri = ? AND kind = 'write'
-                    """,
-                    [.text(space.rawValue)]
-                )
-            }
-        }
-    }
 
     /// Evaluates persisted policy facts in a read transaction before the
     /// caller mints a transient read credential. The supplied authorization
@@ -11590,13 +10961,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    /// Claims one durable authority fanout intent. It deliberately mirrors the
-    /// commit outbox lease API rather than sharing its table: registrations are
-    /// authority-owned, while a commit outbox is owned by the writer PDS.
-    public func leaseNextNotificationFanout(
+    public func leaseNextSpaceSyncNotification(
         now: Date = Date(),
         leaseDuration: TimeInterval
-    ) async throws -> PersistedSpaceNotificationFanoutLease? {
+    ) async throws -> PersistedSpaceSyncNotificationLease? {
         let nowTimestamp = try outboxTimestamp(now)
         let leaseExpiry = try outboxTimestamp(
             now.addingTimeInterval(try validOutboxInterval(leaseDuration, name: "lease duration"))
@@ -11606,10 +10974,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 let token = UUID()
                 let rows = try await connection.query(
                     """
-                    SELECT id, source_issuer, source_event_id, kind, space_uri,
-                           repo_did, wire_revision, commitment, endpoint, attempts,
-                           lease_token, lease_expires_at, space_rev, prev_space_rev
-                    FROM permissioned_space_notification_fanout
+                    SELECT id, kind, space_uri, endpoint, token, repo_did,
+                           repo_revision, commitment, space_revision,
+                           previous_space_revision, registration_expires_at,
+                           retry_expires_at, attempts, lease_token, lease_expires_at
+                    FROM permissioned_space_sync_notifications
                     WHERE available_at <= ?
                       AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
                     ORDER BY available_at, created_at, id
@@ -11618,17 +10987,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     [.integer(nowTimestamp), .integer(nowTimestamp)]
                 )
                 guard let row = rows.first else { return nil }
-                let event = try decodeNotificationFanout(row)
-                _ = try decodeNotificationFanoutLease(row)
+                let event = try decodeSpaceSyncNotification(row)
+                _ = try decodeSpaceSyncNotificationLease(row)
                 _ = try await connection.query(
                     """
-                    UPDATE permissioned_space_notification_fanout
+                    UPDATE permissioned_space_sync_notifications
                     SET lease_token = ?, lease_expires_at = ?
                     WHERE id = ?
                     """,
                     [.text(token.uuidString), .integer(leaseExpiry), .text(event.id.uuidString)]
                 )
-                return PersistedSpaceNotificationFanoutLease(
+                return PersistedSpaceSyncNotificationLease(
                     event: event,
                     token: token,
                     expiresAt: Date(timeIntervalSince1970: Double(leaseExpiry) / 1_000_000)
@@ -11637,32 +11006,74 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
+    public func spaceSyncNotificationIsOwed(
+        _ event: PersistedSpaceSyncNotification
+    ) async throws -> Bool {
+        guard event.kind == .registrationExpired,
+              let registrationExpiredAt = event.registrationExpiredAt else {
+            return true
+        }
+        let cutoff = try outboxTimestamp(registrationExpiredAt)
+        return try await withReadConnectionGate {
+            try await readConnection.query(
+                """
+                SELECT 1 FROM permissioned_space_sync_registrations
+                WHERE space_uri = ? AND endpoint = ? AND token = ?
+                  AND expires_at <= ? AND expiry_notified = 1
+                LIMIT 1
+                """,
+                [
+                    .text(event.space.rawValue), .text(event.endpoint),
+                    .text(event.token), .integer(cutoff),
+                ]
+            ).isEmpty == false
+        }
+    }
+
     @discardableResult
-    public func completeNotificationFanoutLease(
+    public func completeSpaceSyncNotificationLease(
         eventID: UUID,
-        token: UUID
+        token: UUID,
+        dropRegistration: Bool = false
     ) async throws -> Bool {
         try await withConnectionGate {
             try await transaction {
                 let rows = try await connection.query(
                     """
-                    SELECT id, source_issuer, source_event_id, kind, space_uri,
-                           repo_did, wire_revision, commitment, endpoint, attempts,
-                           lease_token, lease_expires_at, space_rev, prev_space_rev
-                    FROM permissioned_space_notification_fanout WHERE id = ?
+                    SELECT id, kind, space_uri, endpoint, token, repo_did,
+                           repo_revision, commitment, space_revision,
+                           previous_space_revision, registration_expires_at,
+                           retry_expires_at, attempts, lease_token, lease_expires_at
+                    FROM permissioned_space_sync_notifications WHERE id = ?
                     """,
                     [.text(eventID.uuidString)]
                 )
                 guard let row = rows.first else { return false }
-                let event = try decodeNotificationFanout(row)
-                let lease = try decodeNotificationFanoutLease(row)
+                let event = try decodeSpaceSyncNotification(row)
+                let lease = try decodeSpaceSyncNotificationLease(row)
                 guard lease.token == token else { return false }
                 _ = try await connection.query(
-                    "DELETE FROM permissioned_space_notification_fanout WHERE id = ? AND lease_token = ?",
+                    """
+                    DELETE FROM permissioned_space_sync_notifications
+                    WHERE id = ? AND lease_token = ?
+                    """,
                     [.text(eventID.uuidString), .text(token.uuidString)]
                 )
-                if event.kind == .deleted {
-                    try await pruneCompletedDeletionRegistrationsWithoutGate(space: event.space)
+                if dropRegistration,
+                   event.kind == .registrationExpired,
+                   let registrationExpiredAt = event.registrationExpiredAt {
+                    _ = try await connection.query(
+                        """
+                        DELETE FROM permissioned_space_sync_registrations
+                        WHERE space_uri = ? AND endpoint = ? AND token = ?
+                          AND expires_at <= ?
+                        """,
+                        [
+                            .text(event.space.rawValue), .text(event.endpoint),
+                            .text(event.token),
+                            .integer(try outboxTimestamp(registrationExpiredAt)),
+                        ]
+                    )
                 }
                 return true
             }
@@ -11670,7 +11081,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     }
 
     @discardableResult
-    public func failNotificationFanoutLease(
+    public func failSpaceSyncNotificationLease(
         eventID: UUID,
         token: UUID,
         retryAt: Date
@@ -11680,24 +11091,27 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await transaction {
                 let rows = try await connection.query(
                     """
-                    SELECT id, source_issuer, source_event_id, kind, space_uri,
-                           repo_did, wire_revision, commitment, endpoint, attempts,
-                           lease_token, lease_expires_at, space_rev, prev_space_rev
-                    FROM permissioned_space_notification_fanout WHERE id = ?
+                    SELECT id, kind, space_uri, endpoint, token, repo_did,
+                           repo_revision, commitment, space_revision,
+                           previous_space_revision, registration_expires_at,
+                           retry_expires_at, attempts, lease_token, lease_expires_at
+                    FROM permissioned_space_sync_notifications WHERE id = ?
                     """,
                     [.text(eventID.uuidString)]
                 )
                 guard let row = rows.first else { return nil }
-                let event = try decodeNotificationFanout(row)
-                let lease = try decodeNotificationFanoutLease(row)
+                let event = try decodeSpaceSyncNotification(row)
+                let lease = try decodeSpaceSyncNotificationLease(row)
                 guard lease.token == token else { return nil }
                 guard event.attempts < Int.max else {
-                    throw SQLiteRepositoryError.corruptDatabase("notification fanout attempts overflow")
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "space sync notification attempts overflow"
+                    )
                 }
                 let nextAttempts = event.attempts + 1
                 _ = try await connection.query(
                     """
-                    UPDATE permissioned_space_notification_fanout
+                    UPDATE permissioned_space_sync_notifications
                     SET attempts = ?, available_at = ?,
                         lease_token = NULL, lease_expires_at = NULL
                     WHERE id = ? AND lease_token = ?
@@ -11712,26 +11126,27 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    public func pendingNotificationFanout(
+    public func pendingSpaceSyncNotifications(
         limit: Int = 100
-    ) async throws -> [PersistedSpaceNotificationFanout] {
+    ) async throws -> [PersistedSpaceSyncNotification] {
         guard (0 ... 10_000).contains(limit) else {
-            throw SwanError.malformed("notification fanout limit is invalid")
+            throw SwanError.malformed("space sync notification limit is invalid")
         }
         return try await withReadConnectionGate {
             let rows = try await readConnection.query(
                 """
-                SELECT id, source_issuer, source_event_id, kind, space_uri,
-                       repo_did, wire_revision, commitment, endpoint, attempts,
-                       lease_token, lease_expires_at, space_rev, prev_space_rev
-                FROM permissioned_space_notification_fanout
+                SELECT id, kind, space_uri, endpoint, token, repo_did,
+                       repo_revision, commitment, space_revision,
+                       previous_space_revision, registration_expires_at,
+                       retry_expires_at, attempts, lease_token, lease_expires_at
+                FROM permissioned_space_sync_notifications
                 ORDER BY created_at, id LIMIT ?
                 """,
                 [.integer(limit)]
             )
-            return try rows.map { row in
-                _ = try decodeNotificationFanoutLease(row)
-                return try decodeNotificationFanout(row)
+            return try rows.map {
+                _ = try decodeSpaceSyncNotificationLease($0)
+                return try decodeSpaceSyncNotification($0)
             }
         }
     }
@@ -12975,78 +12390,115 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    private func decodeNotificationFanout(
+    private func decodeSpaceSyncNotification(
         _ row: SQLiteRow
-    ) throws -> PersistedSpaceNotificationFanout {
+    ) throws -> PersistedSpaceSyncNotification {
         guard let id = row.column("id")?.string.flatMap(UUID.init(uuidString:)),
-              let issuer = row.column("source_issuer")?.string,
-              let eventID = row.column("source_event_id")?.string,
               let kindRaw = row.column("kind")?.string,
-              let kind = PersistedSpaceNotificationFanout.Kind(rawValue: kindRaw),
+              let kind = PersistedSpaceSyncNotification.Kind(rawValue: kindRaw),
               let spaceRaw = row.column("space_uri")?.string,
               let space = try? SpaceURI(spaceRaw),
               space.rawValue == spaceRaw,
-              let endpoint = row.column("endpoint")?.string else {
-            throw SQLiteRepositoryError.corruptDatabase("invalid notification fanout row")
+              let endpoint = row.column("endpoint")?.string,
+              let token = row.column("token")?.string,
+              !token.isEmpty,
+              token.utf16.count <= 512 else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid space sync notification row"
+            )
         }
-        _ = try validServiceEventID(eventID)
         _ = try validNotificationEndpoint(endpoint)
-        guard isValidSimpleSpaceDID(issuer) else {
-            throw SQLiteRepositoryError.corruptDatabase("invalid notification fanout issuer")
-        }
         let repository = row.column("repo_did")?.string
-        let wireRevision = row.column("wire_revision")?.string
+        let wireRevision = row.column("repo_revision")?.string
         let commitment = row.column("commitment").flatMap { column -> Data? in
             if case let .blob(data) = column { return Data(buffer: data) }
             return nil
         }
-        switch kind {
-        case .write:
-            guard let repository,
-                  isValidSimpleSpaceDID(repository),
-                  let wireRevision,
-                  (try? TID(tidString: wireRevision)) != nil,
-                  let commitment,
-                  commitment.count == 32 else {
-                throw SQLiteRepositoryError.corruptDatabase("invalid write notification fanout")
-            }
-        case .deleted:
-            guard repository == nil, wireRevision == nil, commitment == nil else {
-                throw SQLiteRepositoryError.corruptDatabase("invalid deletion notification fanout")
-            }
-        }
-        let spaceRevision = row.column("space_rev")?.string
-        let previousSpaceRevision = row.column("prev_space_rev")?.string
-        // A previous revision only exists beside the revision it precedes,
-        // and both are valid TIDs in strictly increasing order.
+        let spaceRevision = row.column("space_revision")?.string
+        let previousSpaceRevision = row.column("previous_space_revision")?.string
         if let spaceRevision {
-            guard kind == .write,
-                  let current = SpaceRevisionSequence.value(of: spaceRevision),
+            guard let current = SpaceRevisionSequence.value(of: spaceRevision),
                   previousSpaceRevision.map({
                       SpaceRevisionSequence.value(of: $0).map { $0 < current } ?? false
                   }) ?? true else {
-                throw SQLiteRepositoryError.corruptDatabase("invalid notification fanout space revision")
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "invalid space sync notification revision"
+                )
             }
         } else if previousSpaceRevision != nil {
-            throw SQLiteRepositoryError.corruptDatabase("invalid notification fanout space revision")
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid space sync notification revision"
+            )
         }
-        return PersistedSpaceNotificationFanout(
+        func optionalDate(_ name: String) throws -> Date? {
+            guard let value = row.column(name) else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "missing space sync notification timestamp"
+                )
+            }
+            if value.isNull { return nil }
+            guard let integer = value.integer, integer >= 0 else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "invalid space sync notification timestamp"
+                )
+            }
+            return Date(timeIntervalSince1970: Double(integer) / 1_000_000)
+        }
+        let registrationExpiredAt = try optionalDate("registration_expires_at")
+        let retryExpiresAt = try optionalDate("retry_expires_at")
+        switch kind {
+        case .repoWrite:
+            guard let repository, isValidSimpleSpaceDID(repository),
+                  let wireRevision, (try? TID(tidString: wireRevision)) != nil,
+                  commitment?.count == 32, spaceRevision != nil,
+                  registrationExpiredAt == nil, retryExpiresAt == nil else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "invalid repoWrite notification"
+                )
+            }
+        case .repoRemoved:
+            guard let repository, isValidSimpleSpaceDID(repository),
+                  wireRevision == nil, commitment == nil, spaceRevision != nil,
+                  registrationExpiredAt == nil, retryExpiresAt == nil else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "invalid repoRemoved notification"
+                )
+            }
+        case .spaceDeleted:
+            guard repository == nil, wireRevision == nil, commitment == nil,
+                  spaceRevision == nil, previousSpaceRevision == nil,
+                  registrationExpiredAt == nil, retryExpiresAt != nil else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "invalid spaceDeleted notification"
+                )
+            }
+        case .registrationExpired:
+            guard repository == nil, wireRevision == nil, commitment == nil,
+                  spaceRevision != nil, previousSpaceRevision == nil,
+                  registrationExpiredAt != nil, retryExpiresAt != nil else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "invalid registrationExpired notification"
+                )
+            }
+        }
+        return PersistedSpaceSyncNotification(
             id: id,
-            sourceIssuer: issuer,
-            sourceEventID: eventID,
             kind: kind,
             space: space,
+            endpoint: endpoint,
+            token: token,
             repository: repository,
             wireRevision: wireRevision,
             commitment: commitment,
-            endpoint: endpoint,
-            attempts: try requiredNonnegativeInteger(row, "attempts"),
             spaceRevision: spaceRevision,
-            previousSpaceRevision: previousSpaceRevision
+            previousSpaceRevision: previousSpaceRevision,
+            registrationExpiredAt: registrationExpiredAt,
+            retryExpiresAt: retryExpiresAt,
+            attempts: try requiredNonnegativeInteger(row, "attempts")
         )
     }
 
-    private func decodeNotificationFanoutLease(
+    private func decodeSpaceSyncNotificationLease(
         _ row: SQLiteRow
     ) throws -> (token: UUID?, expiresAt: Int?) {
         let token = row.column("lease_token")
@@ -13056,11 +12508,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             return (nil, nil)
         case let (.some(.text(rawToken)), .some(.integer(rawExpiry))):
             guard let token = UUID(uuidString: rawToken), rawExpiry >= 0 else {
-                throw SQLiteRepositoryError.corruptDatabase("invalid notification fanout lease")
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "invalid space sync notification lease"
+                )
             }
             return (token, rawExpiry)
         default:
-            throw SQLiteRepositoryError.corruptDatabase("invalid notification fanout lease")
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid space sync notification lease"
+            )
         }
     }
 

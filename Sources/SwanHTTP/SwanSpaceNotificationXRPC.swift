@@ -17,14 +17,7 @@ public struct SwanAuthenticatedSpaceNotificationsCapability: Sendable {
     let directory: any AuthorizedSpaceNotificationDirectory
     let credentialAuthorizer: any SpaceCredentialAuthorizationVerifier
     let serviceAuthentication: any SpaceServiceAuthenticationVerifier
-    let recipientBindings: SwanSpaceNotificationRecipientBindings
     let notificationJSONDecodeObserver: (@Sendable () async -> Void)?
-    /// Resolves a `registerNotify` subscriber's `service` identifier to its
-    /// DID-document endpoint (Erratum 03). `nil` when the server runs without
-    /// outbound DID resolution — `service` registrations then answer the same
-    /// `ServiceNotResolvable` as an identifier that does not resolve, because
-    /// from the caller's seat that is exactly what it is.
-    let serviceEndpointResolver: SwanServiceEndpointResolver?
     /// `--enable-spaces-open-interop`; `nil` keeps the hardened receive rules.
     let openInterop: SwanSpacesOpenInteropNotificationPolicy?
 
@@ -33,9 +26,7 @@ public struct SwanAuthenticatedSpaceNotificationsCapability: Sendable {
         directory: any AuthorizedSpaceNotificationDirectory,
         credentialAuthorizer: any SpaceCredentialAuthorizationVerifier,
         serviceAuthentication: any SpaceServiceAuthenticationVerifier,
-        recipientBindings: SwanSpaceNotificationRecipientBindings,
         notificationJSONDecodeObserver: (@Sendable () async -> Void)? = nil,
-        serviceEndpointResolver: SwanServiceEndpointResolver? = nil,
         openInterop: SwanSpacesOpenInteropNotificationPolicy? = nil
     ) {
         self.openInterop = openInterop
@@ -43,18 +34,15 @@ public struct SwanAuthenticatedSpaceNotificationsCapability: Sendable {
         self.directory = directory
         self.credentialAuthorizer = credentialAuthorizer
         self.serviceAuthentication = serviceAuthentication
-        self.recipientBindings = recipientBindings
         self.notificationJSONDecodeObserver = notificationJSONDecodeObserver
-        self.serviceEndpointResolver = serviceEndpointResolver
     }
 }
 
 /// The notification-route half of ``SwanSpacesOpenInteropConfiguration``:
-/// unbound service-JWT admission and header-less registration caps.
+/// unbound service-JWT admission for the remaining repo-host methods.
 struct SwanSpacesOpenInteropNotificationPolicy: Sendable {
     let configuration: SwanSpacesOpenInteropConfiguration
     let replayStore: DurableSpaceServiceJWTReplayStore
-    let registrationLimiter: SwanHeaderlessRegistrationLimiter
 
     init(
         configuration: SwanSpacesOpenInteropConfiguration,
@@ -62,10 +50,6 @@ struct SwanSpacesOpenInteropNotificationPolicy: Sendable {
     ) {
         self.configuration = configuration
         self.replayStore = replayStore
-        registrationLimiter = SwanHeaderlessRegistrationLimiter(
-            perSpace: configuration.maximumHeaderlessRegistrationsPerSpacePerHour,
-            perSubject: configuration.maximumHeaderlessRegistrationsPerSubjectPerHour
-        )
     }
 
     /// The audiences a notification to `authority` may name: the bare DID
@@ -106,46 +90,6 @@ struct SwanSpacesOpenInteropNotificationPolicy: Sendable {
     }
 }
 
-/// Fixed-window (one hour) admission for header-less registerNotify calls.
-/// In memory by design: it bounds abuse rates, while the durable per-space
-/// registration ceiling (`maximumNotificationRegistrationsPerSpace`) and the
-/// 24 h TTL bound stored state.
-actor SwanHeaderlessRegistrationLimiter {
-    private static let window: TimeInterval = 60 * 60
-    private static let maximumTrackedKeys = 16_384
-    private let perSpace: Int
-    private let perSubject: Int
-    private var counters: [String: (windowStart: Date, count: Int)] = [:]
-
-    init(perSpace: Int, perSubject: Int) {
-        self.perSpace = perSpace
-        self.perSubject = perSubject
-    }
-
-    func admit(space: SpaceURI, subject: String, now: Date = Date()) -> Bool {
-        let spaceKey = "space\u{0}\(space.rawValue)"
-        let subjectKey = "subject\u{0}\(space.rawValue)\u{0}\(subject)"
-        if counters.count >= Self.maximumTrackedKeys {
-            counters = counters.filter { now.timeIntervalSince($0.value.windowStart) < Self.window }
-            guard counters.count < Self.maximumTrackedKeys - 1 else { return false }
-        }
-        let spaceCount = current(spaceKey, now: now)
-        let subjectCount = current(subjectKey, now: now)
-        guard spaceCount.count < perSpace, subjectCount.count < perSubject else {
-            return false
-        }
-        counters[spaceKey] = (spaceCount.windowStart, spaceCount.count + 1)
-        counters[subjectKey] = (subjectCount.windowStart, subjectCount.count + 1)
-        return true
-    }
-
-    private func current(_ key: String, now: Date) -> (windowStart: Date, count: Int) {
-        if let entry = counters[key], now.timeIntervalSince(entry.windowStart) < Self.window {
-            return entry
-        }
-        return (now, 0)
-    }
-}
 
 private enum AuthenticatedSpaceNotificationFailure: Error {
     case invalidRequest
@@ -156,12 +100,7 @@ private enum AuthenticatedSpaceNotificationFailure: Error {
     case repoDeactivated
     case repoTakendown
     case upstreamFailure
-    /// The `service` identifier could not be resolved to a DID document with
-    /// a usable service endpoint (Erratum 03). The lexicon's one named error
-    /// for it; the underlying cause is logged, never returned — a 500 would
-    /// implicate the server in what is usually a typo'd DID.
-    case serviceNotResolvable
-    /// notifyWrite's `repoRev` is more than five minutes ahead (`FutureRev`).
+    /// notifyRepoUpdate's `repoRev` is more than five minutes ahead (`FutureRev`).
     case futureRevision
 }
 
@@ -172,7 +111,6 @@ private enum SwanSpaceNotificationHTTP {
     static let maximumJSONBytes = 16 * 1_024
     static let maximumQueryBytes = 4 * 1_024
     static let maximumListLimit = 1_000
-    static let registrationLifetime: TimeInterval = 24 * 60 * 60
 }
 
 private struct ListSpaceWritersParameters {
@@ -248,157 +186,20 @@ private struct AuthenticatedListSpaceWritersHandler {
     }
 }
 
-/// The `registerNotify` wire input. `service` names the subscriber (a DID
-/// with an optional `#fragment`, resolved through its DID document — the
-/// current lexicon shape); `endpoint` is the pre-lexicon legacy. At least one
-/// is required, and when both are sent `service` decides, mirroring the
-/// reference handler.
-private struct RegisterSpaceNotifyWireInput: Decodable {
+
+private struct NotifyRepoUpdateWireInput: Decodable {
     let space: SpaceRef
-    let repo: DID?
-    let endpoint: String?
-    let service: String?
+    let repo: DID
+    let repoRev: TID
+    let data: Bytes
 }
 
-private struct AuthenticatedRegisterSpaceNotifyHandler {
+private struct AuthenticatedNotifyRepoUpdateHandler {
     let capability: SwanAuthenticatedSpaceNotificationsCapability
 
     func handle(
         parameters _: Void,
-        input: RegisterSpaceNotifyWireInput,
-        context request: Request
-    ) async throws -> ComAtprotoSpaceRegisterNotify.Output {
-        let space = try notificationSpace(input.space)
-        let authorization = try await credentialAuthorization(
-            capability,
-            request: request,
-            space: space
-        )
-        let ownerDID: String
-        if let openInterop = capability.openInterop,
-           !hasAtprotoServiceAuthHeader(request.headers) {
-            // Upstream shape: the space credential alone. Any credential
-            // holder may name any service, exactly as upstream allows; the
-            // registration is owned by the named service's DID and rate-capped.
-            guard let requested = input.service,
-                  case let .spaceCredential(grant) = authorization else {
-                throw AuthenticatedSpaceNotificationFailure.denied
-            }
-            guard await openInterop.registrationLimiter.admit(
-                space: space,
-                subject: grant.subject
-            ) else {
-                throw AuthenticatedSpaceNotificationFailure.unavailable
-            }
-            ownerDID = serviceIssuerDID(requested) ?? requested
-        } else {
-            let authenticatedService = try await atprotoServiceAuthentication(
-                capability,
-                request: request,
-                space: space,
-                method: ComAtprotoSpaceRegisterNotify.typeIdentifier
-            )
-            ownerDID = authenticatedService.issuer
-            if let requested = input.service {
-                guard requested == ownerDID || serviceIssuerDID(requested) == ownerDID else {
-                    throw AuthenticatedSpaceNotificationFailure.denied
-                }
-            }
-        }
-        let endpoint: String
-        let service: String?
-        if let identifier = input.service {
-            guard let resolver = capability.serviceEndpointResolver else {
-                throw AuthenticatedSpaceNotificationFailure.serviceNotResolvable
-            }
-            let resolved: URL
-            do {
-                resolved = try await resolver.endpoint(serviceIdentifier: identifier)
-            } catch {
-                throw AuthenticatedSpaceNotificationFailure.serviceNotResolvable
-            }
-            endpoint = resolved.absoluteString
-            service = identifier
-        } else if let supplied = input.endpoint {
-            endpoint = supplied
-            service = nil
-        } else {
-            throw AuthenticatedSpaceNotificationFailure.invalidRequest
-        }
-        let now = Date()
-        let expiry = now.addingTimeInterval(SwanSpaceNotificationHTTP.registrationLifetime)
-        do {
-            try await capability.directory.registerSpaceNotification(
-                .init(
-                    space: space,
-                    endpoint: endpoint,
-                    repository: input.repo?.didString(),
-                    expiresAt: expiry,
-                    service: service,
-                    serviceDID: ownerDID
-                ),
-                serviceDID: ownerDID,
-                authorization: authorization
-            )
-            return .init(expiresAt: ATProtocolDate(date: expiry))
-        } catch {
-            throw notificationStorageFailure(error)
-        }
-    }
-}
-
-private struct AuthenticatedUnregisterSpaceNotifyHandler {
-    let capability: SwanAuthenticatedSpaceNotificationsCapability
-
-    func handle(
-        parameters _: Void,
-        input: ComAtprotoSpaceUnregisterNotify.Input,
-        context request: Request
-    ) async throws {
-        let space = try notificationSpace(input.space)
-        let authorization = try await credentialAuthorization(
-            capability, request: request, space: space
-        )
-        let ownerDID: String
-        if capability.openInterop != nil,
-           !hasAtprotoServiceAuthHeader(request.headers) {
-            // Upstream shape: the space credential alone may withdraw the
-            // named service's registration.
-            ownerDID = serviceIssuerDID(input.service) ?? input.service
-        } else {
-            let authenticatedService = try await atprotoServiceAuthentication(
-                capability,
-                request: request,
-                space: space,
-                method: ComAtprotoSpaceUnregisterNotify.typeIdentifier
-            )
-            ownerDID = authenticatedService.issuer
-            guard input.service == ownerDID || serviceIssuerDID(input.service) == ownerDID else {
-                throw AuthenticatedSpaceNotificationFailure.denied
-            }
-        }
-        do {
-            try await capability.directory.unregisterSpaceNotification(
-                space: space,
-                ownerServiceDID: ownerDID,
-                deliveryServiceDID: input.service,
-                authorization: authorization
-            )
-        } catch {
-            throw notificationStorageFailure(error)
-        }
-    }
-}
-
-private struct AuthenticatedNotifyRepoUpdateHandler:
-    ComAtprotoSpaceNotifyWrite.ServerHandler
-{
-    typealias Context = Request
-    let capability: SwanAuthenticatedSpaceNotificationsCapability
-
-    func handle(
-        parameters: Void,
-        input: ComAtprotoSpaceNotifyWrite.Input,
+        input: NotifyRepoUpdateWireInput,
         context request: Request
     ) async throws {
         let space = try notificationSpace(input.space)
@@ -480,61 +281,6 @@ private struct AuthenticatedNotifyRepoUpdateHandler:
     }
 }
 
-private struct AuthenticatedNotifySpaceDeletedHandler:
-    ComAtprotoSpaceNotifySpaceDeleted.ServerHandler
-{
-    typealias Context = Request
-
-    let capability: SwanAuthenticatedSpaceNotificationsCapability
-
-    func handle(
-        parameters: Void,
-        input: ComAtprotoSpaceNotifySpaceDeleted.Input,
-        context request: Request
-    ) async throws {
-        let space = try notificationSpace(input.space)
-        let expectedDigest = SpaceNotificationRequestDigest.deletion(space: space)
-        let service = try await serviceAuthentication(
-            capability,
-            request: request,
-            expectedAudience: nil,
-            expectedMethod: ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier,
-            expectedRequestBodyDigest: capability.openInterop == nil ? expectedDigest : nil
-        )
-        guard service.issuer == space.authority else {
-            throw AuthenticatedSpaceNotificationFailure.denied
-        }
-        let verifiedDigest: String
-        if let bound = service.requestBodyDigest {
-            guard bound == expectedDigest else {
-                throw AuthenticatedSpaceNotificationFailure.denied
-            }
-            verifiedDigest = bound
-        } else if let openInterop = capability.openInterop {
-            try await openInterop.admitUnbound(service)
-            verifiedDigest = expectedDigest
-        } else {
-            throw AuthenticatedSpaceNotificationFailure.denied
-        }
-        guard let recipientAccount = capability.recipientBindings.account(
-            forServiceIdentity: service.audience
-        ) else {
-            return
-        }
-        do {
-            try await capability.directory.receiveSpaceDeletionNotification(
-                space: space,
-                issuer: service.issuer,
-                audience: recipientAccount,
-                eventID: service.eventID,
-                requestBodyDigest: verifiedDigest,
-                issuedAt: service.issuedAt
-            )
-        } catch {
-            throw notificationStorageFailure(error)
-        }
-    }
-}
 
 /// The repo-host receiver for `com.atproto.space.notifyCredentialsRevoked`:
 /// service auth whose `iss` is the space authority, whose `aud` is the bare
@@ -544,16 +290,18 @@ private struct AuthenticatedNotifySpaceDeletedHandler:
 /// `--enable-spaces-open-interop` (with a 60 s lifetime and a durable
 /// single-use `jti`). Revocations are persisted idempotently by `(space, jti)`
 /// and honoured for ``DurableSpaceCredentialRevocations/retention``.
-private struct AuthenticatedNotifyCredentialsRevokedHandler:
-    ComAtprotoSpaceNotifyCredentialRevoked.ServerHandler
-{
-    typealias Context = Request
+private struct NotifyCredentialsRevokedWireInput: Decodable {
+    let space: SpaceRef
+    let credentials: [String]
+}
+
+private struct AuthenticatedNotifyCredentialsRevokedHandler {
 
     let capability: SwanAuthenticatedSpaceNotificationsCapability
 
     func handle(
-        parameters: Void,
-        input: ComAtprotoSpaceNotifyCredentialRevoked.Input,
+        parameters _: Void,
+        input: NotifyCredentialsRevokedWireInput,
         context request: Request
     ) async throws {
         let space = try notificationSpace(input.space)
@@ -653,66 +401,6 @@ func registerAuthenticatedListSpaceWritersEndpoint(
     registerAuthenticatedNotificationWrongMethods(on: router, path: path, allowed: .get)
 }
 
-func registerAuthenticatedRegisterSpaceNotifyEndpoint(
-    on router: Router<BasicRequestContext>,
-    capability: SwanAuthenticatedSpaceNotificationsCapability,
-    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
-) {
-    let handler = AuthenticatedRegisterSpaceNotifyHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.space.registerNotify"
-    router.post(path) { request, context async -> Response in
-        do {
-            let input = try await decodeRegisterSpaceNotifyInput(
-                request, context: context, requestBodyAdmission: requestBodyAdmission,
-                decodeObserver: capability.notificationJSONDecodeObserver)
-            let output = try await handler.handle(parameters: (), input: input, context: request)
-            return authenticatedGetSpaceJSON(.ok, output)
-        } catch let failure as AuthenticatedSpaceNotificationFailure {
-            // Rejection KIND only — never body content. Tonight's debugging
-            // repeatedly stalled on silent 400s from this route.
-            context.logger.info(
-                "registerNotify rejected",
-                metadata: ["failure": .string(String(describing: failure))]
-            )
-            return authenticatedSpaceNotificationResponse(for: failure)
-        } catch let failure as SwanRequestBodyCollectionFailure {
-            return authenticatedSpaceNotificationResponse(
-                for: failure == .unavailable ? .unavailable : .invalidRequest
-            )
-        } catch {
-            return authenticatedSpaceNotificationError(.badRequest, code: "InvalidRequest")
-        }
-    }
-    registerAuthenticatedNotificationWrongMethods(on: router, path: path, allowed: .post)
-}
-
-func registerAuthenticatedUnregisterSpaceNotifyEndpoint(
-    on router: Router<BasicRequestContext>,
-    capability: SwanAuthenticatedSpaceNotificationsCapability,
-    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
-) {
-    let handler = AuthenticatedUnregisterSpaceNotifyHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.space.unregisterNotify"
-    router.post(path) { request, context async -> Response in
-        do {
-            let input = try await decodeUnregisterSpaceNotifyInput(
-                request, context: context, requestBodyAdmission: requestBodyAdmission,
-                decodeObserver: capability.notificationJSONDecodeObserver)
-            try await handler.handle(parameters: (), input: input, context: request)
-            return Response(status: .ok, headers: [.cacheControl: "no-store"])
-        } catch let failure as AuthenticatedSpaceNotificationFailure {
-            return authenticatedSpaceNotificationResponse(for: failure)
-        } catch let failure as SwanRequestBodyCollectionFailure {
-            return authenticatedSpaceNotificationResponse(
-                for: failure == .unavailable ? .unavailable : .invalidRequest
-            )
-        } catch {
-            return authenticatedSpaceNotificationError(.badRequest, code: "InvalidRequest")
-        }
-    }
-    registerAuthenticatedNotificationWrongMethods(on: router, path: path, allowed: .post)
-}
-
 func registerAuthenticatedNotifyRepoUpdateEndpoint(
     on router: Router<BasicRequestContext>,
     capability: SwanAuthenticatedSpaceNotificationsCapability,
@@ -740,32 +428,6 @@ func registerAuthenticatedNotifyRepoUpdateEndpoint(
     registerAuthenticatedNotificationWrongMethods(on: router, path: path, allowed: .post)
 }
 
-func registerAuthenticatedNotifySpaceDeletedEndpoint(
-    on router: Router<BasicRequestContext>,
-    capability: SwanAuthenticatedSpaceNotificationsCapability,
-    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
-) {
-    let handler = AuthenticatedNotifySpaceDeletedHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.space.notifySpaceDeleted"
-    router.post(path) { request, context async -> Response in
-        do {
-            let input = try await decodeNotifySpaceDeletedInput(
-                request, context: context, requestBodyAdmission: requestBodyAdmission,
-                decodeObserver: capability.notificationJSONDecodeObserver)
-            try await handler.handle(parameters: (), input: input, context: request)
-            return Response(status: .ok, headers: [.cacheControl: "no-store"])
-        } catch let failure as AuthenticatedSpaceNotificationFailure {
-            return authenticatedSpaceNotificationResponse(for: failure)
-        } catch let failure as SwanRequestBodyCollectionFailure {
-            return authenticatedSpaceNotificationResponse(
-                for: failure == .unavailable ? .unavailable : .invalidRequest
-            )
-        } catch {
-            return authenticatedSpaceNotificationError(.badRequest, code: "InvalidRequest")
-        }
-    }
-    registerAuthenticatedNotificationWrongMethods(on: router, path: path, allowed: .post)
-}
 
 private func parseListSpaceWritersParameters(
     _ request: Request
@@ -816,105 +478,13 @@ private func parseListSpaceWritersParameters(
     }
 }
 
-private func decodeRegisterSpaceNotifyInput(
-    _ request: Request,
-    context: SwanHTTPRequestContext,
-    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
-    decodeObserver: (@Sendable () async -> Void)?
-) async throws -> RegisterSpaceNotifyWireInput {
-    let admitted = try await notificationJSONBody(
-        request, context: context, requestBodyAdmission: requestBodyAdmission)
-    defer { withExtendedLifetime(admitted.body) {} }
-    let data = admitted.data
-    await decodeObserver?()
-    try notificationJSONObject(
-        data,
-        allowedKeys: ["space", "repo", "endpoint", "service"],
-        requiredKeys: ["space"]
-    )
-    do {
-        let input = try JSONDecoder().decode(RegisterSpaceNotifyWireInput.self, from: data)
-        _ = try notificationSpace(input.space)
-        if let repository = input.repo {
-            _ = try DID(didString: repository.didString())
-        }
-        // At least one subscriber locator; `service` decides when both are
-        // sent (the handler ignores `endpoint` in that case).
-        guard input.service != nil || input.endpoint != nil else {
-            throw AuthenticatedSpaceNotificationFailure.invalidRequest
-        }
-        if let service = input.service {
-            guard validNotificationServiceIdentifier(service) else {
-                throw AuthenticatedSpaceNotificationFailure.invalidRequest
-            }
-        }
-        if input.service == nil, let endpoint = input.endpoint {
-            guard validRegisteredNotificationEndpoint(endpoint) else {
-                throw AuthenticatedSpaceNotificationFailure.invalidRequest
-            }
-        }
-        return input
-    } catch let failure as AuthenticatedSpaceNotificationFailure {
-        throw failure
-    } catch {
-        throw AuthenticatedSpaceNotificationFailure.invalidRequest
-    }
-}
-
-private func decodeUnregisterSpaceNotifyInput(
-    _ request: Request,
-    context: SwanHTTPRequestContext,
-    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
-    decodeObserver: (@Sendable () async -> Void)?
-) async throws -> ComAtprotoSpaceUnregisterNotify.Input {
-    let admitted = try await notificationJSONBody(
-        request, context: context, requestBodyAdmission: requestBodyAdmission)
-    defer { withExtendedLifetime(admitted.body) {} }
-    let data = admitted.data
-    await decodeObserver?()
-    try notificationJSONObject(
-        data,
-        allowedKeys: ["space", "service"],
-        requiredKeys: ["space", "service"]
-    )
-    do {
-        let input = try JSONDecoder().decode(ComAtprotoSpaceUnregisterNotify.Input.self, from: data)
-        _ = try notificationSpace(input.space)
-        guard validNotificationServiceIdentifier(input.service) else {
-            throw AuthenticatedSpaceNotificationFailure.invalidRequest
-        }
-        return input
-    } catch let failure as AuthenticatedSpaceNotificationFailure {
-        throw failure
-    } catch {
-        throw AuthenticatedSpaceNotificationFailure.invalidRequest
-    }
-}
-
-/// A subscriber service identifier: `did:<method>:…` with at most one
-/// non-empty `#fragment`, printable ASCII, bounded. Resolution decides
-/// everything further — this only refuses shapes that could never name a
-/// verifiable audience.
-private func validNotificationServiceIdentifier(_ value: String) -> Bool {
-    guard !value.isEmpty, value.utf8.count <= 640,
-          value.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7F }) else {
-        return false
-    }
-    let parts = value.split(separator: "#", omittingEmptySubsequences: false)
-    guard (1 ... 2).contains(parts.count),
-          parts.allSatisfy({ !$0.isEmpty }),
-          parts[0].hasPrefix("did:") else {
-        return false
-    }
-    return true
-}
 
 private func decodeNotifyRepoUpdateInput(
     _ request: Request,
     context: SwanHTTPRequestContext,
     requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
     decodeObserver: (@Sendable () async -> Void)?
-) async throws -> ComAtprotoSpaceNotifyWrite.Input {
+) async throws -> NotifyRepoUpdateWireInput {
     let admitted = try await notificationJSONBody(
         request, context: context, requestBodyAdmission: requestBodyAdmission)
     defer { withExtendedLifetime(admitted.body) {} }
@@ -926,7 +496,7 @@ private func decodeNotifyRepoUpdateInput(
         requiredKeys: ["space", "repo", "repoRev", "data"]
     )
     do {
-        let input = try JSONDecoder().decode(ComAtprotoSpaceNotifyWrite.Input.self, from: data)
+        let input = try JSONDecoder().decode(NotifyRepoUpdateWireInput.self, from: data)
         _ = try notificationSpace(input.space)
         _ = try DID(didString: input.repo.didString())
         guard input.data.data.count == 32 else {
@@ -940,26 +510,6 @@ private func decodeNotifyRepoUpdateInput(
     }
 }
 
-private func decodeNotifySpaceDeletedInput(
-    _ request: Request,
-    context: SwanHTTPRequestContext,
-    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
-    decodeObserver: (@Sendable () async -> Void)?
-) async throws -> ComAtprotoSpaceNotifySpaceDeleted.Input {
-    let admitted = try await notificationJSONBody(
-        request, context: context, requestBodyAdmission: requestBodyAdmission)
-    defer { withExtendedLifetime(admitted.body) {} }
-    let data = admitted.data
-    await decodeObserver?()
-    try notificationJSONObject(data, allowedKeys: ["space"], requiredKeys: ["space"])
-    do {
-        let input = try JSONDecoder().decode(ComAtprotoSpaceNotifySpaceDeleted.Input.self, from: data)
-        _ = try notificationSpace(input.space)
-        return input
-    } catch {
-        throw AuthenticatedSpaceNotificationFailure.invalidRequest
-    }
-}
 
 /// `{space, credentials}` with 1...100 nonempty JWT IDs, as the lexicon
 /// requires. Anything else, including a JWT-shaped or control-bearing ID, is
@@ -969,7 +519,7 @@ private func decodeNotifyCredentialsRevokedInput(
     context: SwanHTTPRequestContext,
     requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
     decodeObserver: (@Sendable () async -> Void)?
-) async throws -> ComAtprotoSpaceNotifyCredentialRevoked.Input {
+) async throws -> NotifyCredentialsRevokedWireInput {
     let admitted = try await notificationJSONBody(
         request, context: context, requestBodyAdmission: requestBodyAdmission)
     defer { withExtendedLifetime(admitted.body) {} }
@@ -982,7 +532,7 @@ private func decodeNotifyCredentialsRevokedInput(
     )
     do {
         let input = try JSONDecoder().decode(
-            ComAtprotoSpaceNotifyCredentialRevoked.Input.self,
+            NotifyCredentialsRevokedWireInput.self,
             from: data
         )
         _ = try notificationSpace(input.space)
@@ -1053,9 +603,8 @@ private func notificationSpace(_ value: SpaceRef) throws -> SpaceURI {
     }
 }
 
-/// listRepos, registerNotify, and unregisterNotify are space-host
-/// operations, so the credential's signed audience must be the space
-/// authority's bare DID.
+/// listWriters is a space-host operation, so the credential's signed
+/// audience must be the space authority's bare DID.
 private func credentialAuthorization(
     _ capability: SwanAuthenticatedSpaceNotificationsCapability,
     request: Request,
@@ -1123,65 +672,6 @@ private func serviceAuthentication(
     }
 }
 
-private func hasAtprotoServiceAuthHeader(_ headers: HTTPFields) -> Bool {
-    headers.contains {
-        $0.name.rawName.caseInsensitiveCompare("atproto-service-auth") == .orderedSame
-    }
-}
-
-/// Verifies the Swan `Atproto-Service-Auth` header for (un)registerNotify:
-/// `aud` is the space authority and `lxm` the route.
-private func atprotoServiceAuthentication(
-    _ capability: SwanAuthenticatedSpaceNotificationsCapability,
-    request: Request,
-    space: SpaceURI,
-    method: String
-) async throws -> VerifiedSpaceServiceAuthentication {
-    let serviceToken: String
-    do {
-        serviceToken = try exactAtprotoServiceAuthBearerToken(from: request.headers)
-    } catch {
-        throw AuthenticatedSpaceNotificationFailure.denied
-    }
-    do {
-        return try await capability.serviceAuthentication.authenticate(
-            serviceToken,
-            expectedAudience: space.authority,
-            expectedMethod: method,
-            expectedRequestBodyDigest: nil,
-            now: Date()
-        )
-    } catch let error as SwanError {
-        if case .unavailable = error {
-            throw AuthenticatedSpaceNotificationFailure.unavailable
-        }
-        throw AuthenticatedSpaceNotificationFailure.denied
-    } catch {
-        throw AuthenticatedSpaceNotificationFailure.denied
-    }
-}
-
-func exactAtprotoServiceAuthBearerToken(from headers: HTTPFields) throws -> String {
-    let matches = headers.filter {
-        $0.name.rawName.caseInsensitiveCompare("atproto-service-auth") == .orderedSame
-    }
-    guard matches.count == 1,
-          let raw = matches.first?.value else {
-        throw SwanError.unauthorized("Atproto-Service-Auth header is required")
-    }
-    let prefix = "Bearer "
-    guard raw.count >= prefix.count,
-          raw.prefix(prefix.count).caseInsensitiveCompare(prefix) == .orderedSame else {
-        throw SwanError.unauthorized("service authentication is invalid")
-    }
-    let token = String(raw.dropFirst(prefix.count))
-    guard !token.isEmpty,
-          token.utf8.count <= SpaceServiceJWT.maximumCompactBytes,
-          token.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
-        throw SwanError.unauthorized("service authentication is invalid")
-    }
-    return token
-}
 
 /// Parses the only authorization presentation accepted by service-auth XRPC
 /// endpoints. OAuth DPoP and generic Bearer credentials never fall through:
@@ -1280,8 +770,6 @@ private func authenticatedSpaceNotificationResponse(
         authenticatedSpaceNotificationError(.serviceUnavailable, code: "temporarily_unavailable")
     case .upstreamFailure:
         authenticatedSpaceNotificationError(.badGateway, code: "UpstreamFailure")
-    case .serviceNotResolvable:
-        authenticatedSpaceNotificationError(.badRequest, code: "ServiceNotResolvable")
     case .futureRevision:
         authenticatedSpaceNotificationError(.badRequest, code: "FutureRev")
     case .repoDeactivated:

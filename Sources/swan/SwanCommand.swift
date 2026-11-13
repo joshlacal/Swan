@@ -4144,10 +4144,8 @@ extension SwanCommand {
                 }
                 let notificationRecoveryService: SwanNotificationRecoveryService?
                 if enableNotificationDelivery, let notificationRuntime {
-                    // Erratum 03: operator pins are no longer the only
-                    // destinations — service-named registrations deliver to
-                    // DID-document-resolved endpoints under dynamic peer
-                    // selection, so an empty pin set is a valid runtime.
+                    // Outbox authority calls use service auth; registered sync
+                    // endpoints use the opaque token and the same SSRF guard.
                     let serviceIssuer: any SpaceServiceAuthenticationIssuer
                     if let localSpaceRuntime,
                        notificationAccountKEKFile == nil,
@@ -4206,8 +4204,8 @@ extension SwanCommand {
                             transport: NIOPeerPinnedOAuthPostTransport(
                                 configuration: try .init(
                                     endpointPeers: pinned.endpointPeers,
-                                    // Service-named subscriber endpoints have
-                                    // no operator pin by construction.
+                                    // Registered sync endpoints have no
+                                    // operator pin by construction.
                                     allowsDynamicPeerSelection: true,
                                     additionalTrustRootsPEM: pinned.additionalTrustRootsPEM
                                 )
@@ -4226,11 +4224,8 @@ extension SwanCommand {
                                 poster: poster
                             )
                         },
-                        makeFanoutTransport: { database in
-                            HTTPPermissionedSpaceNotificationFanoutTransport(
-                                database: database,
-                                destinations: notificationRuntime.destinations,
-                                serviceAuthentication: serviceIssuer,
+                        makeSyncTransport: { _ in
+                            HTTPPermissionedSpaceSyncNotificationTransport(
                                 poster: poster
                             )
                         }

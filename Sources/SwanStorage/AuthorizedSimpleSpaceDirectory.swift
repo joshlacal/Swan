@@ -343,45 +343,6 @@ public struct AuthorizedSpaceWriter: Sendable, Equatable {
     }
 }
 
-/// A bounded recipient registered to receive future write notifications. The
-/// endpoint is intentionally opaque at this layer: URL/SSRF validation belongs
-/// to the HTTP transport and no notification route may serialize its value in
-/// an error response.
-public struct AuthorizedSpaceNotificationRegistration: Sendable, Equatable {
-    public let space: SpaceURI
-    public let endpoint: String
-    public let repository: String?
-    public let expiresAt: Date
-    /// The authenticated subscriber identity derived from verified credentials.
-    public let ownerServiceDID: String
-    /// The subscriber's service identifier (`did` or `did#fragment`) when the
-    /// registration named one — the audience `notifyWrite` deliveries are
-    /// addressed to, and the marker that the endpoint has DID-document
-    /// provenance. `nil` for a legacy endpoint-only registration, which stays
-    /// local discovery state and is never a dynamic delivery destination.
-    public let deliveryServiceDID: String?
-
-    public var serviceDID: String { ownerServiceDID }
-    public var service: String? { deliveryServiceDID }
-
-    public init(
-        space: SpaceURI,
-        endpoint: String,
-        repository: String?,
-        expiresAt: Date,
-        service: String? = nil,
-        serviceDID: String? = nil,
-        ownerServiceDID: String? = nil,
-        deliveryServiceDID: String? = nil
-    ) {
-        self.space = space
-        self.endpoint = endpoint
-        self.repository = repository
-        self.expiresAt = expiresAt
-        self.ownerServiceDID = ownerServiceDID ?? serviceDID ?? service ?? ""
-        self.deliveryServiceDID = deliveryServiceDID ?? service
-    }
-}
 
 /// A notification registration created while authorizing a space sync. The
 /// opaque token is supplied by the endpoint and is never an authorization
@@ -476,22 +437,6 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
         authorization: AuthorizationContext
     ) async throws -> [AuthorizedSpaceWriter]
 
-    func registerSpaceNotification(
-        _ registration: AuthorizedSpaceNotificationRegistration,
-        serviceDID: String,
-        authorization: AuthorizationContext
-    ) async throws
-
-    /// Withdraws a subscriber's registration by authenticated service identity
-    /// (`com.atproto.space.unregisterNotify`). Idempotent: succeeds whether or
-    /// not a matching registration existed. Implementations gate on a space
-    /// credential for exactly this space and on the space still being active.
-    func unregisterSpaceNotification(
-        space: SpaceURI,
-        ownerServiceDID: String,
-        deliveryServiceDID: String?,
-        authorization: AuthorizationContext
-    ) async throws
 
     /// Records a direct writer-to-authority service-authenticated announcement.
     /// In one transaction it advances the writer's state, allocates the next
@@ -505,77 +450,8 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
     func receiveSpaceWriteNotification(
         _ notification: AuthorizedSpaceWriteNotification
     ) async throws
-
-    /// Marks a local non-authority space deleted when an authenticated space
-    /// authority announces deletion. Unknown/non-hosted targets are a
-    /// best-effort no-op and must not create local state.
-    func receiveSpaceDeletionNotification(
-        space: SpaceURI,
-        issuer: String,
-        audience: String,
-        eventID: String,
-        requestBodyDigest: String
-    ) async throws
-
-    /// The same notice with its service JWT's `iat`, which lets the receiver
-    /// recognize a retry of a deletion older than an adopted recreation. A
-    /// directory that does not implement it drops the `iat`.
-    func receiveSpaceDeletionNotification(
-        space: SpaceURI,
-        issuer: String,
-        audience: String,
-        eventID: String,
-        requestBodyDigest: String,
-        issuedAt: Date?
-    ) async throws
 }
-public extension AuthorizedSpaceNotificationDirectory {
-    func receiveSpaceDeletionNotification(
-        space: SpaceURI,
-        issuer: String,
-        audience: String,
-        eventID: String,
-        requestBodyDigest: String,
-        issuedAt _: Date?
-    ) async throws {
-        try await receiveSpaceDeletionNotification(
-            space: space,
-            issuer: issuer,
-            audience: audience,
-            eventID: eventID,
-            requestBodyDigest: requestBodyDigest
-        )
-    }
 
-    func registerSpaceNotification(
-        _ registration: AuthorizedSpaceNotificationRegistration,
-        authorization: AuthorizationContext
-    ) async throws {
-        try await registerSpaceNotification(registration, serviceDID: registration.serviceDID, authorization: authorization)
-    }
-
-    func unregisterSpaceNotification(
-        space: SpaceURI,
-        serviceDID: String,
-        authorization: AuthorizationContext
-    ) async throws {
-        let baseDID = serviceIssuerDID(serviceDID) ?? serviceDID
-        try await unregisterSpaceNotification(
-            space: space,
-            ownerServiceDID: baseDID,
-            deliveryServiceDID: serviceDID,
-            authorization: authorization
-        )
-    }
-
-    func unregisterSpaceNotification(
-        space: SpaceURI,
-        service: String,
-        authorization: AuthorizationContext
-    ) async throws {
-        try await unregisterSpaceNotification(space: space, serviceDID: service, authorization: authorization)
-    }
-}
 
 /// A deliberately narrow lifecycle/membership projection for a simple-space
 /// authority account that was opened at service startup.  It names domain

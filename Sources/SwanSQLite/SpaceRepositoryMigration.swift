@@ -151,9 +151,9 @@ extension SQLiteAccountDatabase {
                commitment: ltHash.commitment,
                updatedAt: Int64(createdAt)
            ) {
-            try await enqueueWriteForwardsWithoutGate(
+            try await enqueueSpaceSyncUpdateWithoutGate(
                 space: space,
-                sourceEventID: eventID.uuidString.lowercased(),
+                kind: .repoWrite,
                 repository: author,
                 wireRevision: wireRevision.toString(),
                 commitment: ltHash.commitment,
@@ -474,15 +474,6 @@ extension SQLiteAccountDatabase {
                     if (row.column("is_deleted")?.integer ?? 0) != 0 {
                         // As createSpace: a revived space starts fresh.
                         try await deleteAuthorityRepositoryWithoutGate(space: space)
-                        for table in [
-                            "permissioned_space_notification_fanout",
-                            "permissioned_space_notification_registrations",
-                        ] {
-                            _ = try await connection.query(
-                                "DELETE FROM \(table) WHERE space_uri = ?",
-                                [.text(space.rawValue)]
-                            )
-                        }
                     }
                     let nextRevision = try nextSimpleSpaceRevision(try requiredRevision(row, "revision"))
                     _ = try await connection.query(
