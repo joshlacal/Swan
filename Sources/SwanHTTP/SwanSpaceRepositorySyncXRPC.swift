@@ -243,7 +243,7 @@ private struct AuthenticatedListRepoOpsHandler:
 }
 
 /// Parses the reference `listRepoOps` cursor, `${rev}/${idx}`. Anything else
-/// is the lexicon's `MalformedCursor`.
+/// is the lexicon's `InvalidCursor`.
 private func parseRepositoryOplogCursor(
     _ cursor: String
 ) throws -> (revision: String, index: Int) {
@@ -492,7 +492,7 @@ func registerAuthenticatedGetLatestCommitEndpoint(
                 let mac = try secret.map { try responseCommit(output.commit).mac(sharedSecret: $0) }
                 return try withSpaceResponseMAC(authenticatedGetLatestCommitJSON(.ok, output), mac: mac, type: .repository)
             } catch is SpaceMACHeaders.HeaderError {
-                return authenticatedRepositorySyncError(.badRequest, code: "BadSpaceMac")
+                return authenticatedRepositorySyncError(.badRequest, code: "InvalidSpaceMac")
             } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
                 return authenticatedRepositorySyncResponse(for: failure, capability: capability)
             } catch {
@@ -514,7 +514,7 @@ func registerAuthenticatedListRepoOpsEndpoint(
         do {
             parameters = try parseAuthenticatedListRepoOpsParameters(request)
         } catch AuthenticatedSpaceRepositorySyncFailure.malformedCursor {
-            return authenticatedRepositorySyncError(.badRequest, code: "MalformedCursor")
+            return authenticatedRepositorySyncError(.badRequest, code: "InvalidCursor")
         } catch {
             return authenticatedRepositorySyncError(.badRequest, code: "InvalidRequest")
         }
@@ -536,7 +536,7 @@ func registerAuthenticatedListRepoOpsEndpoint(
             return try withSpaceResponseMAC(authenticatedListRepoOpsJSON(.ok, output, lease: lease), mac: mac, type: .repository)
         } catch is SpaceMACHeaders.HeaderError {
             lease.release()
-            return authenticatedRepositorySyncError(.badRequest, code: "BadSpaceMac")
+            return authenticatedRepositorySyncError(.badRequest, code: "InvalidSpaceMac")
         } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
             lease.release()
             return authenticatedRepositorySyncResponse(for: failure, capability: capability)
@@ -581,7 +581,7 @@ func registerAuthenticatedGetRepoEndpoint(
                 }
             ), mac: prepared.mac, type: .repository)
         } catch is SpaceMACHeaders.HeaderError {
-            return authenticatedRepositorySyncError(.badRequest, code: "BadSpaceMac")
+            return authenticatedRepositorySyncError(.badRequest, code: "InvalidSpaceMac")
         } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
             return authenticatedRepositorySyncResponse(for: failure, capability: capability)
         } catch {
@@ -719,7 +719,7 @@ private func authenticatedRepositorySyncResponse(
             code: "full_repo_recovery_required"
         )
     case .malformedCursor:
-        authenticatedRepositorySyncError(.badRequest, code: "MalformedCursor")
+        authenticatedRepositorySyncError(.badRequest, code: "InvalidCursor")
     case .unavailable:
         authenticatedRepositorySyncError(.serviceUnavailable, code: "temporarily_unavailable")
     }

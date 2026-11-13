@@ -15,8 +15,8 @@ public enum SpaceMACHeaders {
         public let keyShare: String
     }
 
-    /// These failures map to the XRPC `BadSpaceMac` error, without reflecting
-    /// untrusted header content in diagnostics.
+    /// These failures map to the XRPC `InvalidSpaceMac` error, without
+    /// reflecting untrusted header content in diagnostics.
     public enum HeaderError: Error, Sendable, Equatable {
         case badSpaceMAC
     }

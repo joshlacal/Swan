@@ -35,6 +35,7 @@ public struct SwanAuthenticatedSimpleSpaceLifecycleCapability: Sendable {
 
 enum AuthenticatedSimpleSpaceLifecycleFailure: Error {
     case invalidRequest
+    case invalidSpaceMeta
     case spaceNotFound
     case notAuthorized
     case spaceAlreadyExists
@@ -681,6 +682,8 @@ func simpleSpaceLifecycleResponse(
     switch failure {
     case .invalidRequest:
         simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
+    case .invalidSpaceMeta:
+        simpleSpaceLifecycleError(.badRequest, code: "InvalidSpaceMeta")
     case .spaceNotFound:
         simpleSpaceLifecycleError(.badRequest, code: "SpaceNotFound")
     case .notAuthorized:

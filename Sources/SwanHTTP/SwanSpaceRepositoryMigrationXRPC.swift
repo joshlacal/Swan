@@ -11,7 +11,7 @@ import SwanStorage
 /// October 29 sections 4 and 5d on the repo host: `com.atproto.space.clearRecords`
 /// and `com.atproto.space.importRepo`, both for the account's own repo only.
 
-/// The bound and admission for octet-stream import bodies (importRepo,
+/// The bound and admission for STAR import bodies (importRepo,
 /// importSpaceMeta). They get their own small pool so an import can never
 /// starve the shared JSON command admission, and a longer total deadline
 /// sized for the body bound on a slow link.
@@ -23,13 +23,13 @@ enum SpaceImportBody {
     )
     static let policy = try! SwanJSONWriteBodyPolicy(totalBodyTimeout: .seconds(300))
 
-    /// `Content-Type: application/octet-stream` and, when present, a
+    /// `Content-Type: application/vnd.dasl.star` and, when present, a
     /// canonical `Content-Length` within the bound.
     static func acceptsHeaders(_ request: Request) -> Bool {
         let contentTypes = request.headers[values: .contentType]
         guard contentTypes.count == 1,
               contentTypes[0].split(separator: ";", maxSplits: 1).first?
-                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "application/octet-stream"
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == SpaceSTARCodec.mediaType
         else { return false }
         let lengths = request.headers[values: .contentLength]
         guard lengths.count <= 1 else { return false }
@@ -86,14 +86,13 @@ private struct AuthenticatedImportRepoHandler {
         do {
             verified = try SpaceSTARCodec.decodeImport(archive)
         } catch {
-            throw AuthenticatedSpaceWriteFailure.invalidRequest
+            throw AuthenticatedSpaceWriteFailure.invalidRepoFile
         }
         guard case let .accountOAuth(subject, _) = authorization else {
             throw AuthenticatedSpaceWriteFailure.denied
         }
         guard verified.commit.repo == subject else {
-            // The reference: "Repo does not match the authenticated account".
-            throw AuthenticatedSpaceWriteFailure.invalidRequest
+            throw AuthenticatedSpaceWriteFailure.repoMismatch
         }
         do {
             try await capability.directory.importRepository(

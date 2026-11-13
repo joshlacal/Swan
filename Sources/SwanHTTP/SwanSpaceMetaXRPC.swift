@@ -47,7 +47,7 @@ private struct AuthenticatedImportSpaceMetaHandler {
         } catch SpacePolicyError.unsupportedPolicy {
             throw AuthenticatedSimpleSpaceLifecycleFailure.unsupportedPolicy
         } catch {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidSpaceMeta
         }
         try requireSpaceOwner(authorization, space: archive.space)
         do {

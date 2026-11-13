@@ -318,32 +318,22 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                         "\(Self.otherCollection)/third",
                         "\(Self.collection)/second",
                     ])
-                    XCTAssertEqual(body["cursor"] as? String, "\(Self.collection)/second")
+                    XCTAssertEqual(body["cursor"] as? String, fixture.recordURIs[1].rawValue)
                     XCTAssertFalse(records.flatMap(\.keys).contains("$type"))
                 }
 
                 let nextHeaders = try self.signedHeaders(fixture, subject: Self.alice, path: Self.listPath, jti: "list-next")
                 try await client.execute(
-                    uri: self.listURI(fixture, limit: 2, cursor: "\(Self.collection)/second"),
+                    uri: self.listURI(fixture, limit: 2, cursor: fixture.recordURIs[1].rawValue),
                     method: .get,
                     headers: nextHeaders
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     let records = try XCTUnwrap((try self.jsonObject(response.body))["records"] as? [[String: Any]])
                     XCTAssertEqual(records.map { $0["rkey"] as? String }, ["first"])
-                    XCTAssertEqual((try self.jsonObject(response.body))["cursor"] as? String, "\(Self.collection)/first")
+                    XCTAssertNil((try self.jsonObject(response.body))["cursor"])
                 }
 
-                let reverseHeaders = try self.signedHeaders(fixture, subject: Self.alice, path: Self.listPath, jti: "list-reverse")
-                try await client.execute(
-                    uri: self.listURI(fixture, collection: Self.collection, limit: 2, reverse: true),
-                    method: .get,
-                    headers: reverseHeaders
-                ) { response in
-                    XCTAssertEqual(response.status, .ok)
-                    let records = try XCTUnwrap((try self.jsonObject(response.body))["records"] as? [[String: Any]])
-                    XCTAssertEqual(records.map { $0["rkey"] as? String }, ["first", "second"])
-                }
 
                 let excludedHeaders = try self.signedHeaders(fixture, subject: Self.alice, path: Self.listPath, jti: "list-excluded")
                 try await client.execute(
@@ -572,10 +562,10 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
             ]
             let invalidListQueries = [
                 "space=\(percentEncode(fixture.space.rawValue))&repo=\(Self.alice)&limit=0",
-                "space=\(percentEncode(fixture.space.rawValue))&repo=\(Self.alice)&limit=101",
-                "space=\(percentEncode(fixture.space.rawValue))&repo=\(Self.alice)&reverse=yes",
-                "space=\(percentEncode(fixture.space.rawValue))&repo=\(Self.alice)&cursor=%00",
+                "space=\(percentEncode(fixture.space.rawValue))&repo=\(Self.alice)&limit=1001",
+                "space=\(percentEncode(fixture.space.rawValue))&repo=\(Self.alice)&reverse=true",
             ]
+            let invalidCursorQuery = "space=\(percentEncode(fixture.space.rawValue))&repo=\(Self.alice)&cursor=not-an-at-uri"
             let missingProof = authorizationHeaders(token: fixture.aliceToken)
             let replay = try signedHeaders(fixture, subject: Self.alice, path: Self.getPath, jti: "replay")
             let badTarget = try signedHeaders(fixture, subject: Self.alice, path: "/xrpc/not-this", jti: "bad-target")
@@ -602,6 +592,11 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                         self.assertNoStore(response)
                         XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
                     }
+                }
+                try await client.execute(uri: "\(Self.listPath)?\(invalidCursorQuery)", method: .get) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidCursor")
                 }
                 try await client.execute(uri: validGet, method: .get, headers: missingProof) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -637,15 +632,14 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                     self.assertNoStore(response)
                     XCTAssertEqual(try self.errorCode(response.body), "Unauthorized")
                 }
-                let malformedCursorHeaders = try self.signedHeaders(fixture, subject: Self.alice, path: Self.listPath, jti: "cursor-tolerant")
+                let malformedCursorHeaders = try self.signedHeaders(fixture, subject: Self.alice, path: Self.listPath, jti: "cursor-invalid")
                 try await client.execute(
                     uri: "\(validList)&cursor=not-a-valid-cursor",
                     method: .get,
                     headers: malformedCursorHeaders
                 ) { response in
-                    XCTAssertEqual(response.status, .ok)
-                    let records = try XCTUnwrap((try self.jsonObject(response.body))["records"] as? [[String: Any]])
-                    XCTAssertEqual(records.count, 3)
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidCursor")
                 }
                 try await client.execute(uri: validList, method: .post) { response in
                     XCTAssertEqual(response.status, .notFound)
@@ -1682,14 +1676,12 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         collection: String? = nil,
         limit: Int? = nil,
         cursor: String? = nil,
-        reverse: Bool? = nil,
         excludeValues: Bool? = nil
     ) -> String {
         var fields = ["space=\(percentEncode(fixture.space.rawValue))", "repo=\(Self.alice)"]
         if let collection { fields.append("collection=\(collection)") }
         if let limit { fields.append("limit=\(limit)") }
         if let cursor { fields.append("cursor=\(percentEncode(cursor))") }
-        if let reverse { fields.append("reverse=\(reverse ? "true" : "false")") }
         if let excludeValues { fields.append("excludeValues=\(excludeValues ? "true" : "false")") }
         return "\(Self.listPath)?\(fields.joined(separator: "&"))"
     }

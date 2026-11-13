@@ -737,7 +737,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                         }
                         try await client.execute(uri: uri, method: .get, headers: headers) { response in
                             XCTAssertEqual(response.status, .badRequest, failure)
-                            XCTAssertEqual(try self.errorCode(response.body), "BadSpaceMac", failure)
+                            XCTAssertEqual(try self.errorCode(response.body), "InvalidSpaceMac", failure)
                             XCTAssertNil(response.headers[macName])
                         }
                     }
@@ -878,7 +878,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                         headers: self.credentialHeaders(credential, audience: Self.alice, fixture: fixture)
                     ) { response in
                         XCTAssertEqual(response.status, .badRequest, malformed)
-                        XCTAssertEqual(try self.errorCode(response.body), "MalformedCursor", malformed)
+                        XCTAssertEqual(try self.errorCode(response.body), "InvalidCursor", malformed)
                     }
                 }
             }

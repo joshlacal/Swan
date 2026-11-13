@@ -406,7 +406,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                         liveHeaders[.contentType] = "application/json"
                     default:
                         live = "/xrpc/\(nsid)"
-                        liveHeaders[.contentType] = "application/octet-stream"
+                        liveHeaders[.contentType] = SpaceSTARCodec.mediaType
                     }
                     let liveBody = nsid.hasSuffix("clearRecords")
                         ? ByteBuffer(string: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\"}")

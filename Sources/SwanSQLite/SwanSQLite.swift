@@ -7232,7 +7232,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         authorization: AuthorizationContext? = nil
     ) async throws -> [PersistedSpaceRecord] {
         try requireAccount(author)
-        guard (1 ... 100).contains(limit),
+        guard (1 ... 1_000).contains(limit),
               maximumAggregateRecordBytes > 0,
               (cursorCollection == nil) == (cursorRKey == nil) else {
             throw SwanError.malformed("permissioned record page is invalid")
@@ -14161,12 +14161,9 @@ public actor DurableSpaceRepository {
         )?.records.map(record(from:)) ?? []
     }
 
-    /// Returns the exact page shape used by the pinned
-    /// `com.atproto.space.listRecords` reader. The pinned implementation
-    /// orders the default page descending by `(collection, rkey)` and flips
-    /// to ascending only when `reverse` is true. Cursor syntax that cannot
-    /// name a domain record is deliberately ignored, matching the reference
-    /// reader's tolerant `parseListCursor` behavior.
+    /// Returns the `com.atproto.space.listRecords` page shape. Records are
+    /// ordered descending by `(collection, rkey)`, and a cursor must be the
+    /// complete URI of a record in this repository and space.
     ///
     /// This remains a domain operation: a collection-qualified OAuth grant
     /// is checked against a synthetic, valid record URI before the durable
@@ -14203,7 +14200,7 @@ public actor DurableSpaceRepository {
         reverse: Bool,
         authorization: AuthorizationContext
     ) async throws -> [SpaceRecord] {
-        guard (1 ... 100).contains(limit) else {
+        guard (1 ... 1_000).contains(limit) else {
             throw SwanError.malformed("permissioned record page limit is invalid")
         }
 
@@ -14222,7 +14219,7 @@ public actor DurableSpaceRepository {
         }
         try requireRead(uri: authorizationURI, authorization: authorization)
 
-        let cursorKey = cursor.flatMap(Self.parseListCursor)
+        let cursorKey = try cursor.map(parseListCursor)
         let records = try await database.repositoryRecordPage(
             space: space,
             author: author,
@@ -14369,24 +14366,19 @@ public actor DurableSpaceRepository {
         "\(record.uri.collection)/\(record.uri.rkey)/\(record.cid)"
     }
 
-    private static func parseListCursor(
+    private func parseListCursor(
         _ cursor: String
-    ) -> (collection: String, rkey: String)? {
-        let pieces = cursor.split(separator: "/", omittingEmptySubsequences: false)
-        guard pieces.count == 2,
-              let URI = try? SpaceRecordURI(
-                  space: try SpaceURI(
-                      authority: "did:plc:abcdefghijklmnopqrstuvwx",
-                      spaceType: "app.swan.cursor",
-                      skey: "cursor"
-                  ),
-                  author: "did:plc:abcdefghijklmnopqrstuvwx",
-                  collection: String(pieces[0]),
-                  rkey: String(pieces[1])
-              ) else {
-            return nil
+    ) throws -> (collection: String, rkey: String) {
+        let uri: SpaceRecordURI
+        do {
+            uri = try SpaceRecordURI(cursor)
+        } catch {
+            throw SwanError.malformed("permissioned record cursor is invalid")
         }
-        return (URI.collection, URI.rkey)
+        guard uri.space == space, uri.author == author else {
+            throw SwanError.malformed("permissioned record cursor is invalid")
+        }
+        return (uri.collection, uri.rkey)
     }
 }
 

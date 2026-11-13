@@ -112,7 +112,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     signed[HTTPField.Name(SpaceMACHeaders.requestHeader)!] = nil
                     try await client.execute(uri: uri, method: .get, headers: signed) { response in
                         XCTAssertEqual(response.status, .badRequest)
-                        XCTAssertEqual(try self.errorCode(response.body), "BadSpaceMac")
+                        XCTAssertEqual(try self.errorCode(response.body), "InvalidSpaceMac")
                     }
                     let exchange = try SpaceMAC.encapsulate(authorKey: October22MACProvider.publicKey)
                     var headers = signed
@@ -123,7 +123,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                         XCTAssertTrue(response.headers[.accessControlExposeHeaders]?.contains(SpaceMACHeaders.responseHeader) == true)
                         let mac = try SpaceMACHeaders.parseMAC(response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!], type: .repository)
                         if method == "getRepo" {
-                            XCTAssertEqual(response.headers[.contentType], "application/octet-stream")
+                            XCTAssertEqual(response.headers[.contentType], SpaceSTARCodec.mediaType)
                             let archive = try SpaceSTARCodec.decode(Data(response.body.readableBytesView), space: fixture.publicSpace, author: Self.member) { commit in
                                 try commit.mac(sharedSecret: exchange.sharedSecret) == mac
                             }

@@ -325,6 +325,7 @@ public struct SwanAuthenticatedSpaceRecordsCapability: Sendable {
 
 private enum AuthenticatedSpaceRecordFailure: Error {
     case invalidRequest
+    case invalidCursor
     case spaceNotFound
     case recordNotFound
     case denied
@@ -462,20 +463,24 @@ private struct AuthenticatedListRecordsHandler: ComAtprotoSpaceListRecords.Serve
             throw AuthenticatedSpaceRecordFailure.spaceNotFound
         }
 
+        let limit = parameters.limit ?? 50
         let records: [SpaceRecord]
         do {
             records = try await capability.directory.records(
                 space: space,
                 author: repo,
                 collection: collection,
-                limit: parameters.limit ?? 50,
+                limit: limit,
                 cursor: parameters.cursor,
-                reverse: parameters.reverse ?? false,
+                reverse: false,
                 authorization: authorization
             )
         } catch let error as SwanError {
             if case .unauthorized = error {
                 throw AuthenticatedSpaceRecordFailure.denied
+            }
+            if case .malformed = error {
+                throw AuthenticatedSpaceRecordFailure.invalidCursor
             }
             throw AuthenticatedSpaceRecordFailure.unavailable
         } catch {
@@ -501,9 +506,7 @@ private struct AuthenticatedListRecordsHandler: ComAtprotoSpaceListRecords.Serve
                     value: value
                 )
             }
-            let cursor = outputRecords.last.map {
-                "\($0.collection.nsidString())/\($0.rkey.value)"
-            }
+            let cursor = records.count < limit ? nil : records.last?.uri.rawValue
             return ComAtprotoSpaceListRecords.Output(
                 cursor: cursor,
                 records: outputRecords
@@ -565,7 +568,7 @@ private struct AuthenticatedListBlobsHandler: ComAtprotoSpaceListBlobs.ServerHan
             cids = try await capability.directory.repositoryBlobCIDs(
                 space: space,
                 author: repo,
-                since: parameters.since?.toString(),
+                since: nil,
                 limit: limit,
                 cursor: parameters.cursor,
                 authorization: authorization
@@ -631,13 +634,10 @@ private func parseAuthenticatedListBlobsParameters(
     let query = try strictAuthenticatedRecordQuery(
         request,
         required: ["space", "repo"],
-        optional: ["since", "limit", "cursor"]
+        optional: ["limit", "cursor"]
     )
     let space = try SpaceRef(uriString: try requiredQueryValue("space", in: query, maximumBytes: 2_048))
     let repo = try DID(didString: try requiredQueryValue("repo", in: query, maximumBytes: 2_048))
-    let since = try query["since"].map {
-        try TID(tidString: try bounded($0, maximumBytes: 32))
-    }
     let limit: Int?
     if let rawLimit = query["limit"] {
         guard !rawLimit.isEmpty,
@@ -657,7 +657,7 @@ private func parseAuthenticatedListBlobsParameters(
         collection: "app.swan.records",
         rkey: "scope"
     )
-    return .init(space: space, repo: repo, since: since, limit: limit, cursor: cursor)
+    return .init(space: space, repo: repo, since: nil, limit: limit, cursor: cursor)
 }
 
 func registerAuthenticatedGetRecordEndpoint(
@@ -691,7 +691,7 @@ func registerAuthenticatedGetRecordEndpoint(
             return try withSpaceResponseMAC(authenticatedGetRecordJSON(.ok, output, lease: lease), mac: mac, type: .record)
         } catch is SpaceMACHeaders.HeaderError {
             lease.release()
-            return authenticatedSpaceRecordError(.badRequest, code: "BadSpaceMac")
+            return authenticatedSpaceRecordError(.badRequest, code: "InvalidSpaceMac")
         } catch let failure as AuthenticatedSpaceRecordFailure {
             lease.release()
             return authenticatedSpaceRecordResponse(for: failure, capability: capability)
@@ -713,6 +713,8 @@ func registerAuthenticatedListRecordsEndpoint(
         let parameters: ComAtprotoSpaceListRecords.Parameters
         do {
             parameters = try parseAuthenticatedListRecordsParameters(request)
+        } catch AuthenticatedSpaceRecordFailure.invalidCursor {
+            return authenticatedSpaceRecordError(.badRequest, code: "InvalidCursor")
         } catch {
             return authenticatedSpaceRecordError(.badRequest, code: "InvalidRequest")
         }
@@ -847,6 +849,8 @@ private let authenticatedSpaceWriteMaximumOperations =
 
 enum AuthenticatedSpaceWriteFailure: Error {
     case invalidRequest
+    case invalidRepoFile
+    case repoMismatch
     case spaceNotFound
     /// `SpaceNotFound` as a declared lexicon error (HTTP 400), for importRepo.
     case declaredSpaceNotFound
@@ -1283,6 +1287,8 @@ func authenticatedSpaceWriteResponse(
 ) -> Response {
     switch failure {
     case .invalidRequest: authenticatedSpaceWriteError(.badRequest, code: "InvalidRequest")
+    case .invalidRepoFile: authenticatedSpaceWriteError(.badRequest, code: "InvalidRepoFile")
+    case .repoMismatch: authenticatedSpaceWriteError(.badRequest, code: "RepoMismatch")
     case .spaceNotFound: authenticatedSpaceWriteError(.notFound, code: "SpaceNotFound")
     case .declaredSpaceNotFound: authenticatedSpaceWriteError(.badRequest, code: "SpaceNotFound")
     case .denied: authenticatedSpaceWriteError(.unauthorized, code: "Unauthorized")
@@ -1458,7 +1464,7 @@ private let spaceGetRecordQuerySchema = StrictQuerySchema(
 )
 private let spaceListRecordsQuerySchema = StrictQuerySchema(
     required: ["space", "repo"],
-    optional: ["collection", "limit", "cursor", "reverse", "excludeValues"]
+    optional: ["collection", "limit", "cursor", "excludeValues"]
 )
 
 private func parseAuthenticatedGetRecordParameters(
@@ -1494,8 +1500,20 @@ private func parseAuthenticatedListRecordsParameters(
     let repo = try DID(didString: try requiredQueryValue("repo", in: query, maximumBytes: 2_048))
     let collection = try query["collection"].map { try NSID(nsidString: bounded($0, maximumBytes: 317)) }
     let limit = try query["limit"].map(strictRecordPageLimit)
-    let cursor = try query["cursor"].map { try bounded($0, maximumBytes: 1_024) }
-    let reverse = try query["reverse"].map(strictBoolean)
+    let cursor = try query["cursor"].map { raw -> String in
+        let raw = try bounded(raw, maximumBytes: 2_048)
+        do {
+            let uri = try SpaceRecordURI(raw)
+            guard uri.space.rawValue == space.uriString(), uri.author == repo.didString() else {
+                throw AuthenticatedSpaceRecordFailure.invalidCursor
+            }
+            return uri.rawValue
+        } catch is AuthenticatedSpaceRecordFailure {
+            throw AuthenticatedSpaceRecordFailure.invalidCursor
+        } catch {
+            throw AuthenticatedSpaceRecordFailure.invalidCursor
+        }
+    }
     let excludeValues = try query["excludeValues"].map(strictBoolean)
     _ = try SpaceRecordURI(
         space: try SpaceURI(space.uriString()),
@@ -1509,7 +1527,7 @@ private func parseAuthenticatedListRecordsParameters(
         collection: collection,
         limit: limit,
         cursor: cursor,
-        reverse: reverse,
+        reverse: nil,
         excludeValues: excludeValues
     )
 }
@@ -1588,7 +1606,7 @@ private func strictRecordPageLimit(_ value: String) throws -> Int {
     guard !value.isEmpty,
           value.utf8.allSatisfy({ $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }),
           let limit = Int(value),
-          (1 ... 100).contains(limit) else {
+          (1 ... 1_000).contains(limit) else {
         throw AuthenticatedSpaceRecordFailure.invalidRequest
     }
     return limit
@@ -1609,6 +1627,8 @@ private func authenticatedSpaceRecordResponse(
     switch failure {
     case .invalidRequest:
         authenticatedSpaceRecordError(.badRequest, code: "InvalidRequest")
+    case .invalidCursor:
+        authenticatedSpaceRecordError(.badRequest, code: "InvalidCursor")
     case .spaceNotFound:
         authenticatedSpaceRecordError(.notFound, code: "SpaceNotFound")
     case .recordNotFound:
