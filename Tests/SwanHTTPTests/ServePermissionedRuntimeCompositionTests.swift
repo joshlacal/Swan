@@ -1278,25 +1278,30 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             )
             headers = [.authorization: "Bearer \(checkUserAccess)"]
         }
-        if method == .get, let type = semanticMACType(for: path) {
-            let exchange = try SpaceMAC.encapsulate(
-                authorKey: AccountKEMKeyProvider.didKey(fixture.localKEMKey.publicKey)
+        if method == .get, let profile = semanticMACProfile(for: path) {
+            let exchange = try SpaceMACKeyAgreement.send(
+                authorKeyID: AccountKEMKeyProvider.didKey(
+                    fixture.localKEMKey.publicKey
+                )
             )
-            headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!] = try SpaceMACHeaders.formatWantMAC(
-                keyShare: exchange.keyShare,
-                type: type
-            )
+            headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!] =
+                try SpaceMACHeaders.makeRequest(
+                    keyID: exchange.keyID,
+                    profile: profile
+                ).headerValue
         }
         if hasBody { headers[.contentType] = "application/json" }
         return headers
     }
 
-    private func semanticMACType(for path: String) -> SpaceMACHeaders.MACType? {
+    private func semanticMACProfile(
+        for path: String
+    ) -> SpaceMACHeaders.Profile? {
         switch path {
         case "/xrpc/com.atproto.space.getRecord": .record
         case "/xrpc/com.atproto.space.getLatestCommit",
              "/xrpc/com.atproto.space.listRepoOps",
-             "/xrpc/com.atproto.space.getRepo": .repository
+             "/xrpc/com.atproto.space.getRepo": .commit
         default: nil
         }
     }
@@ -1308,48 +1313,92 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         space: SpaceURI,
         path: String
     ) throws -> VerifiedSpaceSTARRecovery? {
-        guard let type = semanticMACType(for: path) else { return nil }
-        let wanted = try SpaceMACHeaders.parseWantMAC(
-            requestHeaders[HTTPField.Name(SpaceMACHeaders.requestHeader)!],
-            type: type
-        )
-        let sharedSecret = try SpaceMAC.decapsulate(
-            privateKey: fixture.localKEMKey,
-            keyShare: wanted.keyShare
-        )
-        let mac = try SpaceMACHeaders.parseMAC(
-            response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!],
-            type: type
+        guard let profile = semanticMACProfile(for: path) else { return nil }
+        let request = try XCTUnwrap(SpaceMACHeaders.parseRequest(
+            requestHeaders[values: HTTPField.Name(
+                SpaceMACHeaders.requestHeader
+            )!],
+            profile: profile
+        ))
+        let sharedSecret = try SpaceMACKeyAgreement.receive(
+            authorPrivateKey: fixture.localKEMKey,
+            keyID: request.keyID
         )
         if path == "/xrpc/com.atproto.space.getRepo" {
             return try SpaceSTARCodec.decode(
                 Data(buffer: response.body), space: space, author: localDID
             ) { commit in
-                try SpaceMAC.verify(mac: mac, expected: commit.mac(sharedSecret: sharedSecret))
+                try SpaceMACHeaders.verifyCommit(
+                    commit,
+                    request: request,
+                    sharedSecret: sharedSecret,
+                    coveredHeader: response.headers[
+                        HTTPField.Name(SpaceMACHeaders.commitHeader)!
+                    ],
+                    signatureInput: response.headers[
+                        HTTPField.Name(SpaceMACHeaders.signatureInputHeader)!
+                    ],
+                    signature: response.headers[
+                        HTTPField.Name(SpaceMACHeaders.signatureHeader)!
+                    ]
+                )
                 return true
             }
         }
-        if type == .record {
+        if profile == .record {
             let output = try JSONDecoder().decode(
-                ComAtprotoSpaceGetRecord.Output.self, from: Data(buffer: response.body)
+                ComAtprotoSpaceGetRecord.Output.self,
+                from: Data(buffer: response.body)
             )
-            let canonicalRecord = try DAGCBOR.encodeValue(output.value.toCBORValue())
+            let canonicalRecord = try DAGCBOR.encodeValue(
+                output.value.toCBORValue()
+            )
             XCTAssertEqual(output.cid, CID.fromDAGCBOR(canonicalRecord))
             XCTAssertEqual(output.uri.uriString(), try SpaceRecordURI(
-                space: space, author: localDID, collection: "app.bsky.feed.post", rkey: "seed"
+                space: space,
+                author: localDID,
+                collection: "app.bsky.feed.post",
+                rkey: "seed"
             ).rawValue)
-            try SpaceMAC.verify(mac: mac, expected: SpaceMAC.record(
-                sharedSecret: sharedSecret, uri: output.uri.uriString(), cid: Data(output.cid.bytes)
-            ))
+            try SpaceMACHeaders.verifyRecord(
+                uri: output.uri.uriString(),
+                cid: output.cid.string,
+                request: request,
+                sharedSecret: sharedSecret,
+                coveredHeader: response.headers[
+                    HTTPField.Name(SpaceMACHeaders.recordHeader)!
+                ],
+                signatureInput: response.headers[
+                    HTTPField.Name(SpaceMACHeaders.signatureInputHeader)!
+                ],
+                signature: response.headers[
+                    HTTPField.Name(SpaceMACHeaders.signatureHeader)!
+                ]
+            )
         } else {
-            let object = try XCTUnwrap(jsonObject(response.body)["commit"] as? [String: Any])
+            let object = try XCTUnwrap(
+                jsonObject(response.body)["commit"] as? [String: Any]
+            )
             let commit = try JSONDecoder().decode(
                 SpaceRepositoryCommit.self,
                 from: JSONSerialization.data(withJSONObject: object)
             )
             XCTAssertEqual(commit.space, space)
             XCTAssertEqual(commit.repo, localDID)
-            try SpaceMAC.verify(mac: mac, expected: commit.mac(sharedSecret: sharedSecret))
+            try SpaceMACHeaders.verifyCommit(
+                commit,
+                request: request,
+                sharedSecret: sharedSecret,
+                coveredHeader: response.headers[
+                    HTTPField.Name(SpaceMACHeaders.commitHeader)!
+                ],
+                signatureInput: response.headers[
+                    HTTPField.Name(SpaceMACHeaders.signatureInputHeader)!
+                ],
+                signature: response.headers[
+                    HTTPField.Name(SpaceMACHeaders.signatureHeader)!
+                ]
+            )
         }
         return nil
     }

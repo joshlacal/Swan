@@ -15,18 +15,21 @@ import SwanSpaces
 import SwanStorage
 import XCTest
 
-private struct October22MACProvider: SpaceRepositoryCommitSigner {
+private struct November12MACProvider: SpaceRepositoryCommitSigner {
     static var key: P256.KeyAgreement.PrivateKey {
-        try! P256.KeyAgreement.PrivateKey(rawRepresentation: Data(repeating: 0x51, count: 32))
+        try! P256.KeyAgreement.PrivateKey(
+            rawRepresentation: Data(repeating: 0x51, count: 32)
+        )
     }
     static var publicKey: String {
-        P256DIDKey(publicKey: try! P256.Signing.PublicKey(x963Representation: key.publicKey.x963Representation)).value
+        P256DIDKey(
+            publicKey: try! P256.Signing.PublicKey(
+                x963Representation: key.publicKey.x963Representation
+            )
+        ).value
     }
-    func sharedSecret(author: String, keyShare: String) async throws -> Data {
-        try SpaceMAC.decapsulate(privateKey: Self.key, keyShare: keyShare)
-    }
-    func signRepositoryCommit(space: SpaceURI, author: String, wireRevision: String, commitment: Data) async throws -> SpaceCommitEnvelope {
-        throw SwanError.unavailable("legacy signatures are not used on October 22 wire")
+    func sharedSecret(author: String, keyID: String) async throws -> Data {
+        try SpaceMACKeyAgreement.receive(authorPrivateKey: Self.key, keyID: keyID)
     }
 }
 
@@ -97,53 +100,142 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         } catch { try? await fixture.close(); throw error }
     }
 
-    func testOctober22ResponseMACAndSTARAreBoundToAuthenticatedBody() async throws {
+    func testNovember12ResponseMACAndSTARAreBoundToAuthenticatedBody() async throws {
         let fixture = try await Fixture.make()
         defer { fixture.cleanup() }
         do {
-            let app = try makeServer(fixture).buildApplication(logger: Logger(label: "spaces.oct22.mac"))
+            let app = try makeServer(fixture).buildApplication(
+                logger: Logger(label: "spaces.nov12.mac")
+            )
             let credential = try PermissionedDataJWT.createSpaceCredential(
-                issuer: Self.authority, space: fixture.publicSpace, key: fixture.authorityKey,
-                confirmationKeyID: SpaceCredentialSignatureTestSupport.keyID)
+                issuer: Self.authority,
+                space: fixture.publicSpace,
+                key: fixture.authorityKey,
+                confirmationKeyID: SpaceCredentialSignatureTestSupport.keyID
+            )
             try await app.test(.router) { client in
                 for method in ["getLatestCommit", "listRepoOps", "getRepo"] {
                     let uri = "/xrpc/com.atproto.space.\(method)?space=\(fixture.publicSpace.rawValue)&repo=\(Self.member)"
                     var signed = try self.credentialHeaders(credential)
                     signed[HTTPField.Name(SpaceMACHeaders.requestHeader)!] = nil
-                    try await client.execute(uri: uri, method: .get, headers: signed) { response in
+                    try await client.execute(
+                        uri: uri,
+                        method: .get,
+                        headers: signed
+                    ) { response in
                         XCTAssertEqual(response.status, .badRequest)
-                        XCTAssertEqual(try self.errorCode(response.body), "InvalidSpaceMac")
+                        XCTAssertEqual(
+                            try self.errorCode(response.body),
+                            "InvalidSpaceMac"
+                        )
                     }
-                    let exchange = try SpaceMAC.encapsulate(authorKey: October22MACProvider.publicKey)
+
+                    let exchange = try SpaceMACKeyAgreement.send(
+                        authorKeyID: November12MACProvider.publicKey
+                    )
+                    let request = try SpaceMACHeaders.makeRequest(
+                        keyID: exchange.keyID,
+                        profile: .commit
+                    )
                     var headers = signed
-                    headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!] = try SpaceMACHeaders.formatWantMAC(keyShare: exchange.keyShare, type: .repository)
-                    try await client.execute(uri: uri, method: .get, headers: headers) { response in
+                    headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!] =
+                        request.headerValue
+                    try await client.execute(
+                        uri: uri,
+                        method: .get,
+                        headers: headers
+                    ) { response in
                         XCTAssertEqual(response.status, .ok)
-                        XCTAssertTrue(response.headers[HTTPField.Name("Vary")!]?.contains(SpaceMACHeaders.requestHeader) == true)
-                        XCTAssertTrue(response.headers[.accessControlExposeHeaders]?.contains(SpaceMACHeaders.responseHeader) == true)
-                        let mac = try SpaceMACHeaders.parseMAC(response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!], type: .repository)
+                        XCTAssertTrue(
+                            response.headers[HTTPField.Name("Vary")!]?
+                                .contains(SpaceMACHeaders.requestHeader) == true
+                        )
+                        let exposed = try XCTUnwrap(
+                            response.headers[.accessControlExposeHeaders]
+                        )
+                        for name in [
+                            SpaceMACHeaders.commitHeader,
+                            SpaceMACHeaders.signatureInputHeader,
+                            SpaceMACHeaders.signatureHeader,
+                        ] {
+                            XCTAssertTrue(exposed.contains(name), exposed)
+                        }
+                        let verify: (SpaceRepositoryCommit) throws -> Bool = {
+                            try SpaceMACHeaders.verifyCommit(
+                                $0,
+                                request: request,
+                                sharedSecret: exchange.sharedSecret,
+                                coveredHeader: response.headers[
+                                    HTTPField.Name(SpaceMACHeaders.commitHeader)!
+                                ],
+                                signatureInput: response.headers[
+                                    HTTPField.Name(
+                                        SpaceMACHeaders.signatureInputHeader
+                                    )!
+                                ],
+                                signature: response.headers[
+                                    HTTPField.Name(SpaceMACHeaders.signatureHeader)!
+                                ]
+                            )
+                            return true
+                        }
                         if method == "getRepo" {
-                            XCTAssertEqual(response.headers[.contentType], SpaceSTARCodec.mediaType)
-                            let archive = try SpaceSTARCodec.decode(Data(response.body.readableBytesView), space: fixture.publicSpace, author: Self.member) { commit in
-                                try commit.mac(sharedSecret: exchange.sharedSecret) == mac
-                            }
+                            XCTAssertEqual(
+                                response.headers[.contentType],
+                                SpaceSTARCodec.mediaType
+                            )
+                            let archive = try SpaceSTARCodec.decode(
+                                Data(response.body.readableBytesView),
+                                space: fixture.publicSpace,
+                                author: Self.member,
+                                commitVerifier: verify
+                            )
                             XCTAssertEqual(archive.records.count, 1)
                         } else {
                             let object = try self.jsonObject(response.body)
-                            let commit = try XCTUnwrap(object["commit"] as? [String: Any])
-                            XCTAssertEqual(Set(commit.keys), ["ver", "repo", "space", "rev", "data"])
-                            let dataObject = try XCTUnwrap(commit["data"] as? [String: String])
-                            let data = try XCTUnwrap(Data(base64Encoded: XCTUnwrap(dataObject["$bytes"])))
-                            let expected = try SpaceMAC.commit(sharedSecret: exchange.sharedSecret,
-                                space: fixture.publicSpace.rawValue, repo: Self.member,
-                                rev: XCTUnwrap(commit["rev"] as? String), data: data)
-                            XCTAssertEqual(mac, expected)
+                            let commitObject = try XCTUnwrap(
+                                object["commit"] as? [String: Any]
+                            )
+                            XCTAssertEqual(
+                                Set(commitObject.keys),
+                                ["ver", "repo", "space", "rev", "data"]
+                            )
+                            let commit = try JSONDecoder().decode(
+                                SpaceRepositoryCommit.self,
+                                from: JSONSerialization.data(
+                                    withJSONObject: commitObject
+                                )
+                            )
+                            XCTAssertTrue(try verify(commit))
                         }
                     }
                 }
-                let uri = self.getURI(space: fixture.publicSpace, repo: Self.member, rkey: "public")
+                let uri = self.getURI(
+                    space: fixture.publicSpace,
+                    repo: Self.member,
+                    rkey: "public"
+                )
+                var missingRecordMAC = try self.credentialHeaders(credential)
+                missingRecordMAC[
+                    HTTPField.Name(SpaceMACHeaders.requestHeader)!
+                ] = nil
+                try await client.execute(
+                    uri: uri,
+                    method: .get,
+                    headers: missingRecordMAC
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(
+                        try self.errorCode(response.body),
+                        "InvalidSpaceMac"
+                    )
+                }
                 let headers = try self.credentialHeaders(credential)
-                try await client.execute(uri: uri, method: .get, headers: headers) { response in
+                try await client.execute(
+                    uri: uri,
+                    method: .get,
+                    headers: headers
+                ) { response in
                     XCTAssertEqual(response.status, .ok)
                     try self.assertRecordMAC(
                         response,
@@ -154,7 +246,10 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 }
             }
             try await fixture.close()
-        } catch { try? await fixture.close(); throw error }
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
     }
 
     func testCredentialRenewalReportsSpaceDeletedOnlyAfterValidDelegationAndCredentialKey() async throws {
@@ -320,7 +415,9 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     self.assertNoStore(response)
-                    XCTAssertNil(response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!])
+                    XCTAssertNil(response.headers[
+                        HTTPField.Name(SpaceMACHeaders.signatureHeader)!
+                    ])
                     let records = try XCTUnwrap(
                         (try self.jsonObject(response.body))["records"] as? [[String: Any]]
                     )
@@ -1403,7 +1500,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 credentialPublicKeys: credentialKeys,
                 clientAttestationPolicy: clientAttestationPolicy
             ),
-            spaceRepositorySyncConfiguration: .init(commitSigner: October22MACProvider())
+            spaceRepositorySyncConfiguration: .init(commitSigner: November12MACProvider())
         )
     }
 
@@ -1470,19 +1567,25 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
     }
 
     /// Every credential read here targets the member's repo, so the signed
-    /// audience defaults to that repo owner's DID. Each request receives a fresh
-    /// key exchange for the October 22 record response MAC.
+    /// audience defaults to that repo owner's DID. Each request receives a
+    /// fresh HPKE export for the record response MAC.
     private func credentialHeaders(
         _ token: String,
         audience: String = SpaceCredentialHTTPTests.member,
         contentType: Bool = false
     ) throws -> HTTPFields {
-        var headers = try SpaceCredentialSignatureTestSupport.headers(token: token, audience: audience)
-        let exchange = try SpaceMAC.encapsulate(authorKey: October22MACProvider.publicKey)
-        headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!] = try SpaceMACHeaders.formatWantMAC(
-            keyShare: exchange.keyShare,
-            type: .record
+        var headers = try SpaceCredentialSignatureTestSupport.headers(
+            token: token,
+            audience: audience
         )
+        let exchange = try SpaceMACKeyAgreement.send(
+            authorKeyID: November12MACProvider.publicKey
+        )
+        headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!] =
+            try SpaceMACHeaders.makeRequest(
+                keyID: exchange.keyID,
+                profile: .record
+            ).headerValue
         if contentType { headers[.contentType] = "application/json" }
         return headers
     }
@@ -1503,38 +1606,48 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         let canonicalRecord = try DAGCBOR.encodeValue(output.value.toCBORValue())
         XCTAssertEqual(uri, expectedURI, file: file, line: line)
         XCTAssertEqual(canonicalRecord, expectedRecord, file: file, line: line)
-        XCTAssertEqual(output.cid, CID.fromDAGCBOR(canonicalRecord), file: file, line: line)
-
-        let request = try SpaceMACHeaders.parseWantMAC(
-            requestHeaders[HTTPField.Name(SpaceMACHeaders.requestHeader)!],
-            type: .record
-        )
-        let sharedSecret = try SpaceMAC.decapsulate(
-            privateKey: October22MACProvider.key,
-            keyShare: request.keyShare
-        )
-        let mac = try SpaceMACHeaders.parseMAC(
-            response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!],
-            type: .record
-        )
         XCTAssertEqual(
-            mac,
-            try SpaceMAC.record(sharedSecret: sharedSecret, uri: uri, cid: Data(output.cid.bytes)),
+            output.cid,
+            CID.fromDAGCBOR(canonicalRecord),
             file: file,
             line: line
         )
-        XCTAssertNotEqual(
-            mac,
-            try SpaceMAC.record(sharedSecret: sharedSecret, uri: uri + "-changed", cid: Data(output.cid.bytes)),
-            file: file,
-            line: line
+
+        let request = try XCTUnwrap(SpaceMACHeaders.parseRequest(
+            requestHeaders[values: HTTPField.Name(SpaceMACHeaders.requestHeader)!],
+            profile: .record
+        ))
+        let sharedSecret = try SpaceMACKeyAgreement.receive(
+            authorPrivateKey: November12MACProvider.key,
+            keyID: request.keyID
         )
-        XCTAssertNotEqual(
-            mac,
-            try SpaceMAC.record(
-                sharedSecret: sharedSecret,
+        func verify(uri: String, cid: String) throws {
+            try SpaceMACHeaders.verifyRecord(
                 uri: uri,
-                cid: Data(CID.fromDAGCBOR(recordCBOR("changed")).bytes)
+                cid: cid,
+                request: request,
+                sharedSecret: sharedSecret,
+                coveredHeader: response.headers[
+                    HTTPField.Name(SpaceMACHeaders.recordHeader)!
+                ],
+                signatureInput: response.headers[
+                    HTTPField.Name(SpaceMACHeaders.signatureInputHeader)!
+                ],
+                signature: response.headers[
+                    HTTPField.Name(SpaceMACHeaders.signatureHeader)!
+                ]
+            )
+        }
+        try verify(uri: uri, cid: output.cid.string)
+        XCTAssertThrowsError(
+            try verify(uri: uri + "-changed", cid: output.cid.string),
+            file: file,
+            line: line
+        )
+        XCTAssertThrowsError(
+            try verify(
+                uri: uri,
+                cid: CID.fromDAGCBOR(recordCBOR("changed")).string
             ),
             file: file,
             line: line

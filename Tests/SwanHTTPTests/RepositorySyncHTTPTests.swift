@@ -432,17 +432,17 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                             requestHeaders: headers, responseHeaders: response.headers
                         )
                         XCTAssertEqual(verified.records.map { $0.uri.rkey }, ["bob"])
-                        let mac = try SpaceMACHeaders.parseMAC(
-                            response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!], type: .repository
-                        )
+                        let signature = try XCTUnwrap(response.headers[
+                            HTTPField.Name(SpaceMACHeaders.signatureHeader)!
+                        ])
                         if index == 0 {
                             await firstMemberArchive.set(archive)
-                            await firstMemberMAC.set(mac)
+                            await firstMemberMAC.set(Data(signature.utf8))
                         } else {
                             let initialArchive = await firstMemberArchive.value
                             let initialMAC = await firstMemberMAC.value
                             XCTAssertEqual(archive, initialArchive)
-                            XCTAssertNotEqual(mac, initialMAC)
+                            XCTAssertNotEqual(Data(signature.utf8), initialMAC)
                         }
                     }
                 }
@@ -717,42 +717,105 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             let credential = try await fixture.credential(for: fixture.space)
             let oauth = try await issueToken(runtime: fixture.runtime, subject: Self.alice,
                                              scopes: [wholeSpaceReadScope(for: fixture.space)])
-            let wantName = HTTPField.Name(SpaceMACHeaders.requestHeader)!
-            let macName = HTTPField.Name(SpaceMACHeaders.responseHeader)!
+            let requestName = HTTPField.Name(SpaceMACHeaders.requestHeader)!
+            let signatureName = HTTPField.Name(SpaceMACHeaders.signatureHeader)!
             try await app.test(.router) { client in
                 for uri in [self.latestURI(space: fixture.space, repo: Self.alice),
                             self.oplogURI(space: fixture.space, repo: Self.alice, limit: 1),
                             self.repoURI(space: fixture.space, repo: Self.alice)] {
-                    for failure in ["missing", "wrong-type", "invalid-share", "duplicate"] {
-                        var headers = try self.credentialHeaders(credential, audience: Self.alice, fixture: fixture)
-                        let valid = try XCTUnwrap(headers[wantName])
+                    for failure in [
+                        "missing", "wrong-tag", "invalid-key", "duplicate",
+                        "malformed", "unsupported", "wrong-component", "wrong-alg",
+                    ] {
+                        var headers = try self.credentialHeaders(
+                            credential,
+                            audience: Self.alice,
+                            fixture: fixture
+                        )
+                        let valid = try XCTUnwrap(headers[requestName])
+                        let parsed = try XCTUnwrap(
+                            SpaceMACHeaders.parseRequest(valid, profile: .commit)
+                        )
                         switch failure {
-                        case "missing": headers[wantName] = nil
-                        case "wrong-type":
-                            let share = try SpaceMACHeaders.parseWantMAC(valid, type: .repository).keyShare
-                            headers[wantName] = try SpaceMACHeaders.formatWantMAC(keyShare: share, type: .record)
-                        case "invalid-share":
-                            headers[wantName] = try SpaceMACHeaders.formatWantMAC(keyShare: "invalid", type: .repository)
-                        default: headers.append(HTTPField(name: wantName, value: valid))
+                        case "missing":
+                            headers[requestName] = nil
+                        case "wrong-tag":
+                            headers[requestName] = try SpaceMACHeaders.makeRequest(
+                                keyID: parsed.keyID,
+                                profile: .record
+                            ).headerValue
+                        case "invalid-key":
+                            headers[requestName] =
+                                #"mac=("atproto-space-commit";sf);keyid="did:key:invalid";tag="atproto-space-commit""#
+                        case "duplicate":
+                            headers[requestName] =
+                                valid + ", second=" + parsed.signatureParameters
+                        case "malformed":
+                            headers[requestName] = "not a structured field"
+                        case "unsupported":
+                            headers[requestName] = valid + ";created=1"
+                        case "wrong-component":
+                            headers[requestName] =
+                                #"mac=("atproto-space-record";sf);keyid="\#(parsed.keyID)";tag="atproto-space-commit""#
+                        default:
+                            headers[requestName] = valid + #";alg="sha-256""#
                         }
-                        try await client.execute(uri: uri, method: .get, headers: headers) { response in
+                        try await client.execute(
+                            uri: uri,
+                            method: .get,
+                            headers: headers
+                        ) { response in
                             XCTAssertEqual(response.status, .badRequest, failure)
-                            XCTAssertEqual(try self.errorCode(response.body), "InvalidSpaceMac", failure)
-                            XCTAssertNil(response.headers[macName])
+                            XCTAssertEqual(
+                                try self.errorCode(response.body),
+                                "InvalidSpaceMac",
+                                failure
+                            )
+                            XCTAssertNil(response.headers[signatureName])
                         }
                     }
                 }
                 var headers = try self.dpopHeaders(
                     token: oauth.token, key: oauth.key, jwk: oauth.jwk,
-                    nonce: fixture.runtime.dpopNonceService.issue(), jti: "owner-mac-opt-in", path: Self.latestPath
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "owner-mac-opt-in", path: Self.latestPath
                 )
-                headers[wantName] = try self.credentialHeaders(credential, audience: Self.alice, fixture: fixture)[wantName]
-                try await client.execute(uri: self.latestURI(space: fixture.space, repo: Self.alice),
-                                         method: .get, headers: headers) { response in
+                let credentialRequest = try XCTUnwrap(
+                    self.credentialHeaders(
+                        credential,
+                        audience: Self.alice,
+                        fixture: fixture
+                    )[requestName]
+                )
+                let keyID = try XCTUnwrap(
+                    SpaceMACHeaders.parseRequest(
+                        credentialRequest,
+                        profile: .commit
+                    )
+                ).keyID
+                let ignored = try SpaceMACHeaders.makeRequest(
+                    keyID: keyID,
+                    profile: .record,
+                    label: "other"
+                ).headerValue
+                headers[requestName] = ignored + ", " + credentialRequest
+                try await client.execute(
+                    uri: self.latestURI(space: fixture.space, repo: Self.alice),
+                    method: .get,
+                    headers: headers
+                ) { response in
                     XCTAssertEqual(response.status, .ok)
-                    let commit = try XCTUnwrap(self.jsonObject(response.body)["commit"] as? [String: Any])
-                    try self.assertCommit(commit, fixture: fixture, author: Self.alice,
-                                          requestHeaders: headers, responseHeaders: response.headers)
+                    let commit = try XCTUnwrap(
+                        self.jsonObject(response.body)["commit"]
+                            as? [String: Any]
+                    )
+                    try self.assertCommit(
+                        commit,
+                        fixture: fixture,
+                        author: Self.alice,
+                        requestHeaders: headers,
+                        responseHeaders: response.headers
+                    )
                 }
             }
             try await fixture.close()
@@ -814,14 +877,15 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 var cursor: String?
                 var cursors: [String] = []
                 var sawCommit = false
-                var previousKeyShare: String?
+                var previousKeyID: String?
                 for _ in 0 ..< 10 {
                     let headers = try self.credentialHeaders(credential, audience: Self.alice, fixture: fixture)
-                    let keyShare = try SpaceMACHeaders.parseWantMAC(
-                        headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!], type: .repository
-                    ).keyShare
-                    XCTAssertNotEqual(keyShare, previousKeyShare)
-                    previousKeyShare = keyShare
+                    let keyID = try XCTUnwrap(SpaceMACHeaders.parseRequest(
+                        headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!],
+                        profile: .commit
+                    )).keyID
+                    XCTAssertNotEqual(keyID, previousKeyID)
+                    previousKeyID = keyID
                     try await client.execute(
                         uri: self.oplogURI(
                             space: fixture.space,
@@ -847,7 +911,9 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                             XCTAssertNil(next)
                             sawCommit = true
                         } else {
-                            XCTAssertNil(response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!])
+                            XCTAssertNil(response.headers[
+                                HTTPField.Name(SpaceMACHeaders.signatureHeader)!
+                            ])
                             XCTAssertNotNil(next)
                         }
                         cursor = next
@@ -1387,10 +1453,17 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         _ credential: String, audience: String, fixture: Fixture
     ) throws -> HTTPFields {
         var headers = try SpaceCredentialSignatureTestSupport.headers(token: credential, audience: audience)
-        let key = try P256.KeyAgreement.PrivateKey(rawRepresentation: XCTUnwrap(fixture.kemPrivateKeys[audience]))
-        let exchange = try SpaceMAC.encapsulate(authorKey: AccountKEMKeyProvider.didKey(key.publicKey))
+        let key = try P256.KeyAgreement.PrivateKey(
+            rawRepresentation: XCTUnwrap(fixture.kemPrivateKeys[audience])
+        )
+        let exchange = try SpaceMACKeyAgreement.send(
+            authorKeyID: AccountKEMKeyProvider.didKey(key.publicKey)
+        )
         headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!] =
-            try SpaceMACHeaders.formatWantMAC(keyShare: exchange.keyShare, type: .repository)
+            try SpaceMACHeaders.makeRequest(
+                keyID: exchange.keyID,
+                profile: .commit
+            ).headerValue
         return headers
     }
 
@@ -1421,16 +1494,40 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         requestHeaders: HTTPFields?,
         responseHeaders: HTTPFields?
     ) throws {
-        let responseHeader = responseHeaders?[HTTPField.Name(SpaceMACHeaders.responseHeader)!]
-        guard let requestHeader = requestHeaders?[HTTPField.Name(SpaceMACHeaders.requestHeader)!] else {
-            XCTAssertNil(responseHeader, "Owner OAuth without a MAC exchange returns no response MAC")
+        let signature = responseHeaders?[
+            HTTPField.Name(SpaceMACHeaders.signatureHeader)!
+        ]
+        guard let requestValues = requestHeaders?[
+            values: HTTPField.Name(SpaceMACHeaders.requestHeader)!
+        ], !requestValues.isEmpty else {
+            XCTAssertNil(
+                signature,
+                "Owner OAuth without a MAC exchange returns no response MAC"
+            )
             return
         }
-        let wanted = try SpaceMACHeaders.parseWantMAC(requestHeader, type: .repository)
-        let key = try P256.KeyAgreement.PrivateKey(rawRepresentation: XCTUnwrap(fixture.kemPrivateKeys[commit.repo]))
-        let secret = try SpaceMAC.decapsulate(privateKey: key, keyShare: wanted.keyShare)
-        let actual = try SpaceMACHeaders.parseMAC(responseHeader, type: .repository)
-        try SpaceMAC.verify(mac: actual, expected: commit.mac(sharedSecret: secret))
+        let request = try XCTUnwrap(
+            SpaceMACHeaders.parseRequest(requestValues, profile: .commit)
+        )
+        let key = try P256.KeyAgreement.PrivateKey(
+            rawRepresentation: XCTUnwrap(fixture.kemPrivateKeys[commit.repo])
+        )
+        let secret = try SpaceMACKeyAgreement.receive(
+            authorPrivateKey: key,
+            keyID: request.keyID
+        )
+        try SpaceMACHeaders.verifyCommit(
+            commit,
+            request: request,
+            sharedSecret: secret,
+            coveredHeader: responseHeaders?[
+                HTTPField.Name(SpaceMACHeaders.commitHeader)!
+            ],
+            signatureInput: responseHeaders?[
+                HTTPField.Name(SpaceMACHeaders.signatureInputHeader)!
+            ],
+            signature: signature
+        )
     }
 
     private func makeJWK(_ key: P256.Signing.PrivateKey) throws -> OAuthJSONWebKey {
