@@ -1,7 +1,6 @@
 import Crypto
 import Foundation
 import Petrel
-import PetrelCrypto
 import SwanCore
 import SwanOAuth
 import SwanSpaces
@@ -33,8 +32,7 @@ public struct PermissionedRemoteReplicaSourceSession: Sendable {
     public let verificationKey: PermissionedDataJWTVerificationKey?
     fileprivate let starAuthentication: STARAuthentication?
     fileprivate struct STARAuthentication: Sendable {
-        let sharedSecret: Data
-        let mac: Data
+        let commit: SpaceRepositoryCommit
     }
     public let freshnessWitness: PermissionedRemoteReplicaFreshnessWitness
     public let source: any SpaceCARRecoveryByteSource
@@ -64,27 +62,34 @@ public struct PermissionedRemoteReplicaSourceSession: Sendable {
         )
     }
 
-    /// Native October 22 source session. The dedicated KEM key's fingerprint
-    /// binds source custody; the shared secret and MAC are request-specific.
+    /// Native Nov-12 source session. The dedicated KEM key's fingerprint
+    /// binds source custody; the commit was authenticated by the request's
+    /// RFC 9421 response MAC before the streamed archive is exposed.
     public init(
         identity: PermissionedRemoteReplicaSourceIdentity,
         authorKEMKey: String,
-        sharedSecret: Data,
-        mac: Data,
+        authenticatedCommit: SpaceRepositoryCommit,
         freshnessWitness: PermissionedRemoteReplicaFreshnessWitness,
         source: any SpaceCARRecoveryByteSource,
         closeSource: @escaping @Sendable () async -> Void
     ) throws {
-        guard identity.verifierIdentity == (try PermissionedSpaceMACRequest.verifierIdentity(authorKEMKey: authorKEMKey)),
-              sharedSecret.count == 32, mac.count == 32 else {
+        guard identity.verifierIdentity == (
+            try PermissionedSpaceMACRequest.verifierIdentity(
+                authorKEMKey: authorKEMKey
+            )
+        ) else {
             throw PermissionedRemoteReplicaRecoveryError.invalidBinding
         }
         self.identity = identity
         self.verificationKey = nil
-        self.starAuthentication = STARAuthentication(sharedSecret: sharedSecret, mac: mac)
+        self.starAuthentication = STARAuthentication(
+            commit: authenticatedCommit
+        )
         self.freshnessWitness = freshnessWitness
         self.source = source
-        self.closeGate = PermissionedRemoteReplicaSourceCloseGate(action: closeSource)
+        self.closeGate = PermissionedRemoteReplicaSourceCloseGate(
+            action: closeSource
+        )
     }
 
     fileprivate func close() async {
@@ -279,10 +284,9 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
                         maximumRecordCount: limits.maximumIndexEntries
                     ),
                     commitVerifier: { commit in
-                        try SpaceMAC.verify(
-                            mac: authentication.mac,
-                            expected: commit.mac(sharedSecret: authentication.sharedSecret)
-                        )
+                        guard commit == authentication.commit else {
+                            throw SpaceSTARError.badMAC
+                        }
                         return true
                     }
                 )

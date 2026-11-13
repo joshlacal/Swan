@@ -1,6 +1,5 @@
 import Foundation
 import Petrel
-import PetrelCrypto
 import SwanCore
 import SwanOAuth
 import SwanSpaces
@@ -49,8 +48,7 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
         commit: ComAtprotoSpaceDefs.Commit,
         base: PermissionedRemoteReplicaIncrementalBaseState,
         target: PermissionedRemoteReplicaTarget,
-        sharedSecret: Data,
-        mac: Data
+        authenticatedCommit: SpaceRepositoryCommit
     ) throws -> VerifiedPermissionedRemoteReplicaIncrementalPage {
         guard base.head.target == target else {
             throw PermissionedRemoteReplicaIncrementalVerificationError
@@ -145,8 +143,7 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
         let freshness = try verifyCommit(
             commit,
             target: target,
-            sharedSecret: sharedSecret,
-            mac: mac
+            authenticatedCommit: authenticatedCommit
         )
         guard freshness.wireRevision == previousRevision else {
             throw PermissionedRemoteReplicaIncrementalVerificationError
@@ -176,23 +173,30 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
     public static func verifyCommit(
         _ commit: ComAtprotoSpaceDefs.Commit,
         target: PermissionedRemoteReplicaTarget,
-        sharedSecret: Data,
-        mac: Data
+        authenticatedCommit: SpaceRepositoryCommit
     ) throws -> PermissionedRemoteReplicaFreshnessWitness {
         let value: SpaceRepositoryCommit
         do {
             value = try SpaceRepositoryCommit(
-                ver: commit.ver, repo: commit.repo.didString(),
-                space: SpaceURI(commit.space.uriString()), rev: commit.rev.toString(), data: commit.data.data
+                ver: commit.ver,
+                repo: commit.repo.didString(),
+                space: SpaceURI(commit.space.uriString()),
+                rev: commit.rev.toString(),
+                data: commit.data.data
             )
-        } catch { throw PermissionedRemoteReplicaIncrementalVerificationError.invalidCommit }
+        } catch {
+            throw PermissionedRemoteReplicaIncrementalVerificationError.invalidCommit
+        }
         guard value.repo == target.repositoryDID, value.space == target.space else {
             throw PermissionedRemoteReplicaIncrementalVerificationError.invalidCommit
         }
-        do {
-            try SpaceMAC.verify(mac: mac, expected: value.mac(sharedSecret: sharedSecret))
-        } catch { throw PermissionedRemoteReplicaIncrementalVerificationError.contentBindingMismatch }
-        return try PermissionedRemoteReplicaFreshnessWitness(wireRevision: commit.rev, commitment: value.data)
+        guard value == authenticatedCommit else {
+            throw PermissionedRemoteReplicaIncrementalVerificationError.contentBindingMismatch
+        }
+        return try PermissionedRemoteReplicaFreshnessWitness(
+            wireRevision: commit.rev,
+            commitment: value.data
+        )
     }
 
     public static func requireSameHead(

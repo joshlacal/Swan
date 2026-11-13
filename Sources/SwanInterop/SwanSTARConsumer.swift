@@ -1,6 +1,5 @@
 import Foundation
 import Petrel
-import PetrelCrypto
 import SwanSpaces
 
 /// A bounded witness from a fully authenticated current-protocol STAR file.
@@ -14,8 +13,10 @@ public struct SwanSTARConsumer: Sendable {
     public init(limits: SpaceSTARLimits = .standard) { self.limits = limits }
 
     public func verifyStreaming(
-        fileURL: URL, space: SpaceURI, author: String,
-        sharedSecret: Data, mac: Data,
+        fileURL: URL,
+        space: SpaceURI,
+        author: String,
+        authenticatedCommit: SpaceRepositoryCommit,
         expectedEntries: [SpaceCARRecoveryIndexEntry] = []
     ) async throws -> VerifiedSwanSTARWitness {
         let source = try PermissionedRemoteReplicaFileSource(fileURL: fileURL)
@@ -24,7 +25,7 @@ public struct SwanSTARConsumer: Sendable {
             let result = try await SpaceSTARCodec.verifyStreaming(
                 source: source, sink: sink, space: space, author: author, limits: limits,
                 commitVerifier: { commit in
-                    try SpaceMAC.verify(mac: mac, expected: commit.mac(sharedSecret: sharedSecret))
+                    guard commit == authenticatedCommit else { throw SpaceSTARError.badMAC }
                     return true
                 }
             )

@@ -1,6 +1,5 @@
 import Foundation
 import Petrel
-import PetrelCrypto
 import SwanAccounts
 import SwanCore
 import SwanOAuth
@@ -42,9 +41,9 @@ public enum PermissionedRemoteReplicaSourceFault: Sendable, Equatable {
     }
 }
 
-/// A native October 22 HTTP source: independently MAC-authenticates a fresh
-/// head observation and STAR metadata using a new KEM exchange per request.
-/// Full record/digest validation and transactional publication happen in the
+/// A native Nov-12 HTTP source: independently MAC-authenticates a fresh head
+/// observation and STAR metadata using a new HPKE export per request. Full
+/// record/digest validation and transactional publication happen in the
 /// recovery orchestrator; a metadata MAC alone is never a complete-repo proof.
 public struct PermissionedRemoteReplicaHTTPSourceProvider:
     PermissionedRemoteReplicaSourceProvider, Sendable
@@ -120,20 +119,22 @@ public struct PermissionedRemoteReplicaHTTPSourceProvider:
                     try await self.authorization(path: path, provider: self.host.authorizationProvider, fallback: self.host.authorization)
                 }
             )
-            guard (200...299).contains(authenticated.response.status), authenticated.commit != nil else {
+            guard (200...299).contains(authenticated.response.status),
+                  let authenticatedCommit = authenticated.commit else {
                 throw InteropHTTPError.unexpectedStatus(authenticated.response.status)
             }
             let identity = try PermissionedRemoteReplicaSourceIdentity(
                 origin: host.client.http.baseURL, repositoryDID: target.repositoryDID,
                 verifierIdentity: authenticated.request.verifierIdentity
             )
-            let mac = try SpaceMACHeaders.parseMAC(authenticated.response.header(SpaceMACHeaders.responseHeader), type: .repository)
             try fault.apply(to: spoolURL)
             let source = try PermissionedRemoteReplicaFileSource(fileURL: spoolURL)
             return try PermissionedRemoteReplicaSourceSession(
-                identity: identity, authorKEMKey: authenticated.request.authorKEMKey,
-                sharedSecret: authenticated.request.sharedSecret, mac: mac,
-                freshnessWitness: freshness, source: source,
+                identity: identity,
+                authorKEMKey: authenticated.request.authorKEMKey,
+                authenticatedCommit: authenticatedCommit,
+                freshnessWitness: freshness,
+                source: source,
                 closeSource: {
                     await source.close()
                     try? FileManager.default.removeItem(at: spoolURL)

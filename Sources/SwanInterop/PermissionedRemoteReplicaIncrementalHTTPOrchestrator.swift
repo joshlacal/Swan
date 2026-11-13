@@ -1,7 +1,5 @@
-import Crypto
 import Foundation
 import Petrel
-import PetrelCrypto
 import SwanAccounts
 import SwanCore
 import SwanOAuth
@@ -65,32 +63,20 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
             since: base.head.wireRevision.toString()
         )
         Self.stageLog("listRepoOps response received")
-        let output: ComAtprotoSpaceListRepoOps.Output
-        let pageRequest: PermissionedSpaceMACRequest
-        let pageMAC: Data?
+        let operations: [ComAtprotoSpaceListRepoOps.OpEntry]
+        let terminalCommit: ComAtprotoSpaceDefs.Commit
+        let authenticatedCommit: SpaceRepositoryCommit
         switch page {
         case .fullRecoveryRequired:
             return .fullCARRecoveryRequired
-        case let .output(value, request, mac):
-            output = value
-            pageRequest = request
-            pageMAC = mac
+        case let .output(value):
+            operations = value.operations
+            terminalCommit = value.commit
+            authenticatedCommit = value.authenticatedCommit
         }
-        guard let terminalCommit = output.commit, let pageMAC else {
-            // The current reference uses a rev/index cursor for a full page.
-            // This client deliberately falls back to complete STAR recovery
-            // rather than publishing any unauthenticated intermediate page.
-            if (Self.maximumWirePageOperations...SpaceWriteLimits.maximumOperations).contains(output.ops.count),
-               let cursor = output.cursor, let last = output.ops.last,
-               Self.validContinuation(cursor, lastRevision: last.rev.toString()) {
-                return .fullCARRecoveryRequired
-            }
-            throw PermissionedRemoteReplicaIncrementalVerificationError.invalidCommit
-        }
-        guard output.cursor == nil else {
-            throw PermissionedRemoteReplicaIncrementalVerificationError.invalidOperation
-        }
-        let operations = output.ops
+        // Every page has already authenticated the host's current commit with
+        // a fresh HPKE export. Only the final page's commit is compared with
+        // the state after all pages have been applied.
         // The pinned PDS omits values for mutations superseded by a later
         // operation in the requested interval. The durable store cannot
         // materialize those intermediate CIDs without their authenticated
@@ -113,8 +99,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                 .verifyCommit(
                     terminalCommit,
                     target: target,
-                    sharedSecret: pageRequest.sharedSecret,
-                    mac: pageMAC
+                    authenticatedCommit: authenticatedCommit
                 )
             try PermissionedRemoteReplicaIncrementalVerifier.requireSameHead(
                 page, latest
@@ -146,8 +131,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                     commit: terminalCommit,
                     base: base,
                     target: target,
-                    sharedSecret: pageRequest.sharedSecret,
-                    mac: pageMAC
+                    authenticatedCommit: authenticatedCommit
                 )
         } catch PermissionedRemoteReplicaIncrementalVerificationError
             .commitmentMismatch {
@@ -161,8 +145,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                 .verifyCommit(
                     terminalCommit,
                     target: target,
-                    sharedSecret: pageRequest.sharedSecret,
-                    mac: pageMAC
+                    authenticatedCommit: authenticatedCommit
                 )
             try PermissionedRemoteReplicaIncrementalVerifier.requireSameHead(
                 terminal, latest
@@ -221,8 +204,14 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
         return true
     }
 
+    private struct ListedOperations {
+        let operations: [ComAtprotoSpaceListRepoOps.OpEntry]
+        let commit: ComAtprotoSpaceDefs.Commit
+        let authenticatedCommit: SpaceRepositoryCommit
+    }
+
     private enum ListResult {
-        case output(ComAtprotoSpaceListRepoOps.Output, PermissionedSpaceMACRequest, Data?)
+        case output(ListedOperations)
         case fullRecoveryRequired
     }
 
@@ -234,47 +223,87 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
         target: PermissionedRemoteReplicaTarget,
         since: String
     ) async throws -> ListResult {
-        let query = [
-            "space": target.space.rawValue,
-            "repo": target.repositoryDID,
-            "since": since,
-            "limit": String(Self.maximumWirePageOperations),
-        ]
-        let path = try source.client.xrpcPath(
-            "com.atproto.space.listRepoOps", query: query
-        )
-        let authenticated: PermissionedSpaceMACResponse
-        do {
-            authenticated = try await PermissionedSpaceMACHTTP.query(
-                host: source, nsid: "com.atproto.space.listRepoOps", query: query,
-                space: target.space, author: target.repositoryDID,
-                authorization: { try await self.authorization(path: path) },
-                commit: { try StrictJSON.decode(ComAtprotoSpaceListRepoOps.Output.self, from: $0).commit }
+        var cursor: String?
+        var seenCursors = Set<String>()
+        var operations: [ComAtprotoSpaceListRepoOps.OpEntry] = []
+        while true {
+            var query = [
+                "space": target.space.rawValue,
+                "repo": target.repositoryDID,
+                "since": since,
+                "limit": String(Self.maximumWirePageOperations),
+            ]
+            query["cursor"] = cursor
+            let path = try source.client.xrpcPath(
+                "com.atproto.space.listRepoOps",
+                query: query
             )
-        } catch InteropHTTPError.responseTooLarge {
-            return .fullRecoveryRequired
-        }
-        let response = authenticated.response
-        if response.status == 409 {
-            guard response.header("content-type")?.lowercased().contains("json")
-                    == true,
-                  let error = try? StrictJSON.decode(
-                      ErrorBody.self,
-                      from: response.body
-                  ),
-                  error.error == "full_repo_recovery_required" else {
+            let authenticated: PermissionedSpaceMACResponse
+            do {
+                authenticated = try await PermissionedSpaceMACHTTP.query(
+                    host: source,
+                    nsid: "com.atproto.space.listRepoOps",
+                    query: query,
+                    space: target.space,
+                    author: target.repositoryDID,
+                    authorization: { try await self.authorization(path: path) },
+                    commit: {
+                        try StrictJSON.decode(
+                            ComAtprotoSpaceListRepoOps.Output.self,
+                            from: $0
+                        ).commit
+                    }
+                )
+            } catch InteropHTTPError.responseTooLarge {
+                return .fullRecoveryRequired
+            }
+            let response = authenticated.response
+            if response.status == 409 {
+                guard response.header("content-type")?.lowercased().contains("json")
+                        == true,
+                      let error = try? StrictJSON.decode(
+                          ErrorBody.self,
+                          from: response.body
+                      ),
+                      error.error == "full_repo_recovery_required" else {
+                    throw InteropHTTPError.unexpectedStatus(response.status)
+                }
+                return .fullRecoveryRequired
+            }
+            guard (200 ... 299).contains(response.status),
+                  response.header("content-type")?.lowercased().contains("json")
+                    == true else {
                 throw InteropHTTPError.unexpectedStatus(response.status)
             }
-            return .fullRecoveryRequired
+            let output = try StrictJSON.decode(
+                ComAtprotoSpaceListRepoOps.Output.self,
+                from: response.body
+            )
+            guard let commit = output.commit,
+                  let authenticatedCommit = authenticated.commit else {
+                throw PermissionedRemoteReplicaIncrementalVerificationError.invalidCommit
+            }
+            guard output.ops.count <= Self.maximumWirePageOperations else {
+                return .fullRecoveryRequired
+            }
+            guard output.ops.count <= SpaceWriteLimits.maximumOperations - operations.count else {
+                return .fullRecoveryRequired
+            }
+            operations.append(contentsOf: output.ops)
+            guard let next = output.cursor else {
+                return .output(.init(
+                    operations: operations,
+                    commit: commit,
+                    authenticatedCommit: authenticatedCommit
+                ))
+            }
+            guard let last = output.ops.last,
+                  Self.validContinuation(next, lastRevision: last.rev.toString()),
+                  seenCursors.insert(next).inserted else {
+                throw PermissionedRemoteReplicaIncrementalVerificationError.invalidOperation
+            }
+            cursor = next
         }
-        guard (200 ... 299).contains(response.status),
-              response.header("content-type")?.lowercased().contains("json")
-                == true else {
-            throw InteropHTTPError.unexpectedStatus(response.status)
-        }
-        let output = try StrictJSON.decode(ComAtprotoSpaceListRepoOps.Output.self, from: response.body)
-        let mac = output.commit == nil ? nil : try SpaceMACHeaders.parseMAC(response.header(SpaceMACHeaders.responseHeader), type: .repository)
-        return .output(output, authenticated.request, mac)
     }
 
     private func getLatestCommit(

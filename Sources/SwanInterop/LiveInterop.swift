@@ -523,7 +523,7 @@ public struct InteropXRPCClient: Sendable {
         query: [String: String] = [:],
         authorization: InteropAuthorization = .none,
         maximumResponseBytes: Int? = nil,
-        spaceWantMAC: String? = nil
+        acceptSignature: String? = nil
     ) async throws -> InteropHTTPResponse {
         try await request(
             method: .get,
@@ -532,7 +532,7 @@ public struct InteropXRPCClient: Sendable {
             body: nil,
             authorization: authorization,
             maximumResponseBytes: maximumResponseBytes,
-            spaceWantMAC: spaceWantMAC
+            acceptSignature: acceptSignature
         )
     }
 
@@ -611,11 +611,11 @@ public struct InteropXRPCClient: Sendable {
         authorization: InteropAuthorization = .none,
         to destination: URL,
         maximumResponseBytes: Int,
-        spaceWantMAC: String? = nil
+        acceptSignature: String? = nil
     ) async throws -> InteropHTTPResponse {
         let path = try xrpcPath(nsid, query: query)
-        var headers = ["Accept": "application/vnd.ipld.car, application/octet-stream, */*"]
-        if let spaceWantMAC { headers[SpaceMACHeaders.requestHeader] = spaceWantMAC }
+        var headers = ["Accept": "application/vnd.dasl.star, application/vnd.ipld.car, application/octet-stream, */*"]
+        if let acceptSignature { headers[SpaceMACHeaders.requestHeader] = acceptSignature }
         try addAuthorization(authorization, query: query, body: nil, to: &headers)
         let response = try await http.executeStreaming(
             method: .get,
@@ -656,11 +656,11 @@ public struct InteropXRPCClient: Sendable {
         body: Data?,
         authorization: InteropAuthorization,
         maximumResponseBytes: Int?,
-        spaceWantMAC: String? = nil
+        acceptSignature: String? = nil
     ) async throws -> InteropHTTPResponse {
         let path = try makeXRPCPath(nsid, query: query)
         var headers = ["Accept": "application/json"]
-        if let spaceWantMAC { headers[SpaceMACHeaders.requestHeader] = spaceWantMAC }
+        if let acceptSignature { headers[SpaceMACHeaders.requestHeader] = acceptSignature }
         if body != nil { headers["Content-Type"] = "application/json" }
         try addAuthorization(authorization, query: query, body: body, to: &headers)
         let response = try await http.execute(
@@ -1486,7 +1486,7 @@ public enum PermissionedRecoveryFailureCode {
             case .digestMismatch: return "STARDigestMismatch"
             case .invalidSource: return "STARInvalidSource"
             }
-        case is SpaceMAC.Failure, is SpaceMACHeaders.HeaderError:
+        case is SpaceMACHeaders.HeaderError:
             return "SpaceMACMismatch"
         case let streaming as SpaceCARStreamingError:
             return spaceCARStreamingErrorCode(streaming)
@@ -2909,10 +2909,14 @@ public enum LiveInteropRunner {
                     verified: false, errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
                 )
             }
+            guard let authenticatedCommit = authenticated.commit else {
+                throw SpaceMACHeaders.HeaderError.invalidSpaceMAC
+            }
             let recovery = try await SwanSTARConsumer().verifyStreaming(
-                fileURL: spoolURL, space: space, author: author,
-                sharedSecret: authenticated.request.sharedSecret,
-                mac: SpaceMACHeaders.parseMAC(response.header(SpaceMACHeaders.responseHeader), type: .repository),
+                fileURL: spoolURL,
+                space: space,
+                author: author,
+                authenticatedCommit: authenticatedCommit,
                 expectedEntries: [expectedEntry]
             )
             return PermissionedCARResult(
@@ -3167,7 +3171,7 @@ private func canonicalInteropTID(_ rawValue: String?) -> String? {
 }
 
 private func liveErrorCode(_ error: Error) -> String {
-    if error is SpaceSTARError || error is SpaceMAC.Failure || error is SpaceMACHeaders.HeaderError {
+    if error is SpaceSTARError || error is SpaceMACHeaders.HeaderError {
         return PermissionedRecoveryFailureCode.code(for: error)
     }
     if let error = error as? SpaceCARStreamingError {
