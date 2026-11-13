@@ -213,28 +213,19 @@ private struct AuthenticatedListRepoOpsHandler:
             throw AuthenticatedSpaceRepositorySyncFailure.fullRecoveryRequired
         case let .incremental(state, entries):
             let operations = try entries.map(syncWireOperation)
-            let commit: ComAtprotoSpaceDefs.Commit?
-            // This is deliberately the reference condition, not `ops.isEmpty`:
-            // an exactly-full final page does not bind a head commit until the
-            // caller asks again and receives the short/empty page. Storage can
-            // extend the terminal revision beyond `limit` rather than split a
-            // same-TID atomic batch that this endpoint's `since` cursor could
-            // not resume; that conservative overflow likewise gets its commit
-            // on the following empty page.
-            if operations.count < limit {
-                commit = try await signedCommit(
-                    state: state,
-                    expectedSpace: target.space,
-                    expectedAuthor: target.author,
-                    capability: capability
-                )
-            } else {
-                commit = nil
+            guard let commit = try await signedCommit(
+                state: state,
+                expectedSpace: target.space,
+                expectedAuthor: target.author,
+                capability: capability
+            ) else {
+                throw AuthenticatedSpaceRepositorySyncFailure.repoNotFound
             }
-            // Like the reference, a cursor accompanies exactly the pages that
-            // carry no commit (more may follow).
+            // Every full page carries a cursor even when it happens to be the
+            // final page. The client's next request may therefore be empty;
+            // that extra round trip is the reference catch-up contract.
             var cursor: String?
-            if commit == nil, let last = operations.last {
+            if operations.count >= limit, let last = operations.last {
                 let lastRevision = last.rev.toString()
                 let index = operations.reduce(-1) {
                     $1.rev.toString() == lastRevision ? $0 + 1 : $0

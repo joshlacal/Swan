@@ -32,7 +32,7 @@ final class SpaceCredentialBrokerSignatureTests: XCTestCase, @unchecked Sendable
             authorization: authorization
         )
         _ = try await authority.query(
-            "com.atproto.space.listRepos",
+            "com.atproto.space.listWriters",
             query: ["space": fixture.space.rawValue],
             authorization: authorization
         )

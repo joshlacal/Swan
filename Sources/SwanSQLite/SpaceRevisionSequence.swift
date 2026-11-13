@@ -120,7 +120,7 @@ extension SQLiteAccountDatabase {
     /// then gives every writer row without a space revision one from
     /// ``SpaceRevisionSequence/backfill(repoRevisions:after:ceiling:)``.
     /// Queued forwards from before this migration keep NULL revisions and are
-    /// retired undelivered (syncers recover through `listRepos`).
+    /// retired undelivered (syncers recover through `listWriters`).
     ///
     /// The columns and NULL rows are re-checked on every open instead of
     /// trusting the marker alone, because the v21 rebuild recreates the
@@ -219,7 +219,7 @@ extension SQLiteAccountDatabase {
     /// endpoint (SWAN-SYNC-4), the row names the lowest service key, the one
     /// the endpoint-keyed transport lookup
     /// (`spaceNotificationRegistrationService`) resolves; write forwards are
-    /// reasonable-effort and syncers catch up through listRepos.
+    /// reasonable-effort and syncers catch up through listWriters.
     func enqueueWriteForwardsWithoutGate(
         space: SpaceURI,
         sourceEventID: String,

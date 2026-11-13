@@ -153,6 +153,8 @@ private enum AuthenticatedSpaceNotificationFailure: Error {
     case denied
     case credentialPresentation(SpaceCredentialPresentationFailure)
     case unavailable
+    case repoDeactivated
+    case repoTakendown
     /// The `service` identifier could not be resolved to a DID document with
     /// a usable service endpoint (Erratum 03). The lexicon's one named error
     /// for it; the underlying cause is logged, never returned — a 500 would
@@ -172,18 +174,40 @@ private enum SwanSpaceNotificationHTTP {
     static let registrationLifetime: TimeInterval = 24 * 60 * 60
 }
 
-private struct AuthenticatedListSpaceReposHandler:
-    ComAtprotoSpaceListRepos.ServerHandler
-{
-    typealias Context = Request
+private struct ListSpaceWritersParameters {
+    let space: SpaceRef
+    let limit: Int?
+    let cursor: String?
+}
 
+private struct ListSpaceWriterWireEntry: Encodable {
+    let type: String
+    let repo: DID
+    let repoRev: TID?
+    let data: Bytes?
+    let spaceRev: TID
+
+    enum CodingKeys: String, CodingKey {
+        case type = "$type"
+        case repo
+        case repoRev
+        case data
+        case spaceRev
+    }
+}
+
+private struct ListSpaceWritersWireOutput: Encodable {
+    let repos: [ListSpaceWriterWireEntry]
+    let cursor: String?
+}
+
+private struct AuthenticatedListSpaceWritersHandler {
     let capability: SwanAuthenticatedSpaceNotificationsCapability
 
     func handle(
-        parameters: ComAtprotoSpaceListRepos.Parameters,
-        input: Void,
+        parameters: ListSpaceWritersParameters,
         context request: Request
-    ) async throws -> ComAtprotoSpaceListRepos.Output {
+    ) async throws -> ListSpaceWritersWireOutput {
         let space = try notificationSpace(parameters.space)
         let authorization = try await credentialAuthorization(
             capability,
@@ -202,26 +226,22 @@ private struct AuthenticatedListSpaceReposHandler:
             throw notificationStorageFailure(error)
         }
         do {
-            // Latest writer states in ascending spaceRev order. A nonempty
-            // page always returns its last spaceRev as the exclusive
-            // checkpoint, even when short; an empty page omits the cursor so
-            // the caller keeps its previous one.
-            let repos: [ComAtprotoSpaceListRepos.Repo] = try writers.map {
+            let repos: [ListSpaceWriterWireEntry] = try writers.map {
                 guard let spaceRevision = $0.spaceRevision else {
                     throw AuthenticatedSpaceNotificationFailure.unavailable
                 }
-                return .init(
-                    did: try DID(didString: $0.repository),
-                    repoRev: try TID(tidString: $0.wireRevision),
-                    data: Bytes(data: $0.commitment),
-                    spaceRev: try TID(tidString: spaceRevision)
+                return try ListSpaceWriterWireEntry(
+                    type: $0.isRemoved
+                        ? "com.atproto.space.defs#repoRemoved"
+                        : "com.atproto.space.defs#repoWrite",
+                    repo: DID(didString: $0.repository),
+                    repoRev: $0.isRemoved ? nil : TID(tidString: $0.wireRevision),
+                    data: $0.isRemoved ? nil : Bytes(data: $0.commitment),
+                    spaceRev: TID(tidString: spaceRevision)
                 )
             }
             return .init(repos: repos, cursor: repos.last?.spaceRev.toString())
         } catch {
-            // The directory must already have validated these identifiers;
-            // treating an impossible projection mismatch as unavailable does
-            // not expose its internal state to the client.
             throw AuthenticatedSpaceNotificationFailure.unavailable
         }
     }
@@ -612,16 +632,16 @@ func registerAuthenticatedNotifyCredentialRevokedEndpoint(
     registerAuthenticatedNotificationWrongMethods(on: router, path: path, allowed: .post)
 }
 
-func registerAuthenticatedListSpaceReposEndpoint(
+func registerAuthenticatedListSpaceWritersEndpoint(
     on router: Router<BasicRequestContext>,
     capability: SwanAuthenticatedSpaceNotificationsCapability
 ) {
-    let handler = AuthenticatedListSpaceReposHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.space.listRepos"
+    let handler = AuthenticatedListSpaceWritersHandler(capability: capability)
+    let path: RouterPath = "/xrpc/com.atproto.space.listWriters"
     router.get(path) { request, _ async -> Response in
         do {
-            let parameters = try parseListSpaceReposParameters(request)
-            let output = try await handler.handle(parameters: parameters, input: (), context: request)
+            let parameters = try parseListSpaceWritersParameters(request)
+            let output = try await handler.handle(parameters: parameters, context: request)
             return authenticatedGetSpaceJSON(.ok, output)
         } catch let failure as AuthenticatedSpaceNotificationFailure {
             return authenticatedSpaceNotificationResponse(for: failure)
@@ -746,9 +766,9 @@ func registerAuthenticatedNotifySpaceDeletedEndpoint(
     registerAuthenticatedNotificationWrongMethods(on: router, path: path, allowed: .post)
 }
 
-private func parseListSpaceReposParameters(
+private func parseListSpaceWritersParameters(
     _ request: Request
-) throws -> ComAtprotoSpaceListRepos.Parameters {
+) throws -> ListSpaceWritersParameters {
     guard !request.uri.string.contains("#"),
           let rawQuery = request.uri.query,
           !rawQuery.isEmpty,
@@ -1212,6 +1232,12 @@ private func notificationStorageFailure(_ error: Error) -> AuthenticatedSpaceNot
     if error is AuthorizedSimpleSpaceLifecycleError {
         return .spaceNotFound
     }
+    if let error = error as? AuthorizedSpaceAuthorityStatusError {
+        return switch error {
+        case .deactivated: .repoDeactivated
+        case .takendown: .repoTakendown
+        }
+    }
     if let error = error as? AuthorizedSpaceWriteNotificationError {
         return switch error {
         case .futureRevision: .futureRevision
@@ -1252,6 +1278,10 @@ private func authenticatedSpaceNotificationResponse(
         authenticatedSpaceNotificationError(.badRequest, code: "ServiceNotResolvable")
     case .futureRevision:
         authenticatedSpaceNotificationError(.badRequest, code: "FutureRev")
+    case .repoDeactivated:
+        authenticatedSpaceNotificationError(.badRequest, code: "RepoDeactivated")
+    case .repoTakendown:
+        authenticatedSpaceNotificationError(.badRequest, code: "RepoTakendown")
     }
 }
 

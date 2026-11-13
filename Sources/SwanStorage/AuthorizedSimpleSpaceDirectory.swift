@@ -321,19 +321,25 @@ public struct AuthorizedSpaceWriter: Sendable, Equatable {
     /// from the authority's writer set, such as a repo host's outbound
     /// announcement, which carries no space revision.
     public let spaceRevision: String?
+    /// A removed writer remains in the sequenced set until a later write
+    /// re-adds it. Its previous repo revision and commitment are retained only
+    /// as durable high-water state and are not emitted on the wire.
+    public let isRemoved: Bool
 
     public init(
         space: SpaceURI,
         repository: String,
         wireRevision: String,
         commitment: Data,
-        spaceRevision: String? = nil
+        spaceRevision: String? = nil,
+        isRemoved: Bool = false
     ) {
         self.space = space
         self.repository = repository
         self.wireRevision = wireRevision
         self.commitment = commitment
         self.spaceRevision = spaceRevision
+        self.isRemoved = isRemoved
     }
 }
 
@@ -719,6 +725,13 @@ public enum AuthorizedSimpleSpaceLifecycleError: Error, Sendable, Equatable {
     /// Credential renewal distinguishes a durable tombstone from a missing
     /// space so a syncer can discard retained data after a missed notification.
     case deleted
+}
+
+/// Account states which the Spaces wire exposes distinctly while treating all
+/// other unavailable authority states as an opaque denial.
+public enum AuthorizedSpaceAuthorityStatusError: Error, Sendable, Equatable {
+    case deactivated
+    case takendown
 }
 
 /// A write notification the space host refuses for a reason the lexicon

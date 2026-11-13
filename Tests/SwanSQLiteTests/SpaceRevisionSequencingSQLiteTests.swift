@@ -200,6 +200,51 @@ final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
         XCTAssertEqual(empty.count, 2)
     }
 
+    func testRemovalIsSequencedRetainedAndReaddedByANewerWrite() async throws {
+        let fixture = try SequencingFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close(); fixture.cleanup() } }
+        try await fixture.createSpace(on: database)
+        try await database.receiveSpaceWriteNotification(
+            fixture.write(fixture.bob, event: "b1", revision: 1), now: now
+        )
+        let writtenRows = try await fixture.list(database)
+        let written = try XCTUnwrap(writtenRows.first)
+
+        try await database.removeSpaceWriter(
+            space: fixture.space,
+            writer: fixture.bob,
+            authorization: fixture.ownerAuthorization
+        )
+        let removedRows = try await fixture.list(database)
+        let removed = try XCTUnwrap(removedRows.first)
+        XCTAssertTrue(removed.isRemoved)
+        XCTAssertEqual(removed.repository, fixture.bob)
+        XCTAssertGreaterThan(try XCTUnwrap(removed.spaceRevision), try XCTUnwrap(written.spaceRevision))
+        let exported = try await database.exportSpaceMeta(
+            space: fixture.space,
+            authorization: fixture.ownerAuthorization
+        )
+        XCTAssertTrue(exported.writers.isEmpty, "space-meta never exports writer tombstones")
+
+        try await database.removeSpaceWriter(
+            space: fixture.space,
+            writer: fixture.bob,
+            authorization: fixture.ownerAuthorization
+        )
+        let afterDuplicateRemoval = try await fixture.list(database)
+        XCTAssertEqual(afterDuplicateRemoval, [removed], "removal is idempotent")
+
+        try await database.receiveSpaceWriteNotification(
+            fixture.write(fixture.bob, event: "b2", revision: 2), now: now
+        )
+        let readdedRows = try await fixture.list(database)
+        let readded = try XCTUnwrap(readdedRows.first)
+        XCTAssertFalse(readded.isRemoved)
+        XCTAssertEqual(readded.wireRevision, try fixture.tid(2))
+        XCTAssertGreaterThan(try XCTUnwrap(readded.spaceRevision), try XCTUnwrap(removed.spaceRevision))
+    }
+
     func testLocalAuthorityWriteIsSequencedAndItsSelfNotificationIsIgnored() async throws {
         let fixture = try SequencingFixture()
         let database = try await fixture.open()
@@ -308,6 +353,45 @@ final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
         XCTAssertEqual(after.last?.repository, fixture.carol)
         let newest = try XCTUnwrap(after.last?.spaceRevision.flatMap(SpaceRevisionSequence.value(of:)))
         XCTAssertGreaterThan(newest, clamped)
+    }
+
+    func testV29FixtureMigratesToV30WithoutRetargetingForeignKeys() async throws {
+        let fixture = try SequencingFixture()
+        let database = try await fixture.open()
+        try await fixture.createSpace(on: database)
+        try await database.receiveSpaceWriteNotification(
+            fixture.write(fixture.bob, event: "v29-writer", revision: 1), now: now
+        )
+        try await database.close()
+
+        let path = SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.authority).path
+        let v29 = try await SQLiteConnection.open(storage: .file(path: path))
+        _ = try await v29.query(
+            "DELETE FROM permissioned_repository_migrations WHERE version = 30"
+        )
+        _ = try await v29.query(
+            "ALTER TABLE permissioned_space_writers DROP COLUMN removed_at"
+        )
+        try await v29.close()
+
+        let reopened = try await fixture.open()
+        defer { Task { try? await reopened.close(); fixture.cleanup() } }
+        let columns = try await reopened.connection.query(
+            "PRAGMA table_info(permissioned_space_writers)"
+        )
+        XCTAssertTrue(columns.contains { $0.column("name")?.string == "removed_at" })
+        let listed = try await fixture.list(reopened)
+        XCTAssertEqual(listed.map(\.isRemoved), [false])
+        let markers = try await reopened.connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = 30"
+        )
+        XCTAssertEqual(markers.count, 1)
+        let integrity = try await reopened.connection.query("PRAGMA integrity_check")
+        XCTAssertEqual(integrity.first?.column("integrity_check")?.string, "ok")
+        let foreignKeyViolations = try await reopened.connection.query(
+            "PRAGMA foreign_key_check"
+        )
+        XCTAssertTrue(foreignKeyViolations.isEmpty)
     }
 
     func testRevisionArithmeticRoundTripsAndNeverGoesBackwards() throws {

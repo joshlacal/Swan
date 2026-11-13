@@ -420,7 +420,7 @@ extension SQLiteAccountDatabase {
                     """
                     SELECT repo_did, wire_revision, commitment, space_rev
                     FROM permissioned_space_writers
-                    WHERE space_uri = ? ORDER BY repo_did
+                    WHERE space_uri = ? AND removed_at IS NULL ORDER BY repo_did
                     """,
                     [.text(space.rawValue)]
                 ) {
@@ -441,7 +441,7 @@ extension SQLiteAccountDatabase {
 
     /// Creates or replaces the authority's space from an archive its
     /// previous host exported: the policy wholesale, the member list, and the
-    /// writer set with its space revisions, so `listRepos` cursors stay
+    /// writer set with its space revisions, so `listWriters` cursors stay
     /// valid. A tombstoned space is revived as `createSpace` revives one.
     /// Nothing is published: the published records arrive with the
     /// authority's repo through `importRepo`.

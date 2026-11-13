@@ -581,8 +581,14 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     let body = try self.jsonObject(response.body)
                     let entries = try XCTUnwrap(body["ops"] as? [[String: Any]])
                     XCTAssertEqual(entries.count, 1)
-                    XCTAssertTrue(entries[0]["prev"] is NSNull)
-                    XCTAssertNil(body["commit"])
+                    XCTAssertNotNil(body["cursor"])
+                    try self.assertCommit(
+                        try XCTUnwrap(body["commit"] as? [String: Any]),
+                        fixture: fixture,
+                        author: Self.alice,
+                        requestHeaders: pageHeaders,
+                        responseHeaders: response.headers
+                    )
                 }
 
                 let fullHeaders = try self.dpopHeaders(
@@ -626,12 +632,10 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     )
                 }
 
-                // `since` is a TID, not a `(TID, operation-index)` cursor.
-                // A limit boundary through the two-operation atomic batch at
-                // tids[4] must include both rows; otherwise a consumer that
-                // advances `since` to tids[4] could never retrieve the
-                // omitted sibling. The next empty page is where the existing
-                // reference caught-up rule supplies the head commit.
+                // Swan keeps same-revision operations atomic. A boundary may
+                // therefore overflow the requested limit; it is still a full
+                // page and carries a cursor. The current commit is present on
+                // every page.
                 let boundaryHeaders = try self.dpopHeaders(
                     token: oauth.token, key: oauth.key, jwk: oauth.jwk,
                     nonce: fixture.runtime.dpopNonceService.issue(),
@@ -656,7 +660,14 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                         Array(fixture.tids.dropFirst()) + [fixture.tids[4]]
                     )
                     XCTAssertEqual(entries.suffix(2).map { $0["rkey"] as? String }, ["third", "fourth"])
-                    XCTAssertNil(body["commit"])
+                    XCTAssertEqual(body["cursor"] as? String, "\(fixture.tids[4])/1")
+                    try self.assertCommit(
+                        try XCTUnwrap(body["commit"] as? [String: Any]),
+                        fixture: fixture,
+                        author: Self.alice,
+                        requestHeaders: boundaryHeaders,
+                        responseHeaders: response.headers
+                    )
                 }
 
                 let afterBatchHeaders = try self.dpopHeaders(
@@ -862,8 +873,8 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
     }
 
     /// SWAN-08: `listRepoOps` accepts the reference `${rev}/${idx}` cursor
-    /// (preferred over `since`) and emits one exactly on pages without a
-    /// commit. Following cursors yields every operation once.
+    /// (preferred over `since`), emits one on each full page, and returns the
+    /// current commit on every page. Following cursors yields every operation once.
     func testListRepoOpsCursorPagesEveryOperationOnceAndRejectsMalformedCursor() async throws {
         let fixture = try await Fixture.make()
         defer { fixture.cleanup() }
@@ -876,7 +887,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 var collected: [String] = []
                 var cursor: String?
                 var cursors: [String] = []
-                var sawCommit = false
+                var caughtUp = false
                 var previousKeyID: String?
                 for _ in 0 ..< 10 {
                     let headers = try self.credentialHeaders(credential, audience: Self.alice, fixture: fixture)
@@ -905,23 +916,20 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                             "\($0["rev"] as? String ?? "")/\($0["rkey"] as? String ?? "")"
                         }
                         let next = body["cursor"] as? String
-                        if let commit = body["commit"] as? [String: Any] {
-                            try self.assertCommit(commit, fixture: fixture, author: Self.alice,
-                                                  requestHeaders: headers, responseHeaders: response.headers)
-                            XCTAssertNil(next)
-                            sawCommit = true
-                        } else {
-                            XCTAssertNil(response.headers[
-                                HTTPField.Name(SpaceMACHeaders.signatureHeader)!
-                            ])
-                            XCTAssertNotNil(next)
-                        }
+                        try self.assertCommit(
+                            try XCTUnwrap(body["commit"] as? [String: Any]),
+                            fixture: fixture,
+                            author: Self.alice,
+                            requestHeaders: headers,
+                            responseHeaders: response.headers
+                        )
+                        caughtUp = next == nil
                         cursor = next
                         if let next { cursors.append(next) }
                     }
-                    if sawCommit { break }
+                    if caughtUp { break }
                 }
-                XCTAssertTrue(sawCommit)
+                XCTAssertTrue(caughtUp)
                 XCTAssertEqual(collected.count, 6)
                 XCTAssertEqual(Set(collected).count, 6)
                 XCTAssertEqual(

@@ -14,14 +14,14 @@ import SwanSQLite
 import SwanSpaces
 import SwanStorage
 
-/// atproto#5574 over HTTP, against the real preopened SQLite directory:
-/// notifyWrite (repo host -> space host) and listRepos paging by `spaceRev`.
+/// November Spaces sequencing over HTTP, against the real preopened SQLite
+/// directory: notifyRepoUpdate and listWriters paging by `spaceRev`.
 final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
     private let authority = "did:plc:abcdefghijklmnopqrstuvwx"
     private let bob = "did:plc:bcdefghijklmnopqrstuvwxy"
     private let dan = "did:plc:cdefghijklmnopqrstuvwxyz"
 
-    func testNotifyWriteSequencesAndListReposPagesBySpaceRevision() async throws {
+    func testNotifyWriteSequencesAndListWritersPagesBySpaceRevision() async throws {
         let fixture = try await SpaceRevisionHTTPFixture.make(authority: authority, members: [bob, dan])
         do {
             let app = try fixture.server().buildApplication(logger: Logger(label: "SpaceRevisionHTTPTests"))
@@ -72,14 +72,14 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .unauthorized)
                 }
 
-                let listURI = "/xrpc/com.atproto.space.listRepos?space=\(fixture.encodedSpace)"
+                let listURI = "/xrpc/com.atproto.space.listWriters?space=\(fixture.encodedSpace)"
                 var checkpoint = ""
                 try await client.execute(uri: listURI, method: .get, headers: try fixture.credentialHeaders()) { response in
                     XCTAssertEqual(response.status, .ok)
                     let value = try Self.json(response.body)
                     XCTAssertEqual(Set(value.keys), ["repos", "cursor"], "no top-level spaceRev")
                     let repos = try XCTUnwrap(value["repos"] as? [[String: Any]])
-                    XCTAssertEqual(repos.compactMap { $0["did"] as? String }, [self.bob, self.dan])
+                    XCTAssertEqual(repos.compactMap { $0["repo"] as? String }, [self.bob, self.dan])
                     XCTAssertEqual(repos.compactMap { $0["repoRev"] as? String }, [bobRev, danRev])
                     let revisions = repos.compactMap { $0["spaceRev"] as? String }
                     XCTAssertEqual(revisions.count, 2)
@@ -89,12 +89,10 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                         XCTAssertLessThan(revisions[0], revisions[1])
                     }
                     for repo in repos {
-                        // The generated encoder also writes the object's
-                        // `$type`, which Lexicon permits on a ref. October 22
-                        // renamed the entry's `hash` to `data`.
+                        XCTAssertEqual(repo["$type"] as? String, "com.atproto.space.defs#repoWrite")
                         XCTAssertEqual(
                             Set(repo.keys).subtracting(["$type"]),
-                            ["did", "repoRev", "data", "spaceRev"]
+                            ["repo", "repoRev", "data", "spaceRev"]
                         )
                         XCTAssertNil(repo["rev"])
                     }
@@ -115,6 +113,29 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                     let value = try Self.json(response.body)
                     XCTAssertEqual(Set(value.keys), ["repos"])
                     XCTAssertEqual((value["repos"] as? [Any])?.count, 0)
+                }
+                try await fixture.directory.removeSpaceWriter(
+                    self.bob,
+                    from: fixture.space,
+                    authorization: .accountOAuthForTesting(
+                        subject: self.authority,
+                        scopes: ["atproto"]
+                    )
+                )
+                try await client.execute(
+                    uri: "\(listURI)&cursor=\(checkpoint)",
+                    method: .get,
+                    headers: try fixture.credentialHeaders()
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let value = try Self.json(response.body)
+                    let repos = try XCTUnwrap(value["repos"] as? [[String: Any]])
+                    let removed = try XCTUnwrap(repos.first)
+                    XCTAssertEqual(repos.count, 1)
+                    XCTAssertEqual(removed["$type"] as? String, "com.atproto.space.defs#repoRemoved")
+                    XCTAssertEqual(removed["repo"] as? String, self.bob)
+                    XCTAssertEqual(Set(removed.keys), ["$type", "repo", "spaceRev"])
+                    checkpoint = try XCTUnwrap(removed["spaceRev"] as? String)
                 }
                 // A newer repoRev is listed after the checkpoint; a replay of
                 // an already-accepted one is not.
@@ -139,7 +160,7 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(uri: "\(listURI)&cursor=\(checkpoint)", method: .get, headers: try fixture.credentialHeaders()) { response in
                     let value = try Self.json(response.body)
                     let repos = try XCTUnwrap(value["repos"] as? [[String: Any]])
-                    XCTAssertEqual(repos.compactMap { $0["did"] as? String }, [self.bob])
+                    XCTAssertEqual(repos.compactMap { $0["repo"] as? String }, [self.bob])
                     XCTAssertEqual(repos.first?["repoRev"] as? String, bobNewer)
                     let spaceRev = try XCTUnwrap(repos.first?["spaceRev"] as? String)
                     XCTAssertGreaterThan(spaceRev, checkpoint)
@@ -150,6 +171,42 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
             try? await fixture.close()
             throw error
         }
+    }
+
+    func testListWritersNamesDeactivatedAndTakendownAuthorityAccounts() async throws {
+        let fixture = try await SpaceRevisionHTTPFixture.make(authority: authority, members: [])
+        defer { Task { try? await fixture.close() } }
+        let app = try fixture.server().buildApplication(logger: Logger(label: "SpaceRevisionHTTPTests.status"))
+        let uri = "/xrpc/com.atproto.space.listWriters?space=\(fixture.encodedSpace)"
+        let cases: [(AccountControlStatus, String)] = [
+            (.deactivated, "RepoDeactivated"),
+            (.takendown, "RepoTakendown"),
+        ]
+        try await app.test(.router) { client in
+            for (status, errorCode) in cases {
+                _ = try await fixture.control.transitionStatus(
+                    did: self.authority,
+                    to: status,
+                    declaration: .init(),
+                    now: Date()
+                )
+                try await client.execute(
+                    uri: uri,
+                    method: .get,
+                    headers: try fixture.credentialHeaders()
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try Self.json(response.body)["error"] as? String, errorCode)
+                }
+                _ = try await fixture.control.transitionStatus(
+                    did: self.authority,
+                    to: .active,
+                    declaration: .init(),
+                    now: Date()
+                )
+            }
+        }
+        try await fixture.close()
     }
 
     func testNotifyWriteAnswersFutureRevAndSpaceNotFound() async throws {
@@ -305,7 +362,7 @@ private struct SpaceRevisionHTTPFixture {
         )
     }
 
-    /// listRepos is a space-host operation: the signed audience is the
+    /// listWriters is a space-host operation: the signed audience is the
     /// authority's bare DID.
     func credentialHeaders() throws -> HTTPFields {
         let credential = try PermissionedDataJWT.createSpaceCredential(

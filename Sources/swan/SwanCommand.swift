@@ -9356,8 +9356,8 @@ extension SwanCommand {
                 return url
             }
 
-            /// Pages `com.atproto.space.listRepos` at the authority with the
-            /// space credential and returns the writer DID set.
+            /// Pages `com.atproto.space.listWriters` at the authority with the
+            /// space credential and returns the active writer DID set.
             private static func listWriters(
                 authority: LiveInteropHost,
                 space: SpaceURI,
@@ -9374,7 +9374,7 @@ extension SwanCommand {
                     ]
                     if let cursor { query["cursor"] = cursor }
                     let response = try await authority.client.query(
-                        "com.atproto.space.listRepos",
+                        "com.atproto.space.listWriters",
                         query: query,
                         authorization: authorization
                     )
@@ -9384,16 +9384,23 @@ extension SwanCommand {
                         throw InteropHTTPError.unexpectedStatus(response.status)
                     }
                     let output = try StrictJSON.decode(
-                        ForumListReposResponse.self,
+                        ForumListWritersResponse.self,
                         from: response.body
                     )
-                    for repo in output.repos {
+                    for entry in output.repos {
                         let did: String
-                        do { did = try AccountIdentifiers.validateDID(repo.did) }
+                        do { did = try AccountIdentifiers.validateDID(entry.repo) }
                         catch {
-                            throw ValidationError("listRepos returned a non-canonical writer DID")
+                            throw ValidationError("listWriters returned a non-canonical writer DID")
                         }
-                        if !writers.contains(did) { writers.append(did) }
+                        switch entry.type {
+                        case "com.atproto.space.defs#repoWrite":
+                            if !writers.contains(did) { writers.append(did) }
+                        case "com.atproto.space.defs#repoRemoved":
+                            writers.removeAll { $0 == did }
+                        default:
+                            throw ValidationError("listWriters returned an unknown entry type")
+                        }
                     }
                     // atproto#5574: every nonempty page returns its last
                     // spaceRev as the cursor; an empty page (which omits it)
@@ -10003,9 +10010,15 @@ private struct ForumPutRecordResponse: Decodable {
     let cid: String
 }
 
-private struct ForumListReposResponse: Decodable {
+private struct ForumListWritersResponse: Decodable {
     struct Repo: Decodable {
-        let did: String
+        let type: String
+        let repo: String
+
+        enum CodingKeys: String, CodingKey {
+            case type = "$type"
+            case repo
+        }
     }
 
     let cursor: String?

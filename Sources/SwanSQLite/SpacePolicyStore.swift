@@ -131,12 +131,48 @@ extension SQLiteAccountDatabase {
         )
     }
 
-    /// Drops one account from a space's writer set. Caller holds the gate
-    /// and transaction.
-    func removeSpaceWriterWithoutGate(space: SpaceURI, writer: String) async throws {
-        _ = try await connection.query(
-            "DELETE FROM permissioned_space_writers WHERE space_uri = ? AND repo_did = ?",
+    /// Tombstones one account in a space's writer set. Caller holds the gate
+    /// and transaction. Absent/already-removed rows are idempotent; an active
+    /// row consumes the next space revision exactly like an accepted write.
+    @discardableResult
+    func removeSpaceWriterWithoutGate(
+        space: SpaceURI,
+        writer: String,
+        now: Date = Date()
+    ) async throws -> SpaceWriterSequence? {
+        let rows = try await connection.query(
+            """
+            SELECT removed_at
+            FROM permissioned_space_writers
+            WHERE space_uri = ? AND repo_did = ?
+            """,
             [.text(space.rawValue), .text(writer)]
+        )
+        guard let row = rows.first,
+              row.column("removed_at")?.isNull == true else {
+            return nil
+        }
+        let previousSpaceRevision = try await latestSpaceRevisionWithoutGate(space: space)
+        let spaceRevision = try SpaceRevisionSequence.next(
+            after: previousSpaceRevision,
+            now: now
+        )
+        _ = try await connection.query(
+            """
+            UPDATE permissioned_space_writers
+            SET removed_at = ?, space_rev = ?
+            WHERE space_uri = ? AND repo_did = ? AND removed_at IS NULL
+            """,
+            [
+                .integer(Int(now.timeIntervalSince1970 * 1_000_000)),
+                .text(spaceRevision),
+                .text(space.rawValue),
+                .text(writer),
+            ]
+        )
+        return SpaceWriterSequence(
+            spaceRevision: spaceRevision,
+            previousSpaceRevision: previousSpaceRevision
         )
     }
 

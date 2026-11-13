@@ -1249,7 +1249,7 @@ public struct SwanHTTPServer: Sendable {
                 )
             } else if descriptor.nsid == ComAtprotoSpaceListRepos.typeIdentifier,
                       let authenticatedSpaceNotifications {
-                registerAuthenticatedListSpaceReposEndpoint(
+                registerAuthenticatedListSpaceWritersEndpoint(
                     on: router,
                     capability: authenticatedSpaceNotifications
                 )

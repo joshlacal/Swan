@@ -222,7 +222,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .ok)
                 }
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)",
+                    uri: "/xrpc/com.atproto.space.listWriters?space=\(encodedSpace)",
                     method: .get,
                     headers: credentialHeaders
                 ) { response in
@@ -230,7 +230,8 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     let value = try notificationJSONObject(response.body)
                     let repos = try XCTUnwrap(value["repos"] as? [[String: Any]])
                     XCTAssertEqual(repos.count, 1)
-                    XCTAssertEqual(repos.first?["did"] as? String, expectedWriter)
+                    XCTAssertEqual(repos.first?["$type"] as? String, "com.atproto.space.defs#repoWrite")
+                    XCTAssertEqual(repos.first?["repo"] as? String, expectedWriter)
                     XCTAssertEqual(repos.first?["repoRev"] as? String, "3l72c4e2y2222")
                     XCTAssertEqual(repos.first?["spaceRev"] as? String, "3l72c4e2y2222")
                     XCTAssertEqual(value["cursor"] as? String, "3l72c4e2y2222", "cursor = last spaceRev")
@@ -241,7 +242,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 // The cursor is an exclusive checkpoint; the empty page that
                 // follows omits it.
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)&cursor=3l72c4e2y2222",
+                    uri: "/xrpc/com.atproto.space.listWriters?space=\(encodedSpace)&cursor=3l72c4e2y2222",
                     method: .get,
                     headers: credentialHeaders
                 ) { response in
@@ -251,21 +252,21 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 }
                 // Not TID-validated: any string is accepted as a checkpoint.
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)&cursor=not-a-tid",
+                    uri: "/xrpc/com.atproto.space.listWriters?space=\(encodedSpace)&cursor=not-a-tid",
                     method: .get,
                     headers: credentialHeaders
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)",
+                    uri: "/xrpc/com.atproto.space.listWriters?space=\(encodedSpace)",
                     method: .get
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
                     XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
                 }
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)",
+                    uri: "/xrpc/com.atproto.space.listWriters?space=\(encodedSpace)",
                     method: .post
                 ) { response in
                     XCTAssertEqual(response.status, .notFound)
@@ -2537,7 +2538,7 @@ extension SpaceNotificationHTTPTests {
                 confirmationKeyID: try SpaceCredentialSignatureTestSupport.keyID
             )
             let revokedJTI = try PermissionedDataJWT.inspectSpaceCredential(revoked).claims.jti
-            let listURI = "/xrpc/com.atproto.space.listRepos?space=\(fixture.space.rawValue.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!)"
+            let listURI = "/xrpc/com.atproto.space.listWriters?space=\(fixture.space.rawValue.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!)"
             let revokedHeaders = try SpaceCredentialSignatureTestSupport.headers(token: revoked, audience: authority)
             let keptHeaders = try SpaceCredentialSignatureTestSupport.headers(token: kept, audience: authority)
             let method = ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier

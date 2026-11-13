@@ -704,6 +704,8 @@ public actor SQLitePreMigratedAccountDirectory:
             throw error
         } catch let error as ManagedSpaceAccessError {
             throw error
+        } catch let error as AuthorizedSpaceAuthorityStatusError {
+            throw error
         } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
@@ -730,6 +732,8 @@ public actor SQLitePreMigratedAccountDirectory:
         } catch let error as SwanError {
             throw error
         } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch let error as AuthorizedSpaceAuthorityStatusError {
             throw error
         } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
@@ -3080,9 +3084,7 @@ public actor SQLitePreMigratedAccountDirectory:
         guard !isClosed else {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
-        guard try await isActiveAccount(space.authority) else {
-            throw SwanError.unauthorized("authority account is unavailable")
-        }
+        try await requireCredentialAuthorityActive(space.authority)
         do {
             try Self.requireExistingRegularDatabase(
                 SQLiteLayout.accountDatabase(in: dataDirectory, did: space.authority)
@@ -3158,9 +3160,10 @@ public actor SQLitePreMigratedAccountDirectory:
     }
 
     private func requireCredentialAuthorityStillAvailable(_ did: String) async throws {
-        guard try await isActiveAccount(did), !isClosed else {
+        guard !isClosed else {
             throw SwanError.unauthorized("authority account is unavailable")
         }
+        try await requireCredentialAuthorityActive(did)
         do {
             try Self.requireExistingRegularDatabase(
                 SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
@@ -3170,6 +3173,28 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
+
+    private func requireCredentialAuthorityActive(_ did: String) async throws {
+        let account: AccountControlAccount?
+        do {
+            account = try await controlStore.account(did: did)
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard let account else {
+            throw SwanError.unauthorized("authority account is unavailable")
+        }
+        switch account.status {
+        case .active:
+            return
+        case .deactivated:
+            throw AuthorizedSpaceAuthorityStatusError.deactivated
+        case .takendown:
+            throw AuthorizedSpaceAuthorityStatusError.takendown
+        default:
+            throw SwanError.unauthorized("authority account is unavailable")
+        }
+    }
     private static func validateStartupDIDs(_ dids: [String]) throws {
         var previous: String?
         for did in dids {

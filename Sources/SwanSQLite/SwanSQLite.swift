@@ -785,6 +785,7 @@ public enum SQLiteLayout {
             wire_revision TEXT NOT NULL,
             commitment BLOB NOT NULL CHECK(length(commitment) = 32),
             updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+            removed_at INTEGER CHECK(removed_at IS NULL OR removed_at >= 0),
             PRIMARY KEY(space_uri, repo_did)
         )
         """,
@@ -2337,6 +2338,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let publicFirehoseOutboxCompactionMigrationVersion = 19
     private static let publicRepositoryRequestReceiptRetentionMigrationVersion = 20
     private static let simpleSpaceIndependentAccessSchemaMigrationVersion = 23
+    static let spaceNotificationsV30MigrationVersion = 30
 
     /// How long an uploaded blob no commit has claimed stays staged.
     ///
@@ -2831,6 +2833,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migrateSpaceNotificationServiceKeysIfNeeded()
             try await migrateRemoteReplicaLifecycleFenceIfNeeded()
             try await migrateSpacePolicyIfNeeded()
+            try await migrateSpaceNotificationsV30IfNeeded()
         }
         try await migrateSpaceNotificationReceiptScopeIfNeeded()
         try await compactSpaceNotificationReceiptsIfNeeded()
@@ -2890,6 +2893,33 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             ]
         )
     }
+    /// November 12 account-schema v30. Shape checks, rather than the marker
+    /// alone, let a database opened by an intermediate build finish the
+    /// migration. This is additive and never renames an FK target.
+    private func migrateSpaceNotificationsV30IfNeeded() async throws {
+        let writerColumns = try await connection.query(
+            "PRAGMA table_info(permissioned_space_writers)"
+        )
+        if !writerColumns.contains(where: { $0.column("name")?.string == "removed_at" }) {
+            _ = try await connection.query(
+                """
+                ALTER TABLE permissioned_space_writers
+                ADD COLUMN removed_at INTEGER CHECK(removed_at IS NULL OR removed_at >= 0)
+                """
+            )
+        }
+        _ = try await connection.query(
+            """
+            INSERT OR IGNORE INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(Self.spaceNotificationsV30MigrationVersion),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
     /// The first notification schema keyed receipts only by issuer and JTI.
     /// A service JTI is consumed in the context of one space, so retaining that
     /// key globally could suppress a valid announcement for a second space if
@@ -8725,7 +8755,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 values.append(.integer(limit))
                 let rows = try await readConnection.query(
                     """
-                    SELECT repo_did, wire_revision, commitment, space_rev
+                    SELECT repo_did, wire_revision, commitment, space_rev, removed_at
                     FROM permissioned_space_writers
                     WHERE space_uri = ?\(cursorClause)
                     ORDER BY space_rev ASC
@@ -8744,12 +8774,16 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         throw SQLiteRepositoryError.corruptDatabase("invalid writer commitment")
                     }
                     let spaceRevision = try requiredTID(row, "space_rev").toString()
+                    guard let removedAt = row.column("removed_at") else {
+                        throw SQLiteRepositoryError.corruptDatabase("missing writer removal state")
+                    }
                     return AuthorizedSpaceWriter(
                         space: space,
                         repository: repository,
                         wireRevision: wireRevision,
                         commitment: commitment,
-                        spaceRevision: spaceRevision
+                        spaceRevision: spaceRevision,
+                        isRemoved: !removedAt.isNull
                     )
                 }
             }
@@ -8804,13 +8838,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         _ = try await connection.query(
             """
             INSERT INTO permissioned_space_writers(
-                space_uri, repo_did, wire_revision, commitment, updated_at, space_rev
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                space_uri, repo_did, wire_revision, commitment, updated_at, space_rev, removed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL)
             ON CONFLICT(space_uri, repo_did) DO UPDATE SET
                 wire_revision = excluded.wire_revision,
                 commitment = excluded.commitment,
                 updated_at = excluded.updated_at,
-                space_rev = excluded.space_rev
+                space_rev = excluded.space_rev,
+                removed_at = NULL
             """,
             [
                 .text(space.rawValue), .text(repository),

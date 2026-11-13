@@ -233,7 +233,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.space.registerNotify", method: .post, uri: "/xrpc/com.atproto.space.registerNotify", body: "{\"space\":\"\(space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}", authorization: .registerNotify, invariant: .jsonNonEmptyString("expiresAt")),
                 .init(nsid: "com.atproto.space.unregisterNotify", method: .post, uri: "/xrpc/com.atproto.space.unregisterNotify", body: "{\"space\":\"\(space.rawValue)\",\"service\":\"\(remoteDID)#notify\"}", authorization: .unregisterNotify, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.notifyWrite", method: .post, uri: "/xrpc/com.atproto.space.notifyWrite", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"repoRev\":\"222222222222z\",\"data\":{\"$bytes\":\"\(Data(repeating: 0x31, count: 32).base64EncodedString())\"}}", authorization: .notifyWrite, invariant: .emptyBody),
-                .init(nsid: "com.atproto.space.listRepos", method: .get, uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)", body: nil, authorization: .credential, invariant: .jsonArrayContains("repos", field: "did", value: localDID)),
+                .init(nsid: "com.atproto.space.listWriters", method: .get, uri: "/xrpc/com.atproto.space.listWriters?space=\(encodedSpace)", body: nil, authorization: .credential, invariant: .jsonArrayContains("repos", field: "repo", value: localDID)),
                 .init(nsid: "com.atproto.managedspace.checkUserAccess", method: .get, uri: "/xrpc/com.atproto.managedspace.checkUserAccess?space=\(encodedSpace)&user=\(remoteDID)&access=read", body: nil, authorization: .checkUserAccess, invariant: .jsonBoolean("authorized", false)),
                 .init(nsid: "com.atproto.space.deleteRecord", method: .post, uri: "/xrpc/com.atproto.space.deleteRecord", body: recordPrefix + ",\"rkey\":\"delete-me\"}", authorization: .oauth, invariant: .jsonEmptyObject),
                 .init(nsid: "com.atproto.memberspace.removeMembers", method: .post, uri: "/xrpc/com.atproto.memberspace.removeMembers", body: "{\"space\":\"\(lifecycle.rawValue)\",\"dids\":[\"\(remoteDID)\"]}", authorization: .oauth, invariant: .emptyBody),
@@ -421,10 +421,10 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                         XCTAssertEqual(response.status, .notFound, nsid)
                     }
                 }
-                // The matrix's last case revoked the credential its listRepos
+                // The matrix's last case revoked the credential its listWriters
                 // case used: the same signed presentation is now refused.
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)",
+                    uri: "/xrpc/com.atproto.space.listWriters?space=\(encodedSpace)",
                     method: .get,
                     headers: SpaceCredentialSignatureTestSupport.headers(
                         token: credential, audience: space.authority
@@ -1193,7 +1193,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 jti: jti
             )
         case .credential:
-            // listRepos: a space-host operation, so the authority's bare DID.
+            // listWriters: a space-host operation, so the authority's bare DID.
             headers = try SpaceCredentialSignatureTestSupport.headers(
                 token: credential, audience: space.authority
             )
