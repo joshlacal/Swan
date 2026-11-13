@@ -316,13 +316,16 @@ private func loginLocalhostAuthorization(
             csrfToken: session.csrfToken,
             lifetime: session.expiresAt.timeIntervalSinceNow
         )
+        let spaceTitles = try await OAuthLexiconScopeResolution.resolveSpaceTitles(
+            pushed.binding.scopes, resolver: runtime.lexiconResolver)
         return localhostHTML(
             .ok,
             SwanBrowserPages.consent(
                 csrf: issued.session.csrfToken,
                 subject: authenticated.account.did,
                 clientID: pushed.binding.clientID,
-                scopes: pushed.binding.scopes
+                scopes: pushed.binding.scopes,
+                spaceTitles: spaceTitles
             ),
             setCookie: browserCookie(issued.value)
         )
@@ -391,13 +394,16 @@ private func completeLocalhostAuthorizationMFA(
             csrfToken: session.csrfToken,
             lifetime: session.expiresAt.timeIntervalSinceNow
         )
+        let spaceTitles = try await OAuthLexiconScopeResolution.resolveSpaceTitles(
+            pushed.binding.scopes, resolver: runtime.lexiconResolver)
         return localhostHTML(
             .ok,
             SwanBrowserPages.consent(
                 csrf: issued.session.csrfToken,
                 subject: authenticated.account.did,
                 clientID: pushed.binding.clientID,
-                scopes: pushed.binding.scopes
+                scopes: pushed.binding.scopes,
+                spaceTitles: spaceTitles
             ),
             setCookie: browserCookie(issued.value)
         )

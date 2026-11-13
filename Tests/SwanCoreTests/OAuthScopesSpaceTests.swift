@@ -12,7 +12,7 @@ struct OAuthScopesSpaceTests {
     func spaceParsesWithFullDefaults() throws {
         // SP1
         let p = try SpacePermission.parse("space:com.atmoboards.forum")
-        #expect(p.type == .nsid("com.atmoboards.forum"))
+        #expect(p.spaceType == .nsid("com.atmoboards.forum"))
         #expect(p.authority == .unresolvedSelf)
         #expect(p.skey == .any)
         #expect(p.collection == [])
@@ -24,9 +24,19 @@ struct OAuthScopesSpaceTests {
     func spaceParsesWildcardTypeAndConcreteAuthority() throws {
         // SP2, SP3
         let a = try SpacePermission.parse("space:*?authority=did:plc:abc123xyz")
-        #expect(a.type == .any && a.authority == .did("did:plc:abc123xyz"))
+        #expect(a.spaceType == .any && a.authority == .did("did:plc:abc123xyz"))
         let b = try SpacePermission.parse("space:com.atmoboards.forum?authority=*")
         #expect(b.authority == .any)
+    }
+
+    @Test
+    func namedSpaceTypeUsesTheNewKeyWhilePositionalFormIsUnchanged() throws {
+        let named = try SpacePermission.parse("space?spaceType=com.atmoboards.forum")
+        #expect(named.spaceType == .nsid("com.atmoboards.forum"))
+        #expect(try named.canonicalScopeString() == "space:com.atmoboards.forum")
+        #expect(throws: ScopeParseError.self) {
+            try SpacePermission.parse("space?type=com.atmoboards.forum")
+        }
     }
 
     @Test
@@ -527,6 +537,6 @@ struct OAuthScopesSpaceTests {
         #expect(parsed.scopeParameters.provenance(for: "authority") == .stated)
         #expect(parsed.scopeParameters.provenance(for: "skey") == .defaulted)
         #expect(parsed.scopeParameters.provenance(for: "nonexistent") == nil)
-        #expect(parsed.scopeParameters.statedKeys == ["type", "authority", "action"])
+        #expect(parsed.scopeParameters.statedKeys == ["spaceType", "authority", "action"])
     }
 }

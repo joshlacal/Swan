@@ -551,16 +551,14 @@ public protocol AuthorizedSimpleSpaceLifecycleDirectory: Sendable {
         authorization: AuthorizationContext
     ) async throws
 
-    func putSimpleSpaceMember(
-        _ member: String,
-        read: Bool,
-        write: Bool,
+    func putSimpleSpaceMembers(
+        _ members: [AuthorizedSimpleSpaceMemberPage.Member],
         in space: SpaceURI,
         authorization: AuthorizationContext
     ) async throws
 
-    func removeSimpleSpaceMember(
-        _ member: String,
+    func removeSimpleSpaceMembers(
+        _ members: [String],
         from space: SpaceURI,
         authorization: AuthorizationContext
     ) async throws
@@ -621,34 +619,46 @@ public extension AuthorizedSimpleSpaceLifecycleDirectory {
     }
 }
 
-/// Asks a managedspace's managing app about one user
-/// (`com.atproto.managedspace.checkUserAccess`). Implementations must deny
-/// (return `false`) when the app cannot be resolved, is unreachable, or
-/// answers anything but a well-formed `{ authorized: true }`. Callers never
-/// invoke this inside a SQLite transaction.
-public protocol ManagedSpaceAccessChecking: Sendable {
-    func checkUserAccess(
-        space: SpaceURI,
-        user: String,
-        access: SimpleSpaceAccessKind,
-        clientID: String?,
-        managingApp: String
-    ) async -> Bool
+/// The two decisions returned by `com.atproto.managedspace.checkAccess`.
+public struct ManagedSpaceAccess: Sendable, Equatable {
+    public let read: Bool
+    public let write: Bool
+
+    public init(read: Bool, write: Bool) {
+        self.read = read
+        self.write = write
+    }
 }
 
-/// The fail-closed checker used when no managing-app client is configured:
-/// every non-owner of a managedspace is refused.
-public struct DenyingManagedSpaceAccessChecker: ManagedSpaceAccessChecking {
+/// A managing app that cannot be reached or does not answer correctly is an
+/// upstream failure, not an access denial.
+public enum ManagedSpaceAccessError: Error, Sendable, Equatable {
+    case upstreamFailure
+}
+
+/// Asks a managedspace's managing app for both access decisions in one
+/// `com.atproto.managedspace.checkAccess` request. `repo` is absent when the
+/// credential request carries no delegation token.
+public protocol ManagedSpaceAccessChecking: Sendable {
+    func checkAccess(
+        space: SpaceURI,
+        repo: String?,
+        clientID: String?,
+        managingApp: String
+    ) async throws -> ManagedSpaceAccess
+}
+
+/// The checker used when no managing-app client is configured.
+public struct UnavailableManagedSpaceAccessChecker: ManagedSpaceAccessChecking {
     public init() {}
 
-    public func checkUserAccess(
+    public func checkAccess(
         space _: SpaceURI,
-        user _: String,
-        access _: SimpleSpaceAccessKind,
+        repo _: String?,
         clientID _: String?,
         managingApp _: String
-    ) async -> Bool {
-        false
+    ) async throws -> ManagedSpaceAccess {
+        throw ManagedSpaceAccessError.upstreamFailure
     }
 }
 

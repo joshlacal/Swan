@@ -214,8 +214,8 @@ struct OAuthScopesGrammarTests {
         #expect(throws: ScopeParseError.positionalAndNamedConflict(prefix: "identity", key: "attr")) {
             try IdentityPermission.parse("identity:handle?attr=*")
         }
-        #expect(throws: ScopeParseError.positionalAndNamedConflict(prefix: "space", key: "type")) {
-            try SpacePermission.parse("space:com.example.type?type=com.other.type")
+        #expect(throws: ScopeParseError.positionalAndNamedConflict(prefix: "space", key: "spaceType")) {
+            try SpacePermission.parse("space:com.example.type?spaceType=com.other.type")
         }
         #expect(throws: ScopeParseError.positionalAndNamedConflict(prefix: "rpc", key: "lxm")) {
             // rpc-permission.test.ts:65-71 — upstream's own vector.

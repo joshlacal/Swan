@@ -53,7 +53,7 @@ final class OAuthLexiconScopeResolutionTests: XCTestCase {
     }
 
     private static func space(_ collections: [String]) -> SwanLexiconDocument {
-        .space(LexiconSpace(name: "Forum", collections: collections))
+        .space(LexiconSpace(title: "Forum", collections: collections))
     }
 
     private static func permissionSet(
@@ -64,21 +64,21 @@ final class OAuthLexiconScopeResolutionTests: XCTestCase {
 
     // MARK: - (b) expandSpaceCollections — the ported LexiconManager vectors
 
-    func testSpaceDeclarationAllowsLongNamesAndCrossNamespaceCollections() throws {
-        let name = String(repeating: "Forum", count: 20)
+    func testSpaceDeclarationAllowsLongTitlesAndCrossNamespaceCollections() throws {
+        let title = String(repeating: "Forum", count: 20)
         let bytes = try JSONSerialization.data(withJSONObject: [
-            "type": "space", "name": name,
+            "type": "space", "title": title,
             "collections": [Self.thread, "org.other.reply"],
         ])
         let space = try JSONDecoder().decode(LexiconSpace.self, from: bytes)
-        XCTAssertEqual(space.name, name)
+        XCTAssertEqual(space.title, title)
         XCTAssertEqual(space.collections, [Self.thread, "org.other.reply"])
     }
 
     func testSpaceDeclarationRejectsWildcardAndMalformedCollections() throws {
         for collection in ["*", "com.example.*", "invalid"] {
             let bytes = try JSONSerialization.data(withJSONObject: [
-                "type": "space", "name": "Forum", "collections": [collection],
+                "type": "space", "title": "Forum", "collections": [collection],
             ])
             XCTAssertThrowsError(try JSONDecoder().decode(LexiconSpace.self, from: bytes))
         }

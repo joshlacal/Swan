@@ -114,8 +114,8 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
         }
     }
 
-    func testOptionalCredentialParametersAndOtherLabelsAreAccepted() throws {
-        let input = "(\"authorization\" \"atproto-space-audience\");tag=\"atproto-space-credential\";alg=\"ecdsa-p256-sha256\";keyid=\"\(keyID)\""
+    func testTaggedCredentialSignatureUsesAnyLabelAndIgnoresOtherParameters() throws {
+        let input = "(\"authorization\" \"atproto-space-audience\");tag=\"atproto-space-credential\";alg=\"ecdsa-p256-sha256\";keyid=\"\(keyID)\";created=1"
         let base = "\"authorization\": \(Self.authorization)\n"
             + "\"atproto-space-audience\": \(Self.audience)\n"
             + "\"@signature-params\": \(input)"
@@ -123,8 +123,8 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
         let combined = Fields(
             authorization: [Self.authorization],
             audience: [Self.audience],
-            signatureInput: ["other=(\"authorization\");keyid=\"other\", atproto-space-credential=\(input)"],
-            signature: ["other=:YWJj:, atproto-space-credential=:\(signature.base64EncodedString()):"]
+            signatureInput: ["other=(\"authorization\");keyid=\"other\", presentation=\(input)"],
+            signature: ["other=:YWJj:, presentation=:\(signature.base64EncodedString()):"]
         )
         XCTAssertEqual(try combined.verify(keyID: keyID), keyID)
         // The same members split across repeated field lines combine per
@@ -132,10 +132,20 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
         let split = Fields(
             authorization: [Self.authorization],
             audience: [Self.audience],
-            signatureInput: ["other=(\"authorization\");keyid=\"other\"", "atproto-space-credential=\(input)"],
-            signature: ["other=:YWJj:", "atproto-space-credential=:\(signature.base64EncodedString()):"]
+            signatureInput: ["other=(\"authorization\");keyid=\"other\"", "presentation=\(input)"],
+            signature: ["other=:YWJj:", "presentation=:\(signature.base64EncodedString()):"]
         )
         XCTAssertEqual(try split.verify(keyID: keyID), keyID)
+    }
+
+    func testTwoTaggedCredentialSignaturesAreRejected() throws {
+        var fields = try signed()
+        let second = "second=(\"authorization\" \"atproto-space-audience\");tag=\"atproto-space-credential\""
+        fields.signatureInput = [fields.signatureInput[0] + ", " + second]
+        fields.signature = [fields.signature[0] + ", second=:YWJj:"]
+        XCTAssertThrowsError(try fields.verify(keyID: keyID)) {
+            XCTAssertEqual($0 as? SpaceHTTPSignatureError, .malformedSignature)
+        }
     }
 
     func testChangedAuthorizationOrAudienceIsRejected() throws {

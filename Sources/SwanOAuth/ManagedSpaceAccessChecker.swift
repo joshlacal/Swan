@@ -4,23 +4,18 @@ import SwanCore
 import SwanSpaces
 import SwanStorage
 
-/// The outbound `com.atproto.managedspace.checkUserAccess` client a
-/// managedspace authority uses to ask its managing app about one user
-/// (October 29 section 1d).
+/// The outbound `com.atproto.managedspace.checkAccess` client used by a
+/// managedspace authority.
 ///
 /// The request carries service auth signed by the space authority with
-/// `lxm=com.atproto.managedspace.checkUserAccess` and `aud` set to
-/// `managingApp` exactly as the policy names it, as the reference
-/// `resolveNotifyTarget` does. The endpoint is the named service of the
-/// managing app's DID document, or its `#atproto_pds` service for a bare
-/// DID. `clientId` is sent on reads only.
+/// `lxm=com.atproto.managedspace.checkAccess` and `aud` set to the policy's
+/// `did#serviceId`. A missing repository means the credential request carried
+/// no delegation token. `clientId` is included only for an attested client.
 ///
-/// Every failure denies: an unresolvable app, a transport error, a non-200
-/// status, or a body that is not exactly `{ "authorized": true }`. Failing
-/// open would hand out credentials for the spaces that asked for the
-/// strictest gate. No answer is cached.
+/// Resolution, transport, timeout, status, and response-shape failures are
+/// upstream failures rather than access denials. No answer is cached.
 public struct RemoteManagedSpaceAccessChecker: ManagedSpaceAccessChecking {
-    public static let method = "com.atproto.managedspace.checkUserAccess"
+    public static let method = "com.atproto.managedspace.checkAccess"
     static let maximumResponseBytes = 4_096
 
     private let resolver: SwanServiceEndpointResolver
@@ -44,42 +39,41 @@ public struct RemoteManagedSpaceAccessChecker: ManagedSpaceAccessChecking {
         self.hostnameResolver = hostnameResolver
     }
 
-    public func checkUserAccess(
+    public func checkAccess(
         space: SpaceURI,
-        user: String,
-        access: SimpleSpaceAccessKind,
+        repo: String?,
         clientID: String?,
         managingApp: String
-    ) async -> Bool {
+    ) async throws -> ManagedSpaceAccess {
         do {
             return try await ask(
-                space: space, user: user, access: access,
-                clientID: access == .read ? clientID : nil,
+                space: space, repo: repo, clientID: clientID,
                 managingApp: managingApp
             )
         } catch {
             logger.warning("managing app check failed", fields: [
                 "space": space.rawValue,
-                "access": access.rawValue,
             ])
-            return false
+            throw ManagedSpaceAccessError.upstreamFailure
         }
     }
 
     private func ask(
         space: SpaceURI,
-        user: String,
-        access: SimpleSpaceAccessKind,
+        repo: String?,
         clientID: String?,
         managingApp: String
-    ) async throws -> Bool {
-        let parts = managingApp.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+    ) async throws -> ManagedSpaceAccess {
+        let parts = managingApp.split(
+            separator: "#", maxSplits: 1, omittingEmptySubsequences: false
+        )
+        guard parts.count == 2, !parts[1].isEmpty else {
+            throw ManagedSpaceAccessError.upstreamFailure
+        }
         let did = String(parts[0])
-        let fragment = parts.count == 2 ? String(parts[1]) : "atproto_pds"
-        let base = try await resolver.endpoint(did: did, fragment: fragment)
+        let base = try await resolver.endpoint(did: did, fragment: String(parts[1]))
         let url = try Self.requestURL(
-            base: base, space: space, user: user, access: access,
-            clientID: access == .read ? clientID : nil
+            base: base, space: space, repo: repo, clientID: clientID
         )
         let token = try await signer.issue(
             issuer: space.authority,
@@ -90,41 +84,41 @@ public struct RemoteManagedSpaceAccessChecker: ManagedSpaceAccessChecking {
             now: Date()
         )
         let host = try policy.validateURL(url)
-        let before = Set(try await resolveOAuthHostname(hostnameResolver, host: host, timeout: policy.timeout))
+        let timeout = min(policy.timeout, 10)
+        let before = Set(try await resolveOAuthHostname(
+            hostnameResolver, host: host, timeout: timeout
+        ))
         try policy.validateResolved(Array(before), host: host)
         let response = try await transport.getAuthenticated(
             url: url,
             approvedPeers: before,
             headers: ["Authorization": "Bearer " + token, "Accept": "application/json"],
-            timeout: policy.timeout,
+            timeout: timeout,
             maximumResponseBodyBytes: Self.maximumResponseBytes
         )
         guard response.status == 200, response.redirectCount == 0,
               response.body.count <= Self.maximumResponseBytes else {
-            return false
+            throw ManagedSpaceAccessError.upstreamFailure
         }
-        return Self.isAuthorized(response.body)
+        return try Self.access(from: response.body)
     }
 
-    /// `GET <endpoint>/xrpc/com.atproto.managedspace.checkUserAccess` with
-    /// `space`, `user`, `access` and, on reads only, `clientId`.
+    /// `GET <endpoint>/xrpc/com.atproto.managedspace.checkAccess`.
     static func requestURL(
         base: URL,
         space: SpaceURI,
-        user: String,
-        access: SimpleSpaceAccessKind,
+        repo: String?,
         clientID: String?
     ) throws -> URL {
         guard var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
             throw SwanError.unavailable("managing app endpoint is invalid")
         }
         components.path = "/xrpc/" + method
-        var query = [
-            URLQueryItem(name: "space", value: space.rawValue),
-            URLQueryItem(name: "user", value: user),
-            URLQueryItem(name: "access", value: access.rawValue),
-        ]
-        if access == .read, let clientID {
+        var query = [URLQueryItem(name: "space", value: space.rawValue)]
+        if let repo {
+            query.append(URLQueryItem(name: "repo", value: repo))
+        }
+        if let clientID {
             query.append(URLQueryItem(name: "clientId", value: clientID))
         }
         components.queryItems = query
@@ -137,15 +131,17 @@ public struct RemoteManagedSpaceAccessChecker: ManagedSpaceAccessChecking {
         return url
     }
 
-    /// Only a JSON object whose `authorized` member is the boolean `true`.
-    static func isAuthorized(_ body: Data) -> Bool {
+    /// Only an exact object with boolean `read` and `write` members is valid.
+    static func access(from body: Data) throws -> ManagedSpaceAccess {
         guard (try? StrictJSON.validate(body)) != nil,
               let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-              let value = object["authorized"],
-              SpacePolicy.isJSONBoolean(value),
-              let authorized = value as? Bool else {
-            return false
+              Set(object.keys) == ["read", "write"],
+              let readValue = object["read"], SpacePolicy.isJSONBoolean(readValue),
+              let writeValue = object["write"], SpacePolicy.isJSONBoolean(writeValue),
+              let read = readValue as? Bool,
+              let write = writeValue as? Bool else {
+            throw ManagedSpaceAccessError.upstreamFailure
         }
-        return authorized
+        return ManagedSpaceAccess(read: read, write: write)
     }
 }

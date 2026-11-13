@@ -1923,9 +1923,9 @@ private struct Fixture: Sendable {
                 configuration: try .init(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
                 authorization: controlAuthorization
             )
-            _ = try await authority.addMember(
+            _ = try await authority.putMembers(
                 space: memberSpace,
-                member: SpaceCredentialHTTPTests.member,
+                members: [.init(did: SpaceCredentialHTTPTests.member, read: true, write: true)],
                 authorization: controlAuthorization
             )
             _ = try await authority.create(

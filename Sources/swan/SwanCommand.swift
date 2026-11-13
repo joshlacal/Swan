@@ -892,7 +892,7 @@ struct ServePermissionedRuntime {
     let repositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration?
     let repositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration?
     let notificationConfiguration: SwanSpaceNotificationHTTPConfiguration?
-    let checkUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration?
+    let managedSpaceCheckAccessConfiguration: SwanManagedSpaceCheckAccessHTTPConfiguration?
     /// `--enable-spaces-open-interop`; `nil` keeps hardened behaviour.
     var spacesOpenInterop: SwanSpacesOpenInteropConfiguration? = nil
 
@@ -1003,15 +1003,15 @@ struct ServePermissionedRuntime {
             configuredManagingAudience = notification?.managingServiceAudience ?? managingServiceAudience
         }
 
-        let checkUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration?
+        let managedSpaceCheckAccessConfiguration: SwanManagedSpaceCheckAccessHTTPConfiguration?
         if let serviceAuthentication,
            let managingServiceAudience = configuredManagingAudience {
-            checkUserAccessConfiguration = try .init(
+            managedSpaceCheckAccessConfiguration = try .init(
                 serviceAuthentication: serviceAuthentication,
                 managingServiceAudience: managingServiceAudience
             )
         } else {
-            checkUserAccessConfiguration = nil
+            managedSpaceCheckAccessConfiguration = nil
         }
 
         return .init(
@@ -1032,7 +1032,7 @@ struct ServePermissionedRuntime {
                 .init(credentialPublicKeys: $0)
             },
             notificationConfiguration: notificationConfiguration,
-            checkUserAccessConfiguration: checkUserAccessConfiguration,
+            managedSpaceCheckAccessConfiguration: managedSpaceCheckAccessConfiguration,
             spacesOpenInterop: spacesOpenInterop
         )
     }
@@ -1079,7 +1079,7 @@ struct ServePermissionedRuntime {
             spaceRepositorySyncConfiguration: repositorySyncConfiguration,
             spaceRepositoryCredentialConfiguration: repositoryCredentialConfiguration,
             spaceNotificationConfiguration: notificationConfiguration,
-            simpleSpaceCheckUserAccessConfiguration: checkUserAccessConfiguration,
+            managedSpaceCheckAccessConfiguration: managedSpaceCheckAccessConfiguration,
             spacesOpenInterop: spacesOpenInterop,
             publicRepositoryReadDirectory: directory,
             publicRepositoryMutationDirectory: publicMutationRuntime.map { _ in
@@ -2327,7 +2327,7 @@ extension SwanCommand {
 
         @Option(
             name: .customLong("managing-service-audience"),
-            help: "Explicit service-JWT audience for com.atproto.managedspace.checkUserAccess"
+            help: "Explicit service-JWT audience for com.atproto.managedspace.checkAccess"
         )
         var managingServiceAudience: String?
 
@@ -4096,13 +4096,13 @@ extension SwanCommand {
                         spacesOpenInterop: enableSpacesOpenInterop ? .standard : nil,
                         openFederation: openFederationResolver
                     )
-                    // October 29 managedspace: ask the managing app through
-                    // com.atproto.managedspace.checkUserAccess, signed as the
-                    // space authority. Without a resolver or a local signer
-                    // the directory keeps its default, which refuses every
-                    // non-authority user of a managedspace.
+                    // Ask the managing app through
+                    // com.atproto.managedspace.checkAccess, signed as the
+                    // space authority. Without a resolver or local signer,
+                    // requests fail as UpstreamFailure rather than becoming
+                    // policy denials.
                     if let notifyServiceResolver, let localSpaceRuntime {
-                        let policy = try OAuthRemoteFetchPolicy(maximumBodyBytes: 4_096, timeout: 5)
+                        let policy = try OAuthRemoteFetchPolicy(maximumBodyBytes: 4_096, timeout: 10)
                         await directory.setManagedSpaceAccessChecker(RemoteManagedSpaceAccessChecker(
                             resolver: notifyServiceResolver,
                             signer: localSpaceRuntime.notificationServiceIssuer,

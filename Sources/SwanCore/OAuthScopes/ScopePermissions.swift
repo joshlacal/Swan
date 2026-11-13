@@ -507,7 +507,7 @@ public extension SwanScopePermissions {
         //    bit denies; it never grants).
         guard statedKeys.contains("action"), grant.action.contains(.read) else { return false }
         // 2. Concrete space type.
-        guard case .nsid = grant.type else { return false }
+        guard case .nsid = grant.spaceType else { return false }
         return true
     }
 
@@ -574,7 +574,7 @@ public extension SwanScopePermissions {
             //    a wildcard REQUEST is satisfied only by a wildcard GRANT. An
             //    unresolved `self` authority renders as "self", which no
             //    concrete request and no `*` request can match — fail closed.
-            return Self.aggregateDimension(resolved.type.stringValue, covers: requestedType)
+            return Self.aggregateDimension(resolved.spaceType.stringValue, covers: requestedType)
                 && Self.aggregateDimension(resolved.authority.stringValue, covers: requestedAuthority)
         }
     }

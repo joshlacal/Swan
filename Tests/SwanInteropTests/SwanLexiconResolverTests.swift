@@ -269,7 +269,7 @@ final class SwanLexiconResolverTests: XCTestCase {
         await harness.assertUnresolvable(.documentSchemaInvalid)
     }
 
-    func testSpaceDocumentResolvesToASpace() async throws {
+    func testSpaceDocumentWithoutTitleFallsBackAfterIgnoringLegacyName() async throws {
         let harness = try await Harness(
             .valid,
             record: PublicRecord([
@@ -290,17 +290,13 @@ final class SwanLexiconResolverTests: XCTestCase {
         guard case let .resolved(.space(space), _, _) = resolution else {
             return XCTFail("expected a space, got \(resolution)")
         }
-        XCTAssertEqual(space.name, "Bulleted")
+        XCTAssertNil(space.title)
         XCTAssertEqual(space.collections, ["com.example.foo.item", "com.example.foo.list"])
     }
 
-    func testSpaceDocumentCarryingNameLangStillDecodes() async throws {
-        // `name:lang` (`lib/lexicon.ts:26` at the pinned corpus commit
-        // `bddc99fb`) is a display-localisation map that contributes no
-        // capability. Upstream declares it, so a real space from a localised
-        // lexicon carries it, and refusing the document over it would reject a
-        // legitimate authority. Same treatment `LexiconPermissionSet` already
-        // gives `title:lang` / `detail:lang`.
+    func testSpaceDocumentCarryingTitleLangStillDecodes() async throws {
+        // `title:lang` is a display-localisation map that contributes no
+        // capability. A localised declaration must still decode.
         let harness = try await Harness(
             .valid,
             record: PublicRecord([
@@ -309,13 +305,12 @@ final class SwanLexiconResolverTests: XCTestCase {
                 "id": .string(PublicRepositoryProofFixtureBuilder.defaultNSID),
                 "defs": .object(["main": .object([
                     "type": .string("space"),
-                    "name": .string("Bulleted"),
-                    "name:lang": .object([
+                    "title": .string("Bulleted"),
+                    "title:lang": .object([
                         "fr": .string("Puces"),
                         "ja": .string("ブレット"),
                     ]),
                     "collections": .array([.string("com.example.foo.item")]),
-                    "description": .string("A bulleted space"),
                 ])]),
             ])
         )
@@ -324,9 +319,8 @@ final class SwanLexiconResolverTests: XCTestCase {
             return XCTFail("expected a space, got \(resolution)")
         }
         XCTAssertEqual(space.type, "space")
-        XCTAssertEqual(space.name, "Bulleted")
+        XCTAssertEqual(space.title, "Bulleted")
         XCTAssertEqual(space.collections, ["com.example.foo.item"])
-        XCTAssertEqual(space.description, "A bulleted space")
     }
 
     func testPermissionSetCarryingTitleLangStillDecodes() async throws {

@@ -53,7 +53,7 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
     /// it is a positive control, not the property.
     func testNarrowingAPermissionSetTakesEffectOnRefresh() async throws {
         let resolver = MutableStubLexiconResolver([
-            Self.spaceType: .space(LexiconSpace(name: "Forum", collections: [Self.thread, Self.reply])),
+            Self.spaceType: .space(LexiconSpace(title: "Forum", collections: [Self.thread, Self.reply])),
         ])
         // A BARE space grant: no `collection`, so what it covers is whatever the
         // authority declares. That is the shape §5.7.5(b) materialises, and the
@@ -81,7 +81,7 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
         // The authority narrows its declaration. Nothing about the client, its
         // registration or its requested bytes changes.
         resolver.replace([
-            Self.spaceType: .space(LexiconSpace(name: "Forum", collections: [Self.thread])),
+            Self.spaceType: .space(LexiconSpace(title: "Forum", collections: [Self.thread])),
         ])
 
         let refreshToken = try XCTUnwrap(issued.refreshToken)
@@ -133,7 +133,7 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
     /// §9-D20 comparison would begin refusing the client's own original bytes.
     func testTheRequestedBaselineSurvivesRotationSoAWideningAlsoTakesEffect() async throws {
         let resolver = MutableStubLexiconResolver([
-            Self.spaceType: .space(LexiconSpace(name: "Forum", collections: [Self.thread])),
+            Self.spaceType: .space(LexiconSpace(title: "Forum", collections: [Self.thread])),
         ])
         let client = try PermissionedScopeClient(
             scopes: ["atproto", "space:\(Self.spaceType)"], kind: .localhostBridge
@@ -145,7 +145,7 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
         var refreshToken = try XCTUnwrap(issued.refreshToken)
 
         resolver.replace([
-            Self.spaceType: .space(LexiconSpace(name: "Forum", collections: [Self.thread, Self.reply])),
+            Self.spaceType: .space(LexiconSpace(title: "Forum", collections: [Self.thread, Self.reply])),
         ])
         let rotated = try await fixture.runtime.tokenService.redeemLocalhostPublicRefresh(
             refreshToken,
@@ -180,7 +180,7 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
     /// changes neither the client's stated collection set nor its read access.
     func testExplicitCollectionsRemainStableWhenTheDeclarationChanges() async throws {
         let resolver = MutableStubLexiconResolver([
-            Self.spaceType: .space(LexiconSpace(name: "Forum", collections: [Self.thread])),
+            Self.spaceType: .space(LexiconSpace(title: "Forum", collections: [Self.thread])),
         ])
         let client = try PermissionedScopeClient(
             scopes: ["atproto", "space:\(Self.spaceType)?collection=\(Self.thread)"],
@@ -191,7 +191,7 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
         let issued = try await fixture.mint(client: client, proofID: "rederive-explicit-mint")
 
         resolver.replace([
-            Self.spaceType: .space(LexiconSpace(name: "Forum", collections: [Self.reply])),
+            Self.spaceType: .space(LexiconSpace(title: "Forum", collections: [Self.reply])),
         ])
         let rotated = try await fixture.runtime.tokenService.redeemLocalhostPublicRefresh(
             try XCTUnwrap(issued.refreshToken),
@@ -232,7 +232,7 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
     /// refresh token.
     func testAnUnresolvableAuthorityFailsTheRefreshWithoutConsumingTheToken() async throws {
         let resolver = MutableStubLexiconResolver([
-            Self.spaceType: .space(LexiconSpace(name: "Forum", collections: [Self.thread])),
+            Self.spaceType: .space(LexiconSpace(title: "Forum", collections: [Self.thread])),
         ])
         let client = try PermissionedScopeClient(
             scopes: ["atproto", "space:\(Self.spaceType)"], kind: .localhostBridge
@@ -272,7 +272,7 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
         // The refresh token was NOT burned: the authority recovers and the same
         // token still rotates.
         resolver.replace([
-            Self.spaceType: .space(LexiconSpace(name: "Forum", collections: [Self.thread])),
+            Self.spaceType: .space(LexiconSpace(title: "Forum", collections: [Self.thread])),
         ])
         _ = try await fixture.runtime.tokenService.redeemLocalhostPublicRefresh(
             refreshToken,
@@ -402,7 +402,7 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
     /// identical to one that skipped — so this asserts the decision directly.
     func testAnUnchangedDeclarationRewritesNothing() async throws {
         let resolver = MutableStubLexiconResolver([
-            Self.spaceType: .space(LexiconSpace(name: "Forum", collections: [Self.thread])),
+            Self.spaceType: .space(LexiconSpace(title: "Forum", collections: [Self.thread])),
         ])
         let client = try PermissionedScopeClient(
             scopes: ["atproto", "space:\(Self.spaceType)"], kind: .localhostBridge
@@ -422,7 +422,7 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
         // same call now produces a grant. Without this, `nil` above could mean
         // "re-derivation never runs".
         resolver.replace([
-            Self.spaceType: .space(LexiconSpace(name: "Forum", collections: [Self.thread, Self.reply])),
+            Self.spaceType: .space(LexiconSpace(title: "Forum", collections: [Self.thread, Self.reply])),
         ])
         let changed = try await fixture.runtime.tokenService.rederivedGrant(for: family)
         XCTAssertNotNil(changed, "positive control: a changed declaration must produce a rewrite")

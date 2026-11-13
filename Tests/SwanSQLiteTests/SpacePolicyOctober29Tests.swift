@@ -105,8 +105,9 @@ final class SpacePolicyOctober29Tests: XCTestCase {
             XCTAssertEqual(Set(records.keys), [policyPath])
             XCTAssertEqual(records[policyPath], CID.fromDAGCBOR(try policy.policyRecordValue()).string)
 
-            _ = try await database.putSimpleSpaceMember(
-                space: space, member: Self.bob, read: true, write: false, authorization: owner
+            _ = try await database.putSimpleSpaceMembers(
+                space: space, members: [.init(did: Self.bob, read: true, write: false)],
+                authorization: owner
             )
             records = try await published(database)
             XCTAssertEqual(Set(records.keys), [policyPath, bobPath])
@@ -151,21 +152,22 @@ final class SpacePolicyOctober29Tests: XCTestCase {
                 configuration: SimpleSpaceConfiguration(policy: .member(try MemberSpacePolicy())),
                 authorization: owner
             )
-            for member in [Self.bob, Self.carol] {
-                _ = try await database.putSimpleSpaceMember(
-                    space: space, member: member, read: true, write: true, authorization: owner
-                )
-            }
+            _ = try await database.putSimpleSpaceMembers(
+                space: space,
+                members: [Self.bob, Self.carol].map { .init(did: $0, read: true, write: true) },
+                authorization: owner
+            )
             try await seedWriters(database, [Self.bob, Self.carol])
 
-            _ = try await database.putSimpleSpaceMember(
-                space: space, member: Self.bob, read: true, write: false, authorization: owner
+            _ = try await database.putSimpleSpaceMembers(
+                space: space, members: [.init(did: Self.bob, read: true, write: false)],
+                authorization: owner
             )
             var current = try await writers(database)
             XCTAssertEqual(current, [Self.carol])
 
-            _ = try await database.removeSimpleSpaceMember(
-                space: space, member: Self.carol, authorization: owner
+            _ = try await database.removeSimpleSpaceMembers(
+                space: space, members: [Self.carol], authorization: owner
             )
             current = try await writers(database)
             XCTAssertTrue(current.isEmpty)
@@ -194,8 +196,9 @@ final class SpacePolicyOctober29Tests: XCTestCase {
                 configuration: SimpleSpaceConfiguration(policy: .member(try MemberSpacePolicy())),
                 authorization: owner
             )
-            _ = try await database.putSimpleSpaceMember(
-                space: space, member: Self.bob, read: true, write: true, authorization: owner
+            _ = try await database.putSimpleSpaceMembers(
+                space: space, members: [.init(did: Self.bob, read: true, write: true)],
+                authorization: owner
             )
             let managed = SpacePolicy.managed(try ManagedSpacePolicy(managingApp: "did:web:manager.example#space"))
             _ = try await database.updateSimpleSpace(
@@ -205,12 +208,13 @@ final class SpacePolicyOctober29Tests: XCTestCase {
                 do {
                     switch operation {
                     case "put":
-                        _ = try await database.putSimpleSpaceMember(
-                            space: space, member: Self.bob, read: true, write: true, authorization: owner
+                        _ = try await database.putSimpleSpaceMembers(
+                            space: space, members: [.init(did: Self.bob, read: true, write: true)],
+                            authorization: owner
                         )
                     case "remove":
-                        _ = try await database.removeSimpleSpaceMember(
-                            space: space, member: Self.bob, authorization: owner
+                        _ = try await database.removeSimpleSpaceMembers(
+                            space: space, members: [Self.bob], authorization: owner
                         )
                     default:
                         _ = try await database.simpleSpaceMemberPage(
@@ -240,8 +244,9 @@ final class SpacePolicyOctober29Tests: XCTestCase {
                 space: space, owner: Self.alice,
                 configuration: SimpleSpaceConfiguration(policy: allowList), authorization: owner
             )
-            _ = try await database.putSimpleSpaceMember(
-                space: space, member: Self.bob, read: true, write: false, authorization: owner
+            _ = try await database.putSimpleSpaceMembers(
+                space: space, members: [.init(did: Self.bob, read: true, write: false)],
+                authorization: owner
             )
             let carolAuth = AuthorizationContext.accountOAuthForTesting(subject: Self.carol, scopes: ["atproto"])
             let bobAuth = AuthorizationContext.accountOAuthForTesting(subject: Self.bob, scopes: ["atproto"])
@@ -320,8 +325,9 @@ final class SpacePolicyOctober29Tests: XCTestCase {
                     configuration: SimpleSpaceConfiguration(policy: .member(try MemberSpacePolicy())),
                     authorization: owner
                 )
-                _ = try await database.putSimpleSpaceMember(
-                    space: target, member: Self.bob, read: true, write: true, authorization: owner
+                _ = try await database.putSimpleSpaceMembers(
+                    space: target, members: [.init(did: Self.bob, read: true, write: true)],
+                    authorization: owner
                 )
             }
             // Rewrite the rows into October 22 shapes and forget v29.

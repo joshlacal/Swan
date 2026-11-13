@@ -327,7 +327,11 @@ final class SwanSpacesTests: XCTestCase {
             owner: "did:plc:alice",
             configuration: try .init(readPolicy: .memberList, writePolicy: .memberList, appAccess: .allowList(["https://reader.example/client.json"]))
         )
-        try await authority.addMember(space: memberSpace, member: "did:plc:bob", by: "did:plc:alice")
+        try await authority.putMembers(
+            space: memberSpace,
+            members: [.init(did: "did:plc:bob", read: true, write: true)],
+            by: "did:plc:alice"
+        )
         _ = try await authority.issueReadCredential(
             space: memberSpace, user: "did:plc:bob", clientID: "https://reader.example/client.json"
         )
@@ -415,10 +419,18 @@ final class SwanSpacesTests: XCTestCase {
             try await authority.issueReadCredential(space: spaceURI, user: "did:plc:bob", clientID: nil)
         )
 
-        // Add bob with read: true, write: false
-        try await authority.putMember(space: spaceURI, member: "did:plc:bob", read: true, write: false, by: "did:plc:alice")
+        // Add bob with read: true, write: false.
+        try await authority.putMembers(
+            space: spaceURI,
+            members: [.init(did: "did:plc:bob", read: true, write: false)],
+            by: "did:plc:alice"
+        )
         // Now bob can read
         _ = try await authority.issueReadCredential(space: spaceURI, user: "did:plc:bob", clientID: nil)
+        // A member's explicit write:false overrides publicWrite.
+        await XCTAssertThrowsErrorAsync(
+            try await authority.authorizeWrite(space: spaceURI, writer: "did:plc:bob")
+        )
 
         // Change write policy to member-list: now bob cannot write (write: false)
         try await authority.update(
@@ -432,7 +444,11 @@ final class SwanSpacesTests: XCTestCase {
         )
 
         // Update bob to read: false, write: true
-        try await authority.putMember(space: spaceURI, member: "did:plc:bob", read: false, write: true, by: "did:plc:alice")
+        try await authority.putMembers(
+            space: spaceURI,
+            members: [.init(did: "did:plc:bob", read: false, write: true)],
+            by: "did:plc:alice"
+        )
         // Now bob can write but cannot read
         try await authority.authorizeWrite(space: spaceURI, writer: "did:plc:bob")
         await XCTAssertThrowsErrorAsync(
@@ -440,8 +456,10 @@ final class SwanSpacesTests: XCTestCase {
         )
 
         // Authority access is identity-based, even after an explicit flag downgrade.
-        try await authority.putMember(
-            space: spaceURI, member: "did:plc:alice", read: false, write: false, by: "did:plc:alice"
+        try await authority.putMembers(
+            space: spaceURI,
+            members: [.init(did: "did:plc:alice", read: false, write: false)],
+            by: "did:plc:alice"
         )
         _ = try await authority.issueReadCredential(space: spaceURI, user: "did:plc:alice", clientID: nil)
         try await authority.authorizeWrite(space: spaceURI, writer: "did:plc:alice")
@@ -500,9 +518,9 @@ final class SwanSpacesTests: XCTestCase {
             )
         )
         await XCTAssertThrowsErrorAsync(
-            try await authority.removeMember(
+            try await authority.removeMembers(
                 space: space,
-                member: "not-a-did",
+                members: ["not-a-did"],
                 by: space.authority
             )
         )
@@ -1208,21 +1226,21 @@ final class SwanSpacesTests: XCTestCase {
         XCTAssertEqual(created.space.members, [authorityDID: SimpleSpaceMember(did: authorityDID, read: true, write: true)])
 
         await XCTAssertThrowsErrorAsync(
-            try await authority.addMember(
+            try await authority.putMembers(
                 space: space,
-                member: "did:plc:bob",
+                members: [.init(did: "did:plc:bob", read: true, write: true)],
                 authorization: .accountOAuthForTesting(subject: "did:plc:mallory", scopes: ["atproto"])
             )
         )
-        let firstMemberMutation = try await authority.addMember(
+        let firstMemberMutation = try await authority.putMembers(
             space: space,
-            member: "did:plc:bob",
+            members: [.init(did: "did:plc:bob", read: true, write: true)],
             authorization: manage
         )
         XCTAssertEqual(firstMemberMutation.revision, 2)
-        let duplicateMemberMutation = try await authority.addMember(
+        let duplicateMemberMutation = try await authority.putMembers(
             space: space,
-            member: "did:plc:bob",
+            members: [.init(did: "did:plc:bob", read: true, write: true)],
             authorization: manage
         )
         XCTAssertEqual(duplicateMemberMutation, firstMemberMutation)

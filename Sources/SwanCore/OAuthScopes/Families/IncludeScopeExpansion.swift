@@ -178,7 +178,7 @@ extension IncludeScope {
         case let .repo(repo):
             return repo.collection.allSatisfy { isParentAuthorityOf($0.stringValue) }
         case let .space(space):
-            return isParentAuthorityOf(space.type.stringValue)
+            return isParentAuthorityOf(space.spaceType.stringValue)
         }
     }
 

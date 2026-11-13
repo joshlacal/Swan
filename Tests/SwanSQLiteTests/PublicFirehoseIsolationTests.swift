@@ -38,9 +38,9 @@ final class PublicFirehoseIsolationTests: XCTestCase {
       configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
       authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"])
     )
-    _ = try await lifecycle.addMember(
+    _ = try await lifecycle.putMembers(
       space: space,
-      member: writer,
+      members: [.init(did: writer, read: true, write: true)],
       authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"])
     )
     let now = Date(timeIntervalSince1970: 1_785_844_800)

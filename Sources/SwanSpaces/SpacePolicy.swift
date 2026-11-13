@@ -107,7 +107,8 @@ public enum SpacePolicy: Sendable, Equatable, Hashable {
                 publishMembers: try optionalBool(object["publishMembers"])
             ))
         case managedType:
-            guard let managingApp = object["managingApp"] as? String else {
+            guard let managingApp = object["managingApp"] as? String,
+                  SpacePolicyValidation.isValidManagingAppService(managingApp) else {
                 throw SpacePolicyError.invalidPolicy
             }
             return .managed(try ManagedSpacePolicy(
@@ -277,7 +278,7 @@ public struct MemberSpacePolicy: Sendable, Equatable, Hashable {
 
 /// `com.atproto.managedspace.policy`. Every user decision, for reads and
 /// writes, is deferred to `managingApp` through
-/// `com.atproto.managedspace.checkUserAccess`.
+/// `com.atproto.managedspace.checkAccess`.
 public struct ManagedSpacePolicy: Sendable, Equatable, Hashable {
     public let managingApp: String
     public let publishPolicy: Bool
@@ -312,32 +313,65 @@ public enum SpacePolicyError: Error, Sendable, Equatable {
 }
 
 public enum SpacePolicyValidation {
-    /// Client identifiers are opaque app names in the wire protocol. Keep
-    /// their lexical contract shared so every adapter agrees on valid state.
-    public static func isValidAppIdentifier(_ identifier: String) -> Bool {
-        !identifier.isEmpty
-            && identifier.utf8.count <= 2_048
-            && identifier.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value != 0x7F }
+    /// Lexicon `uri` format, matching `@atproto/syntax`'s absolute-URI gate.
+    public static func isValidURI(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 2_048,
+              let colon = value.firstIndex(of: ":"),
+              colon != value.startIndex,
+              value[..<colon].utf8.allSatisfy({
+                  ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x41 && $0 <= 0x5A)
+                      || ($0 >= 0x61 && $0 <= 0x7A) || $0 == 0x5F
+              }) else {
+            return false
+        }
+        var remainder = value[value.index(after: colon)...]
+        if remainder.hasPrefix("//") {
+            remainder = remainder.dropFirst(2)
+        }
+        guard let first = remainder.unicodeScalars.first,
+              first.value != 0x2F,
+              !CharacterSet.whitespacesAndNewlines.contains(first) else {
+            return false
+        }
+        return remainder.unicodeScalars.allSatisfy {
+            !CharacterSet.whitespacesAndNewlines.contains($0)
+                && !CharacterSet.controlCharacters.contains($0)
+        }
     }
 
-    /// `managingApp` must be a DID with an optional service fragment.
+    public static func isValidAppIdentifier(_ identifier: String) -> Bool {
+        isValidURI(identifier)
+    }
+
+    /// Stored pre-November rows may contain a bare DID, so this tolerant
+    /// validator remains available for loading and reporting them.
     public static func isValidManagingApp(_ value: String) -> Bool {
         guard value.utf8.count <= 2_048 else { return false }
         let parts = value.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
         guard SpaceURI.isValidDID(String(parts[0])) else { return false }
         if parts.count == 2 {
-            let fragment = parts[1]
-            guard !fragment.isEmpty, fragment.utf8.count <= 256,
-                  fragment.utf8.allSatisfy({ byte in
-                      (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5A)
-                          || (byte >= 0x61 && byte <= 0x7A)
-                          || byte == 0x2D || byte == 0x2E || byte == 0x5F || byte == 0x7E
-                          || byte == 0x3A
-                  }) else {
-                return false
-            }
+            guard isValidServiceFragment(parts[1]) else { return false }
         }
         return true
+    }
+
+    /// New policies require the named DID service, never a bare DID.
+    public static func isValidManagingAppService(_ value: String) -> Bool {
+        let parts = value.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+        return parts.count == 2
+            && SpaceURI.isValidDID(String(parts[0]))
+            && isValidServiceFragment(parts[1])
+            && value.utf8.count <= 2_048
+    }
+
+    private static func isValidServiceFragment(_ fragment: Substring) -> Bool {
+        !fragment.isEmpty && fragment.utf8.count <= 256
+            && fragment.utf8.allSatisfy { byte in
+                (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5A)
+                    || (byte >= 0x61 && byte <= 0x7A)
+                    || byte == 0x2D || byte == 0x2E || byte == 0x5F || byte == 0x7E
+                    || byte == 0x3A
+            }
     }
 }
 

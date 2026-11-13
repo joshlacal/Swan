@@ -1180,7 +1180,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                 repositorySyncConfiguration: nil,
                 repositoryCredentialConfiguration: nil,
                 notificationConfiguration: nil,
-                checkUserAccessConfiguration: nil
+                managedSpaceCheckAccessConfiguration: nil
             )
             let server = permissionedRuntime.makeServer(
                 profile: profile,

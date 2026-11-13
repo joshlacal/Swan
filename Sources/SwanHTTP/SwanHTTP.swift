@@ -382,10 +382,10 @@ public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
 }
 
 /// Explicitly enables Swan's generic managing-app response for
-/// `com.atproto.managedspace.checkUserAccess`.  It deliberately contains no
-/// account directory, authority policy, or repository capability: a generic
-/// PDS can verify who called it, but cannot make an application-policy grant.
-public struct SwanSimpleSpaceCheckUserAccessHTTPConfiguration: Sendable {
+/// `com.atproto.managedspace.checkAccess`. It contains no account directory,
+/// authority policy, or repository capability: a generic PDS can verify who
+/// called it, but cannot make an application-policy grant.
+public struct SwanManagedSpaceCheckAccessHTTPConfiguration: Sendable {
     public let serviceAuthentication: any SpaceServiceAuthenticationVerifier
     let managingServiceAudience: String
 
@@ -469,7 +469,7 @@ public struct SwanHTTPServer: Sendable {
     /// The standalone managing-app service-auth endpoint. Unlike authority
     /// routes, this has no storage dependency and always returns the pinned
     /// generic PDS denial after authenticating its service caller.
-    public let simpleSpaceCheckUserAccess: SwanSimpleSpaceCheckUserAccessCapability?
+    public let managedSpaceCheckAccess: SwanManagedSpaceCheckAccessCapability?
     /// Public-only read capability selected from the startup-preopened account
     /// inventory. It contains no authorization or permissioned-data fallback.
     public let publicRepositoryReadDirectory: (any PublicRepositoryReadDirectory)?
@@ -563,7 +563,7 @@ public struct SwanHTTPServer: Sendable {
         spaceRepositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration? = nil,
         spaceRepositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration? = nil,
         spaceNotificationConfiguration: SwanSpaceNotificationHTTPConfiguration? = nil,
-        simpleSpaceCheckUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration? = nil,
+        managedSpaceCheckAccessConfiguration: SwanManagedSpaceCheckAccessHTTPConfiguration? = nil,
         spacesOpenInterop: SwanSpacesOpenInteropConfiguration? = nil,
         publicRepositoryReadDirectory: (any PublicRepositoryReadDirectory)? = nil,
         publicRepositoryMutationDirectory: (any PublicRepositoryMutationDirectory)? = nil,
@@ -631,13 +631,13 @@ public struct SwanHTTPServer: Sendable {
         self.blobStreamAdmission = blobStreamAdmission
             ?? publicBlobSpoolAdmission
             ?? PublicRepositorySpoolAdmission.shared
-        if let simpleSpaceCheckUserAccessConfiguration {
-            simpleSpaceCheckUserAccess = SwanSimpleSpaceCheckUserAccessCapability(
-                serviceAuthentication: simpleSpaceCheckUserAccessConfiguration.serviceAuthentication,
-                managingServiceAudience: simpleSpaceCheckUserAccessConfiguration.managingServiceAudience
+        if let managedSpaceCheckAccessConfiguration {
+            managedSpaceCheckAccess = SwanManagedSpaceCheckAccessCapability(
+                serviceAuthentication: managedSpaceCheckAccessConfiguration.serviceAuthentication,
+                managingServiceAudience: managedSpaceCheckAccessConfiguration.managingServiceAudience
             )
         } else {
-            simpleSpaceCheckUserAccess = nil
+            managedSpaceCheckAccess = nil
         }
         // A caller may not smuggle metadata publication through a partial
         // assembly. Only the complete remote authorization-server config can
@@ -1288,11 +1288,11 @@ public struct SwanHTTPServer: Sendable {
                     capability: authenticatedSpaceNotifications,
                     requestBodyAdmission: requestBodyAdmission
                 )
-            } else if descriptor.nsid == "com.atproto.managedspace.checkUserAccess",
-                      let simpleSpaceCheckUserAccess {
-                registerSimpleSpaceCheckUserAccessEndpoint(
+            } else if descriptor.nsid == "com.atproto.managedspace.checkAccess",
+                      let managedSpaceCheckAccess {
+                registerManagedSpaceCheckAccessEndpoint(
                     on: router,
-                    capability: simpleSpaceCheckUserAccess
+                    capability: managedSpaceCheckAccess
                 )
             } else if let authenticatedSimpleSpaceLifecycle,
                       Self.isSimpleSpaceLifecycleMethod(descriptor.nsid) {
@@ -1420,8 +1420,8 @@ public struct SwanHTTPServer: Sendable {
              "com.atproto.space.removeWriter",
              "com.atproto.space.exportSpaceMeta",
              "com.atproto.space.importSpaceMeta",
-             "com.atproto.memberspace.putMember",
-             "com.atproto.memberspace.removeMember",
+             "com.atproto.memberspace.putMembers",
+             "com.atproto.memberspace.removeMembers",
              "com.atproto.memberspace.listMembers":
             true
         default:

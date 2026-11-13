@@ -40,8 +40,8 @@ final class SwanDisposableAuthorityProvisioningTests: XCTestCase, @unchecked Sen
         XCTAssertEqual(created["uri"] as? String, expectedSpace)
         let member = "did:plc:xx5pwgo7a7k3sjz4xzoau2bq"
         let memberResponse = try await oauth.executeResource(token: token, method: .post,
-            path: "/xrpc/com.atproto.memberspace.putMember", body: JSONSerialization.data(withJSONObject: [
-                "space": expectedSpace, "did": member, "read": true, "write": true]))
+            path: "/xrpc/com.atproto.memberspace.putMembers", body: JSONSerialization.data(withJSONObject: [
+                "space": expectedSpace, "members": [["did": member, "read": true, "write": true]]]))
         XCTAssertEqual(memberResponse.status, 200, String(decoding: memberResponse.body, as: UTF8.self))
         guard response.status == 200, memberResponse.status == 200 else { return }
         let evidence: [String: Any] = ["space": expectedSpace, "member": member, "authority": token.subject,

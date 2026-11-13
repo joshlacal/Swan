@@ -72,44 +72,19 @@ public struct LexPermissionSyntax: Sendable, ScopeSyntax {
     /// `:18-20`.
     public var positional: String? { nil }
 
-    /// `:22-42`. Reserved-key filtering plus the `spaceType` remap.
+    /// Surface fields from the already-filtered permission payload.
     ///
-    /// Both halves are load-bearing, and either one missing empties the
-    /// expansion rather than narrowing it:
-    ///
-    ///  * without the remap, `space`'s required `type` (§5.6.2) is absent from
-    ///    every upstream fixture — they all spell it `spaceType` — so each space
-    ///    entry throws `.missingRequiredParameter` and no space permission is
-    ///    ever expanded;
-    ///  * without the reserved-key filter, `type: "permission"` and
-    ///    `resource: "repo"|"space"|"rpc"` are unknown keys under §4.6's rule
-    ///    (`parser.ts:105-107`), and EVERY entry is dropped.
+    /// `LexiconPermission` removes the reserved `type` and `resource`
+    /// discriminators while decoding. Permission-set space entries already use
+    /// `spaceType`, which is now also the scope schema's named key, so no key
+    /// remapping is required.
     private func get(_ key: String) -> LexiconValue? {
-        if key == "type" {
-            // `:24-34` — only `space` surfaces a `type`, sourced from `spaceType`.
-            guard permission.resource == SpacePermission.prefix else { return nil }
-            return permission.fields["spaceType"]
-        }
-        if key == "resource" { return nil }   // :35
-        if key == "spaceType" { return nil }  // :36
-        return permission.fields[key]         // :38-41
+        permission.fields[key]
     }
 
-    /// `:44-51`. Surface keys only — `spaceType` is yielded as `type` for a
-    /// space, and any key whose `get()` is nil is omitted entirely. This is what
-    /// makes §4.6's unknown-key rejection safe against `type` / `resource`.
-    ///
-    /// `permission.fields` already excludes the two reserved discriminators, so
-    /// where upstream iterates `Object.keys` and relies on `get()` to filter
-    /// them back out, this iterates the already-filtered set. The yielded set is
-    /// the same; upstream can additionally yield `"type"` twice for a space that
-    /// carries both `type` and `spaceType`, which is a no-op for the caller.
+    /// Surface keys in the permission's stable insertion order.
     public func keys() -> [String] {
-        let isSpace = permission.resource == SpacePermission.prefix
-        return permission.fields.keys.compactMap { key in
-            let surfaceKey = (isSpace && key == "spaceType") ? "type" : key
-            return get(surfaceKey) != nil ? surfaceKey : nil
-        }
+        Array(permission.fields.keys)
     }
 
     /// `:53-57`. `.repeated` <-> upstream `null`: present, but an ARRAY where a

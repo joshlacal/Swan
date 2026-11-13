@@ -45,13 +45,13 @@ public struct SwanConversationSpaceLifecycle: AuthorizedSimpleSpaceLifecycleDire
         try requireLocalPolicy(space)
         try await local.removeSpaceWriter(writer, from: space, authorization: authorization)
     }
-    public func putSimpleSpaceMember(_ member: String, read: Bool, write: Bool, in space: SpaceURI, authorization: AuthorizationContext) async throws {
+    public func putSimpleSpaceMembers(_ members: [AuthorizedSimpleSpaceMemberPage.Member], in space: SpaceURI, authorization: AuthorizationContext) async throws {
         try requireLocalPolicy(space)
-        try await local.putSimpleSpaceMember(member, read: read, write: write, in: space, authorization: authorization)
+        try await local.putSimpleSpaceMembers(members, in: space, authorization: authorization)
     }
-    public func removeSimpleSpaceMember(_ member: String, from space: SpaceURI, authorization: AuthorizationContext) async throws {
+    public func removeSimpleSpaceMembers(_ members: [String], from space: SpaceURI, authorization: AuthorizationContext) async throws {
         try requireLocalPolicy(space)
-        try await local.removeSimpleSpaceMember(member, from: space, authorization: authorization)
+        try await local.removeSimpleSpaceMembers(members, from: space, authorization: authorization)
     }
     public func simpleSpaceMembers(_ space: SpaceURI, limit: Int, cursor: String?, authorization: AuthorizationContext) async throws -> AuthorizedSimpleSpaceMemberPage {
         try requireLocalPolicy(space)

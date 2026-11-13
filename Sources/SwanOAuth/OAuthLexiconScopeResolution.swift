@@ -325,7 +325,7 @@ public enum OAuthLexiconScopeResolution {
         var bare: Set<String> = []
         for raw in scopes {
             guard case let .space(permission)? = try? AtprotoScope.parse(raw),
-                  case let .nsid(type) = permission.type,
+                  case let .nsid(type) = permission.spaceType,
                   !permission.hasCollections else { continue }
             bare.insert(type)
         }
@@ -371,7 +371,7 @@ public enum OAuthLexiconScopeResolution {
         var rekeyed = provenance
         for raw in scopes {
             guard case let .space(permission)? = try? AtprotoScope.parse(raw),
-                  case let .nsid(type) = permission.type,
+                  case let .nsid(type) = permission.spaceType,
                   !permission.hasCollections,
                   let declared = spaces[type], !declared.collections.isEmpty else {
                 effective.insert(raw)
@@ -395,6 +395,34 @@ public enum OAuthLexiconScopeResolution {
         return OAuthExpandedScopeSet(
             scopes: effective, provenance: rekeyed.restricted(to: effective)
         )
+    }
+
+    /// Resolves display titles for concrete space types in a consent payload.
+    /// Missing, unresolvable, non-space, and untitled declarations are omitted;
+    /// the renderer falls back to the NSID for each omitted entry.
+    public static func resolveSpaceTitles(
+        _ scopes: Set<String>,
+        resolver: (any SwanLexiconResolving)?
+    ) async throws -> [String: String] {
+        guard let resolver else { return [:] }
+        let types = Set(scopes.compactMap { raw -> String? in
+            guard case let .space(permission)? = try? AtprotoScope.parse(raw),
+                  case let .nsid(type) = permission.spaceType else {
+                return nil
+            }
+            return type
+        })
+        guard !types.isEmpty else { return [:] }
+        let resolutions = try await resolver.resolveAll(types, population: .spaceTypes)
+        var titles: [String: String] = [:]
+        for type in types {
+            guard case let .resolved(.space(space), _, _) = resolutions[type],
+                  let title = space.title, !title.isEmpty else {
+                continue
+            }
+            titles[type] = title
+        }
+        return titles
     }
 
     // MARK: - Call site 2 — the three transformations in order

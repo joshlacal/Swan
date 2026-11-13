@@ -258,9 +258,11 @@ private struct SpaceRevisionHTTPFixture {
                 configuration: try .init(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
                 authorization: owner
             )
-            for member in members {
-                _ = try await lifecycle.addMember(space: space, member: member, authorization: owner)
-            }
+            _ = try await lifecycle.putMembers(
+                space: space,
+                members: members.map { .init(did: $0, read: true, write: true) },
+                authorization: owner
+            )
             try await database.close()
             let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
                 dataDirectory: root,

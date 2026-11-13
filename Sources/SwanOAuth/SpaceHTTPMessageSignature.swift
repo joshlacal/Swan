@@ -109,8 +109,16 @@ public enum SpaceHTTPSignature {
         } catch {
             throw SpaceHTTPSignatureError.malformedSignature
         }
-        guard case let .innerList(input)? = inputDictionary[label],
-              case let .item(signatureItem)? = signatureDictionary[label],
+        let tagged = inputDictionary.entries.filter { entry in
+            let parameters = switch entry.value {
+            case let .item(item): item.parameters
+            case let .innerList(list): list.parameters
+            }
+            return parameters["tag"] == .string(label)
+        }
+        guard tagged.count == 1,
+              case let .innerList(input) = tagged[0].value,
+              case let .item(signatureItem)? = signatureDictionary[tagged[0].key],
               case let .byteSequence(signatureBytes) = signatureItem.value,
               signatureItem.parameters.isEmpty else {
             throw SpaceHTTPSignatureError.malformedSignature

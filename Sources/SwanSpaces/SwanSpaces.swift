@@ -2019,8 +2019,8 @@ private struct MutableSimpleSpace: Sendable {
 /// Process-local policy coordinator for the laboratory. Durable deployments
 /// persist the same decisions with the authority account; it never writes to a
 /// member repository during credential issuance. Its managing-app decision
-/// sets stand in for a local `checkUserAccess` app: a managedspace consults
-/// them for both reads and writes.
+/// sets stand in for a local `checkAccess` app: a managedspace consults them
+/// for both reads and writes.
 public actor SimpleSpaceAuthority {
     private let credentials: HMACSpaceCredentialAuthority
     private var spaces: [SpaceURI: MutableSimpleSpace] = [:]
@@ -2032,6 +2032,10 @@ public actor SimpleSpaceAuthority {
     }
 
     public func create(space: SpaceURI, owner: String, configuration: SimpleSpaceConfiguration) throws -> SimpleSpace {
+        if case let .managed(policy) = configuration.policy,
+           !SpacePolicyValidation.isValidManagingAppService(policy.managingApp) {
+            throw SpacePolicyError.invalidPolicy
+        }
         guard owner == space.authority else { throw SwanError.unauthorized("only the authority DID may create this simple space") }
         guard spaces[space] == nil else { throw SwanError.conflict(expected: 0, actual: 1) }
         guard spaces.count < SimpleSpaceLimits.maximumSpacesPerAuthority else {
@@ -2048,6 +2052,10 @@ public actor SimpleSpaceAuthority {
     /// Replaces the policy wholesale. A different `$type` discards the
     /// previous policy's state, so leaving memberspace drops the member list.
     public func update(space: SpaceURI, configuration: SimpleSpaceConfiguration, by subject: String) throws {
+        if case let .managed(policy) = configuration.policy,
+           !SpacePolicyValidation.isValidManagingAppService(policy.managingApp) {
+            throw SpacePolicyError.invalidPolicy
+        }
         var state = try activeSpace(space)
         try requireOwner(state, subject: subject)
         let previous = state.configuration
@@ -2063,33 +2071,52 @@ public actor SimpleSpaceAuthority {
         }
     }
 
-    public func putMember(space: SpaceURI, member: String, read: Bool, write: Bool, by subject: String) throws {
+    public func putMembers(
+        space: SpaceURI,
+        members: [SimpleSpaceMember],
+        by subject: String
+    ) throws {
+        guard members.count <= 100 else {
+            throw SwanError.malformed("too many members")
+        }
         var state = try activeSpace(space)
         try requireOwner(state, subject: subject)
         guard case .member = state.configuration.policy else { throw SpacePolicyError.policyMismatch }
-        guard SpaceURI.isValidDID(member) else { throw SwanError.invalidIdentifier(member) }
-        guard state.members[member] != nil
-            || state.members.count < SimpleSpaceLimits.maximumMembersPerSpace
-        else {
+        var finalByDID: [String: SimpleSpaceMember] = [:]
+        for member in members {
+            guard SpaceURI.isValidDID(member.did) else {
+                throw SwanError.invalidIdentifier(member.did)
+            }
+            finalByDID[member.did] = member
+        }
+        let added = finalByDID.keys.reduce(into: 0) {
+            if state.members[$1] == nil { $0 += 1 }
+        }
+        guard state.members.count + added <= SimpleSpaceLimits.maximumMembersPerSpace else {
             throw SwanError.unavailable("simple-space member capacity exhausted")
         }
-        state.members[member] = SimpleSpaceMember(did: member, read: read, write: write)
+        for member in finalByDID.values {
+            state.members[member.did] = member
+        }
         spaces[space] = state
     }
 
-    public func addMember(space: SpaceURI, member: String, by subject: String) throws {
-        try putMember(space: space, member: member, read: true, write: true, by: subject)
-    }
-
-    public func removeMember(space: SpaceURI, member: String, by subject: String) throws {
+    public func removeMembers(space: SpaceURI, members: [String], by subject: String) throws {
+        guard members.count <= 100 else {
+            throw SwanError.malformed("too many members")
+        }
         var state = try activeSpace(space)
         try requireOwner(state, subject: subject)
         guard case .member = state.configuration.policy else { throw SpacePolicyError.policyMismatch }
-        guard SpaceURI.isValidDID(member) else {
-            throw SwanError.invalidIdentifier(member)
+        for member in Set(members) {
+            guard SpaceURI.isValidDID(member) else {
+                throw SwanError.invalidIdentifier(member)
+            }
+            guard member != state.owner else {
+                throw SwanError.malformed("a space owner cannot be removed")
+            }
+            state.members.removeValue(forKey: member)
         }
-        guard member != state.owner else { throw SwanError.malformed("a space owner cannot be removed") }
-        state.members.removeValue(forKey: member)
         spaces[space] = state
     }
 
@@ -2190,7 +2217,8 @@ public actor SimpleSpaceAuthority {
         case .personal:
             throw SwanError.unauthorized("writer is not authorized to write to this space")
         case let .member(member):
-            guard member.publicWrite || state.members[writer]?.write == true else {
+            let allowed = state.members[writer]?.write ?? member.publicWrite
+            guard allowed else {
                 throw SwanError.unauthorized("writer is not authorized to write to this space")
             }
         case .managed:

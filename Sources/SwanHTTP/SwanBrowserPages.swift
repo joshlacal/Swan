@@ -37,10 +37,14 @@ enum SwanBrowserPages {
         subject: String,
         clientID: String,
         scopes: Set<String>,
-        emptyPermissionSets: [String] = []
+        emptyPermissionSets: [String] = [],
+        spaceTitles: [String: String] = [:]
     ) -> String {
         let scopeSection = ScopeDescription.render(
-            scopes: scopes, emptyPermissionSets: emptyPermissionSets)
+            scopes: scopes,
+            emptyPermissionSets: emptyPermissionSets,
+            spaceTitles: spaceTitles
+        )
         return page(
             title: "Authorize client",
             body: """

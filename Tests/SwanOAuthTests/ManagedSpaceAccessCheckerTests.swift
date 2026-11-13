@@ -5,8 +5,8 @@ import SwanSpaces
 import SwanStorage
 import XCTest
 
-/// The outbound `com.atproto.managedspace.checkUserAccess` client: request
-/// shape, strict answer parsing, and deny-on-failure.
+/// The outbound `com.atproto.managedspace.checkAccess` client: request shape,
+/// strict answer parsing, and upstream-failure semantics.
 final class ManagedSpaceAccessCheckerTests: XCTestCase {
     private static let authority = "did:plc:abcdefghijklmnopqrstuvwx"
     private static let user = "did:plc:bcdefghijklmnopqrstuvwxy"
@@ -20,56 +20,54 @@ final class ManagedSpaceAccessCheckerTests: XCTestCase {
         return Dictionary(uniqueKeysWithValues: items.map { ($0.name, $0.value ?? "") })
     }
 
-    func testRequestCarriesClientIdOnReadsOnly() throws {
+    func testRequestCarriesOptionalRepoAndAttestedClientID() throws {
         let base = try XCTUnwrap(URL(string: "https://manager.example"))
-        let read = try RemoteManagedSpaceAccessChecker.requestURL(
-            base: base, space: space(), user: Self.user, access: .read,
+        let delegated = try RemoteManagedSpaceAccessChecker.requestURL(
+            base: base, space: space(), repo: Self.user,
             clientID: "https://app.example/client+metadata.json"
         )
-        XCTAssertEqual(read.path, "/xrpc/com.atproto.managedspace.checkUserAccess")
-        XCTAssertEqual(query(read), [
+        XCTAssertEqual(delegated.path, "/xrpc/com.atproto.managedspace.checkAccess")
+        XCTAssertEqual(query(delegated), [
             "space": try space().rawValue,
-            "user": Self.user,
-            "access": "read",
+            "repo": Self.user,
             "clientId": "https://app.example/client+metadata.json",
         ])
-        XCTAssertTrue(read.absoluteString.contains("client%2Bmetadata"), "`+` must not decode as a space")
+        XCTAssertTrue(delegated.absoluteString.contains("client%2Bmetadata"))
 
-        let write = try RemoteManagedSpaceAccessChecker.requestURL(
-            base: base, space: space(), user: Self.user, access: .write,
-            clientID: "https://app.example/client.json"
+        let undelegated = try RemoteManagedSpaceAccessChecker.requestURL(
+            base: base, space: space(), repo: nil, clientID: nil
         )
-        XCTAssertEqual(query(write), [
-            "space": try space().rawValue,
-            "user": Self.user,
-            "access": "write",
-        ])
+        XCTAssertEqual(query(undelegated), ["space": try space().rawValue])
     }
 
-    func testOnlyABooleanTrueAuthorizes() {
-        XCTAssertTrue(RemoteManagedSpaceAccessChecker.isAuthorized(Data(#"{"authorized":true}"#.utf8)))
+    func testResponseRequiresExactlyTwoBooleans() throws {
+        XCTAssertEqual(
+            try RemoteManagedSpaceAccessChecker.access(from: Data(#"{"read":true,"write":false}"#.utf8)),
+            ManagedSpaceAccess(read: true, write: false)
+        )
         for body in [
-            #"{"authorized":false}"#,
-            #"{"authorized":1}"#,
-            #"{"authorized":"true"}"#,
-            #"{"authorized":null}"#,
-            #"{}"#,
-            #"[true]"#,
-            #"{"authorized":true,"authorized":false}"#,
+            #"{"read":true}"#,
+            #"{"read":true,"write":0}"#,
+            #"{"read":true,"write":false,"other":false}"#,
+            #"[true,false]"#,
             "not json",
             "",
         ] {
-            XCTAssertFalse(RemoteManagedSpaceAccessChecker.isAuthorized(Data(body.utf8)), body)
+            XCTAssertThrowsError(
+                try RemoteManagedSpaceAccessChecker.access(from: Data(body.utf8)),
+                body
+            ) {
+                XCTAssertEqual($0 as? ManagedSpaceAccessError, .upstreamFailure)
+            }
         }
     }
 
-    func testEveryFailureDenies() async throws {
+    func testResolutionAndTransportFailuresAreUpstreamFailures() async throws {
         let signer = RecordingIssuer()
         let manager = "did:web:manager.example"
         let documents = StubDocuments(documents: [
             manager: Data("""
             {"id":"\(manager)","service":[
-              {"id":"#atproto_pds","serviceEndpoint":"https://127.0.0.1:9"},
               {"id":"#space","serviceEndpoint":"https://localhost:9"}
             ]}
             """.utf8),
@@ -82,45 +80,33 @@ final class ManagedSpaceAccessCheckerTests: XCTestCase {
                 configuration: try .init(endpointPeers: [:], allowsDynamicPeerSelection: true)
             )
         )
-        // An app whose DID document cannot be fetched: denied, nothing signed.
-        let unresolvable = await checker.checkUserAccess(
-            space: try space(), user: Self.user, access: .read, clientID: nil,
-            managingApp: "did:web:absent.example"
-        )
-        XCTAssertFalse(unresolvable)
-        let afterUnresolvable = await signer.calls
-        XCTAssertTrue(afterUnresolvable.isEmpty)
-
-        // A named fragment the document lacks: denied.
-        let missingFragment = await checker.checkUserAccess(
-            space: try space(), user: Self.user, access: .write, clientID: nil,
-            managingApp: "\(manager)#other"
-        )
-        XCTAssertFalse(missingFragment)
-
-        // Resolvable, but the endpoint is cleartext or loopback, which the
-        // outbound policy refuses: denied, after signing with the authority
-        // as issuer and the app exactly as written as audience.
-        for app in [manager, "\(manager)#space"] {
-            let allowed = await checker.checkUserAccess(
-                space: try space(), user: Self.user, access: .read, clientID: nil,
-                managingApp: app
-            )
-            XCTAssertFalse(allowed, app)
+        for app in ["did:web:absent.example#space", "\(manager)#other", manager, "\(manager)#space"] {
+            do {
+                _ = try await checker.checkAccess(
+                    space: try space(), repo: Self.user, clientID: nil, managingApp: app
+                )
+                XCTFail("expected upstream failure for \(app)")
+            } catch {
+                XCTAssertEqual(error as? ManagedSpaceAccessError, .upstreamFailure)
+            }
         }
         let calls = await signer.calls
-        XCTAssertEqual(calls.map(\.audience), [manager, "\(manager)#space"])
+        XCTAssertEqual(calls.map(\.audience), ["\(manager)#space"])
         XCTAssertTrue(calls.allSatisfy { $0.issuer == Self.authority })
-        XCTAssertTrue(calls.allSatisfy { $0.method == "com.atproto.managedspace.checkUserAccess" })
+        XCTAssertTrue(calls.allSatisfy { $0.method == "com.atproto.managedspace.checkAccess" })
         XCTAssertTrue(calls.allSatisfy { $0.requestBodyDigest == nil })
     }
 
-    func testDenyingCheckerAlwaysDenies() async throws {
-        let allowed = await DenyingManagedSpaceAccessChecker().checkUserAccess(
-            space: try space(), user: Self.user, access: .read, clientID: nil,
-            managingApp: "did:web:manager.example"
-        )
-        XCTAssertFalse(allowed)
+    func testUnavailableCheckerReportsUpstreamFailure() async throws {
+        do {
+            _ = try await UnavailableManagedSpaceAccessChecker().checkAccess(
+                space: space(), repo: nil, clientID: nil,
+                managingApp: "did:web:manager.example#space"
+            )
+            XCTFail("expected upstream failure")
+        } catch {
+            XCTAssertEqual(error as? ManagedSpaceAccessError, .upstreamFailure)
+        }
     }
 }
 

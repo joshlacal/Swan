@@ -71,14 +71,12 @@ private struct SpaceUpdateWireInput {
     }
 }
 
-/// `{ space }` (deleteSpace) and `{ space, did }` (removeMembers).
-private struct SpaceMemberWireInput {
+/// `{ space }`.
+private struct SpaceWireInput {
     let space: SpaceURI
-    let did: String?
 
     init(_ root: SpaceLifecycleJSONObject) throws {
         space = try lifecycleSpace(root["space"])
-        did = try root["did"].map(lifecycleDID)
     }
 }
 
@@ -93,18 +91,41 @@ private struct SpaceRemoveWriterWireInput {
     }
 }
 
-/// `com.atproto.memberspace.putMember` input `{ space, did, read, write }`.
-private struct SpacePutMemberWireInput {
+/// `com.atproto.memberspace.putMembers` input.
+private struct SpacePutMembersWireInput {
     let space: SpaceURI
-    let did: String
-    let read: Bool
-    let write: Bool
+    let members: [AuthorizedSimpleSpaceMemberPage.Member]
 
     init(_ root: SpaceLifecycleJSONObject) throws {
         space = try lifecycleSpace(root["space"])
-        did = try lifecycleDID(root["did"])
-        read = try lifecycleBool(root["read"])
-        write = try lifecycleBool(root["write"])
+        guard let values = root["members"] as? [Any], values.count <= 100 else {
+            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+        }
+        members = try values.map { value in
+            guard let member = value as? [String: Any],
+                  Set(member.keys) == ["did", "read", "write"] else {
+                throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+            }
+            return AuthorizedSimpleSpaceMemberPage.Member(
+                did: try lifecycleDID(member["did"]),
+                read: try lifecycleBool(member["read"]),
+                write: try lifecycleBool(member["write"])
+            )
+        }
+    }
+}
+
+/// `com.atproto.memberspace.removeMembers` input.
+private struct SpaceRemoveMembersWireInput {
+    let space: SpaceURI
+    let dids: [String]
+
+    init(_ root: SpaceLifecycleJSONObject) throws {
+        space = try lifecycleSpace(root["space"])
+        guard let values = root["dids"] as? [Any], values.count <= 100 else {
+            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+        }
+        dids = try values.map(lifecycleDID)
     }
 }
 
@@ -224,7 +245,7 @@ private struct AuthenticatedSpaceUpdateHandler {
 private struct AuthenticatedSpaceDeleteHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
-    func handle(_ input: SpaceMemberWireInput, request: Request) async throws {
+    func handle(_ input: SpaceWireInput, request: Request) async throws {
         let authorization = try await lifecycleAuthorization(
             capability.authorizer,
             request: request,
@@ -261,21 +282,19 @@ private struct AuthenticatedSpaceRemoveWriterHandler {
     }
 }
 
-private struct AuthenticatedMemberspacePutMemberHandler {
+private struct AuthenticatedMemberspacePutMembersHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
-    func handle(_ input: SpacePutMemberWireInput, request: Request) async throws {
+    func handle(_ input: SpacePutMembersWireInput, request: Request) async throws {
         let authorization = try await lifecycleAuthorization(
             capability.authorizer,
             request: request,
-            fixedPath: "/xrpc/com.atproto.memberspace.putMember"
+            fixedPath: "/xrpc/com.atproto.memberspace.putMembers"
         )
         try requireLifecycleAuthority(authorization, space: input.space)
         do {
-            try await capability.directory.putSimpleSpaceMember(
-                input.did,
-                read: input.read,
-                write: input.write,
+            try await capability.directory.putSimpleSpaceMembers(
+                input.members,
                 in: input.space,
                 authorization: authorization
             )
@@ -285,22 +304,19 @@ private struct AuthenticatedMemberspacePutMemberHandler {
     }
 }
 
-private struct AuthenticatedMemberspaceRemoveMemberHandler {
+private struct AuthenticatedMemberspaceRemoveMembersHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
-    func handle(_ input: SpaceMemberWireInput, request: Request) async throws {
-        guard let member = input.did else {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-        }
+    func handle(_ input: SpaceRemoveMembersWireInput, request: Request) async throws {
         let authorization = try await lifecycleAuthorization(
             capability.authorizer,
             request: request,
-            fixedPath: "/xrpc/com.atproto.memberspace.removeMember"
+            fixedPath: "/xrpc/com.atproto.memberspace.removeMembers"
         )
         try requireLifecycleAuthority(authorization, space: input.space)
         do {
-            try await capability.directory.removeSimpleSpaceMember(
-                member,
+            try await capability.directory.removeSimpleSpaceMembers(
+                input.dids,
                 from: input.space,
                 authorization: authorization
             )
@@ -373,7 +389,7 @@ func registerAuthenticatedSimpleSpaceLifecycleEndpoints(
         on: router, path: "/xrpc/com.atproto.space.deleteSpace", capability: capability,
         required: ["space"], allowed: ["space"]
     ) { root, request in
-        try await delete.handle(try SpaceMemberWireInput(root), request: request)
+        try await delete.handle(try SpaceWireInput(root), request: request)
         return Response(status: .ok, headers: [.cacheControl: "no-store"])
     }
     let removeWriter = AuthenticatedSpaceRemoveWriterHandler(capability: capability)
@@ -384,20 +400,20 @@ func registerAuthenticatedSimpleSpaceLifecycleEndpoints(
         try await removeWriter.handle(try SpaceRemoveWriterWireInput(root), request: request)
         return Response(status: .ok, headers: [.cacheControl: "no-store"])
     }
-    let putMember = AuthenticatedMemberspacePutMemberHandler(capability: capability)
+    let putMembers = AuthenticatedMemberspacePutMembersHandler(capability: capability)
     registerSpaceLifecycleProcedure(
-        on: router, path: "/xrpc/com.atproto.memberspace.putMember", capability: capability,
-        required: ["space", "did", "read", "write"], allowed: ["space", "did", "read", "write"]
+        on: router, path: "/xrpc/com.atproto.memberspace.putMembers", capability: capability,
+        required: ["space", "members"], allowed: ["space", "members"]
     ) { root, request in
-        try await putMember.handle(try SpacePutMemberWireInput(root), request: request)
+        try await putMembers.handle(try SpacePutMembersWireInput(root), request: request)
         return Response(status: .ok, headers: [.cacheControl: "no-store"])
     }
-    let removeMember = AuthenticatedMemberspaceRemoveMemberHandler(capability: capability)
+    let removeMembers = AuthenticatedMemberspaceRemoveMembersHandler(capability: capability)
     registerSpaceLifecycleProcedure(
-        on: router, path: "/xrpc/com.atproto.memberspace.removeMember", capability: capability,
-        required: ["space", "did"], allowed: ["space", "did"]
+        on: router, path: "/xrpc/com.atproto.memberspace.removeMembers", capability: capability,
+        required: ["space", "dids"], allowed: ["space", "dids"]
     ) { root, request in
-        try await removeMember.handle(try SpaceMemberWireInput(root), request: request)
+        try await removeMembers.handle(try SpaceRemoveMembersWireInput(root), request: request)
         return Response(status: .ok, headers: [.cacheControl: "no-store"])
     }
     registerMemberspaceListMembers(on: router, capability: capability)

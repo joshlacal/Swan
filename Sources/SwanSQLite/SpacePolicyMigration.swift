@@ -246,10 +246,11 @@ extension SQLiteAccountDatabase {
     }
 }
 
-/// A read-only listing of the space configurations the v29 policy migration
-/// converts lossily. Before the upgrade it predicts them from the October 22
-/// columns; after it, it reads the rows the migration recorded. It never
-/// writes, never migrates, and opens the database with `mode=ro`.
+/// A read-only listing of lossy v29 policy conversions and managed spaces
+/// whose stored managing app lacks the required service fragment. Before the
+/// upgrade it predicts rows from the October 22 columns; after it, it combines
+/// the migration log with current invalid managed rows. It never writes or
+/// migrates, and opens the database with `mode=ro`.
 public enum SpacePolicyMigrationReport {
     static let personalType = "personalspace"
     static let memberType = "memberspace"
@@ -318,7 +319,7 @@ public enum SpacePolicyMigrationReport {
                 ORDER BY l.space_uri
                 """
             )
-            return rows.map { row in
+            var entries = rows.map { row in
                 let clients = row.column("old_allowed_clients")?.string ?? ""
                 return Entry(
                     spaceURI: row.column("space_uri")?.string ?? "",
@@ -336,6 +337,12 @@ public enum SpacePolicyMigrationReport {
                     recorded: true
                 )
             }
+            let recordedSpaces = Set(entries.map(\.spaceURI))
+            entries.append(contentsOf: try await conversions(connection: connection).filter {
+                $0.reasons.contains("managing-app-missing-service")
+                    && !recordedSpaces.contains($0.spaceURI)
+            })
+            return entries.sorted { $0.spaceURI < $1.spaceURI }
         }
         return try await conversions(connection: connection).filter { !$0.reasons.isEmpty }
     }
@@ -384,6 +391,9 @@ public enum SpacePolicyMigrationReport {
                 if SpacePolicyValidation.isValidManagingApp(managingApp) {
                     newType = managedType
                     newApp = managingApp
+                    if !SpacePolicyValidation.isValidManagingAppService(managingApp) {
+                        reasons.append("managing-app-missing-service")
+                    }
                 } else {
                     newType = personalType
                     newApp = nil

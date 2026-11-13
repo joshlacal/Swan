@@ -6,9 +6,9 @@ import SwanCore
 import SwanOAuth
 import SwanSpaces
 
-/// The complete capability for the generic PDS managing-app endpoint.  Its
+/// The complete capability for Swan's generic managing-app endpoint. Its
 /// construction deliberately makes storage access unrepresentable.
-public struct SwanSimpleSpaceCheckUserAccessCapability: Sendable {
+public struct SwanManagedSpaceCheckAccessCapability: Sendable {
     let serviceAuthentication: any SpaceServiceAuthenticationVerifier
     let managingServiceAudience: String
 
@@ -21,93 +21,88 @@ public struct SwanSimpleSpaceCheckUserAccessCapability: Sendable {
     }
 }
 
-private enum SimpleSpaceCheckUserAccessFailure: Error {
+private enum ManagedSpaceCheckAccessFailure: Error {
     case denied
     case unavailable
 }
 
-/// `com.atproto.managedspace.checkUserAccess` parameters `{ space, user,
-/// access, clientId? }` (unchanged from the retired simplespace method).
-private struct ManagedSpaceCheckUserAccessParameters {
+/// `com.atproto.managedspace.checkAccess` parameters.
+private struct ManagedSpaceCheckAccessParameters {
     let space: SpaceURI
-    let user: String
-    let access: String
+    let repo: String?
     let clientId: String?
 }
 
-private struct ManagedSpaceCheckUserAccessOutput: Encodable {
-    let authorized: Bool
+private struct ManagedSpaceCheckAccessOutput: Encodable {
+    let read: Bool
+    let write: Bool
 }
 
-private let managedSpaceCheckUserAccessNSID = "com.atproto.managedspace.checkUserAccess"
+private let managedSpaceCheckAccessNSID = "com.atproto.managedspace.checkAccess"
 
-private struct SimpleSpaceCheckUserAccessHandler {
-    let capability: SwanSimpleSpaceCheckUserAccessCapability
+private struct ManagedSpaceCheckAccessHandler {
+    let capability: SwanManagedSpaceCheckAccessCapability
 
     func handle(
-        parameters _: ManagedSpaceCheckUserAccessParameters,
+        parameters _: ManagedSpaceCheckAccessParameters,
         request: Request
-    ) async throws -> ManagedSpaceCheckUserAccessOutput {
+    ) async throws -> ManagedSpaceCheckAccessOutput {
         do {
             let compact = try exactSpaceServiceBearerToken(from: request.headers)
             _ = try await capability.serviceAuthentication.authenticate(
                 compact,
                 expectedAudience: capability.managingServiceAudience,
-                expectedMethod: managedSpaceCheckUserAccessNSID,
+                expectedMethod: managedSpaceCheckAccessNSID,
                 expectedRequestBodyDigest: nil,
                 now: Date()
             )
         } catch let error as SwanError {
             if case .unavailable = error {
-                throw SimpleSpaceCheckUserAccessFailure.unavailable
+                throw ManagedSpaceCheckAccessFailure.unavailable
             }
-            throw SimpleSpaceCheckUserAccessFailure.denied
+            throw ManagedSpaceCheckAccessFailure.denied
         } catch {
-            throw SimpleSpaceCheckUserAccessFailure.denied
+            throw ManagedSpaceCheckAccessFailure.denied
         }
-        // The pinned PDS is not an application policy engine. A successful
-        // service authentication therefore proves only the caller identity;
-        // it never reaches authority, membership, record, or blob state.
-        return ManagedSpaceCheckUserAccessOutput(authorized: false)
+        // Swan is a PDS, not an application policy engine.
+        return ManagedSpaceCheckAccessOutput(read: false, write: false)
     }
 }
 
-func registerSimpleSpaceCheckUserAccessEndpoint(
+func registerManagedSpaceCheckAccessEndpoint(
     on router: Router<BasicRequestContext>,
-    capability: SwanSimpleSpaceCheckUserAccessCapability
+    capability: SwanManagedSpaceCheckAccessCapability
 ) {
-    let handler = SimpleSpaceCheckUserAccessHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.managedspace.checkUserAccess"
+    let handler = ManagedSpaceCheckAccessHandler(capability: capability)
+    let path: RouterPath = "/xrpc/com.atproto.managedspace.checkAccess"
     router.get(path) { request, _ async -> Response in
         do {
-            let parameters = try parseSimpleSpaceCheckUserAccessParameters(request)
+            let parameters = try parseManagedSpaceCheckAccessParameters(request)
             let output = try await handler.handle(parameters: parameters, request: request)
             return authenticatedGetSpaceJSON(.ok, output)
-        } catch let failure as SimpleSpaceCheckUserAccessFailure {
-            return simpleSpaceCheckUserAccessResponse(for: failure)
+        } catch let failure as ManagedSpaceCheckAccessFailure {
+            return managedSpaceCheckAccessResponse(for: failure)
         } catch {
-            // Query syntax and generated-value conversion intentionally have
-            // the same opaque response as bad service credentials.
-            return simpleSpaceCheckUserAccessResponse(for: .denied)
+            return managedSpaceCheckAccessResponse(for: .denied)
         }
     }
     for method: HTTPRequest.Method in [.head, .post, .put, .patch, .delete, .options, .connect, .trace] {
         router.on(path, method: method) { _, _ -> Response in
-            simpleSpaceCheckUserAccessError(.notFound, code: "permissioned_endpoint_unavailable")
+            managedSpaceCheckAccessError(.notFound, code: "permissioned_endpoint_unavailable")
         }
     }
 }
 
-private func parseSimpleSpaceCheckUserAccessParameters(
+private func parseManagedSpaceCheckAccessParameters(
     _ request: Request
-) throws -> ManagedSpaceCheckUserAccessParameters {
+) throws -> ManagedSpaceCheckAccessParameters {
     guard !request.uri.string.contains("#"),
           let query = request.uri.query,
           !query.isEmpty,
           query.utf8.count <= 4_096 else {
-        throw SimpleSpaceCheckUserAccessFailure.denied
+        throw ManagedSpaceCheckAccessFailure.denied
     }
-    let allowed: Set<String> = ["space", "user", "access", "clientId"]
+    let allowed: Set<String> = ["space", "repo", "clientId"]
     var values: [String: String] = [:]
     for segment in query.split(separator: "&", omittingEmptySubsequences: false) {
         let pair = segment.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
@@ -116,47 +111,43 @@ private func parseSimpleSpaceCheckUserAccessParameters(
               pair[0].utf8.allSatisfy({ ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "z")) || ($0 >= UInt8(ascii: "A") && $0 <= UInt8(ascii: "Z")) }),
               allowed.contains(String(pair[0])),
               values[String(pair[0])] == nil else {
-            throw SimpleSpaceCheckUserAccessFailure.denied
+            throw ManagedSpaceCheckAccessFailure.denied
         }
         values[String(pair[0])] = try strictQueryDecode(pair[1])
     }
     guard let rawSpace = values["space"],
-          let rawUser = values["user"],
-          let rawAccess = values["access"],
           !rawSpace.isEmpty,
-          !rawUser.isEmpty,
-          (rawAccess == "read" || rawAccess == "write"),
           rawSpace.utf8.count <= 2_048,
-          rawUser.utf8.count <= 2_048,
-          values["clientId"].map({ !$0.isEmpty && $0.utf8.count <= 2_048 }) ?? true else {
-        throw SimpleSpaceCheckUserAccessFailure.denied
-    }
-    if rawAccess == "write" && values["clientId"] != nil {
-        throw SimpleSpaceCheckUserAccessFailure.denied
+          values["repo"].map({ !$0.isEmpty && $0.utf8.count <= 2_048 }) ?? true,
+          values["clientId"].map({
+              !$0.isEmpty && $0.utf8.count <= 2_048
+                  && SpacePolicyValidation.isValidURI($0)
+          }) ?? true else {
+        throw ManagedSpaceCheckAccessFailure.denied
     }
     do {
         let space = try SpaceURI(SpaceRef(uriString: rawSpace).uriString())
-        let user = try DID(didString: rawUser).didString()
-        return ManagedSpaceCheckUserAccessParameters(
-            space: space, user: user, access: rawAccess, clientId: values["clientId"]
+        let repo = try values["repo"].map { try DID(didString: $0).didString() }
+        return ManagedSpaceCheckAccessParameters(
+            space: space, repo: repo, clientId: values["clientId"]
         )
     } catch {
-        throw SimpleSpaceCheckUserAccessFailure.denied
+        throw ManagedSpaceCheckAccessFailure.denied
     }
 }
 
-private func simpleSpaceCheckUserAccessResponse(
-    for failure: SimpleSpaceCheckUserAccessFailure
+private func managedSpaceCheckAccessResponse(
+    for failure: ManagedSpaceCheckAccessFailure
 ) -> Response {
     switch failure {
     case .denied:
-        simpleSpaceCheckUserAccessError(.unauthorized, code: "Unauthorized")
+        managedSpaceCheckAccessError(.unauthorized, code: "Unauthorized")
     case .unavailable:
-        simpleSpaceCheckUserAccessError(.serviceUnavailable, code: "temporarily_unavailable")
+        managedSpaceCheckAccessError(.serviceUnavailable, code: "temporarily_unavailable")
     }
 }
 
-private func simpleSpaceCheckUserAccessError(
+private func managedSpaceCheckAccessError(
     _ status: HTTPResponse.Status,
     code: String
 ) -> Response {

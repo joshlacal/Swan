@@ -5,9 +5,10 @@ import Testing
 /// Phase 2 expansion (§5.7.3) and its vectors (§5.7.6).
 ///
 /// Fixtures are decoded from **JSON literals**, not built with the in-memory
-/// initializers, so every vector also exercises the `Decodable` path that gives
-/// `spaceType` its remap and `inheritAud: true` its boolean type. Building them
-/// with `LexiconValue.string("true")` would pass while the wire path was broken.
+/// initializers, so every vector also exercises the `Decodable` path that
+/// carries `spaceType` unchanged and `inheritAud: true` with its boolean type.
+/// Building them with `LexiconValue.string("true")` would pass while the wire
+/// path was broken.
 ///
 /// Vectors transcribed from
 /// `packages/oauth/oauth-scopes/src/scopes/include-scope.test.ts`
@@ -387,12 +388,10 @@ struct OAuthScopesIncludeExpansionTests {
 
     // MARK: - space (§5.7.6, include-scope.test.ts:636-743)
 
-    /// Pins §5.7.3 gate 1, the `spaceType` -> `type` remap
-    /// (`include-scope.test.ts:638-652`). Without it, `space`'s required `type`
-    /// (§5.6.2) is absent from every upstream fixture, `parse` throws
-    /// `.missingRequiredParameter`, and no space permission is ever expanded.
+    /// Pins the shared `spaceType` key used by both permission sets and the
+    /// named scope form. No adapter remap is needed.
     @Test
-    func spaceTypeOnlyExpandsAndPinsTheSpaceTypeRemap() throws {
+    func spaceTypeOnlyExpandsWithoutAKeyRemap() throws {
         #expect(try compile(auth, """
         {"type":"permission-set","permissions":[
           {"type":"permission","resource":"space","spaceType":"com.example.calendar.group",
@@ -401,31 +400,27 @@ struct OAuthScopesIncludeExpansionTests {
     }
 
     @Test
-    func spaceTypeSurfacesOnlyForSpaceResources() throws {
-        // The remap is scoped to `resource == "space"` (`syntax-lexicon.ts:29`).
-        // A repo entry carrying `spaceType` must NOT gain a `type`, and
-        // `spaceType` must stay filtered (`:36`) rather than becoming an unknown
-        // key that drops a valid entry.
+    func spaceTypeSurfacesWithoutResourceSpecificRemapping() throws {
         let space = LexPermissionSyntax(permission: LexiconPermission(
             resource: "space", fields: ["spaceType": .string("com.example.calendar.group")]
         ))
-        #expect(space.getSingle("type") == .present("com.example.calendar.group"))
-        #expect(space.getSingle("spaceType") == .absent)
-        #expect(space.keys() == ["type"])
+        #expect(space.getSingle("spaceType") == .present("com.example.calendar.group"))
+        #expect(space.getSingle("type") == .absent)
+        #expect(space.keys() == ["spaceType"])
 
         let repo = LexPermissionSyntax(permission: LexiconPermission(
             resource: "repo",
             fields: ["collection": .list([.string("com.example.calendar.event")]),
                      "spaceType": .string("com.example.calendar.group")]
         ))
-        #expect(repo.getSingle("type") == .absent)
-        #expect(repo.keys() == ["collection"])
-        // ... so the entry still expands rather than dying on an unknown key.
+        #expect(repo.getSingle("spaceType") == .present("com.example.calendar.group"))
+        #expect(Set(repo.keys()) == ["collection", "spaceType"])
+        // `spaceType` is unknown to repo and therefore rejects the entry.
         #expect(try compile(auth, """
         {"type":"permission-set","permissions":[
           {"type":"permission","resource":"repo","collection":["com.example.calendar.event"],
            "spaceType":"com.example.calendar.group"}]}
-        """) == ["repo:com.example.calendar.event"])
+        """) == [])
     }
 
     @Test
@@ -616,7 +611,7 @@ struct OAuthScopesIncludeExpansionTests {
         guard case let .space(space) = expanded[2] else {
             Issue.record("expected space, got \(expanded[2])"); return
         }
-        #expect(space.type == .nsid("com.example.calendar.group"))
+        #expect(space.spaceType == .nsid("com.example.calendar.group"))
         #expect(space.authority == .unresolvedSelf)
     }
 

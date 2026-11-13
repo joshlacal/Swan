@@ -67,38 +67,28 @@ public struct LexiconSpace: Sendable, Equatable, Decodable {
     /// `lexicon.defs.main?.type !== 'space'`), so the value has to survive
     /// decoding in order to be classified.
     public let type: String
-    /// `name:lang` (`lexicon.ts:26`) is **accepted and ignored**, matching the
-    /// treatment `LexiconPermissionSet` already gives its siblings `title:lang`
-    /// and `detail:lang`: a display-localisation map contributes no capability.
-    ///
-    /// It is ignored by mechanism rather than by intention-in-a-comment — a
-    /// synthesized `Decodable` keyed container simply does not look at keys it
-    /// has no case for. That is load-bearing rather than incidental: a real
-    /// space from a localised lexicon carries `name:lang`, and rejecting the
-    /// document over it would refuse a legitimate authority. Pinned by
-    /// `testSpaceDocumentCarryingNameLangStillDecodes`.
-    public let name: String
+    /// `title:lang` is accepted and ignored. `title` itself is optional; a
+    /// consumer displays the declaration NSID when it is absent. The obsolete
+    /// `name` and `name:lang` keys are unknown and therefore ignored.
+    public let title: String?
     /// May legitimately be empty. §5.7.5: "A space declaring an empty
     /// collection list is not an error; the bare grant passes through."
     /// Materialisation treats `[]` and "unresolvable" completely differently,
     /// so an empty array must decode as an empty array and never as `nil`.
     public let collections: [String]
-    public let description: String?
 
     public init(
         type: String = "space",
-        name: String,
-        collections: [String],
-        description: String? = nil
+        title: String? = nil,
+        collections: [String]
     ) {
         self.type = type
-        self.name = name
+        self.title = title
         self.collections = collections
-        self.description = description
     }
 
     private enum CodingKeys: String, CodingKey {
-        case type, name, collections, description
+        case type, title, collections
     }
 
     public init(from decoder: any Decoder) throws {
@@ -112,9 +102,8 @@ public struct LexiconSpace: Sendable, Equatable, Decodable {
         }
         self.init(
             type: try container.decode(String.self, forKey: .type),
-            name: try container.decode(String.self, forKey: .name),
-            collections: collections,
-            description: try container.decodeIfPresent(String.self, forKey: .description)
+            title: try container.decodeIfPresent(String.self, forKey: .title),
+            collections: collections
         )
     }
 }

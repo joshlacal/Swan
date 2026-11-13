@@ -4256,12 +4256,13 @@ final class SwanSQLiteTests: XCTestCase {
             )
         )
 
-        // 2. Put member with read: true, write: false
-        _ = try await database.putSimpleSpaceMember(
+        // 2. Duplicate DIDs are one mutation and the final member wins.
+        _ = try await database.putSimpleSpaceMembers(
             space: space,
-            member: memberCarol,
-            read: true,
-            write: false,
+            members: [
+                .init(did: memberCarol, read: false, write: true),
+                .init(did: memberCarol, read: true, write: false),
+            ],
             authorization: authorization
         )
         // Carol can now read
@@ -4270,6 +4271,10 @@ final class SwanSQLiteTests: XCTestCase {
             user: memberCarol,
             clientID: nil,
             authorization: .accountOAuthForTesting(subject: memberCarol, scopes: ["atproto"])
+        )
+        // A member's explicit write:false overrides publicWrite.
+        await XCTAssertThrowsErrorAsync(
+            try await database.authorizeSimpleSpaceWrite(space: space, user: memberCarol)
         )
 
         // 3. Update write policy to memberList: now Carol cannot write because Carol's write flag is false
@@ -4283,11 +4288,9 @@ final class SwanSQLiteTests: XCTestCase {
         )
 
         // 4. Re-put member with read: false, write: true (replaces both flags)
-        _ = try await database.putSimpleSpaceMember(
+        _ = try await database.putSimpleSpaceMembers(
             space: space,
-            member: memberCarol,
-            read: false,
-            write: true,
+            members: [.init(did: memberCarol, read: false, write: true)],
             authorization: authorization
         )
         // Now Carol can write
@@ -4313,11 +4316,9 @@ final class SwanSQLiteTests: XCTestCase {
 
         // 6. Explicit owner flags read: false, write: false are permitted,
         // authority authorization bypasses flags by identity and preserves admission.
-        _ = try await database.putSimpleSpaceMember(
+        _ = try await database.putSimpleSpaceMembers(
             space: space,
-            member: fixture.author,
-            read: false,
-            write: false,
+            members: [.init(did: fixture.author, read: false, write: false)],
             authorization: authorization
         )
         try await database.close()

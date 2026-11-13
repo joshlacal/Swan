@@ -365,11 +365,11 @@ private struct SequencingFixture {
             ),
             authorization: ownerAuthorization
         )
-        for member in [bob, dan, carol] {
-            _ = try await lifecycle.addMember(
-                space: space, member: member, authorization: ownerAuthorization
-            )
-        }
+        _ = try await lifecycle.putMembers(
+            space: space,
+            members: [bob, dan, carol].map { .init(did: $0, read: true, write: true) },
+            authorization: ownerAuthorization
+        )
     }
 
     func registerService(on database: SQLiteAccountDatabase, now: Date) async throws {

@@ -91,7 +91,7 @@ enum ConsentScope: Sendable, Hashable {
         case let .space(permission):
             return .space(
                 SpaceGrant(
-                    type: permission.type.stringValue,
+                    type: permission.spaceType.stringValue,
                     authority: permission.authority.stringValue,
                     skey: permission.skey.stringValue,
                     actions: permission.action.map(\.rawValue),
@@ -125,7 +125,8 @@ enum ScopeDescription {
     /// the resolver still knows the NSID was ever asked for.
     static func render(
         scopes: some Sequence<String>,
-        emptyPermissionSets: [String] = []
+        emptyPermissionSets: [String] = [],
+        spaceTitles: [String: String] = [:]
     ) -> String {
         let sortedRaw = Array(Set(scopes)).sorted()
 
@@ -170,7 +171,7 @@ enum ScopeDescription {
         if !identityAttrs.isEmpty { cards.append(identityCard(identityAttrs)) }
         if !repoEntries.isEmpty { cards.append(repoCard(repoEntries)) }
         if !rpcEntries.isEmpty { cards.append(rpcCard(rpcEntries)) }
-        if !spaceGrants.isEmpty { cards.append(spaceCard(spaceGrants)) }
+        if !spaceGrants.isEmpty { cards.append(spaceCard(spaceGrants, titles: spaceTitles)) }
         // Deduplicated and sorted: an unexpanded pass-through `include:` still
         // in `scopes` and an empty expansion naming the same NSID print once.
         if !includeNsids.isEmpty {
@@ -247,11 +248,12 @@ enum ScopeDescription {
     }
 
     /// S4.1b (one card, verbs in prose per grant) + S4.1c (universal-grant
-    /// warning) + S4.1d (unnamed space type falls back to the raw NSID —
-    /// trivially true here since this renderer has no space-name directory
-    /// to consult in the first place, so every label already IS the raw NSID).
-    private static func spaceCard(_ grants: [ConsentScope.SpaceGrant]) -> String {
-        let rows = grants.map(spaceRow).joined()
+    /// warning) + S4.1d (an absent declaration title falls back to the NSID).
+    private static func spaceCard(
+        _ grants: [ConsentScope.SpaceGrant],
+        titles: [String: String]
+    ) -> String {
+        let rows = grants.map { spaceRow($0, titles: titles) }.joined()
         let warning: String
         if grants.contains(where: { $0.isUniversal }) {
             warning =
@@ -266,7 +268,7 @@ enum ScopeDescription {
             bodyHTML: "<p>Access permissioned spaces.</p><ul>\(rows)</ul>\(warning)")
     }
 
-    private static func spaceRow(_ grant: ConsentScope.SpaceGrant) -> String {
+    private static func spaceRow(_ grant: ConsentScope.SpaceGrant, titles: [String: String]) -> String {
         var details: [String] = []
         if !grant.manage.isEmpty {
             details.append("\(joinedProse(grant.manage).capitalizedFirstLetter) the space")
@@ -289,11 +291,12 @@ enum ScopeDescription {
             details.append("\(joinedProse(writeVerbs)) records in this space type's declared collections, which may change")
         }
         if details.isEmpty { details.append("no access") }
-        return "<li><b>\(spaceLabel(grant))</b>: \(details.joined(separator: "; ")).</li>"
+        return "<li><b>\(spaceLabel(grant, titles: titles))</b>: \(details.joined(separator: "; ")).</li>"
     }
 
-    private static func spaceLabel(_ grant: ConsentScope.SpaceGrant) -> String {
-        let typeLabel = grant.type == "*" ? "All spaces" : "<code>\(escape(grant.type))</code> spaces"
+    private static func spaceLabel(_ grant: ConsentScope.SpaceGrant, titles: [String: String]) -> String {
+        let name = titles[grant.type] ?? grant.type
+        let typeLabel = grant.type == "*" ? "All spaces" : "<code>\(escape(name))</code> spaces"
         let base: String
         switch grant.authority {
         case "*": base = "\(typeLabel) on the network"

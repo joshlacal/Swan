@@ -109,6 +109,19 @@ struct ScopeDescriptionTests {
         #expect(grant.skey == "abc123")
     }
 
+    @Test("space declarations show title and fall back to NSID")
+    func spaceDeclarationTitleAndFallback() {
+        let scope = "space:app.bulleted.space"
+        let titled = ScopeDescription.render(
+            scopes: [scope],
+            spaceTitles: ["app.bulleted.space": "Bulleted Forum"]
+        )
+        #expect(titled.contains("<code>Bulleted Forum</code> spaces"))
+
+        let untitled = ScopeDescription.render(scopes: [scope])
+        #expect(untitled.contains("<code>app.bulleted.space</code> spaces"))
+    }
+
     @Test("space:*?authority=* is universal")
     func classifiesUniversalSpace() {
         let scope = ConsentScope.classify("space:*?authority=*")

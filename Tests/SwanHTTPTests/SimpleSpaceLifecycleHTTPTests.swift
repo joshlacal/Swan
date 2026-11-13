@@ -25,8 +25,8 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
     private static let deletePath = "/xrpc/com.atproto.space.deleteSpace"
     private static let getPath = "/xrpc/com.atproto.space.getSpace"
     private static let removeWriterPath = "/xrpc/com.atproto.space.removeWriter"
-    private static let putPath = "/xrpc/com.atproto.memberspace.putMember"
-    private static let removePath = "/xrpc/com.atproto.memberspace.removeMember"
+    private static let putPath = "/xrpc/com.atproto.memberspace.putMembers"
+    private static let removePath = "/xrpc/com.atproto.memberspace.removeMembers"
     private static let listPath = "/xrpc/com.atproto.memberspace.listMembers"
 
     func testLifecycleWriteAdmissionReturnsTemporaryUnavailableBeforeDecode() async throws {
@@ -210,7 +210,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertNil(policy["allowedApps"])
                 }
 
-                let add = #"{"space":"\#(uri)","did":"\#(Self.bob)","read":true,"write":false}"#
+                let add = #"{"space":"\#(uri)","members":[{"did":"\#(Self.bob)","read":true,"write":false}]}"#
                 try await client.execute(uri: Self.putPath, method: .post, headers: try self.postHeaders(fixture, path: Self.putPath, jti: "add-member"), body: ByteBuffer(string: add)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
@@ -237,7 +237,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(secondMembers?.first?["read"] as? Bool, true)
                     XCTAssertEqual(secondMembers?.first?["write"] as? Bool, false)
                 }
-                let ownerRemoval = #"{"space":"\#(uri)","did":"\#(Self.alice)"}"#
+                let ownerRemoval = #"{"space":"\#(uri)","dids":["\#(Self.alice)"]}"#
                 try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(fixture, path: Self.removePath, jti: "remove-owner"), body: ByteBuffer(string: ownerRemoval)) { response in
                     XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
@@ -257,7 +257,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "PolicyMismatch")
                 }
-                let removeMember = #"{"space":"\#(uri)","did":"\#(Self.bob)"}"#
+                let removeMember = #"{"space":"\#(uri)","dids":["\#(Self.bob)"]}"#
                 try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(fixture, path: Self.removePath, jti: "remove-member-personal"), body: ByteBuffer(string: removeMember)) { response in
                     XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "PolicyMismatch")
@@ -374,7 +374,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .ok)
                     uri = try XCTUnwrap((try self.jsonObject(response.body))["space"] as? String)
                 }
-                let add = #"{"space":"\#(uri)","did":"\#(Self.bob)","read":true,"write":true}"#
+                let add = #"{"space":"\#(uri)","members":[{"did":"\#(Self.bob)","read":true,"write":true}]}"#
                 try await client.execute(uri: Self.putPath, method: .post, headers: try self.postHeaders(fixture, path: Self.putPath, jti: "owner-only-add"), body: ByteBuffer(string: add)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
@@ -475,7 +475,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(createToken, fixture: fixture, path: Self.createPath, jti: "scoped-create"), body: ByteBuffer(string: create)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
-                let member = #"{"space":"\#(space.rawValue)","did":"\#(Self.bob)","read":true,"write":true}"#
+                let member = #"{"space":"\#(space.rawValue)","members":[{"did":"\#(Self.bob)","read":true,"write":true}]}"#
                 try await client.execute(uri: Self.putPath, method: .post, headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.putPath, jti: "update-scope-add"), body: ByteBuffer(string: member)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
@@ -489,7 +489,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertEqual(((try self.jsonObject(response.body))["members"] as? [[String: Any]])?.compactMap { $0["did"] as? String }, [Self.alice, Self.bob])
                 }
-                let removeMember = #"{"space":"\#(space.rawValue)","did":"\#(Self.bob)"}"#
+                let removeMember = #"{"space":"\#(space.rawValue)","dids":["\#(Self.bob)"]}"#
                 try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.removePath, jti: "update-scope-remove"), body: ByteBuffer(string: removeMember)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
@@ -619,7 +619,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     uri = try XCTUnwrap((try self.jsonObject(response.body))["space"] as? String)
                 }
                 // Put bob with read: true, write: false
-                let put1 = #"{"space":"\#(uri)","did":"\#(Self.bob)","read":true,"write":false}"#
+                let put1 = #"{"space":"\#(uri)","members":[{"did":"\#(Self.bob)","read":true,"write":false}]}"#
                 try await client.execute(uri: Self.putPath, method: .post, headers: try self.postHeaders(fixture, path: Self.putPath, jti: "put-1"), body: ByteBuffer(string: put1)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
@@ -632,7 +632,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(bobMember?["write"] as? Bool, false)
                 }
                 // Re-put bob with read: false, write: true (replaces both flags)
-                let put2 = #"{"space":"\#(uri)","did":"\#(Self.bob)","read":false,"write":true}"#
+                let put2 = #"{"space":"\#(uri)","members":[{"did":"\#(Self.bob)","read":false,"write":true}]}"#
                 try await client.execute(uri: Self.putPath, method: .post, headers: try self.postHeaders(fixture, path: Self.putPath, jti: "put-2"), body: ByteBuffer(string: put2)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
@@ -800,13 +800,13 @@ private actor CountingSimpleSpaceDirectory:
         domainCallCount += 1
         try await base.deleteSimpleSpace(space, authorization: authorization)
     }
-    func putSimpleSpaceMember(_ member: String, read: Bool, write: Bool, in space: SpaceURI, authorization: AuthorizationContext) async throws {
+    func putSimpleSpaceMembers(_ members: [AuthorizedSimpleSpaceMemberPage.Member], in space: SpaceURI, authorization: AuthorizationContext) async throws {
         domainCallCount += 1
-        try await base.putSimpleSpaceMember(member, read: read, write: write, in: space, authorization: authorization)
+        try await base.putSimpleSpaceMembers(members, in: space, authorization: authorization)
     }
-    func removeSimpleSpaceMember(_ member: String, from space: SpaceURI, authorization: AuthorizationContext) async throws {
+    func removeSimpleSpaceMembers(_ members: [String], from space: SpaceURI, authorization: AuthorizationContext) async throws {
         domainCallCount += 1
-        try await base.removeSimpleSpaceMember(member, from: space, authorization: authorization)
+        try await base.removeSimpleSpaceMembers(members, from: space, authorization: authorization)
     }
     func simpleSpaceMembers(_ space: SpaceURI, limit: Int, cursor: String?, authorization: AuthorizationContext) async throws -> AuthorizedSimpleSpaceMemberPage {
         domainCallCount += 1

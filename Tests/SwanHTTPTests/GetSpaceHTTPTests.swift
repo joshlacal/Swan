@@ -459,9 +459,9 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
                 ),
                 authorization: authorization
             )
-            _ = try await authority.addMember(
+            _ = try await authority.putMembers(
                 space: space,
-                member: Self.privateMember,
+                members: [.init(did: Self.privateMember, read: true, write: true)],
                 authorization: authorization
             )
             if spaceDeleted {

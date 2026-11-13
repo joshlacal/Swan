@@ -579,6 +579,8 @@ private func loginOAuthServerAuthorization(
       resolver: runtime.lexiconResolver,
       stage: .pushedAuthorizationRequest
     )
+    let spaceTitles = try await OAuthLexiconScopeResolution.resolveSpaceTitles(
+      expansion.scopes, resolver: runtime.lexiconResolver)
     oauthServerLogEmptyExpansions(expansion.emptyExpansions, context: context, stage: "consent")
     return oauthServerHTML(
       .ok,
@@ -587,7 +589,8 @@ private func loginOAuthServerAuthorization(
         subject: authenticated.account.did,
         clientID: pushed.binding.clientID,
         scopes: expansion.scopes,
-        emptyPermissionSets: expansion.emptyExpansions
+        emptyPermissionSets: expansion.emptyExpansions,
+        spaceTitles: spaceTitles
       ),
       setCookie: oauthServerCookie(issued.value),
       formActionSource: oauthServerFormActionSource(pushed.binding.redirectURI)
@@ -695,6 +698,8 @@ private func completeOAuthServerAuthorizationMFA(
       lifetime: session.expiresAt.timeIntervalSinceNow)
     let expansion = try await OAuthLexiconScopeResolution.expandIncludes(
       pushed.binding.scopes, resolver: runtime.lexiconResolver, stage: .pushedAuthorizationRequest)
+    let spaceTitles = try await OAuthLexiconScopeResolution.resolveSpaceTitles(
+      expansion.scopes, resolver: runtime.lexiconResolver)
     oauthServerLogEmptyExpansions(expansion.emptyExpansions, context: context, stage: "consent")
     return oauthServerHTML(
       .ok,
@@ -703,7 +708,8 @@ private func completeOAuthServerAuthorizationMFA(
         subject: authenticated.account.did,
         clientID: pushed.binding.clientID,
         scopes: expansion.scopes,
-        emptyPermissionSets: expansion.emptyExpansions),
+        emptyPermissionSets: expansion.emptyExpansions,
+        spaceTitles: spaceTitles),
       setCookie: oauthServerCookie(issued.value),
       formActionSource: oauthServerFormActionSource(pushed.binding.redirectURI))
   } catch is SwanRequestBodyCollectionFailure {

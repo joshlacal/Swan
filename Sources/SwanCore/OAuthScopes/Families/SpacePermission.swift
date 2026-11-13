@@ -82,8 +82,8 @@ public enum SpaceCollectionParam: Sendable, Hashable, Comparable {
 }
 
 public struct SpacePermission: ScopePermission {
-    /// Positional key. single, required, no default.
-    public let type: SpaceTypeParam
+    /// Positional key. Single, required, no default.
+    public let spaceType: SpaceTypeParam
     /// single, not required, default .unresolvedSelf (:183). NOT `.any` —
     /// "the difference between 'my bookmarks' and 'everyone's bookmarks'"
     /// (atproto-crates space_permission.rs:199-206).
@@ -101,27 +101,27 @@ public struct SpacePermission: ScopePermission {
     /// The exact parsed/defaulted values, INCLUDING PROVENANCE. This is the
     /// source of truth for `scopeParameters` and therefore for `wasStated` —
     /// see ScopeParameterValues's doc comment and §9-D23. It must never be
-    /// re-derived from `type`/`authority`/… alone, because those typed fields
+    /// re-derived from `spaceType`/`authority`/… alone, because those typed fields
     /// cannot distinguish "the client wrote `authority=self`" from "the client
     /// wrote nothing and the schema default supplied `self`".
     private let parameters: ScopeParameterValues
 
     public init(
-        type: SpaceTypeParam,
+        spaceType: SpaceTypeParam,
         authority: SpaceAuthorityParam = .unresolvedSelf,
         skey: SpaceSkeyParam = .any,
         collection: [SpaceCollectionParam] = [],
         action: [SpaceAction] = SPACE_DEFAULT_ACTIONS,
         manage: [SpaceManageOp] = []
     ) {
-        self.type = type
+        self.spaceType = spaceType
         self.authority = authority
         self.skey = skey
         self.collection = collection
         self.action = action
         self.manage = manage
         self.parameters = Self.buildParameters(
-            type: type, authority: authority, skey: skey,
+            spaceType: spaceType, authority: authority, skey: skey,
             collection: collection, action: action, manage: manage
         )
     }
@@ -132,7 +132,7 @@ public struct SpacePermission: ScopePermission {
     /// original provenance (§9-D23) — the public initializer above cannot do
     /// this, because it always states everything it is given.
     private init(
-        type: SpaceTypeParam,
+        spaceType: SpaceTypeParam,
         authority: SpaceAuthorityParam,
         skey: SpaceSkeyParam,
         collection: [SpaceCollectionParam],
@@ -140,7 +140,7 @@ public struct SpacePermission: ScopePermission {
         manage: [SpaceManageOp],
         scopeParameters: ScopeParameterValues
     ) {
-        self.type = type
+        self.spaceType = spaceType
         self.authority = authority
         self.skey = skey
         self.collection = collection
@@ -150,11 +150,11 @@ public struct SpacePermission: ScopePermission {
     }
 
     private static func buildParameters(
-        type: SpaceTypeParam, authority: SpaceAuthorityParam, skey: SpaceSkeyParam,
+        spaceType: SpaceTypeParam, authority: SpaceAuthorityParam, skey: SpaceSkeyParam,
         collection: [SpaceCollectionParam], action: [SpaceAction], manage: [SpaceManageOp]
     ) -> ScopeParameterValues {
         var values = ScopeParameterValues()
-        values.set("type", [type.stringValue])
+        values.set("spaceType", [spaceType.stringValue])
         values.set("authority", [authority.stringValue])
         values.set("skey", [skey.stringValue])
         values.set("collection", collection.map(\.stringValue))
@@ -164,10 +164,10 @@ public struct SpacePermission: ScopePermission {
     }
 
     public init(parameters: ScopeParameterValues) throws(ScopeParseError) {
-        guard let typeRaw = parameters.single("type") else {
-            throw .missingRequiredParameter(prefix: Self.schema.prefix, key: "type")
+        guard let typeRaw = parameters.single("spaceType") else {
+            throw .missingRequiredParameter(prefix: Self.schema.prefix, key: "spaceType")
         }
-        self.type = typeRaw == "*" ? .any : .nsid(typeRaw)
+        self.spaceType = typeRaw == "*" ? .any : .nsid(typeRaw)
 
         let authorityRaw = parameters.single("authority") ?? "self"
         self.authority = switch authorityRaw {
@@ -202,9 +202,9 @@ public struct SpacePermission: ScopePermission {
 
     public static let schema = ScopeParameterSchema(
         prefix: "space",
-        positionalKey: "type",
+        positionalKey: "spaceType",
         parameters: [
-            .init(key: "type", arity: .single, isRequired: true,
+            .init(key: "spaceType", arity: .single, isRequired: true,
                   validate: { $0 == "*" || AtprotoSyntax.isValidNSID($0) }),
             .init(key: "authority", arity: .single, defaultValue: ["self"],
                   validate: { $0 == "*" || $0 == "self" || AtprotoSyntax.isValidDID($0) }),
@@ -287,8 +287,8 @@ public struct SpaceScopeTarget: Sendable, Hashable {
 extension SpacePermission {
     /// Port of space-permission.ts:91-116, evaluated in the same order.
     public func matches(_ target: SpaceScopeTarget) -> Bool {
-        // 1. type
-        switch type {
+        // 1. space type
+        switch spaceType {
         case .any: break
         case let .nsid(t): guard t == target.type else { return false }
         }
@@ -415,7 +415,7 @@ extension SpacePermission {
     /// absent key, never a stated-but-empty one (a stated multi-value key that
     /// resolves to zero entries is `.emptyMultiValuedParameter` at parse
     /// time), so there is no other provenance it could have carried.
-    /// Every other key (`type`, `authority`, `skey`, `action`, `manage`) is
+    /// Every other key (`spaceType`, `authority`, `skey`, `action`, `manage`) is
     /// untouched in both value and provenance.
     public func withDefaultCollections(_ collections: [SpaceCollectionParam]) -> SpacePermission {
         guard !hasCollections, !collections.isEmpty else { return self }
@@ -423,7 +423,7 @@ extension SpacePermission {
         let collectionProvenance = parameters.provenance(for: "collection") ?? .defaulted
         updatedParameters.set("collection", collections.map(\.stringValue), collectionProvenance)
         return SpacePermission(
-            type: type, authority: authority, skey: skey,
+            spaceType: spaceType, authority: authority, skey: skey,
             collection: collections, action: action, manage: manage,
             scopeParameters: updatedParameters
         )
@@ -447,7 +447,7 @@ extension SpacePermission {
         let provenance = parameters.provenance(for: "authority") ?? .defaulted
         updatedParameters.set("authority", [userDID], provenance)
         return SpacePermission(
-            type: type, authority: .did(userDID), skey: skey,
+            spaceType: spaceType, authority: .did(userDID), skey: skey,
             collection: collection, action: action, manage: manage,
             scopeParameters: updatedParameters
         )
@@ -495,7 +495,7 @@ extension SpacePermission {
     /// formattable string for a malformed target.
     public static func scopeNeeded(for target: SpaceScopeTarget) throws(ScopeParseError) -> String {
         var values = ScopeParameterValues()
-        values.set("type", [target.type])
+        values.set("spaceType", [target.type])
         values.set("authority", [target.authority])
         values.set("skey", [target.skey])
         switch target.operation {

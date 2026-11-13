@@ -194,8 +194,9 @@ final class SpaceRepositoryMigrationOctober29Tests: XCTestCase {
                 space: space, owner: Self.alice,
                 configuration: SimpleSpaceConfiguration(policy: policy), authorization: owner
             )
-            _ = try await database.putSimpleSpaceMember(
-                space: space, member: Self.bob, read: true, write: true, authorization: owner
+            _ = try await database.putSimpleSpaceMembers(
+                space: space, members: [.init(did: Self.bob, read: true, write: true)],
+                authorization: owner
             )
             try await write(database, space: space, [("app.bsky.feed.post", "a", try value("a"))])
             let keep = SpacePolicy.publishedCollections
@@ -394,11 +395,13 @@ final class SpaceRepositoryMigrationOctober29Tests: XCTestCase {
                 space: space, owner: Self.alice,
                 configuration: SimpleSpaceConfiguration(policy: policy), authorization: owner
             )
-            _ = try await database.putSimpleSpaceMember(
-                space: space, member: Self.bob, read: true, write: false, authorization: owner
-            )
-            _ = try await database.putSimpleSpaceMember(
-                space: space, member: Self.carol, read: true, write: true, authorization: owner
+            _ = try await database.putSimpleSpaceMembers(
+                space: space,
+                members: [
+                    .init(did: Self.bob, read: true, write: false),
+                    .init(did: Self.carol, read: true, write: true),
+                ],
+                authorization: owner
             )
             for (did, spaceRev) in [(Self.bob, "3mzzzzzzzzzy2"), (Self.carol, "3mzzzzzzzzzz2")] {
                 _ = try await database.connection.query(

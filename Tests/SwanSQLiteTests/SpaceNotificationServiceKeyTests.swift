@@ -254,7 +254,11 @@ private struct ServiceKeyFixture {
             configuration: try SimpleSpaceConfiguration(readPolicy: .memberList, writePolicy: .memberList, appAccess: .open),
             authorization: ownerAuthorization
         )
-        _ = try await authority.addMember(space: space, member: writer, authorization: ownerAuthorization)
+        _ = try await authority.putMembers(
+            space: space,
+            members: [.init(did: writer, read: true, write: true)],
+            authorization: ownerAuthorization
+        )
     }
 
     func register(_ service: String, at endpoint: String, on database: SQLiteAccountDatabase, now: Date) async throws {
