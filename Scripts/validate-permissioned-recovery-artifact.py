@@ -9,7 +9,7 @@ import sys
 
 
 EXPECTED_SCENARIO = "permissioned-retention-recovery"
-EXPECTED_PROFILE = "permissioned-data-0016-2026-07-30"
+EXPECTED_PROFILE = "permissioned-data-0016-2026-11-12"
 EXPECTED_POLICY = (
     "semantic-summary-only; no DIDs, space URIs, paths, request identities, "
     "verifier material, credentials, tokens, DPoP proofs, record values, or raw LtHash state"

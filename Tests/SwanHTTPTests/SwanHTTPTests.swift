@@ -20,13 +20,13 @@ final class SwanHTTPTests: XCTestCase {
         // Scripts/generate-space-descriptors.py turns into SwanSpacesWire.
         let profile = try ProtocolProfile.load(
             from: packageRoot().appending(
-                path: "Profiles/permissioned-data-0016-2026-10-29.json"
+                path: "Profiles/permissioned-data-0016-2026-11-12.json"
             )
         )
         let generated = PermissionedData0016.methods
 
         XCTAssertEqual(profile.id, PermissionedData0016.profileID)
-        XCTAssertEqual(profile.endpoints.count, 33)
+        XCTAssertEqual(profile.endpoints.count, 32)
         XCTAssertEqual(profile.endpoints, generated.map(\.nsid))
         XCTAssertEqual(Set(profile.endpoints).count, profile.endpoints.count)
     }
@@ -875,7 +875,7 @@ final class SwanHTTPTests: XCTestCase {
 
     private func loadPinnedProfile() throws -> ProtocolProfile {
         try ProtocolProfile.load(from: packageRoot()
-            .appending(path: "Profiles/permissioned-data-0016-2026-10-29.json"))
+            .appending(path: "Profiles/permissioned-data-0016-2026-11-12.json"))
     }
 
     private func makeServer(profile: ProtocolProfile) async throws -> (SwanHTTPServer, SQLiteControlDatabase, URL) {

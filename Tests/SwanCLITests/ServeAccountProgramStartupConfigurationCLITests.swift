@@ -22,6 +22,24 @@ import Glibc
 /// before any storage or listener exists.
 final class ServeAccountProgramStartupConfigurationCLITests: XCTestCase {
     // MARK: - Option parsing
+    func testPermissionedProfileDefaultsToNovember12() throws {
+        let serve = try XCTUnwrap(
+            try SwanCommand.parseAsRoot(["serve"]) as? SwanCommand.Serve
+        )
+        XCTAssertEqual(
+            serve.profile,
+            "Profiles/permissioned-data-0016-2026-11-12.json"
+        )
+
+        let verify = try XCTUnwrap(
+            try SwanCommand.parseAsRoot(["verify"]) as? SwanCommand.Verify
+        )
+        XCTAssertEqual(
+            verify.profile,
+            "Profiles/permissioned-data-0016-2026-11-12.json"
+        )
+    }
+
 
     func testSignupPolicyOptionParsesAllThreePoliciesAndRejectsGarbage() throws {
         for (raw, expected) in [

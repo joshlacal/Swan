@@ -242,6 +242,10 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                         description.inviteCodeRequired,
                         policy.advertisesInviteCodeRequired
                     )
+                    XCTAssertEqual(
+                        description.swanProfile,
+                        "permissioned-data-0016-2026-11-12"
+                    )
                 }
             }
             try await fixture.close()
@@ -504,7 +508,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
             )
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(
-                    path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                    path: "Profiles/permissioned-data-0016-2026-11-12.json"
                 )
             )
             let oauthRuntime = try SwanOAuthRuntime(
@@ -917,7 +921,7 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
             let sender = RecordingProxySender()
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(
-                    path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                    path: "Profiles/permissioned-data-0016-2026-11-12.json"
                 )
             )
             let oauthRuntime = try SwanOAuthRuntime(

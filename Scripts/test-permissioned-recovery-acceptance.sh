@@ -200,7 +200,7 @@ import sys
 
 artifact = {
     "scenario": "permissioned-retention-recovery",
-    "profileID": "permissioned-data-0016-2026-07-30",
+    "profileID": "permissioned-data-0016-2026-11-12",
     "gapStatus": 409,
     "gapErrorCode": "full_repo_recovery_required",
     "gapFallbackUsed": False,

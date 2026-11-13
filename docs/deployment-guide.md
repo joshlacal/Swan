@@ -7,7 +7,7 @@ This guide describes how to plan, configure, and deploy Swan in production using
 Before deploying Swan, you must decide on the following operational parameters:
 
 1. **Canonical public URL**: Swan requires a canonical public HTTPS issuer URL (for example, `https://pds.example.com`). This URL is advertised in OAuth metadata, server descriptors, and DID documents.
-2. **Public protocol profile**: Swan uses a pinned protocol profile to declare its supported XRPC route surface and schema version. The default profile is `permissioned-data-0016-2026-10-01` (`Profiles/permissioned-data-0016-2026-10-01.json`). Omitting `--public-profile` selects the profile attested by the current build without reading the filesystem.
+2. **Permissioned protocol profile**: Swan uses a pinned protocol profile to declare its supported Spaces XRPC surface and schema version. The default profile is `permissioned-data-0016-2026-11-12` (`Profiles/permissioned-data-0016-2026-11-12.json`). Omitting `--public-profile` separately selects the public profile attested by the current build without reading the filesystem.
 3. **Signup admission policy**:
    - `closed` (default): Registration via the public HTTP API or account portal is disabled. Accounts can only be provisioned using the CLI (`swan account install-local`, `swan account prepare-plc`, `swan account activate-plc`) or the authenticated loopback management API.
    - `inviteRequired`: New users must provide a valid invite code signed with the secret configured in `--signup-secret-file`.
@@ -127,7 +127,7 @@ The primary server daemon is started using `swan serve`. Below is the complete r
 | `--port <int>` | Int (`3000`) | TCP port for public HTTP listener. |
 | `--public-url <url>` | String (Optional, required in production) | Canonical HTTPS public issuer URL (e.g. `https://pds.example.com`). |
 | `--data-directory <path>` | String (`.swan-data`) | Path to directory storing SQLite databases (`control.sqlite`, `firehose.sqlite`, `<did>.sqlite`), blobs, and encrypted key envelopes. |
-| `--profile <path>` | String (`Profiles/permissioned-data-0016-2026-10-01.json`) | Path to pinned permissioned-data protocol profile JSON. |
+| `--profile <path>` | String (`Profiles/permissioned-data-0016-2026-11-12.json`) | Path to pinned permissioned-data protocol profile JSON. |
 | `--public-profile <id\|path>` | String (Optional) | Public-data protocol profile selecting public XRPC route surface: either a registered profile ID or path to JSON. Omit to use the build's attested profile. |
 | `--max-connections <int>` | Int (`256`) | Total accepted connection budget; one quarter (64 connections by default) is reserved for anonymous firehose subscribers. |
 | `--login-trusted-proxy-peer <ip>` | String (Repeatable) | Exact IPv4 or IPv6 socket peer address trusted to supply client IP via `X-Swan-Client-IP`. |

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Seven pinned reference archives coexist deliberately:
-#  - 5d88b414... is the current October 29 wire and runtime reference.
+# Eight pinned reference archives coexist deliberately:
+#  - d4def6e9... is the current November 12 wire and runtime reference.
+#  - 5d88b414... is the historical October 29 wire and runtime reference.
 #  - ac0c9f15... is the historical October 22 profile pin.
 #  - 679724ad… is the historical wire/profile pin (permissioned-data-0016-2026-10-01,
 #    the October 1 Spaces alpha): lexicons and contract tests read this tree.
@@ -13,6 +14,7 @@ set -euo pipefail
 #    overlay patches still build from this tree until the lab is re-pinned.
 # Fetching is idempotent per pin; an already-materialized tree is left alone.
 readonly PINS=(
+  "d4def6e9f521896ed8222f576d54923d00b5fbeb fd0b719f54227f93406770dd6e985147869853cb2a97320b6f072d999fb663d4"
   "5d88b414a98de1ada22c94c78fa0667a7028163c 3e63e8f46acca4b879aca32aca9db7f0b9e8fe46556b0d4e5df2027d58b7757b"
   "ac0c9f15392f6f0298d71dc52aa88c05036150be eae029a70a3adf0f7d6241814d5a91d55bf6768e8f4cd00196870c911df57eb5"
   "679724ad62eb9a02f7f40429c3c4fdd65d3e4c79 4f326ac19b74773fec8fe2d1403978f20779a19670ace185129ae04f60cacaa8"

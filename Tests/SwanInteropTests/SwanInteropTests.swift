@@ -28,10 +28,10 @@ final class SwanInteropTests: XCTestCase {
 
         XCTAssertTrue(report.isValid, "\(report.diagnostics)")
         XCTAssertEqual(report.profileID, OfflineProtocolProfileVerifier.stableProfileID)
-        XCTAssertEqual(OfflineProtocolProfileVerifier.stableProfileID, "permissioned-data-0016-2026-10-29")
+        XCTAssertEqual(OfflineProtocolProfileVerifier.stableProfileID, "permissioned-data-0016-2026-11-12")
         let profile = try Data(contentsOf: fixture.profileURL)
         XCTAssertEqual(SHA256.hash(data: profile).map { String(format: "%02x", $0) }.joined(),
-                       "10066bf334b217e0f021e362805d9340da6a6a4053254674cf1ff93d1b3b84f0")
+                       "eb6b77371f7c0f4f4a04571bf8869a543ec9ed5af8fd7dd297cb7ab56d3d7cec")
     }
 
     func testLegacyPermissionedProfileArtifactsRemainByteExact() throws {
@@ -165,7 +165,7 @@ final class SwanInteropTests: XCTestCase {
         defer { fixture.remove() }
 
         try fixture.replaceInProfile(
-            "b89d0b04495a62e0e22f1ab04c665a9c4e1c655d",
+            "b54ec6853bab77edd4fd373804a480633094b324",
             with: String(repeating: "g", count: 40)
         )
 
@@ -180,7 +180,7 @@ final class SwanInteropTests: XCTestCase {
         defer { fixture.remove() }
 
         try fixture.replaceInProfile(
-            "e115236537041a900ec971be05185a70cca73e8a",
+            "baa8cf10199c049e5137b5f1d8fa3cfbd4563f29",
             with: String(repeating: "a", count: 40)
         )
 
@@ -1729,11 +1729,11 @@ private final class ProfileFixture {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let profileName = "permissioned-data-0016-2026-10-29.json"
-        let lexiconName = "permissioned-data-0016-2026-10-29.lexicons.sha256"
+        let profileName = "permissioned-data-0016-2026-11-12.json"
+        let lexiconName = "permissioned-data-0016-2026-11-12.lexicons.sha256"
         profileURL = profiles.appending(path: profileName)
         lexiconManifestURL = profiles.appending(path: lexiconName)
-        generatedWireManifestURL = profiles.appending(path: "permissioned-data-0016-2026-10-29.generated-wire.sha256")
+        generatedWireManifestURL = profiles.appending(path: "permissioned-data-0016-2026-11-12.generated-wire.sha256")
         generatedWireSourceURL = sources.appending(path: "SwanSpacesWire/SwanSpacesWire.swift")
 
         try FileManager.default.copyItem(
@@ -1745,7 +1745,7 @@ private final class ProfileFixture {
             to: lexiconManifestURL
         )
         try FileManager.default.copyItem(
-            at: packageRoot.appending(path: "Profiles/permissioned-data-0016-2026-10-29.generated-wire.sha256"),
+            at: packageRoot.appending(path: "Profiles/permissioned-data-0016-2026-11-12.generated-wire.sha256"),
             to: generatedWireManifestURL
         )
         try FileManager.default.copyItem(
@@ -1775,7 +1775,7 @@ private final class ProfileFixture {
         try data.write(to: generatedWireManifestURL)
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         try replaceInProfile(
-            "7fb57cdb9bfd067f0deae7fc19b62e481fd5622dc929401c1f5faaa5f3b9c573",
+            "4fed431ea394fdd71b396a2aa67362e64bdcbd3d94ac9d337cd3c4e045fd897b",
             with: digest
         )
     }

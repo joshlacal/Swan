@@ -5,7 +5,7 @@ import SwanCore
 public struct SpaceDeclarationDescriptor: Sendable, Codable, Equatable {
     public let nsid: String
     public let keyType: String
-    public let name: String
+    public let title: String
     public let collections: [String]
 }
 
@@ -24,41 +24,40 @@ public struct XRPCMethodDescriptor: Sendable, Codable, Equatable {
 }
 
 public enum PermissionedData0016 {
-    public static let profileID = "permissioned-data-0016-2026-10-29"
+    public static let profileID = "permissioned-data-0016-2026-11-12"
     public static let methods: [XRPCMethodDescriptor] = [
         .init(nsid: "com.atproto.space.applyWrites", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "RecordNotFound", "RecordAlreadyExists"]),
+        .init(nsid: "com.atproto.space.authorizeSpaceSync", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "SpaceDeleted", "AccountNotAuthorized", "AppNotAuthorized", "NotAuthorized", "InvalidDelegationToken", "InvalidClientAttestation", "RegistrationNotConfirmed", "RepoTakendown", "RepoDeactivated"]),
+        .init(nsid: "com.atproto.space.confirmRegistration", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: []),
         .init(nsid: "com.atproto.space.createRecord", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "RecordAlreadyExists"]),
         .init(nsid: "com.atproto.space.deleteRecord", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["SpaceNotFound"]),
         .init(nsid: "com.atproto.space.getBlob", kind: .query, inputEncoding: nil, outputEncoding: "*/*", declaredErrors: ["BlobNotFound", "SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
         .init(nsid: "com.atproto.space.getDelegationToken", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: []),
-        .init(nsid: "com.atproto.space.getLatestCommit", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["BadSpaceMac", "SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
-        .init(nsid: "com.atproto.space.getRecord", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["BadSpaceMac", "RecordNotFound", "SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
-        .init(nsid: "com.atproto.space.getRepo", kind: .query, inputEncoding: nil, outputEncoding: "application/octet-stream", declaredErrors: ["BadSpaceMac", "SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
-        .init(nsid: "com.atproto.space.getSpaceCredential", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "SpaceDeleted", "UserNotAuthorized", "AppNotAuthorized", "NotAuthorized", "InvalidDelegationToken", "InvalidClientAttestation"]),
+        .init(nsid: "com.atproto.space.getLatestCommit", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["InvalidSpaceMac", "SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
+        .init(nsid: "com.atproto.space.getRecord", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["InvalidSpaceMac", "RecordNotFound", "SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
+        .init(nsid: "com.atproto.space.getRepo", kind: .query, inputEncoding: nil, outputEncoding: "application/vnd.dasl.star", declaredErrors: ["InvalidSpaceMac", "SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
         .init(nsid: "com.atproto.space.listBlobs", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
-        .init(nsid: "com.atproto.space.listRecords", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
-        .init(nsid: "com.atproto.space.listRepoOps", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["BadSpaceMac", "SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
-        .init(nsid: "com.atproto.space.listRepos", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["SpaceNotFound"]),
-        .init(nsid: "com.atproto.space.listSpaces", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: []),
-        .init(nsid: "com.atproto.space.notifyCredentialRevoked", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: []),
-        .init(nsid: "com.atproto.space.notifySpaceDeleted", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: []),
-        .init(nsid: "com.atproto.space.notifyWrite", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "FutureRev"]),
+        .init(nsid: "com.atproto.space.listRecords", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated", "InvalidCursor"]),
+        .init(nsid: "com.atproto.space.listRepoOps", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["InvalidSpaceMac", "SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated", "InvalidCursor"]),
+        .init(nsid: "com.atproto.space.listWriters", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "RepoTakendown", "RepoDeactivated"]),
+        .init(nsid: "com.atproto.space.listSpaces", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["InvalidCursor"]),
+        .init(nsid: "com.atproto.space.notifyCredentialsRevoked", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: []),
+        .init(nsid: "com.atproto.space.notifyRepoUpdate", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "FutureRev"]),
+        .init(nsid: "com.atproto.space.notifySpaceUpdate", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: []),
         .init(nsid: "com.atproto.space.putRecord", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["SpaceNotFound"]),
-        .init(nsid: "com.atproto.space.registerNotify", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "ServiceNotResolvable"]),
-        .init(nsid: "com.atproto.space.unregisterNotify", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound"]),
         .init(nsid: "com.atproto.space.createSpace", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["SpaceAlreadyExists", "UnsupportedPolicy"]),
-        .init(nsid: "com.atproto.space.updateSpace", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "NotSpaceOwner", "UnsupportedPolicy"]),
-        .init(nsid: "com.atproto.space.getSpace", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["SpaceNotFound"]),
-        .init(nsid: "com.atproto.space.deleteSpace", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "NotSpaceOwner"]),
-        .init(nsid: "com.atproto.space.removeWriter", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "NotSpaceOwner"]),
+        .init(nsid: "com.atproto.space.updateSpace", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "NotAuthorized", "UnsupportedPolicy"]),
+        .init(nsid: "com.atproto.space.getSpace", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "NotAuthorized"]),
+        .init(nsid: "com.atproto.space.deleteSpace", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "NotAuthorized"]),
+        .init(nsid: "com.atproto.space.removeWriter", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "NotAuthorized"]),
         .init(nsid: "com.atproto.space.clearRecords", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: []),
-        .init(nsid: "com.atproto.space.importRepo", kind: .procedure, inputEncoding: "application/octet-stream", outputEncoding: nil, declaredErrors: ["SpaceNotFound"]),
-        .init(nsid: "com.atproto.space.exportSpaceMeta", kind: .query, inputEncoding: nil, outputEncoding: "application/octet-stream", declaredErrors: ["SpaceNotFound", "NotSpaceOwner"]),
-        .init(nsid: "com.atproto.space.importSpaceMeta", kind: .procedure, inputEncoding: "application/octet-stream", outputEncoding: nil, declaredErrors: ["NotSpaceOwner", "UnsupportedPolicy"]),
-        .init(nsid: "com.atproto.memberspace.putMember", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "NotSpaceOwner", "PolicyMismatch"]),
-        .init(nsid: "com.atproto.memberspace.removeMember", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "NotSpaceOwner", "PolicyMismatch"]),
-        .init(nsid: "com.atproto.memberspace.listMembers", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "PolicyMismatch"]),
-        .init(nsid: "com.atproto.managedspace.checkUserAccess", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: []),
+        .init(nsid: "com.atproto.space.importRepo", kind: .procedure, inputEncoding: "application/vnd.dasl.star", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "InvalidRepoFile", "RepoMismatch"]),
+        .init(nsid: "com.atproto.space.exportSpaceMeta", kind: .query, inputEncoding: nil, outputEncoding: "application/vnd.dasl.star", declaredErrors: ["SpaceNotFound", "NotAuthorized"]),
+        .init(nsid: "com.atproto.space.importSpaceMeta", kind: .procedure, inputEncoding: "application/vnd.dasl.star", outputEncoding: nil, declaredErrors: ["NotAuthorized", "UnsupportedPolicy", "InvalidSpaceMeta"]),
+        .init(nsid: "com.atproto.memberspace.putMembers", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "NotAuthorized", "PolicyMismatch"]),
+        .init(nsid: "com.atproto.memberspace.removeMembers", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["SpaceNotFound", "NotAuthorized", "PolicyMismatch"]),
+        .init(nsid: "com.atproto.memberspace.listMembers", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["SpaceNotFound", "NotAuthorized", "PolicyMismatch", "InvalidCursor"]),
+        .init(nsid: "com.atproto.managedspace.checkAccess", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: []),
     ]
 }
 

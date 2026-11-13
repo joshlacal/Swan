@@ -10,13 +10,13 @@ parser.add_argument("--reference-root", type=Path, required=True)
 parser.add_argument("--check", action="store_true")
 args = parser.parse_args()
 root = Path(__file__).resolve().parent.parent
-profile_id = "permissioned-data-0016-2026-10-29"
+profile_id = "permissioned-data-0016-2026-11-12"
 schemas = sorted([*args.reference_root.glob("lexicons/com/atproto/space/*.json"),
                   *args.reference_root.glob("lexicons/com/atproto/memberspace/*.json"),
                   *args.reference_root.glob("lexicons/com/atproto/managedspace/*.json"),
                   *args.reference_root.glob("lexicons/com/atproto/personalspace/*.json")])
 if len(schemas) != 39:
-    raise SystemExit("expected the exact 39-file October 29 corpus")
+    raise SystemExit("expected the exact 39-file November 12 corpus")
 profile = json.loads((root / "Profiles" / f"{profile_id}.json").read_text())
 ordered = {json.loads(path.read_text())["id"]: json.loads(path.read_text()) for path in schemas}
 quote = lambda value: "nil" if value is None else json.dumps(value)
@@ -34,7 +34,7 @@ import SwanCore
 public struct SpaceDeclarationDescriptor: Sendable, Codable, Equatable {
     public let nsid: String
     public let keyType: String
-    public let name: String
+    public let title: String
     public let collections: [String]
 }
 
@@ -68,14 +68,21 @@ public protocol XRPCServerHandler: Sendable {
     func handle(_ input: Input, context: Context) async throws -> Output
 }
 ''' % (profile_id, "\n".join(rows))
+wire_source = root / "Sources/SwanSpacesWire/SwanSpacesWire.swift"
 outputs = {
-    root / "Sources/SwanSpacesWire/SwanSpacesWire.swift": source.encode(),
+    wire_source: source.encode(),
     root / "Profiles" / f"{profile_id}.lexicons.sha256": "".join(
         f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(args.reference_root / 'lexicons')}\n"
         for path in schemas).encode(),
 }
-outputs[root / "Profiles" / f"{profile_id}.generated-wire.sha256"] = (
-    hashlib.sha256(source.encode()).hexdigest() + "  Sources/SwanSpacesWire/SwanSpacesWire.swift\n").encode()
+generated_root = root / "Sources/SwanSpacesWire/Generated"
+wire_sources = [(wire_source, source.encode())]
+wire_sources.extend((path, path.read_bytes()) for path in generated_root.rglob("*.swift"))
+wire_sources.sort(key=lambda item: item[0].as_posix())
+outputs[root / "Profiles" / f"{profile_id}.generated-wire.sha256"] = "".join(
+    f"{hashlib.sha256(data).hexdigest()}  {path.relative_to(root)}\n"
+    for path, data in wire_sources
+).encode()
 for path, data in outputs.items():
     if args.check:
         if path.read_bytes() != data:

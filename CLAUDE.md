@@ -7,7 +7,7 @@ This file provides guidance to Claude Code when working with the Swan codebase.
 Swan's primary developer and agent documentation lives in [AGENTS.md](AGENTS.md). Refer to `AGENTS.md` for:
 - Target architecture and module layout across Swift packages and the Svelte frontend.
 - The three storage planes (`control.sqlite`, `<did>.sqlite`, `firehose.sqlite`) and per-account data isolation requirements.
-- Protocol profiles (`Profiles/*.json`), the active profile (`permissioned-data-0016-2026-10-01`), and wire generation boundaries.
+- Protocol profiles (`Profiles/*.json`), the active profile (`permissioned-data-0016-2026-11-12`), and wire generation boundaries.
 - Mandatory security invariants, authorization contexts, and credential handling rules.
 - Complete build, test, and verification commands.
 

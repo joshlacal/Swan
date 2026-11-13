@@ -878,7 +878,7 @@ reject_contains "$notification_config_init_block" 'entrypoint: ["/usr/local/bin/
 reject_contains "$notification_config_init_block" 'privileged:' "notification configuration preparation must not be privileged"
 # shellcheck disable=SC2016 # Reject the literal interpolation prefix.
 reject_contains "$notification_config_init_block" '${' "notification configuration preparation must not interpolate environment values"
-require_contains "$swan_block" '--managing-service-audience' "Compose must enable checkUserAccess service verification"
+require_contains "$swan_block" '--managing-service-audience' "Compose must enable checkAccess service verification"
 reject_contains "$swan_block" '--enable-localhost-oauth' "Compose must not use the narrower localhost-only OAuth bridge"
 require_contains "$swan_block" '--enable-local-space-interop' "local-space interop flag is missing"
 require_contains "$swan_block" '--space-account-kek-file' "account KEK file flag is missing"
@@ -979,8 +979,8 @@ reject_contains "$runner_block" 'https://' "planned runner must not name a live 
 reject_contains "$runner_block" 'toxiproxy' "planned runner must not mutate Toxiproxy"
 reject_contains "$runner_block" 'privileged:' "scenario runner must not be privileged"
 
-rg -q 'permissioned-data-0016-2026-10-01' Sources/SwanInterop/SwanInterop.swift
-rg -q '0c9c2e88ba385809fc9ecba92f362389d9338e16' Sources/SwanInterop/SwanInterop.swift
+rg -q 'permissioned-data-0016-2026-11-12' Sources/SwanInterop/SwanInterop.swift
+rg -q 'b54ec6853bab77edd4fd373804a480633094b324' Sources/SwanInterop/SwanInterop.swift
 rg -q '3f6c96d5d2d25438bd40fa89d6ecc37865f8e354' "$reference_pds_dockerfile"
 rg -q '1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea' "$reference_pds_dockerfile"
 rg -q 'tls internal' "$caddyfile"

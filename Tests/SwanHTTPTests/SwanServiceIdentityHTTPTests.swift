@@ -37,9 +37,10 @@ final class SwanServiceIdentityHTTPTests: XCTestCase {
         }
     }
 
-    func testDescribeServerDoesNotClaimInviteCodesAreRequired() async throws {
+    func testDescribeServerAdvertisesCurrentProfileAndNoRequiredInviteCode() async throws {
         try await withRunningServer(publicURL: Self.swanPlace) { client in
             let description = try await Self.describeServer(using: client)
+            XCTAssertEqual(description.swanProfile, "permissioned-data-0016-2026-11-12")
             XCTAssertFalse(description.inviteCodeRequired)
         }
     }
@@ -230,7 +231,7 @@ final class SwanServiceIdentityHTTPTests: XCTestCase {
             )
             let profile = try ProtocolProfile.load(
                 from: packageRoot()
-                    .appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")
+                    .appending(path: "Profiles/permissioned-data-0016-2026-11-12.json")
             )
             let server = SwanHTTPServer(
                 profile: profile,

@@ -842,7 +842,7 @@ def status(value):
 evidence = {
     "status": "passed",
     "scenario": "first-write-notification-loss",
-    "profileID": "permissioned-data-0016-2026-07-30",
+    "profileID": "permissioned-data-0016-2026-11-12",
     "fixturePolicy": "semantic-summary-only; no credentials, tokens, DPoP proofs, request bodies, record values, or personal selectors",
     "startedAt": started_at,
     "completedAt": completed_at,

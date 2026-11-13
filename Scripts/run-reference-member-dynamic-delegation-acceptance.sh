@@ -547,7 +547,7 @@ docker run --detach \
   --host 0.0.0.0 \
   --port 3000 \
   --public-url https://swan.test \
-  --profile /usr/local/share/swan/Profiles/permissioned-data-0016-2026-07-30.json \
+  --profile /usr/local/share/swan/Profiles/permissioned-data-0016-2026-11-12.json \
   --data-directory /var/lib/swan/data \
   --enable-local-space-interop \
   --space-account-kek-file /run/secrets/swan-runtime/account-kek \

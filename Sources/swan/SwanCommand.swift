@@ -1955,7 +1955,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Run Swan's Hummingbird server")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-10-29.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-11-12.json"
 
         @Option(name: .long, help: "Local authority DID for committed Labyrinth conversation membership policy")
         var conversationSpaceAuthority: String?
@@ -5312,7 +5312,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Verify a pinned Swan artifact")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-10-29.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-11-12.json"
 
         @Option(name: .long, help: "Swan package root containing generated wire sources")
         var sourceRoot: String?

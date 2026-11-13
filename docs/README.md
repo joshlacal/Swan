@@ -1,6 +1,6 @@
 # Documentation index
 
-This directory contains technical documentation for Swan, a Swift-native AT Protocol Personal Data Server (PDS) and permissioned-data server running profile `permissioned-data-0016-2026-10-01`.
+This directory contains technical documentation for Swan, a Swift-native AT Protocol Personal Data Server (PDS) and permissioned-data server running profile `permissioned-data-0016-2026-11-12`.
 
 ## Core documentation
 

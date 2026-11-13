@@ -6,7 +6,7 @@ set -euo pipefail
 # members (Carol on Swan, Bob on the pinned TypeScript reference PDS), posts
 # roots and cross-host replies from three writer identities across the two
 # hosts, then runs the syncer (`forum thread`) as Carol: one delegation
-# token, one space credential, writer-set discovery via listRepos, per-writer
+# token, one space credential, writer-set discovery via listWriters, per-writer
 # repo sync with per-writer commit verification keys, and one merged thread.
 #
 # The stock reference image cannot complete TLS to the authority and its
@@ -553,7 +553,7 @@ docker run --detach \
   --host 0.0.0.0 \
   --port 3000 \
   --public-url https://swan.test \
-  --profile /usr/local/share/swan/Profiles/permissioned-data-0016-2026-07-30.json \
+  --profile /usr/local/share/swan/Profiles/permissioned-data-0016-2026-11-12.json \
   --data-directory /var/lib/swan/data \
   --enable-local-space-interop \
   --space-account-kek-file /run/secrets/swan-runtime/account-kek \
