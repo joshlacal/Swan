@@ -133,7 +133,7 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         return presentation.authorization
     }
 
-    /// Records an authority's `notifyCredentialRevoked` for this repo host.
+    /// Records an authority's `notifyCredentialsRevoked` for this repo host.
     func recordSpaceCredentialRevocations(
         space: SpaceURI,
         credentialIDs: [String],
@@ -148,7 +148,7 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
 
     /// Whether `did` names an account this host stores, in any lifecycle
     /// state (the reference includes deactivated and taken-down accounts):
-    /// the audience test for `notifyCredentialRevoked`. Store failures are
+    /// the audience test for `notifyCredentialsRevoked`. Store failures are
     /// `SwanError.unavailable`.
     func hostsAccount(did: String) async throws -> Bool {
         do {

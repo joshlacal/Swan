@@ -20,20 +20,20 @@ final class ManagedSpaceCheckAccessHTTPTests: XCTestCase, @unchecked Sendable {
     fileprivate static let audience = "did:web:managing.swan.example#service"
 
     func testServiceAuthenticatedGenericPDSDeniesWithoutStorageAndRepoIsOptional() async throws {
-        let fixture = try await CheckUserAccessFixture.make()
+        let fixture = try await CheckAccessFixture.make()
         defer { fixture.cleanup() }
         let token = try fixture.token()
         let app = try fixture.server().buildApplication(logger: Logger(label: "ManagedSpaceCheckAccessHTTPTests.valid"))
         for uri in [
-            checkUserAccessURI(space: fixture.space, repo: Self.user, clientID: "https://client.example/meta"),
-            checkUserAccessURI(space: fixture.space, repo: nil),
+            checkAccessURI(space: fixture.space, repo: Self.user, clientID: "https://client.example/meta"),
+            checkAccessURI(space: fixture.space, repo: nil),
         ] {
             try await app.test(.router) { client in
                 try await client.execute(uri: uri, method: .get, headers: bearer(token)) { response in
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertEqual(response.headers[.contentType], "application/json")
                     XCTAssertEqual(response.headers[.cacheControl], "no-store")
-                    let object = try checkUserAccessObject(response.body)
+                    let object = try checkAccessObject(response.body)
                     XCTAssertEqual(Set(object.keys), ["read", "write"])
                     XCTAssertEqual(object["read"] as? Bool, false)
                     XCTAssertEqual(object["write"] as? Bool, false)
@@ -49,16 +49,16 @@ final class ManagedSpaceCheckAccessHTTPTests: XCTestCase, @unchecked Sendable {
     }
 
     func testInvalidCredentialsAndQueriesAreOpaqueDenials() async throws {
-        let fixture = try await CheckUserAccessFixture.make()
+        let fixture = try await CheckAccessFixture.make()
         defer { fixture.cleanup() }
         let app = try fixture.server().buildApplication(logger: Logger(label: "ManagedSpaceCheckAccessHTTPTests.denied"))
-        let validURI = checkUserAccessURI(space: fixture.space, repo: Self.user)
+        let validURI = checkAccessURI(space: fixture.space, repo: Self.user)
         let valid = try fixture.token()
         let wrongMethod = try fixture.token(method: "com.atproto.space.notifyRepoUpdate")
         let wrongAudience = try fixture.token(audience: "did:web:other.example#service")
         let expired = try fixture.token(now: Date(timeIntervalSinceNow: -120), lifetime: 1)
         let malformedSignature = String(valid.dropLast()) + "x"
-        let encodedSpace = checkUserAccessEncode(fixture.space.rawValue)
+        let encodedSpace = checkAccessEncode(fixture.space.rawValue)
         let invalidQueries = [
             "/xrpc/com.atproto.managedspace.checkAccess",
             "/xrpc/com.atproto.managedspace.checkAccess?space=" + encodedSpace + "&repo=not-a-did",
@@ -86,39 +86,39 @@ final class ManagedSpaceCheckAccessHTTPTests: XCTestCase, @unchecked Sendable {
             try await client.execute(uri: validURI, method: .post, headers: bearer(valid)) { response in
                 XCTAssertEqual(response.status, .notFound)
                 XCTAssertEqual(response.headers[.cacheControl], "no-store")
-                XCTAssertEqual(try checkUserAccessError(response.body), "permissioned_endpoint_unavailable")
+                XCTAssertEqual(try checkAccessError(response.body), "permissioned_endpoint_unavailable")
             }
         }
         try await fixture.close()
     }
 
     func testAbsentCapabilityStaysMethodCorrectClosedAndUnavailableVerifierIsTemporary() async throws {
-        let fixture = try await CheckUserAccessFixture.make()
+        let fixture = try await CheckAccessFixture.make()
         defer { fixture.cleanup() }
-        let profile = try checkUserAccessProfile()
+        let profile = try checkAccessProfile()
         let noCapability = SwanHTTPServer(profile: profile, oauthRuntime: fixture.runtime)
         let unavailable = SwanHTTPServer(
             profile: profile,
             oauthRuntime: fixture.runtime,
             managedSpaceCheckAccessConfiguration: try .init(
-                serviceAuthentication: CheckUserAccessUnavailableVerifier(),
+                serviceAuthentication: CheckAccessUnavailableVerifier(),
                 managingServiceAudience: Self.audience
             )
         )
-        let uri = checkUserAccessURI(space: fixture.space, repo: Self.user)
+        let uri = checkAccessURI(space: fixture.space, repo: Self.user)
         let token = try fixture.token()
         try await noCapability.buildApplication(logger: Logger(label: "ManagedSpaceCheckAccessHTTPTests.closed")).test(.router) { client in
             try await client.execute(uri: uri, method: .get) { response in
                 XCTAssertEqual(response.status, .serviceUnavailable)
                 XCTAssertEqual(response.headers[.cacheControl], "no-store")
-                XCTAssertEqual(try checkUserAccessError(response.body), "permissioned_data_pending")
+                XCTAssertEqual(try checkAccessError(response.body), "permissioned_data_pending")
             }
         }
         try await unavailable.buildApplication(logger: Logger(label: "ManagedSpaceCheckAccessHTTPTests.unavailable")).test(.router) { client in
             try await client.execute(uri: uri, method: .get, headers: bearer(token)) { response in
                 XCTAssertEqual(response.status, .serviceUnavailable)
                 XCTAssertEqual(response.headers[.cacheControl], "no-store")
-                XCTAssertEqual(try checkUserAccessError(response.body), "temporarily_unavailable")
+                XCTAssertEqual(try checkAccessError(response.body), "temporarily_unavailable")
             }
         }
         XCTAssertThrowsError(try SwanManagedSpaceCheckAccessHTTPConfiguration(
@@ -132,11 +132,11 @@ final class ManagedSpaceCheckAccessHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(response.status, .unauthorized)
         XCTAssertEqual(response.headers[.contentType], "application/json")
         XCTAssertEqual(response.headers[.cacheControl], "no-store")
-        XCTAssertEqual(try? checkUserAccessError(response.body), "Unauthorized")
+        XCTAssertEqual(try? checkAccessError(response.body), "Unauthorized")
     }
 }
 
-private actor CheckUserAccessVerifier: SpaceServiceAuthenticationVerifier {
+private actor CheckAccessVerifier: SpaceServiceAuthenticationVerifier {
     private let verifier: DurableSpaceServiceAuthenticationVerifier
     private var expectations: [(audience: String?, method: String)] = []
 
@@ -169,7 +169,7 @@ private actor CheckUserAccessVerifier: SpaceServiceAuthenticationVerifier {
     func lastExpectation() -> (audience: String?, method: String)? { expectations.last }
 }
 
-private struct CheckUserAccessUnavailableVerifier: SpaceServiceAuthenticationVerifier {
+private struct CheckAccessUnavailableVerifier: SpaceServiceAuthenticationVerifier {
     func authenticate(
         _ compact: String,
         expectedAudience: String?,
@@ -181,16 +181,16 @@ private struct CheckUserAccessUnavailableVerifier: SpaceServiceAuthenticationVer
     }
 }
 
-private struct CheckUserAccessFixture {
+private struct CheckAccessFixture {
     let root: URL
     let control: SQLiteControlDatabase
     let runtime: SwanOAuthRuntime
     let key: P256.Signing.PrivateKey
-    let verifier: CheckUserAccessVerifier
+    let verifier: CheckAccessVerifier
     let space: SpaceURI
 
     static func make() async throws -> Self {
-        let root = FileManager.default.temporaryDirectory.appending(path: "SwanCheckUserAccess-\(UUID().uuidString)")
+        let root = FileManager.default.temporaryDirectory.appending(path: "SwanCheckAccess-\(UUID().uuidString)")
         let control = try await SQLiteControlDatabase(dataDirectory: root)
         do {
             let key = P256.Signing.PrivateKey()
@@ -199,7 +199,7 @@ private struct CheckUserAccessFixture {
                 control: control,
                 runtime: SwanOAuthRuntime(controlStore: control, serverKey: Data(repeating: 0xAA, count: 32)),
                 key: key,
-                verifier: CheckUserAccessVerifier(key: key.publicKey),
+                verifier: CheckAccessVerifier(key: key.publicKey),
                 space: SpaceURI(authority: ManagedSpaceCheckAccessHTTPTests.authority, spaceType: "app.bsky.bookmarks", skey: "access")
             )
         } catch {
@@ -211,7 +211,7 @@ private struct CheckUserAccessFixture {
 
     func server() throws -> SwanHTTPServer {
         try .init(
-            profile: checkUserAccessProfile(),
+            profile: checkAccessProfile(),
             oauthRuntime: runtime,
             managedSpaceCheckAccessConfiguration: .init(
                 serviceAuthentication: verifier,
@@ -241,19 +241,19 @@ private struct CheckUserAccessFixture {
     func cleanup() { try? FileManager.default.removeItem(at: root) }
 }
 
-private func checkUserAccessProfile() throws -> ProtocolProfile {
+private func checkAccessProfile() throws -> ProtocolProfile {
     let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
     return try ProtocolProfile.load(from: root.appending(path: "Profiles/permissioned-data-0016-2026-11-12.json"))
 }
 
-private func checkUserAccessURI(space: SpaceURI, repo: String?, clientID: String? = nil) -> String {
-    var result = "/xrpc/com.atproto.managedspace.checkAccess?space=\(checkUserAccessEncode(space.rawValue))"
-    if let repo { result += "&repo=\(checkUserAccessEncode(repo))" }
-    if let clientID { result += "&clientId=\(checkUserAccessEncode(clientID))" }
+private func checkAccessURI(space: SpaceURI, repo: String?, clientID: String? = nil) -> String {
+    var result = "/xrpc/com.atproto.managedspace.checkAccess?space=\(checkAccessEncode(space.rawValue))"
+    if let repo { result += "&repo=\(checkAccessEncode(repo))" }
+    if let clientID { result += "&clientId=\(checkAccessEncode(clientID))" }
     return result
 }
 
-private func checkUserAccessEncode(_ value: String) -> String {
+private func checkAccessEncode(_ value: String) -> String {
     value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? value
 }
 
@@ -263,10 +263,10 @@ private func bearer(_ token: String) -> HTTPFields {
     return headers
 }
 
-private func checkUserAccessObject(_ buffer: ByteBuffer) throws -> [String: Any] {
+private func checkAccessObject(_ buffer: ByteBuffer) throws -> [String: Any] {
     try XCTUnwrap(JSONSerialization.jsonObject(with: Data(buffer.readableBytesView)) as? [String: Any])
 }
 
-private func checkUserAccessError(_ buffer: ByteBuffer) throws -> String {
-    try XCTUnwrap(checkUserAccessObject(buffer)["error"] as? String)
+private func checkAccessError(_ buffer: ByteBuffer) throws -> String {
+    try XCTUnwrap(checkAccessObject(buffer)["error"] as? String)
 }

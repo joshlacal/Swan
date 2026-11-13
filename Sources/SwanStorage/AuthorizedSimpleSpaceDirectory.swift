@@ -633,10 +633,6 @@ public struct AuthorizedSimpleSpaceMemberPage: Sendable, Equatable {
         self.cursor = cursor
     }
 
-    public init(dids: [String], cursor: String?) {
-        self.members = dids.map { Member(did: $0, read: true, write: true) }
-        self.cursor = cursor
-    }
 }
 
 /// Stable, privacy-safe lifecycle error used across the SQLite adapter and

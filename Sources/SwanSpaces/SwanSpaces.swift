@@ -1841,7 +1841,7 @@ public struct SimpleSpaceConfiguration: Sendable, Codable, Equatable {
             guard clients.count <= SimpleSpaceLimits.maximumClientAllowListEntries else {
                 throw SwanError.malformed("simple-space client allow-list is too large")
             }
-            for client in clients where !SpacePolicyValidation.isValidAppIdentifier(client) {
+            for client in clients where !SpacePolicyValidation.isValidURI(client) {
                 throw SwanError.invalidIdentifier(client)
             }
             allowedApps = clients.sorted()
@@ -1890,10 +1890,10 @@ public struct SimpleSpaceConfiguration: Sendable, Codable, Equatable {
         return .open
     }
 
-    /// Client identifiers are opaque app/service names in the wire protocol,
-    /// not URLs or DIDs.
+    /// New client identifiers are absolute URI values on the wire. Stored
+    /// pre-November identifiers remain loadable for migration reporting.
     static func validateAppIdentifier(_ identifier: String) throws {
-        guard SpacePolicyValidation.isValidAppIdentifier(identifier) else {
+        guard SpacePolicyValidation.isValidURI(identifier) else {
             throw SwanError.invalidIdentifier(identifier)
         }
     }

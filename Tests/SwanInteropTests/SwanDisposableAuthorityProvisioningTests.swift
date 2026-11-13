@@ -37,7 +37,7 @@ final class SwanDisposableAuthorityProvisioningTests: XCTestCase, @unchecked Sen
             path: "/xrpc/com.atproto.space.createSpace", body: JSONSerialization.data(withJSONObject: create))
         XCTAssertEqual(response.status, 200, String(decoding: response.body, as: UTF8.self))
         let created = try XCTUnwrap(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
-        XCTAssertEqual(created["uri"] as? String, expectedSpace)
+        XCTAssertEqual(created["space"] as? String, expectedSpace)
         let member = "did:plc:xx5pwgo7a7k3sjz4xzoau2bq"
         let memberResponse = try await oauth.executeResource(token: token, method: .post,
             path: "/xrpc/com.atproto.memberspace.putMembers", body: JSONSerialization.data(withJSONObject: [

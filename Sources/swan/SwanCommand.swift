@@ -2365,7 +2365,7 @@ extension SwanCommand {
 
         @Flag(
             name: .customLong("enable-spaces-open-interop"),
-            help: "Opt into upstream atproto-spaces interop: unbound notify service auth, optional Atproto-Service-Auth on (un)registerNotify, open DID-document federation, and upstream scope/legacy-session semantics. Off by default."
+            help: "Opt into upstream atproto-spaces interop: open DID-document federation and upstream scope/legacy-session semantics. Off by default."
         )
         var enableSpacesOpenInterop = false
 
@@ -4082,11 +4082,8 @@ extension SwanCommand {
                 let permissionedRuntime: ServePermissionedRuntime
                 var openFederationResolver: SwanDIDDocumentSpaceResolver?
                 do {
-                    // Erratum 03: `registerNotify` resolves a subscriber's
-                    // `service` identifier through its DID document. Built
-                    // unconditionally for serve — the fetch path is the same
-                    // peer-policied one OAuth metadata uses, and it only
-                    // fires when a credentialed caller names a service.
+                    // Managed access checks and open federation resolve service
+                    // identifiers through peer-policied DID-document fetching.
                     let notifyServiceResolver: SwanServiceEndpointResolver?
                     let didDocumentFetcher: SwanPeerPinnedDIDDocumentFetcher?
                     do {
@@ -5383,14 +5380,14 @@ extension SwanCommand {
             ]
         )
 
-        /// Read-only report of the October 29 space-policy migration (v29)
-        /// for one account database. Before the migration has run it predicts
-        /// each lossy conversion; afterwards it prints the recorded log. The
-        /// database is opened read-only and is never migrated by this command.
+        /// Read-only report of stored space-policy conversion hazards for one
+        /// account database. Before v29 it predicts each conversion; afterwards
+        /// it combines the recorded log with hazards still present in stored
+        /// policy. The database is opened read-only and never migrated.
         struct SpacePolicyReport: AsyncParsableCommand {
             static let configuration = CommandConfiguration(
                 commandName: "space-policy-report",
-                abstract: "Report lossy October 29 space-policy conversions (read-only)"
+                abstract: "Report stored space-policy conversion hazards (read-only)"
             )
 
             @Option(name: .long, help: "Required Swan data directory")

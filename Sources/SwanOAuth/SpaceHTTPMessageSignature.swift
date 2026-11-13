@@ -2,7 +2,7 @@ import Crypto
 import Foundation
 import PetrelCrypto
 
-/// October 22 credential presentation profile of HTTP Message Signatures.
+/// November 12 credential presentation profile of HTTP Message Signatures.
 /// Covers the exact Authorization and Atproto-Space-Audience field bytes,
 /// requires tag=atproto-space-credential, and verifies the credential's P-256
 /// cnf.kid. Credential exchange carries its key identifier in the JSON body.

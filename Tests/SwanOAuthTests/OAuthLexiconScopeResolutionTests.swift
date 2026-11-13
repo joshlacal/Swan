@@ -566,10 +566,11 @@ final class OAuthLexiconScopeResolutionTests: XCTestCase {
         )
         let scopes = Set(types.map { "space:\($0)?authority=\(Self.owner)" })
 
-        XCTAssertEqual(
-            try await OAuthLexiconScopeResolution.resolveSpaceTitles(scopes, resolver: resolver),
-            [:]
+        let titles = try await OAuthLexiconScopeResolution.resolveSpaceTitles(
+            scopes,
+            resolver: resolver
         )
+        XCTAssertEqual(titles, [:])
         XCTAssertEqual(resolver.resolutionCount, 0)
     }
 

@@ -93,7 +93,7 @@ public enum SpacePolicy: Sendable, Equatable, Hashable {
                 apps.reserveCapacity(values.count)
                 for item in values {
                     guard let app = item as? String,
-                          SpacePolicyValidation.isValidAppIdentifier(app) else {
+                          SpacePolicyValidation.isValidURI(app) else {
                         throw SpacePolicyError.invalidPolicy
                     }
                     apps.append(app)
@@ -337,9 +337,6 @@ public enum SpacePolicyValidation {
         }
     }
 
-    public static func isValidAppIdentifier(_ identifier: String) -> Bool {
-        isValidURI(identifier)
-    }
 
     /// Stored pre-November rows may contain a bare DID, so this tolerant
     /// validator remains available for loading and reporting them.
