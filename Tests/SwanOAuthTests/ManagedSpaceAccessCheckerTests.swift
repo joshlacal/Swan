@@ -40,15 +40,19 @@ final class ManagedSpaceAccessCheckerTests: XCTestCase {
         XCTAssertEqual(query(undelegated), ["space": try space().rawValue])
     }
 
-    func testResponseRequiresExactlyTwoBooleans() throws {
-        XCTAssertEqual(
-            try RemoteManagedSpaceAccessChecker.access(from: Data(#"{"read":true,"write":false}"#.utf8)),
-            ManagedSpaceAccess(read: true, write: false)
-        )
+    func testResponseRequiresTwoBooleansAndIgnoresUnknownFields() throws {
+        for body in [
+            #"{"read":true,"write":false}"#,
+            #"{"read":true,"write":false,"other":{"future":true}}"#,
+        ] {
+            XCTAssertEqual(
+                try RemoteManagedSpaceAccessChecker.access(from: Data(body.utf8)),
+                ManagedSpaceAccess(read: true, write: false)
+            )
+        }
         for body in [
             #"{"read":true}"#,
             #"{"read":true,"write":0}"#,
-            #"{"read":true,"write":false,"other":false}"#,
             #"[true,false]"#,
             "not json",
             "",

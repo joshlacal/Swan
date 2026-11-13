@@ -413,7 +413,12 @@ public enum OAuthLexiconScopeResolution {
             return type
         })
         guard !types.isEmpty else { return [:] }
-        let resolutions = try await resolver.resolveAll(types, population: .spaceTypes)
+        let resolutions: [String: SwanLexiconResolution]
+        do {
+            resolutions = try await resolver.resolveAll(types, population: .spaceTypes)
+        } catch {
+            return [:]
+        }
         var titles: [String: String] = [:]
         for type in types {
             guard case let .resolved(.space(space), _, _) = resolutions[type],

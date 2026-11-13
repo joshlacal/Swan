@@ -210,7 +210,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertNil(policy["allowedApps"])
                 }
 
-                let add = #"{"space":"\#(uri)","members":[{"did":"\#(Self.bob)","read":true,"write":false}]}"#
+                let add = #"{"space":"\#(uri)","members":[{"$type":"com.atproto.memberspace.defs#member","did":"\#(Self.bob)","read":true,"write":false,"futureField":{"retained":false}}]}"#
                 try await client.execute(uri: Self.putPath, method: .post, headers: try self.postHeaders(fixture, path: Self.putPath, jti: "add-member"), body: ByteBuffer(string: add)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }

@@ -559,6 +559,20 @@ final class OAuthLexiconScopeResolutionTests: XCTestCase {
         )
     }
 
+    func testConsentTitleLookupFallsBackToNSIDsWhenResolutionCapFails() async throws {
+        let types = (0 ..< 9).map { "com.example.space\($0)" }
+        let resolver = StubLexiconResolver(
+            Dictionary(uniqueKeysWithValues: types.map { ($0, Self.space([Self.thread])) })
+        )
+        let scopes = Set(types.map { "space:\($0)?authority=\(Self.owner)" })
+
+        XCTAssertEqual(
+            try await OAuthLexiconScopeResolution.resolveSpaceTitles(scopes, resolver: resolver),
+            [:]
+        )
+        XCTAssertEqual(resolver.resolutionCount, 0)
+    }
+
     // MARK: - Honest deadline racing
 
     func testNeverReturningOperationDoesNotHoldSwanLexiconDeadlinePastDeadline() async throws {

@@ -103,7 +103,11 @@ private struct SpacePutMembersWireInput {
         }
         members = try values.map { value in
             guard let member = value as? [String: Any],
-                  Set(member.keys) == ["did", "read", "write"] else {
+                  member["did"] != nil, member["read"] != nil, member["write"] != nil else {
+                throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+            }
+            if let type = member["$type"],
+               type as? String != "com.atproto.memberspace.defs#member" {
                 throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
             }
             return AuthorizedSimpleSpaceMemberPage.Member(

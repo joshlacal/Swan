@@ -96,7 +96,7 @@ public struct RemoteManagedSpaceAccessChecker: ManagedSpaceAccessChecking {
             timeout: timeout,
             maximumResponseBodyBytes: Self.maximumResponseBytes
         )
-        guard response.status == 200, response.redirectCount == 0,
+        guard (200 ... 299).contains(response.status), response.redirectCount == 0,
               response.body.count <= Self.maximumResponseBytes else {
             throw ManagedSpaceAccessError.upstreamFailure
         }
@@ -131,11 +131,10 @@ public struct RemoteManagedSpaceAccessChecker: ManagedSpaceAccessChecking {
         return url
     }
 
-    /// Only an exact object with boolean `read` and `write` members is valid.
+    /// Boolean `read` and `write` members are required; unknown fields are ignored.
     static func access(from body: Data) throws -> ManagedSpaceAccess {
         guard (try? StrictJSON.validate(body)) != nil,
               let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-              Set(object.keys) == ["read", "write"],
               let readValue = object["read"], SpacePolicy.isJSONBoolean(readValue),
               let writeValue = object["write"], SpacePolicy.isJSONBoolean(writeValue),
               let read = readValue as? Bool,
