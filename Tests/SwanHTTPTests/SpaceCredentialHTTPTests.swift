@@ -186,8 +186,8 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
-                try await fixture.directory.removeSimpleSpaceMember(
-                    Self.member,
+                try await fixture.directory.removeSimpleSpaceMembers(
+                    [Self.member],
                     from: fixture.memberSpace,
                     authorization: .accountOAuthForTesting(
                         subject: Self.authority,
@@ -701,7 +701,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 fixture,
                 registrationConfirmer: RegistrationConfirmationProbe()
             ).buildApplication(logger: Logger(label: "SpaceCredentialHTTPTests.managedUpstream"))
-            func body(_ delegation: String) throws -> ByteBuffer {
+            @Sendable func body(_ delegation: String) throws -> ByteBuffer {
                 ByteBuffer(data: try JSONSerialization.data(withJSONObject: [
                     "space": fixture.managingSpace.rawValue,
                     "credentialKey": try SpaceCredentialSignatureTestSupport.keyID,

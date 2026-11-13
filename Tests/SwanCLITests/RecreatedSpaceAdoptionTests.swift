@@ -1,10 +1,11 @@
 import Crypto
 import Foundation
 import Petrel
+import SQLiteNIO
 import SwanCore
 import SwanOAuth
 import SwanSpaces
-import SwanSQLite
+@testable import SwanSQLite
 import SwanStorage
 import XCTest
 @testable import swan
@@ -40,9 +41,18 @@ final class RecreatedSpaceAdoptionTests: XCTestCase {
                 writes: [.put(uri: uri, value: value, cid: CID.fromDAGCBOR(value).string)]
             )
             let deletedAt = Date(timeIntervalSince1970: 1_800_000_000)
-            try await database.receiveSpaceDeletionNotification(
-                space: space, issuer: authority, audience: receiver, eventID: "deletion-1",
-                requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: space), now: deletedAt
+            _ = try await database.connection.query(
+                """
+                INSERT INTO permissioned_space_recipient_tombstones(
+                    space_uri, authority_did, deletion_event_id, closed_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [
+                    .text(space.rawValue),
+                    .text(authority),
+                    .text("deletion-1"),
+                    .integer(Int(deletedAt.timeIntervalSince1970 * 1_000_000)),
+                ]
             )
             let tombstone = try await database.recipientSpaceDeletionTombstone(space)
             XCTAssertEqual(tombstone?.deletionEventID, "deletion-1")

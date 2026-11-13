@@ -10,7 +10,7 @@ import PetrelCrypto
 @testable import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
-@_spi(PortableRestore) import SwanSQLite
+@_spi(PortableRestore) @testable import SwanSQLite
 import SwanSpaces
 import SwanStorage
 import XCTest
@@ -147,7 +147,19 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
             _ = try await ownerRepository.apply(.put(uri: ownerRecord, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2z"), authorization: createAuthorization(for: duplicate))
             _ = try await database.createSimpleSpace(space: deleted, owner: Self.alice, configuration: try .init(readPolicy: .public, writePolicy: .public, appAccess: .open), authorization: .accountOAuthForTesting(subject: Self.alice, scopes: ["atproto"]))
             _ = try await database.deleteSimpleSpace(space: deleted, authorization: .accountOAuthForTesting(subject: Self.alice, scopes: ["atproto"]))
-            try await database.receiveSpaceDeletionNotification(space: tombstoned, issuer: Self.bob, audience: Self.alice, eventID: "tombstone-list", requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: tombstoned))
+            _ = try await database.connection.query(
+                """
+                INSERT INTO permissioned_space_recipient_tombstones(
+                    space_uri, authority_did, deletion_event_id, closed_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [
+                    .text(tombstoned.rawValue),
+                    .text(tombstoned.authority),
+                    .text("tombstone-list"),
+                    .integer(1_790_000_000_000_000),
+                ]
+            )
             let page = try await database.hostedSpaces(spaceType: nil, authority: nil, cursor: nil, limit: 100)
             XCTAssertEqual(page.map(\.space), [duplicate, tombstoned])
             try await database.close()

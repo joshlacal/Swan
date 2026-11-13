@@ -27,19 +27,23 @@ final class ConversationSpaceAuthorityStoreTests: XCTestCase {
             try await database.receiveMembershipVerifiedConversationSpaceWriteNotification(write, now: fixture.now)
             let writers = try await database.spaceWriters(space: fixture.space, limit: 10, cursor: nil, authorization: fixture.credential)
             XCTAssertEqual(writers.map(\.repository), [fixture.writer])
-            let pendingLease = try await database.leaseNextNotificationFanout(now: fixture.now, leaseDuration: 60)
+            let pendingLease = try await database.leaseNextSpaceSyncNotification(
+                now: fixture.now,
+                leaseDuration: 60
+            )
             let leased = try XCTUnwrap(pendingLease)
-            XCTAssertEqual(leased.event.kind, .write)
+            XCTAssertEqual(leased.event.kind, .repoWrite)
             let deletion = try await database.beginConversationSpaceDeletion(space: fixture.space, authorization: fixture.ownerAuthorization, now: fixture.now)
             let repeated = try await database.beginConversationSpaceDeletion(space: fixture.space, authorization: fixture.ownerAuthorization, now: fixture.now)
             XCTAssertEqual(deletion, repeated)
-            let queued = try await database.pendingNotificationFanout()
+            let queued = try await database.pendingSpaceSyncNotifications()
             XCTAssertTrue(queued.isEmpty, "beginning deletion must not publish a deletion before DS confirmation")
-            let active = try await database.isSpaceNotificationRegistrationActive(space: fixture.space, endpoint: fixture.endpoint, repository: fixture.writer, now: fixture.now)
-            let dynamic = try await database.spaceNotificationRegistrationService(space: fixture.space, endpoint: fixture.endpoint, repository: fixture.writer, now: fixture.now)
-            XCTAssertFalse(active)
-            XCTAssertNil(dynamic)
-            let acknowledged = try await database.completeNotificationFanoutLease(eventID: leased.event.id, token: leased.token)
+            let registrations = try await database.connection.query(
+                "SELECT 1 FROM permissioned_space_sync_registrations WHERE space_uri = ?",
+                [.text(fixture.space.rawValue)]
+            )
+            XCTAssertEqual(registrations.count, 1, "the registration is retained until DS confirms deletion")
+            let acknowledged = try await database.completeSpaceSyncNotificationLease(eventID: leased.event.id, token: leased.token)
             XCTAssertFalse(acknowledged)
             for operation in 0..<4 {
                 do {
@@ -86,23 +90,27 @@ final class ConversationSpaceAuthorityStoreTests: XCTestCase {
             try await reopened.finishConversationSpaceDeletion(deletion, now: fixture.now)
             let noPending = try await reopened.pendingConversationSpaceDeletions(authority: fixture.owner)
             XCTAssertTrue(noPending.isEmpty)
-            let fanout = try await reopened.pendingNotificationFanout()
+            let fanout = try await reopened.pendingSpaceSyncNotifications()
             XCTAssertEqual(fanout.count, 2)
-            XCTAssertEqual(Set(fanout.map(\.sourceEventID)), [deletion.eventID])
-            XCTAssertTrue(fanout.allSatisfy { $0.kind == .deleted && $0.repository == nil })
+            XCTAssertTrue(fanout.allSatisfy { $0.kind == .spaceDeleted })
+            XCTAssertEqual(
+                Set(fanout.map(\.token)),
+                Set([
+                    fixture.token(for: fixture.endpoint),
+                    fixture.token(for: "https://second.example/events"),
+                ])
+            )
             let records = try await reopened.connection.query("SELECT 1 FROM permissioned_space_records WHERE space_uri = ?", [.text(fixture.space.rawValue)])
             XCTAssertTrue(records.isEmpty)
-            for _ in 0..<2 {
-                let pendingLease = try await reopened.leaseNextNotificationFanout(now: fixture.now, leaseDuration: 60)
+            for _ in 0 ..< 2 {
+                let pendingLease = try await reopened.leaseNextSpaceSyncNotification(now: fixture.now, leaseDuration: 60)
                 let leased = try XCTUnwrap(pendingLease)
-                let registration = try await reopened.currentSpaceDeletionDeliveryRegistration(for: leased.event, now: fixture.now)
-                XCTAssertNotNil(registration)
-                let completed = try await reopened.completeNotificationFanoutLease(eventID: leased.event.id, token: leased.token)
-                XCTAssertTrue(completed, "SQLite fanout UUID spelling must round-trip through its lease")
+                let completed = try await reopened.completeSpaceSyncNotificationLease(eventID: leased.event.id, token: leased.token)
+                XCTAssertTrue(completed, "SQLite sync UUID spelling must round-trip through its lease")
             }
             try await reopened.finishConversationSpaceDeletion(deletion, now: fixture.now)
-            let drained = try await reopened.pendingNotificationFanout()
-            let registrations = try await reopened.connection.query("SELECT 1 FROM permissioned_space_notification_registrations WHERE space_uri = ?", [.text(fixture.space.rawValue)])
+            let drained = try await reopened.pendingSpaceSyncNotifications()
+            let registrations = try await reopened.connection.query("SELECT 1 FROM permissioned_space_sync_registrations WHERE space_uri = ?", [.text(fixture.space.rawValue)])
             XCTAssertTrue(drained.isEmpty, "repeated completion cannot create another deletion delivery")
             XCTAssertTrue(registrations.isEmpty)
             do {
@@ -113,73 +121,97 @@ final class ConversationSpaceAuthorityStoreTests: XCTestCase {
         } catch { try? await reopened.close(); throw error }
     }
 
-    /// SWAN-SYNC-3: owed recipients survive a delivery-service outage,
-    /// restart and partial drain, but only until their own registration
-    /// expires (October 22 section 6), mirroring simple spaces.
-    func testOwedRecipientsSurviveOutageRestartAndPartialDrainUntilRegistrationExpiry() async throws {
+    /// Nov-12 sync registrations survive a delivery-service outage and
+    /// restart while deletion is pending. DS confirmation then replaces all
+    /// work with one reliable terminal notice for each active or lapsed token.
+    func testRegistrationsSurviveRestartUntilDeletionConfirmationThenDrain() async throws {
         let fixture = try ConversationAuthorityFixture()
         let start = Date(timeIntervalSince1970: 100)
-        let expiry = Date(timeIntervalSince1970: 300)
         let delayed = Date(timeIntervalSince1970: 200)
-        let lapsed = Date(timeIntervalSince1970: 301)
         let database = try await fixture.open()
         let deletion: ConversationSpaceDeletion
         do {
-            try await database.registerKnownConversationSpace(space: fixture.space, now: Date(timeIntervalSince1970: 98))
-            for (endpoint, expires) in [(fixture.endpoint, expiry), ("https://second.example/events", expiry),
-                                        ("https://expired.example/events", Date(timeIntervalSince1970: 99))] {
-                try await database.registerSpaceNotification(.init(space: fixture.space, endpoint: endpoint, repository: nil,
-                    expiresAt: expires, ownerServiceDID: fixture.service(for: endpoint), deliveryServiceDID: fixture.service(for: endpoint)),
-                    authorization: fixture.credential, now: Date(timeIntervalSince1970: 98))
+            try await database.registerKnownConversationSpace(
+                space: fixture.space,
+                now: Date(timeIntervalSince1970: 98)
+            )
+            for (endpoint, token, expiresAt) in [
+                (fixture.endpoint, "active-token", Date(timeIntervalSince1970: 300)),
+                ("https://second.example/events", "second-token", Date(timeIntervalSince1970: 300)),
+                ("https://expired.example/events", "lapsed-token", Date(timeIntervalSince1970: 99)),
+            ] {
+                try await database.putSpaceSyncRegistration(
+                    .init(
+                        space: fixture.space,
+                        endpoint: endpoint,
+                        token: token,
+                        expiresAt: expiresAt
+                    )
+                )
             }
-            deletion = try await database.beginConversationSpaceDeletion(space: fixture.space, authorization: fixture.ownerAuthorization, now: start)
-            let owed = try await database.connection.query("SELECT endpoint, registration_expires_at FROM conversation_space_deletion_recipients WHERE space_uri = ?", [.text(fixture.space.rawValue)])
-            XCTAssertEqual(owed.count, 2, "only recipients authenticated and active at deletion begin are owed the terminal signal")
-            XCTAssertTrue(owed.allSatisfy { $0.column("registration_expires_at")?.integer == 300_000_000 })
-            try await database.deferConversationSpaceDeletion(deletion, now: Date(timeIntervalSince1970: 150))
+            deletion = try await database.beginConversationSpaceDeletion(
+                space: fixture.space,
+                authorization: fixture.ownerAuthorization,
+                now: start
+            )
+            let registered = try await database.connection.query(
+                "SELECT 1 FROM permissioned_space_sync_registrations WHERE space_uri = ?",
+                [.text(fixture.space.rawValue)]
+            )
+            XCTAssertEqual(registered.count, 3)
+            try await database.deferConversationSpaceDeletion(
+                deletion,
+                now: Date(timeIntervalSince1970: 150)
+            )
             try await database.close()
-        } catch { try? await database.close(); throw error }
+        } catch {
+            try? await database.close()
+            throw error
+        }
+
         let reopened = try await fixture.open()
         do {
+            let pendingDeletions = try await reopened.pendingConversationSpaceDeletions(
+                authority: fixture.owner
+            )
+            XCTAssertEqual(pendingDeletions, [deletion])
             try await reopened.finishConversationSpaceDeletion(deletion, now: delayed)
-            let fanout = try await reopened.pendingNotificationFanout()
-            XCTAssertEqual(fanout.count, 2)
-            for event in fanout {
-                let destination = try await reopened.currentSpaceDeletionDeliveryRegistration(for: event, now: delayed)
-                XCTAssertEqual(destination?.serviceIdentity, fixture.service(for: event.endpoint))
-            }
-            let originalExpiry = try await reopened.connection.query("SELECT expires_at FROM permissioned_space_notification_registrations WHERE space_uri = ? AND endpoint = ?", [.text(fixture.space.rawValue), .text(fixture.endpoint)])
-            XCTAssertEqual(originalExpiry.first?.column("expires_at")?.integer, 300_000_000, "a terminal obligation must never synthesize a renewed registration")
-            let firstLease = try await reopened.leaseNextNotificationFanout(now: delayed, leaseDuration: 30)
-            let first = try XCTUnwrap(firstLease)
-            let failed = try await reopened.failNotificationFanoutLease(eventID: first.event.id, token: first.token, retryAt: delayed.addingTimeInterval(1))
-            XCTAssertEqual(failed, 1)
-            let retryDestination = try await reopened.currentSpaceDeletionDeliveryRegistration(for: first.event, now: delayed.addingTimeInterval(1))
-            XCTAssertNotNil(retryDestination)
-            let secondLease = try await reopened.leaseNextNotificationFanout(now: delayed, leaseDuration: 30)
-            let second = try XCTUnwrap(secondLease)
-            let firstAcknowledged = try await reopened.completeNotificationFanoutLease(eventID: second.event.id, token: second.token)
-            XCTAssertTrue(firstAcknowledged)
-            let retained = try await reopened.connection.query("SELECT 1 FROM conversation_space_deletion_recipients WHERE space_uri = ?", [.text(fixture.space.rawValue)])
-            XCTAssertEqual(retained.count, 2, "partial completion retains the immutable recipient snapshot")
-            // Retries stop once that recipient's registration has expired:
-            // the transport treats a nil registration as a delivered no-op.
-            let retriedLease = try await reopened.leaseNextNotificationFanout(now: lapsed, leaseDuration: 30)
-            let retried = try XCTUnwrap(retriedLease)
-            XCTAssertEqual(retried.event.id, first.event.id)
-            let expiredDestination = try await reopened.currentSpaceDeletionDeliveryRegistration(for: retried.event, now: lapsed)
-            XCTAssertNil(expiredDestination, "an expired registration is no longer owed the deletion")
-            let finalAcknowledged = try await reopened.completeNotificationFanoutLease(eventID: retried.event.id, token: retried.token)
-            XCTAssertTrue(finalAcknowledged)
-            let drained = try await reopened.connection.query("SELECT 1 FROM conversation_space_deletion_recipients WHERE space_uri = ?", [.text(fixture.space.rawValue)])
-            let registrations = try await reopened.connection.query("SELECT 1 FROM permissioned_space_notification_registrations WHERE space_uri = ?", [.text(fixture.space.rawValue)])
-            XCTAssertTrue(drained.isEmpty)
+            let fanout = try await reopened.pendingSpaceSyncNotifications()
+            XCTAssertEqual(fanout.count, 3)
+            XCTAssertTrue(fanout.allSatisfy { $0.kind == .spaceDeleted })
+            XCTAssertEqual(
+                Set(fanout.map(\.token)),
+                ["active-token", "second-token", "lapsed-token"]
+            )
+            let registrations = try await reopened.connection.query(
+                "SELECT 1 FROM permissioned_space_sync_registrations WHERE space_uri = ?",
+                [.text(fixture.space.rawValue)]
+            )
             XCTAssertTrue(registrations.isEmpty)
-            try await reopened.finishConversationSpaceDeletion(deletion, now: delayed.addingTimeInterval(2))
-            let noDuplicate = try await reopened.pendingNotificationFanout()
-            XCTAssertTrue(noDuplicate.isEmpty)
+            var delivered = 0
+            while let lease = try await reopened.leaseNextSpaceSyncNotification(
+                now: delayed,
+                leaseDuration: 30
+            ) {
+                let completed = try await reopened.completeSpaceSyncNotificationLease(
+                    eventID: lease.event.id,
+                    token: lease.token
+                )
+                XCTAssertTrue(completed)
+                delivered += 1
+            }
+            XCTAssertEqual(delivered, 3)
+            try await reopened.finishConversationSpaceDeletion(
+                deletion,
+                now: delayed.addingTimeInterval(2)
+            )
+            let remaining = try await reopened.pendingSpaceSyncNotifications()
+            XCTAssertTrue(remaining.isEmpty)
             try await reopened.close()
-        } catch { try? await reopened.close(); throw error }
+        } catch {
+            try? await reopened.close()
+            throw error
+        }
     }
 
     func testFailedPendingBatchRotatesSoLaterGenerationCannotStarve() async throws {
@@ -235,48 +267,6 @@ final class ConversationSpaceAuthorityStoreTests: XCTestCase {
         } catch { try? await database.close(); throw error }
     }
 
-    func testRegistrationForeignKeyMigrationPreservesAuthenticatedSimpleSpaceRecipients() async throws {
-        let fixture = try ConversationAuthorityFixture()
-        let database = try await fixture.open()
-        let simple = try SpaceURI(authority: fixture.owner, spaceType: "app.bsky.bookmarks", skey: "existing")
-        do {
-            _ = try await database.createSimpleSpace(space: simple, owner: fixture.owner, configuration: .init(), authorization: fixture.ownerAuthorization, now: fixture.now)
-            // Reconstruct the prior authenticated schema, which excluded all
-            // non-simple authority kinds through its foreign key.
-            _ = try await database.connection.query("ALTER TABLE permissioned_space_notification_registrations RENAME TO registration_before_fixture")
-            _ = try await database.connection.query("""
-                CREATE TABLE permissioned_space_notification_registrations (
-                    space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
-                    endpoint TEXT NOT NULL, repo_did TEXT, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-                    owner_service_did TEXT NOT NULL, delivery_service_did TEXT, PRIMARY KEY(space_uri, endpoint))
-                """)
-            // A row the earlier binary wrote into that schema. Current code
-            // writes the v27 service-keyed shape, so insert it directly.
-            _ = try await database.connection.query("""
-                INSERT INTO permissioned_space_notification_registrations
-                    (space_uri, endpoint, repo_did, expires_at, updated_at, owner_service_did, delivery_service_did)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, [.text(simple.rawValue), .text(fixture.endpoint), .text(fixture.writer),
-                      .integer(Int(fixture.now.addingTimeInterval(3600).timeIntervalSince1970 * 1_000_000)),
-                      .integer(Int(fixture.now.timeIntervalSince1970 * 1_000_000)),
-                      .text(fixture.service), .text(fixture.service)])
-            try await database.close()
-        } catch { try? await database.close(); throw error }
-        let reopened = try await fixture.open()
-        do {
-            let rows = try await reopened.connection.query("SELECT owner_service_did, delivery_service_did, repo_did, service_key FROM permissioned_space_notification_registrations WHERE space_uri = ?", [.text(simple.rawValue)])
-            XCTAssertEqual(rows.count, 1)
-            XCTAssertEqual(rows.first?.column("service_key")?.string, fixture.service, "v27 re-keys the preserved row by service")
-            XCTAssertEqual(rows.first?.column("owner_service_did")?.string, fixture.service)
-            XCTAssertEqual(rows.first?.column("delivery_service_did")?.string, fixture.service)
-            XCTAssertEqual(rows.first?.column("repo_did")?.string, fixture.writer)
-            let foreignKeys = try await reopened.connection.query("PRAGMA foreign_key_list(permissioned_space_notification_registrations)")
-            XCTAssertTrue(foreignKeys.isEmpty)
-            try await reopened.registerKnownConversationSpace(space: fixture.space, now: fixture.now)
-            try await fixture.register(on: reopened, endpoint: fixture.endpoint, repository: nil)
-            try await reopened.close()
-        } catch { try? await reopened.close(); throw error }
-    }
 }
 
 private struct ConversationAuthorityFixture {
@@ -284,7 +274,6 @@ private struct ConversationAuthorityFixture {
     let owner = "did:plc:alice"
     let writer = "did:plc:bob"
     let endpoint = "https://notify.example/events"
-    let service = "did:web:notify.example#atproto_pds"
     let now = Date()
     let space: SpaceURI
     init() throws {
@@ -296,16 +285,22 @@ private struct ConversationAuthorityFixture {
         .spaceCredential(.init(subject: writer, space: space, permissions: [.read], expiresAt: now.addingTimeInterval(3600)))
     }
     func open() async throws -> SQLiteAccountDatabase { try await SQLiteAccountDatabase(dataDirectory: root, did: owner) }
-    /// One service per endpoint host: registrations are keyed by service
-    /// identity (SWAN-SYNC-4), so each endpoint here names its own service.
-    func service(for endpoint: String) -> String {
-        "did:web:\(URL(string: endpoint)?.host ?? "invalid.example")#atproto_pds"
+    func token(for endpoint: String) -> String {
+        URL(string: endpoint)?.host ?? endpoint
     }
-    func register(on database: SQLiteAccountDatabase, endpoint: String, repository: String?) async throws {
-        let service = service(for: endpoint)
-        try await database.registerSpaceNotification(.init(space: space, endpoint: endpoint, repository: repository,
-            expiresAt: now.addingTimeInterval(3600), ownerServiceDID: service, deliveryServiceDID: service),
-            authorization: credential, now: now)
+    func register(
+        on database: SQLiteAccountDatabase,
+        endpoint: String,
+        repository _: String?
+    ) async throws {
+        try await database.putSpaceSyncRegistration(
+            .init(
+                space: space,
+                endpoint: endpoint,
+                token: token(for: endpoint),
+                expiresAt: now.addingTimeInterval(3_600)
+            )
+        )
     }
     func notification() throws -> AuthorizedSpaceWriteNotification {
         let revision = try TID(tidString: "2222222222223").toString()

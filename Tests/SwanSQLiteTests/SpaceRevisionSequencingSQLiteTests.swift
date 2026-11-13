@@ -9,7 +9,7 @@ import XCTest
 
 /// atproto#5574 space-host sequencing: the space host alone assigns a
 /// strictly increasing `spaceRev` to each accepted writer update, forwards it
-/// with the preceding one, and pages `listRepos` by it.
+/// with the preceding one, and pages `listWriters` by it.
 final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_790_000_000)
 
@@ -36,7 +36,7 @@ final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
 
         // One forward per accepted update, chained: the first omits
         // prevSpaceRev and each later one names its predecessor.
-        let forwards = try await database.pendingNotificationFanout()
+        let forwards = try await database.pendingSpaceSyncNotifications()
             .sorted { ($0.spaceRevision ?? "") < ($1.spaceRevision ?? "") }
         XCTAssertEqual(forwards.count, 3)
         let revisions = forwards.compactMap(\.spaceRevision)
@@ -68,7 +68,7 @@ final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
             fixture.write(fixture.bob, event: "b2", revision: 2), now: now
         )
         let before = try await fixture.list(database)
-        let forwardsBefore = try await database.pendingNotificationFanout().count
+        let forwardsBefore = try await database.pendingSpaceSyncNotifications().count
 
         // An older revision and the same revision under a fresh event ID.
         try await database.receiveSpaceWriteNotification(
@@ -79,7 +79,7 @@ final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
         )
         let after = try await fixture.list(database)
         XCTAssertEqual(after, before, "no new space revision for a repoRev <= the last accepted")
-        let forwardsAfter = try await database.pendingNotificationFanout().count
+        let forwardsAfter = try await database.pendingSpaceSyncNotifications().count
         XCTAssertEqual(forwardsAfter, forwardsBefore, "ignored updates are never forwarded")
     }
 
@@ -255,7 +255,7 @@ final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
 
         let listed = try await fixture.list(database)
         XCTAssertEqual(listed.map(\.repository), [fixture.authority])
-        let forwards = try await database.pendingNotificationFanout()
+        let forwards = try await database.pendingSpaceSyncNotifications()
         XCTAssertEqual(forwards.count, 1)
         XCTAssertEqual(forwards.first?.spaceRevision, listed.first?.spaceRevision)
         XCTAssertNil(forwards.first?.previousSpaceRevision)
@@ -279,7 +279,7 @@ final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
         try await database.receiveSpaceWriteNotification(selfAnnouncement)
         let afterSelf = try await fixture.list(database)
         XCTAssertEqual(afterSelf, listed)
-        let forwardsAfterSelf = try await database.pendingNotificationFanout()
+        let forwardsAfterSelf = try await database.pendingSpaceSyncNotifications()
         XCTAssertEqual(forwardsAfterSelf.count, 1)
     }
 
@@ -492,17 +492,13 @@ private struct SequencingFixture {
     }
 
     func registerService(on database: SQLiteAccountDatabase, now: Date) async throws {
-        try await database.registerSpaceNotification(
+        try await database.putSpaceSyncRegistration(
             .init(
                 space: space,
                 endpoint: "https://syncer.example",
-                repository: nil,
-                expiresAt: now.addingTimeInterval(3_600),
-                service: "did:web:syncer.example#atproto_space_syncer"
-            ),
-            serviceDID: "did:web:syncer.example",
-            authorization: readCredential,
-            now: now
+                token: "sync-token",
+                expiresAt: now.addingTimeInterval(3_600)
+            )
         )
     }
 

@@ -894,13 +894,10 @@ private actor IncrementalTransport {
                     from: body
                 ).commit
             } else {
-                guard let value = try JSONDecoder().decode(
+                commit = try JSONDecoder().decode(
                     ComAtprotoSpaceListRepoOps.Output.self,
                     from: body
-                ).commit else {
-                    throw SpaceMACHeaders.HeaderError.invalidSpaceMAC
-                }
-                commit = value
+                ).commit
             }
             let secret = try SpaceMACKeyAgreement.receive(
                 authorPrivateKey: HTTPIncrementalFixture.kemKey(),

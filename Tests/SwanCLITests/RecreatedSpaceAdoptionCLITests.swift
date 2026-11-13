@@ -1,11 +1,12 @@
 import Crypto
 import Foundation
 import Petrel
+import SQLiteNIO
 import SwanAccounts
 import SwanCore
 import SwanOAuth
 import SwanSpaces
-import SwanSQLite
+@testable import SwanSQLite
 import SwanStorage
 import XCTest
 
@@ -179,10 +180,19 @@ final class RecreatedSpaceAdoptionCLITests: XCTestCase {
                 wireRevision: try TID(tidString: "2222222222222"),
                 writes: [.put(uri: uri, value: value, cid: CID.fromDAGCBOR(value).string)]
             )
-            try await database.receiveSpaceDeletionNotification(
-                space: space, issuer: space.authority, audience: receiver, eventID: "deletion-1",
-                requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: space),
-                now: Date().addingTimeInterval(-600)
+            let closedAt = Date().addingTimeInterval(-600)
+            _ = try await database.connection.query(
+                """
+                INSERT INTO permissioned_space_recipient_tombstones(
+                    space_uri, authority_did, deletion_event_id, closed_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [
+                    .text(space.rawValue),
+                    .text(space.authority),
+                    .text("deletion-1"),
+                    .integer(Int(closedAt.timeIntervalSince1970 * 1_000_000)),
+                ]
             )
             try await database.close()
         } catch {

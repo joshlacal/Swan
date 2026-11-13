@@ -390,13 +390,9 @@ private actor MACResponseTransport {
                 ComAtprotoSpaceGetLatestCommit.Output(commit: commit)
             )
         } else {
-            body = try JSONEncoder().encode(
-                ComAtprotoSpaceListRepoOps.Output(
-                    ops: [],
-                    commit: nil,
-                    cursor: nil
-                )
-            )
+            // Deliberately malformed Nov-12 response: every page requires a
+            // commit, so construct raw JSON instead of the non-optional model.
+            body = Data(#"{"ops":[]}"#.utf8)
         }
         return .init(
             status: 200,
