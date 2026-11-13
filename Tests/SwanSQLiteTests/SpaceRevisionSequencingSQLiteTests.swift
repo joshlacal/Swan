@@ -368,59 +368,146 @@ final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
         let v29 = try await SQLiteConnection.open(storage: .file(path: path))
         do {
             _ = try await v29.query(
-                """
-                CREATE TABLE permissioned_space_notification_registrations (
-                    space_uri TEXT NOT NULL,
-                    service_key TEXT NOT NULL,
-                    endpoint TEXT NOT NULL,
-                    repo_did TEXT,
-                    expires_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    owner_service_did TEXT,
-                    delivery_service_did TEXT
-                )
-                """
-            )
-            _ = try await v29.query(
-                """
-                INSERT INTO permissioned_space_notification_registrations(
-                    space_uri, service_key, endpoint, repo_did, expires_at, updated_at,
-                    owner_service_did, delivery_service_did
-                ) VALUES (?, ?, ?, NULL, ?, ?, ?, NULL)
-                """,
-                [
-                    .text(fixture.space.rawValue),
-                    .text("endpoint:https://retired.example"),
-                    .text("https://retired.example"),
-                    .integer(2_000_000),
-                    .integer(1_000_000),
-                    .text(fixture.authority),
-                ]
-            )
-            for table in [
-                "permissioned_space_notification_fanout",
-                "conversation_space_deletion_recipients",
-            ] {
-                _ = try await v29.query("CREATE TABLE \(table) (id TEXT NOT NULL)")
-                _ = try await v29.query("INSERT INTO \(table)(id) VALUES ('retired-row')")
-            }
-            for table in [
-                "permissioned_space_notification_registrations",
-                "permissioned_space_notification_fanout",
-                "conversation_space_deletion_recipients",
-            ] {
-                let rows = try await v29.query("SELECT COUNT(*) AS count FROM \(table)")
-                XCTAssertEqual(rows.first?.column("count")?.integer, 1)
-            }
-            _ = try await v29.query(
                 "DELETE FROM permissioned_repository_migrations WHERE version = 30"
             )
             _ = try await v29.query(
                 "ALTER TABLE permissioned_space_writers DROP COLUMN removed_at"
             )
             _ = try await v29.query(
+                "DROP TABLE permissioned_space_sync_notifications"
+            )
+            _ = try await v29.query(
                 "DROP TABLE permissioned_space_sync_registrations"
             )
+            _ = try await v29.query(
+                """
+                CREATE TABLE permissioned_space_notification_registrations (
+                    space_uri TEXT NOT NULL REFERENCES
+                        permissioned_simple_space_authorities(space_uri)
+                        ON DELETE CASCADE,
+                    endpoint TEXT NOT NULL,
+                    repo_did TEXT,
+                    expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+                    updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+                    owner_service_did TEXT NOT NULL,
+                    delivery_service_did TEXT,
+                    PRIMARY KEY(space_uri, endpoint),
+                    CHECK(length(endpoint) > 0)
+                )
+                """
+            )
+            _ = try await v29.query(
+                """
+                CREATE TABLE permissioned_space_notification_fanout (
+                    id TEXT PRIMARY KEY,
+                    source_issuer TEXT NOT NULL,
+                    source_event_id TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK(kind IN ('write', 'deleted')),
+                    space_uri TEXT NOT NULL,
+                    repo_did TEXT,
+                    wire_revision TEXT,
+                    commitment BLOB,
+                    endpoint TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                    available_at INTEGER NOT NULL CHECK(available_at >= 0),
+                    lease_token TEXT,
+                    lease_expires_at INTEGER,
+                    UNIQUE(source_issuer, source_event_id, kind, endpoint),
+                    CHECK(
+                        (kind = 'write' AND repo_did IS NOT NULL
+                            AND wire_revision IS NOT NULL
+                            AND commitment IS NOT NULL
+                            AND length(commitment) = 32)
+                        OR (kind = 'deleted' AND repo_did IS NULL
+                            AND wire_revision IS NULL AND commitment IS NULL)
+                    ),
+                    CHECK(
+                        (lease_token IS NULL AND lease_expires_at IS NULL)
+                        OR (lease_token IS NOT NULL
+                            AND lease_expires_at IS NOT NULL
+                            AND lease_expires_at >= 0)
+                    )
+                )
+                """
+            )
+            _ = try await v29.query(
+                """
+                CREATE TABLE conversation_space_deletion_recipients (
+                    space_uri TEXT NOT NULL REFERENCES
+                        conversation_space_authorities(space_uri)
+                        ON DELETE CASCADE,
+                    deletion_event_id TEXT NOT NULL,
+                    endpoint TEXT NOT NULL,
+                    owner_service_did TEXT NOT NULL,
+                    delivery_service_did TEXT,
+                    registration_expires_at INTEGER NOT NULL
+                        CHECK(registration_expires_at >= 0),
+                    PRIMARY KEY(space_uri, endpoint),
+                    CHECK(length(endpoint) > 0)
+                )
+                """
+            )
+            _ = try await v29.query(
+                """
+                INSERT INTO permissioned_space_notification_registrations(
+                    space_uri, endpoint, repo_did, expires_at, updated_at,
+                    owner_service_did, delivery_service_did
+                ) VALUES (?, 'https://retired.example', NULL, 2000000, 1000000,
+                          ?, NULL)
+                """,
+                [.text(fixture.space.rawValue), .text(fixture.authority)]
+            )
+            _ = try await v29.query(
+                """
+                INSERT INTO permissioned_space_notification_fanout(
+                    id, source_issuer, source_event_id, kind, space_uri,
+                    repo_did, wire_revision, commitment, endpoint, attempts,
+                    created_at, available_at, lease_token, lease_expires_at
+                ) VALUES (
+                    'retired-fanout', ?, 'retired-event', 'write', ?, ?,
+                    '2222222222223', ?, 'https://retired.example', 0,
+                    1000000, 1000000, NULL, NULL
+                )
+                """,
+                [
+                    .text(fixture.bob),
+                    .text(fixture.space.rawValue),
+                    .text(fixture.bob),
+                    .blob(ByteBuffer(bytes: [UInt8](repeating: 7, count: 32))),
+                ]
+            )
+            _ = try await v29.query(
+                """
+                INSERT INTO conversation_space_authorities(
+                    space_uri, authority_did, generation, state,
+                    deletion_event_id, deletion_started_at, created_at, updated_at
+                ) VALUES (?, ?, '1', 'deleted', 'retired-deletion', 1, 1, 1)
+                """,
+                [.text(fixture.space.rawValue), .text(fixture.authority)]
+            )
+            _ = try await v29.query(
+                """
+                INSERT INTO conversation_space_deletion_recipients(
+                    space_uri, deletion_event_id, endpoint, owner_service_did,
+                    delivery_service_did, registration_expires_at
+                ) VALUES (
+                    ?, 'retired-deletion', 'https://retired.example', ?, NULL,
+                    2000000
+                )
+                """,
+                [.text(fixture.space.rawValue), .text(fixture.authority)]
+            )
+            for table in [
+                "permissioned_space_notification_registrations",
+                "permissioned_space_notification_fanout",
+                "conversation_space_deletion_recipients",
+            ] {
+                let rows = try await v29.query(
+                    "SELECT COUNT(*) AS count FROM \(table)"
+                )
+                XCTAssertEqual(rows.first?.column("count")?.integer, 1)
+            }
             try await v29.close()
         } catch {
             try? await v29.close()
