@@ -1,44 +1,71 @@
 import Foundation
 import Hummingbird
 import HTTPTypes
-import PetrelCrypto
 import SwanOAuth
-import SwanSpaces
 
-/// Called only after route authentication. Credential reads require a MAC
-/// exchange even on pages which do not carry a terminal commit. Owner OAuth
-/// reads can opt in without changing their existing authorization policy.
-func spaceResponseMACSecret(
+struct SpaceResponseMACContext: Sendable {
+    let request: SpaceMACHeaders.Request
+    let sharedSecret: Data
+}
+
+/// Called only after route authentication. Credential reads require their
+/// profile's request; owner OAuth reads may opt in. Other tags are ignored.
+func spaceResponseMACRequest(
     request: Request,
     author: String,
-    type: SpaceMACHeaders.MACType,
+    profile: SpaceMACHeaders.Profile,
     provider: (any SpaceRepositoryCommitSigner)?
-) async throws -> Data? {
+) async throws -> SpaceResponseMACContext? {
     let values = request.headers[values: HTTPField.Name(SpaceMACHeaders.requestHeader)!]
     let credentialRead = try spaceCredentialSchemeToken(from: request.headers) != nil
-    guard !values.isEmpty || credentialRead else { return nil }
-    guard values.count == 1, let provider else { throw SpaceMACHeaders.HeaderError.badSpaceMAC }
     do {
-        let wanted = try SpaceMACHeaders.parseWantMAC(values[0], type: type)
-        return try await provider.sharedSecret(author: author, keyShare: wanted.keyShare)
+        guard let requested = try SpaceMACHeaders.parseRequest(values, profile: profile) else {
+            if credentialRead { throw SpaceMACHeaders.HeaderError.invalidSpaceMAC }
+            return nil
+        }
+        guard let provider else { throw SpaceMACHeaders.HeaderError.invalidSpaceMAC }
+        return try await SpaceResponseMACContext(
+            request: requested,
+            sharedSecret: provider.sharedSecret(author: author, keyID: requested.keyID)
+        )
     } catch {
-        throw SpaceMACHeaders.HeaderError.badSpaceMAC
+        throw SpaceMACHeaders.HeaderError.invalidSpaceMAC
     }
 }
 
 func withSpaceResponseMAC(
     _ response: Response,
-    mac: Data?,
-    type: SpaceMACHeaders.MACType
-) throws -> Response {
+    headers mac: SpaceMACHeaders.ResponseHeaders?
+) -> Response {
     var response = response
-    let vary = HTTPField.Name("Vary")!
-    let existing = response.headers[vary].map { $0 + ", " } ?? ""
-    response.headers[vary] = existing + SpaceMACHeaders.requestHeader
+    appendHeader(SpaceMACHeaders.requestHeader, named: "Vary", to: &response.headers)
     if let mac {
-        response.headers[HTTPField.Name(SpaceMACHeaders.responseHeader)!] =
-            try SpaceMACHeaders.formatMAC(mac, type: type)
+        response.headers[HTTPField.Name(mac.coveredHeaderName)!] = mac.coveredHeaderValue
+        response.headers[HTTPField.Name(SpaceMACHeaders.signatureInputHeader)!] = mac.signatureInput
+        response.headers[HTTPField.Name(SpaceMACHeaders.signatureHeader)!] = mac.signature
+        for name in [
+            mac.coveredHeaderName,
+            SpaceMACHeaders.signatureInputHeader,
+            SpaceMACHeaders.signatureHeader,
+        ] {
+            appendHeader(name, named: "Access-Control-Expose-Headers", to: &response.headers)
+        }
     }
-    response.headers[.accessControlExposeHeaders] = "DPoP-Nonce, WWW-Authenticate, Atproto-Space-Mac"
     return response
+}
+
+private func appendHeader(
+    _ value: String,
+    named name: String,
+    to headers: inout HTTPFields
+) {
+    let field = HTTPField.Name(name)!
+    var values = headers[field]?
+        .split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespaces) } ?? []
+    guard !values.contains(where: { $0.caseInsensitiveCompare(value) == .orderedSame }) else {
+        return
+    }
+    values.append(value)
+    headers[field] = values.joined(separator: ", ")
 }

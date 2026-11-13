@@ -1656,10 +1656,8 @@ func oauthMetadataCORSHeaders(_ headers: inout HTTPFields) {
 }
 
 /// The exposed pair matches upstream's OAuth provider, which exposes only
-/// `DPoP-Nonce` and `WWW-Authenticate` on these routes. They never carry
-/// `Atproto-Space-Mac`. The MAC-bearing Spaces responses expose that header
-/// themselves (`withSpaceResponseMAC`), as upstream's `getSpaceMacSecret`
-/// does.
+/// `DPoP-Nonce` and `WWW-Authenticate` on these routes. Spaces query responses
+/// use `SwanCORS` to expose their RFC 9421 signature fields separately.
 func oauthAPICORSHeaders(_ headers: inout HTTPFields) {
     headers[HTTPField.Name("Access-Control-Allow-Origin")!] = "*"
     headers[HTTPField.Name("Access-Control-Allow-Methods")!] = "POST, OPTIONS"

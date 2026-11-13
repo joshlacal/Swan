@@ -23,9 +23,6 @@ public struct SpaceRepositoryCommit: Sendable, Equatable, Codable {
         self.data = data
     }
 
-    public func mac(sharedSecret: Data) throws -> Data {
-        try SpaceMAC.commit(sharedSecret: sharedSecret, space: space.rawValue, repo: repo, rev: rev, data: data)
-    }
 
     private enum CodingKeys: String, CodingKey { case ver, repo, space, rev, data }
     private enum BytesKey: String, CodingKey { case bytes = "$bytes" }

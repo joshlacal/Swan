@@ -62,7 +62,7 @@ private struct AuthenticatedGetRepoHandler:
     struct PreparedResponse: Sendable {
         let prefix: Data
         let spool: SpaceSTARBodySpool
-        let mac: Data?
+        let mac: SpaceMACHeaders.ResponseHeaders?
     }
 
     func prepare(parameters: ComAtprotoSpaceGetRepo.Parameters, context request: Request) async throws -> PreparedResponse {
@@ -72,8 +72,8 @@ private struct AuthenticatedGetRepoHandler:
             expectedAudience: target.author, fixedPath: "/xrpc/com.atproto.space.getRepo"
         )
         try requireRepositoryReadAuthorization(authorization, author: target.author)
-        let secret = try await spaceResponseMACSecret(
-            request: request, author: target.author, type: .repository, provider: capability.commitSigner
+        let macContext = try await spaceResponseMACRequest(
+            request: request, author: target.author, profile: .commit, provider: capability.commitSigner
         )
         guard let snapshot = try await capability.directory.repositorySTARSnapshot(
             space: target.space, author: target.author, authorization: authorization
@@ -85,8 +85,15 @@ private struct AuthenticatedGetRepoHandler:
             }
             let commit = try SpaceRepositoryCommit(repo: target.author, space: target.space,
                                                    rev: revision, data: snapshot.state.commitment)
-            return PreparedResponse(prefix: try SpaceSTARCodec.prefix(commit: commit),
-                                    spool: snapshot.spool, mac: try secret.map { try commit.mac(sharedSecret: $0) })
+            return PreparedResponse(
+                prefix: try SpaceSTARCodec.prefix(commit: commit),
+                spool: snapshot.spool,
+                mac: try macContext.map {
+                    try SpaceMACHeaders.commitResponse(
+                        commit, request: $0.request, sharedSecret: $0.sharedSecret
+                    )
+                }
+            )
         } catch { snapshot.spool.cleanup(); throw error }
     }
 
@@ -485,12 +492,19 @@ func registerAuthenticatedGetLatestCommitEndpoint(
             }
             do {
                 let output = try await handler.handle(parameters: parameters, input: (), context: request)
-                let secret = try await spaceResponseMACSecret(
-                    request: request, author: parameters.repo.didString(), type: .repository,
+                let macContext = try await spaceResponseMACRequest(
+                    request: request, author: parameters.repo.didString(), profile: .commit,
                     provider: capability.commitSigner
                 )
-                let mac = try secret.map { try responseCommit(output.commit).mac(sharedSecret: $0) }
-                return try withSpaceResponseMAC(authenticatedGetLatestCommitJSON(.ok, output), mac: mac, type: .repository)
+                let commit = try responseCommit(output.commit)
+                let mac = try macContext.map {
+                    try SpaceMACHeaders.commitResponse(
+                        commit, request: $0.request, sharedSecret: $0.sharedSecret
+                    )
+                }
+                return withSpaceResponseMAC(
+                    authenticatedGetLatestCommitJSON(.ok, output), headers: mac
+                )
             } catch is SpaceMACHeaders.HeaderError {
                 return authenticatedRepositorySyncError(.badRequest, code: "InvalidSpaceMac")
             } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
@@ -526,14 +540,25 @@ func registerAuthenticatedListRepoOpsEndpoint(
         }
         do {
             let output = try await handler.handle(parameters: parameters, input: (), context: request)
-            let secret = try await spaceResponseMACSecret(
-                request: request, author: parameters.repo.didString(), type: .repository,
+            let macContext = try await spaceResponseMACRequest(
+                request: request, author: parameters.repo.didString(), profile: .commit,
                 provider: capability.commitSigner
             )
-            let mac: Data?
-            if let secret, let commit = output.commit { mac = try responseCommit(commit).mac(sharedSecret: secret) }
-            else { mac = nil }
-            return try withSpaceResponseMAC(authenticatedListRepoOpsJSON(.ok, output, lease: lease), mac: mac, type: .repository)
+            let mac: SpaceMACHeaders.ResponseHeaders?
+            if let macContext, let commit = output.commit {
+                mac = try SpaceMACHeaders.commitResponse(
+                    responseCommit(commit),
+                    request: macContext.request,
+                    sharedSecret: macContext.sharedSecret
+                )
+            } else if macContext != nil {
+                throw SpaceMACHeaders.HeaderError.invalidSpaceMAC
+            } else {
+                mac = nil
+            }
+            return withSpaceResponseMAC(
+                authenticatedListRepoOpsJSON(.ok, output, lease: lease), headers: mac
+            )
         } catch is SpaceMACHeaders.HeaderError {
             lease.release()
             return authenticatedRepositorySyncError(.badRequest, code: "InvalidSpaceMac")
@@ -565,7 +590,7 @@ func registerAuthenticatedGetRepoEndpoint(
             let prepared = try await handler.prepare(parameters: parameters, context: request)
             // No content length is supplied: writing directly from the private
             // spool is the deliberate bounded-memory transport contract.
-            return try withSpaceResponseMAC(Response(
+            return withSpaceResponseMAC(Response(
                 status: .ok,
                 headers: [
                     .contentType: SpaceSTARCodec.mediaType,
@@ -579,7 +604,7 @@ func registerAuthenticatedGetRepoEndpoint(
                     }
                     try await writer.finish(nil)
                 }
-            ), mac: prepared.mac, type: .repository)
+            ), headers: prepared.mac)
         } catch is SpaceMACHeaders.HeaderError {
             return authenticatedRepositorySyncError(.badRequest, code: "InvalidSpaceMac")
         } catch let failure as AuthenticatedSpaceRepositorySyncFailure {

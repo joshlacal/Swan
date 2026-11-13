@@ -681,14 +681,21 @@ func registerAuthenticatedGetRecordEndpoint(
         }
         do {
             let output = try await handler.handle(parameters: parameters, input: (), context: request)
-            let secret = try await spaceResponseMACSecret(
-                request: request, author: parameters.repo.didString(), type: .record,
+            let macContext = try await spaceResponseMACRequest(
+                request: request, author: parameters.repo.didString(), profile: .record,
                 provider: capability.macProvider
             )
-            let mac = try secret.map {
-                try SpaceMAC.record(sharedSecret: $0, uri: output.uri.uriString(), cid: output.cid.bytes)
+            let mac = try macContext.map {
+                try SpaceMACHeaders.recordResponse(
+                    uri: output.uri.uriString(),
+                    cid: output.cid.string,
+                    request: $0.request,
+                    sharedSecret: $0.sharedSecret
+                )
             }
-            return try withSpaceResponseMAC(authenticatedGetRecordJSON(.ok, output, lease: lease), mac: mac, type: .record)
+            return withSpaceResponseMAC(
+                authenticatedGetRecordJSON(.ok, output, lease: lease), headers: mac
+            )
         } catch is SpaceMACHeaders.HeaderError {
             lease.release()
             return authenticatedSpaceRecordError(.badRequest, code: "InvalidSpaceMac")

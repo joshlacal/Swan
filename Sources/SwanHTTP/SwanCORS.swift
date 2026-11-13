@@ -1,6 +1,7 @@
 import Foundation
 import HTTPTypes
 import Hummingbird
+import SwanOAuth
 
 /// Cross-Origin Resource Sharing for the public listener.
 ///
@@ -43,20 +44,19 @@ struct SwanCORSMiddleware<Context: RequestContext>: RouterMiddleware {
 
     /// Headers a browser may read off an actual (non-preflight) response.
     ///
-    /// The CORS-safelisted response headers are readable without this; these
-    /// two are not, and both carry protocol-critical values. `DPoP-Nonce`
-    /// drives the OAuth nonce handshake — a browser client that cannot read it
-    /// can never satisfy the retry — and `WWW-Authenticate` carries the
-    /// challenge. Swan's OAuth routes already declare exactly this pair
-    /// (`oauthAPICORSHeaders`); hoisting it here extends the same decision to
-    /// the XRPC surface rather than making a new one.
-    ///
-    /// `Atproto-Space-Mac` is deliberately absent. Only the four MAC-bearing
-    /// Spaces methods emit it, and they expose it on their own responses
-    /// (`withSpaceResponseMAC`), as upstream's `getSpaceMacSecret` does.
-    /// `decorate` leaves that route-level declaration in place.
+    /// `DPoP-Nonce` drives the OAuth nonce handshake and
+    /// `WWW-Authenticate` carries its challenge. The four Spaces MAC headers
+    /// expose the RFC 9421 signature and either structured commit or record
+    /// header; absent headers reveal nothing on routes that do not emit them.
     private static var exposedHeaders: String {
-        "DPoP-Nonce, WWW-Authenticate"
+        [
+            "DPoP-Nonce",
+            "WWW-Authenticate",
+            SpaceMACHeaders.commitHeader,
+            SpaceMACHeaders.recordHeader,
+            SpaceMACHeaders.signatureInputHeader,
+            SpaceMACHeaders.signatureHeader,
+        ].joined(separator: ", ")
     }
 
     /// One day, matching upstream's `maxAge: DAY / SECOND`.
