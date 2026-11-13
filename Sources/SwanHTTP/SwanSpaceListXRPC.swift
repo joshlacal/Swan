@@ -41,7 +41,7 @@ private struct AuthenticatedListSpacesHandler {
         context request: Request
     ) async throws -> ListSpacesWireOutput {
         let spaceType = parameters.spaceType?.nsidString()
-        let authority = parameters.did?.didString()
+        let authority = parameters.spaceDid?.didString()
         let cursor: SpaceURI?
         do {
             cursor = try parameters.cursor.map(SpaceURI.init)
@@ -211,7 +211,7 @@ private func parseAuthenticatedListSpacesParameters(
             throw AuthenticatedSpaceListFailure.invalidCursor
         }
     }
-    return .init(spaceType: spaceType, did: did, limit: limit, cursor: cursor)
+    return .init(spaceDid: did, spaceType: spaceType, limit: limit, cursor: cursor)
 }
 
 private func authenticatedListSpacesResponse(

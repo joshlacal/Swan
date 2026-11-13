@@ -1172,7 +1172,7 @@ public struct SwanHTTPServer: Sendable {
                     on: router,
                     capability: authenticatedSpaceDelegationMinting
                 )
-            } else if descriptor.nsid == ComAtprotoSpaceGetSpaceCredential.typeIdentifier,
+            } else if descriptor.nsid == ComAtprotoSpaceAuthorizeSpaceSync.typeIdentifier,
                       let authenticatedSpaceCredentialExchange {
                 registerAuthenticatedAuthorizeSpaceSyncEndpoint(
                     on: router,
@@ -1233,27 +1233,27 @@ public struct SwanHTTPServer: Sendable {
                     on: router,
                     capability: authenticatedSpaceBlobs
                 )
-            } else if descriptor.nsid == "com.atproto.space.listWriters",
+            } else if descriptor.nsid == ComAtprotoSpaceListWriters.typeIdentifier,
                       let authenticatedSpaceNotifications {
                 registerAuthenticatedListSpaceWritersEndpoint(
                     on: router,
                     capability: authenticatedSpaceNotifications
                 )
-            } else if descriptor.nsid == SwanSpaceNotificationNSID.notifyRepoUpdate,
+            } else if descriptor.nsid == ComAtprotoSpaceNotifyRepoUpdate.typeIdentifier,
                       let authenticatedSpaceNotifications {
                 registerAuthenticatedNotifyRepoUpdateEndpoint(
                     on: router,
                     capability: authenticatedSpaceNotifications,
                     requestBodyAdmission: requestBodyAdmission
                 )
-            } else if descriptor.nsid == SwanSpaceNotificationNSID.notifyCredentialsRevoked,
+            } else if descriptor.nsid == ComAtprotoSpaceNotifyCredentialsRevoked.typeIdentifier,
                       let authenticatedSpaceNotifications {
                 registerAuthenticatedNotifyCredentialsRevokedEndpoint(
                     on: router,
                     capability: authenticatedSpaceNotifications,
                     requestBodyAdmission: requestBodyAdmission
                 )
-            } else if descriptor.nsid == "com.atproto.managedspace.checkAccess",
+            } else if descriptor.nsid == ComAtprotoManagedspaceCheckAccess.typeIdentifier,
                       let managedSpaceCheckAccess {
                 registerManagedSpaceCheckAccessEndpoint(
                     on: router,
@@ -1385,8 +1385,8 @@ public struct SwanHTTPServer: Sendable {
              "com.atproto.space.removeWriter",
              "com.atproto.space.exportSpaceMeta",
              "com.atproto.space.importSpaceMeta",
-             "com.atproto.memberspace.putMembers",
-             "com.atproto.memberspace.removeMembers",
+             ComAtprotoMemberspacePutMembers.typeIdentifier,
+             ComAtprotoMemberspaceRemoveMembers.typeIdentifier,
              "com.atproto.memberspace.listMembers":
             true
         default:

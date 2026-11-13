@@ -43,13 +43,6 @@ func withSpaceResponseMAC(
         response.headers[HTTPField.Name(mac.coveredHeaderName)!] = mac.coveredHeaderValue
         response.headers[HTTPField.Name(SpaceMACHeaders.signatureInputHeader)!] = mac.signatureInput
         response.headers[HTTPField.Name(SpaceMACHeaders.signatureHeader)!] = mac.signature
-        for name in [
-            mac.coveredHeaderName,
-            SpaceMACHeaders.signatureInputHeader,
-            SpaceMACHeaders.signatureHeader,
-        ] {
-            appendHeader(name, named: "Access-Control-Expose-Headers", to: &response.headers)
-        }
     }
     return response
 }

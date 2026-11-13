@@ -38,7 +38,7 @@ private struct ManagedSpaceCheckAccessOutput: Encodable {
     let write: Bool
 }
 
-private let managedSpaceCheckAccessNSID = "com.atproto.managedspace.checkAccess"
+private let managedSpaceCheckAccessNSID = ComAtprotoManagedspaceCheckAccess.typeIdentifier
 
 private struct ManagedSpaceCheckAccessHandler {
     let capability: SwanManagedSpaceCheckAccessCapability
@@ -74,7 +74,7 @@ func registerManagedSpaceCheckAccessEndpoint(
     capability: SwanManagedSpaceCheckAccessCapability
 ) {
     let handler = ManagedSpaceCheckAccessHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.managedspace.checkAccess"
+    let path = RouterPath("/xrpc/\(ComAtprotoManagedspaceCheckAccess.typeIdentifier)")
     router.get(path) { request, _ async -> Response in
         do {
             let parameters = try parseManagedSpaceCheckAccessParameters(request)

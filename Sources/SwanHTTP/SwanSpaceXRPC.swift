@@ -657,7 +657,7 @@ private func parseAuthenticatedListBlobsParameters(
         collection: "app.swan.records",
         rkey: "scope"
     )
-    return .init(space: space, repo: repo, since: nil, limit: limit, cursor: cursor)
+    return .init(space: space, repo: repo, limit: limit, cursor: cursor)
 }
 
 func registerAuthenticatedGetRecordEndpoint(
@@ -1534,7 +1534,6 @@ private func parseAuthenticatedListRecordsParameters(
         collection: collection,
         limit: limit,
         cursor: cursor,
-        reverse: nil,
         excludeValues: excludeValues
     )
 }

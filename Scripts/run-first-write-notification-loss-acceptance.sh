@@ -3,9 +3,9 @@ set -euo pipefail
 
 # Live acceptance for the AT Protocol permissioned-data "first-write discovery
 # liveness gap" (bluesky-social/proposals 0016, Swan Spaces Interoperability
-# Alpha): a brand-new writer whose very first notifyWrite to the space
+# Alpha): a brand-new writer whose very first notifyRepoUpdate to the space
 # authority is lost is never learned by the authority, so a sweep
-# (listRepos / writer set) can never discover them. The proposal's healing
+# (listWriters / writer set) can never discover them. The proposal's healing
 # story ("a later notification or sweep") presumes the authority already knows
 # the writer; an entirely unknown writer has no route into the writer set.
 #
@@ -32,9 +32,10 @@ set -euo pipefail
 #   E. Start the authority container and wait for its healthcheck.
 #   F. Sweep: read-only SQLite assertion that permissioned_space_writers has
 #      NO (space_uri, bob_did) row, plus an attempted protocol-level
-#      listRepos sweep (getDelegationToken -> getSpaceCredential -> listRepos)
-#      whose failure is recorded. The SQLite writer-set assertion is the
-#      authoritative witness because Swan's listRepos reads exactly that table.
+#      listWriters sweep (getDelegationToken -> authorizeSpaceSync with a
+#      notify registration -> listWriters) whose failure is recorded. The
+#      SQLite writer-set assertion is authoritative because listWriters reads
+#      exactly that table.
 #   G. Heal attempt: Bob writes a SECOND record with the authority UP, then
 #      the writer-set state and the reachability of BOTH records through the
 #      live read path are recorded.
@@ -601,7 +602,7 @@ wait_for_healthy_container "$swan_id" "restored authority Swan"
 echo "FIRST-WRITE ACCEPTANCE: authority healthy after restart"
 
 # F. Sweep: the writer set must not contain Bob, and the protocol-level
-#    listRepos sweep must be attempted. Swan's listRepos reads exactly
+#    listWriters sweep must be attempted. Swan's listWriters reads exactly
 #    permissioned_space_writers, so the read-only SQLite assertion is the
 #    authoritative witness.
 sweep_state="$(database_state)"
@@ -636,14 +637,13 @@ except (OSError, ValueError):
       credential_code=""
       if [ -n "$delegation_token" ]; then
         credential_code="$(curl --silent --show-error --max-time 10 \
-          --request POST "https://swan.test/xrpc/com.atproto.space.getSpaceCredential" \
+          --request POST "https://swan.test/xrpc/com.atproto.space.authorizeSpaceSync" \
           --header "content-type: application/json" \
-          --header "authorization: Bearer ${delegation_token}" \
-          --data "{\"space\":\"$1\"}" \
+          --data "{\"space\":\"$1\",\"credentialKey\":\"did:key:zDnaenWLqH8nddvKvYSgjaUsCJkuoxXhbXSqdmf8eM946nBQe\",\"delegationToken\":\"${delegation_token}\",\"notify\":{\"endpoint\":\"https://pds.test\",\"token\":\"first-write-loss-sweep\"}}" \
           --output /tmp/credential.json \
           --write-out "%{http_code}" || true)"
       fi
-      list_repos_code=""
+      list_writers_code=""
       if [ "$credential_code" = "200" ]; then
         credential_token="$(python3 -c '"'"'import json,sys
 try:
@@ -652,21 +652,21 @@ try:
 except (OSError, ValueError):
     print("")'"'"' 2>/dev/null || true)"
         if [ -n "$credential_token" ]; then
-          list_repos_code="$(curl --silent --show-error --max-time 10 \
-            --get "https://swan.test/xrpc/com.atproto.space.listRepos" \
+          list_writers_code="$(curl --silent --show-error --max-time 10 \
+            --get "https://swan.test/xrpc/com.atproto.space.listWriters" \
             --data-urlencode "space=$1" \
             --header "authorization: Bearer ${credential_token}" \
-            --output /tmp/list-repos.json \
+            --output /tmp/list-writers.json \
             --write-out "%{http_code}" || true)"
         fi
       fi
-      printf "%s\n%s\n%s\n" "${delegation_code:-}" "${credential_code:-}" "${list_repos_code:-}"
+      printf "%s\n%s\n%s\n" "${delegation_code:-}" "${credential_code:-}" "${list_writers_code:-}"
     ' _ "$space_uri"
 })" || true
 sweep_delegation_status="$(printf '%s\n' "$sweep_attempt" | sed -n '1p')"
 sweep_credential_status="$(printf '%s\n' "$sweep_attempt" | sed -n '2p')"
-sweep_list_repos_status="$(printf '%s\n' "$sweep_attempt" | sed -n '3p')"
-echo "FIRST-WRITE ACCEPTANCE: sweep writerCountForMember=${sweep_writer_member} delegation=${sweep_delegation_status:-unavailable} credential=${sweep_credential_status:-unavailable} listRepos=${sweep_list_repos_status:-not-attempted}"
+sweep_list_writers_status="$(printf '%s\n' "$sweep_attempt" | sed -n '3p')"
+echo "FIRST-WRITE ACCEPTANCE: sweep writerCountForMember=${sweep_writer_member} delegation=${sweep_delegation_status:-unavailable} credential=${sweep_credential_status:-unavailable} listWriters=${sweep_list_writers_status:-not-attempted}"
 
 # G. Heal attempt: Bob writes a second record with the authority healthy, then
 #    the writer-set state and the live read path for BOTH records are
@@ -808,7 +808,7 @@ python3 - "$evidence_json" \
   "$first_status" "$first_cid" "$first_write_digest" \
   "$second_status" "$second_cid" "$second_write_digest" \
   "$read1_status" "$read1_cid" "$read1_digest" "$read2_status" "$read2_cid" "$read2_digest" \
-  "${sweep_delegation_status:-}" "${sweep_credential_status:-}" "${sweep_list_repos_status:-}" <<'PY'
+  "${sweep_delegation_status:-}" "${sweep_credential_status:-}" "${sweep_list_writers_status:-}" <<'PY'
 import json
 import os
 import sys
@@ -820,7 +820,7 @@ first_status, first_cid, first_digest = sys.argv[13:16]
 second_status, second_cid, second_digest = sys.argv[16:19]
 read1_status, read1_cid, read1_digest = sys.argv[19:22]
 read2_status, read2_cid, read2_digest = sys.argv[22:25]
-delegation_status, credential_status, list_repos_status = sys.argv[25:28]
+delegation_status, credential_status, list_writers_status = sys.argv[25:28]
 
 pre = json.loads(pre_state)
 sweep = json.loads(sweep_state)
@@ -869,11 +869,11 @@ evidence = {
     "sweep": {
         "writerCountForMember": sweep["writerCountForMember"],
         "writerCountForSpace": sweep["writerCountForSpace"],
-        "listReposAttempt": {
+        "listWritersAttempt": {
             "delegationStatus": status(delegation_status),
             "credentialStatus": status(credential_status),
-            "listReposStatus": status(list_repos_status),
-            "note": "protocol sweep not feasible: the authority rejected the member delegation token; the read-only SQLite writer-set assertion is the authoritative witness because Swan listRepos reads exactly permissioned_space_writers",
+            "listWritersStatus": status(list_writers_status),
+            "note": "protocol sweep not feasible: the authority rejected the member delegation token; the read-only SQLite writer-set assertion is authoritative because Swan listWriters reads permissioned_space_writers",
         },
     },
     "secondWrite": {

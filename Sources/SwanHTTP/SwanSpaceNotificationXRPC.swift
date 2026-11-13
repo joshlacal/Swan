@@ -221,7 +221,7 @@ private struct AuthenticatedNotifyRepoUpdateHandler {
                 capability,
                 request: request,
                 expectedAudience: nil,
-                expectedMethod: SwanSpaceNotificationNSID.notifyRepoUpdate,
+                expectedMethod: ComAtprotoSpaceNotifyRepoUpdate.typeIdentifier,
                 expectedRequestBodyDigest: nil
             )
             guard service.issuer == input.repo.didString(),
@@ -248,7 +248,7 @@ private struct AuthenticatedNotifyRepoUpdateHandler {
                 capability,
                 request: request,
                 expectedAudience: nil,
-                expectedMethod: SwanSpaceNotificationNSID.notifyRepoUpdate,
+                expectedMethod: ComAtprotoSpaceNotifyRepoUpdate.typeIdentifier,
                 expectedRequestBodyDigest: expectedDigest
             )
             guard service.issuer == input.repo.didString(),
@@ -313,7 +313,7 @@ private struct AuthenticatedNotifyCredentialsRevokedHandler {
             capability,
             request: request,
             expectedAudience: nil,
-            expectedMethod: SwanSpaceNotificationNSID.notifyCredentialsRevoked,
+            expectedMethod: ComAtprotoSpaceNotifyCredentialsRevoked.typeIdentifier,
             expectedRequestBodyDigest: capability.openInterop == nil ? expectedDigest : nil
         )
         guard service.issuer == space.authority else {
@@ -360,7 +360,7 @@ func registerAuthenticatedNotifyCredentialsRevokedEndpoint(
     requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
     let handler = AuthenticatedNotifyCredentialsRevokedHandler(capability: capability)
-    let path: RouterPath = "/xrpc/\(SwanSpaceNotificationNSID.notifyCredentialsRevoked)"
+    let path = RouterPath("/xrpc/\(ComAtprotoSpaceNotifyCredentialsRevoked.typeIdentifier)")
     router.post(path) { request, context async -> Response in
         do {
             let input = try await decodeNotifyCredentialsRevokedInput(
@@ -386,7 +386,7 @@ func registerAuthenticatedListSpaceWritersEndpoint(
     capability: SwanAuthenticatedSpaceNotificationsCapability
 ) {
     let handler = AuthenticatedListSpaceWritersHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.space.listWriters"
+    let path = RouterPath("/xrpc/\(ComAtprotoSpaceListWriters.typeIdentifier)")
     router.get(path) { request, _ async -> Response in
         do {
             let parameters = try parseListSpaceWritersParameters(request)
@@ -407,7 +407,7 @@ func registerAuthenticatedNotifyRepoUpdateEndpoint(
     requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
     let handler = AuthenticatedNotifyRepoUpdateHandler(capability: capability)
-    let path: RouterPath = "/xrpc/\(SwanSpaceNotificationNSID.notifyRepoUpdate)"
+    let path = RouterPath("/xrpc/\(ComAtprotoSpaceNotifyRepoUpdate.typeIdentifier)")
     router.post(path) { request, context async -> Response in
         do {
             let input = try await decodeNotifyRepoUpdateInput(

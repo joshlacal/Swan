@@ -7214,8 +7214,8 @@ extension SwanCommand {
                         // A transport, OAuth, timeout, or unrelated storage
                         // failure is not evidence that the corrupted archive
                         // reached and was rejected by the STAR verifier. The
-                        // injected final-byte mutation deterministically
-                        // invalidates the containing block's CID.
+                        // final-byte mutation removes STAR's archive terminator
+                        // and is classified as a truncation.
                         corruptionRejected = PermissionedRecoveryFailureCode
                             .isInjectedFinalByteCorruptionRejection(error)
                     }

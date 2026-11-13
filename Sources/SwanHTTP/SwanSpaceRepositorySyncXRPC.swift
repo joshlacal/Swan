@@ -8,10 +8,10 @@ import SwanOAuth
 import SwanSpaces
 import SwanStorage
 
-/// The narrowly composed capability for the two read-only incremental-sync
-/// endpoints.  It carries neither a SQLite handle nor raw key material: the
-/// preopened directory returns safe durable projections, and the signer can
-/// only construct a fixed reader-bound permissioned commit.
+/// The narrowly composed capability for read-only repository sync. It carries
+/// neither a SQLite handle nor raw key material: the preopened directory
+/// returns safe durable projections, and the signer derives one response MAC
+/// secret for the authenticated request.
 public struct SwanAuthenticatedSpaceRepositorySyncCapability: Sendable {
     let authorizer: SwanOAuthResourceAuthorizer
     let directory: any AuthorizedSpaceRepositoryDirectory
@@ -535,17 +535,11 @@ func registerAuthenticatedListRepoOpsEndpoint(
                 request: request, author: parameters.repo.didString(), profile: .commit,
                 provider: capability.commitSigner
             )
-            let mac: SpaceMACHeaders.ResponseHeaders?
-            if let macContext, let commit = output.commit {
-                mac = try SpaceMACHeaders.commitResponse(
-                    responseCommit(commit),
-                    request: macContext.request,
-                    sharedSecret: macContext.sharedSecret
+            let commit = try responseCommit(output.commit)
+            let mac = try macContext.map {
+                try SpaceMACHeaders.commitResponse(
+                    commit, request: $0.request, sharedSecret: $0.sharedSecret
                 )
-            } else if macContext != nil {
-                throw SpaceMACHeaders.HeaderError.invalidSpaceMAC
-            } else {
-                mac = nil
             }
             return withSpaceResponseMAC(
                 authenticatedListRepoOpsJSON(.ok, output, lease: lease), headers: mac

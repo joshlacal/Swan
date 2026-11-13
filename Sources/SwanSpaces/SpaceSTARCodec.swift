@@ -23,7 +23,6 @@ public struct SpaceRepositoryCommit: Sendable, Equatable, Codable {
         self.data = data
     }
 
-
     private enum CodingKeys: String, CodingKey { case ver, repo, space, rev, data }
     private enum BytesKey: String, CodingKey { case bytes = "$bytes" }
 

@@ -6,13 +6,6 @@ import SwanSQLite
 import SwanSpaces
 import SwanStorage
 
-enum SwanSpaceNotificationNSID {
-    static let authorizeSpaceSync = "com.atproto.space.authorizeSpaceSync"
-    static let confirmRegistration = "com.atproto.space.confirmRegistration"
-    static let notifyRepoUpdate = "com.atproto.space.notifyRepoUpdate"
-    static let notifyCredentialsRevoked = "com.atproto.space.notifyCredentialsRevoked"
-    static let notifySpaceUpdate = "com.atproto.space.notifySpaceUpdate"
-}
 
 public protocol SwanSpaceRegistrationConfirming: Sendable {
     func confirmRegistration(
@@ -57,15 +50,14 @@ public struct HTTPSwanSpaceRegistrationConfirmer: SwanSpaceRegistrationConfirmin
         }
         let url = try notificationEndpoint(
             endpoint,
-            method: SwanSpaceNotificationNSID.confirmRegistration
+            method: ComAtprotoSpaceConfirmRegistration.typeIdentifier
         )
-        struct Request: Encodable {
-            let space: String
-            let token: String
-            let challenge: String
-        }
         let body = try JSONEncoder().encode(
-            Request(space: space.rawValue, token: token, challenge: challenge)
+            ComAtprotoSpaceConfirmRegistration.Input(
+                space: try SpaceRef(uriString: space.rawValue),
+                token: token,
+                challenge: challenge
+            )
         )
         let host = try policy.validateURL(url)
         let before = Set(
@@ -378,7 +370,7 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
         )
         let endpoint = try notificationEndpoint(
             destination.endpoint,
-            method: SwanSpaceNotificationNSID.notifyRepoUpdate
+            method: ComAtprotoSpaceNotifyRepoUpdate.typeIdentifier
         )
         let reqDigest = SpaceNotificationRequestDigest.write(
             space: announcement.space,
@@ -395,7 +387,7 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
         let token = try await serviceAuthentication.issue(
             issuer: notification.author,
             audience: destination.audience,
-            method: SwanSpaceNotificationNSID.notifyRepoUpdate,
+            method: ComAtprotoSpaceNotifyRepoUpdate.typeIdentifier,
             eventID: UUID().uuidString.lowercased(),
             requestBodyDigest: reqDigest,
             now: Date()
@@ -438,7 +430,7 @@ public struct HTTPPermissionedSpaceSyncNotificationTransport:
             }
             endpoint = try notificationEndpoint(
                 base,
-                method: SwanSpaceNotificationNSID.notifySpaceUpdate
+                method: ComAtprotoSpaceNotifySpaceUpdate.typeIdentifier
             )
             body = try spaceSyncNotificationJSON(notification)
         } catch {
@@ -459,73 +451,11 @@ public struct HTTPPermissionedSpaceSyncNotificationTransport:
     }
 }
 
-private struct SpaceSyncNotificationRequest: Encodable {
-    let space: String
-    let token: String
-    let update: SpaceSyncNotificationUpdate
-}
-
-private enum SpaceSyncNotificationUpdate: Encodable {
-    private enum CodingKeys: String, CodingKey {
-        case type = "$type"
-        case repo
-        case repoRev
-        case data
-        case spaceRev
-        case prevSpaceRev
-    }
-
-    case repoWrite(
-        repo: String,
-        repoRev: String,
-        data: Bytes,
-        spaceRev: String,
-        prevSpaceRev: String?
-    )
-    case repoRemoved(repo: String, spaceRev: String, prevSpaceRev: String?)
-    case spaceDeleted
-    case registrationExpired(spaceRev: String)
-
-    func encode(to encoder: Encoder) throws {
-        var values = encoder.container(keyedBy: CodingKeys.self)
-        switch self {
-        case let .repoWrite(repo, repoRev, data, spaceRev, prevSpaceRev):
-            try values.encode(
-                "com.atproto.space.defs#repoWrite",
-                forKey: .type
-            )
-            try values.encode(repo, forKey: .repo)
-            try values.encode(repoRev, forKey: .repoRev)
-            try values.encode(data, forKey: .data)
-            try values.encode(spaceRev, forKey: .spaceRev)
-            try values.encodeIfPresent(prevSpaceRev, forKey: .prevSpaceRev)
-        case let .repoRemoved(repo, spaceRev, prevSpaceRev):
-            try values.encode(
-                "com.atproto.space.defs#repoRemoved",
-                forKey: .type
-            )
-            try values.encode(repo, forKey: .repo)
-            try values.encode(spaceRev, forKey: .spaceRev)
-            try values.encodeIfPresent(prevSpaceRev, forKey: .prevSpaceRev)
-        case .spaceDeleted:
-            try values.encode(
-                "com.atproto.space.notifySpaceUpdate#spaceDeleted",
-                forKey: .type
-            )
-        case let .registrationExpired(spaceRev):
-            try values.encode(
-                "com.atproto.space.notifySpaceUpdate#registrationExpired",
-                forKey: .type
-            )
-            try values.encode(spaceRev, forKey: .spaceRev)
-        }
-    }
-}
 
 private func spaceSyncNotificationJSON(
     _ notification: PersistedSpaceSyncNotification
 ) throws -> Data {
-    let update: SpaceSyncNotificationUpdate
+    let update: ComAtprotoSpaceNotifySpaceUpdate.InputUpdateUnion
     switch notification.kind {
     case .repoWrite:
         guard let repo = notification.repository,
@@ -535,34 +465,36 @@ private func spaceSyncNotificationJSON(
               let spaceRev = notification.spaceRevision else {
             throw SwanError.malformed("repository update notification is incomplete")
         }
-        update = .repoWrite(
-            repo: repo,
-            repoRev: repoRev,
+        update = try .init(ComAtprotoSpaceDefs.RepoWrite(
+            repo: DID(didString: repo),
+            repoRev: TID(tidString: repoRev),
             data: Bytes(data: data),
-            spaceRev: spaceRev,
-            prevSpaceRev: notification.previousSpaceRevision
-        )
+            spaceRev: TID(tidString: spaceRev),
+            prevSpaceRev: notification.previousSpaceRevision.map(TID.init(tidString:))
+        ))
     case .repoRemoved:
         guard let repo = notification.repository,
               let spaceRev = notification.spaceRevision else {
             throw SwanError.malformed("repository removal notification is incomplete")
         }
-        update = .repoRemoved(
-            repo: repo,
-            spaceRev: spaceRev,
-            prevSpaceRev: notification.previousSpaceRevision
-        )
+        update = try .init(ComAtprotoSpaceDefs.RepoRemoved(
+            repo: DID(didString: repo),
+            spaceRev: TID(tidString: spaceRev),
+            prevSpaceRev: notification.previousSpaceRevision.map(TID.init(tidString:))
+        ))
     case .spaceDeleted:
-        update = .spaceDeleted
+        update = .init(ComAtprotoSpaceNotifySpaceUpdate.SpaceDeleted())
     case .registrationExpired:
         guard let spaceRev = notification.spaceRevision else {
             throw SwanError.malformed("registration expiry notification is incomplete")
         }
-        update = .registrationExpired(spaceRev: spaceRev)
+        update = try .init(ComAtprotoSpaceNotifySpaceUpdate.RegistrationExpired(
+            spaceRev: TID(tidString: spaceRev)
+        ))
     }
     return try SwanJSONEncoders.sortedNoEscaping.encode(
-        SpaceSyncNotificationRequest(
-            space: notification.space.rawValue,
+        ComAtprotoSpaceNotifySpaceUpdate.Input(
+            space: try SpaceRef(uriString: notification.space.rawValue),
             token: notification.token,
             update: update
         )
@@ -602,40 +534,21 @@ private func notificationEndpoint(_ endpoint: URL, method: String) throws -> URL
     return url
 }
 
-/// The repo-host hop is `{space, repo, repoRev, hash}`; a space-host
-/// forward adds `spaceRev` and, except on the space's first update,
-/// `prevSpaceRev`.
+/// The repo-host hop is `{space, repo, repoRev, data}`.
 private func notificationJSON(
     space: SpaceURI,
     repository: String,
     wireRevision: String,
-    commitment: Data,
-    spaceRevision: String? = nil,
-    previousSpaceRevision: String? = nil
+    commitment: Data
 ) throws -> Data {
-    guard commitment.count == 32,
-          let revision = try? TID(tidString: wireRevision) else {
+    guard commitment.count == 32 else {
         throw SwanError.malformed("writer notification is invalid")
     }
-    let spaceRev = try spaceRevision.map { try TID(tidString: $0) }
-    let prevSpaceRev = try previousSpaceRevision.map { try TID(tidString: $0) }
-    guard spaceRev != nil || prevSpaceRev == nil else {
-        throw SwanError.malformed("writer notification is invalid")
-    }
-    let input = try ComAtprotoSpaceNotifyWrite.Input(
+    let input = try ComAtprotoSpaceNotifyRepoUpdate.Input(
         space: SpaceRef(uriString: space.rawValue),
         repo: DID(didString: repository),
-        repoRev: revision,
-        data: Bytes(data: commitment),
-        spaceRev: spaceRev,
-        prevSpaceRev: prevSpaceRev
-    )
-    return try SwanJSONEncoders.sortedNoEscaping.encode(input)
-}
-
-private func deletionJSON(space: SpaceURI) throws -> Data {
-    let input = try ComAtprotoSpaceNotifySpaceDeleted.Input(
-        space: SpaceRef(uriString: space.rawValue)
+        repoRev: TID(tidString: wireRevision),
+        data: Bytes(data: commitment)
     )
     return try SwanJSONEncoders.sortedNoEscaping.encode(input)
 }

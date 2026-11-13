@@ -81,8 +81,7 @@ public enum SpaceMACHeaders {
     ) throws -> Request? {
         guard !values.isEmpty else { return nil }
         let combined = values.joined(separator: ", ")
-        guard !combined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              combined.utf8.count <= maximumFieldBytes else {
+        guard combined.utf8.count <= maximumFieldBytes else {
             throw HeaderError.invalidSpaceMAC
         }
         let dictionary: StructuredFieldDictionary

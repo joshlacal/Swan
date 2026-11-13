@@ -107,26 +107,6 @@ import Foundation
 //                     LIVE Swan counterpart at SwanAccountEmailXRPC.swift and is
 //                     the cheapest `account:` port.
 //
-// LOCAL POLICY — Swan-specific, no upstream counterpart. A row may appear here
-// only with the positive control that found no counterpart, run against
-// `packages/pds` (§6.5.10's own rule):
-//
-//   com.atproto.space.notifySpaceDeleted
-//     control: `ls packages/pds/src/api/com/atproto/space/` -> 20 entries
-//     (applyWrites, createRecord, deleteRecord, getBlob, getDelegationToken,
-//     getLatestCommit, getRecord, getRepo, getSpaceCredential, index,
-//     listBlobs, listRecords, listRepoOps, listRepos, listSpaces, notifyWrite,
-//     putRecord, registerNotify, unregisterNotify, util) — no notifySpaceDeleted.
-//   com.atproto.simplespace.checkUserAccess
-//     control: `ls packages/pds/src/api/com/atproto/simplespace/` -> addMember,
-//     createSpace, deleteSpace, getSpace, index, listMembers, removeMember,
-//     updateSpace — no checkUserAccess.
-//
-// Routes that exist upstream but carry NO scope assert are a credential-plane
-// check, not an unenforced route: getSpaceCredential (delegationTokenAuth),
-// registerNotify / unregisterNotify / listRepos (spaceCredentialAuth),
-// notifyWrite (serviceAuth). Classifying them as "unenforced" is a reading
-// error (§6.5.10).
 
 /// A frozen, request-scoped answer to "may this token do X".
 ///

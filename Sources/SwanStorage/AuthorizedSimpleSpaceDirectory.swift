@@ -660,6 +660,8 @@ public enum AuthorizedSpaceAuthorityStatusError: Error, Sendable, Equatable {
 /// exposes this as a retryable HTTP 502 `UpstreamFailure`.
 public protocol AuthorizedSpaceUpstreamFailure: Error, Sendable {}
 
+extension ManagedSpaceAccessError: AuthorizedSpaceUpstreamFailure {}
+
 /// A write notification the space host refuses for a reason the lexicon
 /// names. Unknown and deleted spaces use
 /// ``AuthorizedSimpleSpaceLifecycleError`` (`SpaceNotFound`) instead.

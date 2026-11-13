@@ -11395,9 +11395,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     "simple-space client allow-list capacity exhausted"
                 )
             }
-            for client in clients {
-                try validateSimpleSpaceClientIdentifier(client)
-            }
         }
         // Stored pre-November managed policies may contain a bare DID. Keep
         // loading them so the read-only policy report can identify each row.
@@ -11413,6 +11410,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         _ configuration: SimpleSpaceConfiguration
     ) throws {
         try validateSimpleSpaceConfiguration(configuration)
+        if case let .allowList(clients) = configuration.appAccess {
+            for client in clients {
+                try validateSimpleSpaceClientIdentifier(client)
+            }
+        }
         if case let .managed(policy) = configuration.policy,
            !SpacePolicyValidation.isValidManagingAppService(policy.managingApp) {
             throw SwanError.invalidIdentifier(policy.managingApp)
@@ -11650,7 +11652,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         var clients = Set<String>()
         for clientRow in clientRows {
             let clientID = try requiredText(clientRow, "client_id")
-            try validateSimpleSpaceClientIdentifier(clientID)
             guard clients.insert(clientID).inserted else {
                 throw SQLiteRepositoryError.corruptDatabase(
                     "duplicate simple-space client"

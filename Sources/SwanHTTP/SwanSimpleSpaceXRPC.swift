@@ -289,7 +289,7 @@ private struct AuthenticatedMemberspacePutMembersHandler {
         let authorization = try await lifecycleAuthorization(
             capability.authorizer,
             request: request,
-            fixedPath: "/xrpc/com.atproto.memberspace.putMembers"
+            fixedPath: "/xrpc/\(ComAtprotoMemberspacePutMembers.typeIdentifier)"
         )
         try requireLifecycleAuthority(authorization, space: input.space)
         do {
@@ -311,7 +311,7 @@ private struct AuthenticatedMemberspaceRemoveMembersHandler {
         let authorization = try await lifecycleAuthorization(
             capability.authorizer,
             request: request,
-            fixedPath: "/xrpc/com.atproto.memberspace.removeMembers"
+            fixedPath: "/xrpc/\(ComAtprotoMemberspaceRemoveMembers.typeIdentifier)"
         )
         try requireLifecycleAuthority(authorization, space: input.space)
         do {
@@ -402,7 +402,7 @@ func registerAuthenticatedSimpleSpaceLifecycleEndpoints(
     }
     let putMembers = AuthenticatedMemberspacePutMembersHandler(capability: capability)
     registerSpaceLifecycleProcedure(
-        on: router, path: "/xrpc/com.atproto.memberspace.putMembers", capability: capability,
+        on: router, path: RouterPath("/xrpc/\(ComAtprotoMemberspacePutMembers.typeIdentifier)"), capability: capability,
         required: ["space", "members"], allowed: ["space", "members"]
     ) { root, request in
         try await putMembers.handle(try SpacePutMembersWireInput(root), request: request)
@@ -410,7 +410,7 @@ func registerAuthenticatedSimpleSpaceLifecycleEndpoints(
     }
     let removeMembers = AuthenticatedMemberspaceRemoveMembersHandler(capability: capability)
     registerSpaceLifecycleProcedure(
-        on: router, path: "/xrpc/com.atproto.memberspace.removeMembers", capability: capability,
+        on: router, path: RouterPath("/xrpc/\(ComAtprotoMemberspaceRemoveMembers.typeIdentifier)"), capability: capability,
         required: ["space", "dids"], allowed: ["space", "dids"]
     ) { root, request in
         try await removeMembers.handle(try SpaceRemoveMembersWireInput(root), request: request)

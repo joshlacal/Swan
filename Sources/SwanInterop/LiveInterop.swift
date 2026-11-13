@@ -1497,15 +1497,15 @@ public enum PermissionedRecoveryFailureCode {
         }
     }
 
-    /// The acceptance command injects exactly one mutation after a complete
-    /// download: it flips the final payload byte. A STAR digest mismatch
-    /// (or a legacy CAR block-CID mismatch) shows local content rejection. Transport,
-    /// authentication, timeout, and unrelated storage errors must not be
-    /// counted as corruption rejection evidence.
+    /// The acceptance command flips the archive terminator after a complete
+    /// download. Current STAR framing reports that missing final control byte
+    /// as truncation; older STAR/CAR payloads may report a digest or block-CID
+    /// mismatch. Transport, authentication, timeout, and unrelated storage
+    /// errors are not corruption-rejection evidence.
     public static func isInjectedFinalByteCorruptionRejection(
         _ error: Error
     ) -> Bool {
-        ["CARBlockCIDMismatch", "STARDigestMismatch"].contains(code(for: error))
+        ["CARBlockCIDMismatch", "STARDigestMismatch", "STARTruncated"].contains(code(for: error))
     }
 }
 
@@ -2549,9 +2549,9 @@ public enum LiveInteropRunner {
                 ComAtprotoSpaceListRepoOps.Output.self,
                 from: response.body
             )
+            let commit = output.commit
             guard !output.ops.isEmpty,
                   output.ops.allSatisfy({ $0.value == nil }),
-                  let commit = output.commit,
                   commit.ver == 1,
                   commit.rev == output.ops.last?.rev,
                   canonicalInteropTID(commit.rev.toString()) != nil,
@@ -2572,7 +2572,6 @@ public enum LiveInteropRunner {
                     errorCode: "OperationMismatch"
                 )
             }
-            guard authenticated.commit != nil else { throw SpaceSTARError.badMAC }
             return TerminalApplyWritesWitness(
                 status: response.status, revision: commit.rev.toString(), verified: true,
                 errorCode: nil
@@ -2690,9 +2689,9 @@ public enum LiveInteropRunner {
         var query: [String: String] = [
             "space": space.rawValue,
             "repo": author,
-            // The pinned TypeScript implementation emits its MAC-authenticated commit
-            // on a short terminal page. A fresh disposable repo is below this
-            // bound, so the response is also a complete hash witness.
+            // Every page carries its MAC-authenticated commit. A fresh
+            // disposable repo is below this bound, so this page is also a
+            // complete hash witness.
             "limit": "100",
         ]
         if !includeValues {
@@ -2734,7 +2733,7 @@ public enum LiveInteropRunner {
                     status: response.status, opsCount: output.ops.count,
                     operationCID: output.ops.first?.cid?.string,
                     operationRevision: output.ops.first?.rev.toString(),
-                    commitment: nil, commitRevision: output.commit?.rev.toString(),
+                    commitment: nil, commitRevision: output.commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "InvalidOperation"
                 )
@@ -2750,16 +2749,7 @@ public enum LiveInteropRunner {
                     errorCode: "OperationMismatch"
                 )
             }
-            guard let commit = output.commit else {
-                return PermissionedSyncResult(
-                    status: response.status, opsCount: output.ops.count,
-                    operationCID: operation.cid?.string,
-                    operationRevision: operation.rev.toString(),
-                    commitment: nil, commitRevision: nil,
-                    commitVerified: false, valuesIncluded: includeValues,
-                    errorCode: "CommitMissing"
-                )
-            }
+            let commit = output.commit
             guard commit.ver == 1,
                   commit.rev == output.ops.last?.rev,
                   commit.data.data.count == 32 else {
@@ -2836,7 +2826,6 @@ public enum LiveInteropRunner {
                     errorCode: "CommitmentMismatch"
                 )
             }
-            guard authenticated.commit != nil else { throw SpaceSTARError.badMAC }
             return PermissionedSyncResult(
                 status: response.status, opsCount: output.ops.count,
                 operationCID: operation.cid?.string,

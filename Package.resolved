@@ -42,7 +42,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/joshlacal/Petrel.git",
       "state" : {
-        "revision" : "4037e7760e2d1bb71db9a6cfdd0cd4134d4dd3bc"
+        "revision" : "db6c3ccbaff9d62e84c12e9183e2dc292585fc05"
       }
     },
     {

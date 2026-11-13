@@ -230,7 +230,7 @@ func registerAuthenticatedAuthorizeSpaceSyncEndpoint(
     requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
     let handler = AuthenticatedAuthorizeSpaceSyncHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.space.authorizeSpaceSync"
+    let path = RouterPath("/xrpc/\(ComAtprotoSpaceAuthorizeSpaceSync.typeIdentifier)")
     router.post(path) { request, context async -> Response in
         do {
             let input = try await decodeAuthorizeSpaceSyncInput(

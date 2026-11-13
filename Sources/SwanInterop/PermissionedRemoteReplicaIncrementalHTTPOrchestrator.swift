@@ -19,9 +19,9 @@ public enum PermissionedRemoteReplicaIncrementalSyncOutcome:
     case integrityFailure
 }
 
-/// Fetches one bounded value-bearing incremental interval, authenticates its
-/// terminal reader-specific commit against a fresh `getLatestCommit`, and only
-/// then hands the complete batch to the network-free durable store.
+/// Fetches bounded value-bearing pages, authenticates each page's required
+/// reader-specific commit, and only then hands the complete batch to the
+/// network-free durable store.
 public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
     private static let maximumWirePageOperations = 1_000
     public typealias PublicationAuthorization = @Sendable (
@@ -279,8 +279,8 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                 ComAtprotoSpaceListRepoOps.Output.self,
                 from: response.body
             )
-            guard let commit = output.commit,
-                  let authenticatedCommit = authenticated.commit else {
+            let commit = output.commit
+            guard let authenticatedCommit = authenticated.commit else {
                 throw PermissionedRemoteReplicaIncrementalVerificationError.invalidCommit
             }
             guard output.ops.count <= Self.maximumWirePageOperations else {

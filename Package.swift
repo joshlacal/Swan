@@ -20,12 +20,11 @@ let package = Package(
         .executable(name: "swan", targets: ["swan"]),
     ],
     dependencies: [
-        // Immutable October 22 SDK. Its generated sources are unchanged from
-        // generator revision e1152365, which matches the pinned corpus; this
-        // revision adds only runtime fixes (credential refresh margin, precise
-        // exchange errors, getRepo archive cap, per-task download limit).
+        // Immutable November 12 backport on Swan's pre-2.0 Petrel line. It
+        // provides the regenerated Spaces types without pulling the unrelated
+        // Petrel 2.0 API migration into this protocol cutover.
         .package(url: "https://github.com/joshlacal/Petrel.git",
-                 revision: "4037e7760e2d1bb71db9a6cfdd0cd4134d4dd3bc"),
+                 revision: "db6c3ccbaff9d62e84c12e9183e2dc292585fc05"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.36.0"),

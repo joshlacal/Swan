@@ -92,7 +92,10 @@ public enum SpacePolicy: Sendable, Equatable, Hashable {
                 var apps: [String] = []
                 apps.reserveCapacity(values.count)
                 for item in values {
-                    guard let app = item as? String else { throw SpacePolicyError.invalidPolicy }
+                    guard let app = item as? String,
+                          SpacePolicyValidation.isValidAppIdentifier(app) else {
+                        throw SpacePolicyError.invalidPolicy
+                    }
                     apps.append(app)
                 }
                 allowedApps = apps
@@ -259,11 +262,6 @@ public struct MemberSpacePolicy: Sendable, Equatable, Hashable {
         if let allowedApps {
             guard allowedApps.count <= SimpleSpaceLimits.maximumClientAllowListEntries else {
                 throw SpacePolicyError.invalidPolicy
-            }
-            for app in allowedApps {
-                guard SpacePolicyValidation.isValidAppIdentifier(app) else {
-                    throw SpacePolicyError.invalidPolicy
-                }
             }
             self.allowedApps = Array(Set(allowedApps)).sorted()
         } else {
