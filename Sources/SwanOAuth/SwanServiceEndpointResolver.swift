@@ -255,7 +255,7 @@ public struct SwanServiceEndpointResolver: Sendable {
     }
 
     /// Resolves a whole service identifier — `did` or `did#fragment` — as the
-    /// spaces `registerNotify` contract names its subscriber (the reference
+    /// managed-space access contract names its service (the reference
     /// implementation's `resolve_service_endpoint`).
     ///
     /// With a fragment this is exactly ``endpoint(did:fragment:)``. Without

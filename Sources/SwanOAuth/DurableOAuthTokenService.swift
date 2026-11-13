@@ -33,7 +33,7 @@ public struct SwanOAuthRuntime: Sendable {
     public let spaceServiceJWTReplayStore: DurableSpaceServiceJWTReplayStore
     /// The repo host's space-credential revocation list (atproto#5567),
     /// consulted on every credential presentation and written by
-    /// `notifyCredentialRevoked`.
+    /// `notifyCredentialsRevoked`.
     public let spaceCredentialRevocations: DurableSpaceCredentialRevocations
     public let browserSessionService: OAuthBrowserSessionService
     /// The nonce MAC key is the injected non-persisted OAuth server key. It

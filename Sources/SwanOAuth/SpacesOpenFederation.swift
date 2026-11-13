@@ -12,7 +12,7 @@ import SwanStorage
 ///
 /// - delegation, space-credential, and service-JWT issuer keys for any
 ///   `did:plc` or `did:web` issuer, read from the issuer's DID document;
-/// - the `notifyWrite` destination of a space authority, read from its
+/// - the `notifyRepoUpdate` destination of a space authority, read from its
 ///   `#atproto_pds` (type `AtprotoSpaceHost`) entry, else `#atproto_pds`.
 ///
 /// Every fetch goes through the caller-supplied ``SwanDIDDocumentFetching``,
@@ -52,7 +52,7 @@ public actor SwanDIDDocumentSpaceResolver:
         }
     }
 
-    /// A resolved `notifyWrite` destination: the endpoint origin and the
+    /// A resolved `notifyRepoUpdate` destination: the endpoint origin and the
     /// service-JWT audience that endpoint verifies.
     public struct NotifyDestination: Sendable, Equatable {
         public let endpoint: URL
@@ -126,7 +126,7 @@ public actor SwanDIDDocumentSpaceResolver:
         return try Self.verificationKey(in: document, did: did, fragment: "atproto")
     }
 
-    // MARK: notifyWrite routing
+    // MARK: notifyRepoUpdate routing
 
     /// `#atproto_pds` (which must be typed `AtprotoSpaceHost`) when
     /// present, else `#atproto_pds`. A present-but-malformed space-host entry

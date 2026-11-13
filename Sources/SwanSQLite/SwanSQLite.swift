@@ -5256,7 +5256,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             // reference processes a co-located writer the same way). The
             // forwards are authority-signed (`iss = space authority`,
             // `aud = subscriber service`); per-repo rows filter by this
-            // writer. The later self-addressed notifyWrite from the outbox
+            // writer. The later self-addressed notifyRepoUpdate from the outbox
             // then carries a repoRev that is no longer newer and is ignored.
             if space.authority == accountDID,
                try await isActiveSimpleSpaceWithoutGate(space),

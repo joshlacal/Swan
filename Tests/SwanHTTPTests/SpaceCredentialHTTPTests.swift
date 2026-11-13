@@ -489,7 +489,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 let malformedKeyHeaders = self.exchangeHeaders()
                 try await client.execute(
                     uri: Self.credentialPath, method: .post, headers: malformedKeyHeaders,
-                    body: self.exchangeBody(delegationToken: validDelegation, space: fixture.publicSpace, credentialKid: "not-a-did-key")
+                    body: self.exchangeBody(delegationToken: validDelegation, space: fixture.publicSpace, credentialKey: "not-a-did-key")
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
@@ -1915,11 +1915,11 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         delegationToken: String? = nil,
         space: SpaceURI,
         clientAttestation: String? = nil,
-        credentialKid: String? = nil
+        credentialKey: String? = nil
     ) throws -> ByteBuffer {
         var fields: [String: String] = [
             "space": space.rawValue,
-            "credentialKey": try credentialKid ?? SpaceCredentialSignatureTestSupport.keyID,
+            "credentialKey": try credentialKey ?? SpaceCredentialSignatureTestSupport.keyID,
         ]
         fields["delegationToken"] = delegationToken
         fields["clientAttestation"] = clientAttestation

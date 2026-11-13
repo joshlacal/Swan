@@ -20,7 +20,7 @@ set -euo pipefail
 # Scenario (order matters):
 #   A. Preconditions: docker, verified secret source, healthy authority.
 #   B. Fresh TypeScript PDS member account (Bob) + fresh space provisioned
-#      through the authority (createSpace + putMember) via the established
+#      through the authority (createSpace + putMembers) via the established
 #      `swan lab live --mode permissioned --provision-space` path. The
 #      provision round trip must NOT commit a record (in this lab the
 #      authority rejects the member delegation token with 401 before any

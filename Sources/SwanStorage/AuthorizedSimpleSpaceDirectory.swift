@@ -848,7 +848,7 @@ public enum SpaceNotificationRequestDigest {
         SpaceServiceRequestDigest.deletion(space: space)
     }
 
-    /// The `req` binding for `notifyCredentialRevoked`: the space and its
+    /// The `req` binding for `notifyCredentialsRevoked`: the space and its
     /// revoked credential IDs, in body order.
     public static func credentialRevocation(space: SpaceURI, credentials: [String]) -> String {
         SpaceServiceRequestDigest.credentialRevocation(space: space, credentials: credentials)
@@ -868,7 +868,7 @@ public enum SpaceNotificationRequestDigest {
         )
     }
 
-    /// The `req` binding for a space-host -> syncer `notifyWrite`: the
+    /// The `req` binding for a space-host -> syncer `notifySpaceUpdate`: the
     /// repo-host fields plus the space revisions the space host assigned.
     public static func forwardedWrite(
         space: SpaceURI,

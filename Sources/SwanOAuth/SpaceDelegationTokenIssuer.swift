@@ -8,7 +8,7 @@ import SwanSpaces
 /// Mints a user-PDS delegation without exposing account private-key material
 /// to HTTP, storage, or a general-purpose signing API.  Implementations
 /// receive the already-authorized OAuth subject and exact space, then return
-/// only the bounded compact JWT needed by `getSpaceCredential`.
+/// only the bounded compact JWT needed by `authorizeSpaceSync`.
 public protocol SpaceDelegationTokenIssuer: Sendable {
     func issueDelegation(
         space: SpaceURI,

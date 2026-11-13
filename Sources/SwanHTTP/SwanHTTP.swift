@@ -681,18 +681,18 @@ public struct SwanHTTPServer: Sendable {
             // Formed once, ahead of every capability that verifies compact
             // space credentials — including the description endpoint, whose
             // live contract admits a member hosted elsewhere by credential.
-            let getSpaceCredentialVerifier: (any SpaceCredentialAuthorizationVerifier)?
+            let spaceSyncCredentialVerifier: (any SpaceCredentialAuthorizationVerifier)?
             if let spaceCredentialConfiguration {
-                getSpaceCredentialVerifier = DurableSpaceCredentialVerifier(
+                spaceSyncCredentialVerifier = DurableSpaceCredentialVerifier(
                     publicKeys: spaceCredentialConfiguration.credentialPublicKeys
                 )
             } else {
-                getSpaceCredentialVerifier = nil
+                spaceSyncCredentialVerifier = nil
             }
             authenticatedGetSpace = SwanAuthenticatedGetSpaceCapability(
                 authorizer: authorizer,
                 directory: authenticatedGetSpaceDirectory,
-                credentialAuthorizer: getSpaceCredentialVerifier
+                credentialAuthorizer: spaceSyncCredentialVerifier
             )
             if let mutationDirectory = publicRepositoryMutationDirectory,
                let signerProvider = publicRepositoryMutationSignerProvider {
@@ -710,7 +710,7 @@ public struct SwanHTTPServer: Sendable {
             }
             if let repositoryDirectory = authenticatedGetSpaceDirectory
                 as? any AuthorizedSpaceRepositoryDirectory {
-                let credentialVerifier = getSpaceCredentialVerifier
+                let credentialVerifier = spaceSyncCredentialVerifier
                 authenticatedSpaceRecords = SwanAuthenticatedSpaceRecordsCapability(
                     authorizer: authorizer,
                     directory: repositoryDirectory,

@@ -4,7 +4,7 @@ import SwanCore
 import SwanSpaces
 
 extension SQLiteAccountDatabase {
-    /// Account-schema v25 (SWAN-SYNC-2): coalesce the notifyWrite outbox.
+    /// Account-schema v25 (SWAN-SYNC-2): coalesce the notifyRepoUpdate outbox.
     static let permissionedOutboxCoalescingMigrationVersion = 25
 
     /// How long the repo host keeps retrying the newest state of one

@@ -8697,7 +8697,7 @@ extension SwanCommand {
             /// THE SYNCER. Authenticates as the acting user (e.g. Carol),
             /// mints one delegation token at her PDS, exchanges it at the
             /// space authority for ONE space credential, discovers the writer
-            /// repos from the authority's `listRepos`, then fetches, verifies,
+            /// repos from the authority's `listWriters`, then fetches, verifies,
             /// and durably applies every writer's repo with that single
             /// credential, merges the records into one thread, and prints it.
             struct Thread: AsyncParsableCommand {

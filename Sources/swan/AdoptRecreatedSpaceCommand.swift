@@ -51,7 +51,7 @@ enum RecreatedSpaceAdoption {
         // inspection only reads the issue time and ID of that same token.
         let claims = try PermissionedDataJWT.inspectSpaceCredential(token).claims
         // `serve` refuses a credential whose `(space, jti)` the authority
-        // revoked (notifyCredentialRevoked) on every presentation, so
+        // revoked (`notifyCredentialsRevoked`) on every presentation, so
         // adoption does too. An unreadable revocation list fails closed.
         guard try await !revocations.isRevoked(space: space, credentialID: claims.jti, now: now) else {
             throw SwanError.unauthorized("space credential was revoked")

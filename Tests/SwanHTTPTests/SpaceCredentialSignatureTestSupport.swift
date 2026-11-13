@@ -54,7 +54,7 @@ enum SpaceCredentialSignatureTestSupport {
         return try SpaceURI(space).authority
     }
 
-    /// October 22 exchanges carry credentialKid and optional delegationToken
+    /// October 22 exchanges carry credentialKey and optional delegationToken
     /// in JSON; exchange headers contain no bearer credential or signature.
     static func exchangeHeaders() -> HTTPFields {
         var headers = HTTPFields()

@@ -7,7 +7,7 @@ import SwanSpaces
 import SwanStorage
 import XCTest
 
-/// SWAN-SYNC-2: the notifyWrite outbox keeps one row per `(space, author)`
+/// SWAN-SYNC-2: the notifyRepoUpdate outbox keeps one row per `(space, author)`
 /// carrying the latest state and stops retrying 24 hours after the newest
 /// state, restarting that window when newer state arrives (October 1
 /// section 3).

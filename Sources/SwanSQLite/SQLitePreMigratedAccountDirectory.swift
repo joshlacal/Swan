@@ -910,7 +910,7 @@ public actor SQLitePreMigratedAccountDirectory:
     public func receiveSpaceWriteNotification(
         _ notification: AuthorizedSpaceWriteNotification
     ) async throws {
-        // The direct writer->authority message is the only notifyWrite shape
+        // The direct writer->authority message is the only notifyRepoUpdate shape
         // that this host may apply. Authority->recipient fanout is a delivery
         // hint for a remote synchronizer, not remote operation application;
         // it deliberately succeeds as a no-op here.

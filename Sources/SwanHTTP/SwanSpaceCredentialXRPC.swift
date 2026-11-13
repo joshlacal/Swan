@@ -243,20 +243,20 @@ func registerAuthenticatedAuthorizeSpaceSyncEndpoint(
                 try await handler.handle(input: input)
             )
         } catch let failure as SpaceCredentialExchangeFailure {
-            return getSpaceCredentialResponse(for: failure)
+            return authorizeSpaceSyncResponse(for: failure)
         } catch let failure as SwanRequestBodyCollectionFailure {
-            return getSpaceCredentialResponse(
+            return authorizeSpaceSyncResponse(
                 for: failure == .unavailable ? .unavailable : .invalidRequest
             )
         } catch {
-            return getSpaceCredentialError(.badRequest, code: "InvalidRequest")
+            return authorizeSpaceSyncError(.badRequest, code: "InvalidRequest")
         }
     }
     for method: HTTPRequest.Method in [
         .get, .head, .put, .patch, .delete, .options, .connect, .trace,
     ] {
         router.on(path, method: method) { _, _ -> Response in
-            getSpaceCredentialError(
+            authorizeSpaceSyncError(
                 .notFound,
                 code: "permissioned_endpoint_unavailable"
             )
@@ -486,40 +486,40 @@ private func unverifiedCompactJOSEType(of compact: String) -> String? {
 }
 
 
-private func getSpaceCredentialResponse(
+private func authorizeSpaceSyncResponse(
     for failure: SpaceCredentialExchangeFailure
 ) -> Response {
     switch failure {
     case .invalidRequest:
-        getSpaceCredentialError(.badRequest, code: "InvalidRequest")
+        authorizeSpaceSyncError(.badRequest, code: "InvalidRequest")
     case .invalidDelegation:
-        getSpaceCredentialError(.badRequest, code: "InvalidDelegationToken")
+        authorizeSpaceSyncError(.badRequest, code: "InvalidDelegationToken")
     case .invalidSignature:
-        getSpaceCredentialError(.unauthorized, code: "BadSpaceSignature")
+        authorizeSpaceSyncError(.unauthorized, code: "BadSpaceSignature")
     case .invalidClientAttestation:
-        getSpaceCredentialError(.badRequest, code: "InvalidClientAttestation")
+        authorizeSpaceSyncError(.badRequest, code: "InvalidClientAttestation")
     case .spaceNotFound:
-        getSpaceCredentialError(.badRequest, code: "SpaceNotFound")
+        authorizeSpaceSyncError(.badRequest, code: "SpaceNotFound")
     case .spaceDeleted:
-        getSpaceCredentialError(.badRequest, code: "SpaceDeleted")
+        authorizeSpaceSyncError(.badRequest, code: "SpaceDeleted")
     case .appNotAuthorized:
-        getSpaceCredentialError(.badRequest, code: "AppNotAuthorized")
+        authorizeSpaceSyncError(.badRequest, code: "AppNotAuthorized")
     case .notAuthorized:
-        getSpaceCredentialError(.badRequest, code: "NotAuthorized")
+        authorizeSpaceSyncError(.badRequest, code: "NotAuthorized")
     case .registrationNotConfirmed:
-        getSpaceCredentialError(.badRequest, code: "RegistrationNotConfirmed")
+        authorizeSpaceSyncError(.badRequest, code: "RegistrationNotConfirmed")
     case .repoTakendown:
-        getSpaceCredentialError(.badRequest, code: "RepoTakendown")
+        authorizeSpaceSyncError(.badRequest, code: "RepoTakendown")
     case .repoDeactivated:
-        getSpaceCredentialError(.badRequest, code: "RepoDeactivated")
+        authorizeSpaceSyncError(.badRequest, code: "RepoDeactivated")
     case .upstreamFailure:
-        getSpaceCredentialError(.badGateway, code: "UpstreamFailure")
+        authorizeSpaceSyncError(.badGateway, code: "UpstreamFailure")
     case .unavailable:
-        getSpaceCredentialError(.serviceUnavailable, code: "temporarily_unavailable")
+        authorizeSpaceSyncError(.serviceUnavailable, code: "temporarily_unavailable")
     }
 }
 
-private func getSpaceCredentialError(
+private func authorizeSpaceSyncError(
     _ status: HTTPResponse.Status,
     code: String
 ) -> Response {

@@ -29,7 +29,7 @@ public struct PermissionedSpaceOutboxNotification: Sendable, Equatable {
 /// retried after the durable lease expires (at-least-once semantics), so a
 /// repeat must be harmless at the receiver. `notification.id` is the local
 /// idempotency key; the HTTP transport does not reuse it as a service-JWT
-/// `jti`, because receivers dedupe a repeated `notifyWrite` by revision.
+/// `jti`, because receivers dedupe a repeated `notifyRepoUpdate` by revision.
 public protocol PermissionedSpaceOutboxTransport: Sendable {
     func deliver(_ notification: PermissionedSpaceOutboxNotification) async throws
 }

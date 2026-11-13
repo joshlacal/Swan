@@ -33,7 +33,7 @@ import Foundation
 //   | com.atproto.space.get*/list* (7 routes)| space/util.ts:109-127     assertSpaceRead -> read_self     |
 //   | com.atproto.space.getDelegationToken   | space/getDelegationToken.ts:22 assertSpaceScope(read)      |
 //   | com.atproto.space.listSpaces           | space/listSpaces.ts:20-25 assertSpace(filters-as-target)   |
-//   | com.atproto.space.{create,update,      | October 29 (5d88b414): assertSpaceOwner(manage:)           |
+//   | com.atproto.space.{create,update,      | October 29: assertSpaceOwner(manage:)           |
 //   |   delete}Space, removeWriter,          |   (the retired simplespace lifecycle routes used the same  |
 //   |   memberspace.{put,remove}Member       |   manage: verbs)                                           |
 //   | com.atproto.space.getSpace,            | space/getSpace.ts, memberspace/listMembers.ts              |
