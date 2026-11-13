@@ -174,19 +174,18 @@ public protocol AuthorizedPreopenedAccountDirectory: Sendable {
     func requireActivePreopenedAccount(_ did: String) async throws
 }
 
-/// A value-free local-PDS projection for `com.atproto.space.listSpaces`.
-/// This is deliberately not a membership or repository inspection API: its
-/// only durable facts are canonical space identities and whether the selected
-/// local account owns the authority.  In particular, it cannot carry record
-/// values, CIDs, blob references, policy, members, or another account's
-/// inventory.
+/// The authenticated account's current view of one hosted space.
 public struct AuthorizedHostedSpace: Sendable, Equatable {
     public let space: SpaceURI
-    public let isOwner: Bool
+    public let repoRev: String?
+    public let data: Data?
+    public let spaceRev: String?
 
-    public init(space: SpaceURI, isOwner: Bool) {
+    public init(space: SpaceURI, repoRev: String?, data: Data?, spaceRev: String?) {
         self.space = space
-        self.isOwner = isOwner
+        self.repoRev = repoRev
+        self.data = data
+        self.spaceRev = spaceRev
     }
 }
 

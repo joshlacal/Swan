@@ -673,10 +673,10 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         XCTAssertEqual(blobMetadata?.size, blobBytes.count)
         let retainedBlob = try await writerDatabase.blobData(for: blob)
         XCTAssertEqual(retainedBlob, blobBytes)
-        let spaces = try await writerDatabase.hostedSpaceURIs(
+        let spaces = try await writerDatabase.hostedSpaces(
             spaceType: nil, authority: nil, cursor: nil, limit: 100
         )
-        XCTAssertEqual(Set(spaces), Set([fixture.space, fixture.secondarySpace]))
+        XCTAssertEqual(Set(spaces.map(\.space)), Set([fixture.space, fixture.secondarySpace]))
         let receiptRows = try await writerDatabase.connection.query(
             "SELECT COUNT(*) AS row_count FROM permissioned_space_notification_receipts WHERE space_uri = ?",
             [.text(fixture.space.rawValue)]

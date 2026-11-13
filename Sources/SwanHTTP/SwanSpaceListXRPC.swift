@@ -24,12 +24,13 @@ public struct SwanAuthenticatedSpaceListCapability: Sendable {
 
 private enum AuthenticatedSpaceListFailure: Error {
     case invalidRequest
+    case invalidCursor
     case denied
     case nonceChallenge
     case unavailable
 }
 
-private struct AuthenticatedListSpacesHandler: ComAtprotoSpaceListSpaces.ServerHandler {
+private struct AuthenticatedListSpacesHandler {
     typealias Context = Request
 
     let capability: SwanAuthenticatedSpaceListCapability
@@ -38,7 +39,7 @@ private struct AuthenticatedListSpacesHandler: ComAtprotoSpaceListSpaces.ServerH
         parameters: ComAtprotoSpaceListSpaces.Parameters,
         input: Void,
         context request: Request
-    ) async throws -> ComAtprotoSpaceListSpaces.Output {
+    ) async throws -> ListSpacesWireOutput {
         let spaceType = parameters.spaceType?.nsidString()
         let authority = parameters.did?.didString()
         let cursor: SpaceURI?
@@ -48,13 +49,13 @@ private struct AuthenticatedListSpacesHandler: ComAtprotoSpaceListSpaces.ServerH
                 guard cursor.rawValue == parameters.cursor,
                       (spaceType == nil || cursor.spaceType == spaceType),
                       (authority == nil || cursor.authority == authority) else {
-                    throw AuthenticatedSpaceListFailure.invalidRequest
+                    throw AuthenticatedSpaceListFailure.invalidCursor
                 }
             }
         } catch let failure as AuthenticatedSpaceListFailure {
             throw failure
         } catch {
-            throw AuthenticatedSpaceListFailure.invalidRequest
+            throw AuthenticatedSpaceListFailure.invalidCursor
         }
 
         let authorization: AuthorizationContext
@@ -116,18 +117,17 @@ private struct AuthenticatedListSpacesHandler: ComAtprotoSpaceListSpaces.ServerH
             throw AuthenticatedSpaceListFailure.unavailable
         }
 
-        do {
-            return ComAtprotoSpaceListSpaces.Output(
-                cursor: page.cursor?.rawValue,
-                spaces: try page.spaces.map {
-                    ComAtprotoSpaceListSpaces.SpaceView(
-                        uri: try SpaceRef(uriString: $0.space.rawValue)
-                    )
-                }
-            )
-        } catch {
-            throw AuthenticatedSpaceListFailure.unavailable
-        }
+        return ListSpacesWireOutput(
+            cursor: page.cursor?.rawValue,
+            spaces: page.spaces.map {
+                .init(
+                    space: $0.space.rawValue,
+                    repoRev: $0.repoRev,
+                    data: $0.data.map(ListSpacesWireOutput.Bytes.init),
+                    spaceRev: $0.spaceRev
+                )
+            }
+        )
     }
 }
 
@@ -141,12 +141,14 @@ func registerAuthenticatedListSpacesEndpoint(
         let parameters: ComAtprotoSpaceListSpaces.Parameters
         do {
             parameters = try parseAuthenticatedListSpacesParameters(request)
+        } catch AuthenticatedSpaceListFailure.invalidCursor {
+            return authenticatedGetSpaceJSON(.badRequest, ["error": "InvalidCursor"])
         } catch {
             return authenticatedGetSpaceJSON(.badRequest, ["error": "InvalidRequest"])
         }
         do {
             let output = try await handler.handle(parameters: parameters, input: (), context: request)
-            return authenticatedListSpacesJSON(.ok, output)
+            return authenticatedGetSpaceJSON(.ok, output)
         } catch let failure as AuthenticatedSpaceListFailure {
             return authenticatedListSpacesResponse(failure, capability: capability)
         } catch {
@@ -174,13 +176,10 @@ private func parseAuthenticatedListSpacesParameters(
     if let query, !query.isEmpty {
         for segment in query.split(separator: "&", omittingEmptySubsequences: false) {
             let pair = segment.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-            // `spaceType` is the October 1 alpha filter name. The retired
-            // `type` key is rejected like any unknown key rather than
-            // ignored, so an old client gets a 400 instead of an unfiltered
-            // listing.
+            // November 12 renamed the authority filter to `spaceDid`.
             guard pair.count == 2,
                   let key = String(bytes: pair[0].utf8, encoding: .utf8),
-                  ["spaceType", "did", "limit", "cursor"].contains(key),
+                  ["spaceType", "spaceDid", "limit", "cursor"].contains(key),
                   !pair[1].isEmpty,
                   values[key] == nil else {
                 throw AuthenticatedSpaceListFailure.invalidRequest
@@ -192,7 +191,7 @@ private func parseAuthenticatedListSpacesParameters(
     }
 
     let spaceType = try values["spaceType"].map { try NSID(nsidString: bounded($0, maximumBytes: 317)) }
-    let did = try values["did"].map { try DID(didString: bounded($0, maximumBytes: 2_048)) }
+    let did = try values["spaceDid"].map { try DID(didString: bounded($0, maximumBytes: 2_048)) }
     let limit: Int?
     if let raw = values["limit"] {
         guard raw.utf8.allSatisfy({ $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }),
@@ -209,7 +208,7 @@ private func parseAuthenticatedListSpacesParameters(
         guard parsed.rawValue == cursor,
               (spaceType == nil || parsed.spaceType == spaceType?.nsidString()),
               (did == nil || parsed.authority == did?.didString()) else {
-            throw AuthenticatedSpaceListFailure.invalidRequest
+            throw AuthenticatedSpaceListFailure.invalidCursor
         }
     }
     return .init(spaceType: spaceType, did: did, limit: limit, cursor: cursor)
@@ -222,6 +221,8 @@ private func authenticatedListSpacesResponse(
     switch failure {
     case .invalidRequest:
         authenticatedGetSpaceJSON(.badRequest, ["error": "InvalidRequest"])
+    case .invalidCursor:
+        authenticatedGetSpaceJSON(.badRequest, ["error": "InvalidCursor"])
     case .denied:
         authenticatedGetSpaceJSON(.unauthorized, ["error": "Unauthorized"])
     case .nonceChallenge:
@@ -231,29 +232,32 @@ private func authenticatedListSpacesResponse(
     }
 }
 
-/// `SpaceView` is a generated generic lexicon value and its generic encoder
-/// adds `$type`; this query's pinned JSON schema is a plain object. The
-/// handler above still uses the exact generated input/output contracts. This
-/// private route-only projection removes the generator framing without
-/// adding any public fields or exposing storage data.
 private struct ListSpacesWireOutput: Encodable {
+    struct Bytes: Encodable {
+        let value: Data
+
+        init(_ value: Data) {
+            self.value = value
+        }
+
+        private enum CodingKeys: String, CodingKey { case bytes = "$bytes" }
+
+        func encode(to encoder: any Encoder) throws {
+            var values = encoder.container(keyedBy: CodingKeys.self)
+            try values.encode(
+                value.base64EncodedString().replacingOccurrences(of: "=", with: ""),
+                forKey: .bytes
+            )
+        }
+    }
+
     struct Space: Encodable {
-        let uri: String
+        let space: String
+        let repoRev: String?
+        let data: Bytes?
+        let spaceRev: String?
     }
 
     let cursor: String?
     let spaces: [Space]
-}
-
-private func authenticatedListSpacesJSON(
-    _ status: HTTPResponse.Status,
-    _ output: ComAtprotoSpaceListSpaces.Output
-) -> Response {
-    authenticatedGetSpaceJSON(
-        status,
-        ListSpacesWireOutput(
-            cursor: output.cursor,
-            spaces: output.spaces.map { .init(uri: $0.uri.uriString()) }
-        )
-    )
 }

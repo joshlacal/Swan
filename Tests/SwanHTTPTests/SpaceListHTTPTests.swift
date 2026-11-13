@@ -31,12 +31,10 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(uri: Self.path, method: .get, headers: headers) { response in
                     XCTAssertEqual(response.status, .ok)
                     let body = try self.json(response.body)
-                    XCTAssertEqual(Set(body.keys), ["cursor", "spaces"])
+                    XCTAssertEqual(Set(body.keys), ["spaces"])
                     let spaces = try XCTUnwrap(body["spaces"] as? [[String: Any]])
-                    XCTAssertEqual(spaces.map { $0["uri"] as? String }, [fixture.owner.rawValue])
-                    // The live lexicon's SpaceView carries only the URI;
-                    // isOwner was removed at bddc99fb.
-                    XCTAssertTrue(spaces.allSatisfy { Set($0.keys) == ["uri"] })
+                    XCTAssertEqual(spaces.map { $0["space"] as? String }, [fixture.owner.rawValue])
+                    XCTAssertTrue(spaces.allSatisfy { Set($0.keys) == ["space"] })
                     let rendered = String(decoding: response.body.readableBytesView, as: UTF8.self)
                     for forbidden in ["cid", "blob", "policy", "member", "value", "record"] {
                         XCTAssertFalse(rendered.localizedCaseInsensitiveContains(forbidden), forbidden)
@@ -55,7 +53,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
             try await app.test(.router) { client in
                 try await client.execute(uri: Self.path, method: .get, headers: afterWrite) { response in
                     XCTAssertEqual(response.status, .ok)
-                    XCTAssertEqual(((try self.json(response.body))["spaces"] as? [[String: Any]])?.map { $0["uri"] as? String }, [fixture.owner.rawValue, fixture.remote.rawValue])
+                    XCTAssertEqual(((try self.json(response.body))["spaces"] as? [[String: Any]])?.map { $0["space"] as? String }, [fixture.owner.rawValue, fixture.remote.rawValue])
                 }
             }
             try await close(fixture)
@@ -80,15 +78,17 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .ok)
                     let spaces = try XCTUnwrap(self.json(response.body)["spaces"] as? [[String: Any]])
                     XCTAssertEqual(spaces.count, 1)
-                    XCTAssertEqual(spaces[0]["uri"] as? String, fixture.remote.rawValue)
-                    XCTAssertTrue(spaces.allSatisfy { Set($0.keys) == ["uri"] })
+                    XCTAssertEqual(spaces[0]["space"] as? String, fixture.remote.rawValue)
+                    XCTAssertEqual(Set(spaces[0].keys), ["space", "repoRev", "data"])
+                    XCTAssertEqual(spaces[0]["repoRev"] as? String, "3k2l5u2q6za2y")
+                    XCTAssertNotNil((spaces[0]["data"] as? [String: Any])?["$bytes"] as? String)
                 }
                 let filtered = try signedHeaders(fixture.token, path: Self.path, runtime: fixture.runtime, jti: "filter")
-                try await client.execute(uri: "\(Self.path)?spaceType=app.example.space&did=\(Self.bob)", method: .get, headers: filtered) { response in
+                try await client.execute(uri: "\(Self.path)?spaceType=app.example.space&spaceDid=\(Self.bob)", method: .get, headers: filtered) { response in
                     XCTAssertEqual(response.status, .ok)
-                    XCTAssertEqual(((try self.json(response.body))["spaces"] as? [[String: Any]])?.map { $0["uri"] as? String }, [fixture.remote.rawValue])
+                    XCTAssertEqual(((try self.json(response.body))["spaces"] as? [[String: Any]])?.map { $0["space"] as? String }, [fixture.remote.rawValue])
                 }
-                for query in ["?unknown=x", "?limit=0", "?limit=1&limit=2", "?spaceType=invalid", "?type=app.example.space", "?type=app.example.space&spaceType=app.example.space", "?did=not-a-did", "?cursor=not-an-at-uri", "?did=\(Self.bob)&cursor=\(self.percent(fixture.owner.rawValue))"] {
+                for query in ["?unknown=x", "?limit=0", "?limit=1&limit=2", "?spaceType=invalid", "?type=app.example.space", "?type=app.example.space&spaceType=app.example.space", "?did=\(Self.bob)", "?spaceDid=not-a-did", "?cursor=not-an-at-uri", "?spaceDid=\(Self.bob)&cursor=\(self.percent(fixture.owner.rawValue))"] {
                     try await client.execute(uri: "\(Self.path)\(query)", method: .get) { response in
                         XCTAssertEqual(response.status, .badRequest, query)
                     }
@@ -100,13 +100,13 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
                 let narrowScope = "space:app.example.space?authority=\(Self.bob)&skey=*&action=read"
                 let narrow = try await issueToken(fixture.runtime, scopes: [narrowScope])
                 let narrowHeaders = try signedHeaders(narrow, path: Self.path, runtime: fixture.runtime, jti: "narrow-allowed")
-                try await client.execute(uri: "\(Self.path)?spaceType=app.example.space&did=\(Self.bob)", method: .get, headers: narrowHeaders) { response in
+                try await client.execute(uri: "\(Self.path)?spaceType=app.example.space&spaceDid=\(Self.bob)", method: .get, headers: narrowHeaders) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
                 // The spaceType filter is what the grant is checked against: a
                 // filter outside the narrow grant is denied, not widened.
                 let otherTypeHeaders = try signedHeaders(narrow, path: Self.path, runtime: fixture.runtime, jti: "narrow-other-type")
-                try await client.execute(uri: "\(Self.path)?spaceType=app.other.space&did=\(Self.bob)", method: .get, headers: otherTypeHeaders) { response in
+                try await client.execute(uri: "\(Self.path)?spaceType=app.other.space&spaceDid=\(Self.bob)", method: .get, headers: otherTypeHeaders) { response in
                     XCTAssertEqual(response.status, .unauthorized)
                 }
                 let deniedHeaders = try signedHeaders(narrow, path: Self.path, runtime: fixture.runtime, jti: "narrow-denied")
@@ -148,8 +148,8 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
             _ = try await database.createSimpleSpace(space: deleted, owner: Self.alice, configuration: try .init(readPolicy: .public, writePolicy: .public, appAccess: .open), authorization: .accountOAuthForTesting(subject: Self.alice, scopes: ["atproto"]))
             _ = try await database.deleteSimpleSpace(space: deleted, authorization: .accountOAuthForTesting(subject: Self.alice, scopes: ["atproto"]))
             try await database.receiveSpaceDeletionNotification(space: tombstoned, issuer: Self.bob, audience: Self.alice, eventID: "tombstone-list", requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: tombstoned))
-            let page = try await database.hostedSpaceURIs(spaceType: nil, authority: nil, cursor: nil, limit: 100)
-            XCTAssertEqual(page, [duplicate, tombstoned])
+            let page = try await database.hostedSpaces(spaceType: nil, authority: nil, cursor: nil, limit: 100)
+            XCTAssertEqual(page.map(\.space), [duplicate, tombstoned])
             try await database.close()
 
             let app = try makeServer(fixture).buildApplication(logger: Logger(label: "SpaceListHTTPTests.notified-member"))
@@ -158,7 +158,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(uri: Self.path, method: .get, headers: headers) { response in
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertEqual(
-                        ((try self.json(response.body))["spaces"] as? [[String: Any]])?.map { $0["uri"] as? String },
+                        ((try self.json(response.body))["spaces"] as? [[String: Any]])?.map { $0["space"] as? String },
                         [duplicate.rawValue, tombstoned.rawValue]
                     )
                 }
@@ -174,7 +174,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
             try await source.close()
             let restored = try await SQLiteAccountDatabase(dataDirectory: fixture.root.appending(path: "closure-restored"), did: Self.alice)
             try await restored.restorePortableRepositories([.init(space: fixture.remote, author: Self.alice, recovery: recovery)])
-            let restoredPage = try await restored.hostedSpaceURIs(spaceType: nil, authority: nil, cursor: nil, limit: 100)
+            let restoredPage = try await restored.hostedSpaces(spaceType: nil, authority: nil, cursor: nil, limit: 100)
             XCTAssertTrue(restoredPage.isEmpty)
             try await restored.close()
             try await close(fixture)

@@ -2946,10 +2946,8 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
-    /// Lists only canonical local hosted-space identities for the authenticated
-    /// subject. The directory repeats the active/startup-preopened/path checks
-    /// used by request-time repository projections, so a stale account path
-    /// can never become authority to reopen or migrate SQLite.
+    /// Lists only the authenticated account's hosted-space heads from its
+    /// startup-preopened active database.
     public func hostedSpaces(
         _ query: AuthorizedHostedSpaceListQuery,
         authorization: AuthorizationContext
@@ -2966,7 +2964,7 @@ public actor SQLitePreMigratedAccountDirectory:
             throw SwanError.unauthorized("account repository is unavailable")
         }
         do {
-            let spaces = try await database.hostedSpaceURIs(
+            let spaces = try await database.hostedSpaces(
                 spaceType: query.spaceType,
                 authority: query.authority,
                 cursor: query.cursor,
@@ -2978,15 +2976,9 @@ public actor SQLitePreMigratedAccountDirectory:
             guard !isClosed else {
                 throw SwanError.unavailable("authenticated space directory is unavailable")
             }
-            let projected = spaces.map {
-                AuthorizedHostedSpace(
-                    space: $0,
-                    isOwner: $0.authority == query.subject
-                )
-            }
             return AuthorizedHostedSpacePage(
-                spaces: projected,
-                cursor: projected.last?.space
+                spaces: spaces,
+                cursor: spaces.count == query.limit ? spaces.last?.space : nil
             )
         } catch let error as SwanError {
             throw error

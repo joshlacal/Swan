@@ -17,8 +17,8 @@ final class ConversationSpaceAuthorityStoreTests: XCTestCase {
             try await fixture.register(on: database, endpoint: fixture.endpoint, repository: nil)
             let policy = try await database.connection.query("SELECT 1 FROM permissioned_simple_space_authorities WHERE space_uri = ?", [.text(fixture.space.rawValue)])
             XCTAssertTrue(policy.isEmpty, "conversation membership must never be represented as synthetic simple-space policy")
-            let hosted = try await database.hostedSpaceURIs(spaceType: fixture.space.spaceType, authority: fixture.owner, cursor: nil, limit: 100)
-            XCTAssertEqual(hosted, [fixture.space])
+            let hosted = try await database.hostedSpaces(spaceType: fixture.space.spaceType, authority: fixture.owner, cursor: nil, limit: 100)
+            XCTAssertEqual(hosted.map(\.space), [fixture.space])
             let write = try fixture.notification()
             do {
                 try await database.receiveSpaceWriteNotification(write, now: fixture.now)
@@ -52,7 +52,7 @@ final class ConversationSpaceAuthorityStoreTests: XCTestCase {
                     XCTFail("closed conversation generation was accepted by operation \(operation)")
                 } catch let error as AuthorizedSimpleSpaceLifecycleError { XCTAssertEqual(error, .deleted) }
             }
-            let visibleAfterBegin = try await database.hostedSpaceURIs(spaceType: fixture.space.spaceType, authority: fixture.owner, cursor: nil, limit: 100)
+            let visibleAfterBegin = try await database.hostedSpaces(spaceType: fixture.space.spaceType, authority: fixture.owner, cursor: nil, limit: 100)
             XCTAssertTrue(visibleAfterBegin.isEmpty)
             try await database.close()
         } catch { try? await database.close(); throw error }

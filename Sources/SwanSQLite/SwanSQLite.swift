@@ -6939,37 +6939,34 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return state
     }
 
-    /// Enumerates the small, value-free local-PDS hosted-space projection for
-    /// this account.  This intentionally reads only `space_uri` identity
-    /// columns: it never touches record values, CIDs, blob references, or
-    /// simple-space policy/member state.  Request authorization and active
-    /// account/path admission belong to `SQLitePreMigratedAccountDirectory`;
-    /// this account-local primitive cannot select another database.
-    public func hostedSpaceURIs(
+    /// Enumerates this account's hosted-space projection, including only its
+    /// own repository head and, when it is the authority, the current space
+    /// revision. Record, policy, member, and blob values never cross this API.
+    public func hostedSpaces(
         spaceType: String?,
         authority: String?,
         cursor: SpaceURI?,
         limit: Int
-    ) async throws -> [SpaceURI] {
+    ) async throws -> [AuthorizedHostedSpace] {
         guard (1 ... 100).contains(limit) else {
             throw SwanError.malformed("invalid hosted-space page limit")
         }
         return try await withReadConnectionGate {
             try await readTransaction {
-                // `UNION` de-duplicates exact identity rows before Swift
-                // validates their canonical `SpaceURI` spelling and applies
-                // type/authority/cursor paging.  A local authority deletion,
-                // or v1 restored-policy closure always wins over a repository
-                // row. A syncer deletion notice preserves this account's own
-                // authored repository and its self-read projection.
                 let rows = try await readConnection.query(
                     """
-                    SELECT space_uri, MAX(is_local_authority) AS is_local_authority
+                    SELECT hosted.space_uri,
+                           MAX(hosted.is_local_authority) AS is_local_authority,
+                           repo.revision AS repo_revision,
+                           repo.wire_revision AS repo_rev,
+                           repo.lthash AS repo_lthash,
+                           repo.current_commit AS repo_marker,
+                           CASE WHEN MAX(hosted.is_local_authority) = 1
+                                THEN MAX(writer.space_rev) END AS space_rev
                     FROM (
                         SELECT a.space_uri AS space_uri, 1 AS is_local_authority
                         FROM permissioned_simple_space_authorities AS a
-                        WHERE a.owner_did = ?
-                          AND a.is_deleted = 0
+                        WHERE a.owner_did = ? AND a.is_deleted = 0
                         UNION
                         SELECT c.space_uri AS space_uri, 1 AS is_local_authority
                         FROM conversation_space_authorities AS c
@@ -6979,8 +6976,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         FROM permissioned_repository_state AS r
                         WHERE r.author_did = ?
                           AND NOT EXISTS (
-                              SELECT 1
-                              FROM permissioned_simple_space_authorities AS a
+                              SELECT 1 FROM permissioned_simple_space_authorities AS a
                               WHERE a.space_uri = r.space_uri AND a.is_deleted != 0
                           )
                           AND NOT EXISTS (
@@ -6988,23 +6984,26 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                               WHERE c.space_uri = r.space_uri AND c.state != 'active'
                           )
                           AND NOT EXISTS (
-                              SELECT 1
-                              FROM permissioned_restored_repository_closures AS c
+                              SELECT 1 FROM permissioned_restored_repository_closures AS c
                               WHERE c.space_uri = r.space_uri
                                 AND c.author_did = r.author_did
                                 AND c.reason = 'missing-authority-policy-v1'
                           )
-                    )
-                    WHERE (? IS NULL OR space_uri GLOB ?)
-                      AND (? IS NULL OR substr(space_uri, 1, length(?)) = ?)
-                      AND (? IS NULL OR space_uri > ?)
-                    GROUP BY space_uri
-                    ORDER BY space_uri ASC
+                    ) AS hosted
+                    LEFT JOIN permissioned_repository_state AS repo
+                      ON repo.space_uri = hosted.space_uri AND repo.author_did = ?
+                    LEFT JOIN permissioned_space_writers AS writer
+                      ON writer.space_uri = hosted.space_uri
+                    WHERE (? IS NULL OR hosted.space_uri GLOB ?)
+                      AND (? IS NULL OR substr(hosted.space_uri, 1, length(?)) = ?)
+                      AND (? IS NULL OR hosted.space_uri > ?)
+                    GROUP BY hosted.space_uri, repo.revision, repo.wire_revision,
+                             repo.lthash, repo.current_commit
+                    ORDER BY hosted.space_uri ASC
                     LIMIT ?
                     """,
                     [
-                        .text(accountDID),
-                        .text(accountDID),
+                        .text(accountDID), .text(accountDID), .text(accountDID),
                         .text(accountDID),
                         spaceType.map { "at://*/space/\($0)/*" }.map(SQLiteData.text) ?? .null,
                         spaceType.map { "at://*/space/\($0)/*" }.map(SQLiteData.text) ?? .null,
@@ -7017,7 +7016,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     ]
                 )
 
-                let validated = try rows.map { row -> SpaceURI in
+                return try rows.map { row in
                     let raw = try requiredText(row, "space_uri")
                     let space: SpaceURI
                     do {
@@ -7032,19 +7031,66 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             "noncanonical hosted-space identity"
                         )
                     }
-                    guard try requiredInteger(row, "is_local_authority") == 0
-                        || space.authority == accountDID else {
+                    let isAuthority = try requiredInteger(row, "is_local_authority") != 0
+                    guard !isAuthority || space.authority == accountDID else {
                         throw SQLiteRepositoryError.corruptDatabase(
                             "invalid hosted-space authority ownership"
                         )
                     }
-                    return space
+
+                    let repoRevision = row.column("repo_revision")?.integer
+                    let repoRev = row.column("repo_rev")?.string
+                    let repoLtHash = row.column("repo_lthash").flatMap(Data.init(sqliteData:))
+                    let repoMarker = row.column("repo_marker").flatMap(Data.init(sqliteData:))
+                    let data: Data?
+                    switch (repoRevision, repoRev, repoLtHash, repoMarker) {
+                    case (nil, nil, nil, nil):
+                        data = nil
+                    case let (.some(revision), .some(rawRepoRev), .some(ltHash), .some(marker)):
+                        guard revision >= 0, ltHash.count == LtHash.byteCount,
+                              let wireRevision = try? TID(tidString: rawRepoRev) else {
+                            throw SQLiteRepositoryError.corruptDatabase(
+                                "invalid hosted-space repository state"
+                            )
+                        }
+                        let commitment = Data(SHA256.hash(data: ltHash))
+                        let expectedMarker = try repositoryStateMarker(
+                            space: space,
+                            author: accountDID,
+                            revision: UInt64(revision),
+                            wireRevision: wireRevision,
+                            commitment: commitment
+                        )
+                        guard marker == expectedMarker else {
+                            throw SQLiteRepositoryError.corruptDatabase(
+                                "invalid hosted-space repository marker"
+                            )
+                        }
+                        data = commitment
+                    default:
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "partial hosted-space repository state"
+                        )
+                    }
+
+                    let rawSpaceRev = row.column("space_rev")?.string
+                    if let rawSpaceRev, (try? TID(tidString: rawSpaceRev)) == nil {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "invalid hosted-space revision"
+                        )
+                    }
+                    guard isAuthority || rawSpaceRev == nil else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "foreign hosted-space revision"
+                        )
+                    }
+                    return AuthorizedHostedSpace(
+                        space: space,
+                        repoRev: repoRev,
+                        data: data,
+                        spaceRev: rawSpaceRev
+                    )
                 }
-                return Array(validated.lazy.filter { space in
-                    (spaceType == nil || space.spaceType == spaceType)
-                        && (authority == nil || space.authority == authority)
-                        && (cursor == nil || space.rawValue > cursor!.rawValue)
-                }.prefix(limit))
             }
         }
     }

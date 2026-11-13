@@ -4721,14 +4721,14 @@ final class SwanSQLiteTests: XCTestCase {
         )
 
         // Subsequent read on readConnection sees the newly committed space
-        let hostedSpaces = try await database.hostedSpaceURIs(
+        let hostedSpaces = try await database.hostedSpaces(
             spaceType: nil,
             authority: nil,
             cursor: nil,
             limit: 100
         )
         XCTAssertTrue(
-            hostedSpaces.contains(space),
+            hostedSpaces.contains(where: { $0.space == space }),
             "subsequent read transaction must observe the newly committed space"
         )
     }
