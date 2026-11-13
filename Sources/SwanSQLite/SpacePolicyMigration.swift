@@ -337,9 +337,37 @@ public enum SpacePolicyMigrationReport {
                     recorded: true
                 )
             }
+            let reportableReasons: Set<String> = [
+                "allowed-app-not-a-uri",
+                "managing-app-missing-service",
+            ]
+            let current = try await conversions(connection: connection)
+            let currentBySpace = Dictionary(uniqueKeysWithValues: current.map { ($0.spaceURI, $0) })
+            entries = entries.map { entry in
+                guard let conversion = currentBySpace[entry.spaceURI] else { return entry }
+                let additions = conversion.reasons.filter {
+                    reportableReasons.contains($0) && !entry.reasons.contains($0)
+                }
+                guard !additions.isEmpty else { return entry }
+                return Entry(
+                    spaceURI: entry.spaceURI,
+                    owner: entry.owner,
+                    oldReadPolicy: entry.oldReadPolicy,
+                    oldReadManagingApp: entry.oldReadManagingApp,
+                    oldWritePolicy: entry.oldWritePolicy,
+                    oldWriteManagingApp: entry.oldWriteManagingApp,
+                    oldAppAccess: entry.oldAppAccess,
+                    oldAllowedClients: entry.oldAllowedClients,
+                    droppedMemberCount: entry.droppedMemberCount,
+                    newPolicyType: entry.newPolicyType,
+                    newManagingApp: entry.newManagingApp,
+                    reasons: entry.reasons + additions,
+                    recorded: true
+                )
+            }
             let recordedSpaces = Set(entries.map(\.spaceURI))
-            entries.append(contentsOf: try await conversions(connection: connection).filter {
-                $0.reasons.contains("managing-app-missing-service")
+            entries.append(contentsOf: current.filter {
+                !$0.reasons.filter(reportableReasons.contains).isEmpty
                     && !recordedSpaces.contains($0.spaceURI)
             })
             return entries.sorted { $0.spaceURI < $1.spaceURI }
@@ -385,6 +413,9 @@ public enum SpacePolicyMigrationReport {
             ).first?.column("count")?.integer ?? 0
 
             var reasons: [String] = []
+            if clients.contains(where: { !SpacePolicyValidation.isValidURI($0) }) {
+                reasons.append("allowed-app-not-a-uri")
+            }
             let newType: String
             let newApp: String?
             if let managingApp = readApp ?? writeApp {

@@ -362,6 +362,13 @@ final class SpacePolicyOctober29Tests: XCTestCase {
                 [.text(allowList.rawValue)]
             )
             _ = try await connection.query(
+                """
+                INSERT INTO permissioned_simple_space_clients(space_uri, client_id)
+                VALUES (?, ?)
+                """,
+                [.text(allowList.rawValue), .text("legacy-client-name")]
+            )
+            _ = try await connection.query(
                 "DELETE FROM permissioned_repository_migrations WHERE version = 29"
             )
             _ = try await connection.query("DROP TABLE IF EXISTS permissioned_space_policy_migration_v29")
@@ -370,7 +377,10 @@ final class SpacePolicyOctober29Tests: XCTestCase {
         let databasePath = SQLiteLayout.accountDatabase(in: root, did: Self.alice).path
         let predicted = try await SpacePolicyMigrationReport.scan(databasePath: databasePath)
         XCTAssertTrue(predicted.allSatisfy { !$0.recorded })
-        XCTAssertEqual(Set(predicted.map(\.spaceURI)), [oneSided.rawValue, notADID.rawValue])
+        XCTAssertEqual(
+            Set(predicted.map(\.spaceURI)),
+            [oneSided.rawValue, notADID.rawValue, allowList.rawValue]
+        )
 
         try await withDatabase { database in
             let one = try await database.simpleSpace(oneSided, authorization: owner)
@@ -384,7 +394,19 @@ final class SpacePolicyOctober29Tests: XCTestCase {
             let member = try await database.simpleSpace(allowList, authorization: owner)
             XCTAssertEqual(
                 member?.space.configuration.policy,
-                .member(try MemberSpacePolicy(publicRead: true, allowedApps: []))
+                .member(try MemberSpacePolicy(
+                    publicRead: true,
+                    allowedApps: ["legacy-client-name"]
+                ))
+            )
+            let connection = await database.connection
+            _ = try await connection.query(
+                """
+                UPDATE permissioned_space_policy_migration_v29
+                SET reasons = 'one-sided-managing-app,members-dropped'
+                WHERE space_uri = ?
+                """,
+                [.text(oneSided.rawValue)]
             )
         }
 
@@ -397,9 +419,13 @@ final class SpacePolicyOctober29Tests: XCTestCase {
         XCTAssertEqual(oneEntry.droppedMemberCount, 1)
         XCTAssertTrue(oneEntry.reasons.contains("one-sided-managing-app"))
         XCTAssertTrue(oneEntry.reasons.contains("members-dropped"))
+        XCTAssertTrue(oneEntry.reasons.contains("managing-app-missing-service"))
         let notEntry = try XCTUnwrap(byURI[notADID.rawValue])
         XCTAssertEqual(notEntry.newPolicyType, "personalspace")
         XCTAssertTrue(notEntry.reasons.contains("managing-app-not-a-did"))
+        let allowEntry = try XCTUnwrap(byURI[allowList.rawValue])
+        XCTAssertEqual(allowEntry.oldAllowedClients, ["legacy-client-name"])
+        XCTAssertTrue(allowEntry.reasons.contains("allowed-app-not-a-uri"))
         XCTAssertEqual(predicted.count, recorded.count)
     }
 }
