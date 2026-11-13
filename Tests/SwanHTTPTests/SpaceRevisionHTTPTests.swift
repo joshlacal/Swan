@@ -346,7 +346,7 @@ private struct SpaceRevisionHTTPFixture {
         SwanHTTPServer(
             profile: try ProtocolProfile.load(from: URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-                .appending(path: "Profiles/permissioned-data-0016-2026-10-01.json")),
+                .appending(path: "Profiles/permissioned-data-0016-2026-11-12.json")),
             configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: URL(string: "https://swan.example")!),
             oauthRuntime: runtime,
             authenticatedGetSpaceDirectory: directory,

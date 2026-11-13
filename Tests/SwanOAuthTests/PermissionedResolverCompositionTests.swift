@@ -144,12 +144,16 @@ final class PermissionedResolverCompositionTests: XCTestCase {
             expectedMethod: "com.atproto.space.notifyRepoUpdate",
             now: now
         )
-        _ = try await serviceVerifier.authenticate(
-            Self.remoteService,
-            expectedAudience: remoteAuthority,
-            expectedMethod: "com.atproto.space.notifyRepoUpdate",
-            now: now
-        )
+        // The retained TypeScript token is validly signed by the pinned key,
+        // but names the retired notifyWrite method.
+        await XCTAssertCompositionThrowsError {
+            _ = try await serviceVerifier.authenticate(
+                Self.remoteService,
+                expectedAudience: self.remoteAuthority,
+                expectedMethod: "com.atproto.space.notifyRepoUpdate",
+                now: self.now
+            )
+        }
     }
 
     func testConflictingPinnedAndLocalIdentitiesFailComposition() async throws {

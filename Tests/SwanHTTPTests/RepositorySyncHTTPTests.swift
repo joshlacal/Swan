@@ -124,7 +124,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             controlStore: fixture.control
         )
         let profile = try ProtocolProfile.load(
-            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-29.json")
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-11-12.json")
         )
         let server = SwanHTTPServer(
             profile: profile,
@@ -1295,7 +1295,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         jsonReadAdmission: PublicRepositoryJSONReadAdmission? = nil
     ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
-            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-29.json")
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-11-12.json")
         )
         let selectedDirectory = directory ?? fixture.directory
         return SwanHTTPServer(
@@ -1330,7 +1330,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
     /// legacy credential configuration.
     private func makeExchangeAndSyncOnlyServer(_ fixture: Fixture) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
-            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-29.json")
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-11-12.json")
         )
         let credentials = SwanSpaceCredentialHTTPConfiguration(
             authoritySigningKeys: LocalAccountSpaceCredentialSigningKeyResolver(

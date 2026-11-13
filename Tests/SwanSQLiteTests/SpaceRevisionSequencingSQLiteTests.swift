@@ -369,6 +369,20 @@ final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
         do {
             _ = try await v29.query(
                 """
+                CREATE TABLE permissioned_space_notification_registrations (
+                    space_uri TEXT NOT NULL,
+                    service_key TEXT NOT NULL,
+                    endpoint TEXT NOT NULL,
+                    repo_did TEXT,
+                    expires_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    owner_service_did TEXT,
+                    delivery_service_did TEXT
+                )
+                """
+            )
+            _ = try await v29.query(
+                """
                 INSERT INTO permissioned_space_notification_registrations(
                     space_uri, service_key, endpoint, repo_did, expires_at, updated_at,
                     owner_service_did, delivery_service_did
@@ -383,6 +397,21 @@ final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
                     .text(fixture.authority),
                 ]
             )
+            for table in [
+                "permissioned_space_notification_fanout",
+                "conversation_space_deletion_recipients",
+            ] {
+                _ = try await v29.query("CREATE TABLE \(table) (id TEXT NOT NULL)")
+                _ = try await v29.query("INSERT INTO \(table)(id) VALUES ('retired-row')")
+            }
+            for table in [
+                "permissioned_space_notification_registrations",
+                "permissioned_space_notification_fanout",
+                "conversation_space_deletion_recipients",
+            ] {
+                let rows = try await v29.query("SELECT COUNT(*) AS count FROM \(table)")
+                XCTAssertEqual(rows.first?.column("count")?.integer, 1)
+            }
             _ = try await v29.query(
                 "DELETE FROM permissioned_repository_migrations WHERE version = 30"
             )
@@ -417,10 +446,17 @@ final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
             Set(registrationColumns.compactMap { $0.column("name")?.string }),
             ["space_uri", "endpoint", "token", "expires_at", "expiry_notified", "updated_at"]
         )
-        let retiredRows = try await reopened.connection.query(
-            "SELECT 1 FROM permissioned_space_notification_registrations"
+        let retiredTables = try await reopened.connection.query(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name IN (
+                'permissioned_space_notification_registrations',
+                'permissioned_space_notification_fanout',
+                'conversation_space_deletion_recipients'
+            )
+            """
         )
-        XCTAssertTrue(retiredRows.isEmpty)
+        XCTAssertTrue(retiredTables.isEmpty, "v30 must drop one seeded row with each retired table")
         let integrity = try await reopened.connection.query("PRAGMA integrity_check")
         XCTAssertEqual(integrity.first?.column("integrity_check")?.string, "ok")
         let foreignKeyViolations = try await reopened.connection.query(

@@ -147,11 +147,12 @@ final class SimpleSpaceAuthorityRebuildUpgradeTests: XCTestCase {
         return dangling
     }
 
-    /// `required` defaults to every version a v18 upgrade applies; a store
-    /// Swan created fresh never records the upgrade-only versions.
+    /// `required` defaults to every migration retained by the November 12
+    /// upgrade path. Versions 22 and 27 belonged only to retired notification
+    /// tables, so v30 supersedes them.
     private func assertFullyMigrated(
         _ database: SQLiteAccountDatabase,
-        required: Set<Int> = Set(1...29)
+        required: Set<Int> = Set(1...30).subtracting([22, 27])
     ) async throws {
         let connection = await database.connection
         let versions = try await appliedVersions(connection)
@@ -164,7 +165,7 @@ final class SimpleSpaceAuthorityRebuildUpgradeTests: XCTestCase {
         XCTAssertEqual(legacyAlter.first?.column("legacy_alter_table")?.integer, 0)
     }
 
-    func testV18StoreWithWriterAndNotificationRegistrationMigratesToV29() async throws {
+    func testV18StoreWithWriterAndRetiredNotificationRegistrationMigratesToV30() async throws {
         try await withDatabase { database in
             let connection = await database.connection
             try await resetToV18(connection)
@@ -182,10 +183,16 @@ final class SimpleSpaceAuthorityRebuildUpgradeTests: XCTestCase {
                 [.text(memberSpace.rawValue)]
             )
             XCTAssertEqual(writers.compactMap { $0.column("repo_did")?.string }, [Self.bob])
-            // v22 discards registrations that predate authenticated ownership
-            // by design; v23 must not be what stops the upgrade.
+            // v30 retires the pre-authorizeSpaceSync registration table.
+            let retiredRegistrationTable = try await connection.query(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'permissioned_space_notification_registrations'
+                """
+            )
+            XCTAssertTrue(retiredRegistrationTable.isEmpty)
             let registrations = try await connection.query(
-                "SELECT COUNT(*) AS count FROM permissioned_space_notification_registrations"
+                "SELECT COUNT(*) AS count FROM permissioned_space_sync_registrations"
             )
             XCTAssertEqual(registrations.first?.column("count")?.integer, 0)
 
@@ -208,7 +215,7 @@ final class SimpleSpaceAuthorityRebuildUpgradeTests: XCTestCase {
         XCTAssertTrue(entry.recorded)
         XCTAssertEqual(entry.newPolicyType, "managedspace")
         XCTAssertEqual(entry.newManagingApp, Self.manager)
-        XCTAssertEqual(entry.reasons, ["one-sided-managing-app"])
+        XCTAssertEqual(entry.reasons, ["managing-app-missing-service", "one-sided-managing-app"])
     }
 
     /// A store an older binary already took through v23 while its writer
@@ -296,62 +303,4 @@ final class SimpleSpaceAuthorityRebuildUpgradeTests: XCTestCase {
         }
     }
 
-    /// alpha.swan.place's shape: a store already past v22 and v23, whose
-    /// writer registry was rebuilt by v21 but whose notification
-    /// registrations still reference the dropped `_schema_v2` parent. The
-    /// table keeps its current (v27) columns here, so no versioned rebuild
-    /// touches it and only the unconditional foreign-key check on open can
-    /// repair it; the repair must keep the row.
-    func testFullyMigratedStoreWithDanglingRegistrationReferenceIsRepairedOnOpen() async throws {
-        var freshVersions: Set<Int> = []
-        try await withDatabase { database in
-            let connection = await database.connection
-            freshVersions = try await appliedVersions(connection)
-            XCTAssertTrue(freshVersions.isSuperset(of: [21, 22, 23, 27, 29]))
-            let schema = try await connection.query(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'permissioned_space_notification_registrations'"
-            )
-            let currentSQL = try XCTUnwrap(schema.first?.column("sql")?.string)
-            XCTAssertTrue(currentSQL.contains("service_key"))
-            let closing = try XCTUnwrap(currentSQL.lastIndex(of: ")"))
-            let danglingSQL = currentSQL[..<closing]
-                + ", FOREIGN KEY(space_uri) REFERENCES permissioned_simple_space_authorities_schema_v2(space_uri)"
-                + " ON DELETE CASCADE)"
-            _ = try await connection.query("PRAGMA foreign_keys = OFF")
-            _ = try await connection.query("DROP TABLE permissioned_space_notification_registrations")
-            _ = try await connection.query(String(danglingSQL))
-            _ = try await connection.query(
-                """
-                INSERT INTO permissioned_space_notification_registrations(
-                    space_uri, service_key, endpoint, repo_did, expires_at, updated_at,
-                    owner_service_did, delivery_service_did
-                ) VALUES (?, 'did:web:appview.example', 'https://appview.example/notify', NULL,
-                          4102444800, 1, 'did:web:appview.example', 'did:web:appview.example')
-                """,
-                [.text(memberSpace.rawValue)]
-            )
-            _ = try await connection.query("PRAGMA foreign_keys = ON")
-            let dangling = try await danglingForeignKeys(connection)
-            XCTAssertEqual(dangling, [
-                "permissioned_space_notification_registrations -> permissioned_simple_space_authorities_schema_v2",
-            ])
-        }
-
-        try await withDatabase { database in
-            try await assertFullyMigrated(database, required: freshVersions)
-            let connection = await database.connection
-            let references = try await connection.query(
-                "PRAGMA foreign_key_list(permissioned_space_notification_registrations)"
-            )
-            XCTAssertTrue(references.isEmpty)
-            let registrations = try await connection.query(
-                "SELECT endpoint FROM permissioned_space_notification_registrations WHERE space_uri = ?",
-                [.text(memberSpace.rawValue)]
-            )
-            XCTAssertEqual(
-                registrations.compactMap { $0.column("endpoint")?.string },
-                ["https://appview.example/notify"]
-            )
-        }
-    }
 }

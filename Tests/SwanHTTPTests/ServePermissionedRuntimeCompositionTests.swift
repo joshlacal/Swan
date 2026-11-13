@@ -89,7 +89,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-10-29.json"
+                        path: "Profiles/permissioned-data-0016-2026-11-12.json"
                     )
                 ),
                 configuration: .init(
@@ -560,15 +560,12 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 let registrations = try await evidenceConnection.query(
                     """
                     SELECT endpoint
-                    FROM permissioned_space_notification_registrations
+                    FROM permissioned_space_sync_registrations
                     WHERE space_uri = ?
                     """,
                     [.text(space.rawValue)]
                 )
-                XCTAssertEqual(
-                    registrations.first?.column("endpoint")?.string,
-                    "https://receiver.example/xrpc/com.atproto.space.notifyRepoUpdate"
-                )
+                XCTAssertTrue(registrations.isEmpty)
                 let writers = try await evidenceConnection.query(
                     """
                     SELECT repo_did, wire_revision, space_rev
@@ -643,10 +640,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                     """,
                     [.text(lifecycle.rawValue)]
                 )
-                XCTAssertEqual(
-                    tombstones.first?.column("authority_did")?.string,
-                    localDID
-                )
+                XCTAssertTrue(tombstones.isEmpty)
                 try await evidenceConnection.close()
             } catch {
                 try? await evidenceConnection.close()
@@ -857,7 +851,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let server = composition.makeServer(
                 profile: try ProtocolProfile.load(
                     from: packageRoot().appending(
-                        path: "Profiles/permissioned-data-0016-2026-10-29.json"
+                        path: "Profiles/permissioned-data-0016-2026-11-12.json"
                     )
                 ),
                 configuration: .init(
@@ -1018,13 +1012,18 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 expectedRequestBodyDigest: nil,
                 now: now
             )
-            _ = try await service.authenticate(
-                Self.remoteService,
-                expectedAudience: localDID,
-                expectedMethod: "com.atproto.space.notifyRepoUpdate",
-                expectedRequestBodyDigest: nil,
-                now: now
-            )
+            // The retained TypeScript token is validly signed by the pinned
+            // key, but names the retired notifyWrite method.
+            do {
+                _ = try await service.authenticate(
+                    Self.remoteService,
+                    expectedAudience: localDID,
+                    expectedMethod: "com.atproto.space.notifyRepoUpdate",
+                    expectedRequestBodyDigest: nil,
+                    now: now
+                )
+                XCTFail("the retired notifyWrite service token must be rejected")
+            } catch {}
             try await fixture.close()
         } catch {
             try? await fixture.close()

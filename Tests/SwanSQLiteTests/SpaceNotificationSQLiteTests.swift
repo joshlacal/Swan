@@ -850,7 +850,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             attemptAt = attemptAt.addingTimeInterval(TimeInterval(delay))
         }
         guard case .dropped = try await retryWorker.deliverNext(
-            now: start.addingTimeInterval(72 * 60 * 60)
+            now: start.addingTimeInterval(72 * 60 * 60 + 1)
         ) else {
             return XCTFail("retry exhaustion must drop the registration")
         }

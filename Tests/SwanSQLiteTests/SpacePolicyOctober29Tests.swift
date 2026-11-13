@@ -73,7 +73,10 @@ final class SpacePolicyOctober29Tests: XCTestCase {
 
     private func writers(_ database: SQLiteAccountDatabase) async throws -> Set<String> {
         let rows = try await database.connection.query(
-            "SELECT repo_did FROM permissioned_space_writers WHERE space_uri = ?",
+            """
+            SELECT repo_did FROM permissioned_space_writers
+            WHERE space_uri = ? AND removed_at IS NULL
+            """,
             [.text(space.rawValue)]
         )
         return Set(rows.compactMap { $0.column("repo_did")?.string })

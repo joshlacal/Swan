@@ -323,6 +323,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     var headers = signed
                     headers[HTTPField.Name(SpaceMACHeaders.requestHeader)!] =
                         request.headerValue
+                    headers[.origin] = "https://client.example"
                     try await client.execute(
                         uri: uri,
                         method: .get,
@@ -1729,7 +1730,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         credentialPolicyDirectory: (any AuthorizedSimpleSpaceCredentialDirectory)? = nil
     ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
-            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-29.json")
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-11-12.json")
         )
         let signing = StaticSigningKeyResolver(
             authority: Self.authority,

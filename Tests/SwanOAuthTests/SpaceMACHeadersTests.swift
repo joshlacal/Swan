@@ -77,7 +77,7 @@ final class SpaceMACHeadersTests: XCTestCase {
             request
         )
         XCTAssertNil(try SpaceMACHeaders.parseRequest([""], profile: .commit))
-        XCTAssertNil(try SpaceMACHeaders.parseRequest([" \t"], profile: .commit))
+        XCTAssertThrowsError(try SpaceMACHeaders.parseRequest([" \t"], profile: .commit))
 
         let failures = [
             #"a=("atproto-space-commit");keyid="\#(keyID)";tag="atproto-space-commit""#,
