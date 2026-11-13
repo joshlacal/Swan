@@ -401,7 +401,7 @@ final class OAuthLexiconScopeResolutionTests: XCTestCase {
         let expanded = try XCTUnwrap(result.scopes.first { $0.hasPrefix("space:") })
         let stated = result.provenance.statedParameterKeys[expanded]
         XCTAssertEqual(
-            stated, ["type"],
+            stated, ["spaceType"],
             """
             §9-D23: the document wrote only the space type. `authority`, `skey`, \
             `action` and `manage` were defaulted and must not read as stated.

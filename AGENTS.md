@@ -100,8 +100,8 @@ Blobs are stored by content digest under `blobs/`, and encrypted account keys re
 Swan uses protocol profile pins under `Profiles/*.json` to fix protocol versions, lexicon dependencies, and expected cryptographic hashes.
 
 - The active profile in source is `permissioned-data-0016-2026-11-12` (defined in `Profiles/permissioned-data-0016-2026-11-12.json`).
-- Profile pins specify SHA-256 hashes of lexicon definitions (`.lexicons.sha256`) and generated wire code (`.generated-wire.sha256`).
-- Regenerating wire types is an explicit profile-pinned operation that uses an external generator workspace. Wire types are never regenerated during a normal `swift build`.
+- Profile pins specify SHA-256 hashes of lexicon definitions (`.lexicons.sha256`) and the compact generated wire registry (`.generated-wire.sha256`).
+- `Scripts/generate-space-descriptors.py` regenerates `Sources/SwanSpacesWire/SwanSpacesWire.swift`; generated code is never refreshed during a normal `swift build`.
 
 ## Generated-code boundary
 
@@ -139,7 +139,7 @@ swift run swan verify
 
 The verify subcommand runs `OfflineProtocolProfileVerifier.verify`, checking that:
 - The pinned profile JSON (`Profiles/permissioned-data-0016-2026-11-12.json` by default) is syntactically and semantically valid.
-- Checked-in generated wire files in `Sources/SwanSpacesWire/Generated` match their pinned SHA-256 digests without requiring network access.
+- The checked-in compact registry at `Sources/SwanSpacesWire/SwanSpacesWire.swift` matches its pinned SHA-256 digest without requiring network access.
 
 To verify pinned lexicons against an upstream reference repository:
 ```bash
