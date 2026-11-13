@@ -223,28 +223,30 @@ public struct SwanOAuthAuthorizationServerConfiguration: Sendable {
     }
 }
 
-/// The explicit, offline-only dependencies that enable the permissioned
-/// delegation exchange and Bearer credential read paths. The server combines
-/// these with the exact startup-preopened directory supplied to its
-/// initializer, so an issuer cannot accidentally evaluate policy through an
-/// arbitrary request-selected database. Every resolver is local or pinned;
-/// none receives network authority from an HTTP request.
+/// Startup-wired dependencies for permissioned delegation exchange and
+/// credential read paths. Policy and key lookup stay local or pinned. The
+/// optional registration confirmer is the sole request-selected network
+/// capability and applies Swan's SSRF-guarded outbound-fetch policy before
+/// connecting.
 public struct SwanSpaceCredentialHTTPConfiguration: Sendable {
     let authoritySigningKeys: any SpaceCredentialSigningKeyResolver
     let delegationPublicKeys: any SpaceDelegationPublicKeyResolver
     let credentialPublicKeys: any SpaceCredentialPublicKeyResolver
     let clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy
+    let registrationConfirmer: (any SwanSpaceRegistrationConfirming)?
 
     public init(
         authoritySigningKeys: any SpaceCredentialSigningKeyResolver,
         delegationPublicKeys: any SpaceDelegationPublicKeyResolver,
         credentialPublicKeys: any SpaceCredentialPublicKeyResolver,
-        clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy = UnavailableSpaceCredentialClientAttestationPolicy()
+        clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy = UnavailableSpaceCredentialClientAttestationPolicy(),
+        registrationConfirmer: (any SwanSpaceRegistrationConfirming)? = nil
     ) {
         self.authoritySigningKeys = authoritySigningKeys
         self.delegationPublicKeys = delegationPublicKeys
         self.credentialPublicKeys = credentialPublicKeys
         self.clientAttestationPolicy = clientAttestationPolicy
+        self.registrationConfirmer = registrationConfirmer
     }
 }
 
@@ -766,6 +768,8 @@ public struct SwanHTTPServer: Sendable {
                 spaceCredentialExchangeConfiguration ?? spaceCredentialConfiguration
             if let credentialDirectory = authenticatedGetSpaceDirectory
                 as? any AuthorizedSimpleSpaceCredentialDirectory,
+               let registrationDirectory = authenticatedGetSpaceDirectory
+                as? any AuthorizedSpaceSyncRegistrationDirectory,
                let exchangeCredentialConfiguration {
                 authenticatedSpaceCredentialExchange = SwanSpaceCredentialExchangeCapability(
                     authorizer: authorizer,
@@ -778,7 +782,9 @@ public struct SwanHTTPServer: Sendable {
                         signingKeys: exchangeCredentialConfiguration.authoritySigningKeys,
                         clientAttestationPolicy: exchangeCredentialConfiguration.clientAttestationPolicy,
                         configuration: spaceCredentialIssuance
-                    )
+                    ),
+                    registrationDirectory: registrationDirectory,
+                    registrationConfirmer: exchangeCredentialConfiguration.registrationConfirmer
                 )
             } else {
                 authenticatedSpaceCredentialExchange = nil
@@ -1188,7 +1194,7 @@ public struct SwanHTTPServer: Sendable {
                 )
             } else if descriptor.nsid == ComAtprotoSpaceGetSpaceCredential.typeIdentifier,
                       let authenticatedSpaceCredentialExchange {
-                registerAuthenticatedGetSpaceCredentialEndpoint(
+                registerAuthenticatedAuthorizeSpaceSyncEndpoint(
                     on: router,
                     capability: authenticatedSpaceCredentialExchange,
                     requestBodyAdmission: requestBodyAdmission
@@ -1252,20 +1258,6 @@ public struct SwanHTTPServer: Sendable {
                 registerAuthenticatedListSpaceWritersEndpoint(
                     on: router,
                     capability: authenticatedSpaceNotifications
-                )
-            } else if descriptor.nsid == ComAtprotoSpaceRegisterNotify.typeIdentifier,
-                      let authenticatedSpaceNotifications {
-                registerAuthenticatedRegisterSpaceNotifyEndpoint(
-                    on: router,
-                    capability: authenticatedSpaceNotifications,
-                    requestBodyAdmission: requestBodyAdmission
-                )
-            } else if descriptor.nsid == ComAtprotoSpaceUnregisterNotify.typeIdentifier,
-                      let authenticatedSpaceNotifications {
-                registerAuthenticatedUnregisterSpaceNotifyEndpoint(
-                    on: router,
-                    capability: authenticatedSpaceNotifications,
-                    requestBodyAdmission: requestBodyAdmission
                 )
             } else if descriptor.nsid == ComAtprotoSpaceNotifyWrite.typeIdentifier,
                       let authenticatedSpaceNotifications {

@@ -2908,6 +2908,39 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 """
             )
         }
+        let registrationTable = try await connection.query(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'permissioned_space_sync_registrations'
+            """
+        )
+        _ = try await connection.query(
+            """
+            CREATE TABLE IF NOT EXISTS permissioned_space_sync_registrations (
+                space_uri TEXT NOT NULL,
+                endpoint TEXT NOT NULL CHECK(length(endpoint) BETWEEN 1 AND 4096),
+                token TEXT NOT NULL CHECK(length(token) BETWEEN 1 AND 512),
+                expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+                expiry_notified INTEGER NOT NULL DEFAULT 0
+                    CHECK(expiry_notified IN (0, 1)),
+                updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+                PRIMARY KEY(space_uri, endpoint, token)
+            )
+            """
+        )
+        _ = try await connection.query(
+            """
+            CREATE INDEX IF NOT EXISTS permissioned_space_sync_registrations_expiry
+            ON permissioned_space_sync_registrations(expires_at, expiry_notified)
+            """
+        )
+        if registrationTable.isEmpty {
+            // The November registration identity is unrelated to the retired
+            // endpoint/service rows. Do not guess a token: discard them.
+            _ = try await connection.query(
+                "DELETE FROM permissioned_space_notification_registrations"
+            )
+        }
         _ = try await connection.query(
             """
             INSERT OR IGNORE INTO permissioned_repository_migrations(version, applied_at)
@@ -8930,6 +8963,129 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         [.text(space.rawValue), .text(owner), .text(baseDID)]
                     )
                 }
+            }
+        }
+    }
+
+    public func activeSpaceRevision(_ space: SpaceURI) async throws -> String? {
+        try requireAuthorityAccount(space: space)
+        return try await withConnectionGate {
+            try await transaction {
+                if space.spaceType == "blue.catbird.labyrinth.conversation" {
+                    try await requireNotificationAuthorityActive(
+                        space,
+                        connection: connection
+                    )
+                } else {
+                    let stored = try await requiredSimpleSpace(
+                        space,
+                        connection: connection
+                    )
+                    guard !stored.state.space.isDeleted else {
+                        throw AuthorizedSimpleSpaceLifecycleError.deleted
+                    }
+                }
+                return try await latestSpaceRevisionWithoutGate(space: space)
+            }
+        }
+    }
+    public func spaceSyncRegistration(
+        space: SpaceURI,
+        endpoint: String,
+        token: String
+    ) async throws -> AuthorizedSpaceSyncRegistration? {
+        try requireAuthorityAccount(space: space)
+        return try await withConnectionGate {
+            try await transaction {
+                try await requireNotificationAuthorityActive(space, connection: connection)
+                let row = try await connection.query(
+                    """
+                    SELECT expires_at, expiry_notified
+                    FROM permissioned_space_sync_registrations
+                    WHERE space_uri = ? AND endpoint = ? AND token = ?
+                    """,
+                    [.text(space.rawValue), .text(endpoint), .text(token)]
+                ).first
+                guard let row,
+                      let expiresAt = row.column("expires_at")?.integer,
+                      let expiryNotified = row.column("expiry_notified")?.integer,
+                      (0...1).contains(expiryNotified) else {
+                    if row != nil {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "invalid space sync registration"
+                        )
+                    }
+                    return nil
+                }
+                return AuthorizedSpaceSyncRegistration(
+                    space: space,
+                    endpoint: endpoint,
+                    token: token,
+                    expiresAt: Date(
+                        timeIntervalSince1970: TimeInterval(expiresAt) / 1_000_000
+                    ),
+                    expiryNotified: expiryNotified == 1
+                )
+            }
+        }
+    }
+
+    public func putSpaceSyncRegistration(
+        _ registration: AuthorizedSpaceSyncRegistration
+    ) async throws {
+        guard registration.endpoint.count <= 4_096,
+              !registration.endpoint.isEmpty,
+              registration.token.utf16.count <= 512,
+              !registration.token.isEmpty else {
+            throw SwanError.malformed("invalid space sync registration")
+        }
+        let expiresAt = try simpleSpaceTimestamp(registration.expiresAt)
+        let updatedAt = try simpleSpaceTimestamp(Date())
+        try requireAuthorityAccount(space: registration.space)
+        try await withConnectionGate {
+            try await transaction {
+                try await requireNotificationAuthorityActive(
+                    registration.space,
+                    connection: connection
+                )
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_sync_registrations(
+                        space_uri, endpoint, token, expires_at, expiry_notified, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(space_uri, endpoint, token) DO UPDATE SET
+                        expires_at = excluded.expires_at,
+                        expiry_notified = excluded.expiry_notified,
+                        updated_at = excluded.updated_at
+                    """,
+                    [
+                        .text(registration.space.rawValue),
+                        .text(registration.endpoint),
+                        .text(registration.token),
+                        .integer(expiresAt),
+                        .integer(registration.expiryNotified ? 1 : 0),
+                        .integer(updatedAt),
+                    ]
+                )
+            }
+        }
+    }
+
+    public func removeSpaceSyncRegistration(
+        space: SpaceURI,
+        endpoint: String,
+        token: String
+    ) async throws {
+        try requireAuthorityAccount(space: space)
+        try await withConnectionGate {
+            try await transaction {
+                _ = try await connection.query(
+                    """
+                    DELETE FROM permissioned_space_sync_registrations
+                    WHERE space_uri = ? AND endpoint = ? AND token = ?
+                    """,
+                    [.text(space.rawValue), .text(endpoint), .text(token)]
+                )
             }
         }
     }

@@ -963,13 +963,38 @@ struct ServePermissionedRuntime {
             }
         }
 
+        let registrationConfirmer: HTTPSwanSpaceRegistrationConfirmer?
+        if local != nil {
+            do {
+                let pinned = notification?.peerPinnedTransportConfiguration
+                let policy = try OAuthRemoteFetchPolicy(
+                    allowLocalhostDevelopment: notification != nil
+                )
+                registrationConfirmer = HTTPSwanSpaceRegistrationConfirmer(
+                    policy: policy,
+                    transport: NIOPeerPinnedOAuthPostTransport(
+                        configuration: try .init(
+                            endpointPeers: pinned?.endpointPeers ?? [:],
+                            allowsDynamicPeerSelection: true,
+                            additionalTrustRootsPEM: pinned?.additionalTrustRootsPEM
+                        )
+                    )
+                )
+            } catch {
+                throw SwanError.unavailable("space registration confirmer is unavailable")
+            }
+        } else {
+            registrationConfirmer = nil
+        }
+
         let credentialConfiguration: SwanSpaceCredentialHTTPConfiguration?
         if let credentialPublicKeys, let delegationPublicKeys {
             credentialConfiguration = .init(
                 authoritySigningKeys: local?.credentialSigningKeys
                     ?? ServeUnavailableCredentialSigningKeyResolver(),
                 delegationPublicKeys: delegationPublicKeys,
-                credentialPublicKeys: credentialPublicKeys
+                credentialPublicKeys: credentialPublicKeys,
+                registrationConfirmer: registrationConfirmer
             )
         } else {
             credentialConfiguration = nil
@@ -1023,7 +1048,8 @@ struct ServePermissionedRuntime {
                         ?? UnavailableSpaceDelegationPublicKeyResolver(),
                     credentialPublicKeys: credentialPublicKeys
                         ?? UnavailableSpaceCredentialPublicKeyResolver(),
-                    clientAttestationPolicy: clientAttestationPolicy
+                    clientAttestationPolicy: clientAttestationPolicy,
+                    registrationConfirmer: registrationConfirmer
                 )
             },
             delegationConfiguration: local?.delegationConfiguration,

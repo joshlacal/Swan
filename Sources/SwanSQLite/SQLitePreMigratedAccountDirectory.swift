@@ -22,6 +22,7 @@ public actor SQLitePreMigratedAccountDirectory:
     AuthorizedSpaceRepositoryDirectory,
     AuthorizedSpaceBlobDirectory,
     AuthorizedSpaceNotificationDirectory,
+    AuthorizedSpaceSyncRegistrationDirectory,
     AuthorizedHostedSpaceDirectory,
     PublicRepositoryReadDirectory,
     PublicFirehoseAccountDatabaseSource
@@ -712,6 +713,94 @@ public actor SQLitePreMigratedAccountDirectory:
     }
 
     // MARK: Authority writer discovery and notifications
+
+    public func activeSpaceRevision(_ space: SpaceURI) async throws -> String? {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        do {
+            let revision = try await database.activeSpaceRevision(space)
+            try await requireCredentialAuthorityStillAvailable(space.authority)
+            return revision
+        } catch let error as SwanError {
+            throw error
+        } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch let error as AuthorizedSpaceAuthorityStatusError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    public func spaceSyncRegistration(
+        space: SpaceURI,
+        endpoint: String,
+        token: String
+    ) async throws -> AuthorizedSpaceSyncRegistration? {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        do {
+            let registration = try await database.spaceSyncRegistration(
+                space: space,
+                endpoint: endpoint,
+                token: token
+            )
+            try await requireCredentialAuthorityStillAvailable(space.authority)
+            return registration
+        } catch let error as SwanError {
+            throw error
+        } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch let error as AuthorizedSpaceAuthorityStatusError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    public func putSpaceSyncRegistration(
+        _ registration: AuthorizedSpaceSyncRegistration
+    ) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(
+            for: registration.space
+        )
+        do {
+            try await database.putSpaceSyncRegistration(registration)
+            try await requireCredentialAuthorityStillAvailable(
+                registration.space.authority
+            )
+        } catch let error as SwanError {
+            throw error
+        } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch let error as AuthorizedSpaceAuthorityStatusError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    public func removeSpaceSyncRegistration(
+        space: SpaceURI,
+        endpoint: String,
+        token: String
+    ) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        do {
+            try await database.removeSpaceSyncRegistration(
+                space: space,
+                endpoint: endpoint,
+                token: token
+            )
+            try await requireCredentialAuthorityStillAvailable(space.authority)
+        } catch let error as SwanError {
+            throw error
+        } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch let error as AuthorizedSpaceAuthorityStatusError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
 
     public func listSpaceWriters(
         space: SpaceURI,

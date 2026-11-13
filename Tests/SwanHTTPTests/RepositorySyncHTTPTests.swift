@@ -147,7 +147,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         let exactScope = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read"
         let oauth = try await issueToken(runtime: fixture.runtime, subject: Self.bob, scopes: [exactScope])
         let delegationPath = "/xrpc/com.atproto.space.getDelegationToken"
-        let credentialPath = "/xrpc/com.atproto.space.getSpaceCredential"
+        let credentialPath = "/xrpc/com.atproto.space.authorizeSpaceSync"
 
         let app = server.buildApplication(logger: Logger(label: "RepositorySyncHTTPTests.localRuntime"))
         let observedTokens = RuntimeTokenCapture()
@@ -171,7 +171,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             let exchangeHeaders = SpaceCredentialSignatureTestSupport.exchangeHeaders()
             let exchangeBody = ByteBuffer(data: try JSONSerialization.data(withJSONObject: [
                 "space": fixture.space.rawValue,
-                "credentialKid": try SpaceCredentialSignatureTestSupport.keyID,
+                "credentialKey": try SpaceCredentialSignatureTestSupport.keyID,
                 "delegationToken": delegation,
             ]))
             try await client.execute(uri: credentialPath, method: .post, headers: exchangeHeaders, body: exchangeBody) { response in

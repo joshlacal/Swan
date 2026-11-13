@@ -366,13 +366,37 @@ final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
 
         let path = SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.authority).path
         let v29 = try await SQLiteConnection.open(storage: .file(path: path))
-        _ = try await v29.query(
-            "DELETE FROM permissioned_repository_migrations WHERE version = 30"
-        )
-        _ = try await v29.query(
-            "ALTER TABLE permissioned_space_writers DROP COLUMN removed_at"
-        )
-        try await v29.close()
+        do {
+            _ = try await v29.query(
+                """
+                INSERT INTO permissioned_space_notification_registrations(
+                    space_uri, service_key, endpoint, repo_did, expires_at, updated_at,
+                    owner_service_did, delivery_service_did
+                ) VALUES (?, ?, ?, NULL, ?, ?, ?, NULL)
+                """,
+                [
+                    .text(fixture.space.rawValue),
+                    .text("endpoint:https://retired.example"),
+                    .text("https://retired.example"),
+                    .integer(2_000_000),
+                    .integer(1_000_000),
+                    .text(fixture.authority),
+                ]
+            )
+            _ = try await v29.query(
+                "DELETE FROM permissioned_repository_migrations WHERE version = 30"
+            )
+            _ = try await v29.query(
+                "ALTER TABLE permissioned_space_writers DROP COLUMN removed_at"
+            )
+            _ = try await v29.query(
+                "DROP TABLE permissioned_space_sync_registrations"
+            )
+            try await v29.close()
+        } catch {
+            try? await v29.close()
+            throw error
+        }
 
         let reopened = try await fixture.open()
         defer { Task { try? await reopened.close(); fixture.cleanup() } }
@@ -386,6 +410,17 @@ final class SpaceRevisionSequencingSQLiteTests: XCTestCase {
             "SELECT 1 FROM permissioned_repository_migrations WHERE version = 30"
         )
         XCTAssertEqual(markers.count, 1)
+        let registrationColumns = try await reopened.connection.query(
+            "PRAGMA table_info(permissioned_space_sync_registrations)"
+        )
+        XCTAssertEqual(
+            Set(registrationColumns.compactMap { $0.column("name")?.string }),
+            ["space_uri", "endpoint", "token", "expires_at", "expiry_notified", "updated_at"]
+        )
+        let retiredRows = try await reopened.connection.query(
+            "SELECT 1 FROM permissioned_space_notification_registrations"
+        )
+        XCTAssertTrue(retiredRows.isEmpty)
         let integrity = try await reopened.connection.query("PRAGMA integrity_check")
         XCTAssertEqual(integrity.first?.column("integrity_check")?.string, "ok")
         let foreignKeyViolations = try await reopened.connection.query(

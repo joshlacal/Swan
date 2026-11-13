@@ -54,8 +54,6 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
     private enum SemanticAuthorization: Sendable {
         case oauth
         case credential
-        case registerNotify
-        case unregisterNotify
         case delegation
         case notifyRepoUpdate
         case notifyDeleted
@@ -206,7 +204,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let credentialExchangeBody = String(
                 decoding: try JSONSerialization.data(withJSONObject: [
                     "space": space.rawValue,
-                    "credentialKid": try SpaceCredentialSignatureTestSupport.keyID,
+                    "credentialKey": try SpaceCredentialSignatureTestSupport.keyID,
                     "delegationToken": exchangeDelegation,
                 ], options: [.sortedKeys]),
                 as: UTF8.self
@@ -219,7 +217,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.space.getSpace", method: .get, uri: "/xrpc/com.atproto.space.getSpace?space=\(encodedSpace)", body: nil, authorization: .oauth, invariant: .jsonString("space", space.rawValue)),
                 .init(nsid: "com.atproto.space.listSpaces", method: .get, uri: "/xrpc/com.atproto.space.listSpaces", body: nil, authorization: .oauth, invariant: .jsonArrayContains("spaces", field: "space", value: lifecycle.rawValue)),
                 .init(nsid: "com.atproto.space.getDelegationToken", method: .get, uri: "/xrpc/com.atproto.space.getDelegationToken?space=\(encodedSpace)", body: nil, authorization: .oauth, invariant: .jsonNonEmptyString("token")),
-                .init(nsid: "com.atproto.space.getSpaceCredential", method: .post, uri: "/xrpc/com.atproto.space.getSpaceCredential", body: credentialExchangeBody, authorization: .delegation, invariant: .jsonNonEmptyString("credential")),
+                .init(nsid: "com.atproto.space.authorizeSpaceSync", method: .post, uri: "/xrpc/com.atproto.space.authorizeSpaceSync", body: credentialExchangeBody, authorization: .delegation, invariant: .jsonNonEmptyString("credential")),
                 .init(nsid: "com.atproto.space.createRecord", method: .post, uri: "/xrpc/com.atproto.space.createRecord", body: recordPrefix + ",\"rkey\":\"matrix-created\",\"record\":{\"$type\":\"app.bsky.feed.post\",\"text\":\"matrix-create\"}}", authorization: .oauth, invariant: .jsonNonEmptyString("cid")),
                 .init(nsid: "com.atproto.space.putRecord", method: .post, uri: "/xrpc/com.atproto.space.putRecord", body: recordPrefix + ",\"rkey\":\"seed\",\"record\":{\"$type\":\"app.bsky.feed.post\",\"text\":\"matrix-put\"}}", authorization: .oauth, invariant: .jsonNonEmptyString("cid")),
                 .init(nsid: "com.atproto.space.applyWrites", method: .post, uri: "/xrpc/com.atproto.space.applyWrites", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"writes\":[{\"$type\":\"com.atproto.space.applyWrites#create\",\"collection\":\"app.bsky.feed.post\",\"rkey\":\"matrix-batch\",\"value\":{\"$type\":\"app.bsky.feed.post\",\"text\":\"matrix-batch\"}}]}", authorization: .oauth, invariant: .jsonArrayContains("results", field: "uri", value: "\(space.rawValue)/\(localDID)/app.bsky.feed.post/matrix-batch")),
@@ -230,8 +228,6 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.space.listRepoOps", method: .get, uri: "/xrpc/com.atproto.space.listRepoOps?space=\(encodedSpace)&repo=\(localDID)&excludeValues=true", body: nil, authorization: .oauth, invariant: .jsonArray("ops", minimumCount: 1)),
                 .init(nsid: "com.atproto.space.getRepo", method: .get, uri: "/xrpc/com.atproto.space.getRepo?space=\(encodedSpace)&repo=\(localDID)", body: nil, authorization: .oauth, invariant: .star),
                 .init(nsid: "com.atproto.space.getBlob", method: .get, uri: "/xrpc/com.atproto.space.getBlob?space=\(encodedSpace)&repo=\(localDID)&cid=\(blobCID)", body: nil, authorization: .oauth, invariant: .blob(blobPayload)),
-                .init(nsid: "com.atproto.space.registerNotify", method: .post, uri: "/xrpc/com.atproto.space.registerNotify", body: "{\"space\":\"\(space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyRepoUpdate\"}", authorization: .registerNotify, invariant: .jsonNonEmptyString("expiresAt")),
-                .init(nsid: "com.atproto.space.unregisterNotify", method: .post, uri: "/xrpc/com.atproto.space.unregisterNotify", body: "{\"space\":\"\(space.rawValue)\",\"service\":\"\(remoteDID)#notify\"}", authorization: .unregisterNotify, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.notifyRepoUpdate", method: .post, uri: "/xrpc/com.atproto.space.notifyRepoUpdate", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"repoRev\":\"222222222222z\",\"data\":{\"$bytes\":\"\(Data(repeating: 0x31, count: 32).base64EncodedString())\"}}", authorization: .notifyRepoUpdate, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.listWriters", method: .get, uri: "/xrpc/com.atproto.space.listWriters?space=\(encodedSpace)", body: nil, authorization: .credential, invariant: .jsonArrayContains("repos", field: "repo", value: localDID)),
                 .init(nsid: "com.atproto.managedspace.checkUserAccess", method: .get, uri: "/xrpc/com.atproto.managedspace.checkUserAccess?space=\(encodedSpace)&user=\(remoteDID)&access=read", body: nil, authorization: .checkUserAccess, invariant: .jsonBoolean("authorized", false)),
@@ -1201,30 +1197,6 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             // Delegation tokens and credential keys belong in the JSON body;
             // valid and malformed exchanges use the same content-type header.
             headers = SpaceCredentialSignatureTestSupport.exchangeHeaders()
-        case .registerNotify:
-            let registerToken = try SpaceServiceJWT.create(
-                issuer: localDID,
-                audience: space.authority,
-                method: ComAtprotoSpaceRegisterNotify.typeIdentifier,
-                eventID: jti,
-                key: fixture.localKey
-            )
-            headers = try SpaceCredentialSignatureTestSupport.headers(
-                token: credential, audience: space.authority
-            )
-            headers[HTTPField.Name("atproto-service-auth")!] = "Bearer \(registerToken)"
-        case .unregisterNotify:
-            let unregisterToken = try SpaceServiceJWT.create(
-                issuer: remoteDID,
-                audience: space.authority,
-                method: ComAtprotoSpaceUnregisterNotify.typeIdentifier,
-                eventID: jti,
-                key: fixture.localKey
-            )
-            headers = try SpaceCredentialSignatureTestSupport.headers(
-                token: credential, audience: space.authority
-            )
-            headers[HTTPField.Name("atproto-service-auth")!] = "Bearer \(unregisterToken)"
         case .notifyRepoUpdate:
             let writeDigest = SpaceNotificationRequestDigest.write(
                 space: space,

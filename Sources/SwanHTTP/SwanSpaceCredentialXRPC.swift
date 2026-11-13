@@ -8,91 +8,126 @@ import SwanOAuth
 import SwanSpaces
 import SwanStorage
 
-/// The request-only capability for an authority's delegation exchange. It is
-/// assembled by ``SwanHTTPServer`` from a startup-preopened credential-policy
-/// directory and explicitly local/pinned key resolvers. Neither the HTTP
-/// route nor the capability has a database handle, remote resolver, or raw
-/// signing material.
+/// The request-only capability for an authority's sync authorization
+/// exchange. Registration state is selected from the same startup-preopened
+/// authority database as policy; the confirmer is the only network
+/// capability and applies Swan's untrusted-fetch policy.
 public struct SwanSpaceCredentialExchangeCapability: Sendable {
     let authorizer: SwanOAuthResourceAuthorizer
     let delegationAuthorizer: any SpaceDelegationAuthorizationVerifier
-    /// The runtime's dedicated HMAC-backed replay store. A delegation is
-    /// reserved after its signature is verified but before policy evaluation
-    /// or credential signing, so a concurrent/reopened authority cannot mint
-    /// two credentials from one JTI.
     let delegationReplayStore: DurableSpaceDelegationReplayStore
     let credentialIssuer: any SpaceCredentialAuthoritySigner
+    let registrationDirectory: any AuthorizedSpaceSyncRegistrationDirectory
+    let registrationConfirmer: (any SwanSpaceRegistrationConfirming)?
 
     init(
         authorizer: SwanOAuthResourceAuthorizer,
         delegationAuthorizer: any SpaceDelegationAuthorizationVerifier,
         delegationReplayStore: DurableSpaceDelegationReplayStore,
-        credentialIssuer: any SpaceCredentialAuthoritySigner
+        credentialIssuer: any SpaceCredentialAuthoritySigner,
+        registrationDirectory: any AuthorizedSpaceSyncRegistrationDirectory,
+        registrationConfirmer: (any SwanSpaceRegistrationConfirming)? = nil
     ) {
         self.authorizer = authorizer
         self.delegationAuthorizer = delegationAuthorizer
         self.delegationReplayStore = delegationReplayStore
         self.credentialIssuer = credentialIssuer
+        self.registrationDirectory = registrationDirectory
+        self.registrationConfirmer = registrationConfirmer
     }
 }
 
 enum SwanSpaceCredentialHTTP {
-    /// Exchange bodies contain only a space URI and (optionally) a compact
-    /// client attestation. Keep this much smaller than record-write JSON so a
-    /// procedure that returns a bound credential cannot become a generic
-    /// buffered upload endpoint.
     static let maximumJSONBytes = 16 * 1_024
 }
 
 private enum SpaceCredentialExchangeFailure: Error {
     case invalidRequest
     case invalidDelegation
-    /// `BadSpaceSignature`: the exchange's `atproto-space` HTTP message
-    /// signature is missing, malformed, or does not verify under its keyid.
     case invalidSignature
     case invalidClientAttestation
     case spaceNotFound
     case spaceDeleted
     case appNotAuthorized
     case notAuthorized
+    case registrationNotConfirmed
+    case repoTakendown
+    case repoDeactivated
+    case upstreamFailure
     case unavailable
 }
 
-private struct AuthenticatedGetSpaceCredentialHandler:
-    ComAtprotoSpaceGetSpaceCredential.ServerHandler
-{
-    typealias Context = Request
+private struct AuthorizeSpaceSyncInput: Decodable {
+    struct Notification: Decodable {
+        let endpoint: String
+        let token: String
+    }
 
+    let space: String
+    let credentialKey: String
+    let delegationToken: String?
+    let clientAttestation: String?
+    let notify: Notification?
+}
+
+private struct AuthorizeSpaceSyncOutput: Encodable {
+    let credential: String
+    let spaceRev: String?
+}
+
+private struct AuthenticatedAuthorizeSpaceSyncHandler {
     let capability: SwanSpaceCredentialExchangeCapability
 
     func handle(
-        parameters: Void,
-        input: ComAtprotoSpaceGetSpaceCredential.Input,
-        context request: Request
-    ) async throws -> ComAtprotoSpaceGetSpaceCredential.Output {
+        input: AuthorizeSpaceSyncInput
+    ) async throws -> AuthorizeSpaceSyncOutput {
         let space: SpaceURI
         do {
-            space = try SpaceURI(input.space.uriString())
+            space = try SpaceURI(input.space)
         } catch {
             throw SpaceCredentialExchangeFailure.invalidRequest
         }
-
-        let confirmationKeyID = input.credentialKid
-        guard PermissionedDataJWT.isValidConfirmationKeyID(confirmationKeyID) else {
+        guard PermissionedDataJWT.isValidConfirmationKeyID(input.credentialKey) else {
             throw SpaceCredentialExchangeFailure.invalidRequest
         }
+        let notify = try input.notify.map {
+            value -> (endpoint: URL, rawEndpoint: String, token: String) in
+            guard let endpoint = validSpaceSyncNotificationEndpoint(value.endpoint),
+                  !value.token.isEmpty,
+                  value.token.utf16.count <= 512 else {
+                throw SpaceCredentialExchangeFailure.invalidRequest
+            }
+            return (endpoint, value.endpoint, value.token)
+        }
+
+        // Tombstones are intentionally checked before delegation validation or
+        // policy so a deleted space always answers SpaceDeleted.
+        do {
+            _ = try await capability.registrationDirectory.activeSpaceRevision(space)
+        } catch {
+            throw spaceCredentialExchangeFailure(for: error)
+        }
+
         var user: String?
         var authorization: AuthorizationContext = .public
         if let delegation = input.delegationToken {
             do {
                 let grant = try await capability.delegationAuthorizer.verifiedDelegation(
-                    for: delegation, expectedSpace: space, now: Date()
+                    for: delegation,
+                    expectedSpace: space,
+                    now: Date()
                 )
                 guard case let .spaceDelegation(subject, delegatedSpace) = grant.authorization,
-                      delegatedSpace == space, grant.issuer == subject, grant.space == space,
+                      delegatedSpace == space,
+                      grant.issuer == subject,
+                      grant.space == space,
                       try await capability.delegationReplayStore.claim(
-                        issuer: grant.issuer, audience: grant.audience, space: grant.space,
-                        jti: grant.jti, expiresAt: grant.expiresAt.addingTimeInterval(60), now: Date()
+                        issuer: grant.issuer,
+                        audience: grant.audience,
+                        space: grant.space,
+                        jti: grant.jti,
+                        expiresAt: grant.expiresAt.addingTimeInterval(60),
+                        now: Date()
                       ) else {
                     throw SpaceCredentialExchangeFailure.invalidDelegation
                 }
@@ -103,64 +138,109 @@ private struct AuthenticatedGetSpaceCredentialHandler:
             }
         }
 
+        let credential: String
         do {
-            let credential = try await capability.credentialIssuer.issueSpaceCredential(
+            credential = try await capability.credentialIssuer.issueSpaceCredential(
                 space: space,
                 user: user,
                 authorization: authorization,
                 clientAttestation: input.clientAttestation,
-                confirmationKeyID: confirmationKeyID,
+                confirmationKeyID: input.credentialKey,
                 now: Date()
             )
-            return .init(credential: credential)
-        } catch let failure as SpaceCredentialClientAttestationFailure {
-            switch failure {
-            case .invalid:
-                throw SpaceCredentialExchangeFailure.invalidClientAttestation
-            case .unavailable:
-                throw SpaceCredentialExchangeFailure.unavailable
-            }
-        } catch let failure as AuthorizedSimpleSpaceLifecycleError {
-            throw failure == .deleted
-                ? SpaceCredentialExchangeFailure.spaceDeleted
-                : SpaceCredentialExchangeFailure.spaceNotFound
-        } catch is SimpleSpaceCredentialPolicyError {
-            throw SpaceCredentialExchangeFailure.appNotAuthorized
-        } catch let error as SwanError {
-            switch error {
-            case .unavailable:
-                throw SpaceCredentialExchangeFailure.unavailable
-            case .unauthorized:
-                throw SpaceCredentialExchangeFailure.notAuthorized
-            case .invalidIdentifier, .invalidProfile, .conflict, .expired, .malformed:
-                throw SpaceCredentialExchangeFailure.invalidRequest
-            }
         } catch {
-            throw SpaceCredentialExchangeFailure.unavailable
+            if let notify, isSpaceSyncAuthorizationDenial(error) {
+                do {
+                    try await capability.registrationDirectory.removeSpaceSyncRegistration(
+                        space: space,
+                        endpoint: notify.rawEndpoint,
+                        token: notify.token
+                    )
+                } catch {
+                    throw spaceCredentialExchangeFailure(for: error)
+                }
+            }
+            throw spaceCredentialExchangeFailure(for: error)
+        }
+
+        if let notify {
+            let endpoint = notify.rawEndpoint
+            let existing: AuthorizedSpaceSyncRegistration?
+            do {
+                existing = try await capability.registrationDirectory.spaceSyncRegistration(
+                    space: space,
+                    endpoint: endpoint,
+                    token: notify.token
+                )
+            } catch {
+                throw spaceCredentialExchangeFailure(for: error)
+            }
+            if existing == nil {
+                guard let confirmer = capability.registrationConfirmer else {
+                    throw SpaceCredentialExchangeFailure.registrationNotConfirmed
+                }
+                do {
+                    try await confirmer.confirmRegistration(
+                        space: space,
+                        endpoint: notify.endpoint,
+                        token: notify.token,
+                        challenge: UUID().uuidString.lowercased()
+                    )
+                } catch {
+                    throw SpaceCredentialExchangeFailure.registrationNotConfirmed
+                }
+            }
+            let expiresAt: Date
+            do {
+                let inspection = try PermissionedDataJWT.inspectSpaceCredential(credential)
+                expiresAt = Date(
+                    timeIntervalSince1970: TimeInterval(inspection.claims.exp)
+                )
+            } catch {
+                throw SpaceCredentialExchangeFailure.unavailable
+            }
+            do {
+                try await capability.registrationDirectory.putSpaceSyncRegistration(
+                    AuthorizedSpaceSyncRegistration(
+                        space: space,
+                        endpoint: endpoint,
+                        token: notify.token,
+                        expiresAt: expiresAt
+                    )
+                )
+            } catch {
+                throw spaceCredentialExchangeFailure(for: error)
+            }
+        }
+
+        do {
+            return AuthorizeSpaceSyncOutput(
+                credential: credential,
+                spaceRev: try await capability.registrationDirectory.activeSpaceRevision(space)
+            )
+        } catch {
+            throw spaceCredentialExchangeFailure(for: error)
         }
     }
 }
 
-func registerAuthenticatedGetSpaceCredentialEndpoint(
+func registerAuthenticatedAuthorizeSpaceSyncEndpoint(
     on router: Router<BasicRequestContext>,
     capability: SwanSpaceCredentialExchangeCapability,
     requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
-    let handler = AuthenticatedGetSpaceCredentialHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.space.getSpaceCredential"
+    let handler = AuthenticatedAuthorizeSpaceSyncHandler(capability: capability)
+    let path: RouterPath = "/xrpc/com.atproto.space.authorizeSpaceSync"
     router.post(path) { request, context async -> Response in
         do {
-            let input = try await decodeGetSpaceCredentialInput(
+            let input = try await decodeAuthorizeSpaceSyncInput(
                 request,
                 context: context,
                 requestBodyAdmission: requestBodyAdmission
             )
-            let output = try await handler.handle(
-                parameters: (), input: input, context: request
-            )
             return authenticatedGetSpaceJSON(
                 .ok,
-                GetSpaceCredentialWireOutput(credential: output.credential)
+                try await handler.handle(input: input)
             )
         } catch let failure as SpaceCredentialExchangeFailure {
             return getSpaceCredentialResponse(for: failure)
@@ -184,11 +264,11 @@ func registerAuthenticatedGetSpaceCredentialEndpoint(
     }
 }
 
-private func decodeGetSpaceCredentialInput(
+private func decodeAuthorizeSpaceSyncInput(
     _ request: Request,
     context: SwanHTTPRequestContext,
     requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
-) async throws -> ComAtprotoSpaceGetSpaceCredential.Input {
+) async throws -> AuthorizeSpaceSyncInput {
     let body = try await collectAdmittedRequestBody(
         request,
         mediaType: .json,
@@ -207,22 +287,23 @@ private func decodeGetSpaceCredentialInput(
     }
     let data = Data(bytes)
     do {
-        // Reuse the existing recursive duplicate-member validator before
-        // Foundation decodes the same exact bytes into the generated input.
         try StrictPermissionedWriteJSON.validate(data)
     } catch {
         throw SpaceCredentialExchangeFailure.invalidRequest
     }
     guard let root = try? JSONSerialization.jsonObject(with: data)
-        as? [String: Any],
-        !root.isEmpty,
-        Set(root.keys).isSubset(of: ["space", "credentialKid", "delegationToken", "clientAttestation"]),
-        root.keys.filter({ $0 == "space" }).count == 1,
-        let rawSpace = root["space"] as? String,
-        !rawSpace.isEmpty,
-        rawSpace.utf8.count <= 2_048,
-        let credentialKid = root["credentialKid"] as? String,
-        PermissionedDataJWT.isValidConfirmationKeyID(credentialKid) else {
+            as? [String: Any],
+          Set(root.keys).isSubset(
+            of: [
+                "space", "credentialKey", "delegationToken",
+                "clientAttestation", "notify",
+            ]
+          ),
+          let rawSpace = root["space"] as? String,
+          !rawSpace.isEmpty,
+          rawSpace.utf8.count <= 2_048,
+          let credentialKey = root["credentialKey"] as? String,
+          PermissionedDataJWT.isValidConfirmationKeyID(credentialKey) else {
         throw SpaceCredentialExchangeFailure.invalidRequest
     }
     for field in ["clientAttestation", "delegationToken"] where root[field] != nil {
@@ -232,16 +313,80 @@ private func decodeGetSpaceCredentialInput(
             throw SpaceCredentialExchangeFailure.invalidRequest
         }
     }
+    if let rawNotify = root["notify"] {
+        guard let notification = rawNotify as? [String: Any],
+              Set(notification.keys) == ["endpoint", "token"],
+              let endpoint = notification["endpoint"] as? String,
+              validSpaceSyncNotificationEndpoint(endpoint) != nil,
+              let token = notification["token"] as? String,
+              !token.isEmpty,
+              token.utf16.count <= 512 else {
+            throw SpaceCredentialExchangeFailure.invalidRequest
+        }
+    }
     do {
-        let input = try JSONDecoder().decode(
-            ComAtprotoSpaceGetSpaceCredential.Input.self,
-            from: data
-        )
-        _ = try SpaceURI(input.space.uriString())
+        let input = try JSONDecoder().decode(AuthorizeSpaceSyncInput.self, from: data)
+        _ = try SpaceURI(input.space)
         return input
     } catch {
         throw SpaceCredentialExchangeFailure.invalidRequest
     }
+}
+
+private func validSpaceSyncNotificationEndpoint(_ value: String) -> URL? {
+    guard value.utf8.count <= 4_096,
+          let url = URL(string: value),
+          let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+          components.scheme != nil,
+          components.host != nil,
+          components.user == nil,
+          components.password == nil,
+          components.path.isEmpty || components.path == "/",
+          components.query == nil,
+          components.fragment == nil else {
+        return nil
+    }
+    return url
+}
+
+private func isSpaceSyncAuthorizationDenial(_ error: Error) -> Bool {
+    if let lifecycle = error as? AuthorizedSimpleSpaceLifecycleError {
+        return lifecycle == .notFound
+    }
+    if error is SimpleSpaceCredentialPolicyError { return true }
+    if case .unauthorized = error as? SwanError { return true }
+    return false
+}
+
+private func spaceCredentialExchangeFailure(
+    for error: Error
+) -> SpaceCredentialExchangeFailure {
+    if error is any AuthorizedSpaceUpstreamFailure {
+        return .upstreamFailure
+    }
+    if let status = error as? AuthorizedSpaceAuthorityStatusError {
+        return status == .takendown ? .repoTakendown : .repoDeactivated
+    }
+    if let failure = error as? SpaceCredentialClientAttestationFailure {
+        return failure == .invalid ? .invalidClientAttestation : .unavailable
+    }
+    if let lifecycle = error as? AuthorizedSimpleSpaceLifecycleError {
+        return lifecycle == .deleted ? .spaceDeleted : .spaceNotFound
+    }
+    if error is SimpleSpaceCredentialPolicyError {
+        return .appNotAuthorized
+    }
+    if let error = error as? SwanError {
+        switch error {
+        case .unavailable:
+            return .unavailable
+        case .unauthorized:
+            return .notAuthorized
+        case .invalidIdentifier, .invalidProfile, .conflict, .expired, .malformed:
+            return .invalidRequest
+        }
+    }
+    return .unavailable
 }
 
 /// Returns a compact Bearer value only when the request has exactly one
@@ -340,9 +485,6 @@ private func unverifiedCompactJOSEType(of compact: String) -> String? {
     return object["typ"] as? String
 }
 
-private struct GetSpaceCredentialWireOutput: Encodable {
-    let credential: String
-}
 
 private func getSpaceCredentialResponse(
     for failure: SpaceCredentialExchangeFailure
@@ -357,18 +499,21 @@ private func getSpaceCredentialResponse(
     case .invalidClientAttestation:
         getSpaceCredentialError(.badRequest, code: "InvalidClientAttestation")
     case .spaceNotFound:
-        // October 29: an unauthorized user is answered SpaceNotFound with
-        // the reference's HTTP 400, like an absent space.
         getSpaceCredentialError(.badRequest, code: "SpaceNotFound")
     case .spaceDeleted:
         getSpaceCredentialError(.badRequest, code: "SpaceDeleted")
     case .appNotAuthorized:
-        // The reference throws InvalidRequestError('AppNotAuthorized'), an
-        // HTTP 400. 401 is reserved for delegation-signature failures.
         getSpaceCredentialError(.badRequest, code: "AppNotAuthorized")
     case .notAuthorized:
-        // The lexicon's stand-in for User/AppNotAuthorized, both 400.
         getSpaceCredentialError(.badRequest, code: "NotAuthorized")
+    case .registrationNotConfirmed:
+        getSpaceCredentialError(.badRequest, code: "RegistrationNotConfirmed")
+    case .repoTakendown:
+        getSpaceCredentialError(.badRequest, code: "RepoTakendown")
+    case .repoDeactivated:
+        getSpaceCredentialError(.badRequest, code: "RepoDeactivated")
+    case .upstreamFailure:
+        getSpaceCredentialError(.badGateway, code: "UpstreamFailure")
     case .unavailable:
         getSpaceCredentialError(.serviceUnavailable, code: "temporarily_unavailable")
     }

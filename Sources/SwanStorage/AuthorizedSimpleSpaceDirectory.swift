@@ -383,6 +383,52 @@ public struct AuthorizedSpaceNotificationRegistration: Sendable, Equatable {
     }
 }
 
+/// A notification registration created while authorizing a space sync. The
+/// opaque token is supplied by the endpoint and is never an authorization
+/// credential for Swan.
+public struct AuthorizedSpaceSyncRegistration: Sendable, Equatable {
+    public let space: SpaceURI
+    public let endpoint: String
+    public let token: String
+    public let expiresAt: Date
+    public let expiryNotified: Bool
+
+    public init(
+        space: SpaceURI,
+        endpoint: String,
+        token: String,
+        expiresAt: Date,
+        expiryNotified: Bool = false
+    ) {
+        self.space = space
+        self.endpoint = endpoint
+        self.token = token
+        self.expiresAt = expiresAt
+        self.expiryNotified = expiryNotified
+    }
+}
+
+/// Durable registration state owned by the space authority. Selection is
+/// always through a startup-preopened authority database.
+public protocol AuthorizedSpaceSyncRegistrationDirectory: Sendable {
+    /// Requires an active space and returns its latest revision, or `nil`
+    /// before the first sequenced update.
+    func activeSpaceRevision(_ space: SpaceURI) async throws -> String?
+    func spaceSyncRegistration(
+        space: SpaceURI,
+        endpoint: String,
+        token: String
+    ) async throws -> AuthorizedSpaceSyncRegistration?
+    func putSpaceSyncRegistration(
+        _ registration: AuthorizedSpaceSyncRegistration
+    ) async throws
+    func removeSpaceSyncRegistration(
+        space: SpaceURI,
+        endpoint: String,
+        token: String
+    ) async throws
+}
+
 /// A signed service announcement after its HTTP/JWT boundary has completed.
 /// `eventID` is the opaque service-JWT JTI, recorded transactionally by the
 /// authority. Senders mint a fresh one per attempt, so a repeat is recognized

@@ -7,8 +7,191 @@ import SwanSpaces
 import SwanStorage
 
 enum SwanSpaceNotificationNSID {
+    static let authorizeSpaceSync = "com.atproto.space.authorizeSpaceSync"
+    static let confirmRegistration = "com.atproto.space.confirmRegistration"
     static let notifyRepoUpdate = "com.atproto.space.notifyRepoUpdate"
     static let notifyCredentialsRevoked = "com.atproto.space.notifyCredentialsRevoked"
+    static let notifySpaceUpdate = "com.atproto.space.notifySpaceUpdate"
+}
+
+public protocol SwanSpaceRegistrationConfirming: Sendable {
+    func confirmRegistration(
+        space: SpaceURI,
+        endpoint: URL,
+        token: String,
+        challenge: String
+    ) async throws
+}
+
+/// Confirms a request-selected endpoint through the same DNS pinning,
+/// public-address checks, redirect refusal, and bounded response rules as
+/// Swan's other untrusted outbound fetches.
+public struct HTTPSwanSpaceRegistrationConfirmer: SwanSpaceRegistrationConfirming {
+    private let policy: OAuthRemoteFetchPolicy
+    private let resolver: any OAuthHostnameResolving
+    private let transport: NIOPeerPinnedOAuthPostTransport
+
+    public init(
+        policy: OAuthRemoteFetchPolicy,
+        transport: NIOPeerPinnedOAuthPostTransport,
+        resolver: any OAuthHostnameResolving = SystemOAuthHostnameResolver()
+    ) {
+        self.policy = policy
+        self.transport = transport
+        self.resolver = resolver
+    }
+
+    public func confirmRegistration(
+        space: SpaceURI,
+        endpoint: URL,
+        token: String,
+        challenge: String
+    ) async throws {
+        guard token.utf16.count <= 512, !token.isEmpty,
+              challenge.utf8.count <= 128, !challenge.isEmpty,
+              let base = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
+              base.path.isEmpty || base.path == "/",
+              base.query == nil,
+              base.fragment == nil else {
+            throw SwanError.malformed("notification registration is invalid")
+        }
+        let url = try notificationEndpoint(
+            endpoint,
+            method: SwanSpaceNotificationNSID.confirmRegistration
+        )
+        struct Request: Encodable {
+            let space: String
+            let token: String
+            let challenge: String
+        }
+        let body = try JSONEncoder().encode(
+            Request(space: space.rawValue, token: token, challenge: challenge)
+        )
+        let host = try policy.validateURL(url)
+        let before = Set(
+            try await resolveRegistrationHostname(
+                resolver, host: host, timeout: policy.timeout
+            )
+        )
+        try policy.validateResolved(Array(before), host: host)
+        let response = try await transport.post(
+            url: url,
+            approvedPeers: before,
+            headers: [
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            ],
+            body: body,
+            timeout: policy.timeout,
+            maximumResponseBodyBytes: 4_096
+        )
+        let after = Set(
+            try await resolveRegistrationHostname(
+                resolver, host: host, timeout: policy.timeout
+            )
+        )
+        try policy.validateResolved(Array(after), host: host)
+        guard response.status == 200,
+              response.redirectCount == 0,
+              response.responseURL == url,
+              let peer = response.connectedPeerAddress,
+              before.contains(peer),
+              after.contains(peer),
+              response.body.count <= 4_096 else {
+            throw SwanError.unavailable("registration confirmation failed")
+        }
+        try StrictJSON.validate(response.body)
+        guard let object = try JSONSerialization.jsonObject(with: response.body)
+                as? [String: Any],
+              Set(object.keys) == ["challenge"],
+              object["challenge"] as? String == challenge else {
+            throw SwanError.unavailable("registration confirmation failed")
+        }
+    }
+}
+
+private final class RegistrationDNSResolutionDeadline: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<[OAuthIPAddress], Error>?
+    private var result: Result<[OAuthIPAddress], Error>?
+
+    func install(_ continuation: CheckedContinuation<[OAuthIPAddress], Error>) {
+        lock.lock()
+        if let result {
+            lock.unlock()
+            resume(continuation, with: result)
+        } else {
+            self.continuation = continuation
+            lock.unlock()
+        }
+    }
+
+    func complete(_ result: Result<[OAuthIPAddress], Error>) {
+        lock.lock()
+        guard self.result == nil else {
+            lock.unlock()
+            return
+        }
+        self.result = result
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+        if let continuation {
+            resume(continuation, with: result)
+        }
+    }
+
+    private func resume(
+        _ continuation: CheckedContinuation<[OAuthIPAddress], Error>,
+        with result: Result<[OAuthIPAddress], Error>
+    ) {
+        switch result {
+        case let .success(addresses):
+            continuation.resume(returning: addresses)
+        case let .failure(error):
+            continuation.resume(throwing: error)
+        }
+    }
+}
+
+private func resolveRegistrationHostname(
+    _ resolver: any OAuthHostnameResolving,
+    host: String,
+    timeout: TimeInterval
+) async throws -> [OAuthIPAddress] {
+    let completion = RegistrationDNSResolutionDeadline()
+    let resolutionTask = Task { @Sendable in
+        do {
+            completion.complete(.success(try await resolver.resolve(host: host)))
+        } catch {
+            completion.complete(.failure(error))
+        }
+    }
+    let timeoutNanoseconds = UInt64((timeout * 1_000_000_000).rounded(.up))
+    let timeoutTask = Task { @Sendable in
+        do {
+            try await Task.sleep(nanoseconds: timeoutNanoseconds)
+        } catch {
+            return
+        }
+        completion.complete(
+            .failure(SwanError.unavailable("registration DNS resolution timed out"))
+        )
+        resolutionTask.cancel()
+    }
+    defer {
+        resolutionTask.cancel()
+        timeoutTask.cancel()
+    }
+    return try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { continuation in
+            completion.install(continuation)
+        }
+    } onCancel: {
+        completion.complete(.failure(CancellationError()))
+        resolutionTask.cancel()
+        timeoutTask.cancel()
+    }
 }
 
 /// One operator-configured service destination. The endpoint is selected from

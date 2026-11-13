@@ -36,13 +36,8 @@ final class SpaceCredentialBrokerSignatureTests: XCTestCase, @unchecked Sendable
             query: ["space": fixture.space.rawValue],
             authorization: authorization
         )
-        _ = try await authority.procedure(
-            "com.atproto.space.registerNotify",
-            body: Data(#"{"space":"\#(fixture.space.rawValue)","service":"did:web:sync.example#atproto_space_syncer"}"#.utf8),
-            authorization: authorization
-        )
         let requests = await fixture.requests
-        XCTAssertEqual(requests.count, 5)
+        XCTAssertEqual(requests.count, 4)
         XCTAssertEqual(requests[0].authorization, "DPoP member-oauth")
 
         let exchange = requests[1]
@@ -54,10 +49,10 @@ final class SpaceCredentialBrokerSignatureTests: XCTestCase, @unchecked Sendable
         let exchangeBody = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(exchange.body)) as? [String: String])
         XCTAssertEqual(exchangeBody["space"], fixture.space.rawValue)
         XCTAssertEqual(exchangeBody["delegationToken"], "delegation-token")
-        let keyID = try XCTUnwrap(exchangeBody["credentialKid"])
+        let keyID = try XCTUnwrap(exchangeBody["credentialKey"])
         _ = try P256DIDKey(keyID)
 
-        let expectedAudiences = [Self.repo, fixture.space.authority, fixture.space.authority]
+        let expectedAudiences = [Self.repo, fixture.space.authority]
         for (request, audience) in zip(requests.dropFirst(2), expectedAudiences) {
             let authorizationValue = try XCTUnwrap(request.authorization)
             XCTAssertTrue(authorizationValue.hasPrefix("Atproto-Space-Credential "))
@@ -93,10 +88,10 @@ final class SpaceCredentialBrokerSignatureTests: XCTestCase, @unchecked Sendable
         _ = try await broker.exchange(space: fixture.space, memberAuthorization: .none)
         _ = try await broker.exchange(space: fixture.space, memberAuthorization: .none)
         let keyIDs = try await fixture.requests.filter {
-            $0.url.path == "/xrpc/com.atproto.space.getSpaceCredential"
+            $0.url.path == "/xrpc/com.atproto.space.authorizeSpaceSync"
         }.map {
             let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap($0.body)) as? [String: String])
-            return try XCTUnwrap(body["credentialKid"])
+            return try XCTUnwrap(body["credentialKey"])
         }
         XCTAssertEqual(keyIDs.count, 2)
         XCTAssertNotEqual(keyIDs[0], keyIDs[1])
@@ -269,13 +264,13 @@ private actor SpaceCredentialClientFixture {
         switch url.path {
         case "/xrpc/com.atproto.space.getDelegationToken":
             output = Data(#"{"token":"delegation-token"}"#.utf8)
-        case "/xrpc/com.atproto.space.getSpaceCredential":
+        case "/xrpc/com.atproto.space.authorizeSpaceSync":
             XCTAssertNil(headers["Authorization"])
             XCTAssertNil(headers[SpaceHTTPSignature.signatureInputFieldName])
             XCTAssertNil(headers[SpaceHTTPSignature.signatureFieldName])
             let input = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(body)) as? [String: String])
             XCTAssertEqual(input["delegationToken"], "delegation-token")
-            let keyID = try XCTUnwrap(input["credentialKid"])
+            let keyID = try XCTUnwrap(input["credentialKey"])
             _ = try P256DIDKey(keyID)
             let issuedSpace = responseMode == .wrongSpace
                 ? try SpaceURI(authority: space.authority, spaceType: space.spaceType, skey: "other")

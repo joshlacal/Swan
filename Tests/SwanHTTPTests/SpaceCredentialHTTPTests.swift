@@ -38,7 +38,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
     static let member = "did:plc:bcdefghijklmnopqrstuvwxy"
     static let outsider = "did:plc:cdefghijklmnopqrstuvwxyz"
     private static let publicURL = URL(string: "https://swan.example")!
-    private static let credentialPath = "/xrpc/com.atproto.space.getSpaceCredential"
+    private static let credentialPath = "/xrpc/com.atproto.space.authorizeSpaceSync"
     private static let getPath = "/xrpc/com.atproto.space.getRecord"
     private static let listPath = "/xrpc/com.atproto.space.listRecords"
 
@@ -50,7 +50,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             try await app.test(.router) { client in
                 func body(_ space: SpaceURI, delegation: String? = nil, kid: String? = nil) throws -> ByteBuffer {
                     var object: [String: String] = ["space": space.rawValue,
-                                                  "credentialKid": try kid ?? SpaceCredentialSignatureTestSupport.keyID]
+                                                  "credentialKey": try kid ?? SpaceCredentialSignatureTestSupport.keyID]
                     object["delegationToken"] = delegation
                     return ByteBuffer(bytes: try JSONSerialization.data(withJSONObject: object))
                 }
@@ -98,6 +98,189 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             }
             try await fixture.close()
         } catch { try? await fixture.close(); throw error }
+    }
+
+    func testAuthorizeSpaceSyncConfirmsNewRegistrationOnceAndRejectsUnconfirmed() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let confirmer = RegistrationConfirmationProbe()
+            let app = try makeServer(
+                fixture,
+                registrationConfirmer: confirmer
+            ).buildApplication(logger: Logger(label: "spaces.authorize.registration"))
+            let endpoint = "https://notify.example"
+            let token = "opaque-token"
+            let body = ByteBuffer(data: try JSONSerialization.data(withJSONObject: [
+                "space": fixture.publicSpace.rawValue,
+                "credentialKey": try SpaceCredentialSignatureTestSupport.keyID,
+                "notify": ["endpoint": endpoint, "token": token],
+            ]))
+            let headers: HTTPFields = [.contentType: "application/json"]
+            try await app.test(.router) { client in
+                for _ in 0..<2 {
+                    try await client.execute(
+                        uri: Self.credentialPath,
+                        method: .post,
+                        headers: headers,
+                        body: body
+                    ) { response in
+                        XCTAssertEqual(response.status, .ok)
+                        let output = try self.jsonObject(response.body)
+                        XCTAssertNotNil(output["credential"])
+                        XCTAssertNil(output["spaceRev"])
+                    }
+                }
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.getSpaceCredential",
+                    method: .post,
+                    headers: headers,
+                    body: body
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                }
+                let oversized = ByteBuffer(
+                    data: try JSONSerialization.data(withJSONObject: [
+                        "space": fixture.publicSpace.rawValue,
+                        "credentialKey": try SpaceCredentialSignatureTestSupport.keyID,
+                        "notify": [
+                            "endpoint": endpoint,
+                            "token": String(repeating: "x", count: 513),
+                        ],
+                    ])
+                )
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: headers,
+                    body: oversized
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
+                let memberToken = "member-token"
+                func memberBody(_ delegation: String) throws -> ByteBuffer {
+                    ByteBuffer(
+                        data: try JSONSerialization.data(withJSONObject: [
+                            "space": fixture.memberSpace.rawValue,
+                            "credentialKey": try SpaceCredentialSignatureTestSupport.keyID,
+                            "delegationToken": delegation,
+                            "notify": [
+                                "endpoint": endpoint,
+                                "token": memberToken,
+                            ],
+                        ])
+                    )
+                }
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: headers,
+                    body: try memberBody(
+                        self.delegation(
+                            fixture,
+                            user: Self.member,
+                            space: fixture.memberSpace
+                        )
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                try await fixture.directory.removeSimpleSpaceMember(
+                    Self.member,
+                    from: fixture.memberSpace,
+                    authorization: .accountOAuthForTesting(
+                        subject: Self.authority,
+                        scopes: ["atproto"]
+                    )
+                )
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: headers,
+                    body: try memberBody(
+                        self.delegation(
+                            fixture,
+                            user: Self.member,
+                            space: fixture.memberSpace
+                        )
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
+                }
+            }
+            let confirmationCalls = await confirmer.callCount()
+            XCTAssertEqual(confirmationCalls, 2)
+            let registration = try await fixture.directory.spaceSyncRegistration(
+                space: fixture.publicSpace,
+                endpoint: endpoint,
+                token: token
+            )
+            XCTAssertNotNil(registration)
+            let withdrawn = try await fixture.directory.spaceSyncRegistration(
+                space: fixture.memberSpace,
+                endpoint: endpoint,
+                token: "member-token"
+            )
+            XCTAssertNil(withdrawn)
+            let upstreamApp = try makeServer(
+                fixture,
+                registrationConfirmer: confirmer,
+                credentialPolicyDirectory: UpstreamCredentialPolicyDirectory()
+            ).buildApplication(logger: Logger(label: "spaces.authorize.upstream"))
+            try await upstreamApp.test(.router) { client in
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: headers,
+                    body: body
+                ) { response in
+                    XCTAssertEqual(response.status, .badGateway)
+                    XCTAssertEqual(try self.errorCode(response.body), "UpstreamFailure")
+                }
+            }
+            let retained = try await fixture.directory.spaceSyncRegistration(
+                space: fixture.publicSpace,
+                endpoint: endpoint,
+                token: token
+            )
+            XCTAssertNotNil(retained)
+
+            let rejecting = RegistrationConfirmationProbe(rejects: true)
+            let rejectingApp = try makeServer(
+                fixture,
+                registrationConfirmer: rejecting
+            ).buildApplication(logger: Logger(label: "spaces.authorize.unconfirmed"))
+            let rejectedBody = ByteBuffer(
+                data: try JSONSerialization.data(withJSONObject: [
+                    "space": fixture.publicSpace.rawValue,
+                    "credentialKey": try SpaceCredentialSignatureTestSupport.keyID,
+                    "notify": [
+                        "endpoint": "https://other-notify.example",
+                        "token": "other-token",
+                    ],
+                ])
+            )
+            try await rejectingApp.test(.router) { client in
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: headers,
+                    body: rejectedBody
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(
+                        try self.errorCode(response.body),
+                        "RegistrationNotConfirmed"
+                    )
+                }
+            }
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
     }
 
     func testNovember12ResponseMACAndSTARAreBoundToAuthenticatedBody() async throws {
@@ -252,7 +435,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    func testCredentialRenewalReportsSpaceDeletedOnlyAfterValidDelegationAndCredentialKey() async throws {
+    func testAuthorizeSpaceSyncReportsDeletionBeforeDelegationAuthorization() async throws {
         let fixture = try await Fixture.make()
         defer { fixture.cleanup() }
         do {
@@ -316,7 +499,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     body: self.exchangeBody(delegationToken: "invalid-delegation", space: fixture.publicSpace)
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
-                    XCTAssertEqual(try self.errorCode(response.body), "InvalidDelegationToken")
+                    XCTAssertEqual(try self.errorCode(response.body), "SpaceDeleted")
                 }
             }
             try await fixture.close()
@@ -1472,7 +1655,9 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
     private func makeServer(
         _ fixture: Fixture,
         clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy =
-            UnavailableSpaceCredentialClientAttestationPolicy()
+            UnavailableSpaceCredentialClientAttestationPolicy(),
+        registrationConfirmer: (any SwanSpaceRegistrationConfirming)? = nil,
+        credentialPolicyDirectory: (any AuthorizedSimpleSpaceCredentialDirectory)? = nil
     ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
             from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-10-29.json")
@@ -1498,9 +1683,11 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 authoritySigningKeys: signing,
                 delegationPublicKeys: delegationKeys,
                 credentialPublicKeys: credentialKeys,
-                clientAttestationPolicy: clientAttestationPolicy
+                clientAttestationPolicy: clientAttestationPolicy,
+                registrationConfirmer: registrationConfirmer
             ),
-            spaceRepositorySyncConfiguration: .init(commitSigner: November12MACProvider())
+            spaceRepositorySyncConfiguration: .init(commitSigner: November12MACProvider()),
+            spaceCredentialPolicyDirectory: credentialPolicyDirectory
         )
     }
 
@@ -1662,7 +1849,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
     ) throws -> ByteBuffer {
         var fields: [String: String] = [
             "space": space.rawValue,
-            "credentialKid": try credentialKid ?? SpaceCredentialSignatureTestSupport.keyID,
+            "credentialKey": try credentialKid ?? SpaceCredentialSignatureTestSupport.keyID,
         ]
         fields["delegationToken"] = delegationToken
         fields["clientAttestation"] = clientAttestation
@@ -1722,6 +1909,46 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         let index = result.index(result.endIndex, offsetBy: -offsetFromEnd)
         result.replaceSubrange(index ... index, with: result[index] == "A" ? "B" : "A")
         return result
+    }
+}
+
+private struct UpstreamCredentialPolicyDirectory:
+    AuthorizedSimpleSpaceCredentialDirectory
+{
+    func authorizeSimpleSpaceCredentialRead(
+        space _: SpaceURI,
+        user _: String?,
+        clientID _: String?,
+        authorization _: AuthorizationContext
+    ) async throws {
+        throw TestCredentialUpstreamFailure()
+    }
+}
+
+private struct TestCredentialUpstreamFailure: AuthorizedSpaceUpstreamFailure {}
+
+private actor RegistrationConfirmationProbe: SwanSpaceRegistrationConfirming {
+    private let rejects: Bool
+    private var calls = 0
+
+    init(rejects: Bool = false) {
+        self.rejects = rejects
+    }
+
+    func confirmRegistration(
+        space _: SpaceURI,
+        endpoint _: URL,
+        token _: String,
+        challenge _: String
+    ) async throws {
+        calls += 1
+        if rejects {
+            throw SwanError.unavailable("test confirmation rejection")
+        }
+    }
+
+    func callCount() -> Int {
+        calls
     }
 }
 

@@ -3709,24 +3709,24 @@ public struct SpaceCredentialBroker: Sendable {
         try requireJSONSuccess(delegation)
         let delegationObject = try StrictJSON.decode(TokenResponse.self, from: delegation.body)
         // Credential binding is independent of the per-request KEM share.
-        // The October 22 exchange carries both binding and delegation in JSON.
+        // The sync authorization carries both binding and delegation in JSON.
         let credentialKey = P256.Signing.PrivateKey()
         let input = CredentialRequest(
             space: space.rawValue,
-            credentialKid: SpaceHTTPSignature.keyID(for: credentialKey),
+            credentialKey: SpaceHTTPSignature.keyID(for: credentialKey),
             delegationToken: delegationObject.token,
             clientAttestation: clientAttestation
         )
         let inputBody = try encode(input)
         let credential = try await authority.procedure(
-            "com.atproto.space.getSpaceCredential",
+            "com.atproto.space.authorizeSpaceSync",
             body: inputBody,
             authorization: .none
         )
         await recorder?.record(
             host: authorityLabel,
             method: "POST",
-            path: "/xrpc/com.atproto.space.getSpaceCredential",
+            path: "/xrpc/com.atproto.space.authorizeSpaceSync",
             requestBody: inputBody,
             response: credential
         )
@@ -3756,7 +3756,7 @@ public struct SpaceCredentialBroker: Sendable {
 
     private struct CredentialRequest: Encodable {
         let space: String
-        let credentialKid: String
+        let credentialKey: String
         let delegationToken: String
         let clientAttestation: String?
     }
