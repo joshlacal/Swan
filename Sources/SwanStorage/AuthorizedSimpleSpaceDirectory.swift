@@ -885,9 +885,6 @@ public func serviceIssuerDID(_ value: String) -> String? {
 }
 
 public enum SpaceNotificationRequestDigest {
-    public static func deletion(space: SpaceURI) -> String {
-        SpaceServiceRequestDigest.deletion(space: space)
-    }
 
     /// The `req` binding for `notifyCredentialsRevoked`: the space and its
     /// revoked credential IDs, in body order.
@@ -909,29 +906,6 @@ public enum SpaceNotificationRequestDigest {
         )
     }
 
-    /// The `req` binding for a space-host -> syncer `notifySpaceUpdate`: the
-    /// repo-host fields plus the space revisions the space host assigned.
-    public static func forwardedWrite(
-        space: SpaceURI,
-        repository: String,
-        wireRevision: String,
-        commitment: Data,
-        spaceRevision: String,
-        previousSpaceRevision: String?
-    ) -> String {
-        SpaceServiceRequestDigest.forwardedWrite(
-            space: space,
-            repository: repository,
-            revision: wireRevision,
-            commitment: commitment,
-            spaceRevision: spaceRevision,
-            previousSpaceRevision: previousSpaceRevision
-        )
-    }
-
-    public static func deletionBytes(space: SpaceURI) -> Data {
-        SpaceServiceRequestDigest.deletionBytes(space: space)
-    }
 
     public static func writeBytes(
         space: SpaceURI,
@@ -949,9 +923,6 @@ public enum SpaceNotificationRequestDigest {
 }
 
 public enum SpaceServiceRequestDigest {
-    public static func deletion(space: SpaceURI) -> String {
-        base64URLEncode(deletionBytes(space: space))
-    }
 
     public static func write(
         space: SpaceURI,
@@ -960,11 +931,6 @@ public enum SpaceServiceRequestDigest {
         commitment: Data
     ) -> String {
         base64URLEncode(writeBytes(space: space, repository: repository, revision: revision, commitment: commitment))
-    }
-    public static func deletionBytes(space: SpaceURI) -> Data {
-        digestBytes(domain: "swan.space.notify-deleted.v1", parts: [
-            Data(space.rawValue.utf8)
-        ])
     }
 
     public static func credentialRevocation(space: SpaceURI, credentials: [String]) -> String {
@@ -995,46 +961,6 @@ public enum SpaceServiceRequestDigest {
         )
     }
 
-    public static func forwardedWrite(
-        space: SpaceURI,
-        repository: String,
-        revision: String,
-        commitment: Data,
-        spaceRevision: String,
-        previousSpaceRevision: String?
-    ) -> String {
-        base64URLEncode(forwardedWriteBytes(
-            space: space,
-            repository: repository,
-            revision: revision,
-            commitment: commitment,
-            spaceRevision: spaceRevision,
-            previousSpaceRevision: previousSpaceRevision
-        ))
-    }
-
-    /// Parts are length-prefixed and a space revision is never empty, so the
-    /// empty final part unambiguously encodes an omitted `prevSpaceRev`.
-    public static func forwardedWriteBytes(
-        space: SpaceURI,
-        repository: String,
-        revision: String,
-        commitment: Data,
-        spaceRevision: String,
-        previousSpaceRevision: String?
-    ) -> Data {
-        digestBytes(
-            domain: "swan.space.notify-write-forwarded.v1",
-            parts: [
-                Data(space.rawValue.utf8),
-                Data(repository.utf8),
-                Data(revision.utf8),
-                commitment,
-                Data(spaceRevision.utf8),
-                Data((previousSpaceRevision ?? "").utf8),
-            ]
-        )
-    }
     private static func digestBytes(domain: String, parts: [Data]) -> Data {
         var input = Data()
         for part in [Data(domain.utf8)] + parts {

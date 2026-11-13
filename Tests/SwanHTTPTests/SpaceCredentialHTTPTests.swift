@@ -276,6 +276,29 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     )
                 }
             }
+            let disabledApp = try makeServer(fixture).buildApplication(
+                logger: Logger(label: "spaces.authorize.delivery-disabled")
+            )
+            try await disabledApp.test(.router) { client in
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: headers,
+                    body: rejectedBody
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(
+                        try self.errorCode(response.body),
+                        "RegistrationNotConfirmed"
+                    )
+                }
+            }
+            let disabledRegistration = try await fixture.directory.spaceSyncRegistration(
+                space: fixture.publicSpace,
+                endpoint: "https://other-notify.example",
+                token: "other-token"
+            )
+            XCTAssertNil(disabledRegistration)
             try await fixture.close()
         } catch {
             try? await fixture.close()
@@ -293,7 +316,11 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 registrationConfirmer: confirmer
             ).buildApplication(logger: Logger(label: "spaces.authorize.endpoint"))
             let headers: HTTPFields = [.contentType: "application/json"]
-            func body(endpoint: String, token: String, extra: Bool = false) throws -> ByteBuffer {
+            @Sendable func body(
+                endpoint: String,
+                token: String,
+                extra: Bool = false
+            ) throws -> ByteBuffer {
                 var notify: [String: Any] = ["endpoint": endpoint, "token": token]
                 if extra { notify["$type"] = "future-extension" }
                 return ByteBuffer(data: try JSONSerialization.data(withJSONObject: [

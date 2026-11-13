@@ -1215,7 +1215,6 @@ required_root = {
     "servicePublicKeys",
     "authorityDestinations",
     "registrationDestinations",
-    "recipientServiceBindings",
     "managingServiceAudience",
     "credentialKeyPLC",
 }
@@ -1315,18 +1314,6 @@ if configuration["registrationDestinations"]:
         "checked-in notification configuration must not contain registration routes"
     )
 
-bindings = configuration["recipientServiceBindings"]
-require_array(bindings, "$.recipientServiceBindings")
-binding_fields = {"serviceIdentity", "recipientAccount"}
-for index, binding in enumerate(bindings):
-    location = f"$.recipientServiceBindings[{index}]"
-    require_object(binding, location, binding_fields, binding_fields)
-    for field in binding_fields:
-        require_string(binding[field], f"{location}.{field}")
-if bindings:
-    raise SystemExit(
-        "checked-in notification configuration must not contain recipient bindings"
-    )
 if (
     configuration["credentialPublicKeys"]
     or configuration.get("delegationPublicKeys", [])

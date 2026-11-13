@@ -352,8 +352,6 @@ private struct NotificationHTTPFixture {
     func server(
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
         decodeObserver: (@Sendable () async -> Void)? = nil,
-        recipientBindings: SwanSpaceNotificationRecipientBindings = .empty,
-        serviceEndpointResolver: SwanServiceEndpointResolver? = nil,
         serviceAuthentication: (any SpaceServiceAuthenticationVerifier)? = nil,
         spacesOpenInterop: SwanSpacesOpenInteropConfiguration? = nil
     ) throws -> SwanHTTPServer {
@@ -376,62 +374,16 @@ private struct NotificationHTTPFixture {
             spaceNotificationConfiguration: decodeObserver.map {
                 SwanSpaceNotificationHTTPConfiguration(
                     serviceAuthentication: serviceAuthentication,
-                    recipientBindings: recipientBindings,
-                    serviceEndpointResolver: serviceEndpointResolver,
                     notificationJSONDecodeObserver: $0
                 )
             } ?? .init(
-                serviceAuthentication: serviceAuthentication,
-                recipientBindings: recipientBindings,
-                serviceEndpointResolver: serviceEndpointResolver
+                serviceAuthentication: serviceAuthentication
             ),
             spacesOpenInterop: spacesOpenInterop,
             jsonWriteAdmission: jsonWriteAdmission
         )
     }
 
-    func credentialHeaders(serviceAuth: String? = "register-service-token") throws -> HTTPFields {
-        let credential = try PermissionedDataJWT.createSpaceCredential(
-            issuer: authority, space: space, key: key,
-            confirmationKeyID: try SpaceCredentialSignatureTestSupport.keyID
-        )
-        // listRepos, registerNotify, and unregisterNotify are space-host
-        // operations: the signed audience is the authority's bare DID, and
-        // one signature serves all three.
-        var headers = try SpaceCredentialSignatureTestSupport.headers(
-            token: credential, audience: authority
-        )
-        headers[.contentType] = "application/json"
-        if let serviceAuth {
-            headers[.init("Atproto-Service-Auth")!] = "Bearer \(serviceAuth)"
-        }
-        return headers
-    }
-
-    func credentialOnlyHeaders() throws -> HTTPFields {
-        try credentialHeaders(serviceAuth: nil)
-    }
-
-    func registerHeaders(for serviceDID: String? = nil) throws -> HTTPFields {
-        var headers = try credentialHeaders()
-        let did = serviceDID ?? writer
-        headers[HTTPField.Name("atproto-service-auth")!] = "Bearer service-token:\(did)"
-        return headers
-    }
-
-    func foreignAudienceRegisterHeaders(for serviceDID: String? = nil) throws -> HTTPFields {
-        var headers = try credentialHeaders()
-        let did = serviceDID ?? writer
-        headers[HTTPField.Name("atproto-service-auth")!] = "Bearer foreign-audience-token:\(did)"
-        return headers
-    }
-
-    /// The reference presentation: `Atproto-Space` plus an HTTP message
-    /// signature by the credential's `cnf.kid` key over the authorization and
-    /// audience fields.
-    func spaceSchemeCredentialHeaders(for serviceDID: String? = nil) throws -> HTTPFields {
-        try registerHeaders(for: serviceDID)
-    }
 
     func close() async throws {
         try await control.close()
@@ -882,14 +834,6 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
         var issuedAt: Date? = nil
     }
 
-    /// The `iat` the bound deletion token carries, so the route test can see
-    /// it reach the durable receiver (SW-A).
-    static let boundDeletionIssuedAt = Date(timeIntervalSince1970: 1_800_000_000)
-
-    /// The pinned reference PDS registers a raw endpoint as the recipient
-    /// service identity, so the binding key is not a DID.
-    static let boundRecipientIdentity =
-        "https://receiver.example/xrpc/com.atproto.space.notifySpaceDeleted"
 
     let authority: String
     let writer: String
@@ -920,36 +864,6 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
             )
         } else {
             switch (compact, expectedMethod) {
-            case ("register-service-token", "com.atproto.space.registerNotify"):
-                meta = TokenMeta(
-                    issuer: "did:web:events.bulleted.example",
-                    audience: authority,
-                    eventID: "service-event-reg",
-                    requestBodyDigest: nil
-                )
-            case ("unregister-service-token", "com.atproto.space.unregisterNotify"):
-                meta = TokenMeta(
-                    issuer: "did:web:events.bulleted.example",
-                    audience: authority,
-                    eventID: "service-event-unreg",
-                    requestBodyDigest: nil
-                )
-            case ("wrong-audience-token", "com.atproto.space.registerNotify"),
-                 ("wrong-audience-token", "com.atproto.space.unregisterNotify"):
-                meta = TokenMeta(
-                    issuer: "did:web:events.bulleted.example",
-                    audience: "did:plc:other-authority",
-                    eventID: "service-event-wrong-aud",
-                    requestBodyDigest: nil
-                )
-            case ("writer-token", "com.atproto.space.registerNotify"),
-                 ("writer-token", "com.atproto.space.unregisterNotify"):
-                meta = TokenMeta(
-                    issuer: writer,
-                    audience: authority,
-                    eventID: "service-event-registration",
-                    requestBodyDigest: nil
-                )
             case ("writer-token", "com.atproto.space.notifyRepoUpdate"):
                 let space = try SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "http")
                 let writeDigest = SpaceNotificationRequestDigest.write(
@@ -971,13 +885,6 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
                     eventID: "service-event-bad",
                     requestBodyDigest: "mismatched-digest"
                 )
-            case ("bad-digest-token", "com.atproto.space.notifySpaceDeleted"):
-                meta = TokenMeta(
-                    issuer: authority,
-                    audience: NotificationServiceVerifier.boundRecipientIdentity,
-                    eventID: "service-event-bad-digest",
-                    requestBodyDigest: "sha256:mismatched-digest"
-                )
             case ("bad-digest-token", "com.atproto.space.notifyRepoUpdate"):
                 meta = TokenMeta(
                     issuer: writer,
@@ -998,30 +905,6 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
                     audience: "did:plc:unknownabcdefghijklmnopqr",
                     eventID: "service-event-3",
                     requestBodyDigest: expectedRequestBodyDigest
-                )
-            case ("authority-unknown-recipient-token", "com.atproto.space.notifySpaceDeleted"):
-                let space = try SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "http")
-                meta = TokenMeta(
-                    issuer: authority,
-                    audience: "did:plc:unknownabcdefghijklmnopqr",
-                    eventID: "service-event-4",
-                    requestBodyDigest: SpaceNotificationRequestDigest.deletion(space: space)
-                )
-            case ("authority-bound-recipient-token", "com.atproto.space.notifySpaceDeleted"):
-                let space = try SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "http")
-                let sibling = try? SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "http-sibling")
-                let digest: String
-                if let sibling, expectedRequestBodyDigest == SpaceNotificationRequestDigest.deletion(space: sibling) {
-                    digest = SpaceNotificationRequestDigest.deletion(space: sibling)
-                } else {
-                    digest = SpaceNotificationRequestDigest.deletion(space: space)
-                }
-                meta = TokenMeta(
-                    issuer: authority,
-                    audience: NotificationServiceVerifier.boundRecipientIdentity,
-                    eventID: "service-event-5",
-                    requestBodyDigest: digest,
-                    issuedAt: NotificationServiceVerifier.boundDeletionIssuedAt
                 )
             default:
                 throw SwanError.unauthorized("service authentication is invalid")

@@ -520,7 +520,6 @@ configuration = {
         "finalPeer": "127.0.0.1",
     }],
     "registrationDestinations": [],
-    "recipientServiceBindings": [],
     "managingServiceAudience": "did:web:interop-swan-managing-service",
     "delegationKeyPLC": {
         "origin": "http://reference-plc:2582",

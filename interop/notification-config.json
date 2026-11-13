@@ -10,7 +10,6 @@
     }
   ],
   "registrationDestinations": [],
-  "recipientServiceBindings": [],
   "managingServiceAudience": "did:web:interop-swan-managing-service",
   "credentialKeyPLC": {
     "origin": "http://reference-plc:2582",

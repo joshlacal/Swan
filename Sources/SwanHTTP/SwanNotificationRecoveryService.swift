@@ -14,17 +14,20 @@ public struct SwanNotificationRecoveryService: Service {
     private let makeOutboxTransport: OutboxTransportFactory
     private let makeSyncTransport: SyncTransportFactory
     private let configuration: PermissionedSpaceOutboxDeliveryConfiguration
+    private let allowLocalhostDevelopment: Bool
 
     public init(
         databases: [SQLiteAccountDatabase],
         makeOutboxTransport: @escaping OutboxTransportFactory,
         makeSyncTransport: @escaping SyncTransportFactory,
-        configuration: PermissionedSpaceOutboxDeliveryConfiguration = .standard
+        configuration: PermissionedSpaceOutboxDeliveryConfiguration = .standard,
+        allowLocalhostDevelopment: Bool = false
     ) {
         self.databases = databases
         self.makeOutboxTransport = makeOutboxTransport
         self.makeSyncTransport = makeSyncTransport
         self.configuration = configuration
+        self.allowLocalhostDevelopment = allowLocalhostDevelopment
     }
 
     /// Convenience startup constructor for the exact inventory used by the
@@ -34,13 +37,15 @@ public struct SwanNotificationRecoveryService: Service {
         _ directory: SQLitePreMigratedAccountDirectory,
         makeOutboxTransport: @escaping OutboxTransportFactory,
         makeSyncTransport: @escaping SyncTransportFactory,
-        configuration: PermissionedSpaceOutboxDeliveryConfiguration = .standard
+        configuration: PermissionedSpaceOutboxDeliveryConfiguration = .standard,
+        allowLocalhostDevelopment: Bool = false
     ) async throws -> SwanNotificationRecoveryService {
         try await .init(
             databases: directory.notificationRecoveryDatabases(),
             makeOutboxTransport: makeOutboxTransport,
             makeSyncTransport: makeSyncTransport,
-            configuration: configuration
+            configuration: configuration,
+            allowLocalhostDevelopment: allowLocalhostDevelopment
         )
     }
 
@@ -59,7 +64,8 @@ public struct SwanNotificationRecoveryService: Service {
                         let sync = PermissionedSpaceSyncNotificationDeliveryWorker(
                             database: database,
                             transport: syncTransport,
-                            configuration: configuration
+                            configuration: configuration,
+                            allowLocalhostDevelopment: allowLocalhostDevelopment
                         )
                         group.addTask { await sync.runUntilCancelled() }
                     }

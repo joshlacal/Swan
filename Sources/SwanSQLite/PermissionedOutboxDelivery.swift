@@ -243,15 +243,18 @@ public actor PermissionedSpaceSyncNotificationDeliveryWorker {
     private let database: SQLiteAccountDatabase
     private let transport: any PermissionedSpaceSyncNotificationTransport
     private let configuration: PermissionedSpaceOutboxDeliveryConfiguration
+    private let allowLocalhostDevelopment: Bool
 
     public init(
         database: SQLiteAccountDatabase,
         transport: any PermissionedSpaceSyncNotificationTransport,
-        configuration: PermissionedSpaceOutboxDeliveryConfiguration = .standard
+        configuration: PermissionedSpaceOutboxDeliveryConfiguration = .standard,
+        allowLocalhostDevelopment: Bool = false
     ) {
         self.database = database
         self.transport = transport
         self.configuration = configuration
+        self.allowLocalhostDevelopment = allowLocalhostDevelopment
     }
 
     public func deliverNext(
@@ -259,7 +262,8 @@ public actor PermissionedSpaceSyncNotificationDeliveryWorker {
     ) async throws -> PermissionedSpaceSyncNotificationDeliveryResult {
         guard let lease = try await database.leaseNextSpaceSyncNotification(
             now: now,
-            leaseDuration: configuration.leaseDuration
+            leaseDuration: configuration.leaseDuration,
+            allowLocalhostDevelopment: allowLocalhostDevelopment
         ) else {
             return .idle
         }

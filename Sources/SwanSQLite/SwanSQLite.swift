@@ -2269,7 +2269,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let permissionedRemoteReplicaResultBindingMigrationVersion = 8
     private static let spaceNotificationReceiptCompactionMigrationVersion = 9
     private static let permissionedSpaceWriterForeignKeyMigrationVersion = 21
-    private static let spaceNotificationOwnershipMigrationVersion = 22
     private static let accountBlobQuotaMigrationVersion = 10
     private static let permissionedRemoteReplicaIncrementalSequenceMigrationVersion = 11
     private static let permissionedRemoteReplicaLogicalLimitMigrationVersion = 12
@@ -8851,7 +8850,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
     public func putSpaceSyncRegistration(
         _ registration: AuthorizedSpaceSyncRegistration,
-        allowLocalhostDevelopment: Bool
+        allowLocalhostDevelopment: Bool = false
     ) async throws {
         guard validNotificationEndpoint(
             registration.endpoint,
@@ -11008,7 +11007,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
 
     public func leaseNextSpaceSyncNotification(
         now: Date = Date(),
-        leaseDuration: TimeInterval
+        leaseDuration: TimeInterval,
+        allowLocalhostDevelopment: Bool = false
     ) async throws -> PersistedSpaceSyncNotificationLease? {
         let nowTimestamp = try outboxTimestamp(now)
         let leaseExpiry = try outboxTimestamp(
@@ -11047,7 +11047,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     guard let row = rows.first else { return nil }
                     let event: PersistedSpaceSyncNotification
                     do {
-                        event = try decodeSpaceSyncNotification(row)
+                        event = try decodeSpaceSyncNotification(
+                            row,
+                            allowLocalhostDevelopment: allowLocalhostDevelopment
+                        )
                         _ = try decodeSpaceSyncNotificationLease(row)
                     } catch {
                         guard let rowID = row.column("queue_rowid")?.integer else {
@@ -12453,7 +12456,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     }
 
     private func decodeSpaceSyncNotification(
-        _ row: SQLiteRow
+        _ row: SQLiteRow,
+        allowLocalhostDevelopment: Bool = true
     ) throws -> PersistedSpaceSyncNotification {
         guard let id = row.column("id")?.string.flatMap(UUID.init(uuidString:)),
               let kindRaw = row.column("kind")?.string,
@@ -12469,7 +12473,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 "invalid space sync notification row"
             )
         }
-        _ = try validNotificationEndpoint(endpoint)
+        guard validNotificationEndpoint(
+            endpoint,
+            allowLocalhostDevelopment: allowLocalhostDevelopment
+        ) != nil else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid space sync notification endpoint"
+            )
+        }
         let repository = row.column("repo_did")?.string
         let wireRevision = row.column("repo_revision")?.string
         let commitment = row.column("commitment").flatMap { column -> Data? in

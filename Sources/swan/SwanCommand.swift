@@ -60,7 +60,6 @@ struct ServeNotificationRuntime {
     let remoteDelegationPublicKeys: (any SpaceDelegationPublicKeyResolver)?
     let delegationPublicKeys: PinnedSpaceDelegationPublicKeyResolver
     let servicePublicKeys: PinnedSpaceServicePublicKeyResolver
-    let recipientBindings: SwanSpaceNotificationRecipientBindings
     let destinations: StaticSwanSpaceNotificationDestinations
     let peerPinnedTransportConfiguration: NIOPeerPinnedOAuthPostTransport.Configuration
     let managingServiceAudience: String?
@@ -71,7 +70,6 @@ struct ServeNotificationRuntime {
         let servicePublicKeys: [ServiceKey]
         let authorityDestinations: [Destination]
         let registrationDestinations: [Destination]
-        let recipientServiceBindings: [RecipientServiceBinding]?
         let managingServiceAudience: String?
         let credentialKeyPLC: CredentialKeyPLC?
         let delegationKeyPLC: DelegationKeyPLC?
@@ -133,10 +131,6 @@ struct ServeNotificationRuntime {
         let finalPeer: String
     }
 
-    private struct RecipientServiceBinding: Decodable {
-        let serviceIdentity: String
-        let recipientAccount: String
-    }
 
     private enum ConfigurationShapeError: Error {
         case invalid
@@ -327,16 +321,6 @@ struct ServeNotificationRuntime {
                 registrations[destination.key] = decoded.destination
                 try insertPeer(decoded.peer, for: decoded.destination.endpoint, into: &peers)
             }
-            var recipientAccounts: [String: String] = [:]
-            for binding in configuration.recipientServiceBindings ?? [] {
-                guard recipientAccounts[binding.serviceIdentity] == nil else {
-                    throw SwanError.malformed("duplicate notification recipient service identity")
-                }
-                recipientAccounts[binding.serviceIdentity] = binding.recipientAccount
-            }
-            let recipientBindings = try SwanSpaceNotificationRecipientBindings(
-                bindings: recipientAccounts
-            )
             let managedAudience = try resolveManagingServiceAudience(
                 requested: configuration.managingServiceAudience
             )
@@ -355,7 +339,6 @@ struct ServeNotificationRuntime {
                 servicePublicKeys: try PinnedSpaceServicePublicKeyResolver(
                     pins: servicePins
                 ),
-                recipientBindings: recipientBindings,
                 destinations: try StaticSwanSpaceNotificationDestinations(
                     authorityDestinations: authorities
                 ),
@@ -380,7 +363,6 @@ struct ServeNotificationRuntime {
                 "servicePublicKeys",
                 "authorityDestinations",
                 "registrationDestinations",
-                "recipientServiceBindings",
                 "managingServiceAudience",
                 "credentialKeyPLC",
                 "delegationKeyPLC",
@@ -428,10 +410,6 @@ struct ServeNotificationRuntime {
         try validateObjectArray(
             configuration["registrationDestinations"],
             allowed: ["key", "endpoint", "audience", "finalPeer"]
-        )
-        try validateObjectArray(
-            configuration["recipientServiceBindings"],
-            allowed: ["serviceIdentity", "recipientAccount"]
         )
         if let plc = configuration["credentialKeyPLC"] {
             guard let plc = plc as? [String: Any] else {
@@ -901,7 +879,6 @@ struct ServePermissionedRuntime {
         managingServiceAudience: String? = nil,
         clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy =
             UnavailableSpaceCredentialClientAttestationPolicy(),
-        serviceEndpointResolver: SwanServiceEndpointResolver? = nil,
         spacesOpenInterop: SwanSpacesOpenInteropConfiguration? = nil,
         openFederation: SwanDIDDocumentSpaceResolver? = nil,
         notificationDeliveryEnabled: Bool = false,
@@ -1011,10 +988,8 @@ struct ServePermissionedRuntime {
                 publicKeys: servicePublicKeys
             )
             serviceAuthentication = verifier
-            notificationConfiguration = .init(
-                serviceAuthentication: verifier,
-                recipientBindings: notification?.recipientBindings ?? .empty,
-                serviceEndpointResolver: serviceEndpointResolver
+            notificationConfiguration = SwanSpaceNotificationHTTPConfiguration(
+                serviceAuthentication: verifier
             )
         } else {
             serviceAuthentication = nil
@@ -4121,7 +4096,6 @@ extension SwanCommand {
                         notification: notificationRuntime,
                         managingServiceAudience: managingServiceAudience,
                         clientAttestationPolicy: clientAttestationPolicy,
-                        serviceEndpointResolver: notifyServiceResolver,
                         spacesOpenInterop: enableSpacesOpenInterop ? .standard : nil,
                         openFederation: openFederationResolver,
                         notificationDeliveryEnabled: enableNotificationDelivery,
@@ -4237,7 +4211,9 @@ extension SwanCommand {
                             HTTPPermissionedSpaceSyncNotificationTransport(
                                 poster: poster
                             )
-                        }
+                        },
+                        allowLocalhostDevelopment:
+                            !Self.isPubliclyReachableHTTPSOrigin(baseURL)
                     )
                 } else {
                     notificationRecoveryService = nil

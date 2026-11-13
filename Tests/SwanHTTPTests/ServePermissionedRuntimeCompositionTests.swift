@@ -23,7 +23,6 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
     private let localDID = "did:plc:abcdefghijklmnopqrstuvwx"
     private let remoteDID = "did:plc:bcdefghijklmnopqrstuvwxy"
     private let managingAudience = "did:web:configured-managing.example"
-    private let recipientService = "did:web:configured-recipient.example"
 
     /// The order is deliberate: creation rows establish only the durable facts
     /// consumed by later rows, and destructive rows run last. Set equality
@@ -76,11 +75,6 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 notification: notification
             )
 
-            XCTAssertEqual(
-                composition.notificationConfiguration?.recipientBindings
-                    .account(forServiceIdentity: recipientService),
-                localDID
-            )
             XCTAssertEqual(
                 composition.managedSpaceCheckAccessConfiguration?.managingServiceAudience,
                 managingAudience
@@ -750,17 +744,12 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             "audience": managingAudience,
             "finalPeer": "127.0.0.1",
         ]
-        let recipient: [String: Any] = [
-            "serviceIdentity": recipientService,
-            "recipientAccount": localDID,
-        ]
         let base: [String: Any] = [
             "credentialPublicKeys": [credential],
             "delegationPublicKeys": [credential],
             "servicePublicKeys": [service],
             "authorityDestinations": [destination],
             "registrationDestinations": [],
-            "recipientServiceBindings": [recipient],
             "managingServiceAudience": managingAudience,
         ]
         var cases: [(String, [String: Any])] = []
@@ -799,11 +788,6 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         registrationConfig["registrationDestinations"] = [registration]
         cases.append(("registration destination", registrationConfig))
 
-        var recipientWithUnknownKey = recipient
-        recipientWithUnknownKey["token"] = "must-not-be-accepted"
-        var recipientConfig = base
-        recipientConfig["recipientServiceBindings"] = [recipientWithUnknownKey]
-        cases.append(("recipient binding", recipientConfig))
 
         var plcConfig = base
         plcConfig["credentialKeyPLC"] = [
@@ -1076,10 +1060,6 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 "finalPeer": "127.0.0.1",
             ]],
             "registrationDestinations": [],
-            "recipientServiceBindings": [[
-                "serviceIdentity": recipientService,
-                "recipientAccount": localDID,
-            ]],
         ]
         if includeManagingAudience {
             object["managingServiceAudience"] = managingAudience
@@ -1121,7 +1101,6 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 "finalPeer": "127.0.0.1",
             ]],
             "registrationDestinations": [],
-            "recipientServiceBindings": [],
             "managingServiceAudience": managingAudience,
         ]
         try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])

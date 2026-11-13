@@ -308,64 +308,28 @@ public struct SwanSpaceRepositorySyncHTTPConfiguration: Sendable {
 public struct SwanSpacesOpenInteropConfiguration: Sendable, Equatable {
     /// Upstream `createServiceJwt` mints `exp = iat + 60`.
     public static let maximumUnboundServiceLifetime: TimeInterval = 60
-    public static let standard = SwanSpacesOpenInteropConfiguration(
-        uncheckedPerSpace: 32,
-        uncheckedPerSubject: 8
-    )
+    public static let standard = SwanSpacesOpenInteropConfiguration()
 
-    /// Retained command-line compatibility values; registration admission
-    /// moved into authorizeSpaceSync and no longer consumes these caps.
-    public let maximumHeaderlessRegistrationsPerSpacePerHour: Int
-    public let maximumHeaderlessRegistrationsPerSubjectPerHour: Int
-
-    public init(
-        maximumHeaderlessRegistrationsPerSpacePerHour: Int = 32,
-        maximumHeaderlessRegistrationsPerSubjectPerHour: Int = 8
-    ) throws {
-        guard (1 ... 1_024).contains(maximumHeaderlessRegistrationsPerSpacePerHour),
-              (1 ... maximumHeaderlessRegistrationsPerSpacePerHour)
-                .contains(maximumHeaderlessRegistrationsPerSubjectPerHour) else {
-            throw SwanError.malformed("spaces open interop registration caps are invalid")
-        }
-        self.maximumHeaderlessRegistrationsPerSpacePerHour =
-            maximumHeaderlessRegistrationsPerSpacePerHour
-        self.maximumHeaderlessRegistrationsPerSubjectPerHour =
-            maximumHeaderlessRegistrationsPerSubjectPerHour
-    }
-
-    private init(uncheckedPerSpace: Int, uncheckedPerSubject: Int) {
-        maximumHeaderlessRegistrationsPerSpacePerHour = uncheckedPerSpace
-        maximumHeaderlessRegistrationsPerSubjectPerHour = uncheckedPerSubject
-    }
+    public init() {}
 }
 
 public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
     public let serviceAuthentication: any SpaceServiceAuthenticationVerifier
-    let recipientBindings: SwanSpaceNotificationRecipientBindings
     let notificationJSONDecodeObserver: (@Sendable () async -> Void)?
-    let serviceEndpointResolver: SwanServiceEndpointResolver?
 
     public init(
-        serviceAuthentication: any SpaceServiceAuthenticationVerifier,
-        recipientBindings: SwanSpaceNotificationRecipientBindings = .empty,
-        serviceEndpointResolver: SwanServiceEndpointResolver? = nil
+        serviceAuthentication: any SpaceServiceAuthenticationVerifier
     ) {
         self.serviceAuthentication = serviceAuthentication
-        self.recipientBindings = recipientBindings
         notificationJSONDecodeObserver = nil
-        self.serviceEndpointResolver = serviceEndpointResolver
     }
 
     init(
         serviceAuthentication: any SpaceServiceAuthenticationVerifier,
-        recipientBindings: SwanSpaceNotificationRecipientBindings = .empty,
-        serviceEndpointResolver: SwanServiceEndpointResolver? = nil,
         notificationJSONDecodeObserver: @escaping @Sendable () async -> Void
     ) {
         self.serviceAuthentication = serviceAuthentication
-        self.recipientBindings = recipientBindings
         self.notificationJSONDecodeObserver = notificationJSONDecodeObserver
-        self.serviceEndpointResolver = serviceEndpointResolver
     }
 }
 

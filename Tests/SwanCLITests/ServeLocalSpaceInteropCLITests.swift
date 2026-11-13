@@ -284,10 +284,6 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
                 "finalPeer": "127.0.0.1",
             ]],
             "registrationDestinations": [],
-            "recipientServiceBindings": [[
-                "serviceIdentity": "did:web:configured-recipient.example",
-                "recipientAccount": localDID,
-            ]],
             "managingServiceAudience": "did:web:configured-managing.example",
         ]
         try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys])
@@ -468,10 +464,6 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
                 "finalPeer": "127.0.0.1",
             ]],
             "registrationDestinations": [],
-            "recipientServiceBindings": [[
-                "serviceIdentity": "did:web:configured-recipient.example",
-                "recipientAccount": localDID,
-            ]],
             "managingServiceAudience": "did:web:configured-managing.example",
         ]
         try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys])

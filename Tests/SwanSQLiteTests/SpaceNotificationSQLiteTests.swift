@@ -639,7 +639,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
 
 
 
-    func testSpaceDeleteAndRecreateRemovesWriterHighWaterAndAdmitsLiveNotificationAndRecovery() async throws {
+    func testSpaceRevivalPathsClearPendingDeletionAndWriterHighWater() async throws {
         let fixture = try NotificationFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let database = try await fixture.open()
@@ -721,6 +721,29 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         )
         XCTAssertEqual(writersAfterRecreate.count, 1)
         XCTAssertEqual(writersAfterRecreate.first?.column("wire_revision")?.string, rev1.toString())
+        try await database.putSpaceSyncRegistration(.init(
+            space: fixture.space,
+            endpoint: "https://import-revival-syncer.example",
+            token: "import-revival-token",
+            expiresAt: now.addingTimeInterval(600)
+        ))
+
+        let archive = try await database.exportSpaceMeta(
+            space: fixture.space,
+            authorization: authContext
+        )
+        _ = try await database.deleteSimpleSpace(
+            space: fixture.space,
+            authorization: authContext
+        )
+        let queuedSecondDeletion = try await database.pendingSpaceSyncNotifications()
+        XCTAssertEqual(queuedSecondDeletion.map(\.kind), [.spaceDeleted])
+        try await database.importSpaceMeta(archive, authorization: authContext)
+        let queuedAfterImport = try await database.pendingSpaceSyncNotifications()
+        XCTAssertTrue(
+            queuedAfterImport.isEmpty,
+            "an imported revival must not inherit its deletion notice"
+        )
     }
 
     func testSequencedWriteAndRemovalQueueContinuousUpdates() async throws {

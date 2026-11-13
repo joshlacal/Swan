@@ -804,44 +804,6 @@ final class SwanOAuthTests: XCTestCase {
             XCTAssertEqual(error, .unauthorized("service authentication is invalid"))
         }
 
-        // Deletion digest binding
-        let deletionDigest = SpaceServiceRequestDigest.deletion(space: space)
-        let deletionToken = try SpaceServiceJWT.create(
-            issuer: audience,
-            audience: "did:web:receiver.example",
-            method: "com.atproto.space.notifySpaceDeleted",
-            eventID: "event-del-1",
-            requestBodyDigest: deletionDigest,
-            key: key,
-            now: now
-        )
-        let deletionVerifier = DurableSpaceServiceAuthenticationVerifier(
-            publicKeys: try PinnedSpaceServicePublicKeyResolver(pins: [
-                try .init(issuer: audience, generation: 1, publicKey: key.publicKey)
-            ])
-        )
-        let verifiedDeletion = try await deletionVerifier.authenticate(
-            deletionToken,
-            expectedAudience: nil,
-            expectedMethod: "com.atproto.space.notifySpaceDeleted",
-            expectedRequestBodyDigest: deletionDigest,
-            now: now
-        )
-        XCTAssertEqual(verifiedDeletion.requestBodyDigest, deletionDigest)
-
-        // Deletion with altered space digest fails
-        do {
-            _ = try await deletionVerifier.authenticate(
-                deletionToken,
-                expectedAudience: nil,
-                expectedMethod: "com.atproto.space.notifySpaceDeleted",
-                expectedRequestBodyDigest: SpaceServiceRequestDigest.deletion(space: alteredSpace),
-                now: now
-            )
-            XCTFail("expected deletion with altered space to fail")
-        } catch let error as SwanError {
-            XCTAssertEqual(error, .unauthorized("service authentication is invalid"))
-        }
     }
 
     func testRemoteMetadataPolicyRejectsAllPrivateLiteralRanges() throws {

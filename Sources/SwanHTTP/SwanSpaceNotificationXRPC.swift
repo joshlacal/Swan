@@ -704,20 +704,6 @@ func exactSpaceServiceBearerToken(from headers: HTTPFields) throws -> String {
     return token
 }
 
-private func validRegisteredNotificationEndpoint(_ raw: String) -> Bool {
-    guard raw.utf8.count <= 4_096,
-          raw.unicodeScalars.allSatisfy({ $0.value > 0x1f && $0.value != 0x7f }),
-          let components = URLComponents(string: raw),
-          let scheme = components.scheme?.lowercased(),
-          ["https", "http"].contains(scheme),
-          components.host != nil,
-          components.user == nil,
-          components.password == nil,
-          components.fragment == nil else {
-        return false
-    }
-    return true
-}
 
 private func notificationStorageFailure(_ error: Error) -> AuthenticatedSpaceNotificationFailure {
     if error is AuthorizedSimpleSpaceLifecycleError {

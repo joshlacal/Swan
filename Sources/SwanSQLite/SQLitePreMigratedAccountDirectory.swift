@@ -758,7 +758,7 @@ public actor SQLitePreMigratedAccountDirectory:
 
     public func putSpaceSyncRegistration(
         _ registration: AuthorizedSpaceSyncRegistration,
-        allowLocalhostDevelopment: Bool
+        allowLocalhostDevelopment: Bool = false
     ) async throws {
         let database = try await preopenedCredentialAuthorityDatabase(
             for: registration.space
@@ -3098,29 +3098,6 @@ public actor SQLitePreMigratedAccountDirectory:
         return database
     }
 
-    /// Service notifications select their recipient from the signed `aud`
-    /// claim only after the service-JWT verifier has bound it to this route.
-    /// This retains the same active/preopened/path checks as every other
-    /// account database projection and never constructs remote-space state.
-    private func preopenedServiceRecipientDatabase(
-        for did: String
-    ) async throws -> SQLiteAccountDatabase {
-        guard !isClosed,
-              try await isActiveAccount(did) else {
-            throw SwanError.unauthorized("service notification recipient is unavailable")
-        }
-        do {
-            try Self.requireExistingRegularDatabase(
-                SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
-            )
-        } catch {
-            throw SwanError.unavailable("authenticated space directory is unavailable")
-        }
-        guard !isClosed, let database = databases[did] else {
-            throw SwanError.unavailable("authenticated space directory is unavailable")
-        }
-        return database
-    }
 
     /// Returns an existing active account database for a best-effort service
     /// delivery target. Unlike request authorization helpers, absence is not
