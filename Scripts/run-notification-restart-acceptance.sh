@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Live, disposable Compose acceptance for the durable permissioned outbox.
+# Live, disposable Compose acceptance for durable permissioned notifications.
 # Each invocation creates a fresh, internally owned Compose project; callers
 # cannot redirect cleanup to an existing project or volume set.
 # The seed Swan process commits one write with delivery disabled, then receives
-# SIGKILL. A recovery-enabled Swan process then starts only after a
-# loopback-only proxy is ready. The proxy loses the first successful
-# acknowledgement, observes exactly two successful forwards of the stable
-# event, and the authority records exactly one receiver effect.
+# SIGKILL. A recovery-enabled Swan confirms an authorizeSpaceSync registration,
+# drains the surviving writer outbox, and delivers one notifySpaceUpdate to the
+# registered syncer endpoint.
 #
 # The scenario writes request bodies and OAuth results only to container tmpfs.
 # Its host-side state contains transport counts and SHA-256 digests, never
@@ -566,7 +565,6 @@ configuration = {
         "finalPeer": "127.0.0.1",
     }],
     "registrationDestinations": [],
-    "recipientServiceBindings": [],
     "managingServiceAudience": "did:web:interop-swan-managing-service",
     "credentialKeyPLC": {
         "origin": "http://reference-plc:2582",
@@ -739,6 +737,19 @@ database_assertion() {
         process.stdout.write(rows[0].id);
         process.exit(0);
       }
+      if (mode === "registered") {
+        const authorityDatabase = open(authority);
+        const registrations = authorityDatabase.prepare(`
+          SELECT COUNT(*) AS count
+          FROM permissioned_space_sync_registrations
+          WHERE space_uri = ? AND endpoint = ? AND token = ?
+        `).get(space, "http://localhost:3001", "notification-restart-sync").count;
+        if (registrations !== 1) {
+          fail("sync registration invariant failed");
+        }
+        process.stdout.write("registered");
+        process.exit(0);
+      }
       if (mode !== "delivered" || !expectedEvent) {
         fail("notification database assertion mode is invalid");
       }
@@ -763,11 +774,23 @@ database_assertion() {
         FROM permissioned_space_writers
         WHERE space_uri = ? AND repo_did = ?
       `).get(space, member).count;
+      const queuedSync = authorityDatabase.prepare(`
+        SELECT COUNT(*) AS count
+        FROM permissioned_space_sync_notifications
+        WHERE space_uri = ?
+      `).get(space).count;
+      const registrations = authorityDatabase.prepare(`
+        SELECT COUNT(*) AS count
+        FROM permissioned_space_sync_registrations
+        WHERE space_uri = ? AND endpoint = ? AND token = ?
+      `).get(space, "http://localhost:3001", "notification-restart-sync").count;
       if (
         remaining !== 0 ||
         receipts !== 1 ||
         totalReceipts !== 1 ||
-        writerEffects !== 1
+        writerEffects !== 1 ||
+        queuedSync !== 0 ||
+        registrations !== 1
       ) {
         fail("notification convergence invariant failed");
       }
@@ -791,12 +814,54 @@ post_crash_event_id="$(database_assertion pending)"
 }
 docker rm "$seed_container" >/dev/null
 
-# Start and wait for the loopback proxy before the recovery-enabled process is
-# allowed to inspect the pending outbox. The proxy owns the network namespace
-# and the recovery process joins it, so localhost:3001 is already accepting
-# connections before notification delivery starts. The proxy forwards only
-# notifyWrite, drops the first 2xx acknowledgement after the authority commits,
-# and persists counts and body digests only.
+database_mutation() {
+  docker run --rm \
+    --network none \
+    --user 0:0 \
+    --read-only \
+    --tmpfs /tmp:size=16m,mode=1777 \
+    --mount "type=volume,src=${data_volume},dst=/var/lib/swan" \
+    "$reference_image" \
+    node -e '
+      const crypto = require("node:crypto");
+      const path = require("node:path");
+      const Database = require("better-sqlite3");
+      const [mode, authority, member, space] = process.argv.slice(1);
+      const databasePath = (did) => {
+        const digest = crypto.createHash("sha256").update(did, "utf8").digest("hex");
+        return path.join("/var/lib/swan/data/actors", digest.slice(0, 2), `${digest}.sqlite`);
+      };
+      const authorityDatabase = new Database(databasePath(authority));
+      const memberDatabase = new Database(databasePath(member));
+      if (mode === "hold") {
+        authorityDatabase.prepare(`
+          UPDATE permissioned_simple_space_authorities
+          SET read_policy = ?, read_managing_app = NULL
+          WHERE space_uri = ?
+        `).run("public", space);
+        memberDatabase.prepare(`
+          UPDATE permissioned_space_outbox
+          SET available_at = 9000000000000000,
+              lease_token = NULL, lease_expires_at = NULL
+          WHERE space_uri = ? AND author_did = ?
+        `).run(space, member);
+      } else if (mode === "release") {
+        memberDatabase.prepare(`
+          UPDATE permissioned_space_outbox
+          SET available_at = 0, lease_token = NULL, lease_expires_at = NULL
+          WHERE space_uri = ? AND author_did = ?
+        `).run(space, member);
+      } else {
+        throw new Error("invalid database mutation mode");
+      }
+    ' "$1" "$authority_did" "$member_did" "$space_uri"
+}
+
+database_mutation hold
+
+# The proxy is the registered syncer endpoint and the writer-to-authority lab
+# route. It confirms the opaque registration, forwards notifyRepoUpdate to the
+# authority, and records one notifySpaceUpdate without retaining its body.
 proxy_id="$(
   docker run --detach \
     --name "$proxy_container" \
@@ -812,17 +877,17 @@ proxy_id="$(
       const fs = require("node:fs");
       const http = require("node:http");
       const state = {
-        successfulForwards: 0,
-        uniqueRequestDigests: 0,
-        droppedAcknowledgements: 0,
-        returnedAcknowledgements: 0,
+        confirmations: 0,
+        authorityForwards: 0,
+        syncUpdates: 0,
+        uniqueUpdateDigests: 0,
         unexpectedRequests: 0,
         upstreamStatuses: [],
         upstreamErrors: 0,
       };
       const digests = new Set();
       const persist = () => {
-        state.uniqueRequestDigests = digests.size;
+        state.uniqueUpdateDigests = digests.size;
         const temporary = "/state/result.json.tmp";
         fs.writeFileSync(temporary, `${JSON.stringify(state)}\n`, { mode: 0o600 });
         fs.renameSync(temporary, "/state/result.json");
@@ -832,25 +897,18 @@ proxy_id="$(
         response.end();
       };
       const server = http.createServer((request, response) => {
-        if (
-          request.method !== "POST" ||
-          request.url !== "/xrpc/com.atproto.space.notifyWrite" ||
-          state.successfulForwards >= 2
-        ) {
+        if (request.method !== "POST") {
           state.unexpectedRequests += 1;
           persist();
-          reject(response, 503);
+          reject(response, 405);
           return;
         }
         const chunks = [];
         let length = 0;
         request.on("data", (chunk) => {
           length += chunk.length;
-          if (length > 1_048_576) {
-            request.destroy();
-            return;
-          }
-          chunks.push(chunk);
+          if (length > 1_048_576) request.destroy();
+          else chunks.push(chunk);
         });
         request.on("end", () => {
           if (length > 1_048_576) {
@@ -860,6 +918,52 @@ proxy_id="$(
             return;
           }
           const body = Buffer.concat(chunks);
+          if (request.url === "/xrpc/com.atproto.space.confirmRegistration") {
+            let challenge = null;
+            try {
+              challenge = JSON.parse(body.toString("utf8")).challenge;
+            } catch {}
+            if (typeof challenge !== "string" || challenge.length === 0) {
+              state.unexpectedRequests += 1;
+              persist();
+              reject(response, 400);
+              return;
+            }
+            state.confirmations += 1;
+            persist();
+            const output = Buffer.from(JSON.stringify({ challenge }));
+            response.writeHead(200, {
+              "cache-control": "no-store",
+              "content-type": "application/json",
+              "content-length": output.length,
+            });
+            response.end(output);
+            return;
+          }
+          if (request.url === "/xrpc/com.atproto.space.notifySpaceUpdate") {
+            if (
+              request.headers.authorization !==
+                "Bearer notification-restart-sync" ||
+              state.syncUpdates !== 0
+            ) {
+              state.unexpectedRequests += 1;
+              persist();
+              reject(response, 400);
+              return;
+            }
+            digests.add(crypto.createHash("sha256").update(body).digest("hex"));
+            state.syncUpdates += 1;
+            persist();
+            response.writeHead(204, { "cache-control": "no-store" });
+            response.end();
+            return;
+          }
+          if (request.url !== "/xrpc/com.atproto.space.notifyRepoUpdate") {
+            state.unexpectedRequests += 1;
+            persist();
+            reject(response, 404);
+            return;
+          }
           const upstream = http.request({
             hostname: "127.0.0.1",
             port: 3000,
@@ -870,25 +974,17 @@ proxy_id="$(
             upstreamResponse.resume();
             upstreamResponse.on("end", () => {
               state.upstreamStatuses.push(upstreamResponse.statusCode || 0);
-              persist();
               if (
                 upstreamResponse.statusCode < 200 ||
                 upstreamResponse.statusCode > 299
               ) {
+                persist();
                 reject(response, upstreamResponse.statusCode || 502);
                 return;
               }
-              digests.add(crypto.createHash("sha256").update(body).digest("hex"));
-              state.successfulForwards += 1;
-              if (state.successfulForwards === 1) {
-                state.droppedAcknowledgements += 1;
-                persist();
-                response.destroy();
-                return;
-              }
-              state.returnedAcknowledgements += 1;
+              state.authorityForwards += 1;
               persist();
-              response.writeHead(200, { "cache-control": "no-store" });
+              response.writeHead(204, { "cache-control": "no-store" });
               response.end();
             });
           });
@@ -901,6 +997,7 @@ proxy_id="$(
         });
       });
       server.listen(3001, "127.0.0.1", () => {
+        persist();
         fs.writeFileSync("/state/ready", "", { mode: 0o600 });
       });
     '
@@ -912,11 +1009,11 @@ until [[ -f "$temporary_directory/ready" ]]; do
     docker inspect --format '{{.State.Status}}' "$proxy_id" 2>/dev/null || true
   )"
   if [[ "$proxy_status" == "exited" || "$proxy_status" == "dead" ]]; then
-    echo "the loopback acknowledgement-loss proxy exited before becoming ready" >&2
+    echo "the loopback syncer proxy exited before becoming ready" >&2
     exit 1
   fi
   if ((SECONDS >= deadline)); then
-    echo "the loopback acknowledgement-loss proxy did not become ready" >&2
+    echo "the loopback syncer proxy did not become ready" >&2
     exit 1
   fi
   sleep 1
@@ -935,7 +1032,7 @@ recovery_id="$(
     serve \
     --host 0.0.0.0 \
     --port 3000 \
-    --public-url https://swan.test \
+    --public-url http://localhost:3000 \
     --profile /usr/local/share/swan/Profiles/permissioned-data-0016-2026-11-12.json \
     --data-directory /var/lib/swan/data \
     --enable-local-space-interop \
@@ -953,6 +1050,39 @@ recovery_id="$(
 )"
 wait_for_swan_http "$recovery_container" "recovery-enabled Swan"
 
+registration_status="$(
+  docker run --rm \
+    --network "$network_name" \
+    --read-only \
+    --tmpfs /tmp:size=16m,mode=1777 \
+    --entrypoint /bin/sh \
+    "$swan_image" \
+    -ec '
+      curl --silent --show-error --max-time 10 \
+        --request POST "http://swan:3000/xrpc/com.atproto.space.authorizeSpaceSync" \
+        --header "content-type: application/json" \
+        --data "{\"space\":\"$1\",\"credentialKey\":\"did:key:zDnaenWLqH8nddvKvYSgjaUsCJkuoxXhbXSqdmf8eM946nBQe\",\"notify\":{\"endpoint\":\"http://localhost:3001\",\"token\":\"notification-restart-sync\"}}" \
+        --output /tmp/credential.json \
+        --write-out "%{http_code}"
+    ' _ "$space_uri"
+)"
+[[ "$registration_status" == "200" ]] || {
+  echo "authorizeSpaceSync did not confirm the restart sync registration" >&2
+  exit 1
+}
+[[ "$(database_assertion registered)" == "registered" ]] || {
+  echo "confirmed restart sync registration was not durable" >&2
+  exit 1
+}
+
+# Registration confirmation requires the delivery runtime. Stop it before
+# releasing the held writer outbox so the restart remains the drain boundary.
+docker stop --time 10 "$recovery_id" >/dev/null
+wait_for_stopped_container "$recovery_id" "registration-enabled Swan"
+database_mutation release
+docker start "$recovery_id" >/dev/null
+wait_for_swan_http "$recovery_container" "restarted recovery-enabled Swan"
+
 proxy_converged() {
   python3 - "$temporary_directory/result.json" <<'PY'
 import json
@@ -964,12 +1094,12 @@ if not path.is_file():
     raise SystemExit(1)
 state = json.loads(path.read_text(encoding="utf-8"))
 expected = {
-    "successfulForwards": 2,
-    "uniqueRequestDigests": 1,
-    "droppedAcknowledgements": 1,
-    "returnedAcknowledgements": 1,
+    "confirmations": 1,
+    "authorityForwards": 1,
+    "syncUpdates": 1,
+    "uniqueUpdateDigests": 1,
     "unexpectedRequests": 0,
-    "upstreamStatuses": [200, 200],
+    "upstreamStatuses": [200],
     "upstreamErrors": 0,
 }
 raise SystemExit(0 if state == expected else 1)
@@ -1036,4 +1166,4 @@ wait_for_healthy_container "$normal_swan_id" "final normal Swan restart"
   exit 1
 }
 
-echo "NOTIFICATION RESTART OUTBOX CONVERGENCE OK: successful_forwards=2 receiver_effects=1"
+echo "NOTIFICATION RESTART OUTBOX CONVERGENCE OK: notify_space_updates=1 receiver_effects=1"
