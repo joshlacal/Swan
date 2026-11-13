@@ -242,7 +242,13 @@ package enum PermissionedSpaceMACHTTP {
                 throw InteropHTTPError.unexpectedContentType
             }
             do {
-                guard let value = try commit(response.body) else {
+                let value: ComAtprotoSpaceDefs.Commit
+                do {
+                    guard let parsed = try commit(response.body) else {
+                        throw SpaceMACHeaders.HeaderError.invalidSpaceMAC
+                    }
+                    value = parsed
+                } catch {
                     throw SpaceMACHeaders.HeaderError.invalidSpaceMAC
                 }
                 let verified = try request.verify(
