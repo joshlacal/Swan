@@ -10,8 +10,7 @@ import SwanStorage
 /// October 29 sections 5b and 5d on the space host:
 /// `com.atproto.space.exportSpaceMeta` and `importSpaceMeta`, which move an
 /// authority's space state between hosts with its account. Both answer
-/// `NotSpaceOwner`, as the reference `assertSpaceOwner` does, when the space
-/// is not anchored on the caller's DID.
+/// `NotAuthorized` when the space is not anchored on the caller's DID.
 
 private struct AuthenticatedExportSpaceMetaHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
@@ -64,7 +63,7 @@ private func requireSpaceOwner(_ authorization: AuthorizationContext, space: Spa
         throw AuthenticatedSimpleSpaceLifecycleFailure.denied
     }
     guard subject == space.authority else {
-        throw AuthenticatedSimpleSpaceLifecycleFailure.notSpaceOwner
+        throw AuthenticatedSimpleSpaceLifecycleFailure.notAuthorized
     }
 }
 

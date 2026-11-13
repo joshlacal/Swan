@@ -36,7 +36,7 @@ public struct SwanAuthenticatedSimpleSpaceLifecycleCapability: Sendable {
 enum AuthenticatedSimpleSpaceLifecycleFailure: Error {
     case invalidRequest
     case spaceNotFound
-    case notSpaceOwner
+    case notAuthorized
     case spaceAlreadyExists
     case unsupportedPolicy
     case policyMismatch
@@ -70,8 +70,7 @@ private struct SpaceUpdateWireInput {
     }
 }
 
-/// `{ space }` (deleteSpace) and `{ space, did }` (removeMember,
-/// removeWriter).
+/// `{ space }` (deleteSpace) and `{ space, did }` (removeMembers).
 private struct SpaceMemberWireInput {
     let space: SpaceURI
     let did: String?
@@ -79,6 +78,17 @@ private struct SpaceMemberWireInput {
     init(_ root: SpaceLifecycleJSONObject) throws {
         space = try lifecycleSpace(root["space"])
         did = try root["did"].map(lifecycleDID)
+    }
+}
+
+/// `com.atproto.space.removeWriter` input `{ space, repo }`.
+private struct SpaceRemoveWriterWireInput {
+    let space: SpaceURI
+    let repo: String
+
+    init(_ root: SpaceLifecycleJSONObject) throws {
+        space = try lifecycleSpace(root["space"])
+        repo = try lifecycleDID(root["repo"])
     }
 }
 
@@ -180,12 +190,12 @@ private struct AuthenticatedSpaceCreateHandler {
         } catch {
             throw lifecycleFailure(for: error)
         }
-        return SpaceCreateWireOutput(uri: space.rawValue)
+        return SpaceCreateWireOutput(space: space.rawValue)
     }
 }
 
 private struct SpaceCreateWireOutput: Encodable {
-    let uri: String
+    let space: String
 }
 
 private struct AuthenticatedSpaceUpdateHandler {
@@ -231,10 +241,7 @@ private struct AuthenticatedSpaceDeleteHandler {
 private struct AuthenticatedSpaceRemoveWriterHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
-    func handle(_ input: SpaceMemberWireInput, request: Request) async throws {
-        guard let writer = input.did else {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
-        }
+    func handle(_ input: SpaceRemoveWriterWireInput, request: Request) async throws {
         let authorization = try await lifecycleAuthorization(
             capability.authorizer,
             request: request,
@@ -243,7 +250,7 @@ private struct AuthenticatedSpaceRemoveWriterHandler {
         try requireLifecycleAuthority(authorization, space: input.space)
         do {
             try await capability.directory.removeSpaceWriter(
-                writer,
+                input.repo,
                 from: input.space,
                 authorization: authorization
             )
@@ -371,9 +378,9 @@ func registerAuthenticatedSimpleSpaceLifecycleEndpoints(
     let removeWriter = AuthenticatedSpaceRemoveWriterHandler(capability: capability)
     registerSpaceLifecycleProcedure(
         on: router, path: "/xrpc/com.atproto.space.removeWriter", capability: capability,
-        required: ["space", "did"], allowed: ["space", "did"]
+        required: ["space", "repo"], allowed: ["space", "repo"]
     ) { root, request in
-        try await removeWriter.handle(try SpaceMemberWireInput(root), request: request)
+        try await removeWriter.handle(try SpaceRemoveWriterWireInput(root), request: request)
         return Response(status: .ok, headers: [.cacheControl: "no-store"])
     }
     let putMember = AuthenticatedMemberspacePutMemberHandler(capability: capability)
@@ -494,7 +501,7 @@ func lifecycleFailure(for error: Error) -> AuthenticatedSimpleSpaceLifecycleFail
     guard let error = error as? SwanError else { return .unavailable }
     switch error {
     case .conflict: return .spaceAlreadyExists
-    case .unauthorized, .expired: return .denied
+    case .unauthorized, .expired: return .notAuthorized
     case .invalidIdentifier, .malformed: return .invalidRequest
     case .invalidProfile, .unavailable: return .unavailable
     }
@@ -676,8 +683,8 @@ func simpleSpaceLifecycleResponse(
         simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
     case .spaceNotFound:
         simpleSpaceLifecycleError(.badRequest, code: "SpaceNotFound")
-    case .notSpaceOwner:
-        simpleSpaceLifecycleError(.badRequest, code: "NotSpaceOwner")
+    case .notAuthorized:
+        simpleSpaceLifecycleError(.badRequest, code: "NotAuthorized")
     case .spaceAlreadyExists:
         simpleSpaceLifecycleError(.badRequest, code: "SpaceAlreadyExists")
     case .unsupportedPolicy:

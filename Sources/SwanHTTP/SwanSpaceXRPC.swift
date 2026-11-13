@@ -41,7 +41,7 @@ private enum AuthenticatedGetSpaceFailure: Error {
 
 /// `com.atproto.space.getSpace` output.
 struct AuthenticatedGetSpaceOutput: Encodable {
-    let uri: String
+    let space: String
     let policy: SpacePolicy
 }
 
@@ -103,7 +103,7 @@ private struct AuthenticatedGetSpaceHandler {
             throw AuthenticatedGetSpaceFailure.unavailable
         }
         return AuthenticatedGetSpaceOutput(
-            uri: description.space.rawValue,
+            space: description.space.rawValue,
             policy: description.configuration.policy
         )
     }

@@ -166,7 +166,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "create-generated"), body: ByteBuffer(string: create)) { response in
                     XCTAssertEqual(response.status, .ok)
                     self.assertNoStore(response)
-                    uri = try XCTUnwrap((try self.jsonObject(response.body))["uri"] as? String)
+                    uri = try XCTUnwrap((try self.jsonObject(response.body))["space"] as? String)
                 }
                 let space = try SpaceURI(uri)
                 XCTAssertEqual(space.authority, Self.alice)
@@ -178,8 +178,8 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .ok)
                     self.assertNoStore(response)
                     let object = try self.jsonObject(response.body)
-                    XCTAssertEqual(Set(object.keys), ["uri", "policy"])
-                    XCTAssertEqual(object["uri"] as? String, uri)
+                    XCTAssertEqual(Set(object.keys), ["space", "policy"])
+                    XCTAssertEqual(object["space"] as? String, uri)
                     let policy = try XCTUnwrap(object["policy"] as? [String: Any])
                     XCTAssertEqual(policy["$type"] as? String, "com.atproto.memberspace.policy")
                     XCTAssertEqual(policy["publicRead"] as? Bool, false)
@@ -330,7 +330,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 // Nothing was created by a refused body: the skey is free.
                 let (status, object) = try await create(#"{"spaceType":"\#(Self.type)","skey":"a","policy":{"$type":"com.atproto.memberspace.policy"}}"#, jti: "create-after-refusals")
                 XCTAssertEqual(status, .ok)
-                XCTAssertEqual(try SpaceURI(try XCTUnwrap(object["uri"] as? String)).skey, "a")
+                XCTAssertEqual(try SpaceURI(try XCTUnwrap(object["space"] as? String)).skey, "a")
 
                 let managed = try SpaceURI(authority: Self.alice, spaceType: Self.type, skey: "managed")
                 try await client.execute(uri: "\(Self.getPath)?space=\(self.percentEncode(managed.rawValue))", method: .get, headers: try self.getHeaders(fixture, path: Self.getPath, jti: "get-managed")) { response in
@@ -372,7 +372,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 var uri = ""
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "owner-only-create"), body: ByteBuffer(string: create)) { response in
                     XCTAssertEqual(response.status, .ok)
-                    uri = try XCTUnwrap((try self.jsonObject(response.body))["uri"] as? String)
+                    uri = try XCTUnwrap((try self.jsonObject(response.body))["space"] as? String)
                 }
                 let add = #"{"space":"\#(uri)","did":"\#(Self.bob)","read":true,"write":true}"#
                 try await client.execute(uri: Self.putPath, method: .post, headers: try self.postHeaders(fixture, path: Self.putPath, jti: "owner-only-add"), body: ByteBuffer(string: add)) { response in
@@ -388,13 +388,13 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
                 }
-                let removeWriter = #"{"space":"\#(uri)","did":"\#(Self.bob)"}"#
+                let removeWriter = #"{"space":"\#(uri)","repo":"\#(Self.bob)"}"#
                 for jti in ["remove-writer", "remove-writer-again"] {
                     try await client.execute(uri: Self.removeWriterPath, method: .post, headers: try self.postHeaders(fixture, path: Self.removeWriterPath, jti: jti), body: ByteBuffer(string: removeWriter)) { response in
                         XCTAssertEqual(response.status, .ok)
                     }
                 }
-                let badWriter = #"{"space":"\#(uri)","did":"not-a-did"}"#
+                let badWriter = #"{"space":"\#(uri)","repo":"not-a-did"}"#
                 try await client.execute(uri: Self.removeWriterPath, method: .post, headers: try self.postHeaders(fixture, path: Self.removeWriterPath, jti: "remove-writer-bad"), body: ByteBuffer(string: badWriter)) { response in
                     XCTAssertEqual(response.status, .badRequest)
                 }
@@ -422,7 +422,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 var uri = ""
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "phoenix-create"), body: ByteBuffer(string: create)) { response in
                     XCTAssertEqual(response.status, .ok)
-                    uri = try XCTUnwrap((try self.jsonObject(response.body))["uri"] as? String)
+                    uri = try XCTUnwrap((try self.jsonObject(response.body))["space"] as? String)
                 }
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "phoenix-recreate"), body: ByteBuffer(string: create)) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -442,7 +442,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 }
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "phoenix-rise"), body: ByteBuffer(string: create)) { response in
                     XCTAssertEqual(response.status, .ok, "a delete→recreate cycle must be a fresh create, not SpaceAlreadyExists")
-                    XCTAssertEqual((try self.jsonObject(response.body))["uri"] as? String, uri)
+                    XCTAssertEqual((try self.jsonObject(response.body))["space"] as? String, uri)
                 }
                 try await client.execute(uri: "\(Self.getPath)?space=\(self.percentEncode(uri))", method: .get, headers: try self.getHeaders(fixture, path: Self.getPath, jti: "phoenix-get-2")) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -495,8 +495,8 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 }
                 let update = #"{"space":"\#(space.rawValue)","policy":{"$type":"com.atproto.memberspace.policy","publicRead":true}}"#
                 try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(createToken, fixture: fixture, path: Self.updatePath, jti: "wrong-manage"), body: ByteBuffer(string: update)) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
-                    XCTAssertEqual(try self.errorCode(response.body), "Unauthorized")
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "NotAuthorized")
                 }
                 try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.updatePath, jti: "right-manage"), body: ByteBuffer(string: update)) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -616,7 +616,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 var uri = ""
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "put-replaces-create"), body: ByteBuffer(string: create)) { response in
                     XCTAssertEqual(response.status, .ok)
-                    uri = try XCTUnwrap((try self.jsonObject(response.body))["uri"] as? String)
+                    uri = try XCTUnwrap((try self.jsonObject(response.body))["space"] as? String)
                 }
                 // Put bob with read: true, write: false
                 let put1 = #"{"space":"\#(uri)","did":"\#(Self.bob)","read":true,"write":false}"#
