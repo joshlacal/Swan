@@ -7,7 +7,6 @@ import XCTest
 
 final class SpaceSTARCodecTests: XCTestCase {
     private let author = "did:plc:alice"
-    private let secret = Data(repeating: 0x42, count: 32)
     private var space: SpaceURI { get throws { try SpaceURI("at://did:plc:alice/space/app.bsky.bookmarks/self") } }
 
     private func records() throws -> [SpaceRecord] {
@@ -29,9 +28,8 @@ final class SpaceSTARCodecTests: XCTestCase {
     }
 
     private func verify(_ bytes: Data, commit: SpaceRepositoryCommit) throws -> VerifiedSpaceSTARRecovery {
-        let mac = try commit.mac(sharedSecret: secret)
-        return try SpaceSTARCodec.decode(bytes, space: space, author: author) {
-            try SpaceMAC.verify(mac: mac, expected: $0.mac(sharedSecret: self.secret))
+        try SpaceSTARCodec.decode(bytes, space: space, author: author) {
+            guard $0 == commit else { throw SpaceSTARError.badMAC }
             return true
         }
     }

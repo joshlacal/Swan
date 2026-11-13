@@ -292,7 +292,7 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
 
     func testNativeCorruptionClassificationRequiresSTARContentFailure() {
         XCTAssertTrue(PermissionedRecoveryFailureCode.isInjectedFinalByteCorruptionRejection(SpaceSTARError.digestMismatch))
-        for error in [SpaceSTARError.badMAC, SpaceSTARError.wrongRepository, SpaceMAC.Failure.mismatch, InteropHTTPError.transportFailure] as [any Error] {
+        for error in [SpaceSTARError.badMAC, SpaceSTARError.wrongRepository, SpaceMACHeaders.HeaderError.invalidSpaceMAC, InteropHTTPError.transportFailure] as [any Error] {
             XCTAssertFalse(PermissionedRecoveryFailureCode.isInjectedFinalByteCorruptionRejection(error))
         }
     }
@@ -382,11 +382,36 @@ private actor MockWriteOnlyTransport {
         }
         var responseHeaders = ["content-type": "application/json"]
         if method == .get {
-            let want = try SpaceMACHeaders.parseWantMAC(headers[SpaceMACHeaders.requestHeader], type: .repository)
-            let secret = try SpaceMAC.decapsulate(privateKey: kemKey, keyShare: want.keyShare)
-            let commit = try XCTUnwrap(JSONDecoder().decode(ComAtprotoSpaceListRepoOps.Output.self, from: responseBody).commit)
-            let mac = try SpaceMAC.commit(sharedSecret: secret, space: commit.space.uriString(), repo: commit.repo.didString(), rev: commit.rev.toString(), data: commit.data.data)
-            responseHeaders[SpaceMACHeaders.responseHeader] = try SpaceMACHeaders.formatMAC(mac, type: .repository)
+            let request = try XCTUnwrap(SpaceMACHeaders.parseRequest(
+                headers[SpaceMACHeaders.requestHeader],
+                profile: .commit
+            ))
+            let secret = try SpaceMACKeyAgreement.receive(
+                authorPrivateKey: kemKey,
+                keyID: request.keyID
+            )
+            let commit = try XCTUnwrap(
+                JSONDecoder().decode(
+                    ComAtprotoSpaceListRepoOps.Output.self,
+                    from: responseBody
+                ).commit
+            )
+            let value = try SpaceRepositoryCommit(
+                ver: commit.ver,
+                repo: commit.repo.didString(),
+                space: SpaceURI(commit.space.uriString()),
+                rev: commit.rev.toString(),
+                data: commit.data.data
+            )
+            let mac = try SpaceMACHeaders.commitResponse(
+                value,
+                request: request,
+                sharedSecret: secret
+            )
+            responseHeaders[mac.coveredHeaderName] = mac.coveredHeaderValue
+            responseHeaders[SpaceMACHeaders.signatureInputHeader] =
+                mac.signatureInput
+            responseHeaders[SpaceMACHeaders.signatureHeader] = mac.signature
         }
         return InteropHTTPResponse(
             status: 200,

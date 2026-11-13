@@ -144,52 +144,74 @@ final class PermissionedRemoteReplicaIncrementalHTTPOrchestratorTests:
         XCTAssertEqual(paths, ["/xrpc/com.atproto.space.listRepoOps"])
     }
 
-    func testFullCommitlessPageSelectsFullCARWithoutSkippingAtomicRevision() async throws {
+    func testEachPageUsesFreshAuthenticatedCommit() async throws {
         let fixture = try HTTPIncrementalFixture()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let fullPage = try encoder.encode(
+        let first = try encoder.encode(
             ComAtprotoSpaceListRepoOps.Output(
-                ops: Array(repeating: fixture.operation, count: 1_000),
-                commit: nil,
-                cursor: "\(fixture.revision.toString())/999"
+                ops: [fixture.operation],
+                commit: fixture.commit,
+                cursor: "\(fixture.revision.toString())/0"
+            )
+        )
+        let terminal = try encoder.encode(
+            ComAtprotoSpaceListRepoOps.Output(
+                ops: [],
+                commit: fixture.commit,
+                cursor: nil
             )
         )
         let transport = IncrementalTransport(
             listStatus: 200,
-            listBody: fullPage,
-            latestBody: Data()
+            listBodies: [first, terminal],
+            latestBody: try fixture.latestBody(commit: fixture.commit)
         )
         let store = CapturingIncrementalStore(base: fixture.base)
-        let orchestrator = try fixture.orchestrator(
+        let outcome = try await fixture.orchestrator(
             transport: transport,
             store: store
-        )
-
-        let outcome = try await orchestrator.synchronize(
+        ).synchronize(
             target: fixture.target,
-            requestID: "split-atomic-revision",
+            requestID: "paged",
             requestSequence: 1,
             appliedAt: 1
         )
-
-        XCTAssertEqual(outcome, .fullCARRecoveryRequired)
-        let capturedBatch = await store.capturedBatch()
-        XCTAssertNil(capturedBatch)
+        guard case .applied = outcome else {
+            return XCTFail("expected paged apply, got \(outcome)")
+        }
         let paths = await transport.paths()
-        XCTAssertEqual(paths, ["/xrpc/com.atproto.space.listRepoOps"])
+        XCTAssertEqual(paths, [
+            "/xrpc/com.atproto.space.listRepoOps",
+            "/xrpc/com.atproto.space.listRepoOps",
+            "/xrpc/com.atproto.space.getLatestCommit",
+        ])
+        let keyIDs = await transport.keyIDs()
+        XCTAssertEqual(Set(keyIDs).count, 3)
     }
 
-    func testExtendedAtomicCommitlessPageSelectsFullRecovery() async throws {
+    func testExtendedAuthenticatedPageSelectsFullRecovery() async throws {
         let fixture = try HTTPIncrementalFixture()
         let output = ComAtprotoSpaceListRepoOps.Output(
-            ops: Array(repeating: fixture.operation, count: 1_500), commit: nil,
+            ops: Array(repeating: fixture.operation, count: 1_500),
+            commit: fixture.commit,
             cursor: "\(fixture.revision.toString())/1499"
         )
-        let transport = IncrementalTransport(listStatus: 200, listBody: try JSONEncoder().encode(output), latestBody: Data())
+        let transport = IncrementalTransport(
+            listStatus: 200,
+            listBody: try JSONEncoder().encode(output),
+            latestBody: Data()
+        )
         let store = CapturingIncrementalStore(base: fixture.base)
-        let orchestrator = try fixture.orchestrator(transport: transport, store: store)
-        let result = try await orchestrator.synchronize(target: fixture.target, requestID: "extended-page", requestSequence: 1, appliedAt: 1)
+        let result = try await fixture.orchestrator(
+            transport: transport,
+            store: store
+        ).synchronize(
+            target: fixture.target,
+            requestID: "extended-page",
+            requestSequence: 1,
+            appliedAt: 1
+        )
         XCTAssertEqual(result, .fullCARRecoveryRequired)
         let batch = await store.capturedBatch()
         XCTAssertNil(batch)
@@ -227,7 +249,7 @@ final class PermissionedRemoteReplicaIncrementalHTTPOrchestratorTests:
         for (cursor, terminal) in [("malformed", false), ("\(fixture.revision.toString())/-1", false), ("222222222222a/999", false), ("\(fixture.revision.toString())/0", true)] {
             let output = ComAtprotoSpaceListRepoOps.Output(
                 ops: Array(repeating: fixture.operation, count: terminal ? 1 : 1_000),
-                commit: terminal ? fixture.commit : nil, cursor: cursor
+                commit: fixture.commit, cursor: cursor
             )
             let transport = IncrementalTransport(listStatus: 200, listBody: try JSONEncoder().encode(output), latestBody: Data())
             let store = CapturingIncrementalStore(base: fixture.base)
@@ -236,7 +258,10 @@ final class PermissionedRemoteReplicaIncrementalHTTPOrchestratorTests:
                 _ = try await orchestrator.synchronize(target: fixture.target, requestID: "bad-cursor", requestSequence: 1, appliedAt: 1)
                 XCTFail("invalid cursor accepted")
             } catch {
-                XCTAssertEqual(error as? PermissionedRemoteReplicaIncrementalVerificationError, terminal ? .invalidOperation : .invalidCommit)
+                XCTAssertEqual(
+                    error as? PermissionedRemoteReplicaIncrementalVerificationError,
+                    .invalidOperation
+                )
             }
             let batch = await store.capturedBatch()
             XCTAssertNil(batch)
@@ -261,7 +286,7 @@ final class PermissionedRemoteReplicaIncrementalHTTPOrchestratorTests:
         let fullPage = try encoder.encode(
             ComAtprotoSpaceListRepoOps.Output(
                 ops: Array(repeating: operation, count: 1_000),
-                commit: nil,
+                commit: fixture.commit,
                 cursor: nil
             )
         )
@@ -790,15 +815,34 @@ private actor CapturingIncrementalStore:
 
 private actor IncrementalTransport {
     let listStatus: Int
-    let listBody: Data
+    let listBodies: [Data]
     let latestBody: Data
     let tamperListMAC: Bool
+    private var listIndex = 0
     private var requestedPaths: [String] = []
     private var requestedURLs: [URL] = []
+    private var requestedKeyIDs: [String] = []
 
-    init(listStatus: Int, listBody: Data, latestBody: Data, tamperListMAC: Bool = false) {
+    init(
+        listStatus: Int,
+        listBody: Data,
+        latestBody: Data,
+        tamperListMAC: Bool = false
+    ) {
         self.listStatus = listStatus
-        self.listBody = listBody
+        listBodies = [listBody]
+        self.latestBody = latestBody
+        self.tamperListMAC = tamperListMAC
+    }
+
+    init(
+        listStatus: Int,
+        listBodies: [Data],
+        latestBody: Data,
+        tamperListMAC: Bool = false
+    ) {
+        self.listStatus = listStatus
+        self.listBodies = listBodies
         self.latestBody = latestBody
         self.tamperListMAC = tamperListMAC
     }
@@ -820,31 +864,67 @@ private actor IncrementalTransport {
         switch url.path {
         case "/xrpc/com.atproto.space.listRepoOps":
             status = listStatus
-            body = listBody
+            guard !listBodies.isEmpty else {
+                throw InteropHTTPError.transportFailure
+            }
+            body = listBodies[min(listIndex, listBodies.count - 1)]
+            listIndex += 1
         case "/xrpc/com.atproto.space.getLatestCommit":
             status = 200
             body = latestBody
         default:
             throw InteropHTTPError.unexpectedStatus(404)
         }
-        guard body.count <= limit else { throw InteropHTTPError.responseTooLarge }
+        guard body.count <= limit else {
+            throw InteropHTTPError.responseTooLarge
+        }
+        guard let request = try SpaceMACHeaders.parseRequest(
+            headers[SpaceMACHeaders.requestHeader],
+            profile: .commit
+        ) else {
+            throw SpaceMACHeaders.HeaderError.invalidSpaceMAC
+        }
+        requestedKeyIDs.append(request.keyID)
         var responseHeaders = ["content-type": "application/json"]
-        let want = try SpaceMACHeaders.parseWantMAC(headers[SpaceMACHeaders.requestHeader], type: .repository)
         if status == 200 {
-            let commit: ComAtprotoSpaceDefs.Commit?
+            let commit: ComAtprotoSpaceDefs.Commit
             if url.path.hasSuffix("getLatestCommit") {
-                commit = try JSONDecoder().decode(ComAtprotoSpaceGetLatestCommit.Output.self, from: body).commit
+                commit = try JSONDecoder().decode(
+                    ComAtprotoSpaceGetLatestCommit.Output.self,
+                    from: body
+                ).commit
             } else {
-                commit = try JSONDecoder().decode(ComAtprotoSpaceListRepoOps.Output.self, from: body).commit
-            }
-            if let commit {
-                let secret = try SpaceMAC.decapsulate(privateKey: HTTPIncrementalFixture.kemKey(), keyShare: want.keyShare)
-                var mac = try SpaceMAC.commit(sharedSecret: secret, space: commit.space.uriString(), repo: commit.repo.didString(), rev: commit.rev.toString(), data: commit.data.data)
-                if tamperListMAC, url.path.hasSuffix("listRepoOps") {
-                    mac[mac.startIndex] ^= 0x01
+                guard let value = try JSONDecoder().decode(
+                    ComAtprotoSpaceListRepoOps.Output.self,
+                    from: body
+                ).commit else {
+                    throw SpaceMACHeaders.HeaderError.invalidSpaceMAC
                 }
-                responseHeaders[SpaceMACHeaders.responseHeader] = try SpaceMACHeaders.formatMAC(mac, type: .repository)
+                commit = value
             }
+            let secret = try SpaceMACKeyAgreement.receive(
+                authorPrivateKey: HTTPIncrementalFixture.kemKey(),
+                keyID: request.keyID
+            )
+            let value = try SpaceRepositoryCommit(
+                ver: commit.ver,
+                repo: commit.repo.didString(),
+                space: SpaceURI(commit.space.uriString()),
+                rev: commit.rev.toString(),
+                data: commit.data.data
+            )
+            let mac = try SpaceMACHeaders.commitResponse(
+                value,
+                request: request,
+                sharedSecret: tamperListMAC
+                    && url.path.hasSuffix("listRepoOps")
+                    ? Data(repeating: 0, count: 32)
+                    : secret
+            )
+            responseHeaders[mac.coveredHeaderName] = mac.coveredHeaderValue
+            responseHeaders[SpaceMACHeaders.signatureInputHeader] =
+                mac.signatureInput
+            responseHeaders[SpaceMACHeaders.signatureHeader] = mac.signature
         }
         return .init(
             status: status,
@@ -857,4 +937,5 @@ private actor IncrementalTransport {
 
     func paths() -> [String] { requestedPaths }
     func urls() -> [URL] { requestedURLs }
+    func keyIDs() -> [String] { requestedKeyIDs }
 }

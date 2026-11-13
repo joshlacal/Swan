@@ -70,7 +70,7 @@ final class PermissionedRemoteReplicaSTARRecoveryTests: XCTestCase {
                     profileID: "permissioned-data-0016-2026-10-29", expiresAt: 200
                 )
                 XCTFail("corrupt archive must not publish")
-            } catch { XCTAssertEqual(error as? SpaceSTARError, .digestMismatch) }
+            } catch { XCTAssertEqual(error as? SpaceSTARError, .truncated) }
             let head = try await database.permissionedRemoteReplicaHead(target: fixture.target)
             XCTAssertEqual(head, original.head)
             let unexpected = try await database.permissionedRemoteReplicaRecord(target: fixture.target, collection: "app.bsky.feed.post", rkey: "b")
@@ -82,22 +82,22 @@ final class PermissionedRemoteReplicaSTARRecoveryTests: XCTestCase {
         }
     }
 
-    func testBadMACFailsBeforePublicationAndKeepsNoHead() async throws {
+    func testUnauthenticatedCommitFailsBeforePublicationAndKeepsNoHead() async throws {
         let fixture = try NativeSTARFixture()
         let root = FileManager.default.temporaryDirectory.appending(path: "SwanSTARBadMAC-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         let database = try await SQLiteAccountDatabase(dataDirectory: root, did: fixture.target.receiverDID)
         let orchestrator = PermissionedRemoteReplicaRecoveryOrchestrator(
-            database: database, now: { 100 }, publicationAuthorization: { _ in XCTFail("bad MAC reached publication"); throw SpaceSTARError.badMAC }
+            database: database, now: { 100 }, publicationAuthorization: { _ in XCTFail("unauthenticated commit reached publication"); throw SpaceSTARError.badMAC }
         )
         let archive = try fixture.archive(keys: ["a"], revision: "222222222222a")
         do {
             _ = try await orchestrator.recover(
-                target: fixture.target, requestID: "native-star-bad-mac", source: fixture.session(archive, invalidMAC: true),
+                target: fixture.target, requestID: "native-star-bad-mac", source: fixture.session(archive, invalidCommit: true),
                 profileID: "permissioned-data-0016-2026-10-29", expiresAt: 200
             )
             XCTFail("bad MAC accepted")
-        } catch { XCTAssertEqual(error as? SpaceMAC.Failure, .mismatch) }
+        } catch { XCTAssertEqual(error as? SpaceSTARError, .badMAC) }
         let head = try await database.permissionedRemoteReplicaHead(target: fixture.target)
         XCTAssertNil(head)
         try await database.close()
@@ -135,16 +135,26 @@ private struct NativeSTARFixture {
         return Archive(commit: commit, bytes: try SpaceSTARCodec.encode(commit: commit, records: records))
     }
 
-    func session(_ archive: Archive, bytes: Data? = nil, invalidMAC: Bool = false) throws -> PermissionedRemoteReplicaSourceSession {
-        let exchange = try SpaceMAC.encapsulate(authorKey: kemDIDKey)
-        let secret = try SpaceMAC.decapsulate(privateKey: kemKey, keyShare: exchange.keyShare)
+    func session(
+        _ archive: Archive,
+        bytes: Data? = nil,
+        invalidCommit: Bool = false
+    ) throws -> PermissionedRemoteReplicaSourceSession {
+        let authenticatedCommit = invalidCommit
+            ? try SpaceRepositoryCommit(
+                repo: archive.commit.repo,
+                space: archive.commit.space,
+                rev: archive.commit.rev,
+                data: Data(repeating: 0, count: 32)
+            )
+            : archive.commit
         return try PermissionedRemoteReplicaSourceSession(
             identity: PermissionedRemoteReplicaSourceIdentity(
                 origin: URL(string: "https://writer.example")!, repositoryDID: target.repositoryDID,
                 verifierIdentity: PermissionedSpaceMACRequest.verifierIdentity(authorKEMKey: kemDIDKey)
             ),
-            authorKEMKey: kemDIDKey, sharedSecret: exchange.sharedSecret,
-            mac: invalidMAC ? Data(repeating: 0, count: 32) : archive.commit.mac(sharedSecret: secret),
+            authorKEMKey: kemDIDKey,
+            authenticatedCommit: authenticatedCommit,
             freshnessWitness: PermissionedRemoteReplicaFreshnessWitness(wireRevision: TID(tidString: archive.commit.rev), commitment: archive.commit.data),
             source: STARRecoveryTestSource(bytes: bytes ?? archive.bytes), closeSource: {}
         )

@@ -177,8 +177,6 @@ private struct LifecycleAdoptionFixture {
         let revision = try TID(tidString: "222222222222a")
         let commit = try SpaceRepositoryCommit(repo: target.repositoryDID, space: space, rev: revision.toString(), data: LtHash().commitment)
         let bytes = try SpaceSTARCodec.encode(commit: commit, records: [])
-        let secret = Data(repeating: 0x3c, count: 32)
-        let mac = try commit.mac(sharedSecret: secret)
         let binding = try PermissionedRemoteReplicaImportBinding(
             requestID: requestID, requestDigest: Data(SHA256.hash(data: Data(requestID.utf8))),
             source: PermissionedRemoteReplicaSourceIdentity(origin: URL(string: "https://writer.example")!, repositoryDID: target.repositoryDID, verifierIdentity: "key-sha256:" + String(repeating: "a", count: 64)),
@@ -191,7 +189,7 @@ private struct LifecycleAdoptionFixture {
         let verification = try await SpaceSTARCodec.verifyStreaming(
             source: LifecycleSTARSource(bytes), sink: EmptyLifecycleSTARSink(), space: space, author: target.repositoryDID,
             commitVerifier: { value in
-                try SpaceMAC.verify(mac: mac, expected: value.mac(sharedSecret: secret))
+                guard value == commit else { throw SpaceSTARError.badMAC }
                 return true
             }
         )

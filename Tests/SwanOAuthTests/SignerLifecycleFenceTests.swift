@@ -9,14 +9,14 @@ import SwanSpaces
 import SwanStorage
 import XCTest
 
-/// F15/F32/F44/F45 (signing fences) and F16 (service-key resolution).
+/// F15/F32/F44/F45 (key-use fences) and F16 (service-key resolution).
 ///
-/// Every local signer reads account lifecycle and key references, then suspends
-/// inside `keyStore.key(for:)`, then signs. Nothing re-checked the account after
-/// that suspension, so a deactivation or key rotation committed while the
-/// key-store read was in flight still produced a signed artefact. Two of the
-/// four carried a comment stating "Do not perform an await after this point"
-/// immediately above an await.
+/// Every local key user reads account lifecycle and key references, then
+/// suspends inside `keyStore.key(for:)`, then uses that key. Nothing re-checked
+/// the account after that suspension, so a deactivation or key rotation
+/// committed while the key-store read was in flight still produced an
+/// authenticated artefact. Two of the four carried a comment stating
+/// "Do not perform an await after this point" immediately above an await.
 ///
 /// These tests commit the lifecycle change *inside* the suspension — a
 /// deterministic seam, not a sleep — and assert no artefact is produced. The
@@ -116,22 +116,20 @@ final class SignerLifecycleFenceTests: XCTestCase {
         }
     }
 
-    // MARK: F45 — repository commit signer
+    // MARK: F45 — repository response-MAC KEM provider
 
-    func testRepositoryCommitSignerRefusesAfterDeactivationDuringKeyRead() async throws {
+    func testRepositoryMACProviderRefusesAfterDeactivationDuringKeyRead() async throws {
         let fixture = try await Fixture.make()
         addTeardownBlock { try? await fixture.close() }
 
-        let signer = LocalAccountSpaceRepositoryCommitSigner(
+        let provider = LocalAccountSpaceRepositoryCommitSigner(
             accounts: fixture.accounts,
             keyStore: fixture.deactivatingKeyStore()
         )
-        await assertUnavailable("commit signer signed across a deactivation") {
-            try await signer.signRepositoryCommit(
-                space: try Self.space(),
+        await assertUnavailable("MAC provider used a key across a deactivation") {
+            try await provider.sharedSecret(
                 author: Self.accountDID,
-                wireRevision: "3laaaaaaaaaaa",
-                commitment: Data(repeating: 0x11, count: 32)
+                keyID: try Self.ephemeralKeyID()
             )
         }
     }
@@ -172,16 +170,14 @@ final class SignerLifecycleFenceTests: XCTestCase {
         ).issueDelegation(space: try Self.space(), issuer: Self.accountDID, now: now)
         XCTAssertEqual(delegation.split(separator: ".").count, 3)
 
-        let envelope = try await LocalAccountSpaceRepositoryCommitSigner(
+        let sharedSecret = try await LocalAccountSpaceRepositoryCommitSigner(
             accounts: fixture.accounts,
             keyStore: fixture.keyStore
-        ).signRepositoryCommit(
-            space: try Self.space(),
+        ).sharedSecret(
             author: Self.accountDID,
-            wireRevision: "3laaaaaaaaaaa",
-            commitment: Data(repeating: 0x11, count: 32)
+            keyID: try Self.ephemeralKeyID()
         )
-        XCTAssertEqual(envelope.context.author, Self.accountDID)
+        XCTAssertEqual(sharedSecret.count, 32)
     }
 
     // MARK: F16 — service public-key resolution
@@ -270,6 +266,15 @@ final class SignerLifecycleFenceTests: XCTestCase {
             spaceType: "app.bsky.bookmarks",
             skey: "fence"
         )
+    }
+
+    private static func ephemeralKeyID() throws -> String {
+        let key = P256.KeyAgreement.PrivateKey()
+        return P256DIDKey(
+            publicKey: try P256.Signing.PublicKey(
+                x963Representation: key.publicKey.x963Representation
+            )
+        ).value
     }
 
     private func assertUnavailable<T>(
