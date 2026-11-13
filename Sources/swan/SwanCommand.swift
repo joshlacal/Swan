@@ -8368,7 +8368,7 @@ extension SwanCommand {
             /// Creates a forum space on an authority and adds one member.
             /// Mirrors `lab live --provision-space`: it reuses
             /// `LabLiveSupport.provisionSpace` (space.createSpace +
-            /// putMember) through the OAuth-authorized procedure helper.
+            /// putMembers) through the OAuth-authorized procedure helper.
             struct Provision: AsyncParsableCommand {
                 static let configuration = CommandConfiguration(
                     commandName: "provision",
@@ -9952,12 +9952,15 @@ private enum LabLiveSupport {
         }
 
         let putBody = try JSONSerialization.data(
-            withJSONObject: ["space": space.rawValue, "did": member, "read": true, "write": true],
+            withJSONObject: [
+                "space": space.rawValue,
+                "members": [["did": member, "read": true, "write": true]],
+            ],
             options: [.sortedKeys]
         )
         let put = try await authorizedProcedure(
             host: authority,
-            nsid: "com.atproto.memberspace.putMember",
+            nsid: "com.atproto.memberspace.putMembers",
             body: putBody
         )
         guard (200 ... 299).contains(put.status) else {

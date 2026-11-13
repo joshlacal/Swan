@@ -136,6 +136,11 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
             signature: ["other=:YWJj:", "presentation=:\(signature.base64EncodedString()):"]
         )
         XCTAssertEqual(try split.verify(keyID: keyID), keyID)
+        var itemTagged = combined
+        itemTagged.signatureInput = [
+            "note=?1;tag=\"atproto-space-credential\", presentation=\(input)",
+        ]
+        XCTAssertEqual(try itemTagged.verify(keyID: keyID), keyID)
     }
 
     func testTwoTaggedCredentialSignaturesAreRejected() throws {

@@ -110,11 +110,8 @@ public enum SpaceHTTPSignature {
             throw SpaceHTTPSignatureError.malformedSignature
         }
         let tagged = inputDictionary.entries.filter { entry in
-            let parameters = switch entry.value {
-            case let .item(item): item.parameters
-            case let .innerList(list): list.parameters
-            }
-            return parameters["tag"] == .string(label)
+            guard case let .innerList(list) = entry.value else { return false }
+            return list.parameters["tag"] == .string(label)
         }
         guard tagged.count == 1,
               case let .innerList(input) = tagged[0].value,

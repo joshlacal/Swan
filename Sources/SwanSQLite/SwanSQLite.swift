@@ -8290,11 +8290,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 guard case .member = stored.state.space.configuration.policy else {
                     throw SpacePolicyError.policyMismatch
                 }
-                guard !members.contains(stored.state.space.owner) else {
-                    throw SwanError.malformed("a space owner cannot be removed")
-                }
                 let existing = members.filter {
-                    stored.state.space.members[$0] != nil
+                    $0 != stored.state.space.owner
+                        && stored.state.space.members[$0] != nil
                 }
                 guard !existing.isEmpty else { return stored.state }
                 for member in existing {

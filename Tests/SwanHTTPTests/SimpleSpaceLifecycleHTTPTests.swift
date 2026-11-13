@@ -237,10 +237,13 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(secondMembers?.first?["read"] as? Bool, true)
                     XCTAssertEqual(secondMembers?.first?["write"] as? Bool, false)
                 }
-                let ownerRemoval = #"{"space":"\#(uri)","dids":["\#(Self.alice)"]}"#
+                let ownerRemoval = #"{"space":"\#(uri)","dids":["\#(Self.alice)","\#(Self.bob)"]}"#
                 try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(fixture, path: Self.removePath, jti: "remove-owner"), body: ByteBuffer(string: ownerRemoval)) { response in
-                    XCTAssertEqual(response.status, .badRequest)
-                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                    XCTAssertEqual(response.status, .ok)
+                }
+                try await client.execute(uri: first, method: .get, headers: try self.getHeaders(fixture, path: Self.listPath, jti: "members-after-owner-skip")) { response in
+                    let members = (try self.jsonObject(response.body))["members"] as? [[String: Any]]
+                    XCTAssertEqual(members?.map { $0["did"] as? String }, [Self.alice])
                 }
 
                 // A policy of another `$type` drops the member list, and the
@@ -544,6 +547,7 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 let malformedCursor = "\(Self.listPath)?space=\(self.percentEncode(space.rawValue))&cursor=not-a-did"
                 try await client.execute(uri: malformedCursor, method: .get, headers: try self.getHeaders(fixture, path: Self.listPath, jti: "bad-cursor")) { response in
                     XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidCursor")
                 }
                 try await client.execute(uri: Self.createPath, method: .get) { response in
                     XCTAssertEqual(response.status, .notFound)

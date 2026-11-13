@@ -35,6 +35,7 @@ public struct SwanAuthenticatedSimpleSpaceLifecycleCapability: Sendable {
 
 enum AuthenticatedSimpleSpaceLifecycleFailure: Error {
     case invalidRequest
+    case invalidCursor
     case invalidSpaceMeta
     case spaceNotFound
     case notAuthorized
@@ -672,9 +673,13 @@ private func parseSimpleSpaceListMembersParameters(
     let cursor: String?
     if let rawCursor = values["cursor"] {
         guard rawCursor.utf8.count <= 2_048 else {
-            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidCursor
         }
-        _ = try DID(didString: rawCursor)
+        do {
+            _ = try DID(didString: rawCursor)
+        } catch {
+            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidCursor
+        }
         cursor = rawCursor
     } else {
         cursor = nil
@@ -702,6 +707,8 @@ func simpleSpaceLifecycleResponse(
     switch failure {
     case .invalidRequest:
         simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
+    case .invalidCursor:
+        simpleSpaceLifecycleError(.badRequest, code: "InvalidCursor")
     case .invalidSpaceMeta:
         simpleSpaceLifecycleError(.badRequest, code: "InvalidSpaceMeta")
     case .spaceNotFound:

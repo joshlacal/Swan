@@ -2112,10 +2112,9 @@ public actor SimpleSpaceAuthority {
             guard SpaceURI.isValidDID(member) else {
                 throw SwanError.invalidIdentifier(member)
             }
-            guard member != state.owner else {
-                throw SwanError.malformed("a space owner cannot be removed")
+            if member != state.owner {
+                state.members.removeValue(forKey: member)
             }
-            state.members.removeValue(forKey: member)
         }
         spaces[space] = state
     }
