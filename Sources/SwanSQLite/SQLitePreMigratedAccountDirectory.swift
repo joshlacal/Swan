@@ -757,13 +757,17 @@ public actor SQLitePreMigratedAccountDirectory:
     }
 
     public func putSpaceSyncRegistration(
-        _ registration: AuthorizedSpaceSyncRegistration
+        _ registration: AuthorizedSpaceSyncRegistration,
+        allowLocalhostDevelopment: Bool
     ) async throws {
         let database = try await preopenedCredentialAuthorityDatabase(
             for: registration.space
         )
         do {
-            try await database.putSpaceSyncRegistration(registration)
+            try await database.putSpaceSyncRegistration(
+                registration,
+                allowLocalhostDevelopment: allowLocalhostDevelopment
+            )
             try await requireCredentialAuthorityStillAvailable(
                 registration.space.authority
             )
@@ -918,10 +922,10 @@ public actor SQLitePreMigratedAccountDirectory:
               notification.issuer == notification.repository else {
             return
         }
-        // A space whose authority this host does not serve is unknown here:
-        // `SpaceNotFound`, as the reference's `assertSpaceHost` answers. The
-        // sender's outbox treats that 4xx as permanent and stops retrying.
-        guard let database = try await preopenedActiveDatabaseIfHosted(
+        // Notification routes keep writer state current while an authority is
+        // active, deactivated, or taken down. Only an unhosted authority is
+        // absent here.
+        guard let database = try await preopenedSpaceHostDatabaseIfHosted(
             notification.space.authority
         ) else {
             throw AuthorizedSimpleSpaceLifecycleError.notFound
@@ -945,7 +949,8 @@ public actor SQLitePreMigratedAccountDirectory:
                 notification,
                 managedWriteApproval: managedWriteApproval
             )
-            guard try await isActiveAccount(notification.space.authority), !isClosed else {
+            guard try await isSpaceHostAccount(notification.space.authority),
+                  !isClosed else {
                 throw SwanError.unavailable("authenticated space directory is unavailable")
             }
         } catch let error as SwanError {
@@ -2965,6 +2970,21 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
+    private func isSpaceHostAccount(_ did: String) async throws -> Bool {
+        do {
+            guard let account = try await controlStore.account(did: did) else {
+                return false
+            }
+            return account.status == .active
+                || account.status == .deactivated
+                || account.status == .takendown
+        } catch {
+            throw SwanError.unavailable(
+                "authenticated space directory is unavailable"
+            )
+        }
+    }
+
     /// Selects an existing startup-opened database for an OAuth subject's own
     /// repository or for a verified space credential. This is intentionally
     /// shared by the two record-read projections so one path cannot regress
@@ -3122,6 +3142,32 @@ public actor SQLitePreMigratedAccountDirectory:
         }
         guard !isClosed else {
             throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        return databases[did]
+    }
+
+    private func preopenedSpaceHostDatabaseIfHosted(
+        _ did: String
+    ) async throws -> SQLiteAccountDatabase? {
+        guard !isClosed else {
+            throw SwanError.unavailable(
+                "authenticated space directory is unavailable"
+            )
+        }
+        guard try await isSpaceHostAccount(did) else { return nil }
+        do {
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
+            )
+        } catch {
+            throw SwanError.unavailable(
+                "authenticated space directory is unavailable"
+            )
+        }
+        guard !isClosed else {
+            throw SwanError.unavailable(
+                "authenticated space directory is unavailable"
+            )
         }
         return databases[did]
     }

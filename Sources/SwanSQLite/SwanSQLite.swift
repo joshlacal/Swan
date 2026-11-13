@@ -2283,6 +2283,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let publicRepositoryRequestReceiptRetentionMigrationVersion = 20
     private static let simpleSpaceIndependentAccessSchemaMigrationVersion = 23
     static let spaceNotificationsV30MigrationVersion = 30
+    private static let spaceSyncNotificationLog = SwanLog(
+        label: "swan.space-sync-notifications"
+    )
 
     /// How long an uploaded blob no commit has claimed stays staged.
     ///
@@ -7805,6 +7808,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     // Reviving one is a fresh create, never a way to expose
                     // pre-deletion records or reapply old managing decisions.
                     try await deleteAuthorityRepositoryWithoutGate(space: space)
+                    _ = try await connection.query(
+                        "DELETE FROM permissioned_space_sync_notifications WHERE space_uri = ?",
+                        [.text(space.rawValue)]
+                    )
                     let storedRevision = try requiredRevision(row, "revision")
                     let nextRevision = try nextSimpleSpaceRevision(storedRevision)
                     _ = try await connection.query(
@@ -8843,11 +8850,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     }
 
     public func putSpaceSyncRegistration(
-        _ registration: AuthorizedSpaceSyncRegistration
+        _ registration: AuthorizedSpaceSyncRegistration,
+        allowLocalhostDevelopment: Bool
     ) async throws {
-        guard registration.endpoint.count <= 4_096,
-              !registration.endpoint.isEmpty,
-              registration.token.utf16.count <= 512,
+        guard validNotificationEndpoint(
+            registration.endpoint,
+            allowLocalhostDevelopment: allowLocalhostDevelopment
+        ) != nil,
+              registration.token.utf8.count <= 512,
               !registration.token.isEmpty else {
             throw SwanError.malformed("invalid space sync registration")
         }
@@ -8881,9 +8891,46 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         [.text(registration.space.rawValue)]
                     ).first?.column("count")?.integer
                     guard let count,
-                          count < Self.maximumNotificationRegistrationsPerSpace else {
-                        throw SwanError.unavailable(
-                            "space sync registration capacity is exhausted"
+                          count <= Self.maximumNotificationRegistrationsPerSpace else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "space sync registration capacity is invalid"
+                        )
+                    }
+                    if count == Self.maximumNotificationRegistrationsPerSpace {
+                        guard let expired = try await connection.query(
+                            """
+                            SELECT endpoint, token
+                            FROM permissioned_space_sync_registrations
+                            WHERE space_uri = ? AND expiry_notified = 1
+                            ORDER BY updated_at, endpoint, token
+                            LIMIT 1
+                            """,
+                            [.text(registration.space.rawValue)]
+                        ).first,
+                        let endpoint = expired.column("endpoint")?.string,
+                        let token = expired.column("token")?.string else {
+                            throw SwanError.unavailable(
+                                "space sync registration capacity is exhausted"
+                            )
+                        }
+                        let identity: [SQLiteData] = [
+                            .text(registration.space.rawValue),
+                            .text(endpoint),
+                            .text(token),
+                        ]
+                        _ = try await connection.query(
+                            """
+                            DELETE FROM permissioned_space_sync_notifications
+                            WHERE space_uri = ? AND endpoint = ? AND token = ?
+                            """,
+                            identity
+                        )
+                        _ = try await connection.query(
+                            """
+                            DELETE FROM permissioned_space_sync_registrations
+                            WHERE space_uri = ? AND endpoint = ? AND token = ?
+                            """,
+                            identity
                         )
                     }
                 }
@@ -10967,39 +11014,73 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let leaseExpiry = try outboxTimestamp(
             now.addingTimeInterval(try validOutboxInterval(leaseDuration, name: "lease duration"))
         )
+        let bestEffortCutoff = max(0, nowTimestamp - 60 * 1_000_000)
         return try await withConnectionGate {
             try await transaction {
-                let token = UUID()
-                let rows = try await connection.query(
-                    """
-                    SELECT id, kind, space_uri, endpoint, token, repo_did,
-                           repo_revision, commitment, space_revision,
-                           previous_space_revision, registration_expires_at,
-                           retry_expires_at, attempts, lease_token, lease_expires_at
-                    FROM permissioned_space_sync_notifications
-                    WHERE available_at <= ?
-                      AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
-                    ORDER BY available_at, created_at, id
-                    LIMIT 1
-                    """,
-                    [.integer(nowTimestamp), .integer(nowTimestamp)]
-                )
-                guard let row = rows.first else { return nil }
-                let event = try decodeSpaceSyncNotification(row)
-                _ = try decodeSpaceSyncNotificationLease(row)
                 _ = try await connection.query(
                     """
-                    UPDATE permissioned_space_sync_notifications
-                    SET lease_token = ?, lease_expires_at = ?
-                    WHERE id = ?
+                    DELETE FROM permissioned_space_sync_notifications
+                    WHERE kind IN ('repoWrite', 'repoRemoved') AND created_at < ?
                     """,
-                    [.text(token.uuidString), .integer(leaseExpiry), .text(event.id.uuidString)]
+                    [.integer(bestEffortCutoff)]
                 )
-                return PersistedSpaceSyncNotificationLease(
-                    event: event,
-                    token: token,
-                    expiresAt: Date(timeIntervalSince1970: Double(leaseExpiry) / 1_000_000)
-                )
+                while true {
+                    let token = UUID()
+                    let rows = try await connection.query(
+                        """
+                        SELECT rowid AS queue_rowid,
+                               id, kind, space_uri, endpoint, token, repo_did,
+                               repo_revision, commitment, space_revision,
+                               previous_space_revision, registration_expires_at,
+                               retry_expires_at, attempts, lease_token, lease_expires_at
+                        FROM permissioned_space_sync_notifications
+                        WHERE available_at <= ?
+                          AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                        ORDER BY
+                          CASE WHEN kind IN ('spaceDeleted', 'registrationExpired')
+                               THEN 0 ELSE 1 END,
+                          available_at, created_at, id
+                        LIMIT 1
+                        """,
+                        [.integer(nowTimestamp), .integer(nowTimestamp)]
+                    )
+                    guard let row = rows.first else { return nil }
+                    let event: PersistedSpaceSyncNotification
+                    do {
+                        event = try decodeSpaceSyncNotification(row)
+                        _ = try decodeSpaceSyncNotificationLease(row)
+                    } catch {
+                        guard let rowID = row.column("queue_rowid")?.integer else {
+                            throw error
+                        }
+                        _ = try await connection.query(
+                            "DELETE FROM permissioned_space_sync_notifications WHERE rowid = ?",
+                            [.integer(rowID)]
+                        )
+                        Self.spaceSyncNotificationLog.warning(
+                            "dropped invalid space sync notification"
+                        )
+                        continue
+                    }
+                    _ = try await connection.query(
+                        """
+                        UPDATE permissioned_space_sync_notifications
+                        SET lease_token = ?, lease_expires_at = ?
+                        WHERE id = ?
+                        """,
+                        [
+                            .text(token.uuidString), .integer(leaseExpiry),
+                            .text(event.id.uuidString),
+                        ]
+                    )
+                    return PersistedSpaceSyncNotificationLease(
+                        event: event,
+                        token: token,
+                        expiresAt: Date(
+                            timeIntervalSince1970: Double(leaseExpiry) / 1_000_000
+                        )
+                    )
+                }
             }
         }
     }
@@ -11455,24 +11536,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return Int(microseconds)
     }
 
-    /// SQLite owns only a bounded opaque endpoint string. The HTTP transport
-    /// performs the authoritative scheme/DNS/redirect policy immediately
-    /// before use; keeping the lexical guard here prevents corrupt rows from
-    /// becoming unbounded or control-character-bearing transport input.
-    private func validNotificationEndpoint(_ value: String) throws -> String {
-        guard !value.isEmpty,
-              value.utf8.count <= 4_096,
-              value.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }),
-              let components = URLComponents(string: value),
-              components.scheme != nil,
-              components.host != nil,
-              components.user == nil,
-              components.password == nil,
-              components.fragment == nil else {
-            throw SwanError.malformed("notification endpoint is invalid")
-        }
-        return value
-    }
 
     private func validServiceEventID(_ value: String) throws -> String {
         guard !value.isEmpty,
@@ -12401,7 +12464,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
               let endpoint = row.column("endpoint")?.string,
               let token = row.column("token")?.string,
               !token.isEmpty,
-              token.utf16.count <= 512 else {
+              token.utf8.count <= 512 else {
             throw SQLiteRepositoryError.corruptDatabase(
                 "invalid space sync notification row"
             )

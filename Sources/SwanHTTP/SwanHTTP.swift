@@ -234,19 +234,22 @@ public struct SwanSpaceCredentialHTTPConfiguration: Sendable {
     let credentialPublicKeys: any SpaceCredentialPublicKeyResolver
     let clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy
     let registrationConfirmer: (any SwanSpaceRegistrationConfirming)?
+    let allowLocalhostNotificationEndpoints: Bool
 
     public init(
         authoritySigningKeys: any SpaceCredentialSigningKeyResolver,
         delegationPublicKeys: any SpaceDelegationPublicKeyResolver,
         credentialPublicKeys: any SpaceCredentialPublicKeyResolver,
         clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy = UnavailableSpaceCredentialClientAttestationPolicy(),
-        registrationConfirmer: (any SwanSpaceRegistrationConfirming)? = nil
+        registrationConfirmer: (any SwanSpaceRegistrationConfirming)? = nil,
+        allowLocalhostNotificationEndpoints: Bool = false
     ) {
         self.authoritySigningKeys = authoritySigningKeys
         self.delegationPublicKeys = delegationPublicKeys
         self.credentialPublicKeys = credentialPublicKeys
         self.clientAttestationPolicy = clientAttestationPolicy
         self.registrationConfirmer = registrationConfirmer
+        self.allowLocalhostNotificationEndpoints = allowLocalhostNotificationEndpoints
     }
 }
 
@@ -767,7 +770,9 @@ public struct SwanHTTPServer: Sendable {
                         configuration: spaceCredentialIssuance
                     ),
                     registrationDirectory: registrationDirectory,
-                    registrationConfirmer: exchangeCredentialConfiguration.registrationConfirmer
+                    registrationConfirmer: exchangeCredentialConfiguration.registrationConfirmer,
+                    allowLocalhostNotificationEndpoints:
+                        exchangeCredentialConfiguration.allowLocalhostNotificationEndpoints
                 )
             } else {
                 authenticatedSpaceCredentialExchange = nil

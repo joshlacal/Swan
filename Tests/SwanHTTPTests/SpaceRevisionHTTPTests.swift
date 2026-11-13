@@ -209,6 +209,68 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
         try await fixture.close()
     }
 
+    func testSuspendedAuthorityAcceptsRepoUpdateAndPreservesSyncRegistration() async throws {
+        let fixture = try await SpaceRevisionHTTPFixture.make(
+            authority: authority,
+            members: [bob]
+        )
+        defer { Task { try? await fixture.close() } }
+        let endpoint = "https://syncer.example"
+        let token = "suspension-token"
+        try await fixture.directory.putSpaceSyncRegistration(.init(
+            space: fixture.space,
+            endpoint: endpoint,
+            token: token,
+            expiresAt: Date().addingTimeInterval(600)
+        ))
+        let app = try fixture.server().buildApplication(
+            logger: Logger(label: "SpaceRevisionHTTPTests.suspended-update")
+        )
+        try await app.test(.router) { client in
+            for (index, status) in [
+                AccountControlStatus.deactivated,
+                .takendown,
+            ].enumerated() {
+                _ = try await fixture.control.transitionStatus(
+                    did: self.authority,
+                    to: status,
+                    declaration: .init(),
+                    now: Date()
+                )
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate",
+                    method: .post,
+                    headers: Self.serviceHeaders(
+                        issuer: self.bob,
+                        audience: self.authority,
+                        jti: "suspended-\(index)"
+                    ),
+                    body: fixture.writeBody(
+                        repo: self.bob,
+                        repoRev: Self.tid(
+                            at: Date().addingTimeInterval(TimeInterval(index))
+                        )
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                _ = try await fixture.control.transitionStatus(
+                    did: self.authority,
+                    to: .active,
+                    declaration: .init(),
+                    now: Date()
+                )
+                let registration = try await fixture.directory.spaceSyncRegistration(
+                    space: fixture.space,
+                    endpoint: endpoint,
+                    token: token
+                )
+                XCTAssertNotNil(registration)
+            }
+        }
+        try await fixture.close()
+    }
+
     func testNotifyRepoUpdateAnswersFutureRevAndSpaceNotFound() async throws {
         let fixture = try await SpaceRevisionHTTPFixture.make(authority: authority, members: [bob])
         do {

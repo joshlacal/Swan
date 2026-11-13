@@ -645,6 +645,13 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         let database = try await fixture.open()
         defer { Task { try? await database.close() } }
         try await fixture.createAuthorityState(on: database)
+        let now = Date()
+        try await database.putSpaceSyncRegistration(.init(
+            space: fixture.space,
+            endpoint: "https://recreated-syncer.example",
+            token: "recreated-token",
+            expiresAt: now.addingTimeInterval(600)
+        ))
 
         let eventID1 = "writer-event-rev1"
         let rev1 = try fixture.tid(1)
@@ -668,6 +675,8 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         // Delete the space
         let authContext = AuthorizationContext.accountOAuthForTesting(subject: fixture.authority, scopes: ["atproto"])
         _ = try await database.deleteSimpleSpace(space: fixture.space, authorization: authContext)
+        let queuedDeletion = try await database.pendingSpaceSyncNotifications()
+        XCTAssertEqual(queuedDeletion.map(\.kind), [.spaceDeleted])
 
         // Verify permissioned_space_writers is empty immediately after delete
         let writersAfterDelete = try await database.connection.query(
@@ -688,6 +697,11 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             space: fixture.space,
             members: [.init(did: fixture.writer, read: true, write: true)],
             authorization: authContext
+        )
+        let queuedAfterRevival = try await database.pendingSpaceSyncNotifications()
+        XCTAssertTrue(
+            queuedAfterRevival.isEmpty,
+            "a revived space must not inherit its deletion notice"
         )
 
         // Submit a notification at the same wire revision/commitment as before
@@ -1017,6 +1031,174 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         }
         let deliveredEvents = await transport.events()
         XCTAssertEqual(deliveredEvents.count, 2)
+    }
+
+    func testInvalidStoredEndpointIsDroppedBeforeTheNextDelivery() async throws {
+        let fixture = try NotificationFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+        let now = Date()
+        do {
+            try await database.putSpaceSyncRegistration(.init(
+                space: fixture.space,
+                endpoint: "https://exa\u{200b}mple.com",
+                token: "poison",
+                expiresAt: now.addingTimeInterval(600)
+            ))
+            XCTFail("persistence must reject a non-ASCII endpoint")
+        } catch {}
+        try await database.putSpaceSyncRegistration(.init(
+            space: fixture.space,
+            endpoint: "https://healthy.example",
+            token: "healthy",
+            expiresAt: now.addingTimeInterval(600)
+        ))
+        try await database.receiveSpaceWriteNotification(
+            fixture.writeNotification(
+                eventID: "healthy-write",
+                revision: try fixture.tid(1),
+                commitmentByte: 1
+            ),
+            now: now
+        )
+        let poisonID = UUID().uuidString
+        _ = try await database.connection.query(
+            """
+            INSERT INTO permissioned_space_sync_notifications(
+                id, kind, space_uri, endpoint, token, repo_did, repo_revision,
+                commitment, space_revision, previous_space_revision,
+                registration_expires_at, attempts, created_at, available_at,
+                retry_expires_at, lease_token, lease_expires_at
+            )
+            SELECT ?, kind, space_uri, ?, ?, repo_did, repo_revision,
+                   commitment, space_revision, previous_space_revision,
+                   registration_expires_at, attempts, created_at - 1000000,
+                   available_at - 1000000, retry_expires_at, NULL, NULL
+            FROM permissioned_space_sync_notifications
+            LIMIT 1
+            """,
+            [
+                .text(poisonID),
+                .text("https://exa\u{200b}mple.com"),
+                .text("poison"),
+            ]
+        )
+        let transport = RecordingSpaceSyncTransport(.delivered)
+        let worker = PermissionedSpaceSyncNotificationDeliveryWorker(
+            database: database,
+            transport: transport
+        )
+        guard case .delivered = try await worker.deliverNext(
+            now: now.addingTimeInterval(2)
+        ) else {
+            return XCTFail("the valid row after poison must be delivered")
+        }
+        let delivered = await transport.events()
+        XCTAssertEqual(delivered.map(\.endpoint), ["https://healthy.example"])
+        let pendingAfterPoison = try await database.pendingSpaceSyncNotifications()
+        XCTAssertTrue(pendingAfterPoison.isEmpty)
+    }
+
+    func testReliableRowsPrecedeFreshBestEffortAndOldBestEffortExpires() async throws {
+        let fixture = try NotificationFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        try await database.putSpaceSyncRegistration(.init(
+            space: fixture.space,
+            endpoint: "https://active.example",
+            token: "active",
+            expiresAt: start.addingTimeInterval(600)
+        ))
+        try await database.receiveSpaceWriteNotification(
+            fixture.writeNotification(
+                eventID: "fresh-write-1",
+                revision: try fixture.tid(1),
+                commitmentByte: 1
+            ),
+            now: start
+        )
+        try await database.putSpaceSyncRegistration(.init(
+            space: fixture.space,
+            endpoint: "https://lapsed.example",
+            token: "lapsed",
+            expiresAt: start.addingTimeInterval(-1)
+        ))
+        try await database.receiveSpaceWriteNotification(
+            fixture.writeNotification(
+                eventID: "fresh-write-2",
+                revision: try fixture.tid(2),
+                commitmentByte: 2
+            ),
+            now: start.addingTimeInterval(1)
+        )
+        let transport = RecordingSpaceSyncTransport(.delivered)
+        let worker = PermissionedSpaceSyncNotificationDeliveryWorker(
+            database: database,
+            transport: transport
+        )
+        guard case .delivered = try await worker.deliverNext(
+            now: start.addingTimeInterval(2)
+        ) else {
+            return XCTFail("the reliable row must be leased first")
+        }
+        let firstEvents = await transport.events()
+        XCTAssertEqual(firstEvents.map(\.kind), [.registrationExpired])
+        let afterExpiry = try await worker.deliverNext(
+            now: start.addingTimeInterval(63)
+        )
+        XCTAssertEqual(afterExpiry, .idle)
+        let pending = try await database.pendingSpaceSyncNotifications()
+        XCTAssertTrue(pending.isEmpty)
+    }
+
+    func testRegistrationCapacityEvictsOldestNotifiedLapse() async throws {
+        let fixture = try NotificationFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+        _ = try await database.connection.query(
+            """
+            WITH RECURSIVE registrations(n) AS (
+                VALUES(0) UNION ALL SELECT n + 1 FROM registrations WHERE n < 1023
+            )
+            INSERT INTO permissioned_space_sync_registrations(
+                space_uri, endpoint, token, expires_at, expiry_notified, updated_at
+            )
+            SELECT ?, 'https://syncer-' || n || '.example', 'token-' || n,
+                   1, CASE WHEN n < 2 THEN 1 ELSE 0 END, n + 1
+            FROM registrations
+            """,
+            [.text(fixture.space.rawValue)]
+        )
+        let now = Date()
+        try await database.putSpaceSyncRegistration(.init(
+            space: fixture.space,
+            endpoint: "https://new-syncer.example",
+            token: "new-token",
+            expiresAt: now.addingTimeInterval(600)
+        ))
+        let rows = try await database.connection.query(
+            """
+            SELECT endpoint, token
+            FROM permissioned_space_sync_registrations
+            WHERE space_uri = ?
+            """,
+            [.text(fixture.space.rawValue)]
+        )
+        XCTAssertEqual(rows.count, 1_024)
+        XCTAssertFalse(rows.contains {
+            $0.column("endpoint")?.string == "https://syncer-0.example"
+        })
+        XCTAssertTrue(rows.contains {
+            $0.column("endpoint")?.string == "https://new-syncer.example"
+                && $0.column("token")?.string == "new-token"
+        })
     }
 }
 

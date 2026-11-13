@@ -369,6 +369,35 @@ public struct AuthorizedSpaceSyncRegistration: Sendable, Equatable {
     }
 }
 
+/// Validates a request-selected sync notification endpoint before it crosses
+/// either the HTTP or persistence boundary. Production endpoints are
+/// ASCII-only HTTPS origins on the default port. The explicit development
+/// escape hatch additionally permits `http://localhost` and custom ports.
+public func validNotificationEndpoint(
+    _ value: String,
+    allowLocalhostDevelopment: Bool = false
+) -> URL? {
+    guard !value.isEmpty,
+          value.utf8.count <= 4_096,
+          value.utf8.allSatisfy({ (0x21 ... 0x7e).contains($0) }),
+          let components = URLComponents(string: value),
+          let scheme = components.scheme?.lowercased(),
+          let host = components.host?.lowercased(),
+          !host.isEmpty,
+          components.user == nil,
+          components.password == nil,
+          components.fragment == nil,
+          let url = components.url else {
+        return nil
+    }
+    let allowedScheme = scheme == "https"
+        || (allowLocalhostDevelopment && scheme == "http" && host == "localhost")
+    let allowedPort = components.port == nil || components.port == 443
+        || allowLocalhostDevelopment
+    return allowedScheme && allowedPort ? url : nil
+}
+
+
 /// Durable registration state owned by the space authority. Selection is
 /// always through a startup-preopened authority database.
 public protocol AuthorizedSpaceSyncRegistrationDirectory: Sendable {
@@ -381,13 +410,25 @@ public protocol AuthorizedSpaceSyncRegistrationDirectory: Sendable {
         token: String
     ) async throws -> AuthorizedSpaceSyncRegistration?
     func putSpaceSyncRegistration(
-        _ registration: AuthorizedSpaceSyncRegistration
+        _ registration: AuthorizedSpaceSyncRegistration,
+        allowLocalhostDevelopment: Bool
     ) async throws
     func removeSpaceSyncRegistration(
         space: SpaceURI,
         endpoint: String,
         token: String
     ) async throws
+}
+
+public extension AuthorizedSpaceSyncRegistrationDirectory {
+    func putSpaceSyncRegistration(
+        _ registration: AuthorizedSpaceSyncRegistration
+    ) async throws {
+        try await putSpaceSyncRegistration(
+            registration,
+            allowLocalhostDevelopment: false
+        )
+    }
 }
 
 /// A signed service announcement after its HTTP/JWT boundary has completed.

@@ -22,11 +22,11 @@ public protocol SwanSpaceRegistrationConfirming: Sendable {
 public struct HTTPSwanSpaceRegistrationConfirmer: SwanSpaceRegistrationConfirming {
     private let policy: OAuthRemoteFetchPolicy
     private let resolver: any OAuthHostnameResolving
-    private let transport: NIOPeerPinnedOAuthPostTransport
+    private let transport: any OAuthRemotePostTransport
 
     public init(
         policy: OAuthRemoteFetchPolicy,
-        transport: NIOPeerPinnedOAuthPostTransport,
+        transport: any OAuthRemotePostTransport,
         resolver: any OAuthHostnameResolving = SystemOAuthHostnameResolver()
     ) {
         self.policy = policy
@@ -40,12 +40,12 @@ public struct HTTPSwanSpaceRegistrationConfirmer: SwanSpaceRegistrationConfirmin
         token: String,
         challenge: String
     ) async throws {
-        guard token.utf16.count <= 512, !token.isEmpty,
+        guard token.utf8.count <= 512, !token.isEmpty,
               challenge.utf8.count <= 128, !challenge.isEmpty,
-              let base = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
-              base.path.isEmpty || base.path == "/",
-              base.query == nil,
-              base.fragment == nil else {
+              validNotificationEndpoint(
+                endpoint.absoluteString,
+                allowLocalhostDevelopment: policy.allowLocalhostDevelopment
+              ) != nil else {
             throw SwanError.malformed("notification registration is invalid")
         }
         let url = try notificationEndpoint(
@@ -83,7 +83,7 @@ public struct HTTPSwanSpaceRegistrationConfirmer: SwanSpaceRegistrationConfirmin
             )
         )
         try policy.validateResolved(Array(after), host: host)
-        guard response.status == 200,
+        guard (200 ... 299).contains(response.status),
               response.redirectCount == 0,
               response.responseURL == url,
               let peer = response.connectedPeerAddress,
@@ -95,7 +95,6 @@ public struct HTTPSwanSpaceRegistrationConfirmer: SwanSpaceRegistrationConfirmin
         try StrictJSON.validate(response.body)
         guard let object = try JSONSerialization.jsonObject(with: response.body)
                 as? [String: Any],
-              Set(object.keys) == ["challenge"],
               object["challenge"] as? String == challenge else {
             throw SwanError.unavailable("registration confirmation failed")
         }
@@ -217,55 +216,27 @@ public protocol SwanSpaceAuthorityNotificationDestinationResolving: Sendable {
     func destination(forAuthority authority: String) async throws -> SwanSpaceNotificationDestination?
 }
 
-/// Maps an *exact registered endpoint string* to an operator-configured
-/// endpoint and service audience. A registration only acts as a key into this
-/// map; it cannot select an audience or make a new network destination live.
-public protocol SwanRegisteredSpaceNotificationDestinationResolving: Sendable {
-    func destination(
-        forRegisteredEndpoint endpoint: String
-    ) async throws -> SwanSpaceNotificationDestination?
-}
-
-/// Immutable lab configuration for writer-to-authority notifications. The
-/// pinned TypeScript handler accepts only this writer-signed shape. Registered
-/// write fanout is retained as local discovery state but is not represented as
-/// a claimed cross-host delivery protocol until upstream defines a receiver
-/// that accepts an authority signing for another writer.
+/// Immutable configuration for writer-to-authority notifications.
 public struct StaticSwanSpaceNotificationDestinations:
-    SwanSpaceAuthorityNotificationDestinationResolving,
-    SwanRegisteredSpaceNotificationDestinationResolving
+    SwanSpaceAuthorityNotificationDestinationResolving
 {
     private let authorities: [String: SwanSpaceNotificationDestination]
-    private let registrations: [String: SwanSpaceNotificationDestination]
 
     public init(
-        authorityDestinations: [String: SwanSpaceNotificationDestination] = [:],
-        registrationDestinations: [String: SwanSpaceNotificationDestination] = [:]
+        authorityDestinations: [String: SwanSpaceNotificationDestination] = [:]
     ) throws {
         for authority in authorityDestinations.keys {
             guard (try? DID(didString: authority)) != nil else {
                 throw SwanError.malformed("notification authority mapping is invalid")
             }
         }
-        for endpoint in registrationDestinations.keys {
-            guard validConfiguredNotificationEndpoint(endpoint) else {
-                throw SwanError.malformed("notification registration mapping is invalid")
-            }
-        }
         authorities = authorityDestinations
-        registrations = registrationDestinations
     }
 
     public func destination(
         forAuthority authority: String
     ) async throws -> SwanSpaceNotificationDestination? {
         authorities[authority]
-    }
-
-    public func destination(
-        forRegisteredEndpoint endpoint: String
-    ) async throws -> SwanSpaceNotificationDestination? {
-        registrations[endpoint]
     }
 }
 
@@ -561,19 +532,6 @@ private func notificationHeaders(_ token: String) -> [String: String] {
     ]
 }
 
-private func validConfiguredNotificationEndpoint(_ raw: String) -> Bool {
-    guard raw.utf8.count <= 4_096,
-          raw.unicodeScalars.allSatisfy({ $0.value > 0x1f && $0.value != 0x7f }),
-          let components = URLComponents(string: raw),
-          components.scheme != nil,
-          components.host != nil,
-          components.user == nil,
-          components.password == nil,
-          components.fragment == nil else {
-        return false
-    }
-    return true
-}
 
 private func validConfiguredServiceIdentity(_ value: String) -> Bool {
     !value.isEmpty && value.utf8.count <= 4_096 && value.utf8.allSatisfy {

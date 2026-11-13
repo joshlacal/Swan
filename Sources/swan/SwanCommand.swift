@@ -357,8 +357,7 @@ struct ServeNotificationRuntime {
                 ),
                 recipientBindings: recipientBindings,
                 destinations: try StaticSwanSpaceNotificationDestinations(
-                    authorityDestinations: authorities,
-                    registrationDestinations: registrations
+                    authorityDestinations: authorities
                 ),
                 peerPinnedTransportConfiguration: try .init(endpointPeers: peers),
                 managingServiceAudience: managedAudience
@@ -904,7 +903,9 @@ struct ServePermissionedRuntime {
             UnavailableSpaceCredentialClientAttestationPolicy(),
         serviceEndpointResolver: SwanServiceEndpointResolver? = nil,
         spacesOpenInterop: SwanSpacesOpenInteropConfiguration? = nil,
-        openFederation: SwanDIDDocumentSpaceResolver? = nil
+        openFederation: SwanDIDDocumentSpaceResolver? = nil,
+        notificationDeliveryEnabled: Bool = false,
+        allowLocalhostNotificationEndpoints: Bool = false
     ) async throws -> ServePermissionedRuntime {
         var credentialPublicKeys: (any SpaceCredentialPublicKeyResolver)?
         var delegationPublicKeys: (any SpaceDelegationPublicKeyResolver)?
@@ -964,11 +965,12 @@ struct ServePermissionedRuntime {
         }
 
         let registrationConfirmer: HTTPSwanSpaceRegistrationConfirmer?
-        if local != nil {
+        if local != nil, notificationDeliveryEnabled {
             do {
                 let pinned = notification?.peerPinnedTransportConfiguration
                 let policy = try OAuthRemoteFetchPolicy(
-                    allowLocalhostDevelopment: notification != nil
+                    allowLocalhostDevelopment:
+                        allowLocalhostNotificationEndpoints
                 )
                 registrationConfirmer = HTTPSwanSpaceRegistrationConfirmer(
                     policy: policy,
@@ -994,7 +996,9 @@ struct ServePermissionedRuntime {
                     ?? ServeUnavailableCredentialSigningKeyResolver(),
                 delegationPublicKeys: delegationPublicKeys,
                 credentialPublicKeys: credentialPublicKeys,
-                registrationConfirmer: registrationConfirmer
+                registrationConfirmer: registrationConfirmer,
+                allowLocalhostNotificationEndpoints:
+                    allowLocalhostNotificationEndpoints
             )
         } else {
             credentialConfiguration = nil
@@ -1049,7 +1053,9 @@ struct ServePermissionedRuntime {
                     credentialPublicKeys: credentialPublicKeys
                         ?? UnavailableSpaceCredentialPublicKeyResolver(),
                     clientAttestationPolicy: clientAttestationPolicy,
-                    registrationConfirmer: registrationConfirmer
+                    registrationConfirmer: registrationConfirmer,
+                    allowLocalhostNotificationEndpoints:
+                        allowLocalhostNotificationEndpoints
                 )
             },
             delegationConfiguration: local?.delegationConfiguration,
@@ -4117,7 +4123,10 @@ extension SwanCommand {
                         clientAttestationPolicy: clientAttestationPolicy,
                         serviceEndpointResolver: notifyServiceResolver,
                         spacesOpenInterop: enableSpacesOpenInterop ? .standard : nil,
-                        openFederation: openFederationResolver
+                        openFederation: openFederationResolver,
+                        notificationDeliveryEnabled: enableNotificationDelivery,
+                        allowLocalhostNotificationEndpoints:
+                            !Self.isPubliclyReachableHTTPSOrigin(baseURL)
                     )
                     // Ask the managing app through
                     // com.atproto.managedspace.checkAccess, signed as the
@@ -4197,7 +4206,10 @@ extension SwanCommand {
                     do {
                         let pinned = notificationRuntime.peerPinnedTransportConfiguration
                         poster = .init(
-                            policy: try OAuthRemoteFetchPolicy(allowLocalhostDevelopment: true),
+                            policy: try OAuthRemoteFetchPolicy(
+                                allowLocalhostDevelopment:
+                                    !Self.isPubliclyReachableHTTPSOrigin(baseURL)
+                            ),
                             transport: NIOPeerPinnedOAuthPostTransport(
                                 configuration: try .init(
                                     endpointPeers: pinned.endpointPeers,

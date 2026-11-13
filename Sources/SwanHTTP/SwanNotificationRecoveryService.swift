@@ -53,13 +53,16 @@ public struct SwanNotificationRecoveryService: Service {
                         transport: makeOutboxTransport(database),
                         configuration: configuration
                     )
-                    let sync = PermissionedSpaceSyncNotificationDeliveryWorker(
-                        database: database,
-                        transport: makeSyncTransport(database),
-                        configuration: configuration
-                    )
+                    let syncTransport = makeSyncTransport(database)
                     group.addTask { await outbox.runUntilCancelled() }
-                    group.addTask { await sync.runUntilCancelled() }
+                    for _ in 0 ..< 4 {
+                        let sync = PermissionedSpaceSyncNotificationDeliveryWorker(
+                            database: database,
+                            transport: syncTransport,
+                            configuration: configuration
+                        )
+                        group.addTask { await sync.runUntilCancelled() }
+                    }
                 }
                 await group.waitForAll()
             }

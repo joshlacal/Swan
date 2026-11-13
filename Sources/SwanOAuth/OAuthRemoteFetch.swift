@@ -926,7 +926,8 @@ public struct OAuthBoundedJSONPoster: Sendable {
         }
         // Status is classified only AFTER the peer proof above: a forged
         // response must never be able to acknowledge (4xx) a delivery.
-        if (400 ... 499).contains(response.status), response.status != 408, response.status != 429 {
+        if (400 ... 499).contains(response.status),
+           ![408, 425, 429].contains(response.status) {
             throw OAuthOutboundPostPermanentlyRejected(status: response.status)
         }
         guard (200 ... 299).contains(response.status) else {

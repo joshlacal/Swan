@@ -283,6 +283,83 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testAuthorizeSpaceSyncValidatesNotificationEndpointAndUTF8Token() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let confirmer = RegistrationConfirmationProbe()
+            let app = try makeServer(
+                fixture,
+                registrationConfirmer: confirmer
+            ).buildApplication(logger: Logger(label: "spaces.authorize.endpoint"))
+            let headers: HTTPFields = [.contentType: "application/json"]
+            func body(endpoint: String, token: String, extra: Bool = false) throws -> ByteBuffer {
+                var notify: [String: Any] = ["endpoint": endpoint, "token": token]
+                if extra { notify["$type"] = "future-extension" }
+                return ByteBuffer(data: try JSONSerialization.data(withJSONObject: [
+                    "space": fixture.publicSpace.rawValue,
+                    "credentialKey": try SpaceCredentialSignatureTestSupport.keyID,
+                    "notify": notify,
+                ]))
+            }
+            try await app.test(.router) { client in
+                for (index, endpoint) in [
+                    "https://exa\u{200b}mple.com",
+                    "https://é.example.com",
+                    "http://localhost:3001",
+                    "https://notify.example:8443",
+                    "ftp://notify.example",
+                    "https://user@notify.example",
+                    "https://notify.example/#fragment",
+                ].enumerated() {
+                    try await client.execute(
+                        uri: Self.credentialPath,
+                        method: .post,
+                        headers: headers,
+                        body: try body(endpoint: endpoint, token: "invalid-\(index)")
+                    ) { response in
+                        XCTAssertEqual(response.status, .badRequest)
+                        XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                    }
+                }
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: headers,
+                    body: try body(
+                        endpoint: "https://notify.example",
+                        token: String(repeating: "界", count: 171)
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
+                let endpoint = "https://notify.example:443/base?ignored=1"
+                let token = String(repeating: "界", count: 170)
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: headers,
+                    body: try body(endpoint: endpoint, token: token, extra: true)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                let registration = try await fixture.directory.spaceSyncRegistration(
+                    space: fixture.publicSpace,
+                    endpoint: endpoint,
+                    token: token
+                )
+                XCTAssertNotNil(registration)
+            }
+            let confirmationCalls = await confirmer.callCount()
+            XCTAssertEqual(confirmationCalls, 1)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     func testNovember12ResponseMACAndSTARAreBoundToAuthenticatedBody() async throws {
         let fixture = try await Fixture.make()
         defer { fixture.cleanup() }
@@ -501,6 +578,44 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 ) { response in
                     XCTAssertEqual(response.status, .badRequest)
                     XCTAssertEqual(try self.errorCode(response.body), "SpaceDeleted")
+                }
+            }
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    func testMissingSpaceDoesNotPrecedeDelegationValidation() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let app = try makeServer(fixture).buildApplication(
+                logger: Logger(label: "SpaceCredentialHTTPTests.existence")
+            )
+            let missing = try SpaceURI(
+                authority: Self.authority,
+                spaceType: fixture.memberSpace.spaceType,
+                skey: "never-created"
+            )
+            try await app.test(.router) { client in
+                for space in [fixture.memberSpace, missing] {
+                    try await client.execute(
+                        uri: Self.credentialPath,
+                        method: .post,
+                        headers: self.exchangeHeaders(),
+                        body: self.exchangeBody(
+                            delegationToken: "not-a-delegation-token",
+                            space: space
+                        )
+                    ) { response in
+                        XCTAssertEqual(response.status, .badRequest)
+                        XCTAssertEqual(
+                            try self.errorCode(response.body),
+                            "InvalidDelegationToken"
+                        )
+                    }
                 }
             }
             try await fixture.close()

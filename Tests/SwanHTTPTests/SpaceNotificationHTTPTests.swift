@@ -230,6 +230,90 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         _ = await running.value
         try await restarted.close()
     }
+
+    func testRegistrationConfirmerAcceptsExtendedAny2xxResponseAndRewritesBasePath() async throws {
+        let challenge = "challenge-1"
+        let response = try JSONSerialization.data(withJSONObject: [
+            "challenge": challenge,
+            "$type": "future-extension",
+        ])
+        let posts = RecordingPostTransport(
+            responseStatuses: [201],
+            responseBodies: [response]
+        )
+        let confirmer = HTTPSwanSpaceRegistrationConfirmer(
+            policy: try OAuthRemoteFetchPolicy(maximumBodyBytes: 4_096, timeout: 2),
+            transport: posts,
+            resolver: FixedHostnameResolver(
+                answer: try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+            )
+        )
+        let space = try SpaceURI(
+            authority: authority,
+            spaceType: "app.bsky.bookmarks",
+            skey: "confirmation"
+        )
+
+        try await confirmer.confirmRegistration(
+            space: space,
+            endpoint: try XCTUnwrap(
+                URL(string: "https://syncer.example:443/base?ignored=1")
+            ),
+            token: "opaque-token",
+            challenge: challenge
+        )
+
+        let captured = await posts.posts()
+        let post = try XCTUnwrap(captured.first)
+        XCTAssertEqual(
+            post.url.absoluteString,
+            "https://syncer.example:443/xrpc/com.atproto.space.confirmRegistration"
+        )
+        XCTAssertNil(post.headers["authorization"])
+        let body = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: post.body) as? [String: Any]
+        )
+        XCTAssertEqual(
+            Set(body.keys),
+            ["space", "token", "challenge"]
+        )
+        XCTAssertEqual(body["space"] as? String, space.rawValue)
+        XCTAssertEqual(body["token"] as? String, "opaque-token")
+        XCTAssertEqual(body["challenge"] as? String, challenge)
+    }
+
+    func testSyncDeliveryTreatsHTTP425AsRetryable() async throws {
+        let posts = RecordingPostTransport(responseStatuses: [425])
+        let transport = HTTPPermissionedSpaceSyncNotificationTransport(
+            poster: OAuthBoundedJSONPoster(
+                policy: try OAuthRemoteFetchPolicy(
+                    maximumBodyBytes: 4_096,
+                    timeout: 2
+                ),
+                resolver: FixedHostnameResolver(
+                    answer: try XCTUnwrap(
+                        OAuthIPAddress(literal: "93.184.216.34")
+                    )
+                ),
+                transport: posts
+            )
+        )
+        let space = try SpaceURI(
+            authority: authority,
+            spaceType: "app.bsky.bookmarks",
+            skey: "too-early"
+        )
+        let disposition = await transport.deliver(.init(
+            id: UUID(),
+            kind: .spaceDeleted,
+            space: space,
+            endpoint: "https://syncer.example",
+            token: "token",
+            retryExpiresAt: Date().addingTimeInterval(60),
+            attempts: 0
+        ))
+        XCTAssertEqual(disposition, .retryableFailure)
+    }
 }
 
 private struct NotificationHTTPFixture {

@@ -19,6 +19,7 @@ public struct SwanSpaceCredentialExchangeCapability: Sendable {
     let credentialIssuer: any SpaceCredentialAuthoritySigner
     let registrationDirectory: any AuthorizedSpaceSyncRegistrationDirectory
     let registrationConfirmer: (any SwanSpaceRegistrationConfirming)?
+    let allowLocalhostNotificationEndpoints: Bool
 
     init(
         authorizer: SwanOAuthResourceAuthorizer,
@@ -26,7 +27,8 @@ public struct SwanSpaceCredentialExchangeCapability: Sendable {
         delegationReplayStore: DurableSpaceDelegationReplayStore,
         credentialIssuer: any SpaceCredentialAuthoritySigner,
         registrationDirectory: any AuthorizedSpaceSyncRegistrationDirectory,
-        registrationConfirmer: (any SwanSpaceRegistrationConfirming)? = nil
+        registrationConfirmer: (any SwanSpaceRegistrationConfirming)? = nil,
+        allowLocalhostNotificationEndpoints: Bool = false
     ) {
         self.authorizer = authorizer
         self.delegationAuthorizer = delegationAuthorizer
@@ -34,6 +36,8 @@ public struct SwanSpaceCredentialExchangeCapability: Sendable {
         self.credentialIssuer = credentialIssuer
         self.registrationDirectory = registrationDirectory
         self.registrationConfirmer = registrationConfirmer
+        self.allowLocalhostNotificationEndpoints =
+            allowLocalhostNotificationEndpoints
     }
 }
 
@@ -92,18 +96,26 @@ private struct AuthenticatedAuthorizeSpaceSyncHandler {
         }
         let notify = try input.notify.map {
             value -> (endpoint: URL, rawEndpoint: String, token: String) in
-            guard let endpoint = validSpaceSyncNotificationEndpoint(value.endpoint),
+            guard let endpoint = validNotificationEndpoint(
+                value.endpoint,
+                allowLocalhostDevelopment:
+                    capability.allowLocalhostNotificationEndpoints
+            ),
                   !value.token.isEmpty,
-                  value.token.utf16.count <= 512 else {
+                  value.token.utf8.count <= 512 else {
                 throw SpaceCredentialExchangeFailure.invalidRequest
             }
             return (endpoint, value.endpoint, value.token)
         }
 
-        // Tombstones are intentionally checked before delegation validation or
-        // policy so a deleted space always answers SpaceDeleted.
+        // Only a durable tombstone is disclosed before delegation validation.
+        // Absence falls through so it is indistinguishable from an existing
+        // private space to an unauthenticated caller.
         do {
             _ = try await capability.registrationDirectory.activeSpaceRevision(space)
+        } catch AuthorizedSimpleSpaceLifecycleError.notFound {
+        } catch AuthorizedSimpleSpaceLifecycleError.deleted {
+            throw SpaceCredentialExchangeFailure.spaceDeleted
         } catch {
             throw spaceCredentialExchangeFailure(for: error)
         }
@@ -206,7 +218,9 @@ private struct AuthenticatedAuthorizeSpaceSyncHandler {
                         endpoint: endpoint,
                         token: notify.token,
                         expiresAt: expiresAt
-                    )
+                    ),
+                    allowLocalhostDevelopment:
+                        capability.allowLocalhostNotificationEndpoints
                 )
             } catch {
                 throw spaceCredentialExchangeFailure(for: error)
@@ -236,7 +250,9 @@ func registerAuthenticatedAuthorizeSpaceSyncEndpoint(
             let input = try await decodeAuthorizeSpaceSyncInput(
                 request,
                 context: context,
-                requestBodyAdmission: requestBodyAdmission
+                requestBodyAdmission: requestBodyAdmission,
+                allowLocalhostNotificationEndpoints:
+                    capability.allowLocalhostNotificationEndpoints
             )
             return authenticatedGetSpaceJSON(
                 .ok,
@@ -267,7 +283,8 @@ func registerAuthenticatedAuthorizeSpaceSyncEndpoint(
 private func decodeAuthorizeSpaceSyncInput(
     _ request: Request,
     context: SwanHTTPRequestContext,
-    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
+    allowLocalhostNotificationEndpoints: Bool
 ) async throws -> AuthorizeSpaceSyncInput {
     let body = try await collectAdmittedRequestBody(
         request,
@@ -315,12 +332,15 @@ private func decodeAuthorizeSpaceSyncInput(
     }
     if let rawNotify = root["notify"] {
         guard let notification = rawNotify as? [String: Any],
-              Set(notification.keys) == ["endpoint", "token"],
               let endpoint = notification["endpoint"] as? String,
-              validSpaceSyncNotificationEndpoint(endpoint) != nil,
+              validNotificationEndpoint(
+                endpoint,
+                allowLocalhostDevelopment:
+                    allowLocalhostNotificationEndpoints
+              ) != nil,
               let token = notification["token"] as? String,
               !token.isEmpty,
-              token.utf16.count <= 512 else {
+              token.utf8.count <= 512 else {
             throw SpaceCredentialExchangeFailure.invalidRequest
         }
     }
@@ -333,21 +353,6 @@ private func decodeAuthorizeSpaceSyncInput(
     }
 }
 
-private func validSpaceSyncNotificationEndpoint(_ value: String) -> URL? {
-    guard value.utf8.count <= 4_096,
-          let url = URL(string: value),
-          let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-          components.scheme != nil,
-          components.host != nil,
-          components.user == nil,
-          components.password == nil,
-          components.path.isEmpty || components.path == "/",
-          components.query == nil,
-          components.fragment == nil else {
-        return nil
-    }
-    return url
-}
 
 private func isSpaceSyncAuthorizationDenial(_ error: Error) -> Bool {
     if let lifecycle = error as? AuthorizedSimpleSpaceLifecycleError {

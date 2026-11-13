@@ -474,6 +474,10 @@ extension SQLiteAccountDatabase {
                     if (row.column("is_deleted")?.integer ?? 0) != 0 {
                         // As createSpace: a revived space starts fresh.
                         try await deleteAuthorityRepositoryWithoutGate(space: space)
+                        _ = try await connection.query(
+                            "DELETE FROM permissioned_space_sync_notifications WHERE space_uri = ?",
+                            [.text(space.rawValue)]
+                        )
                     }
                     let nextRevision = try nextSimpleSpaceRevision(try requiredRevision(row, "revision"))
                     _ = try await connection.query(
