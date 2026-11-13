@@ -537,7 +537,7 @@ final class SwanOAuthTests: XCTestCase {
                     aud: "did:plc:zyxwvutsrqponmlkjihgfedc",
                     iat: iat,
                     exp: exp,
-                    lxm: "com.atproto.space.notifyWrite",
+                    lxm: "com.atproto.space.notifyRepoUpdate",
                     jti: "absent-iat-service"
                 ),
                 key: key
@@ -578,7 +578,7 @@ final class SwanOAuthTests: XCTestCase {
         let issued = try SpaceServiceJWT.create(
             issuer: "did:plc:abcdefghijklmnopqrstuvwx",
             audience: "did:plc:zyxwvutsrqponmlkjihgfedc",
-            method: "com.atproto.space.notifyWrite",
+            method: "com.atproto.space.notifyRepoUpdate",
             eventID: "swan-issued-service",
             key: key,
             now: now
@@ -613,7 +613,7 @@ final class SwanOAuthTests: XCTestCase {
                 aud: audience,
                 iat: Int64(now.timeIntervalSince1970),
                 exp: Int64(now.timeIntervalSince1970) + 60,
-                lxm: "com.atproto.space.notifyWrite",
+                lxm: "com.atproto.space.notifyRepoUpdate",
                 jti: ""
             ),
             key: key
@@ -622,7 +622,7 @@ final class SwanOAuthTests: XCTestCase {
             _ = try await verifier.authenticate(
                 emptyJTIToken,
                 expectedAudience: audience,
-                expectedMethod: "com.atproto.space.notifyWrite",
+                expectedMethod: "com.atproto.space.notifyRepoUpdate",
                 now: now
             )
             XCTFail("expected empty jti token to be rejected")
@@ -682,7 +682,7 @@ final class SwanOAuthTests: XCTestCase {
         let tokenWithDigest = try SpaceServiceJWT.create(
             issuer: issuer,
             audience: audience,
-            method: "com.atproto.space.notifyWrite",
+            method: "com.atproto.space.notifyRepoUpdate",
             eventID: "event-digest-1",
             requestBodyDigest: writeDigest,
             key: key,
@@ -693,7 +693,7 @@ final class SwanOAuthTests: XCTestCase {
         let verified = try await verifier.authenticate(
             tokenWithDigest,
             expectedAudience: audience,
-            expectedMethod: "com.atproto.space.notifyWrite",
+            expectedMethod: "com.atproto.space.notifyRepoUpdate",
             expectedRequestBodyDigest: writeDigest,
             now: now
         )
@@ -713,7 +713,7 @@ final class SwanOAuthTests: XCTestCase {
             _ = try await verifier.authenticate(
                 tokenWithDigest,
                 expectedAudience: audience,
-                expectedMethod: "com.atproto.space.notifyWrite",
+                expectedMethod: "com.atproto.space.notifyRepoUpdate",
                 expectedRequestBodyDigest: alteredSpaceDigest,
                 now: now
             )
@@ -733,7 +733,7 @@ final class SwanOAuthTests: XCTestCase {
             _ = try await verifier.authenticate(
                 tokenWithDigest,
                 expectedAudience: audience,
-                expectedMethod: "com.atproto.space.notifyWrite",
+                expectedMethod: "com.atproto.space.notifyRepoUpdate",
                 expectedRequestBodyDigest: alteredRepoDigest,
                 now: now
             )
@@ -753,7 +753,7 @@ final class SwanOAuthTests: XCTestCase {
             _ = try await verifier.authenticate(
                 tokenWithDigest,
                 expectedAudience: audience,
-                expectedMethod: "com.atproto.space.notifyWrite",
+                expectedMethod: "com.atproto.space.notifyRepoUpdate",
                 expectedRequestBodyDigest: alteredRevDigest,
                 now: now
             )
@@ -773,7 +773,7 @@ final class SwanOAuthTests: XCTestCase {
             _ = try await verifier.authenticate(
                 tokenWithDigest,
                 expectedAudience: audience,
-                expectedMethod: "com.atproto.space.notifyWrite",
+                expectedMethod: "com.atproto.space.notifyRepoUpdate",
                 expectedRequestBodyDigest: alteredCommitmentDigest,
                 now: now
             )
@@ -786,7 +786,7 @@ final class SwanOAuthTests: XCTestCase {
         let unboundToken = try SpaceServiceJWT.create(
             issuer: issuer,
             audience: audience,
-            method: "com.atproto.space.notifyWrite",
+            method: "com.atproto.space.notifyRepoUpdate",
             eventID: "event-unbound-1",
             key: key,
             now: now
@@ -795,7 +795,7 @@ final class SwanOAuthTests: XCTestCase {
             _ = try await verifier.authenticate(
                 unboundToken,
                 expectedAudience: audience,
-                expectedMethod: "com.atproto.space.notifyWrite",
+                expectedMethod: "com.atproto.space.notifyRepoUpdate",
                 expectedRequestBodyDigest: writeDigest,
                 now: now
             )
@@ -2071,7 +2071,7 @@ final class SwanOAuthTests: XCTestCase {
     }
 
     func testBoundedJSONPosterRejectsPrivateDNSAndRebinding() async throws {
-        let url = URL(string: "https://notify.example/xrpc/com.atproto.space.notifyWrite")!
+        let url = URL(string: "https://notify.example/xrpc/com.atproto.space.notifyRepoUpdate")!
         let publicAddress = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
         let privateAddress = try XCTUnwrap(OAuthIPAddress(literal: "10.0.0.7"))
         let policy = try OAuthRemoteFetchPolicy(maximumBodyBytes: 1_024, timeout: 2)
@@ -2202,7 +2202,7 @@ final class SwanOAuthTests: XCTestCase {
         let publicKey = privateKey.publicKey
         let issuer = "did:plc:bcdefghijklmnopqrstuvwxy"
         let audience = "did:plc:abcdefghijklmnopqrstuvwx"
-        let method = "com.atproto.space.notifyWrite"
+        let method = "com.atproto.space.notifyRepoUpdate"
         let eventID = "evt-test-1234"
         let space = try SpaceURI(authority: audience, spaceType: "app.bsky.bookmarks", skey: "default")
         let repository = issuer

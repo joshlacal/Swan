@@ -54,7 +54,7 @@ final class ManagedSpaceCheckAccessHTTPTests: XCTestCase, @unchecked Sendable {
         let app = try fixture.server().buildApplication(logger: Logger(label: "ManagedSpaceCheckAccessHTTPTests.denied"))
         let validURI = checkUserAccessURI(space: fixture.space, repo: Self.user)
         let valid = try fixture.token()
-        let wrongMethod = try fixture.token(method: "com.atproto.space.notifyWrite")
+        let wrongMethod = try fixture.token(method: "com.atproto.space.notifyRepoUpdate")
         let wrongAudience = try fixture.token(audience: "did:web:other.example#service")
         let expired = try fixture.token(now: Date(timeIntervalSinceNow: -120), lifetime: 1)
         let malformedSignature = String(valid.dropLast()) + "x"

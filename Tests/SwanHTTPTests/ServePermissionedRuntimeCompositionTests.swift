@@ -57,9 +57,9 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
         case registerNotify
         case unregisterNotify
         case delegation
-        case notifyWrite
+        case notifyRepoUpdate
         case notifyDeleted
-        case notifyCredentialRevoked
+        case notifyCredentialsRevoked
         case checkUserAccess
     }
 
@@ -230,9 +230,9 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.space.listRepoOps", method: .get, uri: "/xrpc/com.atproto.space.listRepoOps?space=\(encodedSpace)&repo=\(localDID)&excludeValues=true", body: nil, authorization: .oauth, invariant: .jsonArray("ops", minimumCount: 1)),
                 .init(nsid: "com.atproto.space.getRepo", method: .get, uri: "/xrpc/com.atproto.space.getRepo?space=\(encodedSpace)&repo=\(localDID)", body: nil, authorization: .oauth, invariant: .star),
                 .init(nsid: "com.atproto.space.getBlob", method: .get, uri: "/xrpc/com.atproto.space.getBlob?space=\(encodedSpace)&repo=\(localDID)&cid=\(blobCID)", body: nil, authorization: .oauth, invariant: .blob(blobPayload)),
-                .init(nsid: "com.atproto.space.registerNotify", method: .post, uri: "/xrpc/com.atproto.space.registerNotify", body: "{\"space\":\"\(space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}", authorization: .registerNotify, invariant: .jsonNonEmptyString("expiresAt")),
+                .init(nsid: "com.atproto.space.registerNotify", method: .post, uri: "/xrpc/com.atproto.space.registerNotify", body: "{\"space\":\"\(space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyRepoUpdate\"}", authorization: .registerNotify, invariant: .jsonNonEmptyString("expiresAt")),
                 .init(nsid: "com.atproto.space.unregisterNotify", method: .post, uri: "/xrpc/com.atproto.space.unregisterNotify", body: "{\"space\":\"\(space.rawValue)\",\"service\":\"\(remoteDID)#notify\"}", authorization: .unregisterNotify, invariant: .emptyBody),
-                .init(nsid: "com.atproto.space.notifyWrite", method: .post, uri: "/xrpc/com.atproto.space.notifyWrite", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"repoRev\":\"222222222222z\",\"data\":{\"$bytes\":\"\(Data(repeating: 0x31, count: 32).base64EncodedString())\"}}", authorization: .notifyWrite, invariant: .emptyBody),
+                .init(nsid: "com.atproto.space.notifyRepoUpdate", method: .post, uri: "/xrpc/com.atproto.space.notifyRepoUpdate", body: "{\"space\":\"\(space.rawValue)\",\"repo\":\"\(localDID)\",\"repoRev\":\"222222222222z\",\"data\":{\"$bytes\":\"\(Data(repeating: 0x31, count: 32).base64EncodedString())\"}}", authorization: .notifyRepoUpdate, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.listWriters", method: .get, uri: "/xrpc/com.atproto.space.listWriters?space=\(encodedSpace)", body: nil, authorization: .credential, invariant: .jsonArrayContains("repos", field: "repo", value: localDID)),
                 .init(nsid: "com.atproto.managedspace.checkUserAccess", method: .get, uri: "/xrpc/com.atproto.managedspace.checkUserAccess?space=\(encodedSpace)&user=\(remoteDID)&access=read", body: nil, authorization: .checkUserAccess, invariant: .jsonBoolean("authorized", false)),
                 .init(nsid: "com.atproto.space.deleteRecord", method: .post, uri: "/xrpc/com.atproto.space.deleteRecord", body: recordPrefix + ",\"rkey\":\"delete-me\"}", authorization: .oauth, invariant: .jsonEmptyObject),
@@ -241,7 +241,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 .init(nsid: "com.atproto.space.deleteSpace", method: .post, uri: "/xrpc/com.atproto.space.deleteSpace", body: "{\"space\":\"\(lifecycle.rawValue)\"}", authorization: .oauth, invariant: .emptyBody),
                 .init(nsid: "com.atproto.space.notifySpaceDeleted", method: .post, uri: "/xrpc/com.atproto.space.notifySpaceDeleted", body: "{\"space\":\"\(lifecycle.rawValue)\"}", authorization: .notifyDeleted, invariant: .emptyBody),
                 // Last: it revokes the matrix credential, checked after the loop.
-                .init(nsid: "com.atproto.space.notifyCredentialRevoked", method: .post, uri: "/xrpc/com.atproto.space.notifyCredentialRevoked", body: "{\"space\":\"\(space.rawValue)\",\"credentials\":[\"\(credentialJTI)\"]}", authorization: .notifyCredentialRevoked, invariant: .emptyBody),
+                .init(nsid: "com.atproto.space.notifyCredentialsRevoked", method: .post, uri: "/xrpc/com.atproto.space.notifyCredentialsRevoked", body: "{\"space\":\"\(space.rawValue)\",\"credentials\":[\"\(credentialJTI)\"]}", authorization: .notifyCredentialsRevoked, invariant: .emptyBody),
             ]
 
             let profileSet = Set(profile.endpoints)
@@ -567,7 +567,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 )
                 XCTAssertEqual(
                     registrations.first?.column("endpoint")?.string,
-                    "https://receiver.example/xrpc/com.atproto.space.notifyWrite"
+                    "https://receiver.example/xrpc/com.atproto.space.notifyRepoUpdate"
                 )
                 let writers = try await evidenceConnection.query(
                     """
@@ -581,7 +581,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 XCTAssertEqual(writers.first?.column("repo_did")?.string, localDID)
                 // The authority's own writes are sequenced inside their commit
                 // (atproto#5574), so its writer row holds its latest repoRev.
-                // The matrix's notifyWrite announces the older 222222222222z,
+                // The matrix's notifyRepoUpdate announces the older 222222222222z,
                 // which the space host must ignore rather than regress to.
                 let repositoryState = try await evidenceConnection.query(
                     """
@@ -1004,7 +1004,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let localService = try SpaceServiceJWT.create(
                 issuer: local,
                 audience: localDID,
-                method: "com.atproto.space.notifyWrite",
+                method: "com.atproto.space.notifyRepoUpdate",
                 eventID: "local-composed-service",
                 key: fixture.localKey,
                 now: now
@@ -1014,14 +1014,14 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             _ = try await service.authenticate(
                 localService,
                 expectedAudience: localDID,
-                expectedMethod: "com.atproto.space.notifyWrite",
+                expectedMethod: "com.atproto.space.notifyRepoUpdate",
                 expectedRequestBodyDigest: nil,
                 now: now
             )
             _ = try await service.authenticate(
                 Self.remoteService,
                 expectedAudience: localDID,
-                expectedMethod: "com.atproto.space.notifyWrite",
+                expectedMethod: "com.atproto.space.notifyRepoUpdate",
                 expectedRequestBodyDigest: nil,
                 now: now
             )
@@ -1225,22 +1225,22 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 token: credential, audience: space.authority
             )
             headers[HTTPField.Name("atproto-service-auth")!] = "Bearer \(unregisterToken)"
-        case .notifyWrite:
+        case .notifyRepoUpdate:
             let writeDigest = SpaceNotificationRequestDigest.write(
                 space: space,
                 repository: localDID,
                 wireRevision: "222222222222z",
                 commitment: Data(repeating: 0x31, count: 32)
             )
-            let notifyWrite = try SpaceServiceJWT.create(
+            let notifyRepoUpdate = try SpaceServiceJWT.create(
                 issuer: localDID,
                 audience: space.authority,
-                method: ComAtprotoSpaceNotifyWrite.typeIdentifier,
+                method: SwanSpaceNotificationNSID.notifyRepoUpdate,
                 eventID: jti,
                 requestBodyDigest: writeDigest,
                 key: fixture.localKey
             )
-            headers = [.authorization: "Bearer \(notifyWrite)"]
+            headers = [.authorization: "Bearer \(notifyRepoUpdate)"]
         case .notifyDeleted:
             let lifecycleSpace = fixture.lifecycleSpace ?? space
             let deletionDigest = SpaceNotificationRequestDigest.deletion(space: lifecycleSpace)
@@ -1253,14 +1253,14 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 key: fixture.localKey
             )
             headers = [.authorization: "Bearer \(notifyDeleted)"]
-        case .notifyCredentialRevoked:
+        case .notifyCredentialsRevoked:
             // Service auth from the space authority, addressed to a repo
             // account this host stores, binding the body by default.
             let credentialJTI = try PermissionedDataJWT.inspectSpaceCredential(credential).claims.jti
             let revocation = try SpaceServiceJWT.create(
                 issuer: space.authority,
                 audience: localDID,
-                method: ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier,
+                method: SwanSpaceNotificationNSID.notifyCredentialsRevoked,
                 eventID: jti,
                 requestBodyDigest: SpaceNotificationRequestDigest.credentialRevocation(
                     space: space, credentials: [credentialJTI]

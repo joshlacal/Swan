@@ -240,7 +240,7 @@ final class NIOPeerPinnedOAuthPostTransportTests: XCTestCase {
         let channel = EmbeddedChannel()
         let promise = channel.eventLoop.makePromise(of: OAuthRemoteHTTPResponse.self)
         let peer = try XCTUnwrap(OAuthIPAddress(literal: "127.0.0.1"))
-        let url = try XCTUnwrap(URL(string: "https://hummingbird.codes/xrpc/com.atproto.space.notifyWrite"))
+        let url = try XCTUnwrap(URL(string: "https://hummingbird.codes/xrpc/com.atproto.space.notifyRepoUpdate"))
         let handler = PeerPinnedHTTPResponseHandler(
             responsePromise: promise,
             expectedPeer: peer,
@@ -476,7 +476,7 @@ private final class LocalTLSPeer: @unchecked Sendable {
                 }
             let channel = try await bootstrap.bind(host: peer.description, port: 0).get()
             let port = try XCTUnwrap(channel.localAddress?.port)
-            let endpoint = try XCTUnwrap(URL(string: "https://hummingbird.codes:\(port)/xrpc/com.atproto.space.notifyWrite"))
+            let endpoint = try XCTUnwrap(URL(string: "https://hummingbird.codes:\(port)/xrpc/com.atproto.space.notifyRepoUpdate"))
             return LocalTLSPeer(
                 peer: peer,
                 endpoint: endpoint,

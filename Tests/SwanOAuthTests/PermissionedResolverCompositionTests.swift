@@ -132,7 +132,7 @@ final class PermissionedResolverCompositionTests: XCTestCase {
         let localService = try SpaceServiceJWT.create(
             issuer: localDID,
             audience: remoteAuthority,
-            method: "com.atproto.space.notifyWrite",
+            method: "com.atproto.space.notifyRepoUpdate",
             eventID: "local-service-event",
             key: localKey,
             now: now
@@ -141,13 +141,13 @@ final class PermissionedResolverCompositionTests: XCTestCase {
         _ = try await serviceVerifier.authenticate(
             localService,
             expectedAudience: remoteAuthority,
-            expectedMethod: "com.atproto.space.notifyWrite",
+            expectedMethod: "com.atproto.space.notifyRepoUpdate",
             now: now
         )
         _ = try await serviceVerifier.authenticate(
             Self.remoteService,
             expectedAudience: remoteAuthority,
-            expectedMethod: "com.atproto.space.notifyWrite",
+            expectedMethod: "com.atproto.space.notifyRepoUpdate",
             now: now
         )
     }

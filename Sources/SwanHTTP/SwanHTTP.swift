@@ -1269,7 +1269,7 @@ public struct SwanHTTPServer: Sendable {
                 )
             } else if descriptor.nsid == ComAtprotoSpaceNotifyWrite.typeIdentifier,
                       let authenticatedSpaceNotifications {
-                registerAuthenticatedNotifySpaceWriteEndpoint(
+                registerAuthenticatedNotifyRepoUpdateEndpoint(
                     on: router,
                     capability: authenticatedSpaceNotifications,
                     requestBodyAdmission: requestBodyAdmission
@@ -1283,7 +1283,7 @@ public struct SwanHTTPServer: Sendable {
                 )
             } else if descriptor.nsid == ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier,
                       let authenticatedSpaceNotifications {
-                registerAuthenticatedNotifyCredentialRevokedEndpoint(
+                registerAuthenticatedNotifyCredentialsRevokedEndpoint(
                     on: router,
                     capability: authenticatedSpaceNotifications,
                     requestBodyAdmission: requestBodyAdmission

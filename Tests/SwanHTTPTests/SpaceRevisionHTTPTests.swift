@@ -21,7 +21,7 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
     private let bob = "did:plc:bcdefghijklmnopqrstuvwxy"
     private let dan = "did:plc:cdefghijklmnopqrstuvwxyz"
 
-    func testNotifyWriteSequencesAndListWritersPagesBySpaceRevision() async throws {
+    func testNotifyRepoUpdateSequencesAndListWritersPagesBySpaceRevision() async throws {
         let fixture = try await SpaceRevisionHTTPFixture.make(authority: authority, members: [bob, dan])
         do {
             let app = try fixture.server().buildApplication(logger: Logger(label: "SpaceRevisionHTTPTests"))
@@ -33,14 +33,14 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                 // pre-rename `hash` body are refused before anything is
                 // sequenced.
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate", method: .post,
                     headers: Self.serviceHeaders(issuer: self.bob, audience: "\(self.authority)#atproto_space_host", jti: "bob-retired-audience"),
                     body: fixture.writeBody(repo: self.bob, repoRev: bobRev)
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
                 }
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate", method: .post,
                     headers: Self.serviceHeaders(issuer: self.bob, audience: "\(self.authority)#atproto_pds", jti: "bob-legacy-hash"),
                     body: fixture.legacyHashWriteBody(repo: self.bob, repoRev: bobRev)
                 ) { response in
@@ -50,14 +50,14 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                 // The reference sender's audience, then the bare DID: both
                 // name this space host in the hardened posture.
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate", method: .post,
                     headers: Self.serviceHeaders(issuer: self.bob, audience: "\(self.authority)#atproto_pds", jti: "bob-1"),
                     body: fixture.writeBody(repo: self.bob, repoRev: bobRev)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate", method: .post,
                     headers: Self.serviceHeaders(issuer: self.dan, audience: self.authority, jti: "dan-1"),
                     body: fixture.writeBody(repo: self.dan, repoRev: danRev)
                 ) { response in
@@ -65,7 +65,7 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                 }
                 // Another authority's space-host identifier is not this one.
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate", method: .post,
                     headers: Self.serviceHeaders(issuer: self.bob, audience: "did:plc:zyxwvutsrqponmlkjihgfedc#atproto_pds", jti: "bob-foreign"),
                     body: fixture.writeBody(repo: self.bob, repoRev: Self.tid(at: Date()))
                 ) { response in
@@ -140,7 +140,7 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                 // A newer repoRev is listed after the checkpoint; a replay of
                 // an already-accepted one is not.
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate", method: .post,
                     headers: Self.serviceHeaders(issuer: self.bob, audience: self.authority, jti: "bob-replayed-state"),
                     body: fixture.writeBody(repo: self.bob, repoRev: bobRev)
                 ) { response in
@@ -151,7 +151,7 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                 }
                 let bobNewer = Self.tid(at: Date())
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate", method: .post,
                     headers: Self.serviceHeaders(issuer: self.bob, audience: self.authority, jti: "bob-2"),
                     body: fixture.writeBody(repo: self.bob, repoRev: bobNewer)
                 ) { response in
@@ -209,13 +209,13 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
         try await fixture.close()
     }
 
-    func testNotifyWriteAnswersFutureRevAndSpaceNotFound() async throws {
+    func testNotifyRepoUpdateAnswersFutureRevAndSpaceNotFound() async throws {
         let fixture = try await SpaceRevisionHTTPFixture.make(authority: authority, members: [bob])
         do {
             let app = try fixture.server().buildApplication(logger: Logger(label: "SpaceRevisionHTTPTests"))
             try await app.test(.router) { client in
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate", method: .post,
                     headers: Self.serviceHeaders(issuer: self.bob, audience: self.authority, jti: "future"),
                     body: fixture.writeBody(repo: self.bob, repoRev: Self.tid(at: Date().addingTimeInterval(600)))
                 ) { response in
@@ -224,7 +224,7 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                 }
                 // Positive control: inside the five-minute allowance.
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate", method: .post,
                     headers: Self.serviceHeaders(issuer: self.bob, audience: self.authority, jti: "skewed"),
                     body: fixture.writeBody(repo: self.bob, repoRev: Self.tid(at: Date().addingTimeInterval(60)))
                 ) { response in
@@ -232,7 +232,7 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                 }
                 let unknownSpace = try SpaceURI(authority: self.authority, spaceType: "app.bsky.bookmarks", skey: "missing")
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate", method: .post,
                     headers: Self.serviceHeaders(issuer: self.bob, audience: self.authority, jti: "unknown-space"),
                     body: fixture.writeBody(repo: self.bob, repoRev: Self.tid(at: Date()), space: unknownSpace)
                 ) { response in
@@ -241,7 +241,7 @@ final class SpaceRevisionHTTPTests: XCTestCase, @unchecked Sendable {
                 let foreignAuthority = "did:plc:zyxwvutsrqponmlkjihgfedc"
                 let foreignSpace = try SpaceURI(authority: foreignAuthority, spaceType: "app.bsky.bookmarks", skey: "elsewhere")
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite", method: .post,
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate", method: .post,
                     headers: Self.serviceHeaders(issuer: self.bob, audience: foreignAuthority, jti: "unhosted-authority"),
                     body: fixture.writeBody(repo: self.bob, repoRev: Self.tid(at: Date()), space: foreignSpace)
                 ) { response in
@@ -372,7 +372,7 @@ private struct SpaceRevisionHTTPFixture {
         return try SpaceCredentialSignatureTestSupport.headers(token: credential, audience: authority)
     }
 
-    /// The October 22 notifyWrite body: the set-hash digest is `data`.
+    /// The October 22 notifyRepoUpdate body: the set-hash digest is `data`.
     func writeBody(repo: String, repoRev: String, space: SpaceURI? = nil) -> ByteBuffer {
         writeBody(repo: repo, repoRev: repoRev, space: space, digestKey: "data")
     }

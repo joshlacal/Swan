@@ -115,7 +115,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         try await fixture.createAuthorityState(on: database)
 
         let credential = fixture.readCredential()
-        let endpoint = "https://notify.example/xrpc/com.atproto.space.notifyWrite"
+        let endpoint = "https://notify.example/xrpc/com.atproto.space.notifyRepoUpdate"
         let now = Date(timeIntervalSince1970: 1_750_000_000)
         try await database.registerSpaceNotification(
             .init(
@@ -245,7 +245,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         // rows with real time, so a fixed past epoch would silently expire
         // every registration for that path.
         let now = Date()
-        let legacyEndpoint = "https://legacy.example/xrpc/com.atproto.space.notifyWrite"
+        let legacyEndpoint = "https://legacy.example/xrpc/com.atproto.space.notifyRepoUpdate"
         let serviceEndpoint = "https://events.bulleted.example"
         let serviceIdentity = "did:web:events.bulleted.example#bulleted_events"
         try await database.registerSpaceNotification(
@@ -532,7 +532,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         ))
         let maximum = SQLiteAccountDatabase.maximumNotificationRegistrationsPerSpace
         func endpoint(_ index: Int) -> String {
-            "https://notify-\(index).example/xrpc/com.atproto.space.notifyWrite"
+            "https://notify-\(index).example/xrpc/com.atproto.space.notifyRepoUpdate"
         }
 
         // Fill the admission budget with short-lived rows. This deliberately
@@ -1985,7 +1985,7 @@ private struct NotificationFixture {
         try await database.registerSpaceNotification(
             .init(
                 space: space,
-                endpoint: "https://notify.example/xrpc/com.atproto.space.notifyWrite",
+                endpoint: "https://notify.example/xrpc/com.atproto.space.notifyRepoUpdate",
                 repository: writer,
                 expiresAt: now.addingTimeInterval(3_600),
                 service: service,

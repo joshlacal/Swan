@@ -734,6 +734,10 @@ public enum AuthorizedSpaceAuthorityStatusError: Error, Sendable, Equatable {
     case takendown
 }
 
+/// Marker for a managing-app call that failed upstream. The XRPC boundary
+/// exposes this as a retryable HTTP 502 `UpstreamFailure`.
+public protocol AuthorizedSpaceUpstreamFailure: Error, Sendable {}
+
 /// A write notification the space host refuses for a reason the lexicon
 /// names. Unknown and deleted spaces use
 /// ``AuthorizedSimpleSpaceLifecycleError`` (`SpaceNotFound`) instead.

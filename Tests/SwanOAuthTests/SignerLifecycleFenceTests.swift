@@ -49,7 +49,7 @@ final class SignerLifecycleFenceTests: XCTestCase {
             try await issuer.issue(
                 issuer: Self.accountDID,
                 audience: Self.peerDID,
-                method: "com.atproto.space.notifyWrite",
+                method: "com.atproto.space.notifyRepoUpdate",
                 eventID: "fence-event",
                 now: Date(timeIntervalSince1970: 1_750_000_000)
             )
@@ -70,7 +70,7 @@ final class SignerLifecycleFenceTests: XCTestCase {
             try await issuer.issue(
                 issuer: Self.accountDID,
                 audience: Self.peerDID,
-                method: "com.atproto.space.notifyWrite",
+                method: "com.atproto.space.notifyRepoUpdate",
                 eventID: "fence-event",
                 now: Date(timeIntervalSince1970: 1_750_000_000)
             )
@@ -147,7 +147,7 @@ final class SignerLifecycleFenceTests: XCTestCase {
         ).issue(
             issuer: Self.accountDID,
             audience: Self.peerDID,
-            method: "com.atproto.space.notifyWrite",
+            method: "com.atproto.space.notifyRepoUpdate",
             eventID: "fence-event",
             now: now
         )

@@ -967,7 +967,7 @@ public protocol SpaceDelegationReplayStore: Sendable {
 }
 
 /// The repo host's durable list of space credentials a space authority has
-/// revoked (`com.atproto.space.notifyCredentialRevoked`, atproto#5567). The
+/// revoked (`com.atproto.space.notifyCredentialsRevoked`). The
 /// storage boundary sees only a fixed 32-byte digest of `(space, jti)` and a
 /// retention deadline; credential JWTs are not representable.
 ///

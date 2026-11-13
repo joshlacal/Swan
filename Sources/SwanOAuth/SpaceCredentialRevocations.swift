@@ -5,7 +5,7 @@ import SwanSpaces
 import SwanStorage
 
 /// A repo host's record of space credentials their authority has revoked
-/// (`com.atproto.space.notifyCredentialRevoked`, atproto#5567), consulted on
+/// (`com.atproto.space.notifyCredentialsRevoked`), consulted on
 /// every credential presentation. Short credential lifetimes stay the primary
 /// bound; this closes the window early for the credentials an authority names.
 ///

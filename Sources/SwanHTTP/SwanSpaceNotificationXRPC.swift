@@ -155,6 +155,7 @@ private enum AuthenticatedSpaceNotificationFailure: Error {
     case unavailable
     case repoDeactivated
     case repoTakendown
+    case upstreamFailure
     /// The `service` identifier could not be resolved to a DID document with
     /// a usable service endpoint (Erratum 03). The lexicon's one named error
     /// for it; the underlying cause is logged, never returned — a 500 would
@@ -389,7 +390,7 @@ private struct AuthenticatedUnregisterSpaceNotifyHandler {
     }
 }
 
-private struct AuthenticatedNotifySpaceWriteHandler:
+private struct AuthenticatedNotifyRepoUpdateHandler:
     ComAtprotoSpaceNotifyWrite.ServerHandler
 {
     typealias Context = Request
@@ -419,7 +420,7 @@ private struct AuthenticatedNotifySpaceWriteHandler:
                 capability,
                 request: request,
                 expectedAudience: nil,
-                expectedMethod: ComAtprotoSpaceNotifyWrite.typeIdentifier,
+                expectedMethod: SwanSpaceNotificationNSID.notifyRepoUpdate,
                 expectedRequestBodyDigest: nil
             )
             guard service.issuer == input.repo.didString(),
@@ -446,7 +447,7 @@ private struct AuthenticatedNotifySpaceWriteHandler:
                 capability,
                 request: request,
                 expectedAudience: nil,
-                expectedMethod: ComAtprotoSpaceNotifyWrite.typeIdentifier,
+                expectedMethod: SwanSpaceNotificationNSID.notifyRepoUpdate,
                 expectedRequestBodyDigest: expectedDigest
             )
             guard service.issuer == input.repo.didString(),
@@ -535,15 +536,15 @@ private struct AuthenticatedNotifySpaceDeletedHandler:
     }
 }
 
-/// The repo-host receiver for `com.atproto.space.notifyCredentialRevoked`
-/// (atproto#5567): service auth whose `iss` is the space authority, whose
-/// `aud` is the bare DID of an account this host stores, and whose `lxm` is
-/// this method. Like the other notification receivers, it requires a `req`
-/// claim binding the body by default and admits unbound upstream-shaped
-/// tokens only under `--enable-spaces-open-interop` (with a 60 s lifetime and
-/// a durable single-use `jti`). Revocations are persisted idempotently by
-/// `(space, jti)` and honoured for ``DurableSpaceCredentialRevocations/retention``.
-private struct AuthenticatedNotifyCredentialRevokedHandler:
+/// The repo-host receiver for `com.atproto.space.notifyCredentialsRevoked`:
+/// service auth whose `iss` is the space authority, whose `aud` is the bare
+/// DID of an account this host stores, and whose `lxm` is this method. Like
+/// the other notification receivers, it requires a `req` claim binding the
+/// body by default and admits unbound upstream-shaped tokens only under
+/// `--enable-spaces-open-interop` (with a 60 s lifetime and a durable
+/// single-use `jti`). Revocations are persisted idempotently by `(space, jti)`
+/// and honoured for ``DurableSpaceCredentialRevocations/retention``.
+private struct AuthenticatedNotifyCredentialsRevokedHandler:
     ComAtprotoSpaceNotifyCredentialRevoked.ServerHandler
 {
     typealias Context = Request
@@ -564,7 +565,7 @@ private struct AuthenticatedNotifyCredentialRevokedHandler:
             capability,
             request: request,
             expectedAudience: nil,
-            expectedMethod: ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier,
+            expectedMethod: SwanSpaceNotificationNSID.notifyCredentialsRevoked,
             expectedRequestBodyDigest: capability.openInterop == nil ? expectedDigest : nil
         )
         guard service.issuer == space.authority else {
@@ -605,16 +606,16 @@ private struct AuthenticatedNotifyCredentialRevokedHandler:
     }
 }
 
-func registerAuthenticatedNotifyCredentialRevokedEndpoint(
+func registerAuthenticatedNotifyCredentialsRevokedEndpoint(
     on router: Router<BasicRequestContext>,
     capability: SwanAuthenticatedSpaceNotificationsCapability,
     requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
-    let handler = AuthenticatedNotifyCredentialRevokedHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.space.notifyCredentialRevoked"
+    let handler = AuthenticatedNotifyCredentialsRevokedHandler(capability: capability)
+    let path: RouterPath = "/xrpc/\(SwanSpaceNotificationNSID.notifyCredentialsRevoked)"
     router.post(path) { request, context async -> Response in
         do {
-            let input = try await decodeNotifyCredentialRevokedInput(
+            let input = try await decodeNotifyCredentialsRevokedInput(
                 request, context: context, requestBodyAdmission: requestBodyAdmission,
                 decodeObserver: capability.notificationJSONDecodeObserver)
             try await handler.handle(parameters: (), input: input, context: request)
@@ -712,16 +713,16 @@ func registerAuthenticatedUnregisterSpaceNotifyEndpoint(
     registerAuthenticatedNotificationWrongMethods(on: router, path: path, allowed: .post)
 }
 
-func registerAuthenticatedNotifySpaceWriteEndpoint(
+func registerAuthenticatedNotifyRepoUpdateEndpoint(
     on router: Router<BasicRequestContext>,
     capability: SwanAuthenticatedSpaceNotificationsCapability,
     requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
-    let handler = AuthenticatedNotifySpaceWriteHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.space.notifyWrite"
+    let handler = AuthenticatedNotifyRepoUpdateHandler(capability: capability)
+    let path: RouterPath = "/xrpc/\(SwanSpaceNotificationNSID.notifyRepoUpdate)"
     router.post(path) { request, context async -> Response in
         do {
-            let input = try await decodeNotifySpaceWriteInput(
+            let input = try await decodeNotifyRepoUpdateInput(
                 request, context: context, requestBodyAdmission: requestBodyAdmission,
                 decodeObserver: capability.notificationJSONDecodeObserver)
             try await handler.handle(parameters: (), input: input, context: request)
@@ -908,7 +909,7 @@ private func validNotificationServiceIdentifier(_ value: String) -> Bool {
     return true
 }
 
-private func decodeNotifySpaceWriteInput(
+private func decodeNotifyRepoUpdateInput(
     _ request: Request,
     context: SwanHTTPRequestContext,
     requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
@@ -963,7 +964,7 @@ private func decodeNotifySpaceDeletedInput(
 /// `{space, credentials}` with 1...100 nonempty JWT IDs, as the lexicon
 /// requires. Anything else, including a JWT-shaped or control-bearing ID, is
 /// `InvalidRequest` before authentication work begins.
-private func decodeNotifyCredentialRevokedInput(
+private func decodeNotifyCredentialsRevokedInput(
     _ request: Request,
     context: SwanHTTPRequestContext,
     requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
@@ -1238,6 +1239,9 @@ private func notificationStorageFailure(_ error: Error) -> AuthenticatedSpaceNot
         case .takendown: .repoTakendown
         }
     }
+    if error is any AuthorizedSpaceUpstreamFailure {
+        return .upstreamFailure
+    }
     if let error = error as? AuthorizedSpaceWriteNotificationError {
         return switch error {
         case .futureRevision: .futureRevision
@@ -1274,6 +1278,8 @@ private func authenticatedSpaceNotificationResponse(
         authenticatedSpaceNotificationError(failure.httpStatus, code: failure.xrpcErrorCode)
     case .unavailable:
         authenticatedSpaceNotificationError(.serviceUnavailable, code: "temporarily_unavailable")
+    case .upstreamFailure:
+        authenticatedSpaceNotificationError(.badGateway, code: "UpstreamFailure")
     case .serviceNotResolvable:
         authenticatedSpaceNotificationError(.badRequest, code: "ServiceNotResolvable")
     case .futureRevision:

@@ -78,7 +78,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             let wrongAudienceHeaders = try fixture.credentialHeaders(serviceAuth: "wrong-audience-token")
             let encodedSpace = notificationPercentEncode(fixture.space.rawValue)
             let expectedWriter = writer
-            let registerBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}")
+            let registerBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyRepoUpdate\"}")
             let commitment = Data(repeating: 0x01, count: 32).base64EncodedString()
             let writeBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"repoRev\":\"3l72c4e2y2222\",\"data\":{\"$bytes\":\"\(commitment)\"}}")
             let serviceHeaders: HTTPFields = {
@@ -155,11 +155,11 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .unauthorized)
                     XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
                 }
-                // A notifyWrite request with altered body / mismatched digest is rejected
+                // A notifyRepoUpdate request with altered body / mismatched digest is rejected
                 let badCommitment = Data(repeating: 0xCC, count: 32).base64EncodedString()
                 let alteredWriteBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"repoRev\":\"2222222222222\",\"data\":{\"$bytes\":\"\(badCommitment)\"}}")
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite",
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate",
                     method: .post,
                     headers: serviceHeaders,
                     body: alteredWriteBody
@@ -167,9 +167,19 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .unauthorized)
                     XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
                 }
-                // Valid notifyWrite succeeds
+                await fixture.directory.failNextRepoUpdateUpstream()
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite",
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate",
+                    method: .post,
+                    headers: serviceHeaders,
+                    body: writeBody
+                ) { response in
+                    XCTAssertEqual(response.status, .badGateway)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "UpstreamFailure")
+                }
+                // Valid notifyRepoUpdate succeeds
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate",
                     method: .post,
                     headers: serviceHeaders,
                     body: writeBody
@@ -177,9 +187,17 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertEqual(response.headers[.cacheControl], "no-store")
                 }
-                // Mismatched digest in service JWT is refused with 401
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.notifyWrite",
+                    method: .post,
+                    headers: serviceHeaders,
+                    body: writeBody
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound, "the old NSID is removed")
+                }
+                // Mismatched digest in service JWT is refused with 401
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate",
                     method: .post,
                     headers: mismatchedDigestHeaders,
                     body: writeBody
@@ -188,11 +206,11 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
                 }
                 // The pinned TypeScript receiver requires `iss == repo` for
-                // notifyWrite. Do not accept an authority-signed surrogate:
+                // notifyRepoUpdate. Do not accept an authority-signed surrogate:
                 // it would be incompatible with that receiver and would let
                 // Swan claim an unsupported cross-host delivery mode.
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite",
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate",
                     method: .post,
                     headers: authorityFanoutHeaders,
                     body: writeBody
@@ -203,7 +221,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 // Likewise, an unbound recipient audience cannot turn an
                 // authority signature into a member-writer notification.
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.notifyWrite",
+                    uri: "/xrpc/com.atproto.space.notifyRepoUpdate",
                     method: .post,
                     headers: unknownRecipientHeaders,
                     body: writeBody
@@ -670,7 +688,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     uri: "/xrpc/com.atproto.space.registerNotify",
                     method: .post,
                     headers: try fixture.registerHeaders(for: "did:web:events.example"),
-                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}")
+                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyRepoUpdate\"}")
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
@@ -686,7 +704,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
     }
 
     /// Erratum 03 end-to-end at the delivery seam: a `write` fanout row for a
-    /// service-named registration posts the reference `notifyWrite` shape to
+    /// service-named registration posts the reference `notifyRepoUpdate` shape to
     /// the REGISTERED endpoint with the service identifier as the JWT
     /// audience and the space authority as issuer — no operator destination
     /// map involved. A legacy row delivers nothing, and a withdrawn
@@ -789,7 +807,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         let post = try XCTUnwrap(posts.first)
         XCTAssertEqual(
             post.url.absoluteString,
-            "\(serviceEndpoint)/xrpc/com.atproto.space.notifyWrite"
+            "\(serviceEndpoint)/xrpc/com.atproto.space.notifyRepoUpdate"
         )
         let body = try XCTUnwrap(
             try JSONSerialization.jsonObject(with: post.body) as? [String: Any]
@@ -797,7 +815,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(body["space"] as? String, space.rawValue)
         XCTAssertEqual(body["repo"] as? String, writer)
         XCTAssertEqual(body["repoRev"] as? String, "2222222222222")
-        XCTAssertNil(body["rev"], "notifyWrite carries repoRev, not rev")
+        XCTAssertNil(body["rev"], "notifyRepoUpdate carries repoRev, not rev")
         XCTAssertNotNil(body["data"], "the repository commitment closes the listRepos propagation loop")
         XCTAssertEqual(body["spaceRev"] as? String, "3l72c4e2y2223")
         XCTAssertEqual(body["prevSpaceRev"] as? String, "3l72c4e2y2222")
@@ -806,7 +824,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(issued.count, 1)
         XCTAssertEqual(issued.first?.issuer, authorityDID)
         XCTAssertEqual(issued.first?.audience, serviceIdentity)
-        XCTAssertEqual(issued.first?.method, "com.atproto.space.notifyWrite")
+        XCTAssertEqual(issued.first?.method, "com.atproto.space.notifyRepoUpdate")
         XCTAssertEqual(
             issued.first?.requestBodyDigest,
             SpaceNotificationRequestDigest.forwardedWrite(
@@ -1084,12 +1102,11 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    /// SW-C: a writer's own notifyWrite to the space authority signs every
-    /// delivery attempt with a fresh jti. With the outbox row id as the jti, a
-    /// receiver with a single-use jti store consumed it on the failed attempt
-    /// and answered the retry with 401, which the transport acknowledges as
-    /// permanent, dropping the row.
-    func testWriterOutboxRetryCarriesAFreshJTI() async throws {
+    /// A writer's own notifyRepoUpdate to the space authority retries a 502
+    /// `UpstreamFailure` and signs every attempt with a fresh jti. With the
+    /// outbox row id as the jti, a receiver with a single-use jti store could
+    /// consume it on the failed attempt and reject the retry.
+    func testWriterOutboxRetriesUpstreamFailureWithAFreshJTI() async throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "SwanWriterOutboxJTI-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1108,7 +1125,13 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(pending.count, 1)
 
             let signer = SigningNotificationServiceIssuer()
-            let posts = RecordingPostTransport(failuresRemaining: 1)
+            let posts = RecordingPostTransport(
+                responseStatuses: [502, 200],
+                responseBodies: [
+                    Data(#"{"error":"UpstreamFailure"}"#.utf8),
+                    Data(),
+                ]
+            )
             let endpoint = "https://authority.example"
             let audience = "\(authority)#atproto_pds"
             let transport = HTTPPermissionedSpaceOutboxTransport(
@@ -1144,13 +1167,13 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             )
             var attemptJTIs: [String] = []
             for post in captured {
-                XCTAssertEqual(post.url.absoluteString, "\(endpoint)/xrpc/com.atproto.space.notifyWrite")
+                XCTAssertEqual(post.url.absoluteString, "\(endpoint)/xrpc/com.atproto.space.notifyRepoUpdate")
                 XCTAssertEqual(post.body, captured[0].body, "both attempts announce the same revision")
                 let authorization = try XCTUnwrap(post.headers["authorization"])
                 let verified = try await verifier.authenticate(
                     String(authorization.dropFirst("Bearer ".count)),
                     expectedAudience: audience,
-                    expectedMethod: "com.atproto.space.notifyWrite",
+                    expectedMethod: "com.atproto.space.notifyRepoUpdate",
                     now: Date()
                 )
                 XCTAssertEqual(verified.issuer, writer)
@@ -1252,7 +1275,7 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         defer { fixture.cleanup() }
         let app = try fixture.server().buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.aud"))
         let wrongAudienceHeaders = try fixture.credentialHeaders(serviceAuth: "wrong-audience-token")
-        let registerBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyWrite\"}")
+        let registerBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/xrpc/com.atproto.space.notifyRepoUpdate\"}")
         try await app.test(.router) { client in
             try await client.execute(
                 uri: "/xrpc/com.atproto.space.registerNotify",
@@ -1600,7 +1623,7 @@ private struct NotificationRecoveryFixture {
         try await database.registerSpaceNotification(
             .init(
                 space: space,
-                endpoint: "https://receiver.example/xrpc/com.atproto.space.notifyWrite",
+                endpoint: "https://receiver.example/xrpc/com.atproto.space.notifyRepoUpdate",
                 repository: writer,
                 expiresAt: now.addingTimeInterval(3_600),
                 service: "did:web:receiver.example#service",
@@ -1787,12 +1810,15 @@ private func notificationRecoveryConfiguration() throws -> PermissionedSpaceOutb
     )
 }
 
+private struct TestSpaceUpstreamFailure: AuthorizedSpaceUpstreamFailure {}
+
 private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, AuthorizedSpaceNotificationDirectory {
     private let authority: String
     private let writer: String
     private var registrationsValue: [AuthorizedSpaceNotificationRegistration] = []
     private var notificationsValue: [AuthorizedSpaceWriteNotification] = []
     private var deletionsValue: [RecordedSpaceDeletion] = []
+    private var failNextRepoUpdate = false
 
     init(authority: String, writer: String) {
         self.authority = authority
@@ -1881,9 +1907,17 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
         )
     }
 
+    func failNextRepoUpdateUpstream() {
+        failNextRepoUpdate = true
+    }
+
     func receiveSpaceWriteNotification(_ notification: AuthorizedSpaceWriteNotification) async throws {
         guard notification.space.authority == authority, notification.repository == writer else {
             throw SwanError.unauthorized("notification is invalid")
+        }
+        if failNextRepoUpdate {
+            failNextRepoUpdate = false
+            throw TestSpaceUpstreamFailure()
         }
         if !notificationsValue.contains(where: { $0.eventID == notification.eventID }) {
             notificationsValue.append(notification)
@@ -1969,10 +2003,16 @@ private actor RecordingPostTransport: OAuthRemotePostTransport {
     private var recorded: [RecordedPost] = []
     private var failuresRemaining: Int
     private var responseStatuses: [Int]
+    private var responseBodies: [Data]
 
-    init(failuresRemaining: Int = 0, responseStatuses: [Int] = []) {
+    init(
+        failuresRemaining: Int = 0,
+        responseStatuses: [Int] = [],
+        responseBodies: [Data] = []
+    ) {
         self.failuresRemaining = failuresRemaining
         self.responseStatuses = responseStatuses
+        self.responseBodies = responseBodies
     }
 
     func post(
@@ -1988,10 +2028,12 @@ private actor RecordingPostTransport: OAuthRemotePostTransport {
             failuresRemaining -= 1
             throw SwanError.unavailable("notification delivery failed")
         }
+        let status = responseStatuses.isEmpty ? 200 : responseStatuses.removeFirst()
+        let responseBody = responseBodies.isEmpty ? Data() : responseBodies.removeFirst()
         return .init(
-            status: responseStatuses.isEmpty ? 200 : responseStatuses.removeFirst(),
-            headers: ["content-length": ["0"]],
-            body: Data(),
+            status: status,
+            headers: ["content-length": ["\(responseBody.count)"]],
+            body: responseBody,
             responseURL: url,
             connectedPeerAddress: approvedPeers.first
         )
@@ -2123,7 +2165,7 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
                     eventID: "service-event-registration",
                     requestBodyDigest: nil
                 )
-            case ("writer-token", "com.atproto.space.notifyWrite"):
+            case ("writer-token", "com.atproto.space.notifyRepoUpdate"):
                 let space = try SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "http")
                 let writeDigest = SpaceNotificationRequestDigest.write(
                     space: space,
@@ -2137,7 +2179,7 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
                     eventID: "service-event-1",
                     requestBodyDigest: writeDigest
                 )
-            case ("mismatched-digest-token", "com.atproto.space.notifyWrite"):
+            case ("mismatched-digest-token", "com.atproto.space.notifyRepoUpdate"):
                 meta = TokenMeta(
                     issuer: writer,
                     audience: authority,
@@ -2151,21 +2193,21 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
                     eventID: "service-event-bad-digest",
                     requestBodyDigest: "sha256:mismatched-digest"
                 )
-            case ("bad-digest-token", "com.atproto.space.notifyWrite"):
+            case ("bad-digest-token", "com.atproto.space.notifyRepoUpdate"):
                 meta = TokenMeta(
                     issuer: writer,
                     audience: authority,
                     eventID: "service-event-bad-digest",
                     requestBodyDigest: "sha256:mismatched-digest"
                 )
-            case ("authority-fanout-token", "com.atproto.space.notifyWrite"):
+            case ("authority-fanout-token", "com.atproto.space.notifyRepoUpdate"):
                 meta = TokenMeta(
                     issuer: authority,
                     audience: "did:plc:recipientabcdefghijklmnop",
                     eventID: "service-event-2",
                     requestBodyDigest: expectedRequestBodyDigest
                 )
-            case ("authority-unknown-recipient-token", "com.atproto.space.notifyWrite"):
+            case ("authority-unknown-recipient-token", "com.atproto.space.notifyRepoUpdate"):
                 meta = TokenMeta(
                     issuer: authority,
                     audience: "did:plc:unknownabcdefghijklmnopqr",
@@ -2295,10 +2337,10 @@ extension SpaceNotificationHTTPTests {
         return "\(input).\(signature.base64URLEncodedString())"
     }
 
-    /// SWAN-04: an upstream writer's notifyWrite carries no `req`. Hardened
+    /// SWAN-04: an upstream writer's notifyRepoUpdate carries no `req`. Hardened
     /// Swan refuses it; the interop flag admits it once, for either audience
     /// form, within 60 s, and still refuses a `req` that does not match.
-    func testOpenInteropAdmitsUnboundUpstreamNotifyWriteOnceAndKeepsBoundChecks() async throws {
+    func testOpenInteropAdmitsUnboundUpstreamNotifyRepoUpdateOnceAndKeepsBoundChecks() async throws {
         let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
         defer { fixture.cleanup() }
         do {
@@ -2310,7 +2352,7 @@ extension SpaceNotificationHTTPTests {
                 serviceAuthentication: verifier,
                 spacesOpenInterop: .standard
             ).buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.interop"))
-            let method = "com.atproto.space.notifyWrite"
+            let method = "com.atproto.space.notifyRepoUpdate"
             let rev = "3l72c4e2y2222"
             let hash = Data(repeating: 0x02, count: 32)
             let body = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"repoRev\":\"\(rev)\",\"data\":{\"$bytes\":\"\(hash.base64EncodedString())\"}}")
@@ -2498,7 +2540,7 @@ extension SpaceNotificationHTTPTests {
     }
 }
 
-// MARK: - notifyCredentialRevoked (atproto#5567)
+// MARK: - notifyCredentialsRevoked (atproto#5567)
 
 extension SpaceNotificationHTTPTests {
     private func revocationBody(_ space: SpaceURI, _ credentials: [String]) -> ByteBuffer {
@@ -2541,7 +2583,7 @@ extension SpaceNotificationHTTPTests {
             let listURI = "/xrpc/com.atproto.space.listWriters?space=\(fixture.space.rawValue.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!)"
             let revokedHeaders = try SpaceCredentialSignatureTestSupport.headers(token: revoked, audience: authority)
             let keptHeaders = try SpaceCredentialSignatureTestSupport.headers(token: kept, audience: authority)
-            let method = ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier
+            let method = SwanSpaceNotificationNSID.notifyCredentialsRevoked
             let body = revocationBody(fixture.space, [revokedJTI])
             let digest = SpaceNotificationRequestDigest.credentialRevocation(
                 space: fixture.space, credentials: [revokedJTI]
@@ -2602,7 +2644,7 @@ extension SpaceNotificationHTTPTests {
             let keys = SignedServiceKeys()
             let app = try fixture.server(serviceAuthentication: try keys.verifier(authority: authority, writer: writer))
                 .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.revocationAuth"))
-            let method = ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier
+            let method = SwanSpaceNotificationNSID.notifyCredentialsRevoked
             let body = revocationBody(fixture.space, ["jti-1"])
             let digest = SpaceNotificationRequestDigest.credentialRevocation(space: fixture.space, credentials: ["jti-1"])
             @Sendable func token(
@@ -2622,7 +2664,7 @@ extension SpaceNotificationHTTPTests {
                     ("writer as issuer", try token(issuer: writer, key: keys.writer, jti: "a")),
                     ("authority (not hosted) as audience", try token(audience: authority, jti: "b")),
                     ("service identifier audience", try token(audience: "\(writer)#atproto_pds", jti: "c")),
-                    ("wrong lxm", try token(lxm: "com.atproto.space.notifyWrite", jti: "d")),
+                    ("wrong lxm", try token(lxm: "com.atproto.space.notifyRepoUpdate", jti: "d")),
                     ("unbound without open interop", try token(req: .some(.none), jti: "e")),
                     ("mismatched req", try token(req: .some(String(repeating: "A", count: 43)), jti: "f")),
                 ]
@@ -2668,7 +2710,7 @@ extension SpaceNotificationHTTPTests {
                 serviceAuthentication: try keys.verifier(authority: authority, writer: writer),
                 spacesOpenInterop: .standard
             ).buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.revocationInterop"))
-            let method = ComAtprotoSpaceNotifyCredentialRevoked.typeIdentifier
+            let method = SwanSpaceNotificationNSID.notifyCredentialsRevoked
             let unbound = serviceHeaders(try SpaceServiceJWT.create(
                 issuer: authority, audience: writer, method: method,
                 eventID: "upstream-revocation", key: keys.authority

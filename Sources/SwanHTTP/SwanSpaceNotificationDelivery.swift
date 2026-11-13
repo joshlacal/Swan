@@ -6,6 +6,11 @@ import SwanSQLite
 import SwanSpaces
 import SwanStorage
 
+enum SwanSpaceNotificationNSID {
+    static let notifyRepoUpdate = "com.atproto.space.notifyRepoUpdate"
+    static let notifyCredentialsRevoked = "com.atproto.space.notifyCredentialsRevoked"
+}
+
 /// One operator-configured service destination. The endpoint is selected from
 /// a static allowlist, never directly from a registered URL or an incoming
 /// service JWT. `audience` is the exact configured remote service identity
@@ -31,8 +36,8 @@ public struct SwanSpaceNotificationDestination: Sendable, Equatable {
 }
 
 /// Maps an authority DID to the one configured endpoint that accepts its
-/// `notifyWrite` request. An outbox event with no mapping fails and retries;
-/// it never falls back to a request-controlled URL.
+/// `notifyRepoUpdate` request. An outbox event with no mapping fails and
+/// retries; it never falls back to a request-controlled URL.
 public protocol SwanSpaceAuthorityNotificationDestinationResolving: Sendable {
     func destination(forAuthority authority: String) async throws -> SwanSpaceNotificationDestination?
 }
@@ -190,7 +195,7 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
         )
         let endpoint = try notificationEndpoint(
             destination.endpoint,
-            method: ComAtprotoSpaceNotifyWrite.typeIdentifier
+            method: SwanSpaceNotificationNSID.notifyRepoUpdate
         )
         let reqDigest = SpaceNotificationRequestDigest.write(
             space: announcement.space,
@@ -203,11 +208,11 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
         // it on the first attempt and would refuse the retry with a 4xx, which
         // is acknowledged below as permanent. Receivers dedupe a repeat by the
         // writer's revision, not by jti: Swan's authority and the reference
-        // ignore a notifyWrite whose `repoRev` is not newer.
+        // ignore a notifyRepoUpdate whose `repoRev` is not newer.
         let token = try await serviceAuthentication.issue(
             issuer: notification.author,
             audience: destination.audience,
-            method: ComAtprotoSpaceNotifyWrite.typeIdentifier,
+            method: SwanSpaceNotificationNSID.notifyRepoUpdate,
             eventID: UUID().uuidString.lowercased(),
             requestBodyDigest: reqDigest,
             now: Date()
