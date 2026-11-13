@@ -68,21 +68,14 @@ public protocol XRPCServerHandler: Sendable {
     func handle(_ input: Input, context: Context) async throws -> Output
 }
 ''' % (profile_id, "\n".join(rows))
-wire_source = root / "Sources/SwanSpacesWire/SwanSpacesWire.swift"
 outputs = {
-    wire_source: source.encode(),
+    root / "Sources/SwanSpacesWire/SwanSpacesWire.swift": source.encode(),
     root / "Profiles" / f"{profile_id}.lexicons.sha256": "".join(
         f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(args.reference_root / 'lexicons')}\n"
         for path in schemas).encode(),
 }
-generated_root = root / "Sources/SwanSpacesWire/Generated"
-wire_sources = [(wire_source, source.encode())]
-wire_sources.extend((path, path.read_bytes()) for path in generated_root.rglob("*.swift"))
-wire_sources.sort(key=lambda item: item[0].as_posix())
-outputs[root / "Profiles" / f"{profile_id}.generated-wire.sha256"] = "".join(
-    f"{hashlib.sha256(data).hexdigest()}  {path.relative_to(root)}\n"
-    for path, data in wire_sources
-).encode()
+outputs[root / "Profiles" / f"{profile_id}.generated-wire.sha256"] = (
+    hashlib.sha256(source.encode()).hexdigest() + "  Sources/SwanSpacesWire/SwanSpacesWire.swift\n").encode()
 for path, data in outputs.items():
     if args.check:
         if path.read_bytes() != data:
