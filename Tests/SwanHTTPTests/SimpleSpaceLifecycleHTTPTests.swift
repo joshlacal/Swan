@@ -512,6 +512,34 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .unauthorized)
                     XCTAssertEqual(try self.errorCode(response.body), "Unauthorized")
                 }
+                let tooManyMembers = try JSONSerialization.data(withJSONObject: [
+                    "space": space.rawValue,
+                    "members": (0 ... 100).map { _ in
+                        ["did": Self.bob, "read": true, "write": true] as [String: Any]
+                    },
+                ])
+                try await client.execute(
+                    uri: Self.putPath,
+                    method: .post,
+                    headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.putPath, jti: "put-over-limit"),
+                    body: ByteBuffer(data: tooManyMembers)
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
+                let tooManyDIDs = try JSONSerialization.data(withJSONObject: [
+                    "space": space.rawValue,
+                    "dids": (0 ... 100).map { _ in Self.bob },
+                ])
+                try await client.execute(
+                    uri: Self.removePath,
+                    method: .post,
+                    headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.removePath, jti: "remove-over-limit"),
+                    body: ByteBuffer(data: tooManyDIDs)
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
                 let delete = #"{"space":"\#(space.rawValue)"}"#
                 try await client.execute(uri: Self.deletePath, method: .post, headers: try self.postHeaders(deleteToken, fixture: fixture, path: Self.deletePath, jti: "delete-manage"), body: ByteBuffer(string: delete)) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -553,6 +581,32 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .notFound)
                     self.assertNoStore(response)
                     XCTAssertEqual(try self.errorCode(response.body), "permissioned_endpoint_unavailable")
+                }
+                let retiredRoutes: [(String, HTTPRequest.Method)] = [
+                    ("com.atproto.space.getSpaceCredential", .post),
+                    ("com.atproto.space.listRepos", .get),
+                    ("com.atproto.space.registerNotify", .post),
+                    ("com.atproto.space.unregisterNotify", .post),
+                    ("com.atproto.space.notifyWrite", .post),
+                    ("com.atproto.space.notifySpaceDeleted", .post),
+                    ("com.atproto.memberspace.putMember", .post),
+                    ("com.atproto.memberspace.removeMember", .post),
+                    ("com.atproto.managedspace.checkUserAccess", .get),
+                ]
+                for (nsid, method) in retiredRoutes {
+                    try await client.execute(
+                        uri: "/xrpc/\(nsid)",
+                        method: method,
+                        headers: method == .post ? [.contentType: "application/json"] : [:],
+                        body: method == .post ? ByteBuffer(string: "{}") : nil
+                    ) { response in
+                        XCTAssertEqual(response.status, .notFound, nsid)
+                        XCTAssertEqual(
+                            try self.errorCode(response.body),
+                            "permissioned_endpoint_unavailable",
+                            nsid
+                        )
+                    }
                 }
                 let wrongTarget = try self.getHeaders(fixture, path: Self.updatePath, jti: "wrong-dpop", method: "POST")
                 try await client.execute(uri: Self.createPath, method: .post, headers: self.withJSON(wrongTarget), body: ByteBuffer(string: create)) { response in
