@@ -754,6 +754,82 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         )
     }
 
+    func testBatchMemberChangesQueueOnlyRemovedWriterTombstones() async throws {
+        let fixture = try NotificationFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+        let authority = DurableSimpleSpaceAuthority(lifecycleDatabase: database)
+        let authorization = AuthorizationContext.accountOAuthForTesting(
+            subject: fixture.authority,
+            scopes: ["atproto"]
+        )
+        let now = Date()
+        try await database.putSpaceSyncRegistration(.init(
+            space: fixture.space,
+            endpoint: "https://syncer.example",
+            token: "batch-token",
+            expiresAt: now.addingTimeInterval(600)
+        ))
+        try await database.receiveSpaceWriteNotification(
+            fixture.writeNotification(
+                eventID: "batch-write-1",
+                revision: try fixture.tid(1),
+                commitmentByte: 1
+            ),
+            now: now
+        )
+        _ = try await database.connection.query(
+            "DELETE FROM permissioned_space_sync_notifications"
+        )
+
+        _ = try await authority.putMembers(
+            space: fixture.space,
+            members: [
+                .init(did: fixture.writer, read: true, write: false),
+                .init(did: fixture.reader, read: true, write: false),
+            ],
+            authorization: authorization,
+            now: now
+        )
+        var pending = try await database.pendingSpaceSyncNotifications()
+        XCTAssertEqual(pending.map(\.kind), [.repoRemoved])
+        XCTAssertEqual(pending.map(\.repository), [fixture.writer])
+
+        _ = try await authority.putMembers(
+            space: fixture.space,
+            members: [.init(did: fixture.writer, read: true, write: true)],
+            authorization: authorization,
+            now: now
+        )
+        try await database.receiveSpaceWriteNotification(
+            fixture.writeNotification(
+                eventID: "batch-write-2",
+                revision: try fixture.tid(2),
+                commitmentByte: 2
+            ),
+            now: now
+        )
+        _ = try await database.connection.query(
+            "DELETE FROM permissioned_space_sync_notifications"
+        )
+        _ = try await authority.removeMembers(
+            space: fixture.space,
+            members: [
+                fixture.authority,
+                fixture.writer,
+                fixture.reader,
+                "did:plc:not-a-member",
+            ],
+            authorization: authorization,
+            now: now
+        )
+        pending = try await database.pendingSpaceSyncNotifications()
+        XCTAssertEqual(pending.map(\.kind), [.repoRemoved])
+        XCTAssertEqual(pending.map(\.repository), [fixture.writer])
+    }
+
     func testLapsedRegistrationGetsOneExpiryAndThenSilence() async throws {
         let fixture = try NotificationFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
