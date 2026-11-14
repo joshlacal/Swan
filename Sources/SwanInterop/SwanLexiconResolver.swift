@@ -335,7 +335,7 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
     /// reversed — upstream `NSID.authority`. `com.example.foo.auth` →
     /// `foo.example.com`.
     public static func authorityDomain(ofNSID nsid: String) throws -> String {
-        guard AtprotoSyntax.isValidNSID(nsid) else {
+        guard SwanCore.AtprotoSyntax.isValidNSID(nsid) else {
             throw SwanLexiconResolverFailure.invalidNSID
         }
         let segments = nsid.split(separator: ".", omittingEmptySubsequences: false)
@@ -635,7 +635,7 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
         }
         // `lexiconDocumentSchema` (`lex-document/src/lexicon-document.ts:730`):
         // `lexicon` is the literal 1 and `id` is an NSID.
-        guard record.lexicon == 1, AtprotoSyntax.isValidNSID(record.id) else {
+        guard record.lexicon == 1, SwanCore.AtprotoSyntax.isValidNSID(record.id) else {
             throw SwanLexiconResolverFailure.documentSchemaInvalid
         }
         guard record.id == nsid else {
@@ -693,8 +693,8 @@ private struct LexiconSchemaRecord: Decodable, DAGCBORDecodable {
     /// failure: a lexicon document declaring, say, a `query` is a perfectly
     /// valid document that simply grants nothing.
     enum MainDefinition: Decodable {
-        case permissionSet(LexiconPermissionSet)
-        case space(LexiconSpace)
+        case permissionSet(SwanCore.LexiconPermissionSet)
+        case space(SwanCore.LexiconSpace)
         case other
 
         private enum CodingKeys: String, CodingKey {
@@ -705,9 +705,9 @@ private struct LexiconSchemaRecord: Decodable, DAGCBORDecodable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             switch try container.decode(String.self, forKey: .type) {
             case "permission-set":
-                self = .permissionSet(try LexiconPermissionSet(from: decoder))
+                self = .permissionSet(try SwanCore.LexiconPermissionSet(from: decoder))
             case "space":
-                self = .space(try LexiconSpace(from: decoder))
+                self = .space(try SwanCore.LexiconSpace(from: decoder))
             default:
                 self = .other
             }

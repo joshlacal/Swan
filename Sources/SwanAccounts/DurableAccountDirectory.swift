@@ -811,5 +811,15 @@ private func translatePLCError(_ error: PetrelPLCError) -> SwanError {
         return .malformed(message)
     case let .unavailable(message):
         return .unavailable(message)
+    case .notFound:
+        return .invalidIdentifier(error.description)
+    case .tombstoned:
+        return .unauthorized(error.description)
+    case let .rejected(status, _):
+        return (status == 401 || status == 403)
+            ? .unauthorized(error.description)
+            : .malformed(error.description)
+    case .rateLimited, .submittedButUnconfirmed:
+        return .unavailable(error.description)
     }
 }

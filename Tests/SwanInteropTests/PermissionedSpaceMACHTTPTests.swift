@@ -468,7 +468,7 @@ private actor MACRecordResponseTransport {
         let body = try JSONEncoder().encode(
             ComAtprotoSpaceGetRecord.Output(
                 uri: ATProtocolURI(uriString: returnedURI.rawValue),
-                cid: cid,
+                cid: CIDString(cid),
                 value: returnedValue
             )
         )

@@ -111,6 +111,10 @@ extension SQLiteAccountDatabase: ConversationSpaceAuthorityLifecycle {
                 }
                 _ = try await connection.query("UPDATE conversation_space_authorities SET state = 'deleted', updated_at = MAX(updated_at, ?) WHERE space_uri = ?",
                     [.integer(timestamp), .text(deletion.space.rawValue)])
+                _ = try await enqueueAllSpaceCredentialRevocationsWithoutGate(
+                    space: deletion.space,
+                    timestamp: timestamp
+                )
                 _ = try await connection.query("DELETE FROM permissioned_space_writers WHERE space_uri = ?", [.text(deletion.space.rawValue)])
                 try await deleteAuthorityRepositoryWithoutGate(space: deletion.space)
                 try await enqueueSpaceDeletedNotificationsWithoutGate(

@@ -26,7 +26,7 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
         let kemKey = P256.KeyAgreement.PrivateKey()
         let createResult = ComAtprotoSpaceApplyWrites.CreateResult(
             uri: try ATProtocolURI(uriString: expectedURI),
-            cid: cid,
+            cid: CIDString(cid),
             validationStatus: nil
         )
         let applyOutput = ComAtprotoSpaceApplyWrites.Output(
@@ -40,7 +40,7 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
             rev: try TID(tidString: revision),
             collection: try NSID(nsidString: collection),
             rkey: try RecordKey(keyString: rkey),
-            cid: cid,
+            cid: CIDString(cid),
             prev: nil,
             value: nil
         )

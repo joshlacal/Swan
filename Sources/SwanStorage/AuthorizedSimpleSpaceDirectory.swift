@@ -418,6 +418,13 @@ public protocol AuthorizedSpaceSyncRegistrationDirectory: Sendable {
         endpoint: String,
         token: String
     ) async throws
+    func recordIssuedSpaceCredential(
+        space: SpaceURI,
+        user: String?,
+        credentialID: String,
+        expiresAt: Date,
+        now: Date
+    ) async throws
 }
 
 public extension AuthorizedSpaceSyncRegistrationDirectory {
@@ -429,6 +436,14 @@ public extension AuthorizedSpaceSyncRegistrationDirectory {
             allowLocalhostDevelopment: false
         )
     }
+
+    func recordIssuedSpaceCredential(
+        space _: SpaceURI,
+        user _: String?,
+        credentialID _: String,
+        expiresAt _: Date,
+        now _: Date
+    ) async throws {}
 }
 
 /// A signed service announcement after its HTTP/JWT boundary has completed.
@@ -557,9 +572,18 @@ public protocol AuthorizedSimpleSpaceLifecycleDirectory: Sendable {
         _ archive: SpaceMetaArchive,
         authorization: AuthorizationContext
     ) async throws
+
+    func recentlyRevokedSpaceCredentialIDs(
+        _ space: SpaceURI
+    ) async throws -> [String]
 }
 
 public extension AuthorizedSimpleSpaceLifecycleDirectory {
+    func recentlyRevokedSpaceCredentialIDs(
+        _: SpaceURI
+    ) async throws -> [String] {
+        []
+    }
     func removeSpaceWriter(
         _: String,
         from _: SpaceURI,

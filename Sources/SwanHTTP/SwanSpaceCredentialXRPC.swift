@@ -150,6 +150,7 @@ private struct AuthenticatedAuthorizeSpaceSyncHandler {
             }
         }
 
+        let issuedAt = Date()
         let credential: String
         do {
             credential = try await capability.credentialIssuer.issueSpaceCredential(
@@ -158,7 +159,7 @@ private struct AuthenticatedAuthorizeSpaceSyncHandler {
                 authorization: authorization,
                 clientAttestation: input.clientAttestation,
                 confirmationKeyID: input.credentialKey,
-                now: Date()
+                now: issuedAt
             )
         } catch {
             if let notify, isSpaceSyncAuthorizationDenial(error) {
@@ -173,6 +174,18 @@ private struct AuthenticatedAuthorizeSpaceSyncHandler {
                 }
             }
             throw spaceCredentialExchangeFailure(for: error)
+        }
+
+        let credentialJTI: String
+        let credentialExpiresAt: Date
+        do {
+            let inspection = try PermissionedDataJWT.inspectSpaceCredential(credential)
+            credentialJTI = inspection.claims.jti
+            credentialExpiresAt = Date(
+                timeIntervalSince1970: TimeInterval(inspection.claims.exp)
+            )
+        } catch {
+            throw SpaceCredentialExchangeFailure.unavailable
         }
 
         if let notify {
@@ -202,22 +215,13 @@ private struct AuthenticatedAuthorizeSpaceSyncHandler {
                     throw SpaceCredentialExchangeFailure.registrationNotConfirmed
                 }
             }
-            let expiresAt: Date
-            do {
-                let inspection = try PermissionedDataJWT.inspectSpaceCredential(credential)
-                expiresAt = Date(
-                    timeIntervalSince1970: TimeInterval(inspection.claims.exp)
-                )
-            } catch {
-                throw SpaceCredentialExchangeFailure.unavailable
-            }
             do {
                 try await capability.registrationDirectory.putSpaceSyncRegistration(
                     AuthorizedSpaceSyncRegistration(
                         space: space,
                         endpoint: endpoint,
                         token: notify.token,
-                        expiresAt: expiresAt
+                        expiresAt: credentialExpiresAt
                     ),
                     allowLocalhostDevelopment:
                         capability.allowLocalhostNotificationEndpoints
@@ -228,6 +232,13 @@ private struct AuthenticatedAuthorizeSpaceSyncHandler {
         }
 
         do {
+            try await capability.registrationDirectory.recordIssuedSpaceCredential(
+                space: space,
+                user: user,
+                credentialID: credentialJTI,
+                expiresAt: credentialExpiresAt,
+                now: issuedAt
+            )
             return AuthorizeSpaceSyncOutput(
                 credential: credential,
                 spaceRev: try await capability.registrationDirectory.activeSpaceRevision(space)

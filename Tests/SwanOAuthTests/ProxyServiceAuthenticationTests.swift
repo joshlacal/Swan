@@ -81,7 +81,7 @@ final class ProxyServiceAuthenticationTests: XCTestCase {
         XCTAssertThrowsError(
             try ProxyServiceJWT.create(
                 issuer: issuer, audience: audience, method: "app.bsky.actor.getProfile",
-                eventID: "j", key: key, lifetime: 3600
+                eventID: "j", key: key, lifetime: ServiceJWT.maximumLifetime + 1
             )
         )
     }

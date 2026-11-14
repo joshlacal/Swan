@@ -2598,8 +2598,6 @@ public enum LiveInteropRunner {
             case .comAtprotoSpaceApplyWritesUpdateResult,
                  .comAtprotoSpaceApplyWritesDeleteResult:
                 return nil
-            case .unexpected:
-                return nil
             }
         }
         guard cids.count == results.count,
@@ -2767,7 +2765,7 @@ public enum LiveInteropRunner {
                 if let value = entry.value {
                     guard let cid = entry.cid,
                           let canonicalValue = try? canonicalInteropRecordValue(value),
-                          CID.fromDAGCBOR(canonicalValue) == cid else {
+                          CID.fromDAGCBOR(canonicalValue).string == cid.string else {
                         return PermissionedSyncResult(
                             status: response.status, opsCount: output.ops.count,
                             operationCID: operation.cid?.string,

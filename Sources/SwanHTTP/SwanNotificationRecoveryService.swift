@@ -9,10 +9,12 @@ import SwanSQLite
 public struct SwanNotificationRecoveryService: Service {
     public typealias OutboxTransportFactory = @Sendable (SQLiteAccountDatabase) -> any PermissionedSpaceOutboxTransport
     public typealias SyncTransportFactory = @Sendable (SQLiteAccountDatabase) -> any PermissionedSpaceSyncNotificationTransport
+    public typealias RevocationTransportFactory = @Sendable (SQLiteAccountDatabase) -> any PermissionedSpaceCredentialRevocationTransport
 
     private let databases: [SQLiteAccountDatabase]
     private let makeOutboxTransport: OutboxTransportFactory
     private let makeSyncTransport: SyncTransportFactory
+    private let makeRevocationTransport: RevocationTransportFactory?
     private let configuration: PermissionedSpaceOutboxDeliveryConfiguration
     private let allowLocalhostDevelopment: Bool
 
@@ -20,12 +22,14 @@ public struct SwanNotificationRecoveryService: Service {
         databases: [SQLiteAccountDatabase],
         makeOutboxTransport: @escaping OutboxTransportFactory,
         makeSyncTransport: @escaping SyncTransportFactory,
+        makeRevocationTransport: RevocationTransportFactory? = nil,
         configuration: PermissionedSpaceOutboxDeliveryConfiguration = .standard,
         allowLocalhostDevelopment: Bool = false
     ) {
         self.databases = databases
         self.makeOutboxTransport = makeOutboxTransport
         self.makeSyncTransport = makeSyncTransport
+        self.makeRevocationTransport = makeRevocationTransport
         self.configuration = configuration
         self.allowLocalhostDevelopment = allowLocalhostDevelopment
     }
@@ -37,6 +41,7 @@ public struct SwanNotificationRecoveryService: Service {
         _ directory: SQLitePreMigratedAccountDirectory,
         makeOutboxTransport: @escaping OutboxTransportFactory,
         makeSyncTransport: @escaping SyncTransportFactory,
+        makeRevocationTransport: RevocationTransportFactory? = nil,
         configuration: PermissionedSpaceOutboxDeliveryConfiguration = .standard,
         allowLocalhostDevelopment: Bool = false
     ) async throws -> SwanNotificationRecoveryService {
@@ -44,6 +49,7 @@ public struct SwanNotificationRecoveryService: Service {
             databases: directory.notificationRecoveryDatabases(),
             makeOutboxTransport: makeOutboxTransport,
             makeSyncTransport: makeSyncTransport,
+            makeRevocationTransport: makeRevocationTransport,
             configuration: configuration,
             allowLocalhostDevelopment: allowLocalhostDevelopment
         )
@@ -68,6 +74,15 @@ public struct SwanNotificationRecoveryService: Service {
                             allowLocalhostDevelopment: allowLocalhostDevelopment
                         )
                         group.addTask { await sync.runUntilCancelled() }
+                    }
+                    if let makeRevocationTransport {
+                        let revocationTransport = makeRevocationTransport(database)
+                        let revocation = PermissionedSpaceCredentialRevocationDeliveryWorker(
+                            database: database,
+                            transport: revocationTransport,
+                            configuration: configuration
+                        )
+                        group.addTask { await revocation.runUntilCancelled() }
                     }
                 }
                 await group.waitForAll()

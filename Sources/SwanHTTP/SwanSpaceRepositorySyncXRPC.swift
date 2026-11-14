@@ -437,8 +437,8 @@ private func syncWireOperation(
             rev: revision,
             collection: collection,
             rkey: rkey,
-            cid: cid,
-            prev: previousCID,
+            cid: CIDString(cid),
+            prev: previousCID.map(CIDString.init),
             value: try CARRepository.decodeRecordCBOR(value)
         )
     }
@@ -446,8 +446,8 @@ private func syncWireOperation(
         rev: revision,
         collection: collection,
         rkey: rkey,
-        cid: cid,
-        prev: previousCID,
+        cid: cid.map(CIDString.init),
+        prev: previousCID.map(CIDString.init),
         value: nil
     )
 }

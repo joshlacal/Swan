@@ -110,36 +110,43 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
     func testNotificationRecoveryServiceDrainsCommittedWriterAndSyncQueues() async throws {
         let fixture = try NotificationRecoveryFixture()
         let database = try await fixture.open()
-        defer {
-            Task { try? await database.close() }
-            fixture.cleanup()
-        }
-        try await fixture.prepareCommittedQueues(on: database)
+        defer { fixture.cleanup() }
+        do {
+            try await fixture.prepareCommittedQueues(on: database)
 
-        let transport = NotificationRecoveryTransport()
-        let service = SwanNotificationRecoveryService(
-            databases: [database],
-            makeOutboxTransport: { _ in transport },
-            makeSyncTransport: { _ in transport },
-            configuration: try notificationRecoveryConfiguration()
-        )
-        let running = Task { try? await service.run() }
-        defer { running.cancel() }
+            let transport = NotificationRecoveryTransport()
+            let service = SwanNotificationRecoveryService(
+                databases: [database],
+                makeOutboxTransport: { _ in transport },
+                makeSyncTransport: { _ in transport },
+                configuration: try notificationRecoveryConfiguration()
+            )
+            let running = Task { try? await service.run() }
+            defer { running.cancel() }
 
-        for _ in 0 ..< 100 {
+            for _ in 0 ..< 200 {
+                let counts = await transport.counts()
+                let pendingOutbox = try await database.pendingOutbox()
+                let pendingSync = try await database.pendingSpaceSyncNotifications()
+                if counts.outbox == 1 && counts.sync == 1 && pendingOutbox.isEmpty && pendingSync.isEmpty {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
             let counts = await transport.counts()
-            if counts.outbox == 1 && counts.sync == 1 { break }
-            try? await Task.sleep(nanoseconds: 10_000_000)
+            XCTAssertEqual(counts.outbox, 1)
+            XCTAssertEqual(counts.sync, 1)
+            let remainingOutbox = try await database.pendingOutbox()
+            let remainingSync = try await database.pendingSpaceSyncNotifications()
+            XCTAssertTrue(remainingOutbox.isEmpty)
+            XCTAssertTrue(remainingSync.isEmpty)
+            running.cancel()
+            _ = await running.value
+            try await database.close()
+        } catch {
+            try? await database.close()
+            throw error
         }
-        let counts = await transport.counts()
-        XCTAssertEqual(counts.outbox, 1)
-        XCTAssertEqual(counts.sync, 1)
-        let remainingOutbox = try await database.pendingOutbox()
-        let remainingSync = try await database.pendingSpaceSyncNotifications()
-        XCTAssertTrue(remainingOutbox.isEmpty)
-        XCTAssertTrue(remainingSync.isEmpty)
-        running.cancel()
-        _ = await running.value
     }
 
     func testNotificationRecoveryServiceExitsAfterServiceGroupGracefulShutdown() async throws {
@@ -1287,6 +1294,703 @@ extension SpaceNotificationHTTPTests {
             try await fixture.close()
         } catch {
             try? await fixture.close()
+            throw error
+        }
+    }
+
+    private struct StaticAuthorityCredentialSigningKeyResolver: SpaceCredentialSigningKeyResolver {
+        let authority: String
+        let key: P256.Signing.PrivateKey
+
+        func signingKey(for candidate: String) async throws -> SpaceCredentialAuthoritySigningKey? {
+            guard candidate == authority else { return nil }
+            return SpaceCredentialAuthoritySigningKey(authority: authority, privateKey: key)
+        }
+    }
+
+    private struct SenderRevocationDPoPMaterial: Sendable {
+        let token: String
+        let key: P256.Signing.PrivateKey
+        let jwk: OAuthJSONWebKey
+    }
+
+    private func makeSenderRevocationDPoP(
+        runtime: SwanOAuthRuntime,
+        publicURL: URL,
+        subject: String
+    ) async throws -> SenderRevocationDPoPMaterial {
+        let key = P256.Signing.PrivateKey()
+        let raw = key.publicKey.x963Representation
+        let jwk = try OAuthJSONWebKey(
+            x: Data(raw[1 ..< 33]).base64URLEncodedString(),
+            y: Data(raw[33 ..< 65]).base64URLEncodedString()
+        )
+        let now = Date()
+        let session = try OAuthValidatedSession(
+            issuer: publicURL.absoluteString,
+            client: OAuthResolvedClientMetadata(
+                metadata: try OAuthClientMetadata(
+                    clientID: URL(string: "https://client.example/metadata")!,
+                    redirectURIs: [URL(string: "https://client.example/callback")!],
+                    grantTypes: ["authorization_code", "refresh_token"],
+                    responseTypes: ["code"],
+                    scopes: ["atproto"],
+                    dpopBoundAccessTokens: true
+                ),
+                keySet: nil
+            ),
+            redirectURI: URL(string: "https://client.example/callback")!,
+            scopes: ["atproto"],
+            dpopProof: OAuthValidatedDPoPProof(
+                keyThumbprint: jwk.thumbprint(),
+                jwtID: "sender-revocation-\(UUID().uuidString)",
+                issuedAt: now
+            ),
+            now: now
+        )
+        let tokens = try await runtime.tokenService.issue(subject: subject, session: session, now: now)
+        return .init(token: tokens.accessToken, key: key, jwk: jwk)
+    }
+
+    private func senderRevocationDPoPHeaders(
+        _ material: SenderRevocationDPoPMaterial,
+        runtime: SwanOAuthRuntime,
+        publicURL: URL,
+        path: String,
+        jti: String,
+        method: String = "POST"
+    ) throws -> HTTPFields {
+        struct Header: Encodable {
+            let alg = "ES256"
+            let typ = OAuthDPoPProofValidator.proofType
+            let jwk: OAuthJSONWebKey
+        }
+        struct Claims: Encodable {
+            let jti: String
+            let iat: Int64
+            let htm: String
+            let htu: String
+            let nonce: String
+            let ath: String
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let header = try encoder.encode(Header(jwk: material.jwk)).base64URLEncodedString()
+        let claims = try encoder.encode(Claims(
+            jti: jti,
+            iat: Int64(Date().timeIntervalSince1970),
+            htm: method,
+            htu: "\(publicURL.absoluteString)\(path)",
+            nonce: runtime.dpopNonceService.issue(),
+            ath: Data(SHA256.hash(data: Data(material.token.utf8))).base64URLEncodedString()
+        )).base64URLEncodedString()
+        let signingInput = "\(header).\(claims)"
+        let signature = try P256WireSignature.sign(Data(signingInput.utf8), using: material.key)
+            .base64URLEncodedString()
+        var headers = HTTPFields()
+        headers[.authorization] = "DPoP \(material.token)"
+        headers[HTTPField.Name("DPoP")!] = "\(signingInput).\(signature)"
+        if method == "POST" {
+            headers[.contentType] = "application/json"
+        }
+        return headers
+    }
+
+    /// Removing a member via `com.atproto.memberspace.removeMembers` immediately
+    /// revokes that member's issued Space credentials at the authority and
+    /// durably fans out `com.atproto.space.notifyCredentialsRevoked` (signed by
+    /// the authority with the repo account's bare DID as `aud` and `req` body
+    /// digest) to participating repo hosts, while keeping remaining members'
+    /// credentials valid.
+    func testRemoveMembersRevokesIssuedCredentialsLocallyAndFansOutNotifyCredentialsRevokedToRepoHosts() async throws {
+        let keptMember = "did:plc:cdefghijklmnopqrstuvwxyz"
+        let publicURL = URL(string: "https://authority.example")!
+        let authorityRoot = FileManager.default.temporaryDirectory
+            .appending(path: "SwanSenderRevocationRemove-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: authorityRoot) }
+
+        let remoteFixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
+        defer { remoteFixture.cleanup() }
+
+        let authorityControl = try await SQLiteControlDatabase(dataDirectory: authorityRoot)
+        var authorityDirectory: SQLitePreMigratedAccountDirectory?
+        do {
+            _ = try await authorityControl.createAccount(try AccountControlRegistration(
+                did: authority,
+                canonicalHandle: "authority.example.com",
+                passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: .init(purpose: .signing, generation: 1),
+                rotationKey: .init(purpose: .rotation, generation: 1),
+                createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+            ))
+            let bootstrapDB = try await SQLiteAccountDatabase(dataDirectory: authorityRoot, did: authority)
+            try await bootstrapDB.close()
+
+            let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+                dataDirectory: authorityRoot,
+                controlStore: authorityControl,
+                publicIdentityVerifier: nil
+            )
+            authorityDirectory = directory
+            let authorityOAuth = try SwanOAuthRuntime(
+                controlStore: authorityControl,
+                serverKey: Data(repeating: 0xD4, count: 32)
+            )
+            let ownerToken = try await makeSenderRevocationDPoP(
+                runtime: authorityOAuth,
+                publicURL: publicURL,
+                subject: authority
+            )
+
+            let removedDelegationKey = P256.Signing.PrivateKey()
+            let keptDelegationKey = P256.Signing.PrivateKey()
+            // Share `remoteFixture.key` as the authority's Space-credential signing
+            // key so credentials minted via `authorizeSpaceSync` on the authority
+            // verify directly on the remote repo-host server.
+            let authorityServer = SwanHTTPServer(
+                profile: try ProtocolProfile.load(
+                    from: notificationPackageRoot().appending(path: "Profiles/permissioned-data-0016-2026-11-12.json")
+                ),
+                configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: publicURL),
+                oauthRuntime: authorityOAuth,
+                authenticatedGetSpaceDirectory: directory,
+                accountControlStore: authorityControl,
+                spaceCredentialConfiguration: .init(
+                    authoritySigningKeys: StaticAuthorityCredentialSigningKeyResolver(
+                        authority: authority,
+                        key: remoteFixture.key
+                    ),
+                    delegationPublicKeys: try PinnedSpaceDelegationPublicKeyResolver(pins: [
+                        try .init(issuer: writer, generation: 1, publicKey: removedDelegationKey.publicKey),
+                        try .init(issuer: keptMember, generation: 1, publicKey: keptDelegationKey.publicKey),
+                    ]),
+                    credentialPublicKeys: try PinnedSpaceCredentialPublicKeyResolver(pins: [
+                        try .init(authority: authority, generation: 1, publicKey: remoteFixture.key.publicKey),
+                    ])
+                ),
+                spaceNotificationConfiguration: .init(
+                    serviceAuthentication: NotificationServiceVerifier(authority: authority, writer: writer)
+                )
+            )
+            let authorityApp = authorityServer.buildApplication(
+                logger: Logger(label: "SpaceNotificationHTTPTests.senderRemoveAuthority")
+            )
+
+            try await hostWriterAccount(remoteFixture)
+            let serviceSigner = SigningNotificationServiceIssuer()
+            let remoteVerifier = DurableSpaceServiceAuthenticationVerifier(
+                publicKeys: try PinnedSpaceServicePublicKeyResolver(pins: [
+                    try .init(issuer: authority, generation: 1, publicKey: serviceSigner.key.publicKey),
+                ])
+            )
+            let remoteApp = try remoteFixture.server(serviceAuthentication: remoteVerifier)
+                .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.senderRemoveRemote"))
+
+            let space = remoteFixture.space
+            let createPath = "/xrpc/com.atproto.space.createSpace"
+            let putMembersPath = "/xrpc/com.atproto.memberspace.putMembers"
+            let removeMembersPath = "/xrpc/com.atproto.memberspace.removeMembers"
+            let authorizePath = "/xrpc/com.atproto.space.authorizeSpaceSync"
+            let listWritersURI = "/xrpc/com.atproto.space.listWriters?space=\(notificationPercentEncode(space.rawValue))"
+
+            let (removedCredential, keptCredential): (String, String) = try await authorityApp.test(.router) { client in
+                let createBody = #"{"spaceType":"\#(space.spaceType)","skey":"\#(space.skey)","policy":{"$type":"com.atproto.memberspace.policy"}}"#
+                try await client.execute(
+                    uri: createPath,
+                    method: .post,
+                    headers: try self.senderRevocationDPoPHeaders(
+                        ownerToken, runtime: authorityOAuth, publicURL: publicURL, path: createPath, jti: "create-1"
+                    ),
+                    body: ByteBuffer(string: createBody)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+
+                let putBody = #"{"space":"\#(space.rawValue)","members":[{"did":"\#(self.writer)","read":true,"write":true},{"did":"\#(keptMember)","read":true,"write":true}]}"#
+                try await client.execute(
+                    uri: putMembersPath,
+                    method: .post,
+                    headers: try self.senderRevocationDPoPHeaders(
+                        ownerToken, runtime: authorityOAuth, publicURL: publicURL, path: putMembersPath, jti: "put-1"
+                    ),
+                    body: ByteBuffer(string: putBody)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+
+                var issuedCredentials: [String] = []
+                for (memberDID, key) in [
+                    (self.writer, removedDelegationKey),
+                    (keptMember, keptDelegationKey),
+                ] {
+                    let delegation = try PermissionedDataJWT.createDelegationToken(
+                        issuer: memberDID,
+                        audience: "\(self.authority)#atproto_pds",
+                        space: space,
+                        key: key
+                    )
+                    let authBody = try JSONSerialization.data(withJSONObject: [
+                        "space": space.rawValue,
+                        "credentialKey": try SpaceCredentialSignatureTestSupport.keyID,
+                        "delegationToken": delegation,
+                    ])
+                    let response = try await client.execute(
+                        uri: authorizePath,
+                        method: .post,
+                        headers: [.contentType: "application/json"],
+                        body: ByteBuffer(data: authBody)
+                    )
+                    XCTAssertEqual(response.status, .ok)
+                    let json = try notificationJSONObject(response.body)
+                    issuedCredentials.append(try XCTUnwrap(json["credential"] as? String))
+                }
+                let removed = issuedCredentials[0]
+                let kept = issuedCredentials[1]
+
+                // Positive control on authority before member removal.
+                try await client.execute(
+                    uri: listWritersURI,
+                    method: .get,
+                    headers: try SpaceCredentialSignatureTestSupport.headers(
+                        token: removed, audience: self.authority
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+
+                let removeBody = #"{"space":"\#(space.rawValue)","dids":["\#(self.writer)"]}"#
+                try await client.execute(
+                    uri: removeMembersPath,
+                    method: .post,
+                    headers: try self.senderRevocationDPoPHeaders(
+                        ownerToken, runtime: authorityOAuth, publicURL: publicURL, path: removeMembersPath, jti: "remove-1"
+                    ),
+                    body: ByteBuffer(string: removeBody)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+
+                // Immediate authority-side revocation for removed member only.
+                try await client.execute(
+                    uri: listWritersURI,
+                    method: .get,
+                    headers: try SpaceCredentialSignatureTestSupport.headers(
+                        token: removed, audience: self.authority
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "CredentialRevoked")
+                }
+                try await client.execute(
+                    uri: listWritersURI,
+                    method: .get,
+                    headers: try SpaceCredentialSignatureTestSupport.headers(
+                        token: kept, audience: self.authority
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                return (removed, kept)
+            }
+
+            let removedJTI = try PermissionedDataJWT.inspectSpaceCredential(removedCredential).claims.jti
+
+            // Before draining the sender outbox, the remote repo host still admits both credentials.
+            try await remoteApp.test(.router) { remoteClient in
+                try await remoteClient.execute(
+                    uri: listWritersURI,
+                    method: .get,
+                    headers: try SpaceCredentialSignatureTestSupport.headers(
+                        token: removedCredential, audience: self.authority
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+
+            // Drain durable sender revocation outbox via HTTPPermissionedSpaceCredentialRevocationTransport.
+            // Note that `destination.audience` is configured with `#atproto_pds` (as used by `notifyRepoUpdate`),
+            // verifying that `HTTPPermissionedSpaceCredentialRevocationTransport` signs `notifyCredentialsRevoked`
+            // with the bare recipient DID required by Proposal 0016.
+            let posts = RecordingPostTransport(responseStatuses: [200, 200])
+            let localRevocations = DurableSpaceCredentialRevocations(store: authorityControl)
+            let transport = HTTPPermissionedSpaceCredentialRevocationTransport(
+                destinations: try StaticSwanSpaceNotificationDestinations(authorityDestinations: [
+                    writer: try SwanSpaceNotificationDestination(
+                        endpoint: URL(string: "https://writer-pds.example")!,
+                        audience: "\(writer)#atproto_pds"
+                    ),
+                    keptMember: try SwanSpaceNotificationDestination(
+                        endpoint: URL(string: "https://kept-pds.example")!,
+                        audience: "\(keptMember)#atproto_pds"
+                    ),
+                ]),
+                serviceAuthentication: serviceSigner,
+                poster: OAuthBoundedJSONPoster(
+                    policy: try OAuthRemoteFetchPolicy(maximumBodyBytes: 4_096, timeout: 2),
+                    resolver: FixedHostnameResolver(
+                        answer: try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+                    ),
+                    transport: posts
+                ),
+                localRevocationSink: { recipientDID, targetSpace, credentialIDs in
+                    guard let account = try await authorityControl.account(did: recipientDID),
+                          account.status == .active else {
+                        return false
+                    }
+                    try await localRevocations.record(space: targetSpace, credentialIDs: credentialIDs)
+                    return true
+                }
+            )
+            let recoveryDatabases = try await directory.notificationRecoveryDatabases()
+            let authorityDatabase = try XCTUnwrap(recoveryDatabases.first)
+            let worker = PermissionedSpaceCredentialRevocationDeliveryWorker(
+                database: authorityDatabase,
+                transport: transport,
+                configuration: try notificationRecoveryConfiguration()
+            )
+            while try await worker.deliverNext() != .idle {}
+            let remaining = try await authorityDatabase.pendingSpaceCredentialRevocationNotifications()
+            XCTAssertTrue(remaining.isEmpty)
+
+            let captured = await posts.posts()
+            XCTAssertEqual(captured.count, 2, "fans out to both writer-pds and kept-pds while handling authority locally")
+            let writerPost = try XCTUnwrap(captured.first {
+                $0.url.absoluteString == "https://writer-pds.example/xrpc/com.atproto.space.notifyCredentialsRevoked"
+            })
+            let writerBody = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: writerPost.body) as? [String: Any]
+            )
+            XCTAssertEqual(writerBody["space"] as? String, space.rawValue)
+            XCTAssertEqual(writerBody["credentials"] as? [String], [removedJTI])
+
+            // Deliver the exact outbound wire request into the remote Swan repo-host router.
+            let inboundHeaders: HTTPFields = [
+                .contentType: "application/json",
+                .authorization: try XCTUnwrap(writerPost.headers["authorization"]),
+            ]
+
+            try await remoteApp.test(.router) { remoteClient in
+                try await remoteClient.execute(
+                    uri: "/xrpc/\(ComAtprotoSpaceNotifyCredentialsRevoked.typeIdentifier)",
+                    method: .post,
+                    headers: inboundHeaders,
+                    body: ByteBuffer(data: writerPost.body)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                try await remoteClient.execute(
+                    uri: listWritersURI,
+                    method: .get,
+                    headers: try SpaceCredentialSignatureTestSupport.headers(
+                        token: removedCredential, audience: self.authority
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "CredentialRevoked")
+                }
+                try await remoteClient.execute(
+                    uri: listWritersURI,
+                    method: .get,
+                    headers: try SpaceCredentialSignatureTestSupport.headers(
+                        token: keptCredential, audience: self.authority
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+
+            try await directory.close()
+            authorityDirectory = nil
+            try await authorityControl.close()
+            try await remoteFixture.close()
+        } catch {
+            if let authorityDirectory { try? await authorityDirectory.close() }
+            try? await authorityControl.close()
+            try? await remoteFixture.close()
+            throw error
+        }
+    }
+
+    /// Deleting a Space via `com.atproto.space.deleteSpace` revokes every
+    /// non-expired issued credential for that Space and fans out
+    /// `com.atproto.space.notifyCredentialsRevoked` through
+    /// `SwanNotificationRecoveryService` to participating repo hosts.
+    func testDeleteSpaceRevokesAllRemainingCredentialsAndFansOutNotifyCredentialsRevoked() async throws {
+        let secondMember = "did:plc:cdefghijklmnopqrstuvwxyz"
+        let publicURL = URL(string: "https://authority.example")!
+        let authorityRoot = FileManager.default.temporaryDirectory
+            .appending(path: "SwanSenderRevocationDelete-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: authorityRoot) }
+
+        let remoteFixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
+        defer { remoteFixture.cleanup() }
+
+        let authorityControl = try await SQLiteControlDatabase(dataDirectory: authorityRoot)
+        var authorityDirectory: SQLitePreMigratedAccountDirectory?
+        do {
+            _ = try await authorityControl.createAccount(try AccountControlRegistration(
+                did: authority,
+                canonicalHandle: "authority.example.com",
+                passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: .init(purpose: .signing, generation: 1),
+                rotationKey: .init(purpose: .rotation, generation: 1),
+                createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+            ))
+            let bootstrapDB = try await SQLiteAccountDatabase(dataDirectory: authorityRoot, did: authority)
+            try await bootstrapDB.close()
+
+            let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+                dataDirectory: authorityRoot,
+                controlStore: authorityControl,
+                publicIdentityVerifier: nil
+            )
+            authorityDirectory = directory
+            let authorityOAuth = try SwanOAuthRuntime(
+                controlStore: authorityControl,
+                serverKey: Data(repeating: 0xE5, count: 32)
+            )
+            let ownerToken = try await makeSenderRevocationDPoP(
+                runtime: authorityOAuth,
+                publicURL: publicURL,
+                subject: authority
+            )
+
+            let firstDelegationKey = P256.Signing.PrivateKey()
+            let secondDelegationKey = P256.Signing.PrivateKey()
+            let authorityServer = SwanHTTPServer(
+                profile: try ProtocolProfile.load(
+                    from: notificationPackageRoot().appending(path: "Profiles/permissioned-data-0016-2026-11-12.json")
+                ),
+                configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: publicURL),
+                oauthRuntime: authorityOAuth,
+                authenticatedGetSpaceDirectory: directory,
+                accountControlStore: authorityControl,
+                spaceCredentialConfiguration: .init(
+                    authoritySigningKeys: StaticAuthorityCredentialSigningKeyResolver(
+                        authority: authority,
+                        key: remoteFixture.key
+                    ),
+                    delegationPublicKeys: try PinnedSpaceDelegationPublicKeyResolver(pins: [
+                        try .init(issuer: writer, generation: 1, publicKey: firstDelegationKey.publicKey),
+                        try .init(issuer: secondMember, generation: 1, publicKey: secondDelegationKey.publicKey),
+                    ]),
+                    credentialPublicKeys: try PinnedSpaceCredentialPublicKeyResolver(pins: [
+                        try .init(authority: authority, generation: 1, publicKey: remoteFixture.key.publicKey),
+                    ])
+                ),
+                spaceNotificationConfiguration: .init(
+                    serviceAuthentication: NotificationServiceVerifier(authority: authority, writer: writer)
+                )
+            )
+            let authorityApp = authorityServer.buildApplication(
+                logger: Logger(label: "SpaceNotificationHTTPTests.senderDeleteAuthority")
+            )
+
+            try await hostWriterAccount(remoteFixture)
+            let serviceSigner = SigningNotificationServiceIssuer()
+            let remoteVerifier = DurableSpaceServiceAuthenticationVerifier(
+                publicKeys: try PinnedSpaceServicePublicKeyResolver(pins: [
+                    try .init(issuer: authority, generation: 1, publicKey: serviceSigner.key.publicKey),
+                ])
+            )
+            let remoteApp = try remoteFixture.server(serviceAuthentication: remoteVerifier)
+                .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.senderDeleteRemote"))
+
+            let space = remoteFixture.space
+            let createPath = "/xrpc/com.atproto.space.createSpace"
+            let putMembersPath = "/xrpc/com.atproto.memberspace.putMembers"
+            let deleteSpacePath = "/xrpc/com.atproto.space.deleteSpace"
+            let authorizePath = "/xrpc/com.atproto.space.authorizeSpaceSync"
+            let listWritersURI = "/xrpc/com.atproto.space.listWriters?space=\(notificationPercentEncode(space.rawValue))"
+
+            let (firstCredential, secondCredential): (String, String) = try await authorityApp.test(.router) { client in
+                let createBody = #"{"spaceType":"\#(space.spaceType)","skey":"\#(space.skey)","policy":{"$type":"com.atproto.memberspace.policy"}}"#
+                try await client.execute(
+                    uri: createPath,
+                    method: .post,
+                    headers: try self.senderRevocationDPoPHeaders(
+                        ownerToken, runtime: authorityOAuth, publicURL: publicURL, path: createPath, jti: "del-create"
+                    ),
+                    body: ByteBuffer(string: createBody)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+
+                let putBody = #"{"space":"\#(space.rawValue)","members":[{"did":"\#(self.writer)","read":true,"write":true},{"did":"\#(secondMember)","read":true,"write":true}]}"#
+                try await client.execute(
+                    uri: putMembersPath,
+                    method: .post,
+                    headers: try self.senderRevocationDPoPHeaders(
+                        ownerToken, runtime: authorityOAuth, publicURL: publicURL, path: putMembersPath, jti: "del-put"
+                    ),
+                    body: ByteBuffer(string: putBody)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+
+                var issuedCredentials: [String] = []
+                for (memberDID, key) in [
+                    (self.writer, firstDelegationKey),
+                    (secondMember, secondDelegationKey),
+                ] {
+                    let delegation = try PermissionedDataJWT.createDelegationToken(
+                        issuer: memberDID,
+                        audience: "\(self.authority)#atproto_pds",
+                        space: space,
+                        key: key
+                    )
+                    let authBody = try JSONSerialization.data(withJSONObject: [
+                        "space": space.rawValue,
+                        "credentialKey": try SpaceCredentialSignatureTestSupport.keyID,
+                        "delegationToken": delegation,
+                    ])
+                    let response = try await client.execute(
+                        uri: authorizePath,
+                        method: .post,
+                        headers: [.contentType: "application/json"],
+                        body: ByteBuffer(data: authBody)
+                    )
+                    XCTAssertEqual(response.status, .ok)
+                    let json = try notificationJSONObject(response.body)
+                    issuedCredentials.append(try XCTUnwrap(json["credential"] as? String))
+                }
+                let first = issuedCredentials[0]
+                let second = issuedCredentials[1]
+
+                let deleteBody = #"{"space":"\#(space.rawValue)"}"#
+                try await client.execute(
+                    uri: deleteSpacePath,
+                    method: .post,
+                    headers: try self.senderRevocationDPoPHeaders(
+                        ownerToken, runtime: authorityOAuth, publicURL: publicURL, path: deleteSpacePath, jti: "del-1"
+                    ),
+                    body: ByteBuffer(string: deleteBody)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+
+                for credential in [first, second] {
+                    try await client.execute(
+                        uri: listWritersURI,
+                        method: .get,
+                        headers: try SpaceCredentialSignatureTestSupport.headers(
+                            token: credential, audience: self.authority
+                        )
+                    ) { response in
+                        XCTAssertEqual(response.status, .unauthorized)
+                        XCTAssertEqual(try notificationErrorCode(response.body), "CredentialRevoked")
+                    }
+                }
+                return (first, second)
+            }
+
+            let firstJTI = try PermissionedDataJWT.inspectSpaceCredential(firstCredential).claims.jti
+            let secondJTI = try PermissionedDataJWT.inspectSpaceCredential(secondCredential).claims.jti
+
+            let posts = RecordingPostTransport(responseStatuses: [200, 200])
+            let localRevocations = DurableSpaceCredentialRevocations(store: authorityControl)
+            let idleTransport = NotificationRecoveryTransport()
+            let recoveryService = try await SwanNotificationRecoveryService.fromPreopenedDirectory(
+                directory,
+                makeOutboxTransport: { _ in idleTransport },
+                makeSyncTransport: { _ in idleTransport },
+                makeRevocationTransport: { _ in
+                    try! HTTPPermissionedSpaceCredentialRevocationTransport(
+                        destinations: StaticSwanSpaceNotificationDestinations(authorityDestinations: [
+                            self.writer: SwanSpaceNotificationDestination(
+                                endpoint: URL(string: "https://writer-pds.example")!,
+                                audience: "\(self.writer)#atproto_pds"
+                            ),
+                            secondMember: SwanSpaceNotificationDestination(
+                                endpoint: URL(string: "https://second-pds.example")!,
+                                audience: "\(secondMember)#atproto_pds"
+                            ),
+                        ]),
+                        serviceAuthentication: serviceSigner,
+                        poster: OAuthBoundedJSONPoster(
+                            policy: OAuthRemoteFetchPolicy(maximumBodyBytes: 4_096, timeout: 2),
+                            resolver: FixedHostnameResolver(
+                                answer: OAuthIPAddress(literal: "93.184.216.34")!
+                            ),
+                            transport: posts
+                        ),
+                        localRevocationSink: { recipientDID, targetSpace, credentialIDs in
+                            guard let account = try await authorityControl.account(did: recipientDID),
+                                  account.status == .active else {
+                                return false
+                            }
+                            try await localRevocations.record(space: targetSpace, credentialIDs: credentialIDs)
+                            return true
+                        }
+                    )
+                },
+                configuration: try notificationRecoveryConfiguration()
+            )
+            let recoveryDatabases = try await directory.notificationRecoveryDatabases()
+            let authorityDatabase = try XCTUnwrap(recoveryDatabases.first)
+            let running = Task { try? await recoveryService.run() }
+            defer { running.cancel() }
+            for _ in 0 ..< 200 {
+                let pending = try await authorityDatabase.pendingSpaceCredentialRevocationNotifications()
+                let captured = await posts.posts()
+                if pending.isEmpty && captured.count >= 2 { break }
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            running.cancel()
+            _ = await running.value
+
+            let remaining = try await authorityDatabase.pendingSpaceCredentialRevocationNotifications()
+            XCTAssertTrue(remaining.isEmpty)
+            let captured = await posts.posts()
+            XCTAssertEqual(captured.count, 2)
+            let writerPost = try XCTUnwrap(captured.first {
+                $0.url.absoluteString == "https://writer-pds.example/xrpc/com.atproto.space.notifyCredentialsRevoked"
+            })
+            let writerBody = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: writerPost.body) as? [String: Any]
+            )
+            XCTAssertEqual(
+                Set(try XCTUnwrap(writerBody["credentials"] as? [String])),
+                Set([firstJTI, secondJTI])
+            )
+
+            let inboundHeaders: HTTPFields = [
+                .contentType: "application/json",
+                .authorization: try XCTUnwrap(writerPost.headers["authorization"]),
+            ]
+
+            try await remoteApp.test(.router) { remoteClient in
+                try await remoteClient.execute(
+                    uri: "/xrpc/\(ComAtprotoSpaceNotifyCredentialsRevoked.typeIdentifier)",
+                    method: .post,
+                    headers: inboundHeaders,
+                    body: ByteBuffer(data: writerPost.body)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                for credential in [firstCredential, secondCredential] {
+                    try await remoteClient.execute(
+                        uri: listWritersURI,
+                        method: .get,
+                        headers: try SpaceCredentialSignatureTestSupport.headers(
+                            token: credential, audience: self.authority
+                        )
+                    ) { response in
+                        XCTAssertEqual(response.status, .unauthorized)
+                        XCTAssertEqual(try notificationErrorCode(response.body), "CredentialRevoked")
+                    }
+                }
+            }
+
+            try await directory.close()
+            authorityDirectory = nil
+            try await authorityControl.close()
+            try await remoteFixture.close()
+        } catch {
+            if let authorityDirectory { try? await authorityDirectory.close() }
+            try? await authorityControl.close()
+            try? await remoteFixture.close()
             throw error
         }
     }

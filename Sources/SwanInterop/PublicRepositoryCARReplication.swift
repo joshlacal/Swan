@@ -183,16 +183,20 @@ public enum PublicRepositoryCARImportFailureCode {
         case .revisionNotIncreasing: return "RevisionNotIncreasing"
         case .invalidDataCID: return "InvalidDataCID"
         case .invalidCommitCID: return "InvalidCommitCID"
+        case .invalidPreviousCommitCID: return "InvalidPreviousCommitCID"
         case .invalidSchema: return "InvalidSchema"
+        case .unsupportedVersion: return "UnsupportedVersion"
         case .nonCanonicalCBOR: return "NonCanonicalCBOR"
         case .invalidSignature: return "InvalidSignature"
         case .unsupportedSigningAlgorithm: return "UnsupportedSigningAlgorithm"
+        case .signingKeyUnavailable: return "SigningKeyUnavailable"
         }
     }
 
     private static func repositoryCode(_ error: RepositoryMSTValidationError) -> String {
         switch error {
         case .unsupportedCID: return "UnsupportedCID"
+        case .unsupportedRecordLink: return "UnsupportedRecordLink"
         case .missingBlock: return "MissingBlock"
         case .blockCIDMismatch: return "BlockCIDMismatch"
         case .invalidNodeSchema: return "InvalidNodeSchema"

@@ -340,3 +340,93 @@ public actor PermissionedSpaceSyncNotificationDeliveryWorker {
         }
     }
 }
+
+public protocol PermissionedSpaceCredentialRevocationTransport: Sendable {
+    func deliver(
+        _ notification: PersistedSpaceCredentialRevocationNotification
+    ) async -> PermissionedSpaceSyncNotificationDisposition
+}
+
+public actor PermissionedSpaceCredentialRevocationDeliveryWorker {
+    private static let retryDelays: [TimeInterval] = [
+        5, 30, 120, 600,
+    ]
+
+    private let database: SQLiteAccountDatabase
+    private let transport: any PermissionedSpaceCredentialRevocationTransport
+    private let configuration: PermissionedSpaceOutboxDeliveryConfiguration
+
+    public init(
+        database: SQLiteAccountDatabase,
+        transport: any PermissionedSpaceCredentialRevocationTransport,
+        configuration: PermissionedSpaceOutboxDeliveryConfiguration = .standard
+    ) {
+        self.database = database
+        self.transport = transport
+        self.configuration = configuration
+    }
+
+    public func deliverNext(
+        now: Date = Date()
+    ) async throws -> PermissionedSpaceSyncNotificationDeliveryResult {
+        guard let lease = try await database.leaseNextSpaceCredentialRevocationNotification(
+            now: now,
+            leaseDuration: configuration.leaseDuration
+        ) else {
+            return .idle
+        }
+        let event = lease.event
+        let disposition = await transport.deliver(event)
+        switch disposition {
+        case .delivered:
+            let completed = try await database.completeSpaceCredentialRevocationNotificationLease(
+                eventID: event.id,
+                token: lease.token
+            )
+            return completed ? .delivered(eventID: event.id) : .leaseLost(eventID: event.id)
+        case .rejected:
+            let completed = try await database.completeSpaceCredentialRevocationNotificationLease(
+                eventID: event.id,
+                token: lease.token
+            )
+            return completed ? .dropped(eventID: event.id) : .leaseLost(eventID: event.id)
+        case .retryableFailure:
+            if now >= event.retryExpiresAt {
+                let completed = try await database.completeSpaceCredentialRevocationNotificationLease(
+                    eventID: event.id,
+                    token: lease.token
+                )
+                return completed ? .dropped(eventID: event.id) : .leaseLost(eventID: event.id)
+            }
+            let delay = Self.retryDelays[min(event.attempts, Self.retryDelays.count - 1)]
+            guard let attempts = try await database.failSpaceCredentialRevocationNotificationLease(
+                eventID: event.id,
+                token: lease.token,
+                retryAt: now.addingTimeInterval(delay)
+            ) else {
+                return .leaseLost(eventID: event.id)
+            }
+            return .failed(eventID: event.id, attempts: attempts)
+        }
+    }
+
+    public func runUntilCancelled() async {
+        while !Task.isCancelled {
+            do {
+                if case .idle = try await deliverNext() {
+                    try await Task.sleep(
+                        nanoseconds: UInt64(
+                            (configuration.idlePollInterval * 1_000_000_000).rounded(.up)
+                        )
+                    )
+                }
+            } catch {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(
+                        (configuration.idlePollInterval * 1_000_000_000).rounded(.up)
+                    )
+                )
+            }
+        }
+    }
+}

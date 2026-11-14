@@ -74,7 +74,7 @@ public struct DurableSpaceCredentialRevocations: Sendable {
 
     /// A revoked ID is a nonempty JWT `jti`, never a JWT. The bound matches
     /// what credential verification itself accepts as a `jti`.
-    static func isValidCredentialID(_ value: String) -> Bool {
+    public static func isValidCredentialID(_ value: String) -> Bool {
         let bytes = value.utf8
         return !bytes.isEmpty
             && bytes.count <= PermissionedDataJWT.maximumOpaqueJTIBytes

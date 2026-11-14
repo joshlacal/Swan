@@ -152,7 +152,7 @@ private struct Fixture {
                 rev: firstRevision,
                 collection: try NSID(nsidString: "app.bsky.feed.post"),
                 rkey: try RecordKey(keyString: "one"),
-                cid: firstCID,
+                cid: CIDString(firstCID),
                 prev: nil,
                 value: firstValue
             ),
@@ -160,7 +160,7 @@ private struct Fixture {
                 rev: secondRevision,
                 collection: try NSID(nsidString: "app.bsky.feed.post"),
                 rkey: try RecordKey(keyString: "two"),
-                cid: secondCID,
+                cid: CIDString(secondCID),
                 prev: nil,
                 value: secondValue
             ),

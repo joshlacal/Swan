@@ -226,7 +226,7 @@ final class PermissionedRemoteReplicaIncrementalHTTPOrchestratorTests:
             let rkey = "large-\(suffix)"
             hash.add(element: "app.bsky.feed.post/\(rkey)/\(cid.string)")
             return ComAtprotoSpaceListRepoOps.OpEntry(rev: fixture.revision, collection: fixture.operation.collection,
-                rkey: try RecordKey(keyString: rkey), cid: cid, prev: nil, value: value)
+                rkey: try RecordKey(keyString: rkey), cid: CIDString(cid), prev: nil, value: value)
         }
         let commit = ComAtprotoSpaceDefs.Commit(ver: 1, repo: fixture.commit.repo, space: fixture.commit.space,
             rev: fixture.revision, data: Bytes(data: hash.commitment))
@@ -656,7 +656,7 @@ private struct HTTPIncrementalFixture {
             rev: revision,
             collection: try NSID(nsidString: "app.bsky.feed.post"),
             rkey: try RecordKey(keyString: "one"),
-            cid: cid,
+            cid: CIDString(cid),
             prev: nil,
             value: value
         )

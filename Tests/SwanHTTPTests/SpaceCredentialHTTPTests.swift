@@ -2006,7 +2006,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(uri, expectedURI, file: file, line: line)
         XCTAssertEqual(canonicalRecord, expectedRecord, file: file, line: line)
         XCTAssertEqual(
-            output.cid,
+            output.cid.cid,
             CID.fromDAGCBOR(canonicalRecord),
             file: file,
             line: line

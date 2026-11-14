@@ -37,7 +37,12 @@ final class SwanSpacesTests: XCTestCase {
         XCTAssertEqual(uri.space.spaceType, "app.bsky.bookmarks")
         XCTAssertEqual(uri.author, "did:plc:bob")
         XCTAssertEqual(uri.rawValue, "at://did:plc:alice/space/app.bsky.bookmarks/self/did:plc:bob/app.bsky.feed.post/one")
+        let ref = try uri.space.toSpaceRef()
+        XCTAssertEqual(ref.uriString(), uri.space.rawValue)
+        XCTAssertEqual(try SpaceURI(ref), uri.space)
+        XCTAssertEqual(try ref.recordURI(authorDID: uri.author, collection: uri.collection, recordKey: uri.rkey).uriString(), uri.rawValue)
         XCTAssertThrowsError(try SpaceURI("at://did:plc:alice/not-space/bookmarks"))
+        XCTAssertThrowsError(try SpaceURI("at:space/did:plc:alice/app.bsky.bookmarks/self"))
         XCTAssertThrowsError(try SpaceRecordURI("at://did:plc:alice/space/app.bsky.bookmarks/self/app.bsky.feed.post/one"))
     }
 

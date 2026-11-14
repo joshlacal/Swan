@@ -9,7 +9,7 @@ final class AccountKEMKeyProviderTests: XCTestCase {
         let store = try FileAccountKeyStore(root: root,
             configuration: AccountKeyEncryptionConfiguration(activeKeyID: "test", activeKey: Data(repeating: 0x54, count: 32)))
         defer { try? FileManager.default.removeItem(at: root) }
-        let did = "did:web:alice.example"
+        let did = "did:web:alice.example.com"
         _ = try await AccountKeyProvisioner(keyStore: store).installInitial(accountDID: did,
             signingKey: P256.Signing.PrivateKey(), rotationKey: P256.Signing.PrivateKey())
         do {

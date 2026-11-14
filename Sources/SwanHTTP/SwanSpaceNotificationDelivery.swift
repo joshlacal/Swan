@@ -422,6 +422,115 @@ public struct HTTPPermissionedSpaceSyncNotificationTransport:
     }
 }
 
+/// Sends committed authority-side Space credential revocations
+/// (`com.atproto.space.notifyCredentialsRevoked`) to each repo host participating
+/// in the Space. Unlike `notifyRepoUpdate` (where `destination.audience` may be
+/// a service identifier such as `<did>#atproto_pds`), Proposal 0016 and
+/// `AuthenticatedNotifyCredentialsRevokedHandler` require the service JWT `aud`
+/// claim on `notifyCredentialsRevoked` to be the repo account's bare DID while
+/// binding the request body with `req`.
+public struct HTTPPermissionedSpaceCredentialRevocationTransport:
+    PermissionedSpaceCredentialRevocationTransport
+{
+    private let destinations: any SwanSpaceAuthorityNotificationDestinationResolving
+    private let serviceAuthentication: any SpaceServiceAuthenticationIssuer
+    private let poster: OAuthBoundedJSONPoster
+    private let localRevocationSink:
+        (@Sendable (String, SpaceURI, [String]) async throws -> Bool)?
+
+    public init(
+        destinations: any SwanSpaceAuthorityNotificationDestinationResolving,
+        serviceAuthentication: any SpaceServiceAuthenticationIssuer,
+        poster: OAuthBoundedJSONPoster,
+        localRevocationSink:
+            (@Sendable (String, SpaceURI, [String]) async throws -> Bool)? = nil
+    ) {
+        self.destinations = destinations
+        self.serviceAuthentication = serviceAuthentication
+        self.poster = poster
+        self.localRevocationSink = localRevocationSink
+    }
+
+    public func deliver(
+        _ notification: PersistedSpaceCredentialRevocationNotification
+    ) async -> PermissionedSpaceSyncNotificationDisposition {
+        guard (1 ... DurableSpaceCredentialRevocations.maximumCredentialsPerNotification)
+                .contains(notification.credentialIDs.count),
+              notification.credentialIDs.allSatisfy(
+                DurableSpaceCredentialRevocations.isValidCredentialID
+              ) else {
+            return .rejected
+        }
+        let resolvedDestination: SwanSpaceNotificationDestination?
+        do {
+            resolvedDestination = try await destinations.destination(
+                forAuthority: notification.recipientDID
+            )
+        } catch {
+            return .retryableFailure
+        }
+        guard let destination = resolvedDestination else {
+            if let localRevocationSink {
+                do {
+                    if try await localRevocationSink(
+                        notification.recipientDID,
+                        notification.space,
+                        notification.credentialIDs
+                    ) {
+                        return .delivered
+                    }
+                } catch {
+                    return .retryableFailure
+                }
+            }
+            return .retryableFailure
+        }
+
+        let endpoint: URL
+        let body: Data
+        let token: String
+        do {
+            endpoint = try notificationEndpoint(
+                destination.endpoint,
+                method: ComAtprotoSpaceNotifyCredentialsRevoked.typeIdentifier
+            )
+            body = try SwanJSONEncoders.sortedNoEscaping.encode(
+                ComAtprotoSpaceNotifyCredentialsRevoked.Input(
+                    space: try SpaceRef(uriString: notification.space.rawValue),
+                    credentials: notification.credentialIDs
+                )
+            )
+            let reqDigest = SpaceNotificationRequestDigest.credentialRevocation(
+                space: notification.space,
+                credentials: notification.credentialIDs
+            )
+            token = try await serviceAuthentication.issue(
+                issuer: notification.space.authority,
+                audience: notification.recipientDID,
+                method: ComAtprotoSpaceNotifyCredentialsRevoked.typeIdentifier,
+                eventID: UUID().uuidString.lowercased(),
+                requestBodyDigest: reqDigest,
+                now: Date()
+            )
+        } catch {
+            return .retryableFailure
+        }
+
+        do {
+            try await poster.postJSON(
+                to: endpoint,
+                headers: notificationHeaders(token),
+                body: body
+            )
+            return .delivered
+        } catch is OAuthOutboundPostPermanentlyRejected {
+            return .rejected
+        } catch {
+            return .retryableFailure
+        }
+    }
+}
+
 
 private func spaceSyncNotificationJSON(
     _ notification: PersistedSpaceSyncNotification

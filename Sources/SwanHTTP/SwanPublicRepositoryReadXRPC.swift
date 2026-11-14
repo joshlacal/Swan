@@ -1623,6 +1623,22 @@ private struct DecodableValueDecoder: Decoder {
             dict[key.stringValue] == nil
         }
 
+        func decode(_ type: String.Type, forKey key: Key) throws -> String {
+            guard let val = dict[key.stringValue] else {
+                throw DecodingError.keyNotFound(
+                    key,
+                    .init(codingPath: codingPath, debugDescription: "Missing key \(key.stringValue)")
+                )
+            }
+            guard case let .string(str) = val else {
+                throw DecodingError.typeMismatch(
+                    String.self,
+                    .init(codingPath: codingPath + [key], debugDescription: "Expected string")
+                )
+            }
+            return str
+        }
+
         func decode<T: Decodable>(_ type: T.Type, forKey key: Key) throws -> T {
             guard let val = dict[key.stringValue] else {
                 throw DecodingError.keyNotFound(
@@ -1630,7 +1646,13 @@ private struct DecodableValueDecoder: Decoder {
                     .init(codingPath: codingPath, debugDescription: "Missing key \(key.stringValue)")
                 )
             }
-            if type == String.self, case let .string(str) = val {
+            if type == String.self {
+                guard case let .string(str) = val else {
+                    throw DecodingError.typeMismatch(
+                        String.self,
+                        .init(codingPath: codingPath + [key], debugDescription: "Expected string")
+                    )
+                }
                 return str as! T
             }
             return try T(from: DecodableValueDecoder(value: val, codingPath: codingPath + [key]))
@@ -1671,13 +1693,34 @@ private struct DecodableValueDecoder: Decoder {
 
         mutating func decodeNil() throws -> Bool { false }
 
+        mutating func decode(_ type: String.Type) throws -> String {
+            guard !isAtEnd else {
+                throw DecodingError.valueNotFound(type, .init(codingPath: codingPath, debugDescription: "Unkeyed container is at end"))
+            }
+            let val = array[currentIndex]
+            currentIndex += 1
+            guard case let .string(str) = val else {
+                throw DecodingError.typeMismatch(
+                    String.self,
+                    .init(codingPath: codingPath, debugDescription: "Expected string")
+                )
+            }
+            return str
+        }
+
         mutating func decode<T: Decodable>(_ type: T.Type) throws -> T {
             guard !isAtEnd else {
                 throw DecodingError.valueNotFound(type, .init(codingPath: codingPath, debugDescription: "Unkeyed container is at end"))
             }
             let val = array[currentIndex]
             currentIndex += 1
-            if type == String.self, case let .string(str) = val {
+            if type == String.self {
+                guard case let .string(str) = val else {
+                    throw DecodingError.typeMismatch(
+                        String.self,
+                        .init(codingPath: codingPath, debugDescription: "Expected string")
+                    )
+                }
                 return str as! T
             }
             return try T(from: DecodableValueDecoder(value: val, codingPath: codingPath))
@@ -1712,8 +1755,24 @@ private struct DecodableValueDecoder: Decoder {
 
         func decodeNil() -> Bool { false }
 
+        func decode(_ type: String.Type) throws -> String {
+            guard case let .string(str) = value else {
+                throw DecodingError.typeMismatch(
+                    String.self,
+                    .init(codingPath: codingPath, debugDescription: "Expected string")
+                )
+            }
+            return str
+        }
+
         func decode<T: Decodable>(_ type: T.Type) throws -> T {
-            if type == String.self, case let .string(str) = value {
+            if type == String.self {
+                guard case let .string(str) = value else {
+                    throw DecodingError.typeMismatch(
+                        String.self,
+                        .init(codingPath: codingPath, debugDescription: "Expected string")
+                    )
+                }
                 return str as! T
             }
             return try T(from: DecodableValueDecoder(value: value, codingPath: codingPath))

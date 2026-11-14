@@ -2088,7 +2088,7 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
     )
     let wrongSpace = try SpaceURI(
       authority: "did:plc:wrong-incremental-space",
-      spaceType: "app.swan.remote-replica", skey: "wrong"
+      spaceType: "app.swan.remoteReplica", skey: "wrong"
     )
     let wrongURI = try SpaceRecordURI(
       space: wrongSpace, author: fixture.repositoryDID,
@@ -2228,7 +2228,7 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
 
     let missingSpace = try SpaceURI(
       authority: "did:plc:missing-replica-authority",
-      spaceType: "app.swan.remote-replica", skey: "missing"
+      spaceType: "app.swan.remoteReplica", skey: "missing"
     )
     let missingTarget = try PermissionedRemoteReplicaTarget(
       receiverDID: fixture.receiverDID,
@@ -2735,7 +2735,7 @@ private struct RemoteReplicaSQLiteFixture {
     )
     space = try SpaceURI(
       authority: "did:plc:remote-replica-authority",
-      spaceType: "app.swan.remote-replica",
+      spaceType: "app.swan.remoteReplica",
       skey: skey
     )
     target = try PermissionedRemoteReplicaTarget(

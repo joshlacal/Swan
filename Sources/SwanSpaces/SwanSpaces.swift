@@ -43,37 +43,34 @@ public struct SpaceURI: Sendable, Codable, Hashable, CustomStringConvertible {
     public let skey: String
 
     public init(authority: String, spaceType: String, skey: String) throws {
-        guard Self.isValidDID(authority), Self.isValidNSID(spaceType), Self.isValidRecordKey(skey) else {
+        guard let ref = try? SpaceRef(spaceDID: authority, spaceType: spaceType, skey: skey),
+              Self.isValidDID(authority), Self.isValidNSID(spaceType), Self.isValidRecordKey(skey) else {
             throw SwanError.invalidIdentifier("space URI")
         }
-        self.authority = authority
-        self.spaceType = spaceType
-        self.skey = skey
+        self.authority = ref.spaceDID
+        self.spaceType = ref.spaceType
+        self.skey = ref.skey
+    }
+
+    public init(_ spaceRef: SpaceRef) throws {
+        try self.init(authority: spaceRef.spaceDID, spaceType: spaceRef.spaceType, skey: spaceRef.skey)
     }
 
     public init(_ rawValue: String) throws {
-        let parsed = try Self.parse(rawValue)
-        guard parsed.path.count == 3, parsed.path[0] == "space" else {
+        guard let ref = try? SpaceRef(uriString: rawValue) else {
             throw SwanError.invalidIdentifier(rawValue)
         }
-        try self.init(authority: parsed.authority, spaceType: parsed.path[1], skey: parsed.path[2])
+        try self.init(ref)
     }
 
-    public var description: String { "at://\(authority)/space/\(spaceType)/\(skey)" }
+    public func toSpaceRef() throws -> SpaceRef {
+        try SpaceRef(spaceDID: authority, spaceType: spaceType, skey: skey)
+    }
+
+    public var description: String {
+        (try? toSpaceRef().uriString()) ?? "at://\(authority)/space/\(spaceType)/\(skey)"
+    }
     public var rawValue: String { description }
-
-    fileprivate static func parse(_ rawValue: String) throws -> (authority: String, path: [String]) {
-        guard rawValue.hasPrefix("at://"), !rawValue.contains("?") && !rawValue.contains("#") else {
-            throw SwanError.invalidIdentifier(rawValue)
-        }
-        let remainder = rawValue.dropFirst(5)
-        let pieces = remainder.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
-        guard let authority = pieces.first, !authority.isEmpty, pieces.count > 1,
-              !pieces.dropFirst().contains(where: { $0.isEmpty }) else {
-            throw SwanError.invalidIdentifier(rawValue)
-        }
-        return (authority, Array(pieces.dropFirst()))
-    }
 
     static func isValidDID(_ value: String) -> Bool {
         let parts = value.split(separator: ":", omittingEmptySubsequences: false)
@@ -122,15 +119,24 @@ public struct SpaceRecordURI: Sendable, Codable, Hashable, CustomStringConvertib
     }
 
     public init(_ rawValue: String) throws {
-        let parsed = try SpaceURI.parse(rawValue)
-        guard parsed.path.count == 6, parsed.path[0] == "space" else {
+        guard let uri = try? ATProtocolURI(uriString: rawValue),
+              uri.isSpace,
+              let spaceDID = uri.spaceDID,
+              let spaceType = uri.spaceType,
+              let skey = uri.skey,
+              let author = uri.authorDID,
+              let collection = uri.collection,
+              let rkey = uri.recordKey else {
             throw SwanError.invalidIdentifier(rawValue)
         }
-        let space = try SpaceURI(authority: parsed.authority, spaceType: parsed.path[1], skey: parsed.path[2])
-        try self.init(space: space, author: parsed.path[3], collection: parsed.path[4], rkey: parsed.path[5])
+        let space = try SpaceURI(authority: spaceDID, spaceType: spaceType, skey: skey)
+        try self.init(space: space, author: author, collection: collection, rkey: rkey)
     }
 
-    public var description: String { "\(space)/\(author)/\(collection)/\(rkey)" }
+    public var description: String {
+        (try? space.toSpaceRef().recordURI(authorDID: author, collection: collection, recordKey: rkey).uriString())
+            ?? "\(space)/\(author)/\(collection)/\(rkey)"
+    }
     public var rawValue: String { description }
 }
 

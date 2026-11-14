@@ -629,6 +629,15 @@ public actor SQLitePreMigratedAccountDirectory:
         try await requireLifecycleAuthorityStillAvailable(space.authority)
     }
 
+    public func recentlyRevokedSpaceCredentialIDs(
+        _ space: SpaceURI
+    ) async throws -> [String] {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        let revoked = try await database.recentlyRevokedSpaceCredentialIDs(space)
+        try await requireCredentialAuthorityStillAvailable(space.authority)
+        return revoked
+    }
+
     public func simpleSpaceMembers(
         _ space: SpaceURI,
         limit: Int,
@@ -793,6 +802,34 @@ public actor SQLitePreMigratedAccountDirectory:
                 space: space,
                 endpoint: endpoint,
                 token: token
+            )
+            try await requireCredentialAuthorityStillAvailable(space.authority)
+        } catch let error as SwanError {
+            throw error
+        } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch let error as AuthorizedSpaceAuthorityStatusError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    public func recordIssuedSpaceCredential(
+        space: SpaceURI,
+        user: String?,
+        credentialID: String,
+        expiresAt: Date,
+        now: Date
+    ) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        do {
+            try await database.recordIssuedSpaceCredential(
+                space: space,
+                user: user,
+                credentialID: credentialID,
+                expiresAt: expiresAt,
+                now: now
             )
             try await requireCredentialAuthorityStillAvailable(space.authority)
         } catch let error as SwanError {

@@ -98,9 +98,30 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
                     .invalidOperation
             }
 
+            let parsedCID: CID?
+            if let rawCID = entry.cid {
+                guard let validCID = rawCID.cid else {
+                    throw PermissionedRemoteReplicaIncrementalVerificationError
+                        .invalidOperation
+                }
+                parsedCID = validCID
+            } else {
+                parsedCID = nil
+            }
+            let parsedPrevious: CID?
+            if let rawPrevious = entry.prev {
+                guard let validPrevious = rawPrevious.cid else {
+                    throw PermissionedRemoteReplicaIncrementalVerificationError
+                        .invalidOperation
+                }
+                parsedPrevious = validPrevious
+            } else {
+                parsedPrevious = nil
+            }
+
             let action: PermissionedRemoteReplicaIncrementalAction
             let value: Data?
-            switch (entry.cid, entry.prev) {
+            switch (parsedCID, parsedPrevious) {
             case let (.some(cid), nil):
                 action = .create
                 value = try canonicalValue(entry.value, cid: cid)
@@ -134,8 +155,8 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
                 wireRevision: revision,
                 action: action,
                 uri: uri,
-                cid: entry.cid,
-                previousCID: entry.prev,
+                cid: parsedCID,
+                previousCID: parsedPrevious,
                 value: value
             ))
         }
@@ -207,6 +228,17 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
             throw PermissionedRemoteReplicaIncrementalVerificationError
                 .mixedHead
         }
+    }
+
+    static func canonicalValue(
+        _ value: ATProtocolValueContainer?,
+        cid: CIDString
+    ) throws -> Data {
+        guard let parsedCID = cid.cid else {
+            throw PermissionedRemoteReplicaIncrementalVerificationError
+                .invalidOperation
+        }
+        return try canonicalValue(value, cid: parsedCID)
     }
 
     static func canonicalValue(

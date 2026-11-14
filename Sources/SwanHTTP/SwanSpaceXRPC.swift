@@ -405,7 +405,7 @@ private struct AuthenticatedGetRecordHandler: ComAtprotoSpaceGetRecord.ServerHan
             }
             return ComAtprotoSpaceGetRecord.Output(
                 uri: try ATProtocolURI(uriString: record.uri.rawValue),
-                cid: cid,
+                cid: CIDString(cid),
                 value: try CARRepository.decodeRecordCBOR(record.value)
             )
         } catch let failure as AuthenticatedSpaceRecordFailure {
@@ -502,7 +502,7 @@ private struct AuthenticatedListRecordsHandler: ComAtprotoSpaceListRecords.Serve
                 return ComAtprotoSpaceListRecords.Record(
                     collection: try NSID(nsidString: record.uri.collection),
                     rkey: try RecordKey(keyString: record.uri.rkey),
-                    cid: cid,
+                    cid: CIDString(cid),
                     value: value
                 )
             }
@@ -587,7 +587,7 @@ private struct AuthenticatedListBlobsHandler: ComAtprotoSpaceListBlobs.ServerHan
             // and only a full page advertises one.
             return ComAtprotoSpaceListBlobs.Output(
                 cursor: cids.count < limit ? nil : cids.last,
-                cids: try cids.map { try CID.parse($0) }
+                cids: try cids.map { CIDString(try CID.parse($0)) }
             )
         } catch {
             throw AuthenticatedSpaceRecordFailure.unavailable
@@ -898,7 +898,7 @@ private struct AuthenticatedCreateRecordHandler: ComAtprotoSpaceCreateRecord.Ser
             throw AuthenticatedSpaceWriteFailure.unavailable
         }
         return try ComAtprotoSpaceCreateRecord.Output(
-            uri: ATProtocolURI(uriString: uri.rawValue), cid: CID.parse(cid)
+            uri: ATProtocolURI(uriString: uri.rawValue), cid: CIDString(CID.parse(cid))
         )
     }
 }
@@ -925,7 +925,7 @@ private struct AuthenticatedPutRecordHandler: ComAtprotoSpacePutRecord.ServerHan
             throw AuthenticatedSpaceWriteFailure.unavailable
         }
         return try ComAtprotoSpacePutRecord.Output(
-            uri: ATProtocolURI(uriString: uri.rawValue), cid: CID.parse(cid)
+            uri: ATProtocolURI(uriString: uri.rawValue), cid: CIDString(CID.parse(cid))
         )
     }
 }
@@ -985,8 +985,6 @@ private struct AuthenticatedApplyWritesHandler: ComAtprotoSpaceApplyWrites.Serve
                 ))
             case let .comAtprotoSpaceApplyWritesDelete(delete):
                 writes.append(.delete(uri: try makeWriteURI(space: input.space, repo: input.repo, collection: delete.collection, rkey: delete.rkey)))
-            case .unexpected:
-                throw AuthenticatedSpaceWriteFailure.invalidRequest
             }
         }
         let authorization = try await authorizeWrite(
@@ -1002,10 +1000,10 @@ private struct AuthenticatedApplyWritesHandler: ComAtprotoSpaceApplyWrites.Serve
             switch result.action {
             case .create:
                 guard let cid = result.cid else { throw AuthenticatedSpaceWriteFailure.unavailable }
-                return .comAtprotoSpaceApplyWritesCreateResult(.init(uri: try ATProtocolURI(uriString: result.uri.rawValue), cid: try CID.parse(cid), validationStatus: nil))
+                return .comAtprotoSpaceApplyWritesCreateResult(.init(uri: try ATProtocolURI(uriString: result.uri.rawValue), cid: CIDString(try CID.parse(cid)), validationStatus: nil))
             case .update:
                 guard let cid = result.cid else { throw AuthenticatedSpaceWriteFailure.unavailable }
-                return .comAtprotoSpaceApplyWritesUpdateResult(.init(uri: try ATProtocolURI(uriString: result.uri.rawValue), cid: try CID.parse(cid), validationStatus: nil))
+                return .comAtprotoSpaceApplyWritesUpdateResult(.init(uri: try ATProtocolURI(uriString: result.uri.rawValue), cid: CIDString(try CID.parse(cid)), validationStatus: nil))
             case .delete:
                 return .comAtprotoSpaceApplyWritesDeleteResult(.init())
             }

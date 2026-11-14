@@ -53,6 +53,9 @@ public struct SwanConversationSpaceLifecycle: AuthorizedSimpleSpaceLifecycleDire
         try requireLocalPolicy(space)
         try await local.removeSimpleSpaceMembers(members, from: space, authorization: authorization)
     }
+    public func recentlyRevokedSpaceCredentialIDs(_ space: SpaceURI) async throws -> [String] {
+        try await local.recentlyRevokedSpaceCredentialIDs(space)
+    }
     public func simpleSpaceMembers(_ space: SpaceURI, limit: Int, cursor: String?, authorization: AuthorizationContext) async throws -> AuthorizedSimpleSpaceMemberPage {
         try requireLocalPolicy(space)
         return try await local.simpleSpaceMembers(space, limit: limit, cursor: cursor, authorization: authorization)

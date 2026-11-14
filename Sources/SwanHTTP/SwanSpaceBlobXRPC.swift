@@ -270,8 +270,8 @@ private func blobTarget(
             collection: "app.swan.blob",
             rkey: "scope"
         )
-        let cid = parameters.cid
-        guard cid.string == parameters.cid.string,
+        guard let cid = parameters.cid.cid,
+              cid.string == parameters.cid.string,
               cid.codec == .raw,
               cid.multihash.algorithm == Multihash.sha256Code,
               cid.multihash.length == Multihash.sha256Length,
@@ -388,7 +388,7 @@ private func parseAuthenticatedGetSpaceBlobParameters(
     let parameters = ComAtprotoSpaceGetBlob.Parameters(
         space: space,
         repo: repo,
-        cid: cid
+        cid: CIDString(cid)
     )
     _ = try blobTarget(parameters)
     return parameters

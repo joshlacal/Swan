@@ -8,7 +8,7 @@ import XCTest
 /// Current DID-document credential-key and PDS service resolution for
 /// did:plc / did:web issuers, with malformed entries rejected.
 final class SpacesOpenFederationTests: XCTestCase {
-    private let authority = "did:web:authority.example"
+    private let authority = "did:web:authority.example.com"
     private let key = P256.Signing.PrivateKey()
 
     private var multikey: String {
@@ -79,7 +79,7 @@ final class SpacesOpenFederationTests: XCTestCase {
 
     func testUnsupportedMethodsAndForeignDocumentsResolveNothing() async throws {
         let (resolver, fetcher) = resolver([
-            "did:web:mismatch.example": document(methods: atprotoMethod),
+            "did:web:mismatch.example.com": document(methods: atprotoMethod),
         ])
         let other: PermissionedDataJWTVerificationKey? =
             try await resolver.publicKey(for: "did:key:z6Mk", keyID: "#atproto")
@@ -89,7 +89,7 @@ final class SpacesOpenFederationTests: XCTestCase {
         // A document whose id is not the requested DID is refused.
         do {
             let _: PermissionedDataJWTVerificationKey? =
-                try await resolver.publicKey(for: "did:web:mismatch.example", keyID: "#atproto")
+                try await resolver.publicKey(for: "did:web:mismatch.example.com", keyID: "#atproto")
             XCTFail("a document for another DID must not resolve")
         } catch {}
     }
@@ -132,7 +132,7 @@ final class SpacesOpenFederationTests: XCTestCase {
         for index in 0 ..< 4 {
             do {
                 let _: PermissionedDataJWTVerificationKey? = try await resolver.publicKey(
-                    for: "did:web:issuer\(index).example",
+                    for: "did:web:issuer\(index).example.com",
                     keyID: "#atproto"
                 )
             } catch {}

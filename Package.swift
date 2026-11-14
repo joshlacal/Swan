@@ -20,11 +20,8 @@ let package = Package(
         .executable(name: "swan", targets: ["swan"]),
     ],
     dependencies: [
-        // Immutable November 12 backport on Swan's pre-2.0 Petrel line. It
-        // provides the regenerated Spaces types without pulling the unrelated
-        // Petrel 2.0 API migration into this protocol cutover.
-        .package(url: "https://github.com/joshlacal/Petrel.git",
-                 revision: "db6c3ccbaff9d62e84c12e9183e2dc292585fc05"),
+        // Unified Petrel 2.0 + November 12 Spaces line (Wave 1 `wave1-petrel` @ 932c8292).
+        .package(name: "Petrel", path: "/Users/joshlacalamito/Developer/.workspaces/dec1-w0/wave1-petrel"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.36.0"),

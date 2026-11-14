@@ -247,6 +247,26 @@ private struct AuthenticatedSpaceUpdateHandler {
     }
 }
 
+private func recordLocalSpaceCredentialRevocations(
+    _ capability: SwanAuthenticatedSimpleSpaceLifecycleCapability,
+    space: SpaceURI
+) async {
+    guard let credentialIDs = try? await capability.directory.recentlyRevokedSpaceCredentialIDs(space),
+          !credentialIDs.isEmpty else {
+        return
+    }
+    let chunkSize = DurableSpaceCredentialRevocations.maximumCredentialsPerNotification
+    var start = 0
+    while start < credentialIDs.count {
+        let end = min(start + chunkSize, credentialIDs.count)
+        try? await capability.authorizer.recordSpaceCredentialRevocations(
+            space: space,
+            credentialIDs: Array(credentialIDs[start ..< end])
+        )
+        start = end
+    }
+}
+
 private struct AuthenticatedSpaceDeleteHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
@@ -262,6 +282,7 @@ private struct AuthenticatedSpaceDeleteHandler {
         } catch {
             throw lifecycleFailure(for: error)
         }
+        await recordLocalSpaceCredentialRevocations(capability, space: input.space)
     }
 }
 
@@ -328,6 +349,7 @@ private struct AuthenticatedMemberspaceRemoveMembersHandler {
         } catch {
             throw lifecycleFailure(for: error)
         }
+        await recordLocalSpaceCredentialRevocations(capability, space: input.space)
     }
 }
 

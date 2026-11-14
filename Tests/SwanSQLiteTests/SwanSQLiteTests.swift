@@ -594,10 +594,11 @@ final class SwanSQLiteTests: XCTestCase {
             String(fixture.firstCID.prefix(1))
             + fixture.firstCID.dropFirst().uppercased()
         XCTAssertNotEqual(nonCanonicalCID, fixture.firstCID)
-        XCTAssertEqual(
-            try CID.parse(nonCanonicalCID),
-            try CID.parse(fixture.firstCID)
-        )
+        XCTAssertThrowsError(try CID.parse(nonCanonicalCID)) { error in
+            guard case CID.CIDParseError.nonCanonicalEncoding = error else {
+                return XCTFail("expected nonCanonicalEncoding, got \(error)")
+            }
+        }
         for (value, cid) in [
             (nonCanonical, CID.fromDAGCBOR(nonCanonical).string),
             (fixture.firstValue, fixture.secondCID),

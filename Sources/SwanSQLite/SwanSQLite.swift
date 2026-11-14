@@ -2777,6 +2777,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migrateRemoteReplicaLifecycleFenceIfNeeded()
             try await migrateSpacePolicyIfNeeded()
             try await migrateSpaceNotificationsV30IfNeeded()
+            try await migrateSpaceCredentialRevocationOutboxIfNeeded()
         }
         try await migrateSpaceNotificationReceiptScopeIfNeeded()
         try await compactSpaceNotificationReceiptsIfNeeded()
@@ -8301,6 +8302,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         && stored.state.space.members[$0] != nil
                 }
                 guard !existing.isEmpty else { return stored.state }
+                _ = try await enqueueMemberSpaceCredentialRevocationsWithoutGate(
+                    space: space,
+                    members: Array(existing),
+                    timestamp: timestamp
+                )
                 for member in existing {
                     try await removeSpaceWriterWithoutGate(space: space, writer: member)
                     _ = try await connection.query(
@@ -8490,6 +8496,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         .integer(timestamp), .integer(timestamp),
                         .text(space.rawValue),
                     ]
+                )
+                _ = try await enqueueAllSpaceCredentialRevocationsWithoutGate(
+                    space: space,
+                    timestamp: timestamp
                 )
                 _ = try await connection.query(
                     "DELETE FROM permissioned_space_writers WHERE space_uri = ?",

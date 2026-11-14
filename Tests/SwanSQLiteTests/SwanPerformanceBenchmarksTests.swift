@@ -540,12 +540,12 @@ final class SwanPerformanceBenchmarksTests: XCTestCase {
         ) {
             let scopeStr = sampleScopes[scopeIdx % sampleScopes.count]
             scopeIdx += 1
-            _ = try ScopeStringSyntax.parse(scopeStr)
+            _ = try SwanCore.ScopeStringSyntax.parse(scopeStr)
         }
         printResult(parseResult)
         expectThroughput(parseResult, atLeast: 20_000)
 
-        let parsedScopes = try sampleScopes.map { try ScopeStringSyntax.parse($0) }
+        let parsedScopes = try sampleScopes.map { try SwanCore.ScopeStringSyntax.parse($0) }
         var canonicalIdx = 0
         let canonResult = try measureSyncBenchmark(
             name: "Scope Canonicalizer: Scope Permissions Canonical String Serialization",

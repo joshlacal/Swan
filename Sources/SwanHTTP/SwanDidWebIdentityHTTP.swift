@@ -490,9 +490,14 @@ public struct SwanDidWebIdentityHTTP: Sendable {
                 return .unprocessable(message)
             case let .malformed(message):
                 return .unprocessable(message)
+            case .notFound, .tombstoned:
+                return .unprocessable(error.description)
+            case let .rejected(status, message):
+                if status == 409 { return .conflict }
+                return .unprocessable(message.isEmpty ? error.description : message)
             case .invalidProfile:
                 return .serviceUnavailable
-            case .unavailable:
+            case .unavailable, .rateLimited, .submittedButUnconfirmed:
                 return .serviceUnavailable
             }
         case let error as AccountControlStoreError:

@@ -4197,6 +4197,9 @@ extension SwanCommand {
                     } catch {
                         throw ValidationError("notification peer-pinned transport is unavailable")
                     }
+                    let localRevocations = DurableSpaceCredentialRevocations(
+                        store: controlDatabase
+                    )
                     notificationRecoveryService = try await .fromPreopenedDirectory(
                         directory,
                         makeOutboxTransport: { database in
@@ -4210,6 +4213,24 @@ extension SwanCommand {
                         makeSyncTransport: { _ in
                             HTTPPermissionedSpaceSyncNotificationTransport(
                                 poster: poster
+                            )
+                        },
+                        makeRevocationTransport: { _ in
+                            HTTPPermissionedSpaceCredentialRevocationTransport(
+                                destinations: outboxDestinations,
+                                serviceAuthentication: serviceIssuer,
+                                poster: poster,
+                                localRevocationSink: { recipientDID, space, credentialIDs in
+                                    guard let account = try await controlDatabase.account(did: recipientDID),
+                                          account.status == .active else {
+                                        return false
+                                    }
+                                    try await localRevocations.record(
+                                        space: space,
+                                        credentialIDs: credentialIDs
+                                    )
+                                    return true
+                                }
                             )
                         },
                         allowLocalhostDevelopment:

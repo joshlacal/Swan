@@ -162,8 +162,12 @@ final class SwanAccountsTests: XCTestCase {
 
         XCTAssertEqual(try AccountIdentifiers.validateDID(Self.aliceDID), Self.aliceDID)
         XCTAssertEqual(
-            try AccountIdentifiers.validateDID("did:web:example.com%3A443:user:Alice"),
-            "did:web:example.com%3A443:user:Alice"
+            try AccountIdentifiers.validateDID("did:web:example.com"),
+            "did:web:example.com"
+        )
+        XCTAssertEqual(
+            try AccountIdentifiers.validateDID("did:web:localhost%3A8080"),
+            "did:web:localhost%3A8080"
         )
         for did in [
             "DID:plc:abcdefghijklmnopqrstuvwx",
@@ -173,8 +177,9 @@ final class SwanAccountsTests: XCTestCase {
             "did:plc:abcdefghijklmnopqrstuvw0",
             "did:plc:abcdefghijklmnopqrstuvWX",
             "did:key:abcdefghijklmnopqrstuvwx",
+            "did:web:example.com%3A443:user:Alice",
             "did:web:example.com%3a443",
-            "did:web:Example.com",
+            "did:web:alice.example",
             "did:web:example.com:%61",
         ] {
             XCTAssertThrowsError(try AccountIdentifiers.validateDID(did), did)

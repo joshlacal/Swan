@@ -1295,7 +1295,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
             let canonicalRecord = try DAGCBOR.encodeValue(
                 output.value.toCBORValue()
             )
-            XCTAssertEqual(output.cid, CID.fromDAGCBOR(canonicalRecord))
+            XCTAssertEqual(output.cid.cid, CID.fromDAGCBOR(canonicalRecord))
             XCTAssertEqual(output.uri.uriString(), try SpaceRecordURI(
                 space: space,
                 author: localDID,

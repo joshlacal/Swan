@@ -31,7 +31,7 @@ final class SwanInteropTests: XCTestCase {
         XCTAssertEqual(OfflineProtocolProfileVerifier.stableProfileID, "permissioned-data-0016-2026-11-12")
         let profile = try Data(contentsOf: fixture.profileURL)
         XCTAssertEqual(SHA256.hash(data: profile).map { String(format: "%02x", $0) }.joined(),
-                       "c17bf5afdf09fd1ad23ce41f9f317f42894ae79838d62d746bbb62f08b790141")
+                       "94883aec91cc77c0151bd2fd6b496c2115a0e8bacbc8fca69b32ce865b63c681")
     }
 
     func testLegacyPermissionedProfileArtifactsRemainByteExact() throws {

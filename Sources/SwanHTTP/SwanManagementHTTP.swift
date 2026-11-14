@@ -924,8 +924,12 @@ private func status(for error: any Error) -> HTTPResponse.Status {
         if case .unavailable = error { return .serviceUnavailable }
         return .badRequest
     case let error as PetrelPLCError:
-        if case .unavailable = error { return .serviceUnavailable }
-        return .badRequest
+        switch error {
+        case .unavailable, .rateLimited, .submittedButUnconfirmed:
+            return .serviceUnavailable
+        default:
+            return .badRequest
+        }
     case is AccountControlStoreError:
         return .badRequest
     default:
