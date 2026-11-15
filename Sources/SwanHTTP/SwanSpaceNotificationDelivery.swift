@@ -60,12 +60,13 @@ public struct HTTPSwanSpaceRegistrationConfirmer: SwanSpaceRegistrationConfirmin
             )
         )
         let host = try policy.validateURL(url)
+        let port = URLComponents(url: url, resolvingAgainstBaseURL: false)?.port
         let before = Set(
             try await resolveRegistrationHostname(
                 resolver, host: host, timeout: policy.timeout
             )
         )
-        try policy.validateResolved(Array(before), host: host)
+        try policy.validateResolved(Array(before), host: host, port: port)
         let response = try await transport.post(
             url: url,
             approvedPeers: before,
@@ -82,15 +83,29 @@ public struct HTTPSwanSpaceRegistrationConfirmer: SwanSpaceRegistrationConfirmin
                 resolver, host: host, timeout: policy.timeout
             )
         )
-        try policy.validateResolved(Array(after), host: host)
+        try policy.validateResolved(Array(after), host: host, port: port)
         guard (200 ... 299).contains(response.status),
               response.redirectCount == 0,
-              response.responseURL == url,
+              response.responseURL.absoluteString == url.absoluteString,
               let peer = response.connectedPeerAddress,
               before.contains(peer),
               after.contains(peer),
+              policy.permits(peer, forHost: host, port: port),
               response.body.count <= 4_096 else {
             throw SwanError.unavailable("registration confirmation failed")
+        }
+        let normalizedHeaders = response.headers.reduce(into: [String: [String]]()) { output, item in
+            output[item.key.lowercased(), default: []].append(contentsOf: item.value)
+        }
+        if let lengths = normalizedHeaders["content-length"] {
+            guard lengths.count == 1,
+                  !lengths[0].isEmpty,
+                  lengths[0].utf8.allSatisfy({ (48 ... 57).contains($0) }),
+                  let declared = Int(lengths[0]),
+                  declared == response.body.count,
+                  declared <= 4_096 else {
+                throw SwanError.unavailable("registration confirmation failed")
+            }
         }
         try StrictJSON.validate(response.body)
         guard let object = try JSONSerialization.jsonObject(with: response.body)

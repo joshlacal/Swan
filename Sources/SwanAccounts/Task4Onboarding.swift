@@ -255,11 +255,32 @@ public actor TurnstileVerifier {
     }
 }
 
+private final class DisallowRedirectsURLSessionDelegate: NSObject, URLSessionTaskDelegate, Sendable {
+    func urlSession(
+        _: URLSession,
+        task _: URLSessionTask,
+        willPerformHTTPRedirection _: HTTPURLResponse,
+        newRequest _: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
 /// Production-neutral URLSession adapter. It is deliberately supplied as an
 /// injected transport so tests never contact Cloudflare and deployments can
 /// provide a peer-pinned/bounded HTTP client without changing verification
 /// policy.
 public struct URLSessionTurnstileTransport: TurnstileHTTPTransport {
+    private static let maximumResponseBytes = 16_384
+    private static let session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.urlCache = nil
+        configuration.urlCredentialStorage = nil
+        return URLSession(configuration: configuration, delegate: DisallowRedirectsURLSessionDelegate(), delegateQueue: nil)
+    }()
+
     public let endpoint: URL
     public let timeout: TimeInterval
     public init(endpoint: URL = URL(string: "https://challenges.cloudflare.com/turnstile/v0/siteverify")!, timeout: TimeInterval = 5) throws {
@@ -290,8 +311,13 @@ public struct URLSessionTurnstileTransport: TurnstileHTTPTransport {
         if let remoteIP = request.remoteIP { components.queryItems?.append(URLQueryItem(name: "remoteip", value: remoteIP)) }
         urlRequest.httpBody = components.percentEncodedQuery?.data(using: .utf8)
         try Task.checkCancellation()
-        let (data, response) = try await URLSession.shared.data(for: urlRequest)
-        guard (200 ..< 300).contains((response as? HTTPURLResponse)?.statusCode ?? 0) else { throw TurnstileVerificationError.transport }
+        let (data, response) = try await Self.session.data(for: urlRequest)
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200 ..< 300).contains(httpResponse.statusCode),
+              httpResponse.url?.absoluteString == endpoint.absoluteString,
+              data.count <= Self.maximumResponseBytes else {
+            throw TurnstileVerificationError.transport
+        }
         struct Wire: Decodable {
             let success: Bool
             let challenge_ts: String?

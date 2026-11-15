@@ -8,6 +8,11 @@ import XCTest
 private actor RecordingTransport: SwanProxyTransporting {
     private(set) var approved: Set<OAuthIPAddress> = []
     private(set) var sent: SwanProxyRequest?
+    private let overrideResponse: OAuthRemoteHTTPResponse?
+
+    init(overrideResponse: OAuthRemoteHTTPResponse? = nil) {
+        self.overrideResponse = overrideResponse
+    }
 
     func send(
         _ request: SwanProxyRequest, approvedPeers: Set<OAuthIPAddress>,
@@ -15,8 +20,16 @@ private actor RecordingTransport: SwanProxyTransporting {
     ) async throws -> OAuthRemoteHTTPResponse {
         approved = approvedPeers
         sent = request
+        if let overrideResponse {
+            return overrideResponse
+        }
+        let chosenPeer = approvedPeers.sorted(by: { $0.description < $1.description }).first
         return OAuthRemoteHTTPResponse(
-            status: 200, headers: [:], body: Data("{}".utf8), responseURL: request.url
+            status: 200,
+            headers: [:],
+            body: Data("{}".utf8),
+            responseURL: request.url,
+            connectedPeerAddress: chosenPeer
         )
     }
 

@@ -63,20 +63,51 @@ public struct SwanPeerPinnedProxySender: SwanProxySending {
         guard Self.permittedMethods.contains(request.method) else {
             throw SwanError.malformed("proxied method is not permitted")
         }
+        guard maximumBodyBytes > 0 else {
+            throw SwanError.malformed("proxied response body bound must be positive")
+        }
         let host = try policy.validateURL(request.url)
+        let port = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.port
         // The caller holds a pipethrough lease across this call, and
         // `getaddrinfo` has no cancellation handle, so an attacker-selected
         // service hostname served by a blackholed nameserver would otherwise
         // hold that lease indefinitely. Bound resolution by the same policy
         // deadline the transport uses.
-        let resolved = try await resolveOAuthHostname(
+        let before = Set(try await resolveOAuthHostname(
             resolver, host: host, timeout: policy.timeout
-        )
-        try policy.validateResolved(resolved, host: host)
-        return try await transport.send(
-            request, approvedPeers: Set(resolved), timeout: timeout,
+        ))
+        try policy.validateResolved(Array(before), host: host, port: port)
+        let response = try await transport.send(
+            request, approvedPeers: before, timeout: timeout,
             maximumBodyBytes: maximumBodyBytes
         )
+        let after = Set(try await resolveOAuthHostname(
+            resolver, host: host, timeout: policy.timeout
+        ))
+        try policy.validateResolved(Array(after), host: host, port: port)
+        guard response.redirectCount == 0,
+              response.responseURL.absoluteString == request.url.absoluteString,
+              response.body.count <= maximumBodyBytes,
+              let peer = response.connectedPeerAddress,
+              before.contains(peer),
+              after.contains(peer),
+              policy.permits(peer, forHost: host, port: port) else {
+            throw SwanError.unauthorized("proxied XRPC response failed peer or framing policy")
+        }
+        let normalizedHeaders = response.headers.reduce(into: [String: [String]]()) { output, item in
+            output[item.key.lowercased(), default: []].append(contentsOf: item.value)
+        }
+        if let lengths = normalizedHeaders["content-length"] {
+            guard lengths.count == 1,
+                  !lengths[0].isEmpty,
+                  lengths[0].utf8.allSatisfy({ (48 ... 57).contains($0) }),
+                  let declared = Int(lengths[0]),
+                  declared == response.body.count,
+                  declared <= maximumBodyBytes else {
+                throw SwanError.unauthorized("proxied XRPC response content length is invalid")
+            }
+        }
+        return response
     }
 }
 

@@ -25,8 +25,11 @@ public enum SwanPublicAddressPolicy {
         if first == 172, (16 ... 31).contains(second) { return false }
         if first == 192, second == 0, third == 0 { return false }
         if first == 192, second == 0, third == 2 { return false }
+        if first == 192, second == 31, third == 196 { return false } // RFC 7535 AS112-v4
+        if first == 192, second == 52, third == 193 { return false } // RFC 7450 AMT
         if first == 192, second == 88, third == 99 { return false }
         if first == 192, second == 168 { return false }
+        if first == 192, second == 175, third == 48 { return false } // RFC 7534 Direct Delegation AS112
         if first == 198, second == 18 || second == 19 { return false }
         if first == 198, second == 51, third == 100 { return false }
         if first == 203, second == 0, third == 113 { return false }
@@ -59,9 +62,10 @@ public enum SwanPublicAddressPolicy {
         // bytes 2...5, so accepting it would be a second spelling for every
         // IPv4 address this policy already refuses.
         let deniedSpecialPurposePrefixes: [([UInt8], Int)] = [
-            ([0x20, 0x01, 0x00], 23), // IETF assignments
+            ([0x20, 0x01, 0x00], 23), // IETF assignments (incl. Teredo 2001::/32, ORCHID, AS112-v6)
             ([0x20, 0x01, 0x0D, 0xB8], 32), // documentation
             ([0x20, 0x02], 16), // 6to4
+            ([0x26, 0x20, 0x00, 0x4F, 0x80, 0x00], 48), // RFC 7534 Direct Delegation AS112-v6
             ([0x3F, 0xFF, 0x00], 20), // documentation
         ]
         return !deniedSpecialPurposePrefixes.contains {

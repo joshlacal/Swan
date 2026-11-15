@@ -104,8 +104,9 @@ public struct RemoteConversationSpaceMembershipChecker: ConversationSpaceMembers
         let token = try await signer.issue(issuer: space.authority, audience: audience, method: method,
             eventID: UUID().uuidString.lowercased(), requestBodyDigest: nil, now: now)
         let host = try policy.validateURL(url)
+        let port = URLComponents(url: url, resolvingAgainstBaseURL: false)?.port
         let before = Set(try await resolveOAuthHostname(resolver, host: host, timeout: policy.timeout))
-        try policy.validateResolved(Array(before), host: host)
+        try policy.validateResolved(Array(before), host: host, port: port)
         var headers = ["Authorization": "Bearer " + token, "Accept": "application/json"]
         let response: OAuthRemoteHTTPResponse
         if let body {
@@ -117,10 +118,28 @@ public struct RemoteConversationSpaceMembershipChecker: ConversationSpaceMembers
                 timeout: policy.timeout, maximumResponseBodyBytes: 8192)
         }
         let after = Set(try await resolveOAuthHostname(resolver, host: host, timeout: policy.timeout))
-        try policy.validateResolved(Array(after), host: host)
-        guard response.redirectCount == 0, response.responseURL == url,
-              let peer = response.connectedPeerAddress, before.contains(peer), after.contains(peer),
-              response.body.count <= 8192 else { throw SwanError.unavailable("conversation policy response unavailable") }
+        try policy.validateResolved(Array(after), host: host, port: port)
+        guard response.redirectCount == 0,
+              response.responseURL.absoluteString == url.absoluteString,
+              let peer = response.connectedPeerAddress,
+              before.contains(peer), after.contains(peer),
+              policy.permits(peer, forHost: host, port: port),
+              response.body.count <= 8192 else {
+            throw SwanError.unavailable("conversation policy response unavailable")
+        }
+        let normalizedHeaders = response.headers.reduce(into: [String: [String]]()) { output, item in
+            output[item.key.lowercased(), default: []].append(contentsOf: item.value)
+        }
+        if let lengths = normalizedHeaders["content-length"] {
+            guard lengths.count == 1,
+                  !lengths[0].isEmpty,
+                  lengths[0].utf8.allSatisfy({ (48 ... 57).contains($0) }),
+                  let declared = Int(lengths[0]),
+                  declared == response.body.count,
+                  declared <= 8192 else {
+                throw SwanError.unavailable("conversation policy response unavailable")
+            }
+        }
         return response
     }
 

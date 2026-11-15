@@ -53,24 +53,25 @@ public actor CachingOAuthHostnameResolver: OAuthHostnameResolving {
     }
 
     public func resolve(host: String) async throws -> [OAuthIPAddress] {
+        let key = host.lowercased()
         let moment = now()
-        if let entry = entries[host], entry.expiresAt > moment {
+        if let entry = entries[key], entry.expiresAt > moment {
             return entry.addresses
         }
-        entries.removeValue(forKey: host)
-        if let existing = inFlight[host] {
+        entries.removeValue(forKey: key)
+        if let existing = inFlight[key] {
             return try await existing.value
         }
         let upstream = upstream
         let task = Task<[OAuthIPAddress], any Error> {
             try await upstream.resolve(host: host)
         }
-        inFlight[host] = task
-        defer { inFlight.removeValue(forKey: host) }
+        inFlight[key] = task
+        defer { inFlight.removeValue(forKey: key) }
         // A thrown lookup leaves no entry: a transient resolver outage must not
         // become a cached refusal for the whole TTL.
         let addresses = try await task.value
-        store(host: host, addresses: addresses, at: now())
+        store(host: key, addresses: addresses, at: now())
         return addresses
     }
 

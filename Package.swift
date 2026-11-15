@@ -20,8 +20,8 @@ let package = Package(
         .executable(name: "swan", targets: ["swan"]),
     ],
     dependencies: [
-        // Unified Petrel 2.0 + November 12 Spaces line (Wave 1 `wave1-petrel` @ 932c8292).
-        .package(name: "Petrel", path: "/Users/joshlacalamito/Developer/.workspaces/dec1-w0/wave1-petrel"),
+        // Unified Petrel 2.0 + November 12 Spaces line (Wave 1 `wave1-petrel` @ 59a07d03).
+        .package(name: "Petrel", path: "../../dec1-w0/wave1-petrel"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.36.0"),

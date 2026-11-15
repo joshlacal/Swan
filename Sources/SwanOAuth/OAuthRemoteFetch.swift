@@ -114,6 +114,8 @@ public struct OAuthRemoteFetchPolicy: Sendable, Equatable {
     public func validateURL(_ url: URL) throws -> String {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let scheme = components.scheme?.lowercased(), let host = components.host,
+              !host.isEmpty, !host.hasSuffix("."), !host.contains("%"),
+              host.utf8.allSatisfy({ (0x21 ... 0x7E).contains($0) }),
               components.user == nil, components.password == nil, components.fragment == nil else {
             throw SwanError.unauthorized("OAuth remote URL is malformed")
         }
@@ -125,25 +127,65 @@ public struct OAuthRemoteFetchPolicy: Sendable, Equatable {
         guard scheme == "https" || (allowLocalhostDevelopment && localhostDevelopment) else {
             throw SwanError.unauthorized("OAuth remote URL must use HTTPS")
         }
-        if let literal = OAuthIPAddress(literal: host) {
-            guard permits(literal, forHost: host) else {
+        let port = components.port
+        if let port {
+            guard (1 ... 65_535).contains(port) else {
+                throw SwanError.unauthorized("OAuth remote URL port is invalid")
+            }
+            if scheme == "https", port != 443 {
+                let localhostHTTPSDevelopment = allowLocalhostDevelopment && host == "localhost"
+                guard localhostHTTPSDevelopment || !networkAllowlist.addresses.isEmpty else {
+                    throw SwanError.unauthorized("OAuth remote HTTPS URL must use default port 443")
+                }
+            }
+        }
+        let trimmedBrackets = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        if !trimmedBrackets.contains(":"), Self.looksLikeNumericIPv4Host(trimmedBrackets) {
+            guard let literal = OAuthIPAddress(literal: trimmedBrackets),
+                  literal.description == trimmedBrackets else {
+                throw SwanError.unauthorized("OAuth remote numeric IPv4 literal is non-canonical")
+            }
+            guard permits(literal, forHost: host, port: port) else {
+                throw SwanError.unauthorized("OAuth remote IP literal is not public")
+            }
+        } else if let literal = OAuthIPAddress(literal: host) {
+            guard permits(literal, forHost: host, port: port) else {
                 throw SwanError.unauthorized("OAuth remote IP literal is not public")
             }
         }
         return host
     }
 
-    public func validateResolved(_ addresses: [OAuthIPAddress], host: String) throws {
+    public func validateResolved(_ addresses: [OAuthIPAddress], host: String, port: Int? = nil) throws {
         guard !addresses.isEmpty, addresses.count <= 32,
-              addresses.allSatisfy({ permits($0, forHost: host) }) else {
+              addresses.allSatisfy({ permits($0, forHost: host, port: port) }) else {
             throw SwanError.unauthorized("OAuth remote host resolved to a forbidden address")
         }
     }
 
-    public func permits(_ address: OAuthIPAddress, forHost host: String) -> Bool {
+    public func permits(_ address: OAuthIPAddress, forHost host: String, port: Int? = nil) -> Bool {
         if networkAllowlist.addresses.contains(address) { return true }
         if allowLocalhostDevelopment && host == "localhost" && address.isLoopback { return true }
+        if let port, port != 443 { return false }
         return address.isPublicInternetAddress
+    }
+
+    private static func looksLikeNumericIPv4Host(_ host: String) -> Bool {
+        guard let lastLabel = host.split(separator: ".", omittingEmptySubsequences: false).last,
+              !lastLabel.isEmpty else {
+            return false
+        }
+        if lastLabel.utf8.allSatisfy({ (0x30 ... 0x39).contains($0) }) {
+            return true
+        }
+        let lower = lastLabel.lowercased()
+        if lower.hasPrefix("0x"), lower.count > 2,
+           lower.dropFirst(2).utf8.allSatisfy({
+               (0x30 ... 0x39).contains($0) || (0x61 ... 0x66).contains($0)
+           }) {
+            return true
+        }
+        return false
     }
 }
 
@@ -672,10 +714,11 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         -> (body: Data, headers: [String: [String]])
     {
         let host = try policy.validateURL(url)
+        let port = URLComponents(url: url, resolvingAgainstBaseURL: false)?.port
         let preflightPeers = Set(try await resolveOAuthHostname(
             resolver, host: host, timeout: policy.timeout
         ))
-        try policy.validateResolved(Array(preflightPeers), host: host)
+        try policy.validateResolved(Array(preflightPeers), host: host, port: port)
         let response: OAuthRemoteHTTPResponse
         do {
             response = try await transport.get(
@@ -695,7 +738,7 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         let postflightPeers = Set(try await resolveOAuthHostname(
             resolver, host: host, timeout: policy.timeout
         ))
-        try policy.validateResolved(Array(postflightPeers), host: host)
+        try policy.validateResolved(Array(postflightPeers), host: host, port: port)
         guard response.redirectCount == 0,
               response.responseURL.absoluteString == url.absoluteString,
               response.status == 200 else {
@@ -704,7 +747,7 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         guard let peer = response.connectedPeerAddress,
               preflightPeers.contains(peer),
               postflightPeers.contains(peer),
-              policy.permits(peer, forHost: host) else {
+              policy.permits(peer, forHost: host, port: port) else {
             throw SwanError.unauthorized("OAuth remote peer was not in both approved DNS answer sets")
         }
         let headers = response.headers.reduce(into: [String: [String]]()) { output, item in
@@ -887,10 +930,11 @@ public struct OAuthBoundedJSONPoster: Sendable {
             throw SwanError.malformed("outbound JSON body is out of bounds")
         }
         let host = try policy.validateURL(url)
+        let port = URLComponents(url: url, resolvingAgainstBaseURL: false)?.port
         let initialAddresses = Set(try await resolveOAuthHostname(
             resolver, host: host, timeout: policy.timeout
         ))
-        try policy.validateResolved(Array(initialAddresses), host: host)
+        try policy.validateResolved(Array(initialAddresses), host: host, port: port)
         let response: OAuthRemoteHTTPResponse
         do {
             response = try await transport.post(
@@ -912,7 +956,7 @@ public struct OAuthBoundedJSONPoster: Sendable {
         let finalAddresses = Set(try await resolveOAuthHostname(
             resolver, host: host, timeout: policy.timeout
         ))
-        try policy.validateResolved(Array(finalAddresses), host: host)
+        try policy.validateResolved(Array(finalAddresses), host: host, port: port)
         guard response.redirectCount == 0,
               response.responseURL.absoluteString == url.absoluteString,
               response.body.count <= policy.maximumBodyBytes else {
@@ -921,7 +965,7 @@ public struct OAuthBoundedJSONPoster: Sendable {
         guard let peer = response.connectedPeerAddress,
               initialAddresses.contains(peer),
               finalAddresses.contains(peer),
-              policy.permits(peer, forHost: host) else {
+              policy.permits(peer, forHost: host, port: port) else {
             throw SwanError.unauthorized("outbound notification peer is forbidden")
         }
         // Status is classified only AFTER the peer proof above: a forged
