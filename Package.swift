@@ -1,5 +1,36 @@
 // swift-tools-version: 6.1
+
+import Foundation
 import PackageDescription
+
+let environment = ProcessInfo.processInfo.environment
+let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+let siblingRoot = packageRoot.deletingLastPathComponent()
+
+func siblingPathIfAvailable(_ name: String) -> String? {
+    let candidate = siblingRoot.appendingPathComponent(name, isDirectory: true).standardizedFileURL
+    let manifest = candidate.appendingPathComponent("Package.swift")
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+          isDirectory.boolValue,
+          FileManager.default.fileExists(atPath: manifest.path),
+          candidate.resolvingSymlinksInPath() == candidate
+    else {
+        return nil
+    }
+    return candidate.path
+}
+
+let forceRemote = environment["SWAN_LOCAL_INTEGRATION"] == "0"
+let petrelDependency: Package.Dependency
+if !forceRemote, let localPetrel = siblingPathIfAvailable("Petrel") {
+    petrelDependency = .package(path: localPetrel)
+} else {
+    petrelDependency = .package(
+        url: "https://github.com/joshlacal/Petrel.git",
+        revision: "59a07d0300d697de8a021f2bceae5bae239c0434"
+    )
+}
 
 let package = Package(
     name: "Swan",
@@ -20,8 +51,8 @@ let package = Package(
         .executable(name: "swan", targets: ["swan"]),
     ],
     dependencies: [
-        // Unified Petrel 2.0 + November 12 Spaces line (Wave 1 `wave1-petrel` @ 59a07d03).
-        .package(name: "Petrel", path: "../../dec1-w0/wave1-petrel"),
+        // Unified Petrel 2.0 + November 12 Spaces line (Petrel @ 59a07d03).
+        petrelDependency,
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.36.0"),
