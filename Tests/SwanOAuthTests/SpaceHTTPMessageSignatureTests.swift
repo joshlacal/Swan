@@ -126,7 +126,7 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
             signatureInput: ["other=(\"authorization\");keyid=\"other\", presentation=\(input)"],
             signature: ["other=:YWJj:, presentation=:\(signature.base64EncodedString()):"]
         )
-        XCTAssertEqual(try combined.verify(keyID: keyID), keyID)
+        XCTAssertEqual(try combined.verify(keyID: keyID, now: Date(timeIntervalSince1970: 100)), keyID)
         // The same members split across repeated field lines combine per
         // RFC 9110 §5.3.
         let split = Fields(
@@ -135,12 +135,12 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
             signatureInput: ["other=(\"authorization\");keyid=\"other\"", "presentation=\(input)"],
             signature: ["other=:YWJj:", "presentation=:\(signature.base64EncodedString()):"]
         )
-        XCTAssertEqual(try split.verify(keyID: keyID), keyID)
+        XCTAssertEqual(try split.verify(keyID: keyID, now: Date(timeIntervalSince1970: 100)), keyID)
         var itemTagged = combined
         itemTagged.signatureInput = [
             "note=?1;tag=\"atproto-space-credential\", presentation=\(input)",
         ]
-        XCTAssertEqual(try itemTagged.verify(keyID: keyID), keyID)
+        XCTAssertEqual(try itemTagged.verify(keyID: keyID, now: Date(timeIntervalSince1970: 100)), keyID)
     }
 
     func testTwoTaggedCredentialSignaturesAreRejected() throws {
@@ -333,7 +333,104 @@ final class SpaceHTTPMessageSignatureTests: XCTestCase {
             signatureInput: ["atproto-space-credential=(  \"authorization\"   \"atproto-space-audience\" );tag=\"atproto-space-credential\";created=001;custom=1.500"],
             signature: ["atproto-space-credential=:\(signature.base64EncodedString()):"]
         )
-        XCTAssertEqual(try fields.verify(keyID: keyID), keyID)
+        XCTAssertEqual(
+            try fields.verify(keyID: keyID, now: Date(timeIntervalSince1970: 100)),
+            keyID
+        )
+    }
+
+    /// Signs the profiled components with `parameters` appended to the
+    /// signature input, exactly as a client adding RFC 9421 metadata would.
+    private func signed(appendingParameters parameters: String) throws -> Fields {
+        let input = "(\"authorization\" \"atproto-space-audience\");tag=\"atproto-space-credential\"\(parameters)"
+        let base = "\"authorization\": \(Self.authorization)\n"
+            + "\"atproto-space-audience\": \(Self.audience)\n"
+            + "\"@signature-params\": \(input)"
+        let signature = try P256WireSignature.sign(Data(base.utf8), using: try key)
+        return Fields(
+            authorization: [Self.authorization],
+            audience: [Self.audience],
+            signatureInput: ["atproto-space-credential=\(input)"],
+            signature: ["atproto-space-credential=:\(signature.base64EncodedString()):"]
+        )
+    }
+
+    func testCreatedMustBeRecentAndNotInTheFuture() throws {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        for created in [1_000_000, 1_000_030, 999_700] {
+            XCTAssertEqual(
+                try signed(appendingParameters: ";created=\(created)")
+                    .verify(keyID: keyID, now: now),
+                keyID,
+                "created=\(created)"
+            )
+        }
+        for created in [1_000_031, 999_699, 1] {
+            XCTAssertThrowsError(
+                try signed(appendingParameters: ";created=\(created)")
+                    .verify(keyID: keyID, now: now),
+                "created=\(created)"
+            ) {
+                XCTAssertEqual($0 as? SpaceHTTPSignatureError, .staleSignature)
+            }
+        }
+    }
+
+    func testExpiresIsHonouredWithClockSkew() throws {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        for expires in [1_000_000, 999_970, 2_000_000] {
+            XCTAssertEqual(
+                try signed(appendingParameters: ";expires=\(expires)")
+                    .verify(keyID: keyID, now: now),
+                keyID,
+                "expires=\(expires)"
+            )
+        }
+        for expires in [999_969, 0] {
+            XCTAssertThrowsError(
+                try signed(appendingParameters: ";expires=\(expires)")
+                    .verify(keyID: keyID, now: now),
+                "expires=\(expires)"
+            ) {
+                XCTAssertEqual($0 as? SpaceHTTPSignatureError, .staleSignature)
+            }
+        }
+    }
+
+    func testFreshnessParametersMustBeWellTyped() throws {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        let malformed = [
+            ";created=-1",
+            ";created=\"1000000\"",
+            ";created=1000000.5",
+            ";created=?1",
+            ";expires=-5",
+            ";expires=\"2000000\"",
+            ";expires=2000000.0",
+            ";nonce=\"\"",
+            ";nonce=7",
+            ";nonce=abc",
+            ";nonce=\"\(String(repeating: "n", count: 513))\"",
+        ]
+        for parameters in malformed {
+            XCTAssertThrowsError(
+                try signed(appendingParameters: parameters).verify(keyID: keyID, now: now),
+                parameters
+            ) {
+                XCTAssertEqual($0 as? SpaceHTTPSignatureError, .malformedSignature, parameters)
+            }
+        }
+        for parameters in [
+            ";nonce=\"abc\"",
+            ";nonce=\"\(String(repeating: "n", count: 512))\"",
+            ";created=1000000;expires=1000060;nonce=\"r\"",
+        ] {
+            XCTAssertEqual(
+                try signed(appendingParameters: parameters).verify(keyID: keyID, now: now),
+                keyID,
+                parameters
+            )
+        }
     }
 
     func testCredentialPresentationBindsCnfKid() async throws {
@@ -449,13 +546,14 @@ private struct Fields {
         )
     }
 
-    func verify(keyID: String?) throws -> String {
+    func verify(keyID: String?, now: Date = Date()) throws -> String {
         try SpaceHTTPSignature.verify(
             authorization: authorization,
             audience: keyID == nil ? audience : (audience ?? []),
             signatureInput: signatureInput,
             signature: signature,
-            credentialKeyID: keyID
+            credentialKeyID: keyID,
+            now: now
         )
     }
 }

@@ -70,7 +70,8 @@ public enum SpaceHTTPSignature {
         audience: [String]?,
         signatureInput: [String],
         signature: [String],
-        credentialKeyID: String?
+        credentialKeyID: String?,
+        now: Date = Date()
     ) throws -> String {
         guard credentialKeyID != nil, authorization.count == 1 else {
             throw SpaceHTTPSignatureError.duplicateOrMissingField
@@ -139,6 +140,7 @@ public enum SpaceHTTPSignature {
                 throw SpaceHTTPSignatureError.unsupportedAlgorithm
             }
         }
+        try checkFreshness(input.parameters, now: now)
         let suppliedKeyID: String?
         switch input.parameters["keyid"] {
         case nil:
@@ -179,6 +181,63 @@ public enum SpaceHTTPSignature {
         return signingKeyID
     }
 
+    /// Accepted clock skew for `created` in the future and for `expires`.
+    public static let maximumClockSkewSeconds: Int64 = 30
+    /// Oldest accepted `created`, relative to the verifier's clock.
+    public static let maximumSignatureAgeSeconds: Int64 = 300
+    /// Longest accepted `nonce`, in UTF-8 bytes.
+    public static let maximumNonceBytes = 512
+
+    /// Applies the optional RFC 9421 `created`, `expires`, and `nonce`
+    /// parameters with the same bounds as the reference verifier: `created`
+    /// and `expires` are non-negative integers, `created` is at most 300 s old
+    /// and at most 30 s ahead, `expires` has not passed by more than 30 s, and
+    /// `nonce` is a non-empty string of at most 512 bytes. Absent parameters
+    /// impose no constraint.
+    static func checkFreshness(
+        _ parameters: StructuredFieldParameters,
+        now: Date
+    ) throws {
+        func timestamp(_ name: String) throws -> Int64? {
+            switch parameters[name] {
+            case nil:
+                return nil
+            case let .integer(value)? where value >= 0:
+                return value
+            case .some:
+                throw SpaceHTTPSignatureError.malformedSignature
+            }
+        }
+        let created = try timestamp("created")
+        let expires = try timestamp("expires")
+        switch parameters["nonce"] {
+        case nil:
+            break
+        case let .string(value)? where !value.isEmpty
+            && value.utf8.count <= maximumNonceBytes:
+            break
+        case .some:
+            throw SpaceHTTPSignatureError.malformedSignature
+        }
+        func saturatingSum(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+            let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+            return overflow ? Int64.max : sum
+        }
+        let nowSeconds = Int64(max(0, now.timeIntervalSince1970).rounded(.down))
+        if let created {
+            guard created <= saturatingSum(nowSeconds, maximumClockSkewSeconds),
+                  nowSeconds <= saturatingSum(created, maximumSignatureAgeSeconds)
+            else {
+                throw SpaceHTTPSignatureError.staleSignature
+            }
+        }
+        if let expires {
+            guard nowSeconds <= saturatingSum(expires, maximumClockSkewSeconds) else {
+                throw SpaceHTTPSignatureError.staleSignature
+            }
+        }
+    }
+
     /// The RFC 9421 signature base: one line per covered component, then the
     /// `@signature-params` line, joined by LF with no trailing LF.
     static func signatureBase(
@@ -210,6 +269,8 @@ public enum SpaceHTTPSignatureError: Error, Sendable, Equatable {
     case invalidKey
     case keyMismatch
     case invalidSignature
+    /// `created` is too old or in the future, or `expires` has passed.
+    case staleSignature
 }
 
 // MARK: - RFC 8941 structured fields (the subset signatures need)

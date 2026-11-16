@@ -177,7 +177,8 @@ public extension SpaceCredentialAuthorizationVerifier {
                 audience: presentation.audience,
                 signatureInput: presentation.signatureInput,
                 signature: presentation.signature,
-                credentialKeyID: claims.cnf.kid
+                credentialKeyID: claims.cnf.kid,
+                now: now
             )
         } catch {
             throw SpaceCredentialPresentationFailure.badSignature
