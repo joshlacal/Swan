@@ -235,7 +235,7 @@ final class AccountDeletionProofSQLiteTests: XCTestCase {
             )
             let sql = try XCTUnwrap(probe.first?.column("sql")?.string)
             XCTAssertTrue(sql.contains("REFERENCES \(table))"), sql)
-            XCTAssertFalse(sql.contains("_purpose_v1"), sql)
+            XCTAssertFalse(sql.contains("_purpose_v"), sql)
         }
     }
 

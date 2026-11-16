@@ -1015,9 +1015,18 @@ extension SQLiteControlDatabase {
 
     /// SQLite cannot widen a column CHECK in place. A table created before
     /// account-deletion proofs existed is copied into the current definition
-    /// once; its rows, indexes, and triggers are recreated by the surrounding
+    /// once; its indexes and triggers are recreated by the surrounding
     /// migration. A table that already admits every current purpose is left
     /// untouched, so the step is idempotent.
+    ///
+    /// The canonical table is never renamed. The current definition is built
+    /// under a temporary name, filled, and renamed into place after the old
+    /// table is dropped, so a `REFERENCES` clause in any other table keeps
+    /// naming the canonical table. With `foreign_keys` on, SQLite rewrites
+    /// such clauses on every rename of the referenced table, even under
+    /// `legacy_alter_table`. The final rename runs with `legacy_alter_table`
+    /// on so that it does not re-validate unrelated trigger bodies; the flag
+    /// is connection-local and is restored before any other statement.
     private func rebuildEmailTableForCurrentPurposesIfNeeded(
         table: String,
         createStatement: String,
@@ -1036,15 +1045,31 @@ extension SQLiteControlDatabase {
         guard Set(columns).isSubset(of: existingNames) else {
             throw AccountControlStoreError.malformedRecord
         }
-        let saved = "\(table)_purpose_v1"
-        _ = try await connection.query("DROP TABLE IF EXISTS \(saved)")
-        _ = try await connection.query("ALTER TABLE \(table) RENAME TO \(saved)")
-        _ = try await connection.query(createStatement)
+        let canonicalCreate = "CREATE TABLE IF NOT EXISTS \(table) ("
+        let staging = "\(table)_purpose_v2"
+        guard createStatement.components(separatedBy: canonicalCreate).count == 2 else {
+            throw AccountControlStoreError.malformedRecord
+        }
+        _ = try await connection.query("DROP TABLE IF EXISTS \(staging)")
+        _ = try await connection.query(
+            createStatement.replacingOccurrences(
+                of: canonicalCreate,
+                with: "CREATE TABLE \(staging) ("
+            )
+        )
         let list = columns.joined(separator: ", ")
         _ = try await connection.query(
-            "INSERT INTO \(table)(\(list)) SELECT \(list) FROM \(saved)"
+            "INSERT INTO \(staging)(\(list)) SELECT \(list) FROM \(table)"
         )
-        _ = try await connection.query("DROP TABLE \(saved)")
+        _ = try await connection.query("DROP TABLE \(table)")
+        _ = try await connection.query("PRAGMA legacy_alter_table = ON")
+        do {
+            _ = try await connection.query("ALTER TABLE \(staging) RENAME TO \(table)")
+        } catch {
+            _ = try? await connection.query("PRAGMA legacy_alter_table = OFF")
+            throw error
+        }
+        _ = try await connection.query("PRAGMA legacy_alter_table = OFF")
     }
 
     public func enqueueEmailProofDelivery(

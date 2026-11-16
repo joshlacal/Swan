@@ -340,6 +340,10 @@ private struct SwanAccountDeletionHandlers: Sendable {
         }
     }
 
+    /// Consumes the emailed proof before the shared deletion coordinator
+    /// runs. A proof that passed every check is spent even if the coordinator
+    /// then fails before its first durable stage; the account holder gets a
+    /// 503 and requests a new email.
     private func consumeProof(
         did: String,
         token: String,
