@@ -442,6 +442,11 @@ public struct SwanHTTPServer: Sendable {
     /// control-store adapter, rate limiter, and SMTP worker at startup.
     public let accountEmailXRPC: SwanAccountEmailXRPCServer?
     public let legacySessionXRPC: SwanLegacySessionXRPCServer?
+    /// `com.atproto.server.requestAccountDelete` and `deleteAccount`. Nil
+    /// unless the caller assembled legacy sessions, the account-email outbox,
+    /// and the permanent-deletion coordinator; absent, both methods stay
+    /// behind the `com.atproto.server.*` unknown-method guard.
+    public let accountDeletionXRPC: SwanAccountDeletionXRPCServer?
     /// Optional account portal bundle. Its registration owns `/account/api/**`
     /// and `/account/**` and is installed before every XRPC or proxy fallback.
     public let accountPortalHTTP: SwanAccountPortalHTTP?
@@ -524,6 +529,7 @@ public struct SwanHTTPServer: Sendable {
         blobStreamAdmission: PublicRepositorySpoolAdmission? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
         legacySessionXRPC: SwanLegacySessionXRPCServer? = nil,
+        accountDeletionXRPC: SwanAccountDeletionXRPCServer? = nil,
         accountPortalHTTP: SwanAccountPortalHTTP? = nil,
         accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter? = nil,
         didWebIdentityHTTP: SwanDidWebIdentityHTTP? = nil,
@@ -558,6 +564,7 @@ public struct SwanHTTPServer: Sendable {
         }
         self.accountEmailXRPC = accountEmailXRPC
         self.legacySessionXRPC = legacySessionXRPC
+        self.accountDeletionXRPC = accountDeletionXRPC
         self.accountPortalHTTP = accountPortalHTTP
         self.accountLifecycleXRPC = accountLifecycleXRPC
         self.didWebIdentityHTTP = didWebIdentityHTTP
@@ -972,6 +979,9 @@ public struct SwanHTTPServer: Sendable {
         if legacySessionXRPC != nil {
             describedMethodSet.formUnion(SwanLegacySessionXRPCServer.servedMethodNSIDs)
         }
+        if accountDeletionXRPC != nil {
+            describedMethodSet.formUnion(SwanAccountDeletionXRPCServer.methodNSIDs)
+        }
         if actorPreferencesXRPC != nil {
             describedMethodSet.formUnion([
                 AppBskyActorGetPreferences.typeIdentifier,
@@ -1060,6 +1070,10 @@ public struct SwanHTTPServer: Sendable {
             on: router,
             requestBodyAdmission: requestBodyAdmission,
             resourceAuthorizer: accountResourceAuthorizer
+        )
+        accountDeletionXRPC?.register(
+            on: router,
+            requestBodyAdmission: requestBodyAdmission
         )
         actorPreferencesXRPC?.register(
             on: router,

@@ -116,18 +116,18 @@ extension SQLiteControlDatabase {
             )
             """
         )
-        _ = try await connection.query(
-            """
+        let currentEmailTokensTable = """
             CREATE TABLE IF NOT EXISTS account_email_tokens (
                 digest BLOB PRIMARY KEY CHECK(length(digest) = 32),
                 did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
                 email TEXT NOT NULL,
-                purpose TEXT NOT NULL CHECK(purpose IN ('verify-email', 'password-recovery')),
+                purpose TEXT NOT NULL CHECK(purpose IN ('verify-email', 'password-recovery', 'delete-account')),
                 expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
-                consumed_at INTEGER CHECK(consumed_at >= 0)
+                consumed_at INTEGER CHECK(consumed_at >= 0),
+                delivery_id TEXT
             )
             """
-        )
+        _ = try await connection.query(currentEmailTokensTable)
         // Pre-binding alpha databases cannot prove which address received an
         // outstanding token. Add the column, then invalidate those legacy
         // proofs instead of guessing that the account's current address was
@@ -145,6 +145,14 @@ extension SQLiteControlDatabase {
         _ = try await connection.query(
             "DELETE FROM account_email_tokens WHERE email IS NULL"
         )
+        try await rebuildEmailTableForCurrentPurposesIfNeeded(
+            table: "account_email_tokens",
+            createStatement: currentEmailTokensTable,
+            columns: [
+                "digest", "did", "email", "purpose", "expires_at",
+                "consumed_at", "delivery_id",
+            ]
+        )
         _ = try await connection.query("CREATE INDEX IF NOT EXISTS account_email_tokens_expiry ON account_email_tokens(expires_at)")
         _ = try await connection.query(
             "CREATE INDEX IF NOT EXISTS account_email_tokens_account_purpose ON account_email_tokens(did, purpose)"
@@ -152,8 +160,7 @@ extension SQLiteControlDatabase {
         _ = try await connection.query(
             "CREATE UNIQUE INDEX IF NOT EXISTS account_email_tokens_delivery_id_unique ON account_email_tokens(delivery_id) WHERE delivery_id IS NOT NULL"
         )
-        _ = try await connection.query(
-            """
+        let currentEmailOutboxTable = """
             CREATE TABLE IF NOT EXISTS account_email_delivery_outbox (
                 delivery_id TEXT PRIMARY KEY
                     CHECK(length(delivery_id) = 43)
@@ -162,7 +169,7 @@ extension SQLiteControlDatabase {
                 email TEXT NOT NULL,
                 email_generation INTEGER NOT NULL CHECK(email_generation > 0),
                 purpose TEXT NOT NULL
-                    CHECK(purpose IN ('verify-email', 'password-recovery')),
+                    CHECK(purpose IN ('verify-email', 'password-recovery', 'delete-account')),
                 expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
                 state TEXT NOT NULL
                     CHECK(state IN ('pending', 'leased', 'sent', 'cancelled')),
@@ -181,7 +188,7 @@ extension SQLiteControlDatabase {
                 )
             )
             """
-        )
+        _ = try await connection.query(currentEmailOutboxTable)
         // A delivery can be claimed in one transaction and reach SMTP only
         // after a second transaction. Persist that boundary so permanent
         // deletion can serialize against the actual network attempt. Legacy
@@ -190,6 +197,16 @@ extension SQLiteControlDatabase {
             table: "account_email_delivery_outbox",
             column: "send_started_at",
             definition: "INTEGER"
+        )
+        try await rebuildEmailTableForCurrentPurposesIfNeeded(
+            table: "account_email_delivery_outbox",
+            createStatement: currentEmailOutboxTable,
+            columns: [
+                "delivery_id", "did", "email", "email_generation", "purpose",
+                "expires_at", "state", "lease_owner", "lease_expires_at",
+                "attempts", "next_attempt_at", "created_at", "send_started_at",
+                "sent_at",
+            ]
         )
         _ = try await connection.query(
             """
@@ -996,10 +1013,45 @@ extension SQLiteControlDatabase {
         }
     }
 
+    /// SQLite cannot widen a column CHECK in place. A table created before
+    /// account-deletion proofs existed is copied into the current definition
+    /// once; its rows, indexes, and triggers are recreated by the surrounding
+    /// migration. A table that already admits every current purpose is left
+    /// untouched, so the step is idempotent.
+    private func rebuildEmailTableForCurrentPurposesIfNeeded(
+        table: String,
+        createStatement: String,
+        columns: [String]
+    ) async throws {
+        let schema = try await connection.query(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            [.text(table)]
+        )
+        guard let sql = schema.first?.column("sql")?.string else {
+            throw AccountControlStoreError.malformedRecord
+        }
+        guard !sql.contains("'delete-account'") else { return }
+        let existing = try await connection.query("PRAGMA table_info(\(table))")
+        let existingNames = Set(existing.compactMap { $0.column("name")?.string })
+        guard Set(columns).isSubset(of: existingNames) else {
+            throw AccountControlStoreError.malformedRecord
+        }
+        let saved = "\(table)_purpose_v1"
+        _ = try await connection.query("DROP TABLE IF EXISTS \(saved)")
+        _ = try await connection.query("ALTER TABLE \(table) RENAME TO \(saved)")
+        _ = try await connection.query(createStatement)
+        let list = columns.joined(separator: ", ")
+        _ = try await connection.query(
+            "INSERT INTO \(table)(\(list)) SELECT \(list) FROM \(saved)"
+        )
+        _ = try await connection.query("DROP TABLE \(saved)")
+    }
+
     public func enqueueEmailProofDelivery(
         _ request: AccountEmailProofDeliveryRequest
     ) async throws -> AccountEmailEnqueueOutcome {
-        guard request.purpose == .verifyEmail,
+        guard request.purpose == .verifyEmail
+                || request.purpose == .accountDeletion,
               AccountControlIdentifiers.isDID(request.did),
               (try? AccountEmailAddress(request.email.value)) == request.email,
               request.proofDigest.count == 32 else {
@@ -2087,6 +2139,80 @@ extension SQLiteControlDatabase {
                     [.text(request.did)]
                 )
                 return .confirmed
+            }
+        }
+    }
+
+    public func consumeAccountDeletionProof(
+        did: String,
+        proofDigest: Data,
+        now: Date
+    ) async throws -> AccountDeletionProofOutcome {
+        guard AccountControlIdentifiers.isDID(did),
+              proofDigest.count == 32 else {
+            throw AccountControlStoreError.invalidInput
+        }
+        let timestamp = try controlTimestamp(now)
+        return try await withConnectionGate {
+            try await transaction {
+                // The proof must name this DID, be addressed to the
+                // account's current mailbox, and the account must still be
+                // active. Its pending delivery row is retired with it.
+                let claimed = try await connection.query(
+                    """
+                    UPDATE account_email_tokens
+                    SET consumed_at = ?
+                    WHERE digest = ?
+                      AND did = ?
+                      AND purpose = 'delete-account'
+                      AND consumed_at IS NULL
+                      AND expires_at > ?
+                      AND EXISTS (
+                          SELECT 1
+                          FROM accounts AS a
+                          JOIN account_emails AS e ON e.did = a.did
+                          WHERE a.did = account_email_tokens.did
+                            AND a.status = 'active'
+                            AND e.email = account_email_tokens.email
+                      )
+                    RETURNING delivery_id
+                    """,
+                    [
+                        .integer(timestamp), blob(proofDigest),
+                        .text(did), .integer(timestamp),
+                    ]
+                )
+                guard claimed.count <= 1 else {
+                    throw AccountControlStoreError.malformedRecord
+                }
+                if let row = claimed.first {
+                    if let deliveryID = try optionalText(row, "delivery_id") {
+                        _ = try await connection.query(
+                            """
+                            DELETE FROM account_email_delivery_outbox
+                            WHERE delivery_id = ?
+                              AND send_started_at IS NULL
+                            """,
+                            [.text(deliveryID)]
+                        )
+                    }
+                    return .consumed
+                }
+                // Distinguish only an expired but otherwise matching proof.
+                let expired = try await connection.query(
+                    """
+                    SELECT 1
+                    FROM account_email_tokens
+                    WHERE digest = ?
+                      AND did = ?
+                      AND purpose = 'delete-account'
+                      AND consumed_at IS NULL
+                      AND expires_at <= ?
+                    LIMIT 1
+                    """,
+                    [blob(proofDigest), .text(did), .integer(timestamp)]
+                )
+                return expired.isEmpty ? .invalidToken : .expiredToken
             }
         }
     }

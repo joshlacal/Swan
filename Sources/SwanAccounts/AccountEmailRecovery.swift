@@ -1013,6 +1013,55 @@ public actor AccountEmailRecoveryService {
         }
     }
 
+    /// Mints a single-use account-deletion proof for the account's current
+    /// address and queues its delivery. Replaces any outstanding deletion
+    /// proof for the account.
+    public func requestAccountDeletion(
+        did: String,
+        email: AccountEmailAddress,
+        now: Date = Date()
+    ) async throws {
+        let deliveryID = try proofCodec.newDeliveryID()
+        let proof = proofCodec.proof(for: deliveryID)
+        let request = try AccountEmailProofDeliveryRequest(
+            deliveryID: deliveryID,
+            did: did,
+            email: email,
+            purpose: .accountDeletion,
+            proofDigest: proofCodec.digest(proof: proof),
+            expiresAt: now.addingTimeInterval(tokenLifetime),
+            now: now
+        )
+        switch try await store.enqueueEmailProofDelivery(request) {
+        case .enqueued:
+            return
+        case .accountNotFound:
+            throw AccountEmailRecoveryError.accountNotFound
+        case .invalidEmail:
+            throw AccountEmailRecoveryError.invalidEmail
+        }
+    }
+
+    /// Consumes an emailed account-deletion proof for `did`. A malformed
+    /// proof is reported as invalid without touching storage.
+    public func consumeAccountDeletionProof(
+        did: String,
+        proof: String,
+        now: Date = Date()
+    ) async throws -> AccountDeletionProofOutcome {
+        let digest: Data
+        do {
+            digest = try proofCodec.digest(proof: proof)
+        } catch {
+            return .invalidToken
+        }
+        return try await store.consumeAccountDeletionProof(
+            did: did,
+            proofDigest: digest,
+            now: now
+        )
+    }
+
     /// Always returns successfully for a canonical request regardless of
     /// whether it matched a verified active account.
     public func requestPasswordRecovery(
@@ -1055,9 +1104,11 @@ public actor AccountEmailRecoveryService {
             return .idle
         }
         let proof = proofCodec.proof(for: lease.deliveryID)
-        let subject = lease.purpose == .verifyEmail
-            ? "Verify your Swan email"
-            : "Reset your Swan password"
+        let (subject, body) = Self.message(
+            purpose: lease.purpose,
+            proof: proof,
+            tokenLifetime: tokenLifetime
+        )
         do {
             // Claiming a row is not enough to authorize SMTP: permanent
             // deletion can win the next SQLite transaction and scrub the
@@ -1073,7 +1124,7 @@ public actor AccountEmailRecoveryService {
             try await deliverWithDeadline(
                 to: lease.email,
                 subject: subject,
-                body: "Swan proof token: \(proof)"
+                body: body
             )
             let acknowledged = try await store.acknowledgeEmailDelivery(
                 deliveryID: lease.deliveryID,
@@ -1099,6 +1150,34 @@ public actor AccountEmailRecoveryService {
             case .expired:
                 return .expired(lease.deliveryID)
             }
+        }
+    }
+
+    /// Fixed ASCII subject and body per proof purpose. The proof is the only
+    /// variable content; nothing account-specific is echoed into the message.
+    static func message(
+        purpose: AccountEmailTokenPurpose,
+        proof: String,
+        tokenLifetime: TimeInterval
+    ) -> (subject: String, body: String) {
+        switch purpose {
+        case .verifyEmail:
+            return ("Verify your Swan email", "Swan proof token: \(proof)")
+        case .passwordRecovery:
+            return ("Reset your Swan password", "Swan proof token: \(proof)")
+        case .accountDeletion:
+            let minutes = max(1, Int(tokenLifetime / 60))
+            return (
+                "Confirm deletion of your Swan account",
+                """
+                Swan account deletion token: \(proof)
+
+                Enter this token in your app to permanently delete your account.
+                It expires in \(minutes) minutes and can be used once.
+                If you did not ask to delete your account, ignore this email
+                and change your password.
+                """
+            )
         }
     }
 

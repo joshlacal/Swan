@@ -775,12 +775,23 @@ public enum AccountControlStoreError: Error, Sendable, Equatable {
     case unavailable
 }
 
-/// The two user-facing email proofs deliberately share one keyed-digest-only
+/// The user-facing email proofs deliberately share one keyed-digest-only
 /// durable representation. Raw bearer proofs are delivery-only and never
 /// enter the account registry, its logs, or a decoded storage value.
 public enum AccountEmailTokenPurpose: String, Sendable, Equatable {
     case verifyEmail = "verify-email"
     case passwordRecovery = "password-recovery"
+    /// The emailed half of `com.atproto.server.deleteAccount`. Consumable
+    /// only through ``AccountControlStore/consumeAccountDeletionProof``.
+    case accountDeletion = "delete-account"
+}
+
+/// Result of presenting an account-deletion proof. A consumed proof can never
+/// be presented again; the two failures leave every account fact unchanged.
+public enum AccountDeletionProofOutcome: Sendable, Equatable {
+    case consumed
+    case expiredToken
+    case invalidToken
 }
 
 /// One canonical ASCII mailbox representation shared by association, lookup,
@@ -1402,6 +1413,14 @@ public protocol AccountControlStore: Sendable {
         _ request: AccountPasswordRecoveryRequest,
         now: Date
     ) async throws -> AccountPasswordRecoveryResult
+    /// Atomically marks one live account-deletion proof consumed. The proof
+    /// must belong to `did`, be addressed to the account's current email,
+    /// and the account must still be active. A mismatch consumes nothing.
+    func consumeAccountDeletionProof(
+        did: String,
+        proofDigest: Data,
+        now: Date
+    ) async throws -> AccountDeletionProofOutcome
 }
 
 /// Optional extension implemented by durable stores that can atomically
@@ -1563,6 +1582,13 @@ public extension AccountControlStore {
         _ request: AccountPasswordRecoveryRequest,
         now: Date
     ) async throws -> AccountPasswordRecoveryResult {
+        throw AccountControlStoreError.unavailable
+    }
+    func consumeAccountDeletionProof(
+        did: String,
+        proofDigest: Data,
+        now: Date
+    ) async throws -> AccountDeletionProofOutcome {
         throw AccountControlStoreError.unavailable
     }
 }

@@ -44,7 +44,7 @@ extension SwanOAuthResourceAuthorizer: SwanAccountEmailResourceAuthorizing {
     }
 }
 
-/// The four state-changing or delivery-producing operations which receive
+/// The state-changing or delivery-producing operations which receive
 /// durable rate-limit admission. Unsupported email-update operations never
 /// reach this boundary.
 public enum SwanAccountEmailRateLimitOperation: String, Sendable, Equatable {
@@ -52,6 +52,8 @@ public enum SwanAccountEmailRateLimitOperation: String, Sendable, Equatable {
     case confirmEmail = "confirm-email"
     case requestPasswordReset = "request-password-reset"
     case resetPassword = "reset-password"
+    case requestAccountDelete = "request-account-delete"
+    case deleteAccount = "delete-account"
 }
 
 /// Only canonical domain identifiers and the client IP selected by
@@ -201,6 +203,21 @@ public struct SwanDurableAccountEmailXRPCRateLimiter:
                 rule(.directPeer, "day", 50, 24 * 60 * 60),
             ]
         case .resetPassword:
+            return try [
+                rule(.directPeer, "five-minute", 50, 5 * 60),
+            ]
+        case .requestAccountDelete:
+            // The DID windows match the pinned TypeScript host; the peer
+            // windows mirror requestEmailConfirmation's extra abuse bound.
+            return try [
+                rule(.did, "hour", 5, 60 * 60),
+                rule(.did, "day", 15, 24 * 60 * 60),
+                rule(.directPeer, "hour", 30, 60 * 60),
+                rule(.directPeer, "day", 100, 24 * 60 * 60),
+            ]
+        case .deleteAccount:
+            // The reference host's per-address window. Password guessing is
+            // additionally bounded by the shared login admission service.
             return try [
                 rule(.directPeer, "five-minute", 50, 5 * 60),
             ]

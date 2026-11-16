@@ -1057,6 +1057,7 @@ struct ServePermissionedRuntime {
         authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
         legacySessionXRPC: SwanLegacySessionXRPCServer? = nil,
+        accountDeletionXRPC: SwanAccountDeletionXRPCServer? = nil,
         actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
         accountPortalHTTP: SwanAccountPortalHTTP? = nil,
         accountLifecycleXRPC: SwanAccountLifecycleXRPCAdapter? = nil,
@@ -1099,6 +1100,7 @@ struct ServePermissionedRuntime {
             blobStreamAdmission: directory.publicRepositorySpoolAdmission,
             accountEmailXRPC: accountEmailXRPC,
             legacySessionXRPC: legacySessionXRPC,
+            accountDeletionXRPC: accountDeletionXRPC,
             accountPortalHTTP: accountPortalHTTP,
             accountLifecycleXRPC: accountLifecycleXRPC,
             didWebIdentityHTTP: didWebIdentityHTTP,
@@ -4241,6 +4243,10 @@ extension SwanCommand {
                 }
                 let accountEmailXRPC: SwanAccountEmailXRPCServer?
                 let emailRecoveryService: SwanAccountEmailRecoveryService?
+                // Retained for the account-deletion XRPC, which mints its
+                // proofs through the same durable outbox and proof key.
+                var accountDeletionEmailRecovery: AccountEmailRecoveryService?
+                var accountDeletionProofKey: AccountEmailProofKey?
                 if enableEmailRecovery {
                     do {
                         let proofKey = try AccountEmailProofKey(
@@ -4268,6 +4274,8 @@ extension SwanCommand {
                                 hasher: passwordHasher
                             )
                         )
+                        accountDeletionEmailRecovery = recovery
+                        accountDeletionProofKey = proofKey
                         let authorizer = try SwanOAuthResourceAuthorizer(
                             publicURL: baseURL,
                             runtime: oauthRuntime,
@@ -4914,6 +4922,37 @@ extension SwanCommand {
                 } else {
                     permanentDeletionRuntime = nil
                 }
+                // `com.atproto.server.requestAccountDelete` / `deleteAccount`
+                // are served only when every authority they depend on is
+                // composed: password sessions, the email proof outbox, and
+                // the one permanent-deletion coordinator. There is no second
+                // deletion path.
+                let accountDeletionXRPC: SwanAccountDeletionXRPCServer?
+                if let legacySessionXRPC,
+                   let accountDeletionEmailRecovery,
+                   let accountDeletionProofKey,
+                   let permanentDeletionRuntime {
+                    accountDeletionXRPC = SwanAccountDeletionXRPCServer(
+                        sessions: legacySessionXRPC.sessions,
+                        accounts: accountProgramAccounts,
+                        controlStore: controlDatabase,
+                        email: SwanAccountDeletionEmailAdapter(
+                            service: accountDeletionEmailRecovery,
+                            store: controlDatabase
+                        ),
+                        rateLimiter: SwanDurableAccountEmailXRPCRateLimiter(
+                            store: controlDatabase,
+                            proofCodec: AccountEmailProofCodec(
+                                key: accountDeletionProofKey
+                            )
+                        ),
+                        deletion: permanentDeletionRuntime.coordinator,
+                        deletionProgress: controlDatabase,
+                        loginClientIdentityPolicy: loginClientIdentityPolicy
+                    )
+                } else {
+                    accountDeletionXRPC = nil
+                }
                 // Account program production composition (Task 7). The portal,
                 // legacy session, and did:web identity surfaces are assembled
                 // here from the durable SQLite stores and owner-only mounted
@@ -5154,6 +5193,7 @@ extension SwanCommand {
                     authorizationServerConfiguration: authorizationServerConfiguration,
                     accountEmailXRPC: accountEmailXRPC,
                     legacySessionXRPC: legacySessionXRPC,
+                    accountDeletionXRPC: accountDeletionXRPC,
                     actorPreferencesXRPC: actorPreferencesXRPC,
                     accountPortalHTTP: accountPortalHTTP,
                     accountLifecycleXRPC: accountLifecycleXRPC,
