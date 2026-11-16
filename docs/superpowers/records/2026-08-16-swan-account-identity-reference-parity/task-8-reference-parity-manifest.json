@@ -1,6 +1,6 @@
 {
   "schema": "swan.reference-parity.v1",
-  "reference": {"checkout": "/Users/joshlacalamito/Developer/Catbird+Petrel/atproto", "pin": "0e1042e65d5df27030849167773728b84d469182"},
+  "reference": {"checkout": "~/Developer/Catbird+Petrel/atproto", "pin": "0e1042e65d5df27030849167773728b84d469182"},
   "entries": [
     {"method":"com.atproto.server.updateEmail","capability":"plc-update-adapter","intent":"delegates to existing account PLC/step-up boundary","registered":false},
     {"method":"com.atproto.repo.getRecord","capability":"repo-record-projection","intent":"bounded indexed record read","registered":false},
