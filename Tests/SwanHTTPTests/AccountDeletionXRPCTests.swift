@@ -44,6 +44,35 @@ final class AccountDeletionXRPCTests: XCTestCase {
         try await fixture.assertAccountIntact()
     }
 
+    func testDPoPBoundAccessTokenSentAsBearerCannotRequestDeletion() async throws {
+        let fixture = try await Fixture.make()
+        addTeardownBlock { await fixture.close() }
+        func segment(_ json: String) -> String {
+            Data(json.utf8).base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+        }
+        let token = [
+            segment(#"{"alg":"ES256","typ":"at+jwt"}"#),
+            segment(#"{"sub":"\#(Self.did)","scope":"atproto","cnf":{"jkt":"thumbprint"}}"#),
+            "c2lnbmF0dXJl",
+        ].joined(separator: ".")
+        try await fixture.run { client in
+            try await client.execute(
+                uri: Self.requestPath,
+                method: .post,
+                headers: [.authorization: "Bearer \(token)"]
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+                XCTAssertEqual(Self.errorCode(response), "ExpiredToken")
+            }
+        }
+        let messages = try await fixture.deliverPending()
+        XCTAssertTrue(messages.isEmpty)
+        try await fixture.assertAccountIntact()
+    }
+
     func testAppPasswordSessionCannotRequestDeletion() async throws {
         let fixture = try await Fixture.make()
         addTeardownBlock { await fixture.close() }

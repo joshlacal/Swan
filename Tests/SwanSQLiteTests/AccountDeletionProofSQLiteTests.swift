@@ -182,6 +182,20 @@ final class AccountDeletionProofSQLiteTests: XCTestCase {
         )
         XCTAssertEqual(confirmed, .confirmed)
         // Constraint triggers survive the rebuild.
+        let triggers = try await reopened.connection.query(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'trigger' AND tbl_name = 'account_email_tokens'
+            ORDER BY name
+            """
+        )
+        XCTAssertEqual(
+            triggers.compactMap { $0.column("name")?.string },
+            [
+                "account_email_tokens_email_required_insert",
+                "account_email_tokens_email_required_update",
+            ]
+        )
         do {
             _ = try await reopened.connection.query(
                 """
@@ -192,6 +206,37 @@ final class AccountDeletionProofSQLiteTests: XCTestCase {
             )
             XCTFail("an address-less email proof must be refused")
         } catch {}
+    }
+
+    func testRebuildLeavesReferencesFromOtherTablesOnTheCanonicalName() async throws {
+        let (root, database) = try await openDatabase()
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        try await seedAccount(database, did: did, handle: "deleter.example.com", email: email)
+        try await database.close()
+
+        let path = SQLiteLayout.controlDatabase(in: root).path
+        let previous = try await SQLiteConnection.open(storage: .file(path: path))
+        for statement in Self.previousEmailTableStatements {
+            _ = try await previous.query(statement)
+        }
+        for table in ["account_email_tokens", "account_email_delivery_outbox"] {
+            _ = try await previous.query(
+                "CREATE TABLE \(table)_reference_probe(parent TEXT REFERENCES \(table))"
+            )
+        }
+        try await previous.close()
+
+        let reopened = try await SQLiteControlDatabase(dataDirectory: root)
+        addTeardownBlock { try? await reopened.close() }
+        for table in ["account_email_tokens", "account_email_delivery_outbox"] {
+            let probe = try await reopened.connection.query(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                [.text("\(table)_reference_probe")]
+            )
+            let sql = try XCTUnwrap(probe.first?.column("sql")?.string)
+            XCTAssertTrue(sql.contains("REFERENCES \(table))"), sql)
+            XCTAssertFalse(sql.contains("_purpose_v1"), sql)
+        }
     }
 
     // MARK: - Helpers
