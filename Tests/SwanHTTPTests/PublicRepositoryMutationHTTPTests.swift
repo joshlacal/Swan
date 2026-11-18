@@ -1889,6 +1889,96 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testCustomLexiconMLSRecordsCreatePutGetAndListRoundTrip() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let keyBytes = Data((0 ..< 32).map(UInt8.init))
+        let keyBase64 = keyBytes.base64EncodedString()
+        let sigBase64 = Data(repeating: 0xab, count: 64).base64EncodedString()
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.custom-lexicon-mls")
+        ).test(.router) { client in
+            let createDeviceBody = #"""
+            {"repo":"\#(Self.did)","collection":"blue.catbird.chat.device","rkey":"3m7dev01","record":{"$type":"blue.catbird.chat.device","mlsSignaturePublicKey":{"$bytes":"\#(keyBase64)"},"algorithm":"ed25519","createdAt":"2026-11-18T22:55:00.000Z"}}
+            """#
+            let createRes = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "custom-mls-device-create",
+                    method: "POST",
+                    path: Self.mutationPath
+                ),
+                body: ByteBuffer(string: createDeviceBody)
+            )
+            XCTAssertEqual(createRes.status, .ok)
+
+            let putPath = "/xrpc/com.atproto.repo.putRecord"
+            let putDeclarationBody = #"""
+            {"repo":"\#(Self.did)","collection":"blue.catbird.chat.declaration","rkey":"self","record":{"$type":"blue.catbird.chat.declaration","allowIncoming":"all","deliveryService":"did:web:chat.catbird.blue","protocolVersion":"1","createdAt":"2026-11-18T22:55:00.000Z"}}
+            """#
+            let declRes = try await client.execute(
+                uri: putPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "custom-mls-declaration-put",
+                    method: "POST",
+                    path: putPath
+                ),
+                body: ByteBuffer(string: putDeclarationBody)
+            )
+            XCTAssertEqual(declRes.status, .ok)
+
+            let putMailboxBody = #"""
+            {"repo":"\#(Self.did)","collection":"blue.catbird.labyrinth.mailboxKeys","rkey":"self","record":{"$type":"blue.catbird.labyrinth.mailboxKeys","current":{"$type":"blue.catbird.labyrinth.defs#epochPublic","epochNumber":0,"attestation":{"$type":"blue.catbird.labyrinth.defs#transportAttestation","transportPubkey":{"$bytes":"\#(keyBase64)"},"sig":{"$bytes":"\#(sigBase64)"}}},"backend":"space","updatedAt":"2026-11-18T22:55:00.000Z"}}
+            """#
+            let mailboxRes = try await client.execute(
+                uri: putPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "custom-labyrinth-mailbox-put",
+                    method: "POST",
+                    path: putPath
+                ),
+                body: ByteBuffer(string: putMailboxBody)
+            )
+            XCTAssertEqual(mailboxRes.status, .ok)
+        }
+
+        for (collection, rkey) in [
+            ("blue.catbird.chat.device", "3m7dev01"),
+            ("blue.catbird.chat.declaration", "self"),
+            ("blue.catbird.labyrinth.mailboxKeys", "self"),
+        ] {
+            let path = try PublicRepositoryPath(collection: collection, recordKey: rkey)
+            let maybeCID = try await fixture.database.publicRepositoryRecordCID(for: path)
+            let cid = try XCTUnwrap(maybeCID)
+            let maybeBlock = try await fixture.database.block(for: cid)
+            let block = try XCTUnwrap(maybeBlock)
+            let decoded = try RepositoryMSTValidation.decodeRecordBlock(block, for: path)
+            let output = SwanPublicWire.ComAtprotoRepoGetRecord.Output(
+                uri: try ATProtocolURI(uriString: "at://\(Self.did)/\(path.mstKey)"),
+                cid: cid,
+                value: decoded
+            )
+            let encoded = try JSONEncoder().encode(output)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+            let value = try XCTUnwrap(json["value"] as? [String: Any])
+            XCTAssertEqual(value["$type"] as? String, collection)
+            if collection == "blue.catbird.chat.device" {
+                let pubKeyObj = try XCTUnwrap(value["mlsSignaturePublicKey"] as? [String: Any])
+                XCTAssertEqual(pubKeyObj["$bytes"] as? String, keyBase64)
+            }
+        }
+    }
+
     private func makeFixture(
         includePublicBlobSpoolAdmission: Bool = true,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,

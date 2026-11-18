@@ -28,7 +28,7 @@ if !forceRemote, let localPetrel = siblingPathIfAvailable("Petrel") {
 } else {
     petrelDependency = .package(
         url: "https://github.com/joshlacal/Petrel.git",
-        revision: "8a934f7b39fe8301996310a7584341548c675fb2"
+        revision: "3a9d5b92898604425307a8a0a0c0be4de85f2ef0"
     )
 }
 
