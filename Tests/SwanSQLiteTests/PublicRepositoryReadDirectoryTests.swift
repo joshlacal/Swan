@@ -3,6 +3,7 @@ import Foundation
 import Hummingbird
 import HTTPTypes
 import Petrel
+import PetrelCrypto
 import SQLiteNIO
 import SwanCore
 import SwanHTTP
@@ -1318,6 +1319,367 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
         try await fixture.control.close()
     }
 
+    // MARK: - com.atproto.sync.getRecord proof
+
+    // Production mutation caught: the proof is built from the record index or
+    // a `getRecord` body rather than from the signed commit's MST, so it
+    // carries a record with nothing binding it to the account's signature.
+    func testRecordProofVerifiesInclusionAgainstTheSignedCommit() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let verification = try recordProofVerification(fixture.key)
+        let path = try PublicRepositoryPath(
+            collection: collection, recordKey: "one"
+        )
+
+        try await closingAfter(fixture.directory, fixture.control) {
+            let outcome = try await fixture.directory
+                .publicRepositoryRecordProofOutcome(did: self.did, path: path)
+            guard case let .active(proof) = outcome else {
+                return XCTFail("expected an active proof, got \(outcome)")
+            }
+            XCTAssertEqual(proof.did, self.did)
+            XCTAssertEqual(proof.state, fixture.state)
+            XCTAssertLessThanOrEqual(
+                proof.car.count,
+                PublicRepositoryRecordProofLimits.maximumProofCARBytes
+            )
+
+            let verified = try await Repository.verifyRecordProof(
+                car: proof.car,
+                did: self.did,
+                collection: self.collection,
+                recordKey: "one",
+                verification: verification
+            )
+            XCTAssertEqual(verified.commit.cid, fixture.state.commitCID)
+            XCTAssertEqual(
+                verified.commit.revision.value, fixture.state.revision
+            )
+            XCTAssertTrue(verified.commit.isSignatureVerified)
+            let record = try XCTUnwrap(verified.record)
+            XCTAssertEqual(record.cid, proof.recordCID)
+            let direct = try await fixture.directory.publicRepositoryRecord(
+                selector: self.did, path: path, expectedCID: nil
+            )
+            XCTAssertEqual(record.cid, direct?.cid)
+            XCTAssertEqual(record.bytes, direct?.canonicalBytes)
+
+            // A proof is the search path for one key, not the repository: the
+            // other public records and every permissioned value stay out.
+            XCTAssertNotNil(proof.car.range(of: Data("public-one".utf8)))
+            for other in ["two", "three"] {
+                XCTAssertNil(
+                    proof.car.range(of: Data("public-\(other)".utf8)),
+                    "the proof for `one` must not carry the `\(other)` record"
+                )
+            }
+            XCTAssertNil(proof.car.range(of: fixture.privateCollision))
+            XCTAssertNil(proof.car.range(of: fixture.privateOnly))
+
+            // The proof is bound to the account: it does not verify for
+            // another DID or under another signing key.
+            await XCTAssertThrowsRecordProofRejection(
+                try await Repository.verifyRecordProof(
+                    car: proof.car,
+                    did: "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz",
+                    collection: self.collection,
+                    recordKey: "one",
+                    verification: verification
+                )
+            )
+            let strangerKey = try self.recordProofVerification(
+                P256.Signing.PrivateKey()
+            )
+            await XCTAssertThrowsRecordProofRejection(
+                try await Repository.verifyRecordProof(
+                    car: proof.car,
+                    did: self.did,
+                    collection: self.collection,
+                    recordKey: "one",
+                    verification: strangerKey
+                )
+            )
+        }
+    }
+
+    // Production mutation caught: an absent key answers `.notFound` (or a
+    // commit-only CAR), which a verifier cannot tell apart from a server
+    // withholding the record.
+    func testRecordProofProvesAbsenceForKeysThePublicRepositoryDoesNotHold() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let verification = try recordProofVerification(fixture.key)
+
+        try await closingAfter(fixture.directory, fixture.control) {
+            // `private-only` exists, but only inside a permissioned space:
+            // the public repository must prove it absent, not find it. The
+            // last entry is a collection the repository has never held.
+            for (collection, recordKey) in [
+                (self.collection, "absent"),
+                (self.collection, "private-only"),
+                (self.collection, "zzzz"),
+                (self.collection, "0"),
+                ("blue.catbird.mlsChat.device", "self"),
+            ] {
+                let outcome = try await fixture.directory
+                    .publicRepositoryRecordProofOutcome(
+                        did: self.did,
+                        path: try PublicRepositoryPath(
+                            collection: collection, recordKey: recordKey
+                        )
+                    )
+                guard case let .active(proof) = outcome else {
+                    XCTFail("expected an active proof for \(recordKey)")
+                    continue
+                }
+                XCTAssertNil(proof.recordCID, recordKey)
+                XCTAssertEqual(proof.state, fixture.state, recordKey)
+                let verified = try await Repository.verifyRecordProof(
+                    car: proof.car,
+                    did: self.did,
+                    collection: collection,
+                    recordKey: recordKey,
+                    verification: verification
+                )
+                XCTAssertEqual(
+                    verified.commit.cid, fixture.state.commitCID, recordKey
+                )
+                XCTAssertNil(verified.record, recordKey)
+                XCTAssertNil(
+                    proof.car.range(of: fixture.privateOnly), recordKey
+                )
+            }
+        }
+    }
+
+    func testRecordProofOutcomeRefusesUnhostedInactiveNonDIDAndClosedDirectory() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let path = try PublicRepositoryPath(
+            collection: collection, recordKey: "one"
+        )
+
+        try await closingAfter(fixture.directory, fixture.control) {
+            let unhosted = try await fixture.directory
+                .publicRepositoryRecordProofOutcome(
+                    did: "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz", path: path
+                )
+            guard case .notFound = unhosted else {
+                return XCTFail("an unhosted DID must be reported as not found")
+            }
+
+            // The lexicon's parameter is `did`; a handle is a request fault
+            // here even though the JSON repo reads accept one.
+            do {
+                _ = try await fixture.directory
+                    .publicRepositoryRecordProofOutcome(
+                        did: self.handle, path: path
+                    )
+                XCTFail("a handle selector must be refused")
+            } catch let error as PublicRepositoryReadError {
+                XCTAssertEqual(error, .invalidSelector)
+            }
+
+            _ = try await fixture.control.transitionStatus(
+                did: self.did,
+                to: .deactivated,
+                declaration: .init(),
+                now: Date(timeIntervalSince1970: 1_750_000_010)
+            )
+            let inactive = try await fixture.directory
+                .publicRepositoryRecordProofOutcome(did: self.did, path: path)
+            guard case let .lifecycle(status) = inactive else {
+                return XCTFail("a deactivated account must not yield a proof")
+            }
+            XCTAssertEqual(status.status, .deactivated)
+            XCTAssertNil(status.revision)
+
+            try await fixture.directory.close()
+            await XCTAssertThrowsPublicReadUnavailable(
+                try await fixture.directory.publicRepositoryRecordProofOutcome(
+                    did: self.did, path: path
+                )
+            )
+        }
+    }
+
+    // Production mutation caught: the walk returns only the node that holds
+    // the key (or only the root), which verifies on a one-node tree and
+    // nowhere else. Every hosted repository of any size is deeper than that.
+    func testRecordProofCarriesTheWholeSearchPathOfAMultiLayerTree() async throws {
+        let recordKeys = (0 ..< 64).map { String(format: "k%02d", $0) }
+        let paths = try recordKeys.map {
+            try PublicRepositoryPath(collection: collection, recordKey: $0)
+        }
+        // The premise, asserted rather than assumed: these keys do not all
+        // sit in one MST layer, so the tree has an interior node and the
+        // search path for a layer-0 key crosses at least two nodes.
+        XCTAssertTrue(paths.contains { $0.keyDepth == 0 })
+        XCTAssertTrue(paths.contains { $0.keyDepth > 0 })
+
+        let fixture = try await makeFixture(publicRecordKeys: recordKeys)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let verification = try recordProofVerification(fixture.key)
+
+        try await closingAfter(fixture.directory, fixture.control) {
+            var largestProof = 0
+            for path in paths {
+                let outcome = try await fixture.directory
+                    .publicRepositoryRecordProofOutcome(
+                        did: self.did, path: path
+                    )
+                guard case let .active(proof) = outcome else {
+                    XCTFail("expected an active proof for \(path.recordKey)")
+                    continue
+                }
+                largestProof = max(largestProof, proof.car.count)
+                let verified = try await Repository.verifyRecordProof(
+                    car: proof.car,
+                    did: self.did,
+                    collection: path.collection,
+                    recordKey: path.recordKey,
+                    verification: verification
+                )
+                XCTAssertEqual(
+                    verified.commit.cid, fixture.state.commitCID,
+                    path.recordKey
+                )
+                XCTAssertEqual(
+                    verified.record?.cid, proof.recordCID, path.recordKey
+                )
+                XCTAssertNotNil(verified.record, path.recordKey)
+            }
+            // Absent keys that fall before, between, and after the stored
+            // ones, so the exclusion path ends in different gaps.
+            for recordKey in ["a", "k00a", "k31z", "k63z", "zzzz"] {
+                let outcome = try await fixture.directory
+                    .publicRepositoryRecordProofOutcome(
+                        did: self.did,
+                        path: try PublicRepositoryPath(
+                            collection: self.collection, recordKey: recordKey
+                        )
+                    )
+                guard case let .active(proof) = outcome else {
+                    XCTFail("expected an active proof for \(recordKey)")
+                    continue
+                }
+                XCTAssertNil(proof.recordCID, recordKey)
+                let verified = try await Repository.verifyRecordProof(
+                    car: proof.car,
+                    did: self.did,
+                    collection: self.collection,
+                    recordKey: recordKey,
+                    verification: verification
+                )
+                XCTAssertNil(verified.record, recordKey)
+            }
+            // A path, not the repository: no proof approaches the size of the
+            // 64 record blocks the full export carries.
+            let export = try await self.exportedCARByteCount(fixture.directory)
+            XCTAssertLessThan(largestProof, export)
+        }
+    }
+
+    // Production mutation caught: the proof is assembled without a byte
+    // bound, so the response budget the route reserves is whatever the
+    // account's MST happens to weigh.
+    func testRecordProofIsRefusedWhenItCannotFitTheResponseBudget() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let path = try PublicRepositoryPath(
+            collection: collection, recordKey: "one"
+        )
+
+        try await closingAfter(fixture.directory, fixture.control) {
+            let store = await fixture.directory.preopenedPublicMutationStore(
+                did: self.did
+            )
+            let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
+            let maybeAccount = try await fixture.control.account(did: self.did)
+            let account = try XCTUnwrap(maybeAccount)
+            let generation = try await database.admitPublicRepositoryGeneration(
+                account: account,
+                identityVerifier: TestPublicPLCGenesisVerifier(
+                    operationCID: fixture.genesisOperationCID
+                )
+            )
+
+            let unbounded = try await database.readPublicRepositoryRecordProof(
+                path: path, generation: generation
+            )
+            XCTAssertNotNil(unbounded.recordCID)
+
+            // The accounting is conservative, so a proof that is admitted is
+            // never larger than its budget: one byte short of the real
+            // archive is refused, as is every smaller budget, including one
+            // too small for the commit block alone.
+            for budget in [
+                unbounded.car.count - 1, unbounded.car.count / 2, 256, 64, 0,
+            ] {
+                do {
+                    _ = try await database.readPublicRepositoryRecordProof(
+                        path: path,
+                        generation: generation,
+                        maximumCARBytes: budget
+                    )
+                    XCTFail("a \(budget)-byte budget must refuse the proof")
+                } catch let error as PublicRepositoryReadError {
+                    XCTAssertEqual(error, .resourceLimitExceeded, "\(budget)")
+                }
+            }
+
+            // Positive control: the same read succeeds with room to spare,
+            // and what it returns fits the budget it was given.
+            let roomy = unbounded.car.count + 1_024
+            let bounded = try await database.readPublicRepositoryRecordProof(
+                path: path, generation: generation, maximumCARBytes: roomy
+            )
+            XCTAssertEqual(bounded.car, unbounded.car)
+            XCTAssertLessThanOrEqual(bounded.car.count, roomy)
+        }
+    }
+
+    private func exportedCARByteCount(
+        _ directory: SQLitePreMigratedAccountDirectory
+    ) async throws -> Int {
+        let maybeCAR = try await directory.publicRepositoryCAR(selector: did)
+        let car = try XCTUnwrap(maybeCAR)
+        let collector = PublicReadCARCollector()
+        try await car.spool.stream { await collector.append($0) }
+        return await collector.data.count
+    }
+
+    private func recordProofVerification(
+        _ key: P256.Signing.PrivateKey
+    ) throws -> RepositoryCommitVerification {
+        .signingKey(try ATProtoPublicKey(
+            curve: .p256,
+            sec1Representation: key.publicKey.x963Representation
+        ))
+    }
+
+    /// Runs `body`, then closes the fixture's databases whether or not it
+    /// threw. A thrown error that skipped the close trips SQLiteNIO's
+    /// "not closed before deinitializing" assertion, which aborts the test
+    /// process and hides every test after it behind one unrelated crash.
+    private func closingAfter(
+        _ directory: SQLitePreMigratedAccountDirectory,
+        _ control: SQLiteControlDatabase,
+        _ body: () async throws -> Void
+    ) async throws {
+        do {
+            try await body()
+        } catch {
+            try? await directory.close()
+            try? await control.close()
+            throw error
+        }
+        // A test may already have closed the directory to assert on that.
+        try? await directory.close()
+        try await control.close()
+    }
+
     private func makeFixture(
         admission: PublicRepositorySpoolAdmission? = nil,
         tamperJournalSignature: Bool = false,
@@ -1794,6 +2156,28 @@ private func XCTAssertThrowsPublicReadUnavailable<T>(
         )
     } catch {
         XCTFail("expected public read unavailable, got \(error)", file: file, line: line)
+    }
+}
+
+/// A record proof that must not verify. `Repository.verifyRecordProof`
+/// reports every rejection as a `RepositoryError`; anything else means the
+/// verifier failed for an unrelated reason and the assertion proved nothing.
+private func XCTAssertThrowsRecordProofRejection<T>(
+    _ expression: @autoclosure () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("expected the proof to be rejected", file: file, line: line)
+    } catch is RepositoryError {
+        // Expected.
+    } catch {
+        XCTFail(
+            "expected a RepositoryError, got \(error)",
+            file: file,
+            line: line
+        )
     }
 }
 

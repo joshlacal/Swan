@@ -300,16 +300,22 @@ final class DeploymentStartupInterlockTests: XCTestCase {
     }
 
     /// The asymmetry is deliberate and must stay one-directional: the router
-    /// serves `com.atproto.identity.resolveHandle` although no profile declares
-    /// it, and that is not an error.
+    /// serves `com.atproto.identity.resolveHandle` and
+    /// `com.atproto.sync.getRecord` although no profile declares them, and
+    /// that is not an error.
     func testServingMoreThanTheArtifactDeclaresIsNotARefusal() throws {
         let surface = SwanPublicRouteSurface.default
-        XCTAssertTrue(
-            surface.servedMethodNSIDs.contains("com.atproto.identity.resolveHandle")
-        )
-        XCTAssertFalse(
-            surface.declaredMethodNSIDs.contains("com.atproto.identity.resolveHandle")
-        )
+        for undeclared in [
+            "com.atproto.identity.resolveHandle",
+            "com.atproto.sync.getRecord",
+        ] {
+            XCTAssertTrue(
+                surface.servedMethodNSIDs.contains(undeclared), undeclared
+            )
+            XCTAssertFalse(
+                surface.declaredMethodNSIDs.contains(undeclared), undeclared
+            )
+        }
         let data = try JSONSerialization.data(
             withJSONObject: ["id": surface.profileID, "endpoints": [] as [String]],
             options: [.sortedKeys]

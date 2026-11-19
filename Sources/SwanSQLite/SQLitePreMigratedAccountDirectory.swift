@@ -2140,6 +2140,57 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
+    /// The proof behind `com.atproto.sync.getRecord`.
+    ///
+    /// Admitted and pinned exactly as ``publicRepositoryRecordOutcome`` is: a
+    /// proof is relative to one signed commit, so it is built against the
+    /// verified generation and the control row is re-checked before it is
+    /// returned. Nothing here leaves the startup-preopened inventory.
+    ///
+    /// The selector must be a DID. `resolvePublicAccount` would also accept a
+    /// canonical handle, and the lexicon's parameter is `did`.
+    public func publicRepositoryRecordProofOutcome(
+        did: String,
+        path: PublicRepositoryPath
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadRecordProof> {
+        guard AccountControlIdentifiers.isDID(did) else {
+            throw PublicRepositoryReadError.invalidSelector
+        }
+        guard let account = try await resolvePublicAccount(did) else {
+            return .notFound
+        }
+        guard account.status == .active else {
+            return .lifecycle(try PublicRepositoryReadStatus(
+                did: account.did,
+                status: account.status,
+                revision: nil
+            ))
+        }
+        return try await withPublicReadGeneration(account) {
+            database, generation in
+            let read: SQLitePublicRepositoryRecordProofRead
+            do {
+                read = try await database.readPublicRepositoryRecordProof(
+                    path: path,
+                    generation: generation
+                )
+            } catch let error as PublicRepositoryReadError {
+                throw error
+            } catch {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .storageFailure
+                )
+            }
+            try await recheckPublicAccount(account, generation: generation)
+            return .active(try PublicRepositoryReadRecordProof(
+                did: account.did,
+                state: read.state,
+                recordCID: read.recordCID,
+                car: read.car
+            ))
+        }
+    }
+
     /// Republishes an account's public read generation after a mutation, and
     /// evicts rather than refuses when that cannot be done.
     ///

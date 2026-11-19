@@ -1282,4 +1282,27 @@ public protocol PublicRepositoryReadDirectory: Sendable {
     func publicRepositoryBlobOutcome(
         did: String
     ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadBlobTarget>
+
+    /// Builds the proof `com.atproto.sync.getRecord` returns: the signed
+    /// commit, the MST nodes on the search path for `path`, and the record
+    /// block when the key is present.
+    ///
+    /// An absent key is `.active` with a `nil` `recordCID`, never `.notFound`:
+    /// the same path blocks prove the key is not in the commit, and consumers
+    /// that verify the proof depend on receiving them. `.notFound` means only
+    /// that this server hosts no such repository.
+    ///
+    /// A requirement rather than a defaulted extension, for the reason
+    /// ``publicRepositoryBlobOutcome(did:)`` is one: a default answering
+    /// `.notFound` would let a conformer report every hosted account as
+    /// unhosted to the clients that authenticate records through this proof.
+    ///
+    /// The selector is a DID, never a handle: the lexicon's parameter is
+    /// `did`. Unlike a blob, a proof is relative to one commit, so
+    /// implementations must admit and pin a repository generation and build
+    /// the proof entirely from the startup-preopened inventory.
+    func publicRepositoryRecordProofOutcome(
+        did: String,
+        path: PublicRepositoryPath
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadRecordProof>
 }

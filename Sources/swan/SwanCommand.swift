@@ -2519,9 +2519,9 @@ extension SwanCommand {
         ///
         /// It is a **subset** test, not an equality test.
         /// ``SwanPublicRouteSurface/outOfProfilePublicMethods`` is served
-        /// without being declared by any profile — `resolveHandle` — and that
-        /// asymmetry is intended, so only the advertise-but-do-not-serve
-        /// direction is an error.
+        /// without being declared by any profile — `resolveHandle` and
+        /// `sync.getRecord` — and that asymmetry is intended, so only the
+        /// advertise-but-do-not-serve direction is an error.
         ///
         /// This is a no-op for every profile shipped today; it is a guard
         /// against a future profile bump, which is exactly when nobody will be
@@ -5278,10 +5278,10 @@ extension SwanCommand {
                     // set of public NSIDs this router may install a handler
                     // for. The two differ by
                     // `SwanPublicRouteSurface.outOfProfilePublicMethods`
-                    // (`resolveHandle`), which no profile declares. Logging
-                    // only the first would understate the served surface by
-                    // one, which is the class of thing this line exists to
-                    // stop.
+                    // (`resolveHandle` and `sync.getRecord`), which no
+                    // profile declares. Logging only the first would
+                    // understate the served surface, which is the class of
+                    // thing this line exists to stop.
                     "publicMethodCount": .string(String(publicRouteSurface.methods.count)),
                     "publicServedMethodCount": .string(
                         String(publicRouteSurface.servedMethodNSIDs.count)

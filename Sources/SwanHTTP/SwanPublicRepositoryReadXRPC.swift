@@ -31,6 +31,7 @@ private let publicReadNSIDs: Set<String> = [
     "com.atproto.repo.listRecords",
     "com.atproto.sync.getBlob",
     "com.atproto.sync.getLatestCommit",
+    "com.atproto.sync.getRecord",
     "com.atproto.sync.getRepo",
     "com.atproto.sync.getRepoStatus",
 ]
@@ -71,7 +72,11 @@ let publicHandleResolutionAdmission = try! PublicRepositoryJSONReadAdmission(
 /// Names an HTTP-layer guard that refuses a read after storage has already
 /// answered. These are the 503 causes that never reach
 /// `PublicReadUnavailableReason` because they are decided above the directory.
-private enum PublicReadHandlerGuard: String {
+///
+/// Internal, with the response helpers below, so a public read route that
+/// lives in its own file (`SwanPublicRecordProofXRPC.swift`) refuses, journals
+/// and maps errors through exactly the code these routes use.
+enum PublicReadHandlerGuard: String {
     /// `describeRepo`: the admitted identity's `pdsOrigin` is not this service.
     case pdsOriginMismatch
     /// `listRecords`: the returned page violates its own ordering or cursor
@@ -847,6 +852,17 @@ func registerPublicRepositoryReadEndpoints(
         }
     }
 
+    // `com.atproto.sync.getRecord` — the single-record CAR proof. Its handler
+    // lives in `SwanPublicRecordProofXRPC.swift`; it is installed here so it
+    // exists exactly when the rest of the public read surface does, and its
+    // wrong-method guards come from the loop below.
+    registerPublicRecordProofEndpoint(
+        on: router,
+        directory: directory,
+        servedMethods: servedMethods,
+        jsonReadAdmission: jsonReadAdmission
+    )
+
     // `com.atproto.sync.getBlob` is a read, and it belongs here.
     //
     // It used to be registered inside the *mutation* endpoint block, so
@@ -1011,6 +1027,7 @@ func registerPublicRepositoryReadEndpoints(
         "com.atproto.repo.listRecords",
         "com.atproto.sync.getBlob",
         "com.atproto.sync.getLatestCommit",
+        "com.atproto.sync.getRecord",
         "com.atproto.sync.getRepo",
         "com.atproto.sync.getRepoStatus",
     ] where servedMethods.contains(nsid) {
@@ -1283,7 +1300,7 @@ private let getRepoQuerySchema = StrictQuerySchema(
 private let resolveHandleQuerySchema = StrictQuerySchema(required: ["handle"])
 private let publicBlobQuerySchema = StrictQuerySchema(required: ["did", "cid"])
 
-private func publicReadQuery(
+func publicReadQuery(
     _ request: Request,
     schema: StrictQuerySchema
 ) throws -> [String: String] {
@@ -1334,7 +1351,7 @@ private func publicReadBoolean(_ raw: String) throws -> Bool {
     }
 }
 
-private func publicLifecycleError(_ status: AccountControlStatus) -> Response {
+func publicLifecycleError(_ status: AccountControlStatus) -> Response {
     let code = switch status {
     case .deactivated: "RepoDeactivated"
     case .suspended: "RepoSuspended"
@@ -1365,7 +1382,7 @@ private func publicReadResponse(
     }
 }
 
-private func publicReadError(_ status: HTTPResponse.Status, _ code: String) -> Response {
+func publicReadError(_ status: HTTPResponse.Status, _ code: String) -> Response {
     jsonResponseWithStatus(status, body: ["error": code])
 }
 
@@ -1379,7 +1396,7 @@ private func publicReadError(_ status: HTTPResponse.Status, _ code: String) -> R
 ///
 /// The selector is logged only when it is already a well-formed DID or handle,
 /// so an arbitrary query value can never be reflected into the journal.
-private func publicReadUnavailable(
+func publicReadUnavailable(
     _ error: any Error,
     method: String,
     selector: String?
@@ -1393,7 +1410,7 @@ private func publicReadUnavailable(
 
 /// The 503 exits that are decided rather than thrown — an admission reservation
 /// refused, a response body that will not encode — name their guard directly.
-private func publicReadUnavailable(
+func publicReadUnavailable(
     reason: String,
     method: String,
     selector: String?

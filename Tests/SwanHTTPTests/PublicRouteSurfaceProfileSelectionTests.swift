@@ -198,15 +198,20 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
         }
     }
 
-    /// `resolveHandle` is served by every assembly with a read directory and is
-    /// declared by no profile, so it reaches registration through the named
-    /// out-of-profile constant rather than through a profile's `endpoints`.
-    /// Pin that it is the *only* such route: anything else added to that set
-    /// would be a public route no profile can ever remove.
-    func testTheOnlyRouteOutsideEveryProfileIsResolveHandle() throws {
+    /// `resolveHandle` and `sync.getRecord` are served by every assembly with a
+    /// read directory and are declared by no profile, so they reach
+    /// registration through the named out-of-profile constant rather than
+    /// through a profile's `endpoints`. Pin that they are the *only* such
+    /// routes: anything else added to that set would be a public route no
+    /// profile can ever remove.
+    func testTheOnlyRoutesOutsideEveryProfileAreResolveHandleAndSyncGetRecord() throws {
+        let outOfProfile: Set<String> = [
+            "com.atproto.identity.resolveHandle",
+            "com.atproto.sync.getRecord",
+        ]
         XCTAssertEqual(
             SwanPublicRouteSurface.outOfProfilePublicMethods,
-            ["com.atproto.identity.resolveHandle"]
+            outOfProfile
         )
         for profileID in SwanPublicRouteSurface.registeredProfileIDs.sorted() {
             let surface = try XCTUnwrap(SwanPublicRouteSurface(profileID: profileID))
@@ -217,7 +222,7 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
             )
             XCTAssertEqual(
                 surface.servedMethodNSIDs,
-                surface.declaredMethodNSIDs.union(["com.atproto.identity.resolveHandle"]),
+                surface.declaredMethodNSIDs.union(outOfProfile),
                 profileID
             )
         }
@@ -651,6 +656,7 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
                     Self.putRecordPath,
                     Self.resolveHandlePath,
                     "/xrpc/com.atproto.sync.getRepo",
+                    "/xrpc/com.atproto.sync.getRecord",
                     "/xrpc/com.atproto.repo.uploadBlob",
                     Self.requestPasswordResetPath,
                 ] {
@@ -903,6 +909,13 @@ private struct SurfaceGateReadDirectory: PublicRepositoryReadDirectory {
     func publicRepositoryBlobOutcome(did _: String) async throws
         -> PublicRepositoryReadOutcome<PublicRepositoryReadBlobTarget>
     { throw SurfaceGateStubFailure.unused }
+
+    func publicRepositoryRecordProofOutcome(
+        did _: String,
+        path _: PublicRepositoryPath
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadRecordProof> {
+        throw SurfaceGateStubFailure.unused
+    }
 }
 
 private actor SurfaceGateSpaceDirectory: AuthorizedSimpleSpaceDirectory {

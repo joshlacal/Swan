@@ -122,6 +122,9 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                     // public reads on, public writes off — served no blobs.
                     "/xrpc/com.atproto.sync.getBlob",
                     "/xrpc/com.atproto.sync.getLatestCommit",
+                    // Declared by no public profile, and still installed by
+                    // the read directory in the production composition.
+                    "/xrpc/com.atproto.sync.getRecord",
                     "/xrpc/com.atproto.sync.getRepo",
                     "/xrpc/com.atproto.sync.getRepoStatus",
                 ] {

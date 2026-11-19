@@ -87,20 +87,38 @@ public struct SwanPublicRouteSurface: Sendable, Equatable {
 
     /// Public routes this build serves that **no** public profile declares.
     ///
-    /// Exactly one, and it is not an oversight:
+    /// Exactly two, and neither is an oversight.
+    ///
     /// `com.atproto.identity.resolveHandle` is not in any
     /// `Profiles/public-data-testing-*.json` `endpoints` array, yet the read
     /// surface registers it, because login on every client depends on it and
-    /// no profile family has ever carried it. Naming it here keeps the served
-    /// set enumerable in one place instead of leaving one route silently
-    /// outside the selection: ``servedMethodNSIDs`` is the complete allow-list
-    /// of public NSIDs any assembly may install a real handler for, and route
-    /// registration consults that and nothing else.
+    /// no profile family has ever carried it.
+    ///
+    /// `com.atproto.sync.getRecord` is the single-record CAR proof. Consumers
+    /// that authenticate a record against the account's signed commit rather
+    /// than trusting the host — Catbird's MLS device and declaration
+    /// resolution among them — have no substitute for it, and a PDS that
+    /// answers `404` there cannot interoperate with them however the operator
+    /// selects profiles. No shipped profile can declare it: each profile's
+    /// `generated-wire.sha256` manifest pins
+    /// `Sources/SwanPublicWire/SwanPublicWire.swift`, so adding a descriptor
+    /// would invalidate every attested profile, and the method must be served
+    /// under the profile production already runs. A future public profile
+    /// that does declare it supersedes this entry for that profile, and the
+    /// entry should be removed once every registered profile carries it.
+    ///
+    /// Naming them here keeps the served set enumerable in one place instead
+    /// of leaving a route silently outside the selection:
+    /// ``servedMethodNSIDs`` is the complete allow-list of public NSIDs any
+    /// assembly may install a real handler for, and route registration
+    /// consults that and nothing else. Both are still installed only by an
+    /// assembly that has a public read directory.
     ///
     /// It is a constant rather than a parameter for the same reason the
     /// registry is: a caller must not be able to widen the served set.
     public static let outOfProfilePublicMethods: Set<String> = [
         "com.atproto.identity.resolveHandle",
+        "com.atproto.sync.getRecord",
     ]
 
     public let profileID: String

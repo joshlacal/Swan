@@ -37,6 +37,12 @@ struct SQLitePublicRepositoryPageRead: Sendable {
     let page: PublicRepositoryReadPage
 }
 
+struct SQLitePublicRepositoryRecordProofRead: Sendable {
+    let state: PublicRepositoryState
+    let recordCID: CID?
+    let car: Data
+}
+
 extension SQLiteAccountDatabase {
     /// Returns the DID bound to this managed account database. Replication
     /// callers use this before any network fetch so a valid-but-different DID
@@ -664,6 +670,127 @@ extension SQLiteAccountDatabase {
         }
     }
 
+    /// Builds the `com.atproto.sync.getRecord` proof for one path against the
+    /// admitted generation: the signed commit, the MST nodes on the search
+    /// path from the commit's root to the key, and the record block when the
+    /// key is present. An absent key yields the same path with no record —
+    /// that path *is* the proof of absence, so it is a successful read.
+    ///
+    /// Every block comes from this account's own `public_repository_blocks`,
+    /// inside one read transaction, bracketed by the same generation checks
+    /// `readPublicRepositoryRecord` uses. Each is re-hashed against the link
+    /// that named it on the way down, so the proof is bound to the generation's
+    /// authenticated `dataCID` and not to the record index.
+    ///
+    /// The proof is bounded while it is assembled rather than after: every
+    /// block is charged against
+    /// ``PublicRepositoryRecordProofLimits/maximumProofCARBytes`` as it is
+    /// read, so an account whose search path cannot fit is refused after at
+    /// most one over-budget block instead of after the whole path has been
+    /// materialized.
+    ///
+    /// `maximumCARBytes` is a test seam. Production never passes it: the
+    /// directory calls this with the default, which is the bound the HTTP
+    /// route reserves its lease for.
+    func readPublicRepositoryRecordProof(
+        path: PublicRepositoryPath,
+        generation: SQLiteVerifiedPublicRepositoryGeneration,
+        maximumCARBytes: Int = PublicRepositoryRecordProofLimits
+            .maximumProofCARBytes
+    ) async throws -> SQLitePublicRepositoryRecordProofRead {
+        try await withConnectionGate {
+            try await writerReadTransaction {
+                let state = try await requirePublicRepositoryGenerationWithoutGate(
+                    generation,
+                    connection: connection
+                )
+                let commitBytes = try await blockBytesWithoutGate(
+                    state.commitCID,
+                    connection: connection
+                )
+                let commit = try structurallyValidatedCommit(
+                    signedCommitBytes: commitBytes,
+                    expectedCommitCID: state.commitCID
+                )
+                guard commit.descriptor.did == state.did,
+                      commit.descriptor.revision.value == state.revision,
+                      commit.descriptor.dataCID == state.dataCID else {
+                    throw PublicRepositoryReadError.unavailable(reason: .repositoryStateMismatch)
+                }
+                let budget = SQLitePublicRecordProofBlockBudget(
+                    source: SQLitePublicRepositoryBlockSource(
+                        connection: connection
+                    ),
+                    maximumCARBytes: maximumCARBytes
+                )
+                try await budget.charge(commitBytes.count)
+                let found: (nodes: [PublicRepositoryBlock], recordCID: CID?)
+                do {
+                    found = try await RepositoryMSTProof.pathBlocks(
+                        rootCID: state.dataCID,
+                        path: path,
+                        blocks: budget
+                    )
+                } catch let error as PublicRepositoryReadError {
+                    throw error
+                } catch {
+                    throw PublicRepositoryReadError.unavailable(reason: .blockMaterializationFailed)
+                }
+                var blocks = [
+                    PublicRepositoryBlock(
+                        cid: state.commitCID, bytes: commitBytes
+                    ),
+                ]
+                blocks.append(contentsOf: found.nodes)
+                if let recordCID = found.recordCID {
+                    // Scalar length first, as on the single-record JSON read:
+                    // the body is charged before it is selected, so an
+                    // over-budget record is never materialized to be refused.
+                    let byteCount = try await
+                        publicRepositoryRecordBlockByteCountWithoutGate(recordCID)
+                    try await budget.charge(byteCount)
+                    let bytes = try await blockBytesWithoutGate(
+                        recordCID,
+                        connection: connection
+                    )
+                    guard bytes.count == byteCount else {
+                        throw PublicRepositoryReadError.unavailable(reason: .blockMaterializationFailed)
+                    }
+                    // The construction-time checks `repo.getRecord` applies:
+                    // the bytes hash to the CID the MST names and are a valid
+                    // record block for this path.
+                    let record = try PublicRepositoryReadRecord(
+                        path: path,
+                        cid: recordCID,
+                        canonicalBytes: bytes
+                    )
+                    blocks.append(PublicRepositoryBlock(
+                        cid: record.cid, bytes: record.canonicalBytes
+                    ))
+                }
+                let car: Data
+                do {
+                    car = try await PublicRepositoryCAR.encode(
+                        rootCID: state.commitCID,
+                        blocks: blocks
+                    )
+                } catch {
+                    throw PublicRepositoryReadError.unavailable(reason: .blockMaterializationFailed)
+                }
+                try await recheckPublicRepositoryGenerationWithoutGate(
+                    generation,
+                    expectedState: state,
+                    connection: connection
+                )
+                return SQLitePublicRepositoryRecordProofRead(
+                    state: state,
+                    recordCID: found.recordCID,
+                    car: car
+                )
+            }
+        }
+    }
+
     func readPublicRepositoryRecords(
         collection: String,
         limit: Int,
@@ -1040,6 +1167,54 @@ private func publicReadCID(
         return cid
     } catch {
         throw PublicRepositoryReadError.unavailable(reason: reason)
+    }
+}
+
+/// The block source a record proof is walked through: this account's public
+/// blocks, with every byte charged against one response budget.
+///
+/// `RepositoryMSTProof.pathBlocks` bounds the *depth* of a search path but not
+/// its bytes, and a node may be as large as
+/// `PublicRepositoryLimits.maximumPersistedBlockBytes`. Charging here is what
+/// makes the anonymous proof read bounded in memory: the walk stops at the
+/// first block that would push the encoded archive past the budget.
+///
+/// An actor because the walk reaches it through `any
+/// PublicRepositoryBlockSource`, which is `Sendable`; the walk itself is
+/// sequential, so nothing ever contends for it.
+private actor SQLitePublicRecordProofBlockBudget: PublicRepositoryBlockSource {
+    /// A CARv1 header naming one blessed root is 59 bytes.
+    private static let headerBytes = 64
+    /// Each frame adds a length varint and the block's 36-byte CID.
+    private static let frameOverheadBytes = 48
+
+    private let source: SQLitePublicRepositoryBlockSource
+    private var remainingBytes: Int
+
+    init(source: SQLitePublicRepositoryBlockSource, maximumCARBytes: Int) {
+        self.source = source
+        remainingBytes = maximumCARBytes - Self.headerBytes
+    }
+
+    /// Reserves one block's share of the archive, or refuses the proof.
+    ///
+    /// `resourceLimitExceeded` rather than a load-dependent reason: an
+    /// oversized search path is a property of the account's own data and
+    /// refuses identically on every attempt.
+    func charge(_ blockBytes: Int) throws {
+        let (cost, overflow) = blockBytes.addingReportingOverflow(
+            Self.frameOverheadBytes
+        )
+        guard !overflow, blockBytes >= 0, cost <= remainingBytes else {
+            throw PublicRepositoryReadError.resourceLimitExceeded
+        }
+        remainingBytes -= cost
+    }
+
+    func block(for cid: CID) async throws -> Data? {
+        guard let bytes = try await source.block(for: cid) else { return nil }
+        try charge(bytes.count)
+        return bytes
     }
 }
 

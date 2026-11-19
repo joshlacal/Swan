@@ -781,6 +781,13 @@ private struct PermanentlyUnadmittablePublicReadDirectory:
     ) async throws
         -> PublicRepositoryReadOutcome<PublicRepositoryReadBlobTarget>
     { throw refusal }
+
+    func publicRepositoryRecordProofOutcome(
+        did _: String,
+        path _: PublicRepositoryPath
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadRecordProof>
+    { throw refusal }
 }
 
 /// Stands in for the pinned TXT/`.well-known` resolver so the capability's

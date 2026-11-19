@@ -585,6 +585,13 @@ private actor PublicBlobReadOnlyDirectory: PublicRepositoryReadDirectory {
         )
     }
 
+    func publicRepositoryRecordProofOutcome(
+        did _: String,
+        path _: PublicRepositoryPath
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadRecordProof>
+    { .notFound }
+
     func publicRepositoryStatus(
         selector _: String
     ) async throws -> PublicRepositoryReadStatus? { nil }

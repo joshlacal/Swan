@@ -121,6 +121,14 @@ All mutation endpoints require authentication and enforce granular scope authori
 - **Parameters**: Query parameter `did` (DID string, required). Parameter `since` is not supported and is rejected with `400 InvalidRequest`.
 - **Returns**: Complete repository export as a verified CAR v1 binary stream (`application/vnd.ipld.car`).
 
+#### `com.atproto.sync.getRecord`
+- **Method**: `GET`
+- **Authentication**: None
+- **Parameters**: Query parameters `did` (DID string, required; a handle is rejected), `collection` (NSID, required), `rkey` (record key, required). The deprecated `commit` parameter is accepted and ignored. Malformed or unknown parameters return `400 InvalidRequest`.
+- **Returns**: Record proof as a CAR v1 body (`application/vnd.ipld.car`) whose root is the current signed commit. The blocks are that commit, the MST nodes on the search path for `<collection>/<rkey>`, and the record block when the record exists. A missing record still returns `200`: the same path blocks prove that the key is absent from the commit. The body is bounded at 8 MiB and is not streamed from the `getRepo` spool.
+- **Errors**: `400 RepoNotFound`, `400 RepoTakendown`, `400 RepoSuspended` and `400 RepoDeactivated`, with the same mapping as `com.atproto.sync.getRepo`.
+- **Operational Note**: No public profile artifact declares this method, so it is served under every `--public-profile` selection, like `com.atproto.identity.resolveHandle`.
+
 #### `com.atproto.sync.getBlob`
 - **Method**: `GET`
 - **Authentication**: None
@@ -262,7 +270,6 @@ Swan intentionally closes or does not implement several reference PDS XRPC endpo
 | `com.atproto.server.reserveSigningKey` | `POST` | `404 Not Found` | Loopback management API (`POST /v1/accounts/plc/prepare`) or Account Portal. |
 | `com.atproto.identity.updateHandle` | `POST` | `404 Not Found` | Account Portal (`POST /account/api/identity/*`) or Loopback management API. |
 | `com.atproto.repo.listMissingBlobs` | `GET` | `404 Not Found` | Not implemented. |
-| `com.atproto.sync.getRecord` | `GET` | `404 Not Found` | Use `com.atproto.repo.getRecord`. |
 | `com.atproto.sync.getBlocks` | `GET` | `404 Not Found` | Use `com.atproto.sync.getRepo` for complete CAR exports. |
 | `com.atproto.sync.listBlobs` | `GET` | `404 Not Found` | Public sync listBlobs is not served; permissioned space sync provides `com.atproto.space.listBlobs`. |
 | `com.atproto.sync.listRepoOps` | `GET` | `404 Not Found` | Public sync listRepoOps is not served; permissioned space sync provides `com.atproto.space.listRepoOps`. |

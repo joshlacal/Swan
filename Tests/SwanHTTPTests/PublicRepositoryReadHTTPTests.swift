@@ -1123,6 +1123,24 @@ private actor TestPublicRepositoryReadDirectory: PublicRepositoryReadDirectory {
         return .notFound
     }
 
+    /// This fixture's state names placeholder commit and MST CIDs with no
+    /// blocks behind them, so it cannot build a proof.
+    /// `com.atproto.sync.getRecord` is covered against a real signed
+    /// repository in `PublicRecordProofHTTPTests`.
+    func publicRepositoryRecordProofOutcome(
+        did: String,
+        path _: PublicRepositoryPath
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadRecordProof>
+    {
+        guard recognizes(did) else { return .notFound }
+        let status = try currentStatus()
+        guard status.status == .active else { return .lifecycle(status) }
+        throw PublicRepositoryReadError.unavailable(
+            reason: .blockMaterializationFailed
+        )
+    }
+
     private func recognizes(_ selector: String) -> Bool {
         [description.did, description.canonicalHandle].contains(selector)
     }
