@@ -107,6 +107,95 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// Production defect (November 20): under open interop a hosted account's
+    /// DID document names this host, so a write into the account's own space
+    /// (its personal mailbox) was announced to this host's own public URL,
+    /// answered 503, and retried every minute. The commit already did the
+    /// authority's work, so the row completes without a network call.
+    func testOutboxCompletesAWriteToTheAccountsOwnSpaceWithoutPosting() async throws {
+        let fixture = try await LocalAuthorityOutboxFixture.make(account: writer)
+        do {
+            let mailbox = try SpaceURI(
+                authority: writer, spaceType: "blue.catbird.labyrinth.mailbox", skey: "self"
+            )
+            try await fixture.createPersonalSpace(mailbox)
+            let row = try await fixture.commit(to: mailbox)
+
+            let posts = RecordingPostTransport(responseStatuses: [503])
+            let worker = try fixture.worker(posts: posts, authorities: [writer])
+            let result = try await worker.deliverNext(now: Date())
+            XCTAssertEqual(result, .delivered(eventID: row.id))
+            let captured = await posts.posts()
+            XCTAssertTrue(captured.isEmpty, "a local authority must not be notified over the network")
+            let remaining = try await fixture.database.pendingOutbox()
+            XCTAssertTrue(remaining.isEmpty)
+            await fixture.close()
+        } catch {
+            await fixture.close()
+            throw error
+        }
+    }
+
+    /// The local completion is narrow: every notification whose authority
+    /// work is not already in the writer's own database is still posted.
+    func testOutboxStillPostsWhatTheLocalAuthorityDidNotSequence() async throws {
+        let other = "did:plc:cdefghijklmnopqrstuvwxyz"
+        let fixture = try await LocalAuthorityOutboxFixture.make(account: writer)
+        do {
+            try await fixture.host(other, handle: "other-local.example.com")
+            let posts = RecordingPostTransport()
+            let worker = try fixture.worker(posts: posts, authorities: [authority, other, writer])
+            var expectedPosts = 0
+            func expectPosted(_ space: SpaceURI, _ reason: String) async throws {
+                let row = try await fixture.commit(to: space)
+                let result = try await worker.deliverNext(now: Date())
+                expectedPosts += 1
+                XCTAssertEqual(result, .delivered(eventID: row.id), reason)
+                let captured = await posts.posts()
+                XCTAssertEqual(captured.count, expectedPosts, reason)
+                XCTAssertEqual(
+                    captured.last?.url.absoluteString,
+                    "https://\(space.authority.dropFirst("did:plc:".count)).example/xrpc/com.atproto.space.notifyRepoUpdate",
+                    reason
+                )
+            }
+
+            // An authority this host does not store (did:plc on another PDS).
+            try await expectPosted(
+                try SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "foreign"),
+                "foreign authority"
+            )
+            // Another account on this host: its writer state lives in its own
+            // database, which this commit did not touch.
+            try await expectPosted(
+                try SpaceURI(authority: other, spaceType: "app.bsky.bookmarks", skey: "other-local"),
+                "another local account's space"
+            )
+            // The account's own DID, but no simple space sequenced the write.
+            try await expectPosted(
+                try SpaceURI(authority: writer, spaceType: "app.bsky.bookmarks", skey: "ungoverned"),
+                "own space without authority state"
+            )
+            // The account's own sequenced space, but the account is no longer
+            // active on this host: behave as before.
+            let mailbox = try SpaceURI(
+                authority: writer, spaceType: "blue.catbird.labyrinth.mailbox", skey: "self"
+            )
+            try await fixture.createPersonalSpace(mailbox)
+            _ = try await fixture.control.transitionStatus(
+                did: writer,
+                to: .deactivated,
+                declaration: .init(),
+                now: Date(timeIntervalSince1970: 1_750_000_001)
+            )
+            try await expectPosted(mailbox, "deactivated own account")
+            await fixture.close()
+        } catch {
+            await fixture.close()
+            throw error
+        }
+    }
+
     func testNotificationRecoveryServiceDrainsCommittedWriterAndSyncQueues() async throws {
         let fixture = try NotificationRecoveryFixture()
         let database = try await fixture.open()
@@ -401,6 +490,113 @@ private struct NotificationHTTPFixture {
     }
 }
 
+
+/// One hosted account with its control row and its own repository database,
+/// delivering through the real HTTP outbox transport to a recording peer.
+private struct LocalAuthorityOutboxFixture {
+    let root: URL
+    let control: SQLiteControlDatabase
+    let database: SQLiteAccountDatabase
+    let account: String
+
+    static func make(account: String) async throws -> LocalAuthorityOutboxFixture {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanLocalAuthorityOutboxTests-\(UUID().uuidString)")
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        do {
+            let fixture = LocalAuthorityOutboxFixture(
+                root: root,
+                control: control,
+                database: try await SQLiteAccountDatabase(dataDirectory: root, did: account),
+                account: account
+            )
+            try await fixture.host(account, handle: "local-authority.example.com")
+            return fixture
+        } catch {
+            try? await control.close()
+            try? FileManager.default.removeItem(at: root)
+            throw error
+        }
+    }
+
+    func host(_ did: String, handle: String) async throws {
+        _ = try await control.createAccount(try AccountControlRegistration(
+            did: did,
+            canonicalHandle: handle,
+            passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+            signingKey: AccountControlKeyReference(purpose: .signing, generation: 1),
+            rotationKey: AccountControlKeyReference(purpose: .rotation, generation: 1),
+            publicGenesisCommitCID: nil,
+            createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+        ))
+    }
+
+    func createPersonalSpace(_ space: SpaceURI) async throws {
+        _ = try await database.createSimpleSpace(
+            space: space,
+            owner: account,
+            configuration: SimpleSpaceConfiguration(policy: .personal),
+            authorization: .accountOAuthForTesting(subject: account, scopes: ["atproto"])
+        )
+    }
+
+    /// Commits one record write by the account and returns its outbox row.
+    func commit(to space: SpaceURI) async throws -> PersistedOutboxEvent {
+        let uri = try SpaceRecordURI(
+            space: space, author: account, collection: "app.bsky.feed.post", rkey: "self-notify"
+        )
+        let value = Data([0xA1, 0x61, 0x61, 0x01])
+        let commit = try await database.apply(
+            space: space, author: account, expectedRevision: 0, requestID: UUID(),
+            wireRevision: try TID(tidString: "2222222222222"),
+            writes: [.put(uri: uri, value: value, cid: CID.fromDAGCBOR(value).string)]
+        )
+        return commit.outbox
+    }
+
+    /// Every listed authority has a destination, as an operator pin or a
+    /// resolved DID document would give it, so a missing destination is never
+    /// what keeps a notification off the network.
+    func worker(
+        posts: RecordingPostTransport,
+        authorities: [String]
+    ) throws -> PermissionedSpaceOutboxDeliveryWorker {
+        var destinations: [String: SwanSpaceNotificationDestination] = [:]
+        for authority in authorities {
+            destinations[authority] = try SwanSpaceNotificationDestination(
+                endpoint: try XCTUnwrap(
+                    URL(string: "https://\(authority.dropFirst("did:plc:".count)).example")
+                ),
+                audience: "\(authority)#atproto_pds"
+            )
+        }
+        return PermissionedSpaceOutboxDeliveryWorker(
+            database: database,
+            transport: HTTPPermissionedSpaceOutboxTransport(
+                destinations: try StaticSwanSpaceNotificationDestinations(
+                    authorityDestinations: destinations
+                ),
+                announcements: SQLiteSpaceWriteAnnouncementSource(database: database),
+                serviceAuthentication: SigningNotificationServiceIssuer(),
+                poster: OAuthBoundedJSONPoster(
+                    policy: try OAuthRemoteFetchPolicy(maximumBodyBytes: 4_096, timeout: 2),
+                    resolver: FixedHostnameResolver(
+                        answer: try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+                    ),
+                    transport: posts
+                ),
+                localAccounts: control
+            ),
+            configuration: try .init(initialFailureBackoff: 1, maximumFailureBackoff: 1)
+        )
+    }
+
+    func close() async {
+        try? await database.close()
+        try? await control.close()
+        try? FileManager.default.removeItem(at: root)
+    }
+}
 
 private struct NotificationRecoveryFixture {
     let root: URL

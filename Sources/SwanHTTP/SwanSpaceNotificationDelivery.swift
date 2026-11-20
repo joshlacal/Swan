@@ -318,6 +318,17 @@ public struct SQLiteSpaceWriteAnnouncementSource: Sendable {
             commitment: state.commitment
         )
     }
+
+    /// Whether the authority-side effect of this notification already
+    /// committed with the write, in this same account database.
+    func isSequencedByLocalAuthority(
+        _ notification: PermissionedSpaceOutboxNotification
+    ) async throws -> Bool {
+        try await database.ownWriteIsSequencedByLocalAuthority(
+            space: notification.space,
+            author: notification.author
+        )
+    }
 }
 
 /// Sends an atomically-created local commit outbox event to the configured
@@ -328,20 +339,42 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
     private let announcements: SQLiteSpaceWriteAnnouncementSource
     private let serviceAuthentication: any SpaceServiceAuthenticationIssuer
     private let poster: OAuthBoundedJSONPoster
+    private let localAccounts: (any AccountControlStore)?
 
+    /// `localAccounts` is this host's own account directory. With it, a
+    /// write whose space authority is the writing account itself, active on
+    /// this host, is completed without a network call once its own database
+    /// shows the authority state already committed. `nil` sends everything.
     public init(
         destinations: any SwanSpaceAuthorityNotificationDestinationResolving,
         announcements: SQLiteSpaceWriteAnnouncementSource,
         serviceAuthentication: any SpaceServiceAuthenticationIssuer,
-        poster: OAuthBoundedJSONPoster
+        poster: OAuthBoundedJSONPoster,
+        localAccounts: (any AccountControlStore)? = nil
     ) {
         self.destinations = destinations
         self.announcements = announcements
         self.serviceAuthentication = serviceAuthentication
         self.poster = poster
+        self.localAccounts = localAccounts
     }
 
     public func deliver(_ notification: PermissionedSpaceOutboxNotification) async throws {
+        // The space authority is the writing account itself and it is active
+        // on this host: the commit already recorded the writer state and
+        // queued the subscriber forwards, so a self-addressed notifyRepoUpdate
+        // (to this host's own public URL, once a DID document resolves it)
+        // would be ignored as not newer. Complete the row instead of sending.
+        // Locality comes from the account directory and the writer's own
+        // database, never from the DID method or a resolved endpoint; every
+        // other authority, local or foreign, is delivered below as before.
+        if let localAccounts,
+           notification.space.authority == notification.author,
+           try await localAccounts.account(did: notification.author)?
+               .status.authorizesAccount == true,
+           try await announcements.isSequencedByLocalAuthority(notification) {
+            return
+        }
         guard let destination = try await destinations.destination(
             forAuthority: notification.space.authority
         ) else {

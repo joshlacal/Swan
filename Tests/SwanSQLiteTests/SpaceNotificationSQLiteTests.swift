@@ -1223,6 +1223,101 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
                 && $0.column("token")?.string == "new-token"
         })
     }
+
+    /// A write by an account into a live space it is itself the authority of
+    /// (its personal mailbox) records the writer state in the same commit, so
+    /// the outbox row it also enqueues has nothing left to announce.
+    func testOwnWriteToOwnActiveSpaceIsAlreadySequencedByTheLocalAuthority() async throws {
+        let fixture = try NotificationFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        let owner = AuthorizationContext.accountOAuthForTesting(
+            subject: fixture.authority, scopes: ["atproto"]
+        )
+        let mailbox = try SpaceURI(
+            authority: fixture.authority,
+            spaceType: "blue.catbird.labyrinth.mailbox",
+            skey: "self"
+        )
+        _ = try await database.createSimpleSpace(
+            space: mailbox, owner: fixture.authority,
+            configuration: SimpleSpaceConfiguration(policy: .personal),
+            authorization: owner
+        )
+
+        try await fixture.commit(on: database, space: mailbox, author: fixture.authority, revision: 1)
+        let pending = try await database.pendingOutbox()
+        XCTAssertEqual(pending.map(\.space), [mailbox], "the commit still enqueues its outbox row")
+        let afterFirst = try await database.ownWriteIsSequencedByLocalAuthority(
+            space: mailbox, author: fixture.authority
+        )
+        XCTAssertTrue(afterFirst)
+
+        try await fixture.commit(on: database, space: mailbox, author: fixture.authority, revision: 2)
+        let afterSecond = try await database.ownWriteIsSequencedByLocalAuthority(
+            space: mailbox, author: fixture.authority
+        )
+        XCTAssertTrue(afterSecond)
+
+        // A deleted space is no longer sequenced here.
+        _ = try await database.deleteSimpleSpace(space: mailbox, authorization: owner)
+        let afterDeletion = try await database.ownWriteIsSequencedByLocalAuthority(
+            space: mailbox, author: fixture.authority
+        )
+        XCTAssertFalse(afterDeletion)
+    }
+
+    /// Everything the commit did not sequence in this same database still
+    /// needs its notification: another authority's space, and a space this
+    /// account is the authority of but that held no writer state for the
+    /// write (not a simple space yet when it committed).
+    func testWritesTheLocalAuthorityDidNotSequenceStillNeedTheirNotification() async throws {
+        let fixture = try NotificationFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        // Bob writes into Alice's space: the authority state is in Alice's
+        // database, never in the writer's.
+        let writerDatabase = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root, did: fixture.writer
+        )
+        defer { Task { try? await writerDatabase.close() } }
+        try await fixture.commit(on: writerDatabase, space: fixture.space, author: fixture.writer, revision: 1)
+        let foreign = try await writerDatabase.ownWriteIsSequencedByLocalAuthority(
+            space: fixture.space, author: fixture.writer
+        )
+        XCTAssertFalse(foreign)
+
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        let owner = AuthorizationContext.accountOAuthForTesting(
+            subject: fixture.authority, scopes: ["atproto"]
+        )
+        let late = try SpaceURI(
+            authority: fixture.authority, spaceType: "app.bsky.bookmarks", skey: "created-late"
+        )
+        try await fixture.commit(on: database, space: late, author: fixture.authority, revision: 1)
+        let ungoverned = try await database.ownWriteIsSequencedByLocalAuthority(
+            space: late, author: fixture.authority
+        )
+        XCTAssertFalse(ungoverned, "no simple space, so the commit sequenced nothing")
+
+        _ = try await database.createSimpleSpace(
+            space: late, owner: fixture.authority,
+            configuration: SimpleSpaceConfiguration(policy: .personal),
+            authorization: owner
+        )
+        let createdAfterTheWrite = try await database.ownWriteIsSequencedByLocalAuthority(
+            space: late, author: fixture.authority
+        )
+        XCTAssertFalse(createdAfterTheWrite, "the earlier write has no writer state yet")
+
+        try await fixture.commit(on: database, space: late, author: fixture.authority, revision: 2)
+        let sequenced = try await database.ownWriteIsSequencedByLocalAuthority(
+            space: late, author: fixture.authority
+        )
+        XCTAssertTrue(sequenced)
+    }
 }
 
 private struct NotificationFixture {
@@ -1321,6 +1416,28 @@ private struct NotificationFixture {
     func tid(_ offset: Int) throws -> TID {
         let alphabet = Array("234567abcdefghijklmnopqrstuvwxyz")
         return try TID(tidString: "222222222222\(alphabet[offset])")
+    }
+
+    /// Commits one record write as `author` (the database's own account).
+    func commit(
+        on database: SQLiteAccountDatabase,
+        space: SpaceURI,
+        author: String,
+        revision: Int
+    ) async throws {
+        let uri = try SpaceRecordURI(
+            space: space, author: author,
+            collection: "app.bsky.feed.post", rkey: "self-notify"
+        )
+        let value = Data([0xA1, 0x61, 0x61, UInt8(revision)])
+        _ = try await database.apply(
+            space: space,
+            author: author,
+            expectedRevision: UInt64(revision - 1),
+            requestID: UUID(),
+            wireRevision: try tid(revision),
+            writes: [.put(uri: uri, value: value, cid: CID.fromDAGCBOR(value).string)]
+        )
     }
 
 }

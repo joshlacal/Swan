@@ -55,6 +55,53 @@ extension SQLiteAccountDatabase {
         )
     }
 
+    /// Whether the outbox row for this account's own write into `space` has
+    /// nothing left to announce: the space authority is this same account,
+    /// the space is a live simple space in this database, and the writer
+    /// state that committed with the write (see `apply`) already covers the
+    /// repository's current revision. That is exactly when the authority's
+    /// `notifyRepoUpdate` receiver would ignore the announcement as not
+    /// newer, so completing the row without sending loses nothing. A write
+    /// the commit did not sequence here (another authority, no simple space
+    /// yet, a deleted space, a conflicting commitment) answers `false`.
+    public func ownWriteIsSequencedByLocalAuthority(
+        space: SpaceURI,
+        author: String
+    ) async throws -> Bool {
+        guard space.authority == accountDID, author == accountDID else { return false }
+        return try await withReadConnectionGate {
+            try await readTransaction {
+                let authority = try await readConnection.query(
+                    """
+                    SELECT is_deleted FROM permissioned_simple_space_authorities
+                    WHERE space_uri = ?
+                    """,
+                    [.text(space.rawValue)]
+                )
+                guard authority.first?.column("is_deleted")?.integer == 0,
+                      let state = try await loadStateWithCounts(
+                          space: space, author: author, connection: readConnection
+                      )?.state else {
+                    return false
+                }
+                let writer = try await readConnection.query(
+                    """
+                    SELECT wire_revision, commitment FROM permissioned_space_writers
+                    WHERE space_uri = ? AND repo_did = ?
+                    """,
+                    [.text(space.rawValue), .text(author)]
+                )
+                guard let row = writer.first else { return false }
+                // The comparison `advanceWriterHighWaterWithoutGate` makes.
+                let sequenced = try requiredTID(row, "wire_revision").toString()
+                let announced = state.wireRevision.toString()
+                if announced < sequenced { return true }
+                return try announced == sequenced
+                    && requiredBlob(row, "commitment") == state.commitment
+            }
+        }
+    }
+
     /// Account-schema v25. Keeps the newest unleased row per `(space,
     /// author)` pair and every leased row, and indexes the pair so the
     /// per-commit coalescing delete is a range seek. Runs inside the base

@@ -4209,7 +4209,8 @@ extension SwanCommand {
                                 destinations: outboxDestinations,
                                 announcements: .init(database: database),
                                 serviceAuthentication: serviceIssuer,
-                                poster: poster
+                                poster: poster,
+                                localAccounts: controlDatabase
                             )
                         },
                         makeSyncTransport: { _ in
