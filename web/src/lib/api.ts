@@ -192,6 +192,11 @@ export const api = {
     return result;
   },
   logout: () => accountFetch<MutationResponse>('logout', { method: 'POST', body: '{}' }),
+  changePassword: (currentPassword: string, newPassword: string) =>
+    accountFetch<MutationResponse>('password', {
+      method: 'POST',
+      body: JSON.stringify({ currentPassword, newPassword })
+    }),
   stepUpPassword: (password: string) =>
     accountFetch<MutationResponse>('step-up/password', {
       method: 'POST',

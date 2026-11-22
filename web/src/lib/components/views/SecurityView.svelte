@@ -38,10 +38,63 @@
       revokingId = null;
     }
   }
+
+  let currentPassword = $state('');
+  let newPassword = $state('');
+  let confirmPassword = $state('');
+  let changingPassword = $state(false);
+  const newPasswordBytes = $derived(new TextEncoder().encode(newPassword).length);
+  const passwordFormValid = $derived(
+    currentPassword.length > 0 &&
+      newPasswordBytes >= 8 &&
+      newPasswordBytes <= 256 &&
+      newPassword === confirmPassword
+  );
+
+  async function handleChangePassword(event: SubmitEvent) {
+    event.preventDefault();
+    if (!passwordFormValid) return;
+    changingPassword = true;
+    try {
+      await api.changePassword(currentPassword, newPassword);
+      currentPassword = newPassword = confirmPassword = '';
+      toasts.success('Password changed. Other account sessions were signed out.');
+    } catch (err: any) {
+      toasts.error(err.message || 'Failed to change password.');
+    } finally {
+      changingPassword = false;
+    }
+  }
 </script>
 
 <div class="flex flex-col gap-6">
   <!-- Page Header / Summary Card -->
+  <section class="card bg-base-100 shadow-sm border border-base-200">
+    <form class="card-body gap-4" onsubmit={handleChangePassword}>
+      <h2 class="card-title text-lg">Change password</h2>
+      <label class="form-control w-full">
+        <span class="label-text mb-1">Current password</span>
+        <input class="input input-bordered w-full" type="password" autocomplete="current-password" bind:value={currentPassword} required />
+      </label>
+      <label class="form-control w-full">
+        <span class="label-text mb-1">New password (8–256 characters)</span>
+        <input class="input input-bordered w-full" type="password" autocomplete="new-password" bind:value={newPassword} required />
+      </label>
+      <label class="form-control w-full">
+        <span class="label-text mb-1">Confirm new password</span>
+        <input class="input input-bordered w-full" type="password" autocomplete="new-password" bind:value={confirmPassword} required />
+      </label>
+      {#if confirmPassword && newPassword !== confirmPassword}
+        <p class="text-error text-sm">Passwords do not match.</p>
+      {/if}
+      <div class="card-actions justify-end">
+        <button class="btn btn-primary" type="submit" disabled={!passwordFormValid || changingPassword}>
+          {changingPassword ? 'Changing…' : 'Change password'}
+        </button>
+      </div>
+    </form>
+  </section>
+
   <section class="card bg-base-100 shadow-sm border border-base-200">
     <div class="card-body gap-4">
       <div class="flex items-start justify-between gap-4">
