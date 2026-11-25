@@ -8425,7 +8425,7 @@ extension SwanCommand {
                 @Option(name: .customLong("authority-url"), help: "Authority PDS base URL (default: SWAN_LAB_AUTHORITY_URL or https://swan.test)")
                 var authorityURL: String = ""
 
-                @Option(name: .long, help: "Permissioned space URI, e.g. at://did:plc:.../space/blue.catbird.lab.forum/lab-1")
+                @Option(name: .long, help: "Permissioned space URI, e.g. at:space/did:plc:.../blue.catbird.lab.forum/lab-1")
                 var space: String
 
                 @Option(name: .customLong("member-did"), help: "Member DID to add to the space")
@@ -8514,10 +8514,10 @@ extension SwanCommand {
                 @Option(name: .long, help: "Record key; a sortable TID is generated when absent")
                 var rkey: String = ""
 
-                @Option(name: .customLong("reply-to"), help: "Optional at:// record URI of the parent record (writes reply: {root, parent})")
+                @Option(name: .customLong("reply-to"), help: "Optional at:space/ record URI of the parent record (writes reply: {root, parent})")
                 var replyTo: String = ""
 
-                @Option(name: .customLong("reply-root"), help: "Optional at:// record URI of the thread root; defaults to --reply-to")
+                @Option(name: .customLong("reply-root"), help: "Optional at:space/ record URI of the thread root; defaults to --reply-to")
                 var replyRoot: String = ""
 
                 @Option(name: .long, help: "Repository DID to write (required with bearer auth; defaults to the OAuth subject)")
@@ -8574,10 +8574,10 @@ extension SwanCommand {
                     var reply: [String: String]?
                     if !replyTo.isEmpty {
                         do { _ = try SpaceRecordURI(replyTo) }
-                        catch { throw ValidationError("--reply-to is not a valid at:// record URI") }
+                        catch { throw ValidationError("--reply-to is not a valid at:space/ record URI") }
                         let root = replyRoot.isEmpty ? replyTo : replyRoot
                         do { _ = try SpaceRecordURI(root) }
-                        catch { throw ValidationError("--reply-root is not a valid at:// record URI") }
+                        catch { throw ValidationError("--reply-root is not a valid at:space/ record URI") }
                         reply = ["root": root, "parent": replyTo]
                     }
                     let requestedScopes = Forum.scopes(

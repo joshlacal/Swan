@@ -32,18 +32,38 @@ final class SwanSpacesTests: XCTestCase {
     }
 
     func testStrictSpaceURIGrammar() throws {
-        let uri = try SpaceRecordURI("at://did:plc:alice/space/app.bsky.bookmarks/self/did:plc:bob/app.bsky.feed.post/one")
+        let uri = try SpaceRecordURI("at:space/did:plc:alice/app.bsky.bookmarks/self/did:plc:bob/app.bsky.feed.post/one")
         XCTAssertEqual(uri.space.authority, "did:plc:alice")
         XCTAssertEqual(uri.space.spaceType, "app.bsky.bookmarks")
         XCTAssertEqual(uri.author, "did:plc:bob")
-        XCTAssertEqual(uri.rawValue, "at://did:plc:alice/space/app.bsky.bookmarks/self/did:plc:bob/app.bsky.feed.post/one")
+        XCTAssertEqual(uri.rawValue, "at:space/did:plc:alice/app.bsky.bookmarks/self/did:plc:bob/app.bsky.feed.post/one")
+        XCTAssertEqual(uri.space.rawValue, "at:space/did:plc:alice/app.bsky.bookmarks/self")
+        XCTAssertEqual(try SpaceURI("at:space/did:plc:alice/app.bsky.bookmarks/self"), uri.space)
         let ref = try uri.space.toSpaceRef()
         XCTAssertEqual(ref.uriString(), uri.space.rawValue)
         XCTAssertEqual(try SpaceURI(ref), uri.space)
         XCTAssertEqual(try ref.recordURI(authorDID: uri.author, collection: uri.collection, recordKey: uri.rkey).uriString(), uri.rawValue)
         XCTAssertThrowsError(try SpaceURI("at://did:plc:alice/not-space/bookmarks"))
-        XCTAssertThrowsError(try SpaceURI("at:space/did:plc:alice/app.bsky.bookmarks/self"))
-        XCTAssertThrowsError(try SpaceRecordURI("at://did:plc:alice/space/app.bsky.bookmarks/self/app.bsky.feed.post/one"))
+        // Strict: the spaces alpha form and handle authorities are rejected.
+        XCTAssertThrowsError(try SpaceURI("at://did:plc:alice/space/app.bsky.bookmarks/self"))
+        XCTAssertThrowsError(try SpaceRecordURI("at://did:plc:alice/space/app.bsky.bookmarks/self/did:plc:bob/app.bsky.feed.post/one"))
+        XCTAssertThrowsError(try SpaceURI("at:space/alice.example.com/app.bsky.bookmarks/self"))
+        XCTAssertThrowsError(try SpaceRecordURI("at:space/did:plc:alice/app.bsky.bookmarks/self/bob.example.com/app.bsky.feed.post/one"))
+        XCTAssertThrowsError(try SpaceURI("at:space/did:plc:alice/app.bsky.bookmarks/self/"))
+        XCTAssertThrowsError(try SpaceURI("at:space/did:plc:alice/app.bsky.bookmarks/self?x=1"))
+        XCTAssertThrowsError(try SpaceRecordURI("at:space/did:plc:alice/app.bsky.bookmarks/self/app.bsky.feed.post/one"))
+        // Lenient, for record values written during the alpha only.
+        XCTAssertEqual(
+            SpaceURI.fromLegacySpaceURI("at://did:plc:alice/space/app.bsky.bookmarks/self"),
+            "at:space/did:plc:alice/app.bsky.bookmarks/self"
+        )
+        XCTAssertNil(SpaceURI.fromLegacySpaceURI("at:space/did:plc:alice/app.bsky.bookmarks/self"))
+        XCTAssertNil(SpaceURI.fromLegacySpaceURI("at://did:plc:alice/app.bsky.feed.post/one"))
+        XCTAssertEqual(
+            try SpaceRecordURI(lenientRecordValue: "at://did:plc:alice/space/app.bsky.bookmarks/self/did:plc:bob/app.bsky.feed.post/one"),
+            uri
+        )
+        XCTAssertEqual(try SpaceRecordURI(lenientRecordValue: uri.rawValue), uri)
     }
 
     func testRepositoryEnforcesCredentialAndRecoversAfterOplogGap() async throws {
