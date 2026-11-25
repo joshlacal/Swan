@@ -30,7 +30,7 @@ final class SwanDisposableAuthorityProvisioningTests: XCTestCase, @unchecked Sen
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let token = try await oauth.authorizationCode(handle: "swan-oct22.test", password: password, scopes: scopes)
         let skey = "oauth" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        let expectedSpace = "at://\(token.subject)/space/app.swan.test/\(skey)"
+        let expectedSpace = "at:space/\(token.subject)/app.swan.test/\(skey)"
         let create: [String: Any] = ["spaceType": "app.swan.test", "skey": skey,
             "policy": ["$type": "com.atproto.memberspace.policy"]]
         let response = try await oauth.executeResource(token: token, method: .post,

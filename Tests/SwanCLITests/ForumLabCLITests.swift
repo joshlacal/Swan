@@ -572,7 +572,7 @@ final class ForumLabCLITests: XCTestCase {
     }
 
     private var spaceURI: String {
-        "at://\(did)/space/blue.catbird.lab.forum/lab-1"
+        "at:space/\(did)/blue.catbird.lab.forum/lab-1"
     }
 
     private var secp256k1Key: String {

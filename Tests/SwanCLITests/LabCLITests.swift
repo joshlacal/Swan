@@ -338,13 +338,13 @@ final class LabCLITests: XCTestCase {
         let body = try temporaryDirectory().appending(path: "malformed-apply-writes.json")
         defer { try? FileManager.default.removeItem(at: body) }
         try Data(
-            #"{"space":"at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/a","repo":"did:plc:abcdefghijklmnopqrstuvwx","writes":[]}"#.utf8
+            #"{"space":"at:space/did:plc:abcdefghijklmnopqrstuvwx/app.bsky.bookmarks/a","repo":"did:plc:abcdefghijklmnopqrstuvwx","writes":[]}"#.utf8
         ).write(to: body)
         let result = try runCLI(
             command: [
                 "live", "--mode", "permissioned",
                 "--permissioned-write-only-apply-writes",
-                "--space", "at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/a",
+                "--space", "at:space/did:plc:abcdefghijklmnopqrstuvwx/app.bsky.bookmarks/a",
                 "--repository", "did:plc:abcdefghijklmnopqrstuvwx",
                 "--body-file", body.path,
             ]
@@ -362,7 +362,7 @@ final class LabCLITests: XCTestCase {
                 "recover-permissioned",
                 "--receiver-did", "not-a-did",
                 "--repository", "did:plc:abcdefghijklmnopqrstuvwx",
-                "--space", "at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/recovery",
+                "--space", "at:space/did:plc:abcdefghijklmnopqrstuvwx/app.bsky.bookmarks/recovery",
                 "--since", "2222222222222",
                 "--data-directory", "/definitely/missing/swan-data",
             ]
@@ -382,7 +382,7 @@ final class LabCLITests: XCTestCase {
                 "sync-permissioned",
                 "--receiver-did", "not-a-did",
                 "--repository", "did:plc:abcdefghijklmnopqrstuvwx",
-                "--space", "at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/sync",
+                "--space", "at:space/did:plc:abcdefghijklmnopqrstuvwx/app.bsky.bookmarks/sync",
                 "--data-directory", "/definitely/missing/swan-data",
             ]
         )
@@ -402,7 +402,7 @@ final class LabCLITests: XCTestCase {
                 "sync-permissioned",
                 "--receiver-did", "did:plc:abcdefghijklmnopqrstuvwx",
                 "--repository", "did:plc:zyxwvutsrqponmlkjihgfedc",
-                "--space", "at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/sync",
+                "--space", "at:space/did:plc:abcdefghijklmnopqrstuvwx/app.bsky.bookmarks/sync",
                 "--data-directory", "/definitely/missing/swan-data",
                 "--request-sequence", "0",
             ]
@@ -434,7 +434,7 @@ final class LabCLITests: XCTestCase {
                 "recover-permissioned",
                 "--receiver-did", "did:plc:abcdefghijklmnopqrstuvwx",
                 "--repository", "not-a-did",
-                "--space", "at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/recovery",
+                "--space", "at:space/did:plc:abcdefghijklmnopqrstuvwx/app.bsky.bookmarks/recovery",
                 "--since", "2222222222222",
                 "--data-directory", "/definitely/missing/swan-data",
             ]
@@ -474,7 +474,7 @@ final class LabCLITests: XCTestCase {
                 "recover-permissioned",
                 "--receiver-did", "did:plc:abcdefghijklmnopqrstuvwx",
                 "--repository", "did:plc:zyxwvutsrqponmlkjihgfedc",
-                "--space", "at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/recovery",
+                "--space", "at:space/did:plc:abcdefghijklmnopqrstuvwx/app.bsky.bookmarks/recovery",
                 "--since", "2222222222222",
                 "--source-auth", "none",
                 "--data-directory", "/definitely/missing/swan-data",

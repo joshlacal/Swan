@@ -112,7 +112,7 @@ private struct NativeSTARFixture {
 
     init() throws {
         target = try PermissionedRemoteReplicaTarget(
-            receiverDID: "did:plc:receiverabcdefghijkl", space: SpaceURI("at://did:plc:authorityabcdefghijk/space/app.swan.test/star"),
+            receiverDID: "did:plc:receiverabcdefghijkl", space: SpaceURI("at:space/did:plc:authorityabcdefghijk/app.swan.test/star"),
             repositoryDID: "did:plc:repositoryabcdefghij"
         )
         kemKey = P256.KeyAgreement.PrivateKey()

@@ -217,7 +217,7 @@ private struct MACHTTPFixture {
 
     init() throws {
         space = try SpaceURI(
-            "at://did:plc:authorityabcdefghijk/space/app.swan.test/mac"
+            "at:space/did:plc:authorityabcdefghijk/app.swan.test/mac"
         )
         key = P256.KeyAgreement.PrivateKey()
         didKey = try Self.didKey(key)
