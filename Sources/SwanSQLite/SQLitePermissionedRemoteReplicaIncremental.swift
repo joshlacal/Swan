@@ -1345,30 +1345,6 @@ private extension SQLiteAccountDatabase {
         return Data(hasher.finalize())
     }
 
-    func incrementalStateMarker(
-        target: PermissionedRemoteReplicaTarget,
-        generation: UInt64,
-        wireRevision: TID,
-        historyFloor: TID,
-        commitment: Data
-    ) -> Data {
-        var hasher = SHA256()
-        hasher.update(data: Data(
-            "swan.permissioned.remote-replica.state.v1".utf8
-        ))
-        incrementalDigestAppend(Data(target.receiverDID.utf8), &hasher)
-        incrementalDigestAppend(Data(target.space.rawValue.utf8), &hasher)
-        incrementalDigestAppend(Data(target.repositoryDID.utf8), &hasher)
-        var fixedGeneration = generation.bigEndian
-        withUnsafeBytes(of: &fixedGeneration) {
-            hasher.update(data: Data($0))
-        }
-        incrementalDigestAppend(Data(wireRevision.toString().utf8), &hasher)
-        incrementalDigestAppend(Data(historyFloor.toString().utf8), &hasher)
-        incrementalDigestAppend(commitment, &hasher)
-        return Data(hasher.finalize())
-    }
-
     func incrementalDigestAppend(_ value: Data, _ hasher: inout SHA256) {
         var length = UInt64(value.count).bigEndian
         withUnsafeBytes(of: &length) { hasher.update(data: Data($0)) }
@@ -1401,5 +1377,33 @@ private extension SQLiteAccountDatabase {
         return data.reduce(UInt64(0)) { partial, byte in
             (partial << 8) | UInt64(byte)
         }
+    }
+}
+
+extension SQLiteAccountDatabase {
+    /// Internal rather than file-private: the space-URI form migration
+    /// (`SpaceURIFormMigration.swift`) recomputes this marker for moved rows.
+    func incrementalStateMarker(
+        target: PermissionedRemoteReplicaTarget,
+        generation: UInt64,
+        wireRevision: TID,
+        historyFloor: TID,
+        commitment: Data
+    ) -> Data {
+        var hasher = SHA256()
+        hasher.update(data: Data(
+            "swan.permissioned.remote-replica.state.v1".utf8
+        ))
+        incrementalDigestAppend(Data(target.receiverDID.utf8), &hasher)
+        incrementalDigestAppend(Data(target.space.rawValue.utf8), &hasher)
+        incrementalDigestAppend(Data(target.repositoryDID.utf8), &hasher)
+        var fixedGeneration = generation.bigEndian
+        withUnsafeBytes(of: &fixedGeneration) {
+            hasher.update(data: Data($0))
+        }
+        incrementalDigestAppend(Data(wireRevision.toString().utf8), &hasher)
+        incrementalDigestAppend(Data(historyFloor.toString().utf8), &hasher)
+        incrementalDigestAppend(commitment, &hasher)
+        return Data(hasher.finalize())
     }
 }
