@@ -2778,6 +2778,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migrateSpacePolicyIfNeeded()
             try await migrateSpaceNotificationsV30IfNeeded()
             try await migrateSpaceCredentialRevocationOutboxIfNeeded()
+            // Last: every table holding a space URI exists by now.
+            try await migrateSpaceURIFormIfNeeded()
         }
         try await migrateSpaceNotificationReceiptScopeIfNeeded()
         try await compactSpaceNotificationReceiptsIfNeeded()
@@ -7020,11 +7022,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     [
                         .text(accountDID), .text(accountDID), .text(accountDID),
                         .text(accountDID),
-                        spaceType.map { "at://*/space/\($0)/*" }.map(SQLiteData.text) ?? .null,
-                        spaceType.map { "at://*/space/\($0)/*" }.map(SQLiteData.text) ?? .null,
-                        authority.map { "at://\($0)/space/" }.map(SQLiteData.text) ?? .null,
-                        authority.map { "at://\($0)/space/" }.map(SQLiteData.text) ?? .null,
-                        authority.map { "at://\($0)/space/" }.map(SQLiteData.text) ?? .null,
+                        spaceType.map { "\(SpaceURI.uriPrefix)*/\($0)/*" }.map(SQLiteData.text) ?? .null,
+                        spaceType.map { "\(SpaceURI.uriPrefix)*/\($0)/*" }.map(SQLiteData.text) ?? .null,
+                        authority.map { "\(SpaceURI.uriPrefix)\($0)/" }.map(SQLiteData.text) ?? .null,
+                        authority.map { "\(SpaceURI.uriPrefix)\($0)/" }.map(SQLiteData.text) ?? .null,
+                        authority.map { "\(SpaceURI.uriPrefix)\($0)/" }.map(SQLiteData.text) ?? .null,
                         cursor.map { SQLiteData.text($0.rawValue) } ?? .null,
                         cursor.map { SQLiteData.text($0.rawValue) } ?? .null,
                         .integer(limit),
