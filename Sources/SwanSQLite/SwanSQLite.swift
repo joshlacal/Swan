@@ -4569,9 +4569,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         author: String,
         table: String
     ) throws -> SpaceURI {
+        // This runs before v32 (`migrateSpaceURIFormIfNeeded`) in the same
+        // open, so a row may still hold the spaces alpha form. Read it in the
+        // current form; v32 then rewrites the stored value and recomputes the
+        // repository-state marker from this same current-form URI.
+        // TODO: remove before beta, with SpaceURI.fromLegacySpaceURI.
+        let canonical = SpaceURI.fromLegacySpaceURI(rawValue) ?? rawValue
         guard author == accountDID,
-              let space = try? SpaceURI(rawValue),
-              space.rawValue == rawValue
+              let space = try? SpaceURI(canonical),
+              space.rawValue == canonical
         else {
             throw SQLiteRepositoryError.corruptDatabase(
                 "invalid \(table) ownership"
