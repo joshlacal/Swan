@@ -564,7 +564,7 @@ docker run --detach \
 wait_for_swan_http "$dynamic_container" "dynamic-key Swan"
 wait_for_swan_tls_route "dynamic-key Swan"
 
-space_uri="at://${space_authority_did}/space/app.bsky.bookmarks/dynamic-${suffix}"
+space_uri="at:space/${space_authority_did}/app.bsky.bookmarks/dynamic-${suffix}"
 space_scope="space:app.bsky.bookmarks?authority=${space_authority_did}&skey=dynamic-${suffix}&action=read"
 write_scope="space:app.bsky.bookmarks?authority=${space_authority_did}&skey=dynamic-${suffix}&action=create&collection=app.bsky.feed.post"
 space_scope_client_id="$(python3 - "$space_scope" "$write_scope" <<'PY'

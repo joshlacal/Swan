@@ -11,7 +11,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
 project_name="${SWAN_FORUM_PROJECT:-swan-alpha-current-20260801}"
-space_uri="${SWAN_FORUM_SPACE:-at://did:plc:dmwv2txmmakxe2u47adghce4/space/blue.catbird.lab.forum/forum-demo-d5143f80}"
+space_uri="${SWAN_FORUM_SPACE:-at:space/did:plc:dmwv2txmmakxe2u47adghce4/blue.catbird.lab.forum/forum-demo-d5143f80}"
 receiver_did="${SWAN_FORUM_RECEIVER:-did:plc:tiu5zkymbgotqpoxll55ccyy}"
 alice_did="did:plc:dmwv2txmmakxe2u47adghce4"
 bob_did="did:plc:4ooojm4wsr23c6irj4t6mfrp"

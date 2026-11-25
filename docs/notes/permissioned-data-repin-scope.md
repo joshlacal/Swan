@@ -4,6 +4,31 @@ Written 2026-08-14, prompted by a failed `bulleted.app` sign-in against
 `swan.place`. Everything below is measured against the tree at `main` and
 against `bluesky-social/atproto` as it stands today.
 
+> **Update, 2026-11-24 (November 24 Spaces alpha, atproto `1f510f8e`).** Space
+> URIs moved from `at://{spaceDid}/space/{type}/{skey}[/{author}/{collection}/{rkey}]`
+> to `at:space/{spaceDid}/{type}/{skey}[/...]`. The `at://.../space/` shapes
+> quoted below are historical. Swan now:
+>
+> - parses strictly (`SpaceURI`, `SpaceRecordURI`): the old form and handle
+>   authorities are rejected, which XRPC params answer with 400
+>   `InvalidRequest`; builders emit only `at:space/`;
+> - reads the old form only for record values written during the alpha, via
+>   `SpaceURI.fromLegacySpaceURI` / `SpaceRecordURI(lenientRecordValue:)`
+>   (TODO: remove before beta);
+> - migrates stored URIs in place in account-schema v32
+>   (`Sources/SwanSQLite/SpaceURIFormMigration.swift`, mirroring the reference's
+>   `rewrite-space-uris.ts`), recomputing the repository-state and
+>   remote-replica state markers that bind the URI. Record values are left as
+>   they are (their CIDs cover them).
+>
+> Not migratable, so not faked: remote-replica import/incremental result
+> receipts (their digests bind the old URI; drain in-flight remote-replica
+> imports before deploying), commit signatures held in replicated blocks and in
+> STAR/CAR exports (signed over the old URI; re-replicate or re-export from a
+> migrated host), and portable exports whose paths carry the old form (refused
+> on import, as the reference refuses old space archives). The reference pin
+> (`d4def6e9`, the November 12 profile) is not bumped by this change.
+
 ## 1. Where the branches are
 
 | Branch | HEAD | Date | State |

@@ -571,7 +571,7 @@ wait_for_swan_http "$dynamic_container" "forum Swan"
 wait_for_swan_tls_route "forum Swan"
 
 space_key="forum-demo-${suffix}"
-space_uri="at://${authority_did}/space/blue.catbird.lab.forum/${space_key}"
+space_uri="at:space/${authority_did}/blue.catbird.lab.forum/${space_key}"
 read_scope="space:blue.catbird.lab.forum?authority=${authority_did}&skey=${space_key}&action=read"
 create_scope="space:blue.catbird.lab.forum?authority=${authority_did}&skey=${space_key}&action=create&collection=blue.catbird.lab.post"
 scope_client_id="$(python3 - "$read_scope" "$create_scope" <<'PY'

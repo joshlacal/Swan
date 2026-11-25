@@ -407,7 +407,7 @@ run_selector="$(generate_run_selector)"
   echo "permissioned recovery run selector generation failed" >&2
   exit 1
 }
-space_uri="at://${authority_did}/space/app.bsky.bookmarks/${space_skey}"
+space_uri="at:space/${authority_did}/app.bsky.bookmarks/${space_skey}"
 collection="app.bsky.feed.post"
 client_id="http://localhost?scope=atproto%20space%3Aapp.bsky.bookmarks%3Fauthority%3D${authority_did}%26skey%3D${space_skey}%26action%3Dread%20space%3Aapp.bsky.bookmarks%3Fauthority%3D${authority_did}%26skey%3D${space_skey}%26action%3Dcreate%26collection%3D${collection}&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"
 

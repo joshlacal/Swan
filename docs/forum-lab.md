@@ -22,7 +22,7 @@ EOF
 swift run swan lab forum provision \
   --authority-url https://swan.test \
   --authority-password-file /tmp/authority.password \
-  --space at://did:plc:authority123/space/blue.catbird.lab.forum/lab-1 \
+  --space at:space/did:plc:authority123/blue.catbird.lab.forum/lab-1 \
   --member-did did:plc:member456
 ```
 
@@ -39,9 +39,9 @@ EOF
 swift run swan lab forum post \
   --producer-url https://pds.test \
   --producer-password-file /tmp/producer.password \
-  --space at://did:plc:authority123/space/blue.catbird.lab.forum/lab-1 \
+  --space at:space/did:plc:authority123/blue.catbird.lab.forum/lab-1 \
   --text "hello forum" \
-  --reply-to at://did:plc:authority123/space/blue.catbird.lab.forum/lab-1/did:plc:member456/blue.catbird.lab.post/2222222222222
+  --reply-to at:space/did:plc:authority123/blue.catbird.lab.forum/lab-1/did:plc:member456/blue.catbird.lab.post/2222222222222
 ```
 
 Options and defaults:
@@ -72,7 +72,7 @@ swift run swan lab forum thread \
   --consumer-url https://pds.test \
   --consumer-password-file /tmp/consumer.password \
   --authority-url https://swan.test \
-  --space at://did:plc:authority123/space/blue.catbird.lab.forum/lab-1 \
+  --space at:space/did:plc:authority123/blue.catbird.lab.forum/lab-1 \
   --receiver-did did:plc:consumer789 \
   --data-directory .swan-data \
   --output /tmp/forum-thread.json
