@@ -403,7 +403,7 @@ public struct SwanAccountPortalHTTP: Sendable {
             }
         }
 
-        for path in ["logout", "profile", "identity", "app-passwords", "scopes/validate", "factors", "factors/totp", "factors/totp/verify", "factors/passkeys", "factors/passkeys/challenge", "factors/passkeys/options", "factors/passkeys/step-up-challenge", "factors/passkeys/assertion", "factors/step-up/passkey-challenge", "factors/recovery-codes/rotate", "factors/step-up", "connected-apps", "export", "export/request", "migration", "migration/request", "lifecycle/delete", "step-up", "step-up/password", "sessions/revoke-others"] {
+        for path in ["logout", "profile", "identity", "app-passwords", "scopes/validate", "factors", "factors/totp", "factors/totp/verify", "factors/passkeys", "factors/passkeys/challenge", "factors/passkeys/options", "factors/passkeys/step-up-challenge", "factors/passkeys/assertion", "factors/step-up/passkey-challenge", "factors/recovery-codes/rotate", "factors/step-up", "connected-apps", "export", "export/request", "migration", "migration/request", "lifecycle/delete", "step-up", "step-up/password", "password", "sessions/revoke-others"] {
             router.on("/account/api/\(path)", method: .post) { [configuration, sessions, service] request, context async -> Response in
                 guard mutationHeadersAllow(request, expectedOrigin: configuration.publicOrigin),
                       let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),

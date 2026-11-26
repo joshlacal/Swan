@@ -711,6 +711,42 @@ public actor DurableAccountDirectory {
         }
     }
 
+    public enum PasswordChangeOutcome: Sendable, Equatable { case changed, rejected, invalidPassword }
+
+    /// Replaces the account password after verifying the current one. The
+    /// replacement is a compare-and-swap on the verified credential, so a
+    /// concurrent change or recovery wins and this call reports `rejected`.
+    public func changePassword(
+        did: String,
+        currentPassword: String,
+        newPassword: String,
+        now: Date = Date()
+    ) async throws -> PasswordChangeOutcome {
+        guard (8 ... 256).contains(newPassword.utf8.count) else { return .invalidPassword }
+        guard !currentPassword.isEmpty, currentPassword.utf8.count <= 4_096 else { return .rejected }
+        guard let account = try await store.account(did: did), account.status.authorizesAccount,
+              let credential = try await store.credential(did: did) else { return .rejected }
+        let verified: Bool
+        do {
+            verified = try await verificationExecutor.verify(currentPassword, encodedHash: credential.verifier)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw AccountLoginAuthenticationError.unavailable
+        }
+        guard verified else { return .rejected }
+        let replacement = try passwordHasher.hash(newPassword)
+        switch try await store.replaceCredential(
+            did: did,
+            expectedVerifier: credential.verifier,
+            replacementVerifier: replacement,
+            now: now
+        ) {
+        case .replaced: return .changed
+        case .unchanged: return .rejected
+        }
+    }
+
     private func ifStepUpMFA(_ strength: AuthenticationStrength) -> Bool {
         if case .stepUpMFA = strength { return true }
         return false

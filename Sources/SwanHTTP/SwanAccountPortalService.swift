@@ -932,6 +932,66 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
                 password: request.password,
                 now: now
             )
+        case "password":
+            guard let changer = accountDirectory as? DurableAccountDirectory else {
+                throw SwanAccountPortalServiceError.unsupported
+            }
+            if let admission = accountDirectory as? any SwanAccountPortalLoginAdmissionDirectory {
+                guard let directPeer = context.directPeer else { throw SwanAccountPortalServiceError.unavailable }
+                switch (try? await admission.admitLogin(handle: account.canonicalHandle, directPeer: directPeer, now: now)) {
+                case .allowed?: break
+                case .rateLimited?: throw SwanAccountPortalServiceError.rateLimited
+                case nil: throw SwanAccountPortalServiceError.unavailable
+                }
+            }
+            let request: PasswordChangeRequest
+            do {
+                guard let payload else { throw SwanAccountPortalServiceError.invalidRequest }
+                request = try JSONDecoder().decode(PasswordChangeRequest.self, from: payload)
+            } catch {
+                throw SwanAccountPortalServiceError.invalidRequest
+            }
+            // The current password in the request is the password proof. With
+            // MFA active the login credential is a sensitive operation like
+            // session revocation, so it also needs a fresh second-factor step-up.
+            do {
+                let activeFactors = try await factors?.listFactors(accountDID: account.did, now: now) ?? []
+                if !activeFactors.isEmpty {
+                    try StepUpPolicy().authorize(
+                        .passwordChange,
+                        strength: session.strength,
+                        mfaEnabled: true,
+                        now: now
+                    )
+                }
+            } catch {
+                throw SwanAccountPortalServiceError.forbidden
+            }
+            let outcome: DurableAccountDirectory.PasswordChangeOutcome
+            do {
+                outcome = try await changer.changePassword(
+                    did: account.did,
+                    currentPassword: request.currentPassword,
+                    newPassword: request.newPassword,
+                    now: now
+                )
+            } catch {
+                throw SwanAccountPortalServiceError.unavailable
+            }
+            switch outcome {
+            case .changed: break
+            case .rejected: throw SwanAccountPortalServiceError.unauthorized
+            case .invalidPassword: throw SwanAccountPortalServiceError.invalidRequest
+            }
+            // A changed password ends every other management session. The
+            // credential is already replaced, so a revocation failure is
+            // reported as its own outcome instead of as success.
+            do {
+                try await sessions.revokeOthers(accountDID: account.did, except: context.sessionID, now: now)
+            } catch {
+                return .init(message: Self.passwordChangedSessionsRemainMessage, accountDID: account.did)
+            }
+            return .init(message: Self.passwordChangedMessage, accountDID: account.did)
         case "logout":
             do { try await sessions.revoke(sessionValue: context.sessionID, now: now) }
             catch { throw SwanAccountPortalServiceError.unavailable }
@@ -1192,6 +1252,15 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
     private struct AppPasswordRequest: Decodable {
         let name: String
         let scopes: [String]
+    }
+
+    static let passwordChangedMessage = "Password changed"
+    static let passwordChangedSessionsRemainMessage =
+        "Password changed, but other sessions could not be signed out. Sign them out under Sessions."
+
+    private struct PasswordChangeRequest: Decodable {
+        let currentPassword: String
+        let newPassword: String
     }
 
     private struct PasswordReauthenticationRequest: Decodable {
