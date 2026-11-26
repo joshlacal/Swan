@@ -951,6 +951,22 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
             } catch {
                 throw SwanAccountPortalServiceError.invalidRequest
             }
+            // The current password in the request is the password proof. With
+            // MFA active the login credential is a sensitive operation like
+            // session revocation, so it also needs a fresh second-factor step-up.
+            do {
+                let activeFactors = try await factors?.listFactors(accountDID: account.did, now: now) ?? []
+                if !activeFactors.isEmpty {
+                    try StepUpPolicy().authorize(
+                        .passwordChange,
+                        strength: session.strength,
+                        mfaEnabled: true,
+                        now: now
+                    )
+                }
+            } catch {
+                throw SwanAccountPortalServiceError.forbidden
+            }
             let outcome: DurableAccountDirectory.PasswordChangeOutcome
             do {
                 outcome = try await changer.changePassword(
@@ -967,9 +983,15 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
             case .rejected: throw SwanAccountPortalServiceError.unauthorized
             case .invalidPassword: throw SwanAccountPortalServiceError.invalidRequest
             }
-            // A changed password ends every other management session.
-            try? await sessions.revokeOthers(accountDID: account.did, except: context.sessionID, now: now)
-            return .init(message: "Password changed", accountDID: account.did)
+            // A changed password ends every other management session. The
+            // credential is already replaced, so a revocation failure is
+            // reported as its own outcome instead of as success.
+            do {
+                try await sessions.revokeOthers(accountDID: account.did, except: context.sessionID, now: now)
+            } catch {
+                return .init(message: Self.passwordChangedSessionsRemainMessage, accountDID: account.did)
+            }
+            return .init(message: Self.passwordChangedMessage, accountDID: account.did)
         case "logout":
             do { try await sessions.revoke(sessionValue: context.sessionID, now: now) }
             catch { throw SwanAccountPortalServiceError.unavailable }
@@ -1231,6 +1253,10 @@ public struct SwanAccountPortalService: SwanAccountPortalManagementLoginServing,
         let name: String
         let scopes: [String]
     }
+
+    static let passwordChangedMessage = "Password changed"
+    static let passwordChangedSessionsRemainMessage =
+        "Password changed, but other sessions could not be signed out. Sign them out under Sessions."
 
     private struct PasswordChangeRequest: Decodable {
         let currentPassword: String

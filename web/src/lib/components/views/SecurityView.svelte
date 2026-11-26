@@ -56,9 +56,13 @@
     if (!passwordFormValid) return;
     changingPassword = true;
     try {
-      await api.changePassword(currentPassword, newPassword);
+      const result = await api.changePassword(currentPassword, newPassword);
       currentPassword = newPassword = confirmPassword = '';
-      toasts.success('Password changed. Other account sessions were signed out.');
+      if (result.message === 'Password changed') {
+        toasts.success('Password changed. Other account sessions were signed out.');
+      } else {
+        toasts.warning(result.message);
+      }
     } catch (err: any) {
       toasts.error(err.message || 'Failed to change password.');
     } finally {
