@@ -14,9 +14,9 @@ public struct ForumRecord: Sendable, Equatable, Hashable {
     public let revision: UInt64
     public let text: String
     public let createdAt: Date?
-    /// Full `at://` record URI of the thread root, or nil for a root post.
+    /// Full `at:space/` record URI of the thread root, or nil for a root post.
     public let replyRoot: String?
-    /// Full `at://` record URI of the immediate parent, or nil for a root post.
+    /// Full `at:space/` record URI of the immediate parent, or nil for a root post.
     public let replyParent: String?
 
     public init(
@@ -44,7 +44,7 @@ public struct ForumRecord: Sendable, Equatable, Hashable {
     /// `blue.catbird.lab.reply`).
     public var collection: String { uri.collection }
 
-    /// Full record URI, e.g. `at://did:plc:.../space/.../did:plc:.../.../...`.
+    /// Full record URI, e.g. `at:space/did:plc:.../.../.../did:plc:.../.../...`.
     public var recordURI: String { uri.rawValue }
 
     /// Whether this record is a root post: no reply reference, or a reply
@@ -108,8 +108,12 @@ public enum ForumRecordDecoding {
         var replyRoot: String?
         var replyParent: String?
         if let reply = decoded.reply {
-            replyRoot = reply.root
-            replyParent = reply.parent
+            // Reply refs are record values (covered by the record CID), so
+            // ones written during the spaces alpha keep the `at://.../space/`
+            // form. Read them leniently and compare in the current form.
+            // TODO: remove before beta, with SpaceURI.fromLegacySpaceURI.
+            replyRoot = SpaceURI.fromLegacySpaceURI(reply.root) ?? reply.root
+            replyParent = SpaceURI.fromLegacySpaceURI(reply.parent) ?? reply.parent
             guard !reply.root.isEmpty, reply.root.utf8.count <= 4_096,
                   !reply.parent.isEmpty, reply.parent.utf8.count <= 4_096 else {
                 throw Error.invalidReplyReference

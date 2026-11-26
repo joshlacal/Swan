@@ -36,8 +36,16 @@ public enum Blake3 {
 }
 
 /// The three-part permissioned-data space identifier:
-/// `at://{authorityDid}/space/{spaceType}/{skey}`.
+/// `at:space/{authorityDid}/{spaceType}/{skey}`.
+///
+/// Parsing is strict: only the `at:space/` form with a DID authority is
+/// accepted. The spaces alpha form `at://{authorityDid}/space/...` is read only
+/// through ``fromLegacySpaceURI(_:)``, for record values written during the
+/// alpha.
 public struct SpaceURI: Sendable, Codable, Hashable, CustomStringConvertible {
+    /// The scheme-and-kind prefix of every space and space-record URI.
+    public static let uriPrefix = "at:space/"
+
     public let authority: String
     public let spaceType: String
     public let skey: String
@@ -57,10 +65,13 @@ public struct SpaceURI: Sendable, Codable, Hashable, CustomStringConvertible {
     }
 
     public init(_ rawValue: String) throws {
-        guard let ref = try? SpaceRef(uriString: rawValue) else {
+        guard let segments = Self.spaceURISegments(rawValue), segments.count == 3 else {
             throw SwanError.invalidIdentifier(rawValue)
         }
-        try self.init(ref)
+        guard let parsed = try? SpaceURI(authority: segments[0], spaceType: segments[1], skey: segments[2]) else {
+            throw SwanError.invalidIdentifier(rawValue)
+        }
+        self = parsed
     }
 
     public func toSpaceRef() throws -> SpaceRef {
@@ -68,9 +79,40 @@ public struct SpaceURI: Sendable, Codable, Hashable, CustomStringConvertible {
     }
 
     public var description: String {
-        (try? toSpaceRef().uriString()) ?? "at://\(authority)/space/\(spaceType)/\(skey)"
+        "\(Self.uriPrefix)\(authority)/\(spaceType)/\(skey)"
     }
     public var rawValue: String { description }
+
+    /// Rewrites a spaces alpha URI, `at://{spaceDid}/space/{rest}`, to the
+    /// current form, `at:space/{spaceDid}/{rest}`. Returns `nil` for anything
+    /// not in the alpha form. The conversion is textual: callers still parse
+    /// the result. Use it only for values read back from records written during
+    /// the alpha (whose CIDs cover them), never for request parameters,
+    /// credentials, or headers.
+    /// TODO: remove before beta.
+    public static func fromLegacySpaceURI(_ string: String) -> String? {
+        let scheme = "at://"
+        guard string.hasPrefix(scheme) else { return nil }
+        let rest = string.dropFirst(scheme.count)
+        guard let slash = rest.firstIndex(of: "/") else { return nil }
+        let authority = rest[..<slash]
+        let tail = rest[slash...]
+        let marker = "/space/"
+        guard !authority.isEmpty, tail.hasPrefix(marker) else { return nil }
+        return uriPrefix + String(authority) + "/" + String(tail.dropFirst(marker.count))
+    }
+
+    /// The `/`-separated segments after `at:space/`, or `nil` when the string
+    /// is not in that form or carries a query, fragment, or whitespace.
+    static func spaceURISegments(_ rawValue: String) -> [String]? {
+        guard rawValue.hasPrefix(uriPrefix), rawValue.utf8.count <= 8_192,
+              !rawValue.utf8.contains(where: { $0 == 63 || $0 == 35 || $0 <= 32 || $0 == 127 }) else {
+            return nil
+        }
+        return rawValue.dropFirst(uriPrefix.count)
+            .split(separator: "/", omittingEmptySubsequences: false)
+            .map(String.init)
+    }
 
     static func isValidDID(_ value: String) -> Bool {
         let parts = value.split(separator: ":", omittingEmptySubsequences: false)
@@ -101,7 +143,7 @@ public struct SpaceURI: Sendable, Codable, Hashable, CustomStringConvertible {
 }
 
 /// The complete permissioned-record identifier:
-/// `at://{spaceDid}/space/{type}/{skey}/{authorDid}/{collection}/{rkey}`.
+/// `at:space/{spaceDid}/{type}/{skey}/{authorDid}/{collection}/{rkey}`.
 public struct SpaceRecordURI: Sendable, Codable, Hashable, CustomStringConvertible {
     public let space: SpaceURI
     public let author: String
@@ -119,23 +161,27 @@ public struct SpaceRecordURI: Sendable, Codable, Hashable, CustomStringConvertib
     }
 
     public init(_ rawValue: String) throws {
-        guard let uri = try? ATProtocolURI(uriString: rawValue),
-              uri.isSpace,
-              let spaceDID = uri.spaceDID,
-              let spaceType = uri.spaceType,
-              let skey = uri.skey,
-              let author = uri.authorDID,
-              let collection = uri.collection,
-              let rkey = uri.recordKey else {
+        guard let segments = SpaceURI.spaceURISegments(rawValue), segments.count == 6 else {
             throw SwanError.invalidIdentifier(rawValue)
         }
-        let space = try SpaceURI(authority: spaceDID, spaceType: spaceType, skey: skey)
-        try self.init(space: space, author: author, collection: collection, rkey: rkey)
+        guard (try? DID(didString: segments[3])) != nil,
+              let space = try? SpaceURI(authority: segments[0], spaceType: segments[1], skey: segments[2]),
+              let parsed = try? SpaceRecordURI(space: space, author: segments[3], collection: segments[4], rkey: segments[5]) else {
+            throw SwanError.invalidIdentifier(rawValue)
+        }
+        self = parsed
+    }
+
+    /// Parses a record URI read back from a record value, accepting the spaces
+    /// alpha form `at://{spaceDid}/space/...` as well and normalizing it to the
+    /// current form. Never use this for request input.
+    /// TODO: remove before beta, with ``SpaceURI/fromLegacySpaceURI(_:)``.
+    public init(lenientRecordValue rawValue: String) throws {
+        try self.init(SpaceURI.fromLegacySpaceURI(rawValue) ?? rawValue)
     }
 
     public var description: String {
-        (try? space.toSpaceRef().recordURI(authorDID: author, collection: collection, recordKey: rkey).uriString())
-            ?? "\(space)/\(author)/\(collection)/\(rkey)"
+        "\(space)/\(author)/\(collection)/\(rkey)"
     }
     public var rawValue: String { description }
 }

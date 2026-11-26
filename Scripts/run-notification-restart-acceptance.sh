@@ -546,7 +546,7 @@ then
   echo "bootstrap account metadata contained a malformed DID" >&2
   exit 1
 fi
-space_uri="at://${authority_did}/space/app.bsky.bookmarks/restart-outbox"
+space_uri="at:space/${authority_did}/app.bsky.bookmarks/restart-outbox"
 
 notification_config_path="${temporary_directory}/notification-config.json"
 python3 - "$notification_config_path" "$authority_did" <<'PY'
@@ -640,8 +640,8 @@ docker run --rm \
     # the space-scoped read/create grants. Encode the same qualified scopes in
     # the localhost client metadata so the lab exercises the real authorization
     # path instead of relying on a broad implicit grant.
-    authority_did="${1#at://}"
-    authority_did="${authority_did%%/space/*}"
+    authority_did="${1#at:space/}"
+    authority_did="${authority_did%%/*}"
     read_scope="space:app.bsky.bookmarks?authority=${authority_did}&skey=${4}&action=read"
     create_scope="space:app.bsky.bookmarks?authority=${authority_did}&skey=${4}&action=create&collection=${3}"
     client_id="http://localhost?scope=atproto%20space%3Aapp.bsky.bookmarks%3Fauthority%3D${authority_did}%26skey%3D${4}%26action%3Dread%20space%3Aapp.bsky.bookmarks%3Fauthority%3D${authority_did}%26skey%3D${4}%26action%3Dcreate%26collection%3D${3}&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"

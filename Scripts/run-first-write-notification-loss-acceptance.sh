@@ -291,7 +291,7 @@ do
   }
 done
 
-space_uri="at://${authority_did}/space/app.bsky.bookmarks/first-write-${suffix}"
+space_uri="at:space/${authority_did}/app.bsky.bookmarks/first-write-${suffix}"
 
 echo "FIRST-WRITE ACCEPTANCE: project=${project_name} space=${space_uri} authority=${authority_did}"
 

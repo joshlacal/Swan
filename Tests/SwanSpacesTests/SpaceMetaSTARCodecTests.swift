@@ -9,7 +9,7 @@ import XCTest
 /// import can never silently drop access state.
 final class SpaceMetaSTARCodecTests: XCTestCase {
     private let owner = "did:plc:alice"
-    private var space: SpaceURI { get throws { try SpaceURI("at://did:plc:alice/space/app.bsky.bookmarks/self") } }
+    private var space: SpaceURI { get throws { try SpaceURI("at:space/did:plc:alice/app.bsky.bookmarks/self") } }
 
     private func archive() throws -> SpaceMetaArchive {
         try SpaceMetaArchive(

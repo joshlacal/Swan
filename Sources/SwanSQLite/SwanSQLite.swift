@@ -2778,6 +2778,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migrateSpacePolicyIfNeeded()
             try await migrateSpaceNotificationsV30IfNeeded()
             try await migrateSpaceCredentialRevocationOutboxIfNeeded()
+            // Last: every table holding a space URI exists by now.
+            try await migrateSpaceURIFormIfNeeded()
         }
         try await migrateSpaceNotificationReceiptScopeIfNeeded()
         try await compactSpaceNotificationReceiptsIfNeeded()
@@ -4567,9 +4569,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         author: String,
         table: String
     ) throws -> SpaceURI {
+        // This runs before v32 (`migrateSpaceURIFormIfNeeded`) in the same
+        // open, so a row may still hold the spaces alpha form. Read it in the
+        // current form; v32 then rewrites the stored value and recomputes the
+        // repository-state marker from this same current-form URI.
+        // TODO: remove before beta, with SpaceURI.fromLegacySpaceURI.
+        let canonical = SpaceURI.fromLegacySpaceURI(rawValue) ?? rawValue
         guard author == accountDID,
-              let space = try? SpaceURI(rawValue),
-              space.rawValue == rawValue
+              let space = try? SpaceURI(canonical),
+              space.rawValue == canonical
         else {
             throw SQLiteRepositoryError.corruptDatabase(
                 "invalid \(table) ownership"
@@ -7020,11 +7028,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     [
                         .text(accountDID), .text(accountDID), .text(accountDID),
                         .text(accountDID),
-                        spaceType.map { "at://*/space/\($0)/*" }.map(SQLiteData.text) ?? .null,
-                        spaceType.map { "at://*/space/\($0)/*" }.map(SQLiteData.text) ?? .null,
-                        authority.map { "at://\($0)/space/" }.map(SQLiteData.text) ?? .null,
-                        authority.map { "at://\($0)/space/" }.map(SQLiteData.text) ?? .null,
-                        authority.map { "at://\($0)/space/" }.map(SQLiteData.text) ?? .null,
+                        spaceType.map { "\(SpaceURI.uriPrefix)*/\($0)/*" }.map(SQLiteData.text) ?? .null,
+                        spaceType.map { "\(SpaceURI.uriPrefix)*/\($0)/*" }.map(SQLiteData.text) ?? .null,
+                        authority.map { "\(SpaceURI.uriPrefix)\($0)/" }.map(SQLiteData.text) ?? .null,
+                        authority.map { "\(SpaceURI.uriPrefix)\($0)/" }.map(SQLiteData.text) ?? .null,
+                        authority.map { "\(SpaceURI.uriPrefix)\($0)/" }.map(SQLiteData.text) ?? .null,
                         cursor.map { SQLiteData.text($0.rawValue) } ?? .null,
                         cursor.map { SQLiteData.text($0.rawValue) } ?? .null,
                         .integer(limit),

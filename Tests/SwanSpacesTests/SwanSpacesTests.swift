@@ -32,18 +32,38 @@ final class SwanSpacesTests: XCTestCase {
     }
 
     func testStrictSpaceURIGrammar() throws {
-        let uri = try SpaceRecordURI("at://did:plc:alice/space/app.bsky.bookmarks/self/did:plc:bob/app.bsky.feed.post/one")
+        let uri = try SpaceRecordURI("at:space/did:plc:alice/app.bsky.bookmarks/self/did:plc:bob/app.bsky.feed.post/one")
         XCTAssertEqual(uri.space.authority, "did:plc:alice")
         XCTAssertEqual(uri.space.spaceType, "app.bsky.bookmarks")
         XCTAssertEqual(uri.author, "did:plc:bob")
-        XCTAssertEqual(uri.rawValue, "at://did:plc:alice/space/app.bsky.bookmarks/self/did:plc:bob/app.bsky.feed.post/one")
+        XCTAssertEqual(uri.rawValue, "at:space/did:plc:alice/app.bsky.bookmarks/self/did:plc:bob/app.bsky.feed.post/one")
+        XCTAssertEqual(uri.space.rawValue, "at:space/did:plc:alice/app.bsky.bookmarks/self")
+        XCTAssertEqual(try SpaceURI("at:space/did:plc:alice/app.bsky.bookmarks/self"), uri.space)
         let ref = try uri.space.toSpaceRef()
         XCTAssertEqual(ref.uriString(), uri.space.rawValue)
         XCTAssertEqual(try SpaceURI(ref), uri.space)
         XCTAssertEqual(try ref.recordURI(authorDID: uri.author, collection: uri.collection, recordKey: uri.rkey).uriString(), uri.rawValue)
         XCTAssertThrowsError(try SpaceURI("at://did:plc:alice/not-space/bookmarks"))
-        XCTAssertThrowsError(try SpaceURI("at:space/did:plc:alice/app.bsky.bookmarks/self"))
-        XCTAssertThrowsError(try SpaceRecordURI("at://did:plc:alice/space/app.bsky.bookmarks/self/app.bsky.feed.post/one"))
+        // Strict: the spaces alpha form and handle authorities are rejected.
+        XCTAssertThrowsError(try SpaceURI("at://did:plc:alice/space/app.bsky.bookmarks/self"))
+        XCTAssertThrowsError(try SpaceRecordURI("at://did:plc:alice/space/app.bsky.bookmarks/self/did:plc:bob/app.bsky.feed.post/one"))
+        XCTAssertThrowsError(try SpaceURI("at:space/alice.example.com/app.bsky.bookmarks/self"))
+        XCTAssertThrowsError(try SpaceRecordURI("at:space/did:plc:alice/app.bsky.bookmarks/self/bob.example.com/app.bsky.feed.post/one"))
+        XCTAssertThrowsError(try SpaceURI("at:space/did:plc:alice/app.bsky.bookmarks/self/"))
+        XCTAssertThrowsError(try SpaceURI("at:space/did:plc:alice/app.bsky.bookmarks/self?x=1"))
+        XCTAssertThrowsError(try SpaceRecordURI("at:space/did:plc:alice/app.bsky.bookmarks/self/app.bsky.feed.post/one"))
+        // Lenient, for record values written during the alpha only.
+        XCTAssertEqual(
+            SpaceURI.fromLegacySpaceURI("at://did:plc:alice/space/app.bsky.bookmarks/self"),
+            "at:space/did:plc:alice/app.bsky.bookmarks/self"
+        )
+        XCTAssertNil(SpaceURI.fromLegacySpaceURI("at:space/did:plc:alice/app.bsky.bookmarks/self"))
+        XCTAssertNil(SpaceURI.fromLegacySpaceURI("at://did:plc:alice/app.bsky.feed.post/one"))
+        XCTAssertEqual(
+            try SpaceRecordURI(lenientRecordValue: "at://did:plc:alice/space/app.bsky.bookmarks/self/did:plc:bob/app.bsky.feed.post/one"),
+            uri
+        )
+        XCTAssertEqual(try SpaceRecordURI(lenientRecordValue: uri.rawValue), uri)
     }
 
     func testRepositoryEnforcesCredentialAndRecoversAfterOplogGap() async throws {
@@ -214,11 +234,15 @@ final class SwanSpacesTests: XCTestCase {
             ikm: Data(0..<32)
         )
         let commitment = Data(1...32)
+        // The signed context carries the space URI string, so this vector is
+        // for `at:space/did:plc:alice/app.swan.interop/vector`. The alpha form
+        // `at://did:plc:alice/space/app.swan.interop/vector` gave d19d214e….
+        XCTAssertEqual(space.rawValue, "at:space/did:plc:alice/app.swan.interop/vector")
         let expectedBinding = Data([
-            0xd1, 0x9d, 0x21, 0x4e, 0x46, 0xe6, 0x7f, 0x85,
-            0x13, 0xb9, 0xbe, 0xfc, 0xe7, 0x2b, 0xaf, 0x7a,
-            0xa7, 0x52, 0xa8, 0x0a, 0x3c, 0xb1, 0x2a, 0x32,
-            0x20, 0xa8, 0xd0, 0x4a, 0xdd, 0x41, 0x41, 0x5e,
+            0x9f, 0xf7, 0x7c, 0x6a, 0x87, 0xd8, 0x1d, 0x8d,
+            0x48, 0xc0, 0x34, 0x10, 0x01, 0x31, 0x80, 0x99,
+            0x43, 0xdf, 0x7e, 0x0e, 0xa3, 0xd2, 0xd6, 0x7d,
+            0x8d, 0x8b, 0x8c, 0xc5, 0x4f, 0x80, 0xdc, 0x02,
         ])
         let envelope = SpaceCommitEnvelope(
             context: context,

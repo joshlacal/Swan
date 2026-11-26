@@ -28,7 +28,7 @@ if !forceRemote, let localPetrel = siblingPathIfAvailable("Petrel") {
 } else {
     petrelDependency = .package(
         url: "https://github.com/joshlacal/Petrel.git",
-        revision: "3a9d5b92898604425307a8a0a0c0be4de85f2ef0"
+        revision: "d3d352a96c2f6111bd3cbd3166e54ac0105b5dca"
     )
 }
 
@@ -51,7 +51,7 @@ let package = Package(
         .executable(name: "swan", targets: ["swan"]),
     ],
     dependencies: [
-        // Unified Petrel 2.0 + November 12 Spaces line (Petrel @ 59a07d03).
+        // Petrel 2.0 with the November 24 Spaces alpha (at:space/ URIs), Petrel @ d3d352a9.
         petrelDependency,
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
         .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),

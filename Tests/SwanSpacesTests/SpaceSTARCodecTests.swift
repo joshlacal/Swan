@@ -7,7 +7,7 @@ import XCTest
 
 final class SpaceSTARCodecTests: XCTestCase {
     private let author = "did:plc:alice"
-    private var space: SpaceURI { get throws { try SpaceURI("at://did:plc:alice/space/app.bsky.bookmarks/self") } }
+    private var space: SpaceURI { get throws { try SpaceURI("at:space/did:plc:alice/app.bsky.bookmarks/self") } }
 
     private func records() throws -> [SpaceRecord] {
         try ["aa", "b"].map { key in
@@ -47,7 +47,7 @@ final class SpaceSTARCodecTests: XCTestCase {
     func testEmptyArchiveMatchesIndependentFramingAndCBORVector() throws {
         // Encoded independently with a minimal Python standard-library CBOR
         // encoder and SHA256(bytes(2048)); the final 00 is STAR end-of-pairs.
-        let vector = "2a6c0100a301a6637265766d32323232323232323232323232637665720164646174615820e5a00aa9991ac8a5ee3109844d84a55583bd20572ad3ffcd42792f3c36b183ad647265706f6d6469643a706c633a616c69636565247479706572617470726f746f2d73706163652d7265706f657370616365783061743a2f2f6469643a706c633a616c6963652f73706163652f6170702e62736b792e626f6f6b6d61726b732f73656c6600"
+        let vector = "2a6c0100a101a6637265766d32323232323232323232323232637665720164646174615820e5a00aa9991ac8a5ee3109844d84a55583bd20572ad3ffcd42792f3c36b183ad647265706f6d6469643a706c633a616c69636565247479706572617470726f746f2d73706163652d7265706f657370616365782e61743a73706163652f6469643a706c633a616c6963652f6170702e62736b792e626f6f6b6d61726b732f73656c6600"
         let commit = try commit([])
         let archive = try SpaceSTARCodec.encode(commit: commit, records: [])
         XCTAssertEqual(Hex.encode(archive), vector)

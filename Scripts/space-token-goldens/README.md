@@ -63,3 +63,17 @@ node sign-client-attestation.mjs "$G/node_modules" '<old attestation JWT>' \
 
 Copy `newJwt` from each output into the tests. Keep the old vector as a
 rejected negative case.
+
+## November 24, 2026: `at:space/` space URIs
+
+The November 24 Spaces alpha (atproto 1f510f8e) moved space URIs from
+`at://{spaceDid}/space/...` to `at:space/{spaceDid}/...`, including the `sub`
+of delegations and space credentials. Every ES256K vector whose `sub` was a
+space URI was re-signed with the same scalar, changing only that `sub` value in
+the raw payload bytes (key order and spelling kept), with a deterministic
+RFC 6979 low-S secp256k1 signature over `sha256(signingInput)`, the
+`Secp256k1Keypair.sign` construction, computed with a Python standard-library
+implementation. Positive control: that implementation reproduced every
+deterministic original (the 3f6c96d and ac0c9f15 goldens) byte for byte; each
+randomized Node.js original was first checked to verify, as low-S, under its
+pinned key.

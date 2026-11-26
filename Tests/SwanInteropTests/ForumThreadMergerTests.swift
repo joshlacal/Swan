@@ -1,4 +1,5 @@
 import Foundation
+import Petrel
 import SwanInterop
 import SwanSpaces
 import XCTest
@@ -43,6 +44,29 @@ final class ForumThreadMergerTests: XCTestCase {
     }
 
     private func uri(_ record: ForumRecord) -> String { record.recordURI }
+
+    func testAlphaFormReplyRefsInRecordValuesAreReadInTheCurrentForm() throws {
+        let root = record(author: alice, rkey: "2222222222222", text: "root")
+        let legacyRoot = "at://\(authority)/space/blue.catbird.lab.forum/lab-1/\(alice)/blue.catbird.lab.post/2222222222222"
+        let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "text", value: "reply"),
+            (key: "reply", value: OrderedCBORMap(entries: [
+                (key: "root", value: legacyRoot),
+                (key: "parent", value: legacyRoot),
+            ])),
+        ]))
+        let reply = try ForumRecordDecoding.decode(
+            uri: SpaceRecordURI(space: space, author: bob, collection: "blue.catbird.lab.reply", rkey: "2222222222223"),
+            cid: "bafkreigh2akiscaildcqabsyg3dfr6yo3e5gjr4wzrfpz6k5j5v7aqp2mse",
+            revision: 1,
+            value: value
+        )
+        XCTAssertEqual(reply.replyRoot, uri(root))
+        XCTAssertEqual(reply.replyParent, uri(root))
+        let thread = ForumThreadMerger.merge([root, reply])
+        XCTAssertEqual(thread.roots.count, 1)
+        XCTAssertEqual(thread.roots.first?.replies.map(\.record), [reply])
+    }
 
     func testEmptyInputProducesEmptyThread() {
         let thread = ForumThreadMerger.merge([])
@@ -96,7 +120,7 @@ final class ForumThreadMergerTests: XCTestCase {
             rkey: "2222222222223",
             text: "parent is missing",
             replyRoot: uri(root),
-            replyParent: "at://did:plc:ghostggggggggggggggggggg/space/blue.catbird.lab.forum/lab-1/did:plc:ghostggggggggggggggggggg/blue.catbird.lab.post/2222222222229"
+            replyParent: "at:space/did:plc:ghostggggggggggggggggggg/blue.catbird.lab.forum/lab-1/did:plc:ghostggggggggggggggggggg/blue.catbird.lab.post/2222222222229"
         )
         let thread = ForumThreadMerger.merge([root, orphan])
         XCTAssertEqual(thread.roots.count, 1)
@@ -198,7 +222,7 @@ final class ForumThreadMergerTests: XCTestCase {
     }
 
     func testSelfAnchoredReplyIsARoot() {
-        let anchorURI = "at://did:plc:abcdefghijklmnopqrstuvwx/space/blue.catbird.lab.forum/lab-1/did:plc:aliceaaaaaaaaaaaaaaaaaaa/blue.catbird.lab.post/2222222222222"
+        let anchorURI = "at:space/did:plc:abcdefghijklmnopqrstuvwx/blue.catbird.lab.forum/lab-1/did:plc:aliceaaaaaaaaaaaaaaaaaaa/blue.catbird.lab.post/2222222222222"
         let selfAnchored = record(
             author: alice,
             rkey: "2222222222222",
@@ -297,8 +321,8 @@ final class ForumThreadMergerTests: XCTestCase {
             author: alice,
             rkey: "2222222222222",
             text: "lost",
-            replyRoot: "at://did:plc:ghostggggggggggggggggggg/space/blue.catbird.lab.forum/lab-1/did:plc:ghostggggggggggggggggggg/blue.catbird.lab.post/2222222222229",
-            replyParent: "at://did:plc:ghostggggggggggggggggggg/space/blue.catbird.lab.forum/lab-1/did:plc:ghostggggggggggggggggggg/blue.catbird.lab.post/2222222222229"
+            replyRoot: "at:space/did:plc:ghostggggggggggggggggggg/blue.catbird.lab.forum/lab-1/did:plc:ghostggggggggggggggggggg/blue.catbird.lab.post/2222222222229",
+            replyParent: "at:space/did:plc:ghostggggggggggggggggggg/blue.catbird.lab.forum/lab-1/did:plc:ghostggggggggggggggggggg/blue.catbird.lab.post/2222222222229"
         )
         let thread = ForumThreadMerger.merge([orphan])
         let rendered = ForumThreadRender.render(thread)

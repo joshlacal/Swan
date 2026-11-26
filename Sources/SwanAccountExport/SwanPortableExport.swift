@@ -666,6 +666,10 @@ public enum SwanPortableExportVerifier {
         case .identitySnapshot:
             guard entry.path == "identity/snapshot.json" else { throw SwanPortableExportError.invalidManifest }
         case .spaceCAR:
+            // Paths carry the space URI in its `at:space/` form, and the CAR's
+            // commit is signed over that form. A spaces-alpha archive
+            // (`at://{did}/space/...`) is refused, as the reference refuses
+            // old space archives; re-export it from a migrated host.
             guard parts.count == 3, parts[0] == "spaces", parts[2].hasSuffix(".car") else {
                 throw SwanPortableExportError.invalidManifest
             }

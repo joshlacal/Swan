@@ -298,7 +298,7 @@ When an inbound request under `/xrpc/**` matches no exact local route, Swan eval
 
 ## Permissioned spaces plane
 
-Swan implements the `permissioned-data-0016-2026-10-29` profile for access-controlled collaborative data spaces. All endpoints are mounted under `/xrpc/`. Space references are `at://` URIs, not bare DIDs. A space has exactly one policy, a tagged object whose `$type` is `com.atproto.personalspace.policy`, `com.atproto.memberspace.policy` or `com.atproto.managedspace.policy`. The retired `com.atproto.simplespace.*` routes answer `404 Not Found` and are never proxied.
+Swan implements the `permissioned-data-0016-2026-10-29` profile for access-controlled collaborative data spaces. All endpoints are mounted under `/xrpc/`. Space references are `at:space/{spaceDid}/{spaceType}/{skey}` URIs (records in a space: `at:space/{spaceDid}/{spaceType}/{skey}/{authorDid}/{collection}/{rkey}`), not bare DIDs; the spaces alpha form `at://{spaceDid}/space/...` and handle authorities are rejected with `400 InvalidRequest`. A space has exactly one policy, a tagged object whose `$type` is `com.atproto.personalspace.policy`, `com.atproto.memberspace.policy` or `com.atproto.managedspace.policy`. The retired `com.atproto.simplespace.*` routes answer `404 Not Found` and are never proxied.
 
 ### Space lifecycle (`com.atproto.space.*`)
 

@@ -29,7 +29,7 @@ final class SpaceMACHeadersTests: XCTestCase {
         let commit = try SpaceRepositoryCommit(
             repo: "did:plc:repositoryabcdefghij",
             space: SpaceURI(
-                "at://did:plc:authorityabcdefghijk/space/app.swan.test/mac"
+                "at:space/did:plc:authorityabcdefghijk/app.swan.test/mac"
             ),
             rev: "222222222222a",
             data: Data(repeating: 0x42, count: 32)
@@ -44,7 +44,7 @@ final class SpaceMACHeadersTests: XCTestCase {
         )
         XCTAssertEqual(
             response.signature,
-            "mac=:xCPECWbx8rgn1iZ9L7/E2FoV5gckdutbG+crTBD+du4=:"
+            "mac=:u/zUX7Bdw3K1t+kT+7K4NxHSpTaSPwOuZzwucmP4hvM=:"
         )
     }
 
@@ -127,7 +127,7 @@ final class SpaceMACHeadersTests: XCTestCase {
         let commit = try SpaceRepositoryCommit(
             repo: "did:plc:repositoryabcdefghij",
             space: SpaceURI(
-                "at://did:plc:authorityabcdefghijk/space/app.swan.test/mac"
+                "at:space/did:plc:authorityabcdefghijk/app.swan.test/mac"
             ),
             rev: "222222222222a",
             data: Data(repeating: 0x42, count: 32)
@@ -140,7 +140,7 @@ final class SpaceMACHeadersTests: XCTestCase {
         XCTAssertEqual(commitHeaders.coveredHeaderName, "Atproto-Space-Commit")
         XCTAssertEqual(
             commitHeaders.coveredHeaderValue,
-            #"ver=1, repo="did:plc:repositoryabcdefghij", space="at://did:plc:authorityabcdefghijk/space/app.swan.test/mac", rev="222222222222a", data=:QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=:"#
+            #"ver=1, repo="did:plc:repositoryabcdefghij", space="at:space/did:plc:authorityabcdefghijk/app.swan.test/mac", rev="222222222222a", data=:QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=:"#
         )
         XCTAssertTrue(commitHeaders.signatureInput.hasPrefix("client="))
         XCTAssertTrue(commitHeaders.signature.hasPrefix("client=:"))
