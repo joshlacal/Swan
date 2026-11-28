@@ -28,3 +28,6 @@ artifacts/
 # Python verification helpers
 __pycache__/
 *.pyc
+
+# Xcode per-user state
+xcuserdata/
